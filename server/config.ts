@@ -227,6 +227,7 @@ export function loadConfig(): AppConfig {
   } catch {
     /* first run — env fallbacks below */
   }
+  // Env wins over the file for every credential. The desktop shell keeps
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
