@@ -290,7 +290,7 @@ export function GroupAvatar({ group, size = 44, label }: { group: import("@/stat
         : "0";
   return (
     <div className="relative shrink-0 overflow-hidden" style={{ width: size, height: size, borderRadius: radius }}>
-      <img src={group.avatarUrl} alt={label ?? group.name} className="size-full object-cover" />
+      <img src={group.avatarUrl} alt={label ?? group.name} className="size-full object-cover" draggable={false} />
     </div>
   );
 }
@@ -308,27 +308,6 @@ export function InitialsAvatar({
       style={{ width: size, height: size, fontSize: size * 0.38 }}
     >
       {initials}
-    </div>
-  );
-}
-
-
-export function GroupAvatar({ group, size = 44, label }: { group: any, size?: number, label?: string }) {
-  if (!group.avatarUrl) {
-    return (
-      <div className="flex items-center justify-center bg-control text-ink-secondary" style={{ width: size, height: size, borderRadius: "50%" }}>
-        <span className="font-semibold text-[13px]">{group.name.slice(0, 2).toUpperCase()}</span>
-      </div>
-    );
-  }
-  
-  // Default to a squircle (rounded) for channel logos
-  const crop = group.avatarCrop ?? "rounded";
-  const radius = crop === "circle" ? "50%" : crop === "rounded" ? "22%" : "0";
-
-  return (
-    <div className="relative shrink-0 overflow-hidden" style={{ width: size, height: size, borderRadius: radius }}>
-      <img src={group.avatarUrl} alt={label ?? group.name} className="size-full object-cover" draggable={false} />
     </div>
   );
 }
