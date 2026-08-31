@@ -64,6 +64,7 @@ function normalizeManagedCompanionAccess(credentials) {
     credentials?.[MANAGED_COMPANION_ENDPOINT_FIELD],
   );
   const token = credentials?.[MANAGED_COMPANION_TOKEN_FIELD];
+  if (token === "TRYCLOUDFLARE") return { endpoint: "TRYCLOUDFLARE", token };
   if (!endpoint || !validConnectorToken(token)) return null;
   return { endpoint, token };
 }
@@ -433,10 +434,22 @@ export function createManagedCompanionTunnel({
           windowsHide: true,
           // This open pipe is the parent-death signal. The guardian owns both
           // gateway and connector and tears them down on EOF.
-          stdio: ["pipe", "ignore", "ignore"],
+          stdio: ["pipe", "pipe", "ignore"],
         },
       );
       child = spawned;
+      let tryCloudflareUrl = null;
+      if (tokenFile === "TRYCLOUDFLARE" && spawned.stdout) {
+        spawned.stdout.on("data", (data) => {
+          const text = data.toString();
+          const match = text.match(/TRYCLOUDFLARE_URL:(https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com)/);
+          if (match) {
+            tryCloudflareUrl = match[1];
+            publish({ status: "ready", ready: true, tryCloudflareUrl });
+          }
+        });
+      }
+
       const cancellationController = new AbortController();
       let resolveCancellation;
       const cancellation = new Promise((resolve) => {
@@ -490,7 +503,7 @@ export function createManagedCompanionTunnel({
         if (verified && child === spawned && desired && ownedGeneration === generation) {
           removeTokenFile(attemptTokenFile);
           retryAttempt = 0;
-          publish({ status: "ready", ready: true });
+          publish({ status: "ready", ready: true, tryCloudflareUrl: typeof tryCloudflareUrl !== "undefined" ? tryCloudflareUrl : undefined });
           return state;
         }
         if (Date.now() >= deadline) break;

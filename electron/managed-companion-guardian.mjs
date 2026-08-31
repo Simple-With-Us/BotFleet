@@ -126,7 +126,7 @@ export async function runManagedCompanionGuardian({
   isTargetAlive = ({ pid }) => processIsAlive(pid),
   createGateway = createCompanionOriginGateway,
 } = {}) {
-  if (!path.isAbsolute(cloudflaredBinary ?? "") || !path.isAbsolute(tokenFile ?? "")) {
+  if (!path.isAbsolute(cloudflaredBinary ?? "") || (!path.isAbsolute(tokenFile ?? "") && tokenFile !== "TRYCLOUDFLARE")) {
     throw new Error("The managed connector paths are invalid");
   }
   if (!validCompanionOriginTarget(target, platform)) {
@@ -147,7 +147,16 @@ export async function runManagedCompanionGuardian({
   try {
     connector = spawnProcess(
       cloudflaredBinary,
-      [
+      tokenFile === "TRYCLOUDFLARE" ? [
+        "tunnel",
+        "--url",
+        `http://localhost:${originPort}`,
+        "--no-autoupdate",
+        "--loglevel",
+        "info",
+        "--output",
+        "json"
+      ] : [
         "tunnel",
         "--no-autoupdate",
         "--loglevel",
@@ -162,13 +171,24 @@ export async function runManagedCompanionGuardian({
         env: minimalCloudflaredEnvironment(environment, platform),
         shell: false,
         windowsHide: true,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "ignore", tokenFile === "TRYCLOUDFLARE" ? "pipe" : "ignore"],
       },
     );
   } catch (error) {
     gateway.invalidate();
     await gateway.close();
     throw error;
+  }
+
+  
+  if (tokenFile === "TRYCLOUDFLARE" && connector.stderr) {
+    connector.stderr.on("data", (data) => {
+      const text = data.toString();
+      const match = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
+      if (match) {
+        process.stdout.write("TRYCLOUDFLARE_URL:" + match[0] + "\n");
+      }
+    });
   }
 
   const connectorExit = new Promise((resolve) => {

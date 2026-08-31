@@ -386,7 +386,9 @@ export async function updateSecureCredentialDocument(derive, afterPersist) {
 }
 
 function publicManagedCompanionState() {
-  const access = managedCompanionTunnelAccess(secureCredentials);
+  
+  const access = tryCloudflareEnabled ? { endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE" } : managedCompanionTunnelAccess(secureCredentials);
+
   const status = managedCompanionConnector?.getStatus();
   if (status) {
     const publicState = {
@@ -394,13 +396,14 @@ function publicManagedCompanionState() {
       configured: status.configured,
       ready: status.ready,
     };
-    if (status.endpoint) publicState.url = status.endpoint;
+    if (status.tryCloudflareUrl) publicState.url = status.tryCloudflareUrl;
+    else if (status.endpoint && status.endpoint !== "TRYCLOUDFLARE") publicState.url = status.endpoint;
     if (status.retryInMs) publicState.retryInMs = status.retryInMs;
     if (status.error) publicState.error = status.error;
     return publicState;
   }
   return access
-    ? { status: "stopped", configured: true, ready: false, url: access.endpoint }
+    ? { status: "stopped", configured: true, ready: false, url: access.endpoint !== "TRYCLOUDFLARE" ? access.endpoint : undefined }
     : { status: "unconfigured", configured: false, ready: false };
 }
 
@@ -476,7 +479,9 @@ async function startManagedCompanionConnection({ waitForVerification = true } = 
   if (companionAccountCleanupPending(secureCredentials)) {
     return publicManagedCompanionState();
   }
-  const access = managedCompanionTunnelAccess(secureCredentials);
+  
+  const access = tryCloudflareEnabled ? { endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE" } : managedCompanionTunnelAccess(secureCredentials);
+
   if (!access) return publicManagedCompanionState();
   const target = companionOriginTarget();
   if (!target) return publicManagedCompanionState();
@@ -1413,6 +1418,21 @@ ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(pa
 // The renderer gets these five and nothing else: it can turn the companion
 // on and off, look at it, open or cancel a pairing window, and remove a
 // device. It cannot reach the sidecar's control port itself.
+
+let tryCloudflareEnabled = false;
+ipcMain.handle("companion:trycloudflare", async (_event, enable) => {
+  tryCloudflareEnabled = Boolean(enable);
+  if (tryCloudflareEnabled) {
+    const target = companionOriginTarget();
+    if (target) {
+      ensureManagedCompanionConnector().start({ endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE", originTarget: target });
+    }
+  } else {
+    ensureManagedCompanionConnector().stop();
+  }
+  return publicManagedCompanionState();
+});
+
 ipcMain.handle("companion:state", () => desktopCompanionState());
 ipcMain.handle("companion:start", () => startDesktopCompanion());
 ipcMain.handle("companion:stop", () => stopDesktopCompanion());

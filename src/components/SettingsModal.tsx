@@ -79,6 +79,27 @@ function ProfileFields() {
 function CustomIngressFields() {
   const { state, dispatch } = useStore();
   const [publicUrl, setPublicUrl] = useState(state.config?.ingress?.publicUrl ?? "");
+  const [useFreeUrl, setUseFreeUrl] = useState(false);
+  const [tunnelUrl, setTunnelUrl] = useState("");
+  useEffect(() => {
+    let active = true;
+    const bridge = (window as any).ogb?.companion;
+    if (!bridge) return;
+    
+    // Poll the companion state
+    const poll = async () => {
+      try {
+        const state = await bridge.state();
+        if (active && state?.url) {
+          setTunnelUrl(state.url);
+        }
+      } catch (e) {}
+      if (active) setTimeout(poll, 2000);
+    };
+    poll();
+    return () => { active = false; };
+  }, []);
+
 
   useEffect(() => {
     setPublicUrl(state.config?.ingress?.publicUrl ?? "");
@@ -95,18 +116,59 @@ function CustomIngressFields() {
       .catch(() => {});
   };
 
+  const toggleFreeUrl = () => {
+    const next = !useFreeUrl;
+    setUseFreeUrl(next);
+    if ((window as any).ogb?.companion?.tryCloudflare) {
+      (window as any).ogb.companion.tryCloudflare(next).catch(() => {});
+    }
+  };
+
   return (
-    <div className="flex flex-col gap-1.5">
-      <input
-        type="url"
-        value={publicUrl}
-        onChange={(e) => setPublicUrl(e.target.value)}
-        onBlur={save}
-        placeholder="https://botfleet.yourdomain.com"
-        className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
-      />
-      <div className="text-[12px] text-ink-secondary leading-relaxed">
-        If you run your own Cloudflare Tunnel or proxy, enter its public URL here to bypass BotFleet's managed tunnel.
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-1.5">
+        <input
+          type="url"
+          value={publicUrl}
+          onChange={(e) => setPublicUrl(e.target.value)}
+          onBlur={save}
+          placeholder="https://agents.botfleet.app"
+          disabled={useFreeUrl}
+          className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
+        />
+        <div className="text-[12px] text-ink-secondary leading-relaxed">
+          If you run your own Cloudflare Tunnel (e.g. agents.botfleet.app), enter its public URL here to route webhooks.
+        </div>
+      </div>
+      
+      <div className="h-px w-full bg-hairline/40" />
+      
+      <div className="flex flex-col gap-1.5">
+        <label className="flex items-center gap-2 text-[13px] text-ink cursor-pointer">
+          <input
+            type="checkbox"
+            checked={useFreeUrl}
+            onChange={toggleFreeUrl}
+            className="accent-ink"
+          />
+          Enable Free URL (TryCloudflare)
+        </label>
+
+        <div className="text-[12px] text-ink-secondary leading-relaxed">
+          Generates a free, temporary URL for quick phone pairing. This URL changes every time BotFleet restarts, so it is not recommended for permanent webhooks like Slack.
+        </div>
+        {useFreeUrl && tunnelUrl && (
+          <div className="mt-2 flex items-center justify-between rounded-lg border border-hairline/50 bg-control px-3 py-2">
+            <span className="text-[13px] font-mono text-ink">{tunnelUrl}</span>
+            <button
+              onClick={() => navigator.clipboard.writeText(tunnelUrl ?? "")}
+              className="text-[12px] text-ink-secondary hover:text-ink"
+            >
+              Copy
+            </button>
+          </div>
+        )}
+
       </div>
     </div>
   );
