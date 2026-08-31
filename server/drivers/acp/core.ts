@@ -545,7 +545,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             emit({
               ...base(threadId, turnId),
               type: "runtime.error",
-              message: `${DRIVER_KIND} exited ${code} before the prompt result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+              message: `${DRIVER_KIND} exited ${code} before the prompt result${stderr ? `:\n\n${stderr.trim()}` : ""}`,
             });
             settle(false, "exit_before_result");
           }
