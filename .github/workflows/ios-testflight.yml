@@ -2,14 +2,24 @@ name: iOS TestFlight Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches:
+      - main
+    paths:
+      - "ios/**"
+
+  push:
   workflow_dispatch:
 
 jobs:
   build-and-upload:
     name: Build and Upload to TestFlight
-    runs-on: macos-14
+    runs-on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ios/**"
+ macos-14
     timeout-minutes: 60
 
     steps:
@@ -19,13 +29,25 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version:
+  push:
+    branches:
+      - main
+    paths:
+      - "ios/**"
+ 24
           cache: pnpm
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v3
         with:
-          version: 8
+          version:
+  push:
+    branches:
+      - main
+    paths:
+      - "ios/**"
+ 8
 
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
