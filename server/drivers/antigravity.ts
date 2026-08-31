@@ -661,7 +661,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `agy exited ${code} before result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `agy exited ${code} before result${stderr ? `:\n\n${stderr.trim()}` : ""}`,
           });
           settle(false, "exit_before_result");
         }

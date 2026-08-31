@@ -2,7 +2,7 @@
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, appendFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { extname, join } from "node:path";
@@ -1332,10 +1332,17 @@ bus.subscribe((event: RuntimeEvent) => {
       });
       break;
     case "runtime.error":
+      try {
+        const logPath = join(DATA_DIR, "errors.log");
+        const entry = `[${new Date().toISOString()}] botId=${bot?.id || "unknown"} threadId=${event.threadId}\n${event.message}\n\n`;
+        appendFileSync(logPath, entry);
+      } catch (err) {
+        console.error("Failed to write to errors.log", err);
+      }
       pushMessage({
         role: "bot",
         kind: "activity",
-        tool: { name: `error: ${event.message.slice(0, 160)}`, ok: false, setup: event.setup },
+        tool: { name: `error: ${event.message.slice(0, 8000)}`, ok: false, setup: event.setup },
       });
       // a setup error means the engine could not even start: the bot is
       // dead until something changes, not merely idle. The next successful
