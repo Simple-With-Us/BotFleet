@@ -216,38 +216,12 @@ export function ensureDirs() {
   for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
 }
 
-function loadHandoffSecrets(): Record<string, string> {
-  const map: Record<string, string> = {};
-  const handoff = join(homedir(), ".secrets", "global-api-keys");
-  if (!existsSync(handoff)) return map;
-  try {
-    const raw = readFileSync(handoff, "utf8");
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq > 0) {
-        const k = trimmed.slice(0, eq).trim();
-        const v = trimmed.slice(eq + 1).trim();
-        if (k && v) map[k] = v;
-      }
-    }
-  } catch {
-    /* ignore */
-  }
-  return map;
-}
-
 export function loadConfig(): AppConfig {
   let cfg: AppConfig = {};
   try {
     cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
   } catch {
     /* first run — env fallbacks below */
-  }
-  const handoff = loadHandoffSecrets();
-  if (process.env.DEEPSEEK_API_KEY === undefined && (handoff.DEEPSEEK_API_KEY || handoff.SHELLULAR2_DEEPSEEK_API_KEY)) {
-    process.env.DEEPSEEK_API_KEY = handoff.DEEPSEEK_API_KEY || handoff.SHELLULAR2_DEEPSEEK_API_KEY;
   }
   // Env wins over the file for every credential. The desktop shell keeps
   // these secrets OS-encrypted and hands them to this process as env at

@@ -23,7 +23,7 @@ import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
-import { defaultSaveName, withSavableFile } from "./save-file.mjs";
+import { defaultSaveName, withSavableFile, resolveSavablePath } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -1033,7 +1033,14 @@ function createWindow() {
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:") {
+        shell.openExternal(url);
+      }
+    } catch {
+      // ignore invalid URLs
+    }
     return { action: "deny" };
   });
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
@@ -1292,14 +1299,7 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
 
 ipcMain.handle("desktop:open-file", async (_event, rawPath) => {
   if (typeof rawPath !== "string") throw new Error("A file path is required");
-  let normPath = rawPath.trim();
-  if (normPath.startsWith("file://")) {
-    try {
-      normPath = decodeURIComponent(new URL(normPath).pathname);
-    } catch {
-      // keep normPath
-    }
-  }
+  const normPath = await resolveSavablePath(rawPath.trim(), { home: os.homedir() });
   if (!fs.existsSync(normPath)) {
     throw new Error(`File does not exist: ${normPath}`);
   }
@@ -1312,14 +1312,7 @@ ipcMain.handle("desktop:open-file", async (_event, rawPath) => {
 
 ipcMain.handle("desktop:show-in-folder", async (_event, rawPath) => {
   if (typeof rawPath !== "string") throw new Error("A file path is required");
-  let normPath = rawPath.trim();
-  if (normPath.startsWith("file://")) {
-    try {
-      normPath = decodeURIComponent(new URL(normPath).pathname);
-    } catch {
-      // keep normPath
-    }
-  }
+  const normPath = await resolveSavablePath(rawPath.trim(), { home: os.homedir() });
   shell.showItemInFolder(normPath);
   return true;
 });

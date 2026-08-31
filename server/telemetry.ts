@@ -32,29 +32,7 @@ const DEFAULT_INGEST_URL = "https://usage.jays.services";
 const INGEST_PATH = "/api/ingest/usage";
 
 function loadSecretKey(keyName: string): string | undefined {
-  if (process.env[keyName]) return process.env[keyName]?.trim();
-  const handoffPath = join(homedir(), ".secrets", "global-api-keys");
-  if (!existsSync(handoffPath)) return undefined;
-  try {
-    const content = readFileSync(handoffPath, "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eqIdx = trimmed.indexOf("=");
-      if (eqIdx === -1) continue;
-      const k = trimmed.slice(0, eqIdx).trim();
-      if (k === keyName) {
-        let v = trimmed.slice(eqIdx + 1).trim();
-        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-          v = v.slice(1, -1);
-        }
-        return v;
-      }
-    }
-  } catch {
-    // ignore read errors
-  }
-  return undefined;
+  return process.env[keyName]?.trim();
 }
 
 export function inferProject(cwd?: string | null, botName?: string, taskTitle?: string): string {
