@@ -256,7 +256,7 @@ export function Composer({
     if (!el) return;
     const line = parseFloat(getComputedStyle(el).lineHeight) || 24;
     const cap = line * 6;
-    el.style.height = "auto";
+    el.style.height = "0px";
     el.style.height = `${Math.min(el.scrollHeight, cap)}px`;
   }, [text]);
 
@@ -584,19 +584,30 @@ export function Composer({
             setDismissedAt(null);
           }}
           onPaste={(e) => {
+            const items = Array.from(e.clipboardData.items);
+            const pastedText = e.clipboardData.getData("text/plain");
             const files = Array.from(e.clipboardData.files);
-            if (!files.length && e.clipboardData.items) {
-              for (const item of Array.from(e.clipboardData.items)) {
+            
+            if (!files.length && items.length) {
+              for (const item of items) {
                 if (item.kind === "file") {
                   const f = item.getAsFile();
                   if (f) files.push(f);
                 }
               }
             }
-            if (files.length > 0) {
+
+            // If we have plain text, ignore files that are just rich text representations
+            // (e.g. text/rtf or text/html from iOS/macOS clipboard)
+            const validFiles = files.filter(f => {
+              if (!pastedText) return true;
+              return f.type.startsWith("image/") || (!f.type.startsWith("text/") && f.type !== "application/json");
+            });
+
+            if (validFiles.length > 0) {
               e.preventDefault();
               void (async () => {
-                const { attachments: added, notice } = await intakeFiles(files, {
+                const { attachments: added, notice } = await intakeFiles(validFiles, {
                   allowImages: engineSupportsImages,
                   getPath: pathForFile,
                   uploadImage: imageAttachmentFromFile,
@@ -607,8 +618,7 @@ export function Composer({
               return;
             }
             // a wall of text becomes a chip instead of burying the input
-            const pasted = e.clipboardData.getData("text/plain");
-            if (!isLongPaste(pasted)) return;
+            if (!isLongPaste(pastedText)) return;
             e.preventDefault();
             // Preserve native paste replacement semantics: if text was
             // selected, the attachment replaces that selection.
@@ -618,7 +628,7 @@ export function Composer({
               setText(`${text.slice(0, start)}${text.slice(end)}`);
               setCaret(start);
             }
-            setAttachments((prev) => [...prev, pasteAttachment(pasted)]);
+            setAttachments((prev) => [...prev, pasteAttachment(pastedText)]);
           }}
           onKeyUp={(e) => setCaret((e.target as HTMLTextAreaElement).selectionStart ?? 0)}
           onClick={(e) => setCaret((e.target as HTMLTextAreaElement).selectionStart ?? 0)}

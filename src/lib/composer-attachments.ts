@@ -89,9 +89,10 @@ export function fileAttachment(name: string, path: string, size: number): FileAt
 export const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 
 export function isImageFile(file: { type: string; size: number }): boolean {
+  const t = file.type.split(";")[0]!.trim().toLowerCase();
   return (
-    file.type.startsWith("image/") &&
-    ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type.split(";")[0]!.trim().toLowerCase())
+    t.startsWith("image/") &&
+    ["image/png", "image/jpeg", "image/gif", "image/webp", "image/heic", "image/heif"].includes(t)
   );
 }
 
@@ -290,7 +291,7 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     rejectedNames.push(...result.rejectedNames);
   }
   const pathless = rejectedNames.length
-    ? `${rejectedNames.join(", ")} — that file has no path on disk. Save it first, then attach it from Finder.`
+    ? `${rejectedNames.join(", ")} cannot be attached (this bot might not support images, or the file has no path).`
     : null;
   const failed = imageErrors.length ? imageErrors.join("; ") : null;
   return {

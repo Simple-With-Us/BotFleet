@@ -224,14 +224,9 @@ const support: AcpSupport = {
       ...(turn.model ? ["-m", turn.model] : []),
       ...(turn.effort ? ["--reasoning-effort", turn.effort] : []),
     ];
-    // Spawning Grok subagents should use only the MCP that the bot sent in parameters.
-    // Inject the requested MCPs dynamically.
     if (turn.integrations) {
-      for (const [name, def] of Object.entries(turn.integrations)) {
-        if (def && typeof def === "object" && "command" in def) {
-          args.push("--mcp", `${name}=${def.command} ${(def.args || []).join(" ")}`);
-        }
-      }
+      // The grok CLI does not currently support dynamic --mcp flags on the agent command.
+      // Integrations must be configured in ~/.grok/config.toml.
     }
     args.push("stdio");
     return args;
