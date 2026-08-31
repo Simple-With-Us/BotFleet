@@ -696,7 +696,38 @@ struct MessageRow: View {
         session.state.versions(of: message, inThread: chat.threadId)
     }
 
-    var body: some View {
+    private var senderBot: Bot? {
+        if message.role == .user { return nil }
+        if let botId = message.from?.botId {
+            return session.state.bot(botId)
+        }
+        if case let .bot(bot) = chat {
+            return bot
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private var avatarBadge: some View {
+        if message.role != .user {
+            if let bot = senderBot {
+                if endsRun {
+                    BotAvatarView(bot: bot, size: 28, state: .idle, animated: false)
+                } else {
+                    Color.clear.frame(width: 28, height: 28)
+                }
+            } else if case let .room(room) = chat {
+                if endsRun {
+                    RoomAvatarView(room: room, size: 28, state: .idle, animated: false)
+                } else {
+                    Color.clear.frame(width: 28, height: 28)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var messageContent: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
             content
 
@@ -736,6 +767,13 @@ struct MessageRow: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Color.secondary)
             }
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            avatarBadge
+            messageContent
         }
         .contextMenu {
             ForEach(Self.reactionChoices, id: \.self) { emoji in

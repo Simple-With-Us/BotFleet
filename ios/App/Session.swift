@@ -899,8 +899,8 @@ final class Session: ObservableObject {
         }
     }
 
-    func avatarData(for bot: Bot) async -> Data? {
-        guard let path = bot.avatarUrl, let client else { return nil }
+    func avatarData(forPath path: String?) async -> Data? {
+        guard let path = path, let client else { return nil }
         let key = path as NSString
         if let cached = avatarCache.object(forKey: key) { return cached as Data }
         let generation = avatarCacheGeneration

@@ -39,7 +39,7 @@ struct BotAvatarView: View {
             image = nil
             failed = false
             guard crop != .mascot, bot.avatarUrl != nil else { return }
-            let data = await session.avatarData(for: bot)
+            let data = await session.avatarData(forPath: bot.avatarUrl)
             guard !Task.isCancelled else { return }
             guard let data, let decoded = UIImage(data: data) else {
                 failed = true
@@ -59,6 +59,48 @@ struct BotAvatarView: View {
     }
 }
 
+struct RoomAvatarView: View {
+    let room: Room
+    let size: CGFloat
+    var state: MausState = .idle
+    var animated = false
+    var comets = false
+
+    @EnvironmentObject private var session: Session
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if room.avatarUrl != nil, !failed, let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+            } else {
+                MausAvatar(color: "blue", size: size, state: state, animated: animated, comets: comets)
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(room.name) avatar")
+        .task(id: room.avatarUrl) {
+            image = nil
+            failed = false
+            guard room.avatarUrl != nil else { return }
+            let data = await session.avatarData(forPath: room.avatarUrl)
+            guard !Task.isCancelled else { return }
+            guard let data, let decoded = UIImage(data: data) else {
+                failed = true
+                return
+            }
+            guard !Task.isCancelled else { return }
+            image = decoded
+        }
+    }
+}
+
 struct ChatAvatarView: View {
     let chat: Chat
     let size: CGFloat
@@ -71,8 +113,8 @@ struct ChatAvatarView: View {
         switch chat {
         case let .bot(bot):
             BotAvatarView(bot: bot, size: size, state: state, animated: animated, comets: comets)
-        case .room:
-            MausAvatar(color: "blue", size: size, state: state, animated: animated, comets: comets)
+        case let .room(room):
+            RoomAvatarView(room: room, size: size, state: state, animated: animated, comets: comets)
         }
     }
 }
