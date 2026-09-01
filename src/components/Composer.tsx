@@ -600,7 +600,7 @@ export function Composer({
           }}
           onPaste={(e) => {
             // rely on onGlobalPaste for files to prevent double-intake
-            const pasted = e.clipboardData?.getData("text/plain");
+            const pasted = e.clipboardData?.getData("text/plain") || e.clipboardData?.getData("text") || e.clipboardData?.getData("text/html");
             if (!pasted || !isLongPaste(pasted)) {
               // auto-grow on normal text paste
               setTimeout(() => {
