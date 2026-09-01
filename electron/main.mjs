@@ -482,9 +482,15 @@ async function startManagedCompanionConnection({ waitForVerification = true } = 
   
   const access = tryCloudflareEnabled ? { endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE" } : managedCompanionTunnelAccess(secureCredentials);
 
-  if (!access) return publicManagedCompanionState();
+  if (!access) {
+    ensureManagedCompanionConnector().stop();
+    return publicManagedCompanionState();
+  }
   const target = companionOriginTarget();
-  if (!target) return publicManagedCompanionState();
+  if (!target) {
+    ensureManagedCompanionConnector().stop();
+    return publicManagedCompanionState();
+  }
   const operation = ensureManagedCompanionConnector().start({ ...access, originTarget: target });
   if (!waitForVerification) {
     void operation.catch(() => {});
@@ -1456,14 +1462,7 @@ ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(pa
 let tryCloudflareEnabled = false;
 ipcMain.handle("companion:trycloudflare", async (_event, enable) => {
   tryCloudflareEnabled = Boolean(enable);
-  if (tryCloudflareEnabled) {
-    const target = companionOriginTarget();
-    if (target) {
-      ensureManagedCompanionConnector().start({ endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE", originTarget: target });
-    }
-  } else {
-    ensureManagedCompanionConnector().stop();
-  }
+  await startManagedCompanionConnection({ waitForVerification: true });
   return publicManagedCompanionState();
 });
 

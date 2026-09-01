@@ -1,0 +1,31 @@
+{
+  "" : {
+    "const-values" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.d",
+    "diagnostics" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.dia",
+    "emit-module-dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary-emit-module.dia",
+    "pch" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.swiftdeps"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MausAvatar.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausAvatar.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausAvatar.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausAvatar.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MausFaceData.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausFaceData.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausFaceData.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/MausFaceData.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Shared/BotActivity.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotActivity.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotActivity.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotActivity.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Widgets/OpenMausWidgets.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/OpenMausWidgets.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/OpenMausWidgets.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/OpenMausWidgets.o"
+  }
+}
