@@ -1,4 +1,3 @@
-> ⚠️ **No affiliation with any cryptocurrency.** BotFleet and BotFleet have no token.  Any coin using the BotFleet, BotFleet, Maus, or SupaMaus name is not created, endorsed, or affiliated with this project or its maintainers.
 
 <div align="center">
 
