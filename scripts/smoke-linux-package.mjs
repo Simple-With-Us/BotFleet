@@ -491,7 +491,7 @@ try {
 
     let restartOutput = "";
     let restartResult = null;
-    const restart = spawn(executable, wayland ? ["--ozone-platform=x11"] : [], {
+    const restart = spawn(executable, electronArgs, {
       cwd: root,
       detached: true,
       env: { ...desktopEnv, OMB_SMOKE_KEEP_OPEN: "0" },
