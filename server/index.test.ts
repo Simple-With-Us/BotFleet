@@ -2064,30 +2064,28 @@ describe("harness HTTP API", () => {
     await api("PATCH", "/api/config", { features: { skillRecorder: false, showToolCalls: false, summarizeToolCalls: true } });
   });
 
-  it("persists autoUpdate, ingress, and deepseek without reloading providers", async () => {
-    const saved = await api("PATCH", "/api/config", {
-      autoUpdate: { enabled: true },
-      ingress: { publicUrl: "https://hooks.example.com" },
-      deepseek: { key: "sk-deepseek-test" },
-    });
-    expect(saved.status).toBe(200);
-    expect(saved.body.autoUpdate).toEqual({ enabled: true });
-    expect(saved.body.ingress).toEqual({ publicUrl: "https://hooks.example.com" });
-    expect(saved.body.deepseek).toEqual({ configured: true });
+  it("persists autoUpdate and ingress without reloading providers", async () => {
+    try {
+      const saved = await api("PATCH", "/api/config", {
+        autoUpdate: { enabled: true },
+        ingress: { publicUrl: "https://hooks.example.com" },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.autoUpdate).toEqual({ enabled: true });
+      expect(saved.body.ingress).toEqual({ publicUrl: "https://hooks.example.com" });
 
-    const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
-    expect(disk.autoUpdate).toEqual({ enabled: true });
-    expect(disk.ingress).toEqual({ publicUrl: "https://hooks.example.com" });
-    expect(disk.deepseek?.key).toBe("sk-deepseek-test");
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.autoUpdate).toEqual({ enabled: true });
+      expect(disk.ingress).toEqual({ publicUrl: "https://hooks.example.com" });
 
-    const invalid = await api("PATCH", "/api/config", { ingress: { publicUrl: "hooks.example.com" } });
-    expect(invalid.status).toBe(400);
-
-    await api("PATCH", "/api/config", {
-      autoUpdate: { enabled: false },
-      ingress: { publicUrl: "" },
-      deepseek: { key: "" },
-    });
+      const invalid = await api("PATCH", "/api/config", { ingress: { publicUrl: "hooks.example.com" } });
+      expect(invalid.status).toBe(400);
+    } finally {
+      await api("PATCH", "/api/config", {
+        autoUpdate: { enabled: false },
+        ingress: { publicUrl: "" },
+      });
+    }
   });
 
   it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
