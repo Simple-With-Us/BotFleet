@@ -290,7 +290,7 @@ export function GroupAvatar({ group, size = 44, label }: { group: import("@/stat
         : "0";
   return (
     <div className="relative shrink-0 overflow-hidden" style={{ width: size, height: size, borderRadius: radius }}>
-      <img src={group.avatarUrl} alt={label ?? group.name} className="size-full object-cover" />
+      <img src={group.avatarUrl} alt={label ?? group.name} className="size-full object-cover" draggable={false} />
     </div>
   );
 }
@@ -311,4 +311,3 @@ export function InitialsAvatar({
     </div>
   );
 }
-
