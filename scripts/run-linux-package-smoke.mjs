@@ -46,6 +46,7 @@ for (const executable of executables) {
       cwd: root,
       env: {
         ...process.env,
+        APPIMAGE_EXTRACT_AND_RUN: "1",
         XDG_RUNTIME_DIR: runtimeDirectory,
         OMB_SMOKE_BUNDLED_CUA: "1",
         OMB_SMOKE_EXECUTABLE: executable,
@@ -75,6 +76,7 @@ if (process.exitCode === undefined) {
       cwd: root,
       env: {
         ...process.env,
+        APPIMAGE_EXTRACT_AND_RUN: "1",
         XDG_RUNTIME_DIR: runtimeDirectory,
         OMB_SMOKE_BUNDLED_CUA: "1",
         OMB_SMOKE_SIGNAL_SHUTDOWN: "1",
