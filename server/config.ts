@@ -293,6 +293,8 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
+  "DEEPSEEK_API_KEY",
+  "DEEPSEEK_URL",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
