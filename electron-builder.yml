@@ -176,12 +176,15 @@ linux:
       to: cua-linux-x64
     - from: dist-native/cloudflared/linux-x64/cloudflared
       to: cloudflared/cloudflared
+  # electron-builder spreads this object directly into the [Desktop Entry]
+  # section (name=value per key) — do not nest these under an extra
+  # "entry:" level, or electron-builder emits a literal non-standard
+  # "entry" key instead of the four below.
   desktop:
-    entry:
-      Name: BotFleet
-      Comment: Your own team of AI bots, in a chat app
-      Keywords: AI;Agents;Chat;Productivity;
-      StartupWMClass: botfleet
+    Name: BotFleet
+    Comment: Your own team of AI bots, in a chat app
+    Keywords: AI;Agents;Chat;Productivity;
+    StartupWMClass: botfleet
 
 deb:
   packageCategory: utils
