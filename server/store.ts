@@ -561,6 +561,7 @@ export class Store {
         {
           id: newId(),
           threadId: initialThreadId,
+          createdAt: Date.now(),
           name: "Director",
           title: "Chief of Staff",
           description: "Chief of staff for the BotFleet roster. Route work, manage other bots, and coordinate fleet-wide tasks.",
@@ -568,17 +569,16 @@ export class Store {
           color: "blue",
           mascotExpression: "focused",
           unread: false,
-          modelSelection: this.defaultSelection,
+          modelSelection: this.defaultSelection(),
           resumeCursors: {},
           autoApprove: false,
           tasks: [
             {
-              id: newId(),
               threadId: initialThreadId,
-              summary: "Inbox",
-              active: true,
-              updatedAt: Date.now(),
-            },
+              title: "Inbox",
+              createdAt: Date.now(),
+              resumeCursors: {}
+            }
           ],
         },
       ];
@@ -720,7 +720,6 @@ export class Store {
   private saveBots() {
     writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots, null, 2));
     }
-  }
 
   private saveGroups() {
     writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
