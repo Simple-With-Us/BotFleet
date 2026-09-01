@@ -208,7 +208,7 @@ let smokeResult = null;
 // The smoke runs with a disposable HOME and no interactive keyring. Keep
 // Electron's credential backend inside that sandbox so a GNOME Keyring unlock
 // prompt cannot block the headless renderer before did-finish-load.
-const electronArgs = ["--password-store=basic"];
+const electronArgs = ["--password-store=basic", "--no-sandbox"];
 if (wayland) electronArgs.push("--ozone-platform=x11");
 const child = spawn(executable, electronArgs, {
   cwd: root,

@@ -136,13 +136,13 @@ jobs:
           brew install xcodegen
           cd ios
           xcodegen generate
-      - name: Build the simulator app
+      - name: Build the iOS app (unsigned)
         run: |
           cd ios
           xcodebuild \
             -project BotFleet.xcodeproj \
             -scheme BotFleet \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
+            -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             build
