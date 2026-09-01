@@ -475,6 +475,20 @@ function reconcileCompanionAdvertisement(
   return work;
 }
 
+function readConfigIngressPublicUrl() {
+  try {
+    const dataDir = process.env.OMB_DATA_DIR || path.join(import.meta.dirname, "../.."); // Fallback, but app.getPath("home") is better
+    // wait, I can use app.getPath("home") because `app` is available in main.mjs
+    const realDataDir = process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet");
+    const configPath = path.join(realDataDir, "config.json");
+    if (!fs.existsSync(configPath)) return null;
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return config?.ingress?.publicUrl || null;
+  } catch {
+    return null;
+  }
+}
+
 async function startManagedCompanionConnection({ waitForVerification = true } = {}) {
   if (companionAccountCleanupPending(secureCredentials)) {
     return publicManagedCompanionState();
@@ -482,9 +496,16 @@ async function startManagedCompanionConnection({ waitForVerification = true } = 
   
   const access = tryCloudflareEnabled ? { endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE" } : managedCompanionTunnelAccess(secureCredentials);
 
-  if (!access) return publicManagedCompanionState();
+  if (!access) {
+    ensureManagedCompanionConnector().stop();
+    await reconcileCompanionAdvertisement(readConfigIngressPublicUrl());
+    return publicManagedCompanionState();
+  }
   const target = companionOriginTarget();
-  if (!target) return publicManagedCompanionState();
+  if (!target) {
+    ensureManagedCompanionConnector().stop();
+    return publicManagedCompanionState();
+  }
   const operation = ensureManagedCompanionConnector().start({ ...access, originTarget: target });
   if (!waitForVerification) {
     void operation.catch(() => {});
@@ -1456,14 +1477,12 @@ ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(pa
 let tryCloudflareEnabled = false;
 ipcMain.handle("companion:trycloudflare", async (_event, enable) => {
   tryCloudflareEnabled = Boolean(enable);
-  if (tryCloudflareEnabled) {
-    const target = companionOriginTarget();
-    if (target) {
-      ensureManagedCompanionConnector().start({ endpoint: "TRYCLOUDFLARE", token: "TRYCLOUDFLARE", originTarget: target });
-    }
-  } else {
-    ensureManagedCompanionConnector().stop();
-  }
+  await startManagedCompanionConnection({ waitForVerification: true });
+  return publicManagedCompanionState();
+});
+
+ipcMain.handle("companion:set-custom-ingress", async (_event) => {
+  await startManagedCompanionConnection({ waitForVerification: true });
   return publicManagedCompanionState();
 });
 

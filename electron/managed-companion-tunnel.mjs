@@ -411,12 +411,16 @@ export function createManagedCompanionTunnel({
     let attemptHandle = null;
     let attemptTokenFile = null;
     try {
-      tokenFile = writePrivateToken(runtimeRoot, access.token, {
-        fileSystem,
-        processId,
-        identifier,
-        currentUid,
-      });
+      if (access.endpoint === "TRYCLOUDFLARE") {
+        tokenFile = "TRYCLOUDFLARE";
+      } else {
+        tokenFile = writePrivateToken(runtimeRoot, access.token, {
+          fileSystem,
+          processId,
+          identifier,
+          currentUid,
+        });
+      }
       attemptTokenFile = tokenFile;
       const spawned = spawnProcess(
         runtimeExecutable,
@@ -439,7 +443,7 @@ export function createManagedCompanionTunnel({
       );
       child = spawned;
       let tryCloudflareUrl = null;
-      if (tokenFile === "TRYCLOUDFLARE" && spawned.stdout) {
+      if (access.endpoint === "TRYCLOUDFLARE" && spawned.stdout) {
         spawned.stdout.on("data", (data) => {
           const text = data.toString();
           const match = text.match(/TRYCLOUDFLARE_URL:(https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com)/);

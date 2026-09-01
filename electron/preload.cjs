@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld("ogb", {
     start: () => ipcRenderer.invoke("companion:start"),
     stop: () => ipcRenderer.invoke("companion:stop"),
     tryCloudflare: (enabled) => ipcRenderer.invoke("companion:trycloudflare", enabled),
+    setCustomIngress: () => ipcRenderer.invoke("companion:set-custom-ingress"),
     keepAwake: (enabled) => ipcRenderer.invoke("companion:keep-awake", enabled),
     pairing: (open, expectedToken) => ipcRenderer.invoke("companion:pairing", open, expectedToken),
     cloudDesktop: (deviceId, allowed) => ipcRenderer.invoke("companion:cloud-desktop", deviceId, allowed),
