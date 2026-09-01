@@ -692,11 +692,7 @@ export class Store {
 
   private saveBots() {
     writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots, null, 2));
-<<<<<<< HEAD
   }
-=======
-    }
->>>>>>> origin/fix/default-bots
 
   private saveGroups() {
     writeFileAtomic(GROUPS_FILE, JSON.stringify(this.groups.map(({ busyBotId, ...g }) => g), null, 2));
