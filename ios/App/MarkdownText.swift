@@ -43,6 +43,8 @@ struct MarkdownText: View {
         } message: { url in
             Text("The file '\(url.lastPathComponent)' is on your computer. You can only view it from the desktop app.")
         }
+    }
+
     @ViewBuilder
     private func view(for block: MarkdownBlock, tail: Bool) -> some View {
         switch block {
