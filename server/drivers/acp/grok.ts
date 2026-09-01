@@ -224,6 +224,10 @@ const support: AcpSupport = {
       ...(turn.model ? ["-m", turn.model] : []),
       ...(turn.effort ? ["--reasoning-effort", turn.effort] : []),
     ];
+    if (turn.integrations) {
+      // The grok CLI does not currently support dynamic --mcp flags on the agent command.
+      // Integrations must be configured in ~/.grok/config.toml.
+    }
     args.push("stdio");
     return args;
   },

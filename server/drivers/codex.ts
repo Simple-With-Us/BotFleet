@@ -493,7 +493,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
-            message: `codex exited ${code} before turn/completed${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            message: `codex exited ${code} before turn/completed${stderr ? `:\n\n${stderr.trim()}` : ""}`,
           });
           settle(false, "exit_before_result");
         }

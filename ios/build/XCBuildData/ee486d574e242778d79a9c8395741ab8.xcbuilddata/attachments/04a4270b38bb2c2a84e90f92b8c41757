@@ -1,0 +1,16 @@
+{
+  "" : {
+    "const-values" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary.d",
+    "diagnostics" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary.dia",
+    "emit-module-dependencies" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary-emit-module.dia",
+    "pch" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper-primary.swiftdeps"
+  },
+  "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/Sources/SentryCppHelper/SentryCppHelper.swift" : {
+    "index-unit-output-path" : "/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper.o",
+    "llvm-bc" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper.bc",
+    "object" : "/Users/jay/Library/Developer/Xcode/DerivedData/BotFleet-cksrbjarxtiakcaefxvvnqtrvxgn/SourcePackages/checkouts/sentry-cocoa/build/Sentry.build/Release-iphoneos/SentryCppHelper.build/Objects-normal/arm64/SentryCppHelper.o"
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "" : {
+    "const-values" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.d",
+    "diagnostics" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.dia",
+    "emit-module-dependencies" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary-emit-module.dia",
+    "pch" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.swiftdeps"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Client.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Client.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Client.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Client.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Dictation.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Dictation.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Dictation.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Dictation.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Endpoint.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Endpoint.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Endpoint.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Endpoint.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Failover.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Failover.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Failover.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Failover.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Frames.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Frames.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Frames.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Frames.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Markdown.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Markdown.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Markdown.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Markdown.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Models.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Models.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Models.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Models.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Onboarding.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Onboarding.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Onboarding.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Onboarding.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/SSE.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/SSE.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/SSE.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/SSE.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Store.swift" : {
+    "index-unit-output-path" : "/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Store.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Store.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/Store.o"
+  }
+}

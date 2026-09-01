@@ -1,0 +1,12 @@
+{
+  "/Users/jay/Code/BotFleet/ios/Sources/CompanionCore/Client.swift" : {
+    "abi-baseline-json" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore.abi.json",
+    "const-values" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.d",
+    "diagnostics" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-primary.dia",
+    "objc-header" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore-Swift.h",
+    "swiftdoc" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore.swiftdoc",
+    "swiftmodule" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore.swiftmodule",
+    "swiftsourceinfo" : "/Users/jay/Code/BotFleet/ios/build/CompanionCore.build/Release-iphoneos/CompanionCore.build/Objects-normal/arm64/CompanionCore.swiftsourceinfo"
+  }
+}

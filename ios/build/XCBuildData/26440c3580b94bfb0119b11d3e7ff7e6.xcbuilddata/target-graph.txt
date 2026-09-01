@@ -1,0 +1,12 @@
+Target dependency graph (6 targets)
+Target 'BotFleet' in project 'BotFleet'
+➜ Explicit dependency on target 'BotFleetWidgets' in project 'BotFleet'
+➜ Explicit dependency on target 'CompanionCore' in project 'CompanionCore'
+➜ Explicit dependency on target 'Sentry' in project 'Sentry'
+Target 'Sentry' in project 'Sentry'
+➜ Explicit dependency on target 'SentryCppHelper' in project 'Sentry'
+Target 'SentryCppHelper' in project 'Sentry' (no dependencies)
+Target 'CompanionCore' in project 'CompanionCore'
+➜ Explicit dependency on target 'CompanionCore' in project 'CompanionCore'
+Target 'CompanionCore' in project 'CompanionCore' (no dependencies)
+Target 'BotFleetWidgets' in project 'BotFleet' (no dependencies)

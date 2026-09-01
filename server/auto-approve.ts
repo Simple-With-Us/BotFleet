@@ -18,6 +18,7 @@ const DESTRUCTIVE = [
   /\bgit\s+push\s+[^|]*--force(-with-lease)?\b|\bgit\s+reset\s+--hard\b/i,
   /\bDROP\s+(TABLE|DATABASE)\b|\bTRUNCATE\s+TABLE\b/i,
   /\bsudo\s+rm\b|\bchmod\s+-R\s+777\s+\//i,
+  /\b(curl|wget|fetch|nc)\b/i, // block unattended network fetch / pipe to shell
 ];
 
 // Not destructive, but exactly what you don't hand over unattended: a

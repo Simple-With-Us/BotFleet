@@ -1,0 +1,221 @@
+{
+  "" : {
+    "const-values" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary.d",
+    "diagnostics" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary.dia",
+    "emit-module-dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary-emit-module.dia",
+    "pch" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotFleet-primary.swiftdeps"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/AgentProfileView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentProfileView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentProfileView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentProfileView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/BotAvatarView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotAvatarView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotAvatarView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotAvatarView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Cards/AgentThoughtChamberView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentThoughtChamberView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentThoughtChamberView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/AgentThoughtChamberView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Cards/GitPRDiffCardView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GitPRDiffCardView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GitPRDiffCardView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GitPRDiffCardView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Cards/SQLResultTableView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SQLResultTableView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SQLResultTableView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SQLResultTableView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Cards/SkillExecutionReceiptView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SkillExecutionReceiptView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SkillExecutionReceiptView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SkillExecutionReceiptView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/ChatListView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatListView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatListView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatListView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/ChatView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ChatView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/CloudDesktopBrowser.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CloudDesktopBrowser.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CloudDesktopBrowser.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CloudDesktopBrowser.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/CompanionApp.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CompanionApp.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CompanionApp.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CompanionApp.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Composer/CommandSkillHUDView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CommandSkillHUDView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CommandSkillHUDView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/CommandSkillHUDView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Composer/PredictiveActionChipsView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PredictiveActionChipsView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PredictiveActionChipsView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PredictiveActionChipsView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Composer/TypingIndicatorView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TypingIndicatorView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TypingIndicatorView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TypingIndicatorView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/ComputerView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ComputerView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ComputerView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ComputerView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/ConnectedAppsView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ConnectedAppsView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ConnectedAppsView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/ConnectedAppsView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Discovery.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Discovery.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Discovery.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Discovery.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Glass.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Glass.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Glass.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Glass.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/GroupProfileView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GroupProfileView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GroupProfileView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GroupProfileView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Island.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Island.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Island.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Island.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Keychain.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Keychain.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Keychain.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Keychain.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/LiveActivities.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/LiveActivities.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/LiveActivities.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/LiveActivities.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MarkdownText.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MarkdownText.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MarkdownText.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MarkdownText.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MascotState.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MascotState.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MascotState.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MascotState.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MausAvatar.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausAvatar.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausAvatar.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausAvatar.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/MausFaceData.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausFaceData.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausFaceData.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/MausFaceData.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/NewGroupSheet.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/NewGroupSheet.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/NewGroupSheet.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/NewGroupSheet.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Notifications.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Notifications.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Notifications.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Notifications.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/OnboardingViews.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/OnboardingViews.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/OnboardingViews.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/OnboardingViews.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/PairingScanner.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingScanner.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingScanner.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingScanner.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/PairingView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PairingView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/PlatformBridge.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PlatformBridge.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PlatformBridge.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/PlatformBridge.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/SentryTelemetry.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SentryTelemetry.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SentryTelemetry.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SentryTelemetry.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Session.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Session.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Session.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Session.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/SettingsView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SettingsView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SettingsView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SettingsView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/SpeechBubble.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechBubble.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechBubble.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechBubble.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/SpeechDictation.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechDictation.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechDictation.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/SpeechDictation.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/TaskManagerView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TaskManagerView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TaskManagerView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TaskManagerView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/TasksRoutinesView.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TasksRoutinesView.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TasksRoutinesView.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/TasksRoutinesView.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/Updates.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Updates.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Updates.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/Updates.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/App/UpdatesSheet.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/UpdatesSheet.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/UpdatesSheet.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/UpdatesSheet.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/Shared/BotActivity.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotActivity.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotActivity.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/BotActivity.o"
+  },
+  "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/DerivedSources/GeneratedAssetSymbols.swift" : {
+    "index-unit-output-path" : "/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GeneratedAssetSymbols.o",
+    "llvm-bc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GeneratedAssetSymbols.bc",
+    "object" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleet.build/Objects-normal/arm64/GeneratedAssetSymbols.o"
+  }
+}

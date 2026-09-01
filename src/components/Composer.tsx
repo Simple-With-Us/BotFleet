@@ -256,7 +256,6 @@ export function Composer({
     if (!el) return;
     const line = parseFloat(getComputedStyle(el).lineHeight) || 24;
     const cap = line * 6;
-    el.style.height = "0px";
     el.style.height = `${Math.max(line, Math.min(el.scrollHeight, cap))}px`;
   }, [text]);
 
@@ -620,7 +619,7 @@ export function Composer({
               setText(`${text.slice(0, start)}${text.slice(end)}`);
               setCaret(start);
             }
-            setAttachments((prev) => [...prev, pasteAttachment(pasted)]);
+            setAttachments((prev) => [...prev, pasteAttachment(pastedText)]);
           }}
           onKeyUp={(e) => setCaret((e.target as HTMLTextAreaElement).selectionStart ?? 0)}
           onClick={(e) => setCaret((e.target as HTMLTextAreaElement).selectionStart ?? 0)}

@@ -633,6 +633,20 @@ struct ChatView: View {
                                 return .handled
                             }
                             .onSubmit { submit() }
+                            .pasteDestination(for: PastedImage.self) { images in
+                                for img in images {
+                                    if let uiImage = UIImage(data: img.data),
+                                       let jpeg = uiImage.jpegData(compressionQuality: 0.85) {
+                                        stagedAttachments.append(StagedAttachment(
+                                            name: "Pasted Photo",
+                                            mime: "image/jpeg",
+                                            data: jpeg,
+                                            previewImage: uiImage,
+                                            isImage: true
+                                        ))
+                                    }
+                                }
+                            }
 
                         Button {
                             composerFocused = false
@@ -1178,5 +1192,14 @@ struct StreamingBubble: View {
         // No `.textSelection` on purpose: selecting text that is still growing
         // fights the reader, and the settled bubble a frame later is
         // selectable anyway.
+    }
+}
+
+struct PastedImage: Transferable {
+    let data: Data
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .image) { data in
+            PastedImage(data: data)
+        }
     }
 }

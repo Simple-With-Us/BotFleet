@@ -1,0 +1,12 @@
+{
+  "/Users/jay/Code/BotFleet/ios/Shared/BotActivity.swift" : {
+    "abi-baseline-json" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets.abi.json",
+    "const-values" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.swiftconstvalues",
+    "dependencies" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.d",
+    "diagnostics" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-primary.dia",
+    "objc-header" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets-Swift.h",
+    "swiftdoc" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets.swiftdoc",
+    "swiftmodule" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets.swiftmodule",
+    "swiftsourceinfo" : "/Users/jay/Code/BotFleet/ios/build/BotFleet.build/Release-iphoneos/BotFleetWidgets.build/Objects-normal/arm64/BotFleetWidgets.swiftsourceinfo"
+  }
+}

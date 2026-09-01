@@ -936,7 +936,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // process that exited between turns (idle close, contract change)
         // is just a session ending
         if (session.turn && !session.turn.settled) {
-          const message = `claude exited ${code} before result${session.stderr ? `: ${session.stderr.trim().slice(-300)}` : ""}`;
+          const message = `claude exited ${code} before result${session.stderr ? `:\n\n${session.stderr.trim()}` : ""}`;
           const verdict = classifyError({ exitCode: code, stderr: message });
           if (
             !retry.cancelled &&
