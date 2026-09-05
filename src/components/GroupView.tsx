@@ -140,7 +140,7 @@ function GroupTextRow({
   onReply: (message: Message) => void;
   attachedImages: ReturnType<typeof splitAttachedImages> | null;
 }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const [copied, setCopied] = useState(false);
   const copyContent = attachedImages?.display ?? m.text ?? "";
   const requestId = m.card?.requestId;
@@ -251,7 +251,18 @@ function GroupTextRow({
                 const bot = members.find(b => b.id === m.from?.botId);
                 return bot?.modelSelection ? (
                   <span className="ml-1.5 flex items-center" title={bot.modelSelection.model}>
-                    <ProviderMark driverKind={bot.modelSelection.instanceId.includes('claude') ? 'claude' : bot.modelSelection.instanceId.includes('antigravity') ? 'antigravity' : bot.modelSelection.instanceId.includes('dsh') || bot.modelSelection.instanceId.includes('deepseek') ? 'dsh' : bot.modelSelection.instanceId.includes('grok') ? 'grok' : bot.modelSelection.instanceId.includes('codex') ? 'codex' : bot.modelSelection.instanceId.includes('cursor') ? 'cursor' : 'openai'} size={12} />
+                    {/* the engine's own driver kind, the same lookup the 1:1
+                        transcript does. The instance id is not a brand: a
+                        substring ladder over it silently drew every engine it
+                        had not been taught (minimax, kimi, qwen, hermes, pi,
+                        droid, opencode, the computer) as the generic badge. */}
+                    <ProviderMark
+                      driverKind={
+                        state.instances.find((i) => i.instanceId === bot.modelSelection!.instanceId)?.driverKind ??
+                        bot.modelSelection.instanceId
+                      }
+                      size={12}
+                    />
                   </span>
                 ) : null;
               })()}

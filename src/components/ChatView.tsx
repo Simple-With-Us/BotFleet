@@ -436,7 +436,16 @@ function Bubble({
                 {formatHoverTime(message.at)}
                 {bot && bot.modelSelection && (
                   <span className="ml-1.5 flex items-center" title={bot.modelSelection.model}>
-                    <ProviderMark driverKind={state.instances.find((i: any) => i.instanceId === bot.modelSelection.instanceId)?.driverKind ?? "openai"} size={12} />
+                    {/* fall back to the instance id, not a hardcoded "openai": before the
+                        instance list loads, that constant drew every engine — MiniMax
+                        included — as an "O" badge instead of its own initial. */}
+                    <ProviderMark
+                      driverKind={
+                        state.instances.find((i: any) => i.instanceId === bot.modelSelection.instanceId)?.driverKind ??
+                        bot.modelSelection.instanceId
+                      }
+                      size={12}
+                    />
                   </span>
                 )}
               </div>

@@ -145,6 +145,30 @@ export function QwenMark({ size = 16, className }: IconProps) {
   );
 }
 
+/**
+ * MiniMax mark.  Authored here as a vector rather than dropped in as a PNG:
+ * no official MiniMax raster ships with this repo, and the codex/cursor mark
+ * mix-up (two files holding each other's artwork) is exactly what happens when
+ * a binary nobody can read in a diff is trusted on its filename.  This is a
+ * geometric mark, not the MiniMax corporate logo — a short "mini" peak beside a
+ * tall "max" one, drawn on the same 24-unit grid and ink colour as the other
+ * vector marks so it carries their weight in the rail.
+ */
+export function MiniMaxMark({ size = 16, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" className={className} aria-hidden>
+      <path
+        d="M3.6 19.2 7.8 12 12 19.2 16.2 4.8 20.4 19.2"
+        fill="none"
+        stroke="var(--color-ink)"
+        strokeWidth={3}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 /** Official pi (pi.dev) mark — geometric "Pi" wordmark from pi.dev/logo.svg. */
 export function PiMark({ size = 16, className }: IconProps) {
   return (
@@ -199,6 +223,8 @@ export function ProviderMark({ driverKind, size, className }: IconProps & { driv
       return <ComputerMark size={size} className={className} />;
     case "piAgent":
       return <PiMark size={size} className={className} />;
+    case "minimax":
+      return <MiniMaxMark size={size} className={className} />;
     default:
       return (
         <span className="flex size-full items-center justify-center text-[10px] font-semibold tracking-tight text-ink-secondary">
