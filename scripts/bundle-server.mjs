@@ -97,3 +97,12 @@ const piMcpExtSrc = join(server, "drivers", "pi-mcp-extension.ts");
 const piMcpExtDest = join(root, "dist-server", "drivers", "pi-mcp-extension.ts");
 mkdirSync(dirname(piMcpExtDest), { recursive: true });
 copyFileSync(piMcpExtSrc, piMcpExtDest);
+
+// The DeepSeek Harness ACP bridge is a Python script, not a module to bundle.
+// It has to land BESIDE the bundled server, because server/proxy-paths.ts
+// resolves it from SERVER_ROOT — the same anchor every spawned proxy uses.
+// Edited under tools/ so it is readable and testable on its own.
+const dshAcpSrc = join(root, "tools", "dsh-acp", "dsh-acp.py");
+const dshAcpDest = join(root, "dist-server", "dsh-acp.py");
+mkdirSync(dirname(dshAcpDest), { recursive: true });
+copyFileSync(dshAcpSrc, dshAcpDest);

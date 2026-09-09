@@ -9,6 +9,23 @@ import { dirname } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import type { ModelSelection } from "./contracts.ts";
 
+/** Fleet priority for the one-step chain offered when a bot has configured no
+ * fallbacks of its own (#90).  These are INSTANCE ids, not driver kinds, and
+ * anything absent sorts last — which is exactly why both DeepSeek rails were
+ * unreachable in practice: a fleet with any higher entry enabled never got
+ * past it.  Order is deliberate, so changing it is a decision, not a tidy-up.
+ */
+export const AUTO_FALLBACK_PRIORITY: readonly string[] = [
+  "claude",
+  "antigravity",
+  "gemini",
+  "codex",
+  "dsh",
+  "deepseek",
+  "openaiCompat",
+  "grok",
+];
+
 export interface FallbackScanMessage {
   role: string;
   kind: string;

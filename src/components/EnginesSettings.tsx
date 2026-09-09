@@ -360,7 +360,7 @@ function EngineRow({ instance }: { instance: InstanceInfo }) {
           {"  "}Streams token-level responses and supports the OpenAI function-calling shape.
           {"  "}The harness gives it two tools today — <code>list_bots</code> and{" "}
           <code>ask_bot</code>, run through the HTTP tool loop — and no file, shell, or browser tools.
-          {"  "}For bots that need those, pick an ACP engine (Claude, Codex, DSH, Droid) instead —
+          {"  "}For bots that need those, pick an ACP engine (Claude, Codex, Droid) instead —
           they spawn MCP servers natively and execute the calls.
         </div>
       )}

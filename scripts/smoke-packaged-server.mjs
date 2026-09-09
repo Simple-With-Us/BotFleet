@@ -86,9 +86,13 @@ writeFileSync(
   probe,
   [
     'import { existsSync } from "node:fs";',
-    'import { SPAWNED_PROXIES } from "./proxy-paths.js";',
-    "const missing = Object.entries(SPAWNED_PROXIES).filter(([, p]) => !existsSync(p));",
-    "console.log(JSON.stringify({ resolved: SPAWNED_PROXIES, missing }));",
+    // SPAWNED_SCRIPTS rides along for the same reason: dsh-acp.py is copied
+    // beside the bundled server, not bundled INTO it, so a missing copy step
+    // is invisible until a packaged DeepSeek Harness turn fails to spawn.
+    'import { SPAWNED_PROXIES, SPAWNED_SCRIPTS } from "./proxy-paths.js";',
+    "const resolved = { ...SPAWNED_PROXIES, ...SPAWNED_SCRIPTS };",
+    "const missing = Object.entries(resolved).filter(([, p]) => !existsSync(p));",
+    "console.log(JSON.stringify({ resolved, missing }));",
   ].join("\n"),
 );
 

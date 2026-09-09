@@ -14,8 +14,7 @@ import {
   sliceIsShortProviderError,
   turnHitQuotaOrCap,
   turnProducedAssistantOutput,
-  type FallbackScanMessage,
-} from "./model-fallback.ts";
+  type FallbackScanMessage, AUTO_FALLBACK_PRIORITY } from "./model-fallback.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -433,5 +432,29 @@ describe("QuotaCooldownRegistry", () => {
     second.enablePersist(file, (_path, json) => writeFileSync(file, json));
     expect(second.get("bot", "antigravity", "claude-opus-4-6-thinking")?.error).toBe("exhausted");
     expect(second.get("bot", "grok", "grok-4.6")).toBeUndefined();
+  });
+});
+
+describe("AUTO_FALLBACK_PRIORITY", () => {
+  it("keeps the established CLI order ahead of the newcomers", () => {
+    // The six that were already here, in the order they were already in.
+    // Adding a rail must never reshuffle the ladder a user has been living
+    // with — a failover that lands somewhere new is a surprise, not a fix.
+    const established = ["claude", "antigravity", "gemini", "codex", "openaiCompat", "grok"];
+    expect(AUTO_FALLBACK_PRIORITY.filter((id) => established.includes(id))).toEqual(established);
+  });
+
+  it("reaches both DeepSeek rails, below codex and above openaiCompat", () => {
+    const at = (id: string) => AUTO_FALLBACK_PRIORITY.indexOf(id);
+    expect(at("dsh")).toBeGreaterThan(at("codex"));
+    expect(at("deepseek")).toBeGreaterThan(at("codex"));
+    expect(at("dsh")).toBeLessThan(at("openaiCompat"));
+    expect(at("deepseek")).toBeLessThan(at("openaiCompat"));
+    // dsh is the default-fleet member; deepseek is custom-only, so it sits behind.
+    expect(at("dsh")).toBeLessThan(at("deepseek"));
+  });
+
+  it("lists no id twice", () => {
+    expect(new Set(AUTO_FALLBACK_PRIORITY).size).toBe(AUTO_FALLBACK_PRIORITY.length);
   });
 });

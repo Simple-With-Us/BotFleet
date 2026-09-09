@@ -117,8 +117,15 @@ describe("ACP decodeConfig", () => {
   it("grok defaults to the grok binary", () => {
     expect(GrokAgentDriver.decodeConfig({})).toEqual({ cli: "grok", fullAuto: false, workspace: undefined });
   });
-  it("dsh defaults to the dsh binary", () => {
-    expect(DshAgentDriver.decodeConfig(undefined)).toEqual({ cli: "dsh", fullAuto: false, workspace: undefined });
+  it("dsh defaults to the bundled ACP bridge, not the dsh binary", () => {
+    // `dsh` itself has no acp subcommand, so the bare binary was never an ACP
+    // server — see server/drivers/acp/dsh.ts and docs/dsh-engine.md.
+    const config = DshAgentDriver.decodeConfig(undefined);
+    expect(config).toMatchObject({ fullAuto: false, workspace: undefined });
+    expect(config.cli).toContain("dsh-acp.py");
+    expect(config.cli).not.toBe("dsh");
+    // and a user override still wins over the bundled default
+    expect(DshAgentDriver.decodeConfig({ cli: "/opt/mine/dsh-acp" }).cli).toBe("/opt/mine/dsh-acp");
   });
   it("kimi defaults to the kimi binary and declares cross-platform setup", () => {
     expect(KimiAgentDriver.decodeConfig(undefined)).toEqual({ cli: "kimi", fullAuto: false, workspace: undefined });

@@ -1,8 +1,10 @@
 /** Published DeepSeek API rates, USD per million tokens.
  *
- * Must stay in lockstep with `computeDeepSeekCost` in server/drivers/deepseek.ts.
- * The Vite client cannot import that driver (Node-only), so this is the
- * display copy of the same numbers. */
+ * Display copy for the Settings rates table.  It once had to stay in lockstep
+ * with `computeDeepSeekCost` in server/drivers/deepseek.ts; that function and
+ * the driver file it lived in are both gone.  Nothing on the server derives
+ * cost from these numbers today — they are published DeepSeek rates, and the
+ * only obligation is that they still match DeepSeek's price page. */
 export const DEEPSEEK_PRICE_PER_MILLION = {
   flash: { input: 0.7, cache: 0.175, output: 1.4 },
   pro: { input: 1.4, cache: 0.14, output: 2.8 },

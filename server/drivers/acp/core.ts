@@ -102,6 +102,15 @@ export interface AcpSupport {
   loginNote: string;
   /** How a user installs this harness's CLI; surfaced by the setup UI. */
   install?: EngineInstall;
+  /** Refine the snapshot for a harness whose spawn target is a wrapper.  All
+   * the core learns is that `--version` failed, so the reason it writes names
+   * the wrapper instead of the piece that is actually missing — useless to a
+   * user who has to go install something.  Return a sharper reason. */
+  refineSnapshot?(
+    base: ProviderSnapshot,
+    env: Record<string, string | undefined>,
+    config: AcpConfig,
+  ): ProviderSnapshot | Promise<ProviderSnapshot>;
   /** CLI argv AFTER the binary name to enter ACP stdio mode. */
   spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
   /** Provider credential variables this ACP child is allowed to inherit. */
@@ -814,8 +823,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             resolve(err ? null : stdout.trim()),
           );
         });
-        if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-        return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
+        const base: ProviderSnapshot = version
+          ? { state: "available", version, authenticated: await support.isAuthenticated(env, config) }
+          : { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        return support.refineSnapshot ? support.refineSnapshot(base, env, config) : base;
       };
 
       const mountsMcpServers = support.mcpServers !== false;

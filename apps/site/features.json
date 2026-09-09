@@ -51,8 +51,8 @@
           "prov": { "type": "pr", "prs": [137], "state": "merged", "note": "In testing" }
         },
         {
-          "title": "Native DeepSeek Engine &amp; Pricing Breakdown",
-          "desc": "Native API and ACP drivers for DeepSeek models, complete with an in-app model rates and token pricing reference in Settings.",
+          "title": "DeepSeek Engines &amp; Pricing Breakdown",
+          "desc": "DeepSeek Harness and DeepSeek Code CLI, both as ACP drivers, complete with an in-app model rates and token pricing reference in Settings.",
           "prov": { "type": "host", "note": "In testing" }
         },
         {

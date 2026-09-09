@@ -48,3 +48,23 @@ export const SPAWNED_PROXIES = {
   // check can assert it ships.
   piMcpExtension: resolveProxy("drivers/pi-mcp-extension"),
 } as const;
+
+/** A helper the server spawns that is NOT a JavaScript module — resolved
+ * through the same anchor and for the same reason.  The packaged copy sits
+ * beside the bundled server (scripts/bundle-server.mjs puts it there); the
+ * dev tree reads it from the source directory where it is edited, which is
+ * one level above SERVER_ROOT.  Never write that `".."` inside a nested
+ * module: see the header. */
+export function resolveBundledScript(packagedName: string, ...devSegments: string[]): string {
+  const packaged = join(SERVER_ROOT, packagedName);
+  return existsSync(packaged) ? packaged : join(SERVER_ROOT, "..", ...devSegments);
+}
+
+/** Non-JS scripts the server spawns.  Same single source of truth as
+ * SPAWNED_PROXIES so a packaged-layout check can assert each one ships. */
+export const SPAWNED_SCRIPTS = {
+  /** ACP stdio bridge for the DeepSeek Harness.  The `dsh` CLI has no `acp`
+   * subcommand of its own, so this Python script is the engine's only real
+   * spawn target.  Stdlib only — any system python3 runs it. */
+  dshAcp: resolveBundledScript("dsh-acp.py", "tools", "dsh-acp", "dsh-acp.py"),
+} as const;

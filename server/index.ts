@@ -65,8 +65,7 @@ import {
   selectTurnFallback,
   sliceIsShortProviderError,
   turnHitQuotaOrCap,
-  turnProducedAssistantOutput,
-} from "./model-fallback.ts";
+  turnProducedAssistantOutput, AUTO_FALLBACK_PRIORITY } from "./model-fallback.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -2051,7 +2050,7 @@ bus.subscribe((event: RuntimeEvent) => {
  * still runs it through selectTurnFallback, so the produced / quota /
  * stop-reason rules apply exactly as they do for a configured chain. */
 function autoFallbackChain(currentInstanceId: string): ModelSelection[] {
-  const priority = ["claude", "antigravity", "gemini", "codex", "openaiCompat", "grok"];
+  const priority = AUTO_FALLBACK_PRIORITY;
   const candidates = registry
     .instances()
     .filter((inst) => inst.instanceId !== currentInstanceId && inst.enabled !== false && Boolean(inst.models?.default))

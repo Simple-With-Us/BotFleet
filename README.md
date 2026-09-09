@@ -31,7 +31,7 @@ These are features this fork layered on after OpenMausBot.  **All of them are in
 
 ### Engines, failover, and telemetry
 
-- **Native DeepSeek driver** — DeepSeek models join Claude, Codex, Cursor, Grok, Gemini, and Antigravity via a native driver plus the dsh bot, with in-app rates and token pricing.
+- **DeepSeek engines** — DeepSeek models join Claude, Codex, Cursor, Grok, Gemini, and Antigravity through two ACP drivers: the DeepSeek Harness (`dsh`, spawned through a bundled ACP bridge) and the DeepSeek Code CLI.  Both come with in-app rates and token pricing.  There is no native DeepSeek HTTP driver.
 - **Gemini and Antigravity engines** — including Gemini 3.8 Flash, full tool loading, and local computer dispatch on those harnesses after opt-in.
 - **Multi-tier model fallbacks** — first, second, and third choice models per bot.  Quota, usage-cap, and session-limit chips fail over to the saved chain automatically, including after tools already ran and in rooms.  Other streamed error paths are still in review.
 - **Elapsed turn timer** — a live timer on the in-progress turn, plus duration on completed activity runs.

@@ -498,7 +498,10 @@ function readDeepSeekModelCatalog(env: Record<string, string | undefined>): Mode
 
 const support: AcpSupport = {
   driverKind: "deepseekAgent",
-  displayName: "DeepSeek",
+  // "DeepSeek" alone sat next to "DeepSeek Harness" in the picker with
+  // nothing to tell them apart — same vendor mark, same first word, two very
+  // different CLIs.  Name the CLI each one actually spawns.
+  displayName: "DeepSeek Code",
   // Aliases from the CLI's own catalog (~/.deepseek-code/config.toml
   // [models."deepseek-code/…"] — `deepseek provider list` reports the same four).
   models: STATIC_DEEPSEEK_MODELS,

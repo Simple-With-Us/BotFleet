@@ -38,6 +38,7 @@ function knownDirs(): string[] {
     join(home, ".opencode", "bin"), // opencode installer
     join(home, ".claude", "local"), // claude "local install"
     join(home, "apps", "dsh-runtime"), // deepseek harness runtime
+    join(home, "apps", "dsh-runtime", "node_modules", ".bin"), // …where its `dsh` shim actually is
     "/opt/homebrew/bin", // brew, Apple silicon
     "/usr/local/bin", // brew Intel / classic installs
     join(home, ".volta", "bin"),
