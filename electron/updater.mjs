@@ -8,7 +8,7 @@
 // the packaged app ships no node_modules.
 import { app, ipcMain } from "electron";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -16,8 +16,8 @@ import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
 import {
   AUTO_CHECK_THROTTLE_MS,
   macAppFingerprint,
-  nextAutoUpdateRecord,
   readAutoUpdateConfig,
+  recordAutomaticCheck,
   shouldRunAutomaticCheck,
 } from "./updater-throttle.mjs";
 
@@ -81,23 +81,16 @@ function configPath() {
 function recordSuccessfulAutoCheck() {
   if (!autoUpdateEnabled) return;
   // PATCH the same file the harness reads so the next tick and the next
-  // launch agree.  Read-modify-write, not a full config save: this module
-  // never touches anything other than `autoUpdate`.
+  // launch agree.  The actual read-modify-write lives in
+  // updater-throttle.mjs's `recordAutomaticCheck` so it can be unit-tested
+  // against a real temp file without an `electron` runtime (this module
+  // imports `electron` at the top, which plain `node --test` can't load).
+  //
+  // Previously this stopped at `appendFileSync(path, "")` — a no-op touch
+  // that never wrote `disk` back, so `lastCheckMs` never reached disk and
+  // the 6-hour throttle never actually engaged.
   try {
-    const path = configPath();
-    let disk = {};
-    try {
-      disk = JSON.parse(readFileSync(path, "utf8"));
-    } catch {
-      /* first write */
-    }
-    const fingerprint = macAppFingerprint();
-    disk.autoUpdate = nextAutoUpdateRecord(disk.autoUpdate ?? {}, { fingerprint });
-    // preserve the live enabled state — the helper does not know about it
-    disk.autoUpdate.enabled = autoUpdateEnabled;
-    const directory = join(path, "..");
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    appendFileSync(path, ""); // touch if missing
+    recordAutomaticCheck(configPath(), { enabled: autoUpdateEnabled, fingerprint: macAppFingerprint() });
   } catch {
     /* never let the check fail because we could not persist */
   }
@@ -112,7 +105,12 @@ export function registerUpdaterIpc() {
   ipcMain.handle("update:install", () => updaterCoordinator?.install());
   ipcMain.handle("update:set-enabled", (_event, enabled) => {
     autoUpdateEnabled = Boolean(enabled);
-    if (autoUpdateEnabled) void updaterCoordinator?.check();
+    // manual=true: the coordinator only reports a failure back to the
+    // renderer (vs. silently going idle) when the caller is manual. Flipping
+    // the toggle on is a user-initiated action just like pressing "Check for
+    // updates", so it should surface an error the same way instead of
+    // swallowing it.
+    if (autoUpdateEnabled) void updaterCoordinator?.check(true);
   });
   ipcMain.handle("update:local", () => {
     const script = localUpdateScript();
@@ -190,34 +188,53 @@ export function startUpdater(mainWindow) {
   updaterCoordinator = createUpdaterCoordinator(autoUpdater, setState);
 
   // Wrap the coordinator so a successful check is what actually counts
-  // as "last checked".  The coordinator's `check` returns the in-flight
-  // promise; we hook .then so the timestamp and fingerprint get
-  // persisted only on the success path.  Both manual and automatic
-  // checks persist a timestamp — only the throttle consults it, and the
-  // throttle ignores manual checks, so recording both is correct and
-  // lets the next auto-tick honour the full window.
+  // as "last checked".  The coordinator's `check` resolves to `{ ok }`
+  // rather than throwing, so a rejected `checkForUpdates()` (network
+  // hiccup, update-service outage) resolves `ok: false` and must not be
+  // recorded — recording it would throttle every automatic retry for the
+  // next 6 hours over one transient failure.  Only the timer-driven ticks
+  // route through here; the manual "Check for updates" button and the
+  // set-enabled handler call the coordinator directly and do not persist
+  // a timestamp themselves.
   const trackedCheck = (manual) => {
     const promise = updaterCoordinator?.check(manual);
     if (promise && typeof promise.then === "function") {
-      promise.then(() => recordSuccessfulAutoCheck()).catch(() => {});
+      promise.then((result) => {
+        if (result?.ok !== false) recordSuccessfulAutoCheck();
+      }).catch(() => {});
     }
     return promise;
   };
 
+  // Re-read the persisted record and compare it against the fingerprint of
+  // the bundle running *right now*.  A mismatch means an out-of-band
+  // reinstall landed since the last recorded check — new information the
+  // 6-hour window has not seen — so it bypasses the throttle the same way
+  // "never checked" does.
+  const dueForAutomaticCheck = () => {
+    const record = readAutoUpdateConfig(configPath());
+    return shouldRunAutomaticCheck({
+      enabled: autoUpdateEnabled,
+      lastCheckMs: record.lastCheckMs,
+      lastAppFingerprint: record.lastAppFingerprint,
+      currentFingerprint: macAppFingerprint(),
+    });
+  };
+
   // First automatic check ~15s after launch (let the app settle), then
   // hourly — both silent on failure.  Every tick consults
-  // `shouldRunAutomaticCheck`, which combines the toggle and the
-  // 6-hour throttle into a single decision.
+  // `shouldRunAutomaticCheck`, which combines the toggle, the 6-hour
+  // throttle, and the bundle-fingerprint bypass into a single decision.
   // Manual "Check for updates" always works once the coordinator exists.
   // Timers stay armed so enabling the setting later takes effect without
   // a restart; they no-op while autoUpdateEnabled is false.
   setTimeout(() => {
-    if (shouldRunAutomaticCheck({ enabled: autoUpdateEnabled, lastCheckMs: readAutoUpdateConfig(configPath()).lastCheckMs })) {
+    if (dueForAutomaticCheck()) {
       void trackedCheck(false);
     }
   }, FIRST_CHECK_DELAY_MS).unref?.();
   setInterval(() => {
-    if (shouldRunAutomaticCheck({ enabled: autoUpdateEnabled, lastCheckMs: readAutoUpdateConfig(configPath()).lastCheckMs })) {
+    if (dueForAutomaticCheck()) {
       void trackedCheck(false);
     }
   }, POLL_INTERVAL_MS).unref?.();

@@ -74,9 +74,20 @@ export function createUpdaterCoordinator(updater, setState) {
     const operation = { manual, supersededByDownload: Boolean(downloadOperation), failed: false, promise: null };
     checkOperation = operation;
     try {
+      // Resolve with an outcome object rather than `undefined` either way:
+      // a rejected `checkForUpdates()` used to be swallowed into a plain
+      // resolved promise here, so a caller awaiting `check()` (updater.mjs's
+      // `trackedCheck`) could not tell a failed check from a successful one
+      // and recorded a transient network failure as "last checked just now"
+      // -- suppressing every automatic retry for the next 6 hours. A check
+      // preempted by an in-flight download is not itself a failure (the
+      // download owns the outcome), so it still resolves `ok: true`.
       operation.promise = Promise.resolve(updater.checkForUpdates())
+        .then(() => ({ ok: true }))
         .catch((error) => {
-          if (!operation.supersededByDownload) handleRejectedOperation(operation.manual, error);
+          if (operation.supersededByDownload) return { ok: true };
+          handleRejectedOperation(operation.manual, error);
+          return { ok: false };
         })
         .finally(() => {
           if (checkOperation === operation) checkOperation = null;
@@ -84,7 +95,7 @@ export function createUpdaterCoordinator(updater, setState) {
     } catch (error) {
       if (!operation.supersededByDownload) handleRejectedOperation(operation.manual, error);
       checkOperation = null;
-      operation.promise = Promise.resolve();
+      operation.promise = Promise.resolve({ ok: operation.supersededByDownload });
     }
     return operation.promise;
   }
