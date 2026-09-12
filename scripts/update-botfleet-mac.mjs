@@ -320,6 +320,9 @@ async function strictRuntimePreflight(config, expectedBuild) {
   if (typeof runtime.sourceCommit !== "string" || !/^[a-f0-9]{40}$/.test(runtime.sourceCommit)) {
     return { safe: false, reason: "Authenticated runtime did not report an exact source commit" };
   }
+  if (runtime.sourceDirty !== false) {
+    return { safe: false, reason: "Authenticated runtime reports a dirty or unknown source checkout" };
+  }
   if (expectedBuild && runtime.sourceCommit !== expectedBuild.targetCommit) {
     return { safe: false, reason: `Harness is running ${runtime.sourceCommit.slice(0, 12)}, expected ${expectedBuild.targetCommit.slice(0, 12)}` };
   }
