@@ -444,6 +444,22 @@ async function processCommand(pid) {
   return result.code === 0 ? result.stdout.trim() : "";
 }
 
+async function processCwd(pid) {
+  const result = await run("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], { allowFailure: true });
+  return result.code === 0 ? result.stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) || "" : "";
+}
+
+export function isExpectedBotFleetProcess(command, cwd, config) {
+  const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
+  if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
+    return true;
+  }
+  const executable = command.trim().split(/\s+/)[0] || "";
+  const isNode = ["node", "nodejs"].includes(basename(executable));
+  const serverArgument = command.split(/\s+/).some((argument) => argument === "server/index.ts" || argument === join(config.checkout, "server/index.ts"));
+  return isNode && serverArgument && cwd === config.checkout;
+}
+
 async function waitForExit(pids, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let remaining = pids.filter(processIsAlive);
@@ -458,9 +474,9 @@ async function terminateVerified(pids, previous, config) {
   let remaining = await waitForExit([...new Set(pids)], config.gracefulExitMs);
   for (const pid of remaining) {
     const command = await processCommand(pid);
-    const verified = (previous.processCommands?.[pid] && previous.processCommands[pid] === command) ||
-      command.startsWith(join(config.appPath, "Contents/")) ||
-      command.includes(`${config.checkout}/`);
+    const cwd = await processCwd(pid);
+    const verified = (previous.processCommands?.[pid] && previous.processCommands[pid] === command &&
+        previous.processCwds?.[pid] === cwd) || isExpectedBotFleetProcess(command, cwd, config);
     if (!verified) throw new Error(`Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`);
     process.kill(pid, "SIGTERM");
   }
@@ -698,7 +714,16 @@ function createOperations(config) {
       const holders = await sqliteHolders(config.dataDirectory);
       const runtimePids = [...new Set([...(lastPreflight?.pids || []), lastPreflight?.pid, ...holders].filter(Number.isInteger))];
       const processCommands = {};
-      for (const pid of new Set([...runtimePids, ...appPids])) processCommands[pid] = await processCommand(pid);
+      const processCwds = {};
+      for (const pid of new Set([...runtimePids, ...appPids])) {
+        const command = await processCommand(pid);
+        const cwd = await processCwd(pid);
+        if (!isExpectedBotFleetProcess(command, cwd, config)) {
+          throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
+        }
+        processCommands[pid] = command;
+        processCwds[pid] = cwd;
+      }
       return {
         checkoutCommit,
         installedIdentity,
@@ -708,6 +733,7 @@ function createOperations(config) {
         runtimePids,
         appPids,
         processCommands,
+        processCwds,
         rollbackPath: join(dirname(config.appPath), `.BotFleet.rollback-${Date.now()}-${checkoutCommit.slice(0, 12)}.app`),
         candidatePath: join(dirname(config.appPath), `.BotFleet.update-${process.pid}-${Date.now()}.app`),
         rollbackDependencies: join(dirname(config.checkout), `.botfleet-server.node_modules.rollback-${Date.now()}-${checkoutCommit.slice(0, 12)}`),

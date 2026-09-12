@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { loadPrepared, parseArguments, swapPreparedFiles } from "./update-botfleet-mac.mjs";
+import { isExpectedBotFleetProcess, loadPrepared, parseArguments, swapPreparedFiles } from "./update-botfleet-mac.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
 
@@ -73,6 +73,21 @@ test("production updater has no force-kill or unrelated desktop-process cleanup"
   assert.match(source, /runtime\.safeToRestart !== true/);
   assert.match(source, /runtime\.sourceCommit !== expectedBuild\.targetCommit/);
   assert.match(source, /Database ownership is ambiguous/);
+});
+
+test("process verification binds relative server commands to the live checkout cwd", () => {
+  const config = { appPath: "/Applications/BotFleet.app", checkout: "/Users/test/apps/botfleet-server" };
+  assert.equal(
+    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
+    true,
+  );
+  assert.equal(
+    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
+    false,
+  );
+  assert.equal(isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
+  assert.equal(isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
+  assert.equal(isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
 });
 
 test("packaged identity comes from the build output rather than an ambient label", async () => {
