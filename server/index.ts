@@ -40,6 +40,8 @@ import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, is
 import { openBotFleetDesktop } from "./desktop-open.ts";
 import { IdempotencyCache } from "./idempotency.ts";
 import { initializeHarnessOwnership, harnessOwnerProof } from "../electron/harness-ownership.mjs";
+import { authorizedRuntime } from "../electron/runtime-identity.mjs";
+import { runtimeBuildIdentity, runtimeReadiness } from "./runtime-identity.ts";
 import {
   avatarGenerationRequestSchema,
   avatarGenerationStateMatches,
@@ -161,8 +163,8 @@ import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type C
 import { searchMessages } from "./message-db.ts";
 import { promptWithReply, transcriptText } from "./replies.ts";
 import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
-import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
-import { cancelRoomRounds, drainRoomRounds, queueRoomRound } from "./room-queue.ts";
+import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
+import { cancelRoomRounds, drainRoomRounds, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
 import { formatListenInUse, isListenInUse, listenErrorDisposition } from "./harness-ports.ts";
@@ -7937,6 +7939,31 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (method === "GET" && path === "/api/runtime") {
+      if (!isLoopbackAddress(req.socket.remoteAddress) || !authorizedRuntime(harnessOwner, req.headers.authorization)) {
+        return json(res, 401, { error: "unauthorized" });
+      }
+      const readiness = runtimeReadiness({
+        turns: store.bots.filter((bot) => bot.busy).length,
+        completions: completionFolds.size,
+        groupOperations: groupTurnOperations.size,
+        queuedSends: queuedMessageCount(),
+        queuedRooms: _queuedRoomCount(),
+        delegations: pendingDelegationSnapshot().length,
+        connectors: pendingConnectorResumes.size,
+        secrets: pendingSecretResumes.size,
+        vps: activeVpsThreads.size,
+        localVm: localVmActiveThreads.size + localVmLifecycleBusy.size,
+        localVmChanges: Number(localVmImageBusy) + Number(localVmProvisionBusy) + Number(localVmModeChangeBusy),
+        restores: checkpointRestoreLeases.size,
+        reloads: pendingProviderReloads + Number(providerConfigBusy),
+        routineRuns: routines?.listRuns().filter((run) => ["queued", "running", "waiting"].includes(run.status)).length ?? 0,
+      });
+      return json(res, 200, {
+        ...runtimeBuildIdentity, pid: process.pid, ...readiness,
+        dataOwner: { pid: harnessOwner.pid, port: harnessOwner.port },
+      });
+    }
     // identity handshake for the packaged app's port fallback: the forked
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)

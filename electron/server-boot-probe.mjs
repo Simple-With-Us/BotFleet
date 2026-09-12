@@ -22,6 +22,7 @@
 
 import { randomBytes } from "node:crypto";
 import { verifyHarnessOwnerProof } from "./harness-ownership.mjs";
+import { buildCompatibility } from "./runtime-identity.mjs";
 
 export const BOOT_PROBE_INTERVAL_MS = 500;
 
@@ -115,25 +116,27 @@ export const HARNESS_PROBE_TIMEOUT_MS = 2_000;
 export const ATTACH_SETTLE_MS = 1_500;
 
 /**
- * @param {{ port: number, owner?: import("./harness-ownership.mjs").HarnessOwner | null, timeoutMs?: number, fetchImpl?: typeof fetch }} options
+ * @param {{ port: number, owner?: import("./harness-ownership.mjs").HarnessOwner | null, expectedBuild?: import("./runtime-identity.mjs").BuildIdentity, timeoutMs?: number, fetchImpl?: typeof fetch }} options
  * @returns {Promise<
  *   | { kind: "none" }
  *   | { kind: "foreign" }
  *   | { kind: "unavailable" }
- *   | { kind: "botfleet", pid: number, static: boolean }
+ *   | { kind: "botfleet", pid: number, static: boolean, sourceCommit?: string, apiVersion?: number }
  * >}
  */
 export async function probeHarness({
   port,
   owner = null,
+  expectedBuild,
   timeoutMs = HARNESS_PROBE_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
 }) {
   let res;
   const challenge = owner ? randomBytes(32).toString("hex") : undefined;
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
     res = await fetchImpl(`http://127.0.0.1:${port}/api/health`, {
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
       ...(challenge ? { headers: { "x-botfleet-owner-challenge": challenge } } : {}),
       redirect: "error",
     });
@@ -148,6 +151,28 @@ export async function probeHarness({
     return { kind: "unavailable" };
   }
   if (res.ok && body?.app === "botfleet" && Number.isInteger(body.pid)) {
+    if (expectedBuild) {
+      // Never send the private nonce until the health challenge proved the
+      // recipient owns this data root.  Redirects cannot forward credentials.
+      if (!owner) return { kind: "unavailable" };
+      let runtime;
+      try {
+        const response = await fetchImpl(`http://127.0.0.1:${port}/api/runtime`, {
+          signal, redirect: "error", headers: { authorization: `Bearer ${owner.nonce}` },
+        });
+        if (!response.ok) return { kind: "unavailable" };
+        runtime = await response.json();
+      } catch { return { kind: "unavailable" }; }
+      if (runtime?.pid !== owner.pid || runtime?.dataOwner?.pid !== owner.pid ||
+          runtime?.dataOwner?.port !== port) return { kind: "unavailable" };
+      const compatibility = buildCompatibility(expectedBuild, runtime);
+      if (compatibility === "incompatible") return { kind: "unavailable" };
+      return {
+        kind: "botfleet", pid: body.pid,
+        static: Boolean(body.static) && compatibility === "matching",
+        sourceCommit: runtime.sourceCommit, apiVersion: runtime.apiVersion,
+      };
+    }
     return { kind: "botfleet", pid: body.pid, static: Boolean(body.static) };
   }
   return { kind: "foreign" };
@@ -222,7 +247,7 @@ export async function resolvePackagedServer({
         }
       }
       if (seen.kind === "botfleet") {
-        log(`attaching to the BotFleet harness already on port ${port} (pid ${seen.pid}, static=${seen.static})`);
+        log(`attaching to the BotFleet harness already on port ${port} (pid ${seen.pid}, build=${seen.sourceCommit ?? "unknown"}, api=${seen.apiVersion ?? "unknown"}, UI=${seen.static ? "attached" : "bundled"})`);
         return { mode: "attached", port, pid: seen.pid, static: seen.static };
       }
       if (seen.kind === "foreign") {

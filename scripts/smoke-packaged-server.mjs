@@ -11,7 +11,7 @@
 // test passes on a build that would be dead in the field — which is precisely
 // how the bug escaped. The copy is the whole point; do not "simplify" it away.
 import { execFile, spawn } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,6 +72,27 @@ while (Date.now() < deadline) {
     /* not up yet */
   }
   await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+// Authenticated identity must describe the copied package, and the public
+// health response must not disclose the private owner nonce or build data.
+if (listening) {
+  const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+  const expected = JSON.parse(readFileSync(join(staging, "server", "build-identity.json"), "utf8"));
+  const publicHealth = await (await fetch(`http://127.0.0.1:${port}/api/health`)).json();
+  const denied = await fetch(`http://127.0.0.1:${port}/api/runtime`);
+  const diagnostic = await fetch(`http://127.0.0.1:${port}/api/runtime`, {
+    headers: { authorization: `Bearer ${owner.nonce}` },
+  });
+  const actual = await diagnostic.json();
+  if (denied.status !== 401 || !diagnostic.ok || actual.pid !== child.pid ||
+      actual.sourceCommit !== expected.sourceCommit || actual.apiVersion !== expected.apiVersion ||
+      actual.dataOwner?.pid !== child.pid || actual.dataOwner?.port !== port ||
+      typeof actual.safeToRestart !== "boolean" || JSON.stringify(publicHealth).includes(owner.nonce) ||
+      publicHealth.sourceCommit !== undefined || JSON.stringify(actual).includes(owner.nonce)) {
+    cleanup();
+    throw new Error("Packaged runtime identity, authentication, or redaction contract failed");
+  }
 }
 
 // Serving /api/health is necessary but nowhere near sufficient. Bundling

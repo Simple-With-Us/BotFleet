@@ -22,6 +22,7 @@ import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./di
 import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity, probeHarness, resolvePackagedServer } from "./server-boot-probe.mjs";
+import { readPackagedBuildIdentity } from "./runtime-identity.mjs";
 import { readHarnessOwner } from "./harness-ownership.mjs";
 import { startUiShim } from "./attached-ui-shim.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
@@ -808,6 +809,13 @@ async function startServerOn(port) {
 }
 
 async function startServerPackaged() {
+  let expectedBuild;
+  try { expectedBuild = readPackagedBuildIdentity(path.join(process.resourcesPath, "server")); }
+  catch {
+    slog("packaged build identity is missing or invalid; reinstall the app before attaching");
+    serverStartConflictOnly = false;
+    return false;
+  }
   // Attach-or-spawn: a proven data-root owner is joined, a foreign owner
   // is skipped, and an unambiguous free port gets our own child.  Two
   // passes: a quit-and-reopen relaunch can race the dying instance's server
@@ -815,7 +823,7 @@ async function startServerPackaged() {
   const result = await resolvePackagedServer({
     ports: [8799, 18799, 28799],
     owner: () => readHarnessOwner(process.env.OMB_DATA_DIR || path.join(app.getPath("home"), ".botfleet")),
-    probe: (port, owner) => probeHarness({ port, owner }),
+    probe: (port, owner) => probeHarness({ port, owner, expectedBuild }),
     spawn: startServerOn,
     log: slog,
   });

@@ -120,6 +120,11 @@ export function cancelSteeredMessage(threadId: string, messageId: string): boole
   return true;
 }
 
+/** Count pending sends without exposing message text to diagnostics. */
+export function queuedMessageCount(): number {
+  return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);
+}
+
 /** Test helper: how many messages remain queued for a thread. */
 export function _queuedCount(threadId: string): number {
   return queues.get(threadId)?.items.length ?? 0;
