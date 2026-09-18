@@ -138,7 +138,7 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
   let acpDump: string;
   let dockerLog: string;
 
-  type ApiBody = Record<string, string | boolean | { instanceId: string; model: string } | { sshAlias: string }>;
+  type ApiBody = Record<string, unknown>;
 
   const api = async (method: string, path: string, body?: ApiBody): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
@@ -308,6 +308,71 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
       const released = await api("PUT", "/api/config", { vps: { sshAlias: "other-vps" } });
       expect(released.status).toBe(200);
       expect((await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } })).status).toBe(200);
+    },
+    60_000,
+  );
+
+  it(
+    "runOn=cloud + cloudBackend=vps dispatches the bot's engine, not boxAgent",
+    async () => {
+      // This fleet has no boxAgent instance.  The pre-fix startTurn would
+      // have failed with "configure Box in App Settings" / vpsDriverError.
+      // After the fix the bot's grokAgent runs and the VPS computer mounts.
+      expect((await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } })).status).toBe(200);
+      writeFileSync(gateFile, "open");
+
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        name: "VPS Housekeeper",
+        computers: ["cloud"],
+        cloudBackend: "vps",
+        modelSelection: { instanceId: "vps", model: "fake-model" },
+      })).status).toBe(200);
+
+      const created = await api("POST", "/api/routines", {
+        name: "Cloud VPS eyes",
+        prompt: "Look around the self-hosted desktop",
+        botId: bot.id,
+        runOn: "cloud",
+        enabled: false,
+        schedule: { type: "once", at: Date.now() + 60_000 },
+      });
+      expect(created.status).toBe(201);
+      const launched = await api("POST", `/api/routines/${created.body.routine.id}/run`);
+      expect(launched.status).toBe(201);
+
+      let snapshot: any;
+      await until(async () => {
+        snapshot = await botById(bot.id);
+        return (
+          snapshot?.busy === false &&
+          snapshot.messages.some((m: any) => m.kind === "text" && m.text?.startsWith("echo: "))
+        );
+      }, "the cloud VPS routine echo");
+
+      const echo = snapshot.messages.find((m: any) => m.kind === "text" && m.text?.startsWith("echo: ")).text;
+      expect(echo).toContain("self-hosted remote Linux computer");
+      expect(echo).not.toMatch(/runs its agent on Box|configure Box in App Settings/i);
+
+      const receipts = (await api("GET", "/api/routines")).body.runs as Array<{
+        routineId: string;
+        status: string;
+        error?: string;
+      }>;
+      const receipt = receipts.find((run) => run.routineId === created.body.routine.id);
+      expect(receipt, "cloud VPS routine never settled").toMatchObject({ status: "completed" });
+      expect(receipt?.error ?? "").not.toMatch(/Box|boxAgent/i);
+
+      const mcpServers = JSON.parse(readFileSync(`${acpDump}.mcp.json`, "utf8")) as Array<{
+        name: string;
+        args?: string[];
+      }>;
+      const computer = mcpServers.find((s) => s.name === "computer");
+      expect(computer, "no computer MCP server reached the bot's engine").toBeTruthy();
+      expect((computer?.args ?? []).some((a) => a.includes("vps-container-mcp"))).toBe(true);
+
+      await api("DELETE", `/api/routines/${created.body.routine.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
     },
     60_000,
   );

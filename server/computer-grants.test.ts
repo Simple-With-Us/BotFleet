@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   computerLabel,
   resolveCloudBackend,
+  cloudRunUsesBoxAgent,
   autoDestinations,
   resolveGrants,
   computerSystemPrompt,
@@ -303,6 +304,23 @@ describe("workspace defaults", () => {
     // Backend choice is solely resolveCloudBackend; runOn only grants "cloud".
     expect(resolveCloudBackend("vps", undefined)).toBe("vps");
     expect(resolveCloudBackend(undefined, "vps")).toBe("vps");
+  });
+
+  it("uses Box's Computer engine only when runOn=cloud and the resolved backend is Box", () => {
+    // startTurn / interrupt / boxToken pending previously keyed only on
+    // runOn==="cloud", which forced boxAgent onto a VPS Housekeeper and
+    // then died in vpsDriverError.  The same predicate now decides the
+    // engine AND whether a missing Box API key can block the turn.
+    expect(cloudRunUsesBoxAgent("cloud", "vps")).toBe(false);
+    expect(cloudRunUsesBoxAgent("cloud", "vps", "box")).toBe(false);
+    expect(cloudRunUsesBoxAgent("cloud", "box")).toBe(true);
+    expect(cloudRunUsesBoxAgent("cloud", "box", "vps")).toBe(true);
+    expect(cloudRunUsesBoxAgent("cloud", undefined)).toBe(true);
+    expect(cloudRunUsesBoxAgent("cloud", undefined, "box")).toBe(true);
+    expect(cloudRunUsesBoxAgent("cloud", undefined, "vps")).toBe(false);
+    expect(cloudRunUsesBoxAgent("maus", "box")).toBe(false);
+    expect(cloudRunUsesBoxAgent("maus", "vps")).toBe(false);
+    expect(cloudRunUsesBoxAgent(undefined, "box")).toBe(false);
   });
 });
 

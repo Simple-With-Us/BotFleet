@@ -4027,6 +4027,98 @@ describe("harness HTTP API", () => {
     expect(invalid.status).toBe(400);
   });
 
+  it("runOn=cloud keeps the bot's engine on a VPS and still uses Box's Computer engine on Box", async () => {
+    // Eyes a3d5f16e failed with vpsDriverError(boxAgent) because startTurn
+    // forced boxAgent whenever runOn==="cloud".  A VPS cloud routine must
+    // keep the bot's modelSelection; Box (or unset → box) still uses
+    // boxAgent.  This fleet has no Computer engine, so the Box path fails
+    // at runner lookup; the VPS path reaches provision and fails on the
+    // missing SSH alias — never on a Box API key.
+    const claude = (await api("GET", "/api/instances")).body.instances
+      .find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    expect(claude?.models?.default).toBeTruthy();
+    expect((await api("PUT", "/api/config", { vps: { sshAlias: "" } })).status).toBe(200);
+
+    const vpsBot = (await api("POST", "/api/bots")).body.bot;
+    const boxBot = (await api("POST", "/api/bots")).body.bot;
+    const unsetBot = (await api("POST", "/api/bots")).body.bot;
+    let vpsRoutineId = "";
+    let boxRoutineId = "";
+    let unsetRoutineId = "";
+    try {
+      expect((await api("PATCH", `/api/bots/${vpsBot.id}`, {
+        computers: ["cloud"],
+        cloudBackend: "vps",
+        modelSelection: { instanceId: "claude", model: claude.models.default },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${boxBot.id}`, {
+        computers: ["cloud"],
+        cloudBackend: "box",
+        modelSelection: { instanceId: "claude", model: claude.models.default },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${unsetBot.id}`, {
+        computers: ["cloud"],
+        modelSelection: { instanceId: "claude", model: claude.models.default },
+      })).status).toBe(200);
+      expect(unsetBot.cloudBackend).toBeUndefined();
+
+      const makeRoutine = async (botId: string, name: string) => {
+        const created = await api("POST", "/api/routines", {
+          name,
+          prompt: "Look around the cloud computer",
+          botId,
+          runOn: "cloud",
+          enabled: false,
+          schedule: { type: "once", at: Date.now() + 60_000 },
+        });
+        expect(created.status).toBe(201);
+        return created.body.routine.id as string;
+      };
+      vpsRoutineId = await makeRoutine(vpsBot.id, "VPS cloud eyes");
+      boxRoutineId = await makeRoutine(boxBot.id, "Box cloud eyes");
+      unsetRoutineId = await makeRoutine(unsetBot.id, "Unset cloud eyes");
+
+      const launched = await Promise.all([
+        api("POST", `/api/routines/${vpsRoutineId}/run`),
+        api("POST", `/api/routines/${boxRoutineId}/run`),
+        api("POST", `/api/routines/${unsetRoutineId}/run`),
+      ]);
+      expect(launched.map((item) => item.status)).toEqual([201, 201, 201]);
+
+      const runByRoutine = async (routineId: string) =>
+        (await api("GET", "/api/routines")).body.runs.find((run: { routineId: string }) => run.routineId === routineId) as
+          | { status: string; error?: string }
+          | undefined;
+
+      await expect.poll(async () => {
+        const vps = await runByRoutine(vpsRoutineId);
+        const box = await runByRoutine(boxRoutineId);
+        const unset = await runByRoutine(unsetRoutineId);
+        return [vps?.status, box?.status, unset?.status];
+      }, { timeout: 15_000 }).toEqual(["failed", "failed", "failed"]);
+
+      const vpsError = String((await runByRoutine(vpsRoutineId))?.error ?? "");
+      const boxError = String((await runByRoutine(boxRoutineId))?.error ?? "");
+      const unsetError = String((await runByRoutine(unsetRoutineId))?.error ?? "");
+      expect(vpsError).toMatch(/VPS/i);
+      expect(vpsError).not.toMatch(/runs its agent on Box|configure Box|Cloud VM runner|Box API key|encrypted credential/i);
+      expect(boxError).toMatch(/configure Box|Cloud VM runner/i);
+      expect(boxError).not.toMatch(/self-hosted VPS|VPS is not configured/i);
+      expect(unsetError).toMatch(/configure Box|Cloud VM runner/i);
+      expect(unsetError).not.toMatch(/self-hosted VPS|VPS is not configured/i);
+    } finally {
+      if (vpsRoutineId) await api("DELETE", `/api/routines/${vpsRoutineId}`);
+      if (boxRoutineId) await api("DELETE", `/api/routines/${boxRoutineId}`);
+      if (unsetRoutineId) await api("DELETE", `/api/routines/${unsetRoutineId}`);
+      await api("POST", `/api/bots/${vpsBot.id}/interrupt`);
+      await api("POST", `/api/bots/${boxBot.id}/interrupt`);
+      await api("POST", `/api/bots/${unsetBot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${vpsBot.id}`);
+      await api("DELETE", `/api/bots/${boxBot.id}`);
+      await api("DELETE", `/api/bots/${unsetBot.id}`);
+    }
+  }, 30_000);
+
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
     const oldKey = await api("PUT", "/api/config", { composio: { apiKey: "old_key" } });
     expect(oldKey.status).toBe(400);

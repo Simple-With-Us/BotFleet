@@ -106,6 +106,7 @@ import {
 import {
   applyComputerMounts,
   autoDestinations,
+  cloudRunUsesBoxAgent,
   computerSystemPrompt,
   resolveCloudBackend,
   resolveGrants,
@@ -2858,6 +2859,25 @@ async function finalScreenFrame(botId: string): Promise<Frame | null> {
   return entry.last;
 }
 
+function usesBoxCloudAgent(
+  bot: { cloudBackend?: "box" | "vps" },
+  runOn?: RoutineRunOn,
+): boolean {
+  return cloudRunUsesBoxAgent(runOn, bot.cloudBackend, cfg.botDefaults?.cloudBackend);
+}
+
+/** Box-hosted cloud routines run boxAgent.  A VPS cloud routine keeps the
+ *  bot's selected engine — the VPS is a computer mount, not a runner. */
+function cloudRunInstance(
+  bot: { cloudBackend?: "box" | "vps" },
+  runOn: RoutineRunOn | undefined,
+  selectionInstanceId: string,
+) {
+  return usesBoxCloudAgent(bot, runOn)
+    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
+    : registry.get(selectionInstanceId);
+}
+
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
 async function startTurn(
   botId: string,
@@ -2869,8 +2889,9 @@ async function startTurn(
     excludeMessageIds?: string[];
     /** Routines run in detached tasks; pin the destination for the whole turn. */
     threadId?: string;
-    /** Cloud routines run the whole agent inside the bot's Box VM instead
-     * of merely mounting that VM's computer tools on the MAUS's provider. */
+    /** Cloud routines grant the cloud computer.  Box still runs the
+     * Computer engine on that VM; a self-hosted VPS is a mount for the
+     * bot's own engine. */
     runOn?: RoutineRunOn;
     /** Lets the system prompt put externally supplied payloads behind an
      * explicit untrusted-data boundary without changing ordinary chat. */
@@ -2945,13 +2966,11 @@ async function startTurn(
     pendingCredentialFallback.delete(turnKey);
     stoppedTurns.delete(turnKey);
   }
-  const instance = opts?.runOn === "cloud"
-    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-    : registry.get(selection.instanceId);
+  const instance = cloudRunInstance(bot, opts?.runOn, selection.instanceId);
   if (!instance) {
     throw Object.assign(
       new Error(
-        opts?.runOn === "cloud"
+        usesBoxCloudAgent(bot, opts?.runOn)
           ? "the Cloud VM runner is unavailable — configure Box in App Settings"
           : `provider instance "${selection.instanceId}" is unavailable — pick another model in settings`,
       ),
@@ -2959,10 +2978,12 @@ async function startTurn(
     );
   }
   const instanceId = instance.instanceId;
-  const model = opts?.runOn === "cloud" ? instance.models.default : selection.model;
-  // a cloud routine borrows the instance default model, so it borrows no
-  // per-bot effort either
-  const effort = opts?.runOn === "cloud" ? undefined : selection.effort;
+  const boxCloud = usesBoxCloudAgent(bot, opts?.runOn);
+  const model = boxCloud ? instance.models.default : selection.model;
+  // Box-hosted cloud routines borrow the Computer engine's default model
+  // (and no per-bot effort).  A VPS cloud routine keeps the bot's own
+  // modelSelection — the VPS is a computer mount, not a different engine.
+  const effort = boxCloud ? undefined : selection.effort;
   // A selection can be persisted while its engine is offline. Re-check when
   // the engine returns so an old or unsupported value never reaches a CLI.
   if (effort && !instance.adapter.capabilities.effortLevels?.includes(effort)) {
@@ -3069,9 +3090,7 @@ async function startTurn(
         throw new Error("provider settings changed during turn setup");
       }
       if (providerReloadGeneration !== observedReloadGeneration) {
-        const liveInstance = opts?.runOn === "cloud"
-          ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-          : registry.get(instanceId);
+        const liveInstance = cloudRunInstance(bot, opts?.runOn, instanceId);
         // Every prompt/tool/integration decision below was derived from this
         // adapter's capabilities.  A replacement needs a fresh turn setup;
         // never send those stale inputs through a newly configured adapter.
@@ -3525,11 +3544,9 @@ routines = new RoutineManager({
     startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
-    const instance = runOn === "cloud"
-      ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-      : bot
-        ? registry.get(bot.modelSelection.instanceId)
-        : null;
+    const instance = bot
+      ? cloudRunInstance(bot, runOn, bot.modelSelection.instanceId)
+      : null;
     await instance?.adapter.interruptTurn(threadId);
   },
   // The harness's view of "still running": the bot is busy on this run's
@@ -5907,8 +5924,7 @@ function externalCredentialPending(instanceId: string): boolean {
   return !config.key && !entry.environment?.[keyEnv];
 }
 
-function fixedProviderCredentialPending(instanceId: string, runOn?: RoutineRunOn): boolean {
-  if (runOn === "cloud") return workspaceCredentialPending(cfg, "boxToken");
+function fixedProviderCredentialPending(instanceId: string): boolean {
   const driver = instanceConfigs(cfg)[instanceId]?.driver;
   // The two multi-instance drivers are gated on the RESERVED instance id as
   // well as the driver, exactly as injectedEnvironment() is: only that one
@@ -5936,10 +5952,8 @@ function turnExternalCredentialPending(
   instanceId: string,
   runOn?: RoutineRunOn,
 ): boolean {
-  if (externalCredentialPending(instanceId) || fixedProviderCredentialPending(instanceId, runOn)) return true;
-  const instance = runOn === "cloud"
-    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-    : registry.get(instanceId);
+  if (externalCredentialPending(instanceId) || fixedProviderCredentialPending(instanceId)) return true;
+  const instance = cloudRunInstance(bot, runOn, instanceId);
   if (bot.composio !== false && instance?.adapter.capabilities.composioMcp === true &&
       workspaceCredentialPending(cfg, "composioApiKey")) return true;
 

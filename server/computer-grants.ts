@@ -331,16 +331,32 @@ export function resolveGrants(
 
 /** Which cloud backend a bot uses.
  *
- * One accessor, because the answer is read in four places — the turn that
- * mounts the computer, the status endpoint, the desktop tunnel, and the
- * lifecycle actions. If the turn honored a workspace default and the status
- * endpoint did not, a bot would run on a VPS while its panel reported on a
- * hosted box it never touches. */
+ * One accessor, because the answer is read in the turn that mounts the
+ * computer, the engine chosen for a cloud routine, the status endpoint, the
+ * desktop tunnel, and the lifecycle actions. If the turn honored a workspace
+ * default and the status endpoint did not, a bot would run on a VPS while its
+ * panel reported on a hosted box it never touches. */
 export function resolveCloudBackend(
   botCloudBackend: "box" | "vps" | undefined,
   workspaceDefault?: "box" | "vps",
 ): "box" | "vps" {
   return botCloudBackend ?? workspaceDefault ?? "box";
+}
+
+/** Whether a cloud routine should run Box's Computer engine.
+ *
+ * `runOn=cloud` grants the cloud computer destination.  It does not mean
+ * "run boxAgent".  A self-hosted VPS is a mount for the bot's own engine;
+ * Box is the only backend whose agent lives on the remote VM.  startTurn,
+ * interrupt, and Box-token credential gates all share this predicate so a
+ * VPS Housekeeper cannot be forced onto boxAgent (which vpsDriverError
+ * then rejects). */
+export function cloudRunUsesBoxAgent(
+  runOn: string | undefined,
+  botCloudBackend: "box" | "vps" | undefined,
+  workspaceDefault?: "box" | "vps",
+): boolean {
+  return runOn === "cloud" && resolveCloudBackend(botCloudBackend, workspaceDefault) === "box";
 }
 
 
