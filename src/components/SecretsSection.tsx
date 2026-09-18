@@ -293,6 +293,7 @@ export function SecretsSection() {
                 <label className="text-[12px] font-medium text-ink-secondary" htmlFor="infisical-project-id">
                   Project ID
                 </label>
+                <p className="text-[11px] leading-snug text-ink-secondary">One Project for Now.</p>
                 <input
                   id="infisical-project-id"
                   type="text"

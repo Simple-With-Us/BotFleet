@@ -244,7 +244,13 @@ const TOOLS = [
 type ToolResult = { content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; isError?: boolean };
 const textResult = (text: string, isError = false): ToolResult => ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) });
 
-async function callTool(name: string, args: Json): Promise<ToolResult> {
+/** Exported so the HTTP driver lane (server/tools/phone.ts) can call the
+ *  same tool bodies in-process instead of spawning this file as a stdio MCP
+ *  server — the same shift the bash/file tools already made.  The
+ *  `process.argv[1]` guard below only starts the JSON-RPC loop when this
+ *  file is run as a standalone process, so importing this export elsewhere
+ *  never starts a second stdio listener. */
+export async function callTool(name: string, args: Json): Promise<ToolResult> {
   if (name === "status") {
     const adb = resolveAdbPath();
     const devices = adb ? await usbDevices() : [];

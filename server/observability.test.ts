@@ -106,7 +106,7 @@ afterEach(() => {
 });
 
 describe("observability status resolution", () => {
-  it("reports an unconfigured install as off rather than pretending", () => {
+  it("reports an unconfigured install as off rather than pretending", async () => {
     useConfig({});
     const status = observability.getStatus();
     expect(status).toMatchObject({
@@ -123,7 +123,7 @@ describe("observability status resolution", () => {
     );
   });
 
-  it("lets an environment DSN win over the stored one and says so", () => {
+  it("lets an environment DSN win over the stored one and says so", async () => {
     process.env.SENTRY_DSN = ENV_DSN;
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
@@ -133,7 +133,7 @@ describe("observability status resolution", () => {
     expect(observability.effectiveDsn()).toBe(ENV_DSN);
   });
 
-  it("uses the stored DSN when the environment has none", () => {
+  it("uses the stored DSN when the environment has none", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
     expect(status).toMatchObject({
@@ -146,26 +146,26 @@ describe("observability status resolution", () => {
     });
   });
 
-  it("reports an explicit zero trace sample rate as zero, not as the default", () => {
+  it("reports an explicit zero trace sample rate as zero, not as the default", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN, tracesSampleRate: 0 } });
     const status = observability.getStatus();
     expect(status.tracesSampleRate).toBe(0);
     expect(observabilityBootLine(status)).toContain("traces=0 ");
   });
 
-  it("falls back to the shipped sample rate when nothing is stored", () => {
+  it("falls back to the shipped sample rate when nothing is stored", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     expect(observability.getStatus().tracesSampleRate).toBe(0.2);
   });
 });
 
 describe("observability kill switch", () => {
-  it("keeps Sentry off when diagnostics are turned off, DSN or no DSN", () => {
+  it("keeps Sentry off when diagnostics are turned off, DSN or no DSN", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     useConfig({ observability: { sentryDsn: CONFIG_DSN, enabled: false } });
 
-    const status = observability.apply();
+    const status = await observability.apply();
     expect(status.configured).toBe(true);
     expect(status.enabled).toBe(false);
     expect(status.requestedEnabled).toBe(false);
@@ -176,36 +176,36 @@ describe("observability kill switch", () => {
     );
   });
 
-  it("starts the client when the switch is on and stops it the moment it flips", () => {
+  it("starts the client when the switch is on and stops it the moment it flips", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     const cfg: AppConfig = { observability: { sentryDsn: CONFIG_DSN } };
     useConfig(cfg);
 
-    expect(observability.apply().enabled).toBe(true);
+    expect((await observability.apply()).enabled).toBe(true);
     expect(isSentryActive()).toBe(true);
     expect(record.inits).toHaveLength(1);
     expect(record.inits[0]).toMatchObject({ dsn: CONFIG_DSN, sendDefaultPii: false, enableLogs: true });
 
     cfg.observability = { ...cfg.observability, enabled: false };
-    expect(observability.apply().enabled).toBe(false);
+    expect((await observability.apply()).enabled).toBe(false);
     expect(isSentryActive()).toBe(false);
     expect(record.closes).toBe(1);
   });
 
-  it("re-initialises on a changed DSN and leaves an unchanged one alone", () => {
+  it("re-initialises on a changed DSN and leaves an unchanged one alone", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     const cfg: AppConfig = { observability: { sentryDsn: CONFIG_DSN } };
     useConfig(cfg);
 
-    observability.apply();
-    observability.apply();
+    await observability.apply();
+    await observability.apply();
     expect(record.inits).toHaveLength(1);
     expect(record.closes).toBe(0);
 
     cfg.observability = { sentryDsn: ENV_DSN };
-    observability.apply();
+    await observability.apply();
     expect(record.inits).toHaveLength(2);
     expect(record.closes).toBe(1);
   });
@@ -213,18 +213,18 @@ describe("observability kill switch", () => {
   // A credential rotation keeps the ingest host and the project id, so a
   // fingerprint built from those alone reports the new configuration as
   // active while the harness quietly goes on using the revoked key.
-  it("re-initialises when only the public key changes", () => {
+  it("re-initialises when only the public key changes", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     const cfg: AppConfig = { observability: { sentryDsn: CONFIG_DSN } };
     useConfig(cfg);
 
-    observability.apply();
+    await observability.apply();
     expect(record.inits).toHaveLength(1);
     expect(record.inits[0]).toMatchObject({ dsn: CONFIG_DSN });
 
     cfg.observability = { sentryDsn: ROTATED_DSN };
-    const status = observability.apply();
+    const status = await observability.apply();
     expect(record.closes).toBe(1);
     expect(record.inits).toHaveLength(2);
     expect(record.inits[1]).toMatchObject({ dsn: ROTATED_DSN });
@@ -238,36 +238,36 @@ describe("observability kill switch", () => {
     for (const fragment of KEY_FRAGMENTS) expect(serialized).not.toContain(fragment);
   });
 
-  it("reaches the SDK when only the sample rate changes", () => {
+  it("reaches the SDK when only the sample rate changes", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     const cfg: AppConfig = { observability: { sentryDsn: CONFIG_DSN } };
     useConfig(cfg);
 
-    observability.apply();
+    await observability.apply();
     cfg.observability = { sentryDsn: CONFIG_DSN, tracesSampleRate: 0 };
-    observability.apply();
+    await observability.apply();
     expect(record.inits).toHaveLength(2);
     expect(record.inits[1]).toMatchObject({ tracesSampleRate: 0 });
   });
 
-  it("forwards warnings and errors as logs only when logs are on", () => {
+  it("forwards warnings and errors as logs only when logs are on", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     const cfg: AppConfig = { observability: { sentryDsn: CONFIG_DSN } };
     useConfig(cfg);
 
-    observability.apply();
+    await observability.apply();
     expect(record.inits.at(0)?.integrations).toHaveLength(1);
 
     cfg.observability = { sentryDsn: CONFIG_DSN, logsEnabled: false };
-    observability.apply();
+    await observability.apply();
     expect(record.inits.at(1)?.integrations).toHaveLength(0);
   });
 });
 
 describe("observability leak boundaries", () => {
-  it("never puts the DSN key in a status field or a log line", () => {
+  it("never puts the DSN key in a status field or a log line", async () => {
     const { loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     process.env.SENTRY_DSN = ENV_DSN;
@@ -281,7 +281,7 @@ describe("observability leak boundaries", () => {
       logged.push(args.join(" "));
     });
     try {
-      const status = observability.apply();
+      const status = await observability.apply();
       logged.push(observabilityBootLine(status));
       const serialized = JSON.stringify(status);
       for (const fragment of KEY_FRAGMENTS) {
@@ -295,7 +295,7 @@ describe("observability leak boundaries", () => {
     }
   });
 
-  it("hands the full DSN to the renderer route and only there", () => {
+  it("hands the full DSN to the renderer route and only there", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     expect(observability.effectiveDsn()).toBe(CONFIG_DSN);
     expect(JSON.stringify(observability.getStatus())).not.toContain("config0key");
@@ -340,7 +340,7 @@ describe("observability probe", () => {
     expect(observability.getStatus().lastEventAt).not.toBeNull();
   });
 
-  it("counts captures reported by the AI sink", () => {
+  it("counts captures reported by the AI sink", async () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     observability.noteCapture();
     observability.noteCapture();
@@ -349,20 +349,27 @@ describe("observability probe", () => {
 });
 
 describe("observability malformed DSN", () => {
-  it("treats a stored non-DSN as unconfigured rather than silently inert", () => {
+  it("propagates a stored non-DSN so the runtime can name it, rather than dropping it as unconfigured", async () => {
     useConfig({ observability: { sentryDsn: "https://o0.ingest.sentry.io/1" } });
     const status = observability.getStatus();
-    expect(status.configured).toBe(false);
-    expect(status.source).toBe("none");
+    expect(status.configured).toBe(true);
+    expect(status.enabled).toBe(false);
+    expect(status.source).toBe("config");
+    expect(status.host).toBeNull();
+    expect(status.lastError).toBe("The stored DSN is not a Sentry https:// DSN.");
+
+    const line = observabilityBootLine(status);
+    expect(line).toBe("[sentry] misconfigured (config): The stored DSN is not a Sentry https:// DSN.");
+    expect(line).not.toContain("enabled");
   });
 
   // The boot line is what an operator (and this plan's own verification
   // steps) greps for the word "enabled".  A DSN that never started the SDK
   // must not produce a line that opens with it, however honest the suffix.
-  it("names the problem when the environment pins a non-DSN", () => {
+  it("names the problem when the environment pins a non-DSN", async () => {
     process.env.SENTRY_DSN = "http://key@o0.ingest.sentry.io/1";
     useConfig({});
-    const status = observability.apply();
+    const status = await observability.apply();
     expect(status.configured).toBe(true);
     expect(status.enabled).toBe(false);
     expect(status.host).toBeNull();
@@ -373,7 +380,7 @@ describe("observability malformed DSN", () => {
     expect(line).not.toContain("enabled");
   });
 
-  it("says the same thing before any apply() has run", () => {
+  it("says the same thing before any apply() has run", async () => {
     process.env.SENTRY_DSN = "http://key@o0.ingest.sentry.io/1";
     useConfig({});
     const status = observability.getStatus();
@@ -388,7 +395,7 @@ describe("observability malformed DSN", () => {
   // console.error and then captures nothing — so accepting one here both
   // leaks the key to the harness log and reports a fleet as watched when it
   // is not.
-  it("refuses a DSN the SDK itself would reject, before init can print it", () => {
+  it("refuses a DSN the SDK itself would reject, before init can print it", async () => {
     const { record, loader } = fakeSentry();
     setSentryLoaderForTests(loader);
     process.env.SENTRY_DSN = UUID_KEY_DSN;
@@ -401,7 +408,7 @@ describe("observability malformed DSN", () => {
       }),
     );
     try {
-      const status = observability.apply();
+      const status = await observability.apply();
       logged.push(observabilityBootLine(status));
 
       expect(record.inits).toHaveLength(0);
@@ -423,7 +430,7 @@ describe("observability malformed DSN", () => {
     }
   });
 
-  it("refuses a project id that is not a number", () => {
+  it("refuses a project id that is not a number", async () => {
     process.env.SENTRY_DSN = "https://abc123@o0.ingest.sentry.io/not-a-project";
     useConfig({});
     const status = observability.getStatus();
@@ -437,24 +444,24 @@ describe("observability SDK-side DSN rejection", () => {
   // does not throw on a DSN it discarded, it just builds a client holding
   // none.  Reporting that as running is the failure this whole module exists
   // to prevent, so the client is asked what it kept.
-  it("reports a client that kept no DSN as inactive, not as running", () => {
+  it("reports a client that kept no DSN as inactive, not as running", async () => {
     const { record, loader } = fakeSentry({ acceptsDsn: false });
     setSentryLoaderForTests(loader);
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
 
-    const status = observability.apply();
+    const status = await observability.apply();
     expect(record.inits).toHaveLength(1);
     expect(isSentryActive()).toBe(false);
     expect(status.lastError).toContain("Sentry refused this DSN");
     expect(observabilityBootLine(status)).toContain("[sentry] misconfigured (config)");
   });
 
-  it("leaves a client that kept its DSN alone", () => {
+  it("leaves a client that kept its DSN alone", async () => {
     const { loader } = fakeSentry({ acceptsDsn: true });
     setSentryLoaderForTests(loader);
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
 
-    const status = observability.apply();
+    const status = await observability.apply();
     expect(isSentryActive()).toBe(true);
     expect(status.enabled).toBe(true);
     expect(status.lastError).toBeNull();

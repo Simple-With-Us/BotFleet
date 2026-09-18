@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Bug, ChevronDown, ChevronRight, RefreshCw, X } from "lucide-react";
 import { useStore, type Bot } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { formatTime, toRows, type InspectorEntry, type InspectorPage, type InspectorRow } from "@/lib/inspector";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 
@@ -118,7 +119,7 @@ export function InspectorPanel({ bot }: { bot: Bot }) {
   const total = lens === "raw" ? (page?.total.native ?? 0) : (page?.total.runtime ?? 0);
 
   return (
-    <aside className="animate-panel-in flex h-full w-[460px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[460px]")}>
       <div className="flex items-center justify-between px-4 py-3">
         <span className="flex items-center gap-2 text-[15px] font-semibold text-ink">
           <Bug size={16} className="text-ink-secondary" /> Inspector

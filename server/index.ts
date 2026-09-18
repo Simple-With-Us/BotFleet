@@ -260,7 +260,7 @@ import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { hasAccessServiceToken } from "./recall-access.ts";
-import { recallStatus } from "./recall-transport.ts";
+import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
@@ -445,7 +445,7 @@ const permissionBroker = createPermissionBroker({ publish: (event) => bus.publis
 // next restart.  The boot line names the ingest host and the project id; the
 // DSN itself never reaches a log file.
 observability.configure(() => observabilitySettings(cfg));
-console.log(observabilityBootLine(observability.apply()));
+console.log(observabilityBootLine(await observability.apply()));
 // Only now, with the first sync already applied: the timer is the slow path
 // that keeps a rotated credential current, not the one boot depends on.
 infisical.start();
@@ -2973,9 +2973,18 @@ async function startTurn(
     };
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
+      // A toolLoop (HTTP-lane) driver cannot mount the real phone MCP server
+      // the way Claude/Codex/ACP engines do, but it can still be told about
+      // the skill and offered the harness's own in-process phone_* tools
+      // (registry.ts) — so it is just as eligible for phoneMcp skill
+      // selection as a driver that declares the capability outright.  The
+      // capability flag itself stays untouched; it still means "mounts the
+      // real MCP server" for the drivers that set it.
+      const phoneEligible =
+        instance.adapter.capabilities.phoneMcp === true || instance.adapter.capabilities.toolLoop === true;
       const selectedSkills = selectBundledSkills(
         text,
-        instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+        phoneEligible ? ["phoneMcp"] : [],
         availableSkills(),
       );
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
@@ -3356,8 +3365,25 @@ async function startTurn(
       // Chief's HTTP-lane turn would never be offered the tool its own
       // prompt (chiefOfStaffSystemPrompt) tells it it has.
       const hasHostComputer = Boolean(wantsLocal && mountsLocalComputer);
+      // Bot RAG is host logic, not an MCP mount — any toolLoop driver
+      // qualifies once it is configured, independent of the `qdrantMcp`
+      // capability CLI/ACP engines use to mount the real MCP server (see
+      // registry.ts's `recallEnabled`).  Resolved only behind the cheap
+      // toolLoop/qdrant-enabled check: recallSettings() and (further down)
+      // findRecallCli()'s filesystem stats have no reason to run on every
+      // dispatch for a CLI/ACP-lane bot, which is never eligible anyway.
+      const recallSettingsForTurn =
+        usesDriverToolLoop && cfg.qdrant?.enabled !== false ? recallSettings() : undefined;
+      const hasRecall = Boolean(
+        recallSettingsForTurn && (recallSettingsForTurn.url || findRecallCli()),
+      );
+      // Same reasoning as `phoneEligible` above: the skill selection already
+      // decided whether this message is phone-related, using the SAME
+      // toolLoop eligibility.  Re-deriving that here would just risk the
+      // two checks drifting apart.
+      const hasPhone = usesDriverToolLoop && Boolean(integrations.phone);
       const turnTools = buildTurnTools(
-        { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace },
+        { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone },
         { chiefOfStaff: Boolean(bot.chiefOfStaff) },
       );
       const turnInput = {
@@ -3371,8 +3397,9 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         transcript,
         // `buildTurnTools` only returns tool surfaces the harness can
-        // actually execute: agents for HTTP today, more in a follow-up
-        // (Composio + computer-use still need an MCP-spawning path).
+        // actually execute in-process: agents, host computer, fleet
+        // recall, phone, and github today.  Composio and real GUI/cloud
+        // desktop control still need an MCP-spawning path (board da75e2da).
         tools: turnTools,
         // The harness's executor for this turn, handed only to a driver that
         // declares toolLoop.  Caller identity is baked in here, at dispatch,
@@ -3386,6 +3413,8 @@ async function startTurn(
               commsDepth,
               localComputer: hasHostComputer,
               workspace: worksInWorkspace,
+              recall: hasRecall && recallSettingsForTurn ? { settings: recallSettingsForTurn, botName: bot.name } : undefined,
+              phone: hasPhone,
               cwd: cwd ?? bot.cwd ?? undefined,
               // Read here, not derived from the catalog above: this is what
               // gates create_bot inside the host's own executor (the cap and
@@ -4514,9 +4543,13 @@ async function runGroupMemberTurn(
         }).map((registryTool) => registryTool.name)
       : [],
   });
+  // Same reasoning as the 1:1 dispatch's `phoneEligible`: a toolLoop driver
+  // cannot mount the real phone MCP server, but it can still be offered the
+  // harness's in-process phone_* tools, so it is just as eligible for
+  // phoneMcp skill selection as a driver that declares the capability.
   const selectedSkills = selectBundledSkills(
     serializeRoomContext(threadId, userName),
-    instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+    instance.adapter.capabilities.phoneMcp === true || httpOnlyToolSurface ? ["phoneMcp"] : [],
     availableSkills(),
   );
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
@@ -4642,6 +4675,16 @@ async function runGroupMemberTurn(
   const wantsLocal = granted.includes("local");
   const mountsLocalComputer = instance.adapter.capabilities.localComputerMcp === true;
   const hasHostComputer = Boolean(wantsLocal && mountsLocalComputer);
+  // Same reasoning as the 1:1 dispatch: Bot RAG is host logic, not an MCP
+  // mount, so any toolLoop driver qualifies once it is configured — and
+  // resolved only behind that cheap check for the same reason (see the
+  // 1:1 dispatch's comment on recallSettingsForTurn).
+  const recallSettingsForRoomTurn =
+    httpOnlyToolSurface && cfg.qdrant?.enabled !== false ? recallSettings() : undefined;
+  const hasRoomRecall = Boolean(
+    recallSettingsForRoomTurn && (recallSettingsForRoomTurn.url || findRecallCli()),
+  );
+  const hasRoomPhone = httpOnlyToolSurface && Boolean(integrations.phone);
   const roomSystem =
     system +
     sectionContextSystemPrompt(bot.section) +
@@ -4657,7 +4700,13 @@ async function runGroupMemberTurn(
   const roomTurnTools =
     instance.adapter.capabilities.toolLoop === true
       ? buildTurnTools(
-          { ...integrations, localComputer: hasHostComputer, workspace: Boolean(workspace) },
+          {
+            ...integrations,
+            localComputer: hasHostComputer,
+            workspace: Boolean(workspace),
+            recall: hasRoomRecall,
+            phone: hasRoomPhone,
+          },
           { chiefOfStaff: Boolean(bot.chiefOfStaff) },
         )
       : [];
@@ -4674,6 +4723,8 @@ async function runGroupMemberTurn(
           commsDepth: hop,
           localComputer: hasHostComputer,
           workspace: Boolean(workspace),
+          recall: hasRoomRecall && recallSettingsForRoomTurn ? { settings: recallSettingsForRoomTurn, botName: bot.name } : undefined,
+          phone: hasRoomPhone,
           cwd: cwd ?? bot.cwd ?? undefined,
           chiefOfStaff: Boolean(bot.chiefOfStaff),
           // Bound to THIS room turn's bot and thread in the same closure
@@ -5740,7 +5791,7 @@ async function applyResolvedSecrets(reason: RefreshReason): Promise<void> {
   // Outside the fingerprint check on purpose: a rotated DSN takes effect
   // without a restart, and it is deliberately not a field that rebuilds the
   // fleet, so the fingerprint never moves for it.
-  observability.apply();
+  await observability.apply();
   // Against the fingerprint the REGISTRY was built with, never against `cfg`
   // at the top of this call.  The timer path writes the rotated value into
   // `cfg` and only records the change, so by the time Sync Now runs, a
@@ -8798,7 +8849,7 @@ const server = createServer(async (req, res) => {
             Object.assign(cfg, loadConfig());
             infisical.start();
           }
-          observability.apply();
+          await observability.apply();
           if (credentialFingerprint(cfg) !== loadedCredentialFingerprint) await runProviderReload();
           infisical.setPendingProviderReload(false);
         });
@@ -10090,7 +10141,7 @@ const server = createServer(async (req, res) => {
       // the Sentry client is closed and re-opened in place.  Nothing waits for
       // a restart, and the line printed here says exactly what changed.
       if (patch.observability !== undefined) {
-        console.log(observabilityBootLine(observability.apply()));
+        console.log(observabilityBootLine(await observability.apply()));
       }
       // Provider keys change the fleet. Profile, voice, VPS, and room timeout
       // changes do not rebuild it: no driver reads them, and they should not

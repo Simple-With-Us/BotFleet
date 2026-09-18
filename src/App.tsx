@@ -318,6 +318,18 @@ function Shell() {
           )}
         </main>
       )}
+      {(state.settingsOpen || state.computerOpen || state.inspectorOpen) && (
+        <div
+          aria-hidden
+          onMouseDown={(event) => {
+            if (event.target !== event.currentTarget) return;
+            if (state.settingsOpen) dispatch({ type: "toggleSettings", open: false });
+            else if (state.computerOpen) dispatch({ type: "toggleComputer", open: false });
+            else if (state.inspectorOpen) dispatch({ type: "toggleInspector", open: false });
+          }}
+          className="absolute inset-0 z-10 hidden bg-black/40 max-[1099px]:block"
+        />
+      )}
       {state.settingsOpen && bot && <SettingsPanel bot={bot} />}
       {state.settingsOpen && group && <GroupSettingsPanel group={group} />}
       {state.computerOpen && bot && (

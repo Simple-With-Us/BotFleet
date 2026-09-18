@@ -67,6 +67,20 @@ export interface ToolGateContext {
   localComputer?: boolean;
   /** The bot is working in an assigned workspace directory. */
   workspace?: boolean;
+  /** Fleet recall (Bot RAG) is configured: a Service URL or the local
+   *  `recall` CLI is reachable.  Independent of `agents` — recall is host
+   *  logic, not a peer-comms permission. */
+  recall?: boolean;
+  /** A first-party physical Android phone (USB) is mounted for this turn. */
+  phone?: boolean;
+  /** The bot may use the github_* tools this turn.  A distinct field from
+   *  `localComputer` on purpose — every caller sets it equal to
+   *  `localComputer` today (see registry.ts's own `githubEnabled` note),
+   *  but that is a value a caller chooses, not a constraint this type
+   *  enforces, so a future grant that separates "run shell commands" from
+   *  "act on a git repo" only has to change what callers pass in, not this
+   *  interface or the registry records. */
+  github?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -459,6 +473,17 @@ export const MAX_CREATED_BOTS_PER_TURN = 4;
 
 const hostComputer = (ctx: ToolGateContext) => Boolean(ctx.localComputer);
 const workspaceOrHostComputer = (ctx: ToolGateContext) => Boolean(ctx.localComputer || ctx.workspace);
+const recallEnabled = (ctx: ToolGateContext) => Boolean(ctx.recall);
+const phoneEnabled = (ctx: ToolGateContext) => Boolean(ctx.phone);
+// github rides the SAME "This Computer" grant bash already requires: the
+// tool is a narrower, auditable alternative to running `gh`/`git` through
+// `bash` (argv-only exec, a fixed action per record, real-path confinement
+// to the bot's workspace), not a capability beyond what that grant already
+// implies — a bot with `bash` can already reach `gh`/`git` unscoped.  Its
+// own `ToolGateContext.github` field, not a bare alias of `hostComputer`,
+// so a future caller can grant one without the other by changing what it
+// passes in, without touching this predicate or these records.
+const githubEnabled = (ctx: ToolGateContext) => Boolean(ctx.github);
 
 const BASH: HarnessTool = {
   name: "bash",
@@ -590,6 +615,408 @@ const EDIT_FILE: HarnessTool = {
   },
 };
 
+const RECALL_SEARCH: HarnessTool = {
+  name: "recall_search",
+  description:
+    "Search the configured shared knowledge corpus (lessons, preferences, infrastructure facts, decisions, runbooks, and notes). Hybrid dense + keyword search with cross-encoder reranking.",
+  schema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Natural-language question, topic, or search keywords" },
+      limit: { type: "number", description: "Maximum number of relevant results to return (default: 5, max: 20)" },
+      category: {
+        type: "string",
+        enum: ["lesson", "preference", "infrastructure", "decision", "runbook", "note", "finding", "doc"],
+        description: "Restrict results to one category",
+      },
+      app: { type: "string", description: "Filter by lowercase app slug (e.g. botfleet, docs, research)" },
+      source: {
+        type: "string",
+        enum: ["board", "effort-log", "apple-note", "doc", "skill", "memory", "agent-contribution"],
+        description: "Filter by document source",
+      },
+      seat: { type: "string", description: "Filter by author seat tag (the bot or agent that wrote it)" },
+      since_days: { type: "number", description: "Only return content created in the last N days" },
+      per_doc: { type: "number", description: "Best N chunks to return per document (default: 1)" },
+    },
+    required: ["query"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: recallEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+  promptFragment:
+    "Use recall_search to check the shared knowledge corpus (lessons, preferences, infrastructure facts, decisions, runbooks) before re-deriving something another bot or seat may already have solved.",
+};
+
+const RECALL_CONTRIBUTE: HarnessTool = {
+  name: "recall_contribute",
+  description:
+    "Store a reusable piece of knowledge, lesson learned, preference, infrastructure fact, or runbook into the configured shared memory corpus so other bots and seats can retrieve it.",
+  schema: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "The content or lesson to contribute (40 to 4000 characters)" },
+      category: {
+        type: "string",
+        enum: ["lesson", "preference", "infrastructure", "decision", "runbook"],
+        description: "The knowledge category",
+      },
+      app: { type: "string", description: "Target app slug (default: botfleet)" },
+      seat: { type: "string", description: "Author seat or bot identifier (defaults to this bot's name)" },
+      title: { type: "string", description: "Optional title or concise summary" },
+      url: { type: "string", description: "Optional source link (PR, board item, commit, or doc URL)" },
+      force: { type: "boolean", description: "Store even if a near-duplicate contribution already exists" },
+    },
+    required: ["text", "category"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: recallEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment: "Use recall_contribute to save a reusable lesson to the shared corpus after you learn something worth keeping.",
+  approval: {
+    policy: "ask",
+    summary: (args) => {
+      const text = typeof args.text === "string" ? args.text.replace(/\s+/g, " ").trim() : "";
+      return text ? `recall_contribute: ${text.slice(0, 120)}` : "recall_contribute";
+    },
+  },
+};
+
+const RECALL_STATS: HarnessTool = {
+  name: "recall_stats",
+  description: "Check the health, status, and point counts of the configured shared memory corpus.",
+  schema: { type: "object", properties: {} },
+  surfaces: { mcp: false, http: true },
+  gate: recallEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+  promptFragment: "Use recall_stats to check whether the shared knowledge corpus is configured and healthy.",
+};
+
+const PHONE_STATUS: HarnessTool = {
+  name: "phone_status",
+  description: "Check physical USB Android devices and USB-debugging authorization before any Android phone task.",
+  schema: { type: "object", properties: {} },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const PHONE_READ_SCREEN: HarnessTool = {
+  name: "phone_read_screen",
+  description:
+    "Read visible text, accessibility labels, resource ids, and pixel bounds from the connected Android screen. Use after every action to verify the result.",
+  schema: { type: "object", properties: { serial: { type: "string" } } },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const PHONE_LIST_APPS: HarnessTool = {
+  name: "phone_list_apps",
+  description:
+    "List installed launchable Android package names, optionally filtered by a human app name. Prefer phone_open_app first.",
+  schema: { type: "object", properties: { query: { type: "string" }, serial: { type: "string" } } },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const PHONE_OPEN_APP: HarnessTool = {
+  name: "phone_open_app",
+  description: "Open an installed Android app directly by its human name, such as Uber or Skyscanner. Do not scan the app drawer first.",
+  schema: {
+    type: "object",
+    properties: { name: { type: "string" }, serial: { type: "string" } },
+    required: ["name"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `phone: open ${typeof args.name === "string" ? args.name : "app"}` },
+};
+
+const PHONE_TAP_TEXT: HarnessTool = {
+  name: "phone_tap_text",
+  description: "Tap visible Android text or an accessibility label, then use phone_read_screen to verify.",
+  schema: {
+    type: "object",
+    properties: {
+      text: { type: "string" },
+      exact: { type: "boolean" },
+      index: { type: "integer", minimum: 0 },
+      serial: { type: "string" },
+    },
+    required: ["text"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `phone: tap "${typeof args.text === "string" ? args.text : ""}"` },
+};
+
+const PHONE_TAP: HarnessTool = {
+  name: "phone_tap",
+  description: "Tap Android screen pixel coordinates obtained from phone_read_screen.",
+  schema: {
+    type: "object",
+    properties: { x: { type: "number" }, y: { type: "number" }, serial: { type: "string" } },
+    required: ["x", "y"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `phone: tap ${args.x ?? "?"},${args.y ?? "?"}` },
+};
+
+const PHONE_SWIPE: HarnessTool = {
+  name: "phone_swipe",
+  description: "Swipe the Android screen in a direction, then use phone_read_screen to verify.",
+  schema: {
+    type: "object",
+    properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] }, serial: { type: "string" } },
+    required: ["direction"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `phone: swipe ${typeof args.direction === "string" ? args.direction : ""}` },
+};
+
+const PHONE_TYPE_TEXT: HarnessTool = {
+  name: "phone_type_text",
+  description: "Type basic ASCII text into the focused Android field. Never enter passwords, payment details, or one-time codes.",
+  schema: {
+    type: "object",
+    properties: { text: { type: "string", maxLength: 256 }, serial: { type: "string" } },
+    required: ["text"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: () => "phone: type text" },
+};
+
+const PHONE_PRESS: HarnessTool = {
+  name: "phone_press",
+  description: "Press an Android navigation or keyboard key.",
+  schema: {
+    type: "object",
+    properties: {
+      key: {
+        type: "string",
+        enum: ["back", "delete", "down", "enter", "escape", "home", "left", "recent", "return", "right", "space", "tab", "up"],
+      },
+      serial: { type: "string" },
+    },
+    required: ["key"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: phoneEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `phone: press ${typeof args.key === "string" ? args.key : ""}` },
+};
+
+const GITHUB_CLONE: HarnessTool = {
+  name: "github_clone",
+  description: "Clone a GitHub repository into this bot's own workspace directory, so its file and git tools can act on it.",
+  schema: {
+    type: "object",
+    properties: {
+      repo: { type: "string", description: '"owner/repo" or a https://github.com/owner/repo(.git) URL' },
+      dir: { type: "string", description: "Folder name inside this bot's workspace (default: derived from repo)." },
+    },
+    required: ["repo"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: clone ${typeof args.repo === "string" ? args.repo : ""}` },
+};
+
+const GITHUB_STATUS: HarnessTool = {
+  name: "github_status",
+  description: "Show the GitHub repo's default branch plus this clone's git status for a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: { dir: { type: "string", description: "The folder name passed to github_clone." } },
+    required: ["dir"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const GITHUB_COMMIT: HarnessTool = {
+  name: "github_commit",
+  description: "Stage and commit changes in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      message: { type: "string", description: "The commit message." },
+      files: { type: "array", items: { type: "string" }, description: "Paths (relative to the repo) to stage. Omit to stage all changes." },
+    },
+    required: ["dir", "message"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: commit "${typeof args.message === "string" ? args.message.slice(0, 100) : ""}"` },
+};
+
+const GITHUB_PUSH: HarnessTool = {
+  name: "github_push",
+  description: "Push commits from a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      branch: { type: "string", description: "Branch to push and set upstream for. Omit to push the current branch's existing upstream." },
+    },
+    required: ["dir"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: push ${typeof args.branch === "string" ? args.branch : "(current branch)"}` },
+};
+
+const GITHUB_PR_CREATE: HarnessTool = {
+  name: "github_pr_create",
+  description: "Open a pull request from the current branch of a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      title: { type: "string" },
+      body: { type: "string" },
+      base: { type: "string", description: "Base branch (defaults to the repo's default branch)." },
+      branch: { type: "string", description: "Head branch (defaults to the current branch)." },
+    },
+    required: ["dir", "title"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: open PR "${typeof args.title === "string" ? args.title.slice(0, 100) : ""}"` },
+};
+
+const GITHUB_PR_VIEW: HarnessTool = {
+  name: "github_pr_view",
+  description: "View a pull request's status (including CI checks) in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      number: { type: "integer", description: "PR number. Omit to view the current branch's PR." },
+    },
+    required: ["dir"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const GITHUB_PR_LIST: HarnessTool = {
+  name: "github_pr_list",
+  description: "List open pull requests in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: { dir: { type: "string", description: "The folder name passed to github_clone." } },
+    required: ["dir"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const GITHUB_PR_CHECKOUT: HarnessTool = {
+  name: "github_pr_checkout",
+  description: "Check out an existing pull request's branch in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      number: { type: "integer" },
+    },
+    required: ["dir", "number"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: checkout PR #${args.number ?? "?"}` },
+};
+
+const GITHUB_ISSUE_CREATE: HarnessTool = {
+  name: "github_issue_create",
+  description: "Open an issue in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      title: { type: "string" },
+      body: { type: "string" },
+    },
+    required: ["dir", "title"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  approval: { policy: "ask", summary: (args) => `github: open issue "${typeof args.title === "string" ? args.title.slice(0, 100) : ""}"` },
+};
+
+const GITHUB_ISSUE_VIEW: HarnessTool = {
+  name: "github_issue_view",
+  description: "View an issue in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: {
+      dir: { type: "string", description: "The folder name passed to github_clone." },
+      number: { type: "integer" },
+    },
+    required: ["dir", "number"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const GITHUB_ISSUE_LIST: HarnessTool = {
+  name: "github_issue_list",
+  description: "List open issues in a repo already cloned with github_clone.",
+  schema: {
+    type: "object",
+    properties: { dir: { type: "string", description: "The folder name passed to github_clone." } },
+    required: ["dir"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: githubEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
 /** Every tool the registry owns, in the order the MCP lane publishes them —
  *  spelled out here, not derived, so reordering this array is a deliberate
  *  edit rather than something that silently reorders the MCP wire list. */
@@ -606,6 +1033,29 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   READ_FILE,
   WRITE_FILE,
   EDIT_FILE,
+  RECALL_SEARCH,
+  RECALL_CONTRIBUTE,
+  RECALL_STATS,
+  PHONE_STATUS,
+  PHONE_READ_SCREEN,
+  PHONE_LIST_APPS,
+  PHONE_OPEN_APP,
+  PHONE_TAP_TEXT,
+  PHONE_TAP,
+  PHONE_SWIPE,
+  PHONE_TYPE_TEXT,
+  PHONE_PRESS,
+  GITHUB_CLONE,
+  GITHUB_STATUS,
+  GITHUB_COMMIT,
+  GITHUB_PUSH,
+  GITHUB_PR_CREATE,
+  GITHUB_PR_VIEW,
+  GITHUB_PR_LIST,
+  GITHUB_PR_CHECKOUT,
+  GITHUB_ISSUE_CREATE,
+  GITHUB_ISSUE_VIEW,
+  GITHUB_ISSUE_LIST,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

@@ -55,9 +55,15 @@ resolve_secret() {
   local val="${!name:-}"
 
   if [[ -z "$val" ]] && command -v infisical >/dev/null 2>&1; then
-    val="$(infisical secrets get "$name" \
-      --plain --silent --telemetry=false --expand=false \
-      --env=prod --path=/ 2>/dev/null || true)"
+    local project_id="${INFISICAL_PROJECT_ID:-}"
+    if [[ -z "$project_id" ]] && command -v jq >/dev/null 2>&1 && [[ -f "$HOME/.botfleet/config.json" ]]; then
+      project_id="$(jq -r '.infisical.projectId // empty' "$HOME/.botfleet/config.json" 2>/dev/null)"
+    fi
+    local args=(--plain --silent --telemetry=false --expand=false --env=prod --path=/)
+    if [[ -n "$project_id" ]]; then
+      args+=(--projectId="$project_id")
+    fi
+    val="$(infisical secrets get "$name" "${args[@]}" 2>/dev/null || true)"
   fi
 
   if [[ -z "$val" && -f "$HANDOFF_FILE" ]]; then

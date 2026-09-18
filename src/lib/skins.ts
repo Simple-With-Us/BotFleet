@@ -43,7 +43,7 @@ export type Skin = {
 };
 
 export const SKINS: readonly Skin[] = [
-  { id: "system", name: "System Auto", tagline: "Follows this computer's light or dark look." },
+  { id: "system", name: "System Auto", tagline: "Follows this computer.  Dark uses Midnight; light uses Studio." },
   { id: "user-auto", name: "User Auto", tagline: "Follows this computer, using your light and dark themes." },
   { id: "studio", name: "Studio Clean", tagline: "Pure white, crisp modern macOS daylight." },
   { id: "porcelain", name: "Porcelain Light", tagline: "Ultra-clean Apple White minimalism with soft neutral shadows." },

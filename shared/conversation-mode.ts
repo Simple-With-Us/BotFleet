@@ -43,7 +43,10 @@ export function rosterPrimaryLabel(mode: ConversationMode): {
   newLabel: string;
 } {
   if (mode === "projects") {
-    return { singular: "Thread", plural: "Threads", newLabel: "New Thread" };
+    // Projects paints each bot as a thread, but the create control still
+    // mints a bot record, so it names what it makes.  A thread under an
+    // existing bot is added from that chat's own thread bar.
+    return { singular: "Thread", plural: "Threads", newLabel: "New Bot" };
   }
   return { singular: "Bot", plural: "Bots", newLabel: "New Bot" };
 }

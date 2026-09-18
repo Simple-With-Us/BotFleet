@@ -264,8 +264,8 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
         {state.webhooks.length === 0 ? (
           <div className="border-t border-hairline/40 px-6 py-16 text-center">
             <div className="mx-auto mb-4 flex size-12 items-center justify-center rounded-2xl bg-accent/10 text-accent"><Send size={23} /></div>
-            <h3 className="text-[16px] font-semibold text-ink">Create your first webhook</h3>
-            <p className="mx-auto mt-2 max-w-[420px] text-[12.5px] leading-relaxed text-ink-secondary">Choose a bot, copy one command, and every request becomes a new task in its chat.</p>
+            <h3 className="text-[16px] font-semibold text-ink">Generic Webhooks Only — Guided Setup Coming</h3>
+            <p className="mx-auto mt-2 max-w-[420px] text-[12.5px] leading-relaxed text-ink-secondary">BotFleet accepts a generic webhook POST today.  Choose a bot, copy one command, and every request becomes a new task in its chat.</p>
             <button onClick={() => setEditor("new")} disabled={bots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Local Webhook</button>
             {bots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back here.</p>}
           </div>

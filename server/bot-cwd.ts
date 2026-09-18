@@ -66,8 +66,11 @@ export function protectedCwdDirs(home = homedir(), dataDir?: string): string[] {
 /** Real path when the folder exists; otherwise the real path of its
  * nearest existing ancestor plus the rest, so a root or protected entry
  * that has not been created yet (or a subfolder of one) still compares
- * against real paths on the other side. */
-function realOrResolved(path: string): string {
+ * against real paths on the other side.  Exported for other confinement
+ * checks (e.g. the github tool's workspace-repo confinement) that need the
+ * same symlink-safe comparison but a different root/allowlist shape than
+ * `CwdConfinement` models. */
+export function realOrResolved(path: string): string {
   const resolved = resolve(path);
   try {
     return realpathSync(resolved);
@@ -78,7 +81,7 @@ function realOrResolved(path: string): string {
   }
 }
 
-function isInside(child: string, parent: string): boolean {
+export function isInside(child: string, parent: string): boolean {
   if (child === parent) return true;
   return child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
 }

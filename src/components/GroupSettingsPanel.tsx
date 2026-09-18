@@ -18,6 +18,7 @@ import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { botAvatarUrlFromStoredPath } from "../../shared/bot-avatar";
 import { MausAvatar } from "./Avatar";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 
 function Field({
   label,
@@ -135,7 +136,7 @@ export function GroupSettingsPanel({ group }: { group: Group }) {
   };
 
   return (
-    <aside className="animate-panel-in relative z-20 flex h-full w-[420px] shrink-0 flex-col border-l border-hairline/40 bg-panel shadow-2xl">
+    <aside className={railAsideClass("w-[420px]", "shadow-2xl")}>
       {/* Header */}
       <div className="flex items-center justify-between border-b border-hairline/30 px-4 py-3">
         <button

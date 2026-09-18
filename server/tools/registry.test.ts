@@ -22,6 +22,7 @@ import {
   toolsFor,
   type ToolGateContext,
 } from "./registry.ts";
+import { createPhoneTools } from "./phone.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -263,6 +264,100 @@ describe("gating", () => {
     expect(withWorkspace).toContain("read_file");
     expect(withWorkspace).toContain("write_file");
     expect(withWorkspace).toContain("edit_file");
+  });
+
+  it("offers fleet recall tools on the HTTP surface only, gated on `recall`", () => {
+    const without = httpToolDefinitions(gate({ recall: false })).map((t) => t.name);
+    expect(without).not.toContain("recall_search");
+    expect(without).not.toContain("recall_contribute");
+    expect(without).not.toContain("recall_stats");
+
+    const withRecall = httpToolDefinitions(gate({ recall: true })).map((t) => t.name);
+    expect(withRecall).toContain("recall_search");
+    expect(withRecall).toContain("recall_contribute");
+    expect(withRecall).toContain("recall_stats");
+
+    const mcpWithRecall = mcpToolDefinitions(gate({ recall: true })).map((t) => t.name);
+    expect(mcpWithRecall).not.toContain("recall_search");
+  });
+
+  it("gates recall_contribute (a write to the shared corpus) behind an approval ask", () => {
+    const tool = harnessTool("recall_contribute")!;
+    expect(tool.approval?.policy).toBe("ask");
+    expect(harnessTool("recall_search")!.approval).toBeUndefined();
+    expect(harnessTool("recall_stats")!.approval).toBeUndefined();
+  });
+
+  it("offers phone tools on the HTTP surface only, gated on `phone`, without screenshot", () => {
+    const without = httpToolDefinitions(gate({ phone: false })).map((t) => t.name);
+    expect(without).not.toContain("phone_status");
+
+    const withPhone = httpToolDefinitions(gate({ phone: true })).map((t) => t.name);
+    expect(withPhone).toContain("phone_status");
+    expect(withPhone).toContain("phone_read_screen");
+    expect(withPhone).toContain("phone_tap");
+    expect(withPhone).not.toContain("phone_screenshot");
+
+    const mcpWithPhone = mcpToolDefinitions(gate({ phone: true })).map((t) => t.name);
+    expect(mcpWithPhone).not.toContain("phone_status");
+  });
+
+  it("gates every phone action tool behind an approval ask, but not the three read tools", () => {
+    const reads = ["phone_status", "phone_read_screen", "phone_list_apps"];
+    const writes = ["phone_open_app", "phone_tap_text", "phone_tap", "phone_swipe", "phone_type_text", "phone_press"];
+    for (const name of reads) expect(harnessTool(name)!.approval, name).toBeUndefined();
+    for (const name of writes) expect(harnessTool(name)!.approval?.policy, name).toBe("ask");
+  });
+
+  it("keeps phone.ts's executors and the registry's phone_* records naming the exact same tool set", () => {
+    // Two independently hand-maintained lists of the same names (tools/phone.ts's
+    // ACTIONS, and the PHONE_* records below) with nothing else tying them
+    // together — a name added to one and not the other is either a silent
+    // capability gap (registry advertises a tool the host can't run) or a
+    // dead advertisement (executor exists, nothing ever offers it).
+    const executorNames = Object.keys(createPhoneTools()).sort();
+    const registryNames = httpToolDefinitions(gate({ phone: true }))
+      .map((t) => t.name)
+      .filter((name) => name.startsWith("phone_"))
+      .sort();
+    expect(executorNames).toEqual(registryNames);
+  });
+
+  it("offers github tools on the HTTP surface only, riding the same grant as bash", () => {
+    // `github` is its own ToolGateContext field (see registry.ts's
+    // githubEnabled), not a bare alias of `localComputer` — every real
+    // caller (turn-tools.ts, tools/host.ts) sets the two equal, which is
+    // what these gate() calls reproduce here.
+    const without = httpToolDefinitions(gate({ localComputer: false, github: false })).map((t) => t.name);
+    expect(without).not.toContain("github_clone");
+
+    const withGithub = httpToolDefinitions(gate({ localComputer: true, github: true })).map((t) => t.name);
+    expect(withGithub).toContain("github_clone");
+    expect(withGithub).toContain("github_pr_create");
+
+    // workspace alone (no localComputer/github) must not be enough — github
+    // rides the "This Computer" grant specifically, not the weaker file-tools gate.
+    const withWorkspaceOnly = httpToolDefinitions(gate({ localComputer: false, github: false, workspace: true })).map(
+      (t) => t.name,
+    );
+    expect(withWorkspaceOnly).not.toContain("github_clone");
+
+    const mcpWithGithub = mcpToolDefinitions(gate({ localComputer: true, github: true })).map((t) => t.name);
+    expect(mcpWithGithub).not.toContain("github_clone");
+  });
+
+  it("gates every mutating github tool behind an approval ask, but not the read tools", () => {
+    const reads = ["github_status", "github_pr_view", "github_pr_list", "github_issue_view", "github_issue_list"];
+    const writes = [
+      "github_clone",
+      "github_commit",
+      "github_push",
+      "github_pr_create",
+      "github_pr_checkout",
+      "github_issue_create",
+    ];
+    for (const name of reads) expect(harnessTool(name)!.approval, name).toBeUndefined();
+    for (const name of writes) expect(harnessTool(name)!.approval?.policy, name).toBe("ask");
   });
 });
 

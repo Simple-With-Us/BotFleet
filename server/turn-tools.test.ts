@@ -80,4 +80,41 @@ describe("buildTurnTools", () => {
     expect(names).toContain("edit_file");
     expect(names).not.toContain("bash");
   });
+
+  it("does not expose fleet recall, phone, or github tools by default", () => {
+    const tools = buildTurnTools({ agents: {}, localComputer: true, workspace: true });
+    const names = tools.map((t) => t.name);
+    expect(names).not.toContain("recall_search");
+    expect(names).not.toContain("phone_status");
+  });
+
+  it("exposes fleet recall tools when recall is set", () => {
+    const tools = buildTurnTools({ agents: {}, recall: true });
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("recall_search");
+    expect(names).toContain("recall_contribute");
+    expect(names).toContain("recall_stats");
+  });
+
+  it("exposes phone tools when phone is set", () => {
+    const tools = buildTurnTools({ agents: {}, phone: true });
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("phone_status");
+    expect(names).toContain("phone_read_screen");
+    expect(names).toContain("phone_tap");
+    expect(names).not.toContain("phone_screenshot");
+  });
+
+  it("exposes github tools when localComputer is set, riding the same grant as bash", () => {
+    const tools = buildTurnTools({ agents: {}, localComputer: true });
+    const names = tools.map((t) => t.name);
+    expect(names).toContain("github_clone");
+    expect(names).toContain("github_pr_create");
+  });
+
+  it("does not expose github tools from workspace alone, without localComputer", () => {
+    const tools = buildTurnTools({ agents: {}, workspace: true });
+    const names = tools.map((t) => t.name);
+    expect(names).not.toContain("github_clone");
+  });
 });

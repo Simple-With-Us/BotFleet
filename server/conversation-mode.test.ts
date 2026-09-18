@@ -29,7 +29,7 @@ describe("conversation mode", () => {
     expect(roomRole("simple")).toBe("group-thread");
     expect(roomRole("projects")).toBe("category");
     expect(rosterPrimaryLabel("simple").newLabel).toBe("New Bot");
-    expect(rosterPrimaryLabel("projects").newLabel).toBe("New Thread");
+    expect(rosterPrimaryLabel("projects").newLabel).toBe("New Bot");
   });
 
   it("names automation lanes by type in projects mode", () => {

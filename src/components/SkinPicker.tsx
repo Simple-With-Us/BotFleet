@@ -192,6 +192,15 @@ export function SkinPicker() {
         </div>
       </div>
 
+      {active === "system" && (
+        <div className="rounded-xl border border-hairline/60 bg-control/40 p-3.5">
+          <div className="text-[13px] font-medium text-ink">System Auto</div>
+          <div className="mt-0.5 text-[11.5px] leading-snug text-ink-secondary">
+            When this computer is dark, BotFleet uses Midnight.  When it is light, BotFleet uses Studio.
+          </div>
+        </div>
+      )}
+
       {active === "user-auto" && (
         <div className="rounded-xl border border-hairline/60 bg-control/40 p-3.5">
           <div className="text-[13px] font-medium text-ink">Light And Dark Themes</div>

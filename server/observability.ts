@@ -71,7 +71,7 @@ class ObservabilityManager {
    * without this an environment DSN would beat a rotated stored value forever
    * and the card would call a stored DSN "Settings". */
   private dsnFromVault(): boolean {
-    return secretSource("observability.sentryDsn") === "infisical" && Boolean(this.settings().dsn);
+    return secretSource("observability.sentryDsn") === "infisical";
   }
 
   /** The secret store, then env, then config, then nothing.  Env wins over
@@ -100,8 +100,8 @@ class ObservabilityManager {
   }
 
   /** Re-read the config and bring the Sentry client in line with it. */
-  apply(): ObservabilityStatusView {
-    applySentryConfig(this.resolve());
+  async apply(): Promise<ObservabilityStatusView> {
+    await applySentryConfig(this.resolve());
     return this.getStatus();
   }
 
@@ -111,10 +111,10 @@ class ObservabilityManager {
     const parsed = input.dsn ? describeDsn(input.dsn) : null;
     // A stored string that is not a DSN never starts the SDK, so calling it
     // "enabled" would put a green pill and an `[sentry] enabled` boot line
-    // in front of an operator whose harness is reporting nothing.  Only the
-    // config path filters a malformed value before it gets here; an
-    // env-pinned one arrives raw.  `configured` still says a value is on
-    // file — that is what makes the difference legible rather than baffling.
+    // in front of an operator whose harness is reporting nothing.  Stored
+    // and env-pinned values both arrive raw so `configured` can say a value
+    // is on file — that is what makes a malformed DSN legible rather than
+    // looking like nothing was set.
     const malformed = input.dsn !== null && parsed === null;
     return {
       enabled: input.enabled && input.dsn !== null && !malformed,
@@ -166,7 +166,7 @@ class ObservabilityManager {
         eventId: null,
       };
     }
-    if (!isSentryActive()) this.apply();
+    if (!isSentryActive()) await this.apply();
     const sdk = getSentry();
     if (!isSentryActive() || !sdk) {
       return {

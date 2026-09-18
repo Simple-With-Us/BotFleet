@@ -6,6 +6,7 @@ import { CloudBackendPicker } from "./CloudBackendPicker";
 import { ModelPicker } from "./ModelPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { requestNotificationPermission } from "@/lib/notify";
 import { botUsage, costCaption, formatTokens, formatUsd, hasFiniteCost } from "@/lib/usage";
 import { shortPath } from "@/lib/short-path";
@@ -382,7 +383,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
   return (
     <>
-    <aside className="animate-panel-in relative z-20 flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[400px]")}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button

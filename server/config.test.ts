@@ -1167,9 +1167,9 @@ describe("observability settings", () => {
     expect(observabilityEnabled({ observability: { enabled: false } })).toBe(false);
   });
 
-  it("returns a stored DSN and drops one that is not a DSN at all", () => {
+  it("returns a stored DSN without pre-validating it, leaving validation to the runtime", () => {
     expect(sentryDsnConfigured({ observability: { sentryDsn: ` ${SENTINEL_DSN} ` } })).toBe(SENTINEL_DSN);
-    expect(sentryDsnConfigured({ observability: { sentryDsn: "https://o0.ingest.sentry.io/1" } })).toBeNull();
+    expect(sentryDsnConfigured({ observability: { sentryDsn: "https://o0.ingest.sentry.io/1" } })).toBe("https://o0.ingest.sentry.io/1");
     expect(sentryDsnConfigured({})).toBeNull();
   });
 

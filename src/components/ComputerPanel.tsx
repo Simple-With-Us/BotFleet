@@ -24,6 +24,7 @@ import { useStore, type Bot } from "@/state/store";
 import { nextCalendarRunLabel, routineScheduleLabel } from "@/lib/routine-calendar";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
+import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
@@ -694,7 +695,7 @@ export function ComputerPanel({
 
   return (
     <>
-    <aside className="animate-panel-in flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className={railAsideClass("w-[400px]")}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button

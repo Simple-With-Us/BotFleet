@@ -605,12 +605,12 @@ export interface ObservabilitySettings {
   logsEnabled: boolean;
 }
 
-/** The stored DSN, or null when it is absent or not a real DSN.  A stored
- * value that fails the check is treated as absent rather than handed to the
- * SDK, which would accept it and then quietly drop every event. */
+/** The stored DSN string, or null when none is present.  Shape checks live
+ * in the runtime so a vault-injected malformed value stays visible on the
+ * status card instead of disappearing as "not configured". */
 export function sentryDsnConfigured(cfg: AppConfig): string | null {
   const raw = cfg.observability?.sentryDsn?.trim();
-  return raw && isSentryDsn(raw) ? raw : null;
+  return raw || null;
 }
 
 /** The explicit kill switch.  Absent means on, matching `ingress.enabled`:

@@ -93,17 +93,30 @@ describe("skins", () => {
     expect(picker).toContain("Light And Dark Themes");
     expect(picker).toContain("When This Computer Is Light");
     expect(picker).toContain("When This Computer Is Dark");
+    expect(picker).toContain("When this computer is dark, BotFleet uses Midnight.");
     expect(picker).toContain("followsComputerLook(skin) ? resolveSkin");
+    expect(settings).toContain("System Auto uses Midnight when this computer is dark");
     expect(main).toContain("followsComputerLook(pref)");
   });
 
   it("labels the two auto modes in Title Case", () => {
     expect(SKINS.find((skin) => skin.id === "system")?.name).toBe("System Auto");
     expect(SKINS.find((skin) => skin.id === "user-auto")?.name).toBe("User Auto");
-    expect(SKINS.find((skin) => skin.id === "system")?.tagline).toBe("Follows this computer's light or dark look.");
+    expect(SKINS.find((skin) => skin.id === "system")?.tagline).toBe(
+      "Follows this computer.  Dark uses Midnight; light uses Studio.",
+    );
     expect(SKINS.find((skin) => skin.id === "user-auto")?.tagline).toBe(
       "Follows this computer, using your light and dark themes.",
     );
+  });
+
+  it("site claim matches getDefaultSkin() System Auto", () => {
+    const features = readFileSync(join(here, "../../apps/site/features.json"), "utf8");
+    const html = readFileSync(join(here, "../../apps/site/index.html"), "utf8");
+    expect(getDefaultSkin()).toBe("system");
+    expect(features).toContain("First visit uses System Auto");
+    expect(features).not.toMatch(/First visit uses Studio \(light\)/);
+    expect(html).toContain("First visit uses System Auto");
   });
 });
 

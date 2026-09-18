@@ -433,7 +433,7 @@ async function computeVpsComputerStatus(
   const status = emptyStatus(botId, alias);
   if (!alias) return status;
   viewerConnections.delete(`${alias}:${status.container_name}`);
-  const run = (args: string[], timeoutMs = 10_000, input?: string) =>
+  const run = (args: string[], timeoutMs = 30_000, input?: string) =>
     runner(vpsDockerArgs(alias, args), { timeoutMs, input });
 
   let inspectedImageId: string | null = null;
@@ -759,7 +759,7 @@ async function waitForVpsReady(
     const container = status.container_id ?? status.container_name;
     const driverAnswers = await runner(
       vpsDockerArgs(alias, cuaExecArgs(["status", "--socket", CUA_SOCKET], { container })),
-      { timeoutMs: 10_000 },
+      { timeoutMs: 30_000 },
     ).then(
       () => true,
       () => false,

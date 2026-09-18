@@ -38,6 +38,10 @@ import {
   type AgentToolExecutor,
 } from "./agents.ts";
 import { createComputerTools } from "./computer.ts";
+import { createGithubTools } from "./github.ts";
+import { createPhoneTools } from "./phone.ts";
+import { createRecallTools } from "./recall.ts";
+import type { RecallSettings } from "../recall-transport.ts";
 import { harnessTool, toolsFor, type ToolGateContext } from "./registry.ts";
 
 export type { AgentBot as TurnToolBot } from "./agents.ts";
@@ -67,6 +71,12 @@ export interface TurnToolHostContext {
   workspace?: boolean;
   /** Working directory for file and shell operations. */
   cwd?: string;
+  /** Fleet recall settings, present exactly when Bot RAG is configured for
+   *  this turn — carries what `createRecallTools` needs (the resolved
+   *  service settings and the seat name `recall_contribute` defaults to). */
+  recall?: { settings: RecallSettings; botName: string };
+  /** Whether a first-party physical Android phone (USB) is mounted for this turn. */
+  phone?: boolean;
   deps: TurnToolHostDeps;
   /** Ceiling on model-to-tool rounds; absent = the driver's default. */
   maxRounds?: number;
@@ -88,6 +98,14 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   const executors = new Map<string, AgentToolExecutor>([
     ...Object.entries(createAgentTools(ctx.deps)),
     ...Object.entries(computerTools),
+    ...(ctx.recall ? Object.entries(createRecallTools({ settings: ctx.recall.settings, defaultSeat: ctx.recall.botName })) : []),
+    ...(ctx.phone ? Object.entries(createPhoneTools()) : []),
+    // github has no gate of its own: registry.ts's `githubEnabled` predicate
+    // IS `hostComputer` (the same `localComputer` check bash uses), so
+    // whether the catalog offers github_* tools and whether the host can
+    // run them must stay driven by the one `localComputer` boolean —
+    // a separate flag here could only drift from the registry's gate.
+    ...(ctx.localComputer ? Object.entries(createGithubTools(ctx.botId)) : []),
   ]);
   const gate: ToolGateContext = {
     // The dispatch only builds a host when the agents integration is
@@ -103,6 +121,14 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     chiefOfStaff: ctx.chiefOfStaff ?? false,
     localComputer: Boolean(ctx.localComputer),
     workspace: Boolean(ctx.workspace),
+    recall: Boolean(ctx.recall),
+    phone: Boolean(ctx.phone),
+    // No separate TurnToolHostContext field: github rides the same
+    // localComputer grant bash does (see registry.ts's githubEnabled),
+    // so there is nothing new for a caller to pass in — only the gate
+    // object's own `github` key needs to exist, and it derives from the
+    // same boolean the executor merge above already keys off.
+    github: Boolean(ctx.localComputer),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.

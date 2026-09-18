@@ -624,7 +624,9 @@ public struct ConfigStatus: Codable, Sendable {
 
     public var primarySingular: String { isProjectsMode ? "Thread" : "Bot" }
     public var primaryPlural: String { isProjectsMode ? "Threads" : "Bots" }
-    public var newPrimaryLabel: String { isProjectsMode ? "New Thread" : "New Bot" }
+    /// The create control always mints a bot record, even in projects mode
+    /// where that bot is painted as a thread.  It names what it makes.
+    public var newPrimaryLabel: String { "New Bot" }
 
     public var roomTerminologyLabel: String {
         roomLabels?.singular ?? Self.presetLabels(terminology).singular

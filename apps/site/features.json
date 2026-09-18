@@ -41,8 +41,8 @@
           "prov": { "type": "pr", "prs": [84], "state": "merged", "note": "In testing" }
         },
         {
-          "title": "Studio Light Default &amp; Readable Code Fences",
-          "desc": "First visit uses Studio (light).  Dark and System Auto are explicit picker rows, not the default.  Code fences use a light Shiki theme so they stay readable on the default skin.  Includes update toggle preferences and in-app banner controls.",
+          "title": "System Auto Default &amp; Readable Code Fences",
+          "desc": "First visit uses System Auto, which follows this computer — Studio in light, Midnight in dark.  Other skins stay explicit picker rows.  Code fences pick a Shiki theme that stays readable on the painted skin.  Includes update toggle preferences and in-app banner controls.",
           "prov": { "type": "pr", "prs": [143], "state": "merged", "note": "In testing" }
         },
         {

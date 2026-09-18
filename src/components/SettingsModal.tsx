@@ -1100,7 +1100,7 @@ export function SettingsModal() {
                 <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
                   <ProfileFields />
                 </Card>
-                <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.">
+                <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light.">
                   <SkinPicker />
                 </Card>
                 <ConversationModeRow />
