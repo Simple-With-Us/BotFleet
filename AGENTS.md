@@ -82,3 +82,58 @@ Sentry org `jays-services`, project `botfleet` (web client, harness spans, iOS C
 ## Skills In This Repo
 
 `.claude/skills/` carries the fleet skills a seat should use here: `session-start`, `board-ops`, `closeout`, `land-lane`, `deploy-verify`, `codex-triage`, `unstick-pr`, `pickup-seat`, `fleet-coordination`, `fleet-infra`, `secret-handoff`, `owner-copy`, `sentence-gap`, `apple-notes`, `dns-and-registrars`, `drive-grok-tui`, `mac-cleanup`, `windows-release`.  Load `session-start` at the beginning of a session and `closeout` at the end of a lane.
+
+## Operating Rules
+
+### No external contact without owner approval
+
+**Never submit, post, comment, file an issue, open a PR, create a fork,
+or otherwise initiate any communication to a third-party repository,
+organization, or service on the owner's behalf without explicit
+per-case approval from the owner.**  This includes (non-exhaustive):
+GitHub pull requests or issues (any repo), npm publish, public social
+media posts, email to maintainers, Slack messages to other teams, and
+any webhook or bot that auto-posts anywhere.
+
+This rule covers *outgoing* contact only.  Reading public repositories
+and pinning upstream packages via `npm` is fine; the rule is about
+initiating communication, not about consuming public artifacts.
+
+Rationale: every relationship the owner has with an upstream project is
+opt-in, per-case, and reviewed.  Automated or bulk contact erodes the
+trust the upstream maintainers extend to individual integrators and can
+create legal exposure for the owner.  Attribution for derived work lives
+in `NOTICE` and the README — that is in-repo courtesy, not external
+contact.
+
+If a task seems to require external contact (a feature request that
+only the upstream can fulfill, a security disclosure, a licensing
+question), stop and surface the question to the owner before acting.
+See Harness `docs/decisions/0003-no-external-contact-and-no-forks.md` for
+the canonical decision record (RAG-discoverable).
+
+### No forks of other repositories
+
+**Never create a fork of another person's repository on the owner's
+GitHub account.**  A new repository that exists only because of upstream
+work should be an *independent* project that consumes the upstream via
+the package manager and credits it via `NOTICE` and the README.  GitHub
+forks (`gh repo fork`) and any "spiritual successor" repo that ships
+the upstream's commit history are both out of scope.
+
+The closest analogue in the fleet today is BotFleet's relationship to
+OpenMausBot: BotFleet is its own original repo, not a GitHub fork, and
+its README credits OpenMausBot as the spiritual predecessor.  Harness
+follows the same pattern with the upstream `@deepseek-ai/dsh`.
+
+### What this means in practice
+
+- ✅ `npm install <upstream-package>` (read + pin)
+- ✅ File in-repo `NOTICE` and README attribution sections
+- ✅ Reference the upstream repo in code comments and decision records
+- ❌ `gh repo fork <other-org>/<repo>`
+- ❌ `gh pr create --repo <other-org>/<repo>`
+- ❌ `gh issue create --repo <other-org>/<repo>`
+- ❌ Any auto-posting bot or webhook that touches an external repo
+- ❌ Any commit message, PR description, or comment that "represents"
+  the owner to the upstream maintainers
