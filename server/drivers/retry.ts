@@ -15,7 +15,8 @@ export type TransientReason =
   | "overloaded"
   | "server_error"
   | "connection_reset"
-  | "timeout";
+  | "timeout"
+  | "signaled";
 
 export type TerminalReason =
   | "auth"
@@ -236,6 +237,10 @@ export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
   const exit = err && "exitCode" in err ? err : null;
   if (exit && exit.exitCode !== null && exit.exitCode < 0) return { transient: false, reason: "interrupted" };
+  // POSIX 143/137 (SIGTERM/SIGKILL as an exit status): the CLI was reaped under
+  // us (BOTFLEET-R, SessionEnd hook), so another spawn is worth it.  A driver
+  // interrupt sets retry.cancelled and uses a negative code, handled above.
+  if (exit && (exit.exitCode === 143 || exit.exitCode === 137)) return { transient: true, reason: "signaled" };
 
   for (const { pattern, reason } of PRIORITY_TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };

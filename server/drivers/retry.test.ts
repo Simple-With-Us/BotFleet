@@ -148,6 +148,15 @@ describe("classifyError", () => {
     expect(classifyError({ exitCode: 1, stderr: "Rate limit reached for your plan" })).toEqual(quota);
   });
 
+  it("retries POSIX SIGTERM/SIGKILL exit statuses from a reaped CLI", () => {
+    expect(classifyError({ exitCode: 143 })).toEqual({ transient: true, reason: "signaled" });
+    expect(classifyError({ exitCode: 137 })).toEqual({ transient: true, reason: "signaled" });
+    expect(classifyError({ exitCode: 143, stderr: "claude exited 143 before result" })).toEqual({
+      transient: true,
+      reason: "signaled",
+    });
+  });
+
   it("prefers the transient reading when stderr carries both shapes", () => {
     // a crash whose stderr mentions throttling is worth one more try
     expect(classifyError({ exitCode: 1, stderr: "error: 429 too many requests" })).toEqual({
