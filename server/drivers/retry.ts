@@ -15,7 +15,8 @@ export type TransientReason =
   | "overloaded"
   | "server_error"
   | "connection_reset"
-  | "timeout";
+  | "timeout"
+  | "signaled";
 
 export type TerminalReason =
   | "auth"
@@ -90,14 +91,18 @@ const messageOf = (err: FailureInput): string => {
  *
  * Exit-report shape: a nonzero exit with no error text is treated as
  * terminal (`terminal_exit`) — drivers only reach it after the CLI already
- * reported its own protocol-level failure. A signal kill (negative code) is
- * never retried either.
+ * reported its own protocol-level failure. A negative code is the driver's
+ * own interrupt path and is never retried. POSIX 143/137 (SIGTERM/SIGKILL
+ * as an exit status) is the opposite: the CLI was reaped under us
+ * (BOTFLEET-R, SessionEnd hook) and is worth another spawn unless the
+ * driver already set retry.cancelled.
  */
 export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
   if (err && "exitCode" in err) {
     const { exitCode: code } = err;
     if (code !== null && code < 0) return { transient: false, reason: "interrupted" };
+    if (code === 143 || code === 137) return { transient: true, reason: "signaled" };
     for (const { pattern, reason } of TRANSIENT_PATTERNS) {
       if (pattern.test(text)) return { transient: true, reason };
     }

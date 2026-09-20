@@ -739,21 +739,25 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         active.set(threadId, { stop: () => killCliTree(live.child), turnId, broker: live.broker });
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const written = await writeUser(live, threadId, turn.text);
-        if (!written) {
-          active.delete(threadId);
-          live.turn = null;
-          closeSession(threadId, "stdin write failed");
-          throw new Error("claude session stdin is not writable");
+        if (written) {
+          // the MCP config was for the first spawn; nothing to clean here
+          if (mcpConfigPath) {
+            try {
+              rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
+            } catch {}
+          }
+          return { turnId };
         }
-        // the MCP config was for the first spawn; nothing to clean here
-        if (mcpConfigPath) {
-          try {
-            rmSync(dirname(mcpConfigPath), { recursive: true, force: true });
-          } catch {}
-        }
-        return { turnId };
+        // BOTFLEET-S: a retained CLI can report exitCode=null while stdin is
+        // already closed (half-dead after a SessionEnd hook / prior SIGTERM).
+        // Failing the turn here was the whole incident. Drop the dead session
+        // and spawn fresh the way a spawn-contract change already does.
+        active.delete(threadId);
+        live.turn = null;
+        closeSession(threadId, "stdin write failed");
+      } else if (live) {
+        closeSession(threadId, "spawn contract changed");
       }
-      if (live) closeSession(threadId, "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
