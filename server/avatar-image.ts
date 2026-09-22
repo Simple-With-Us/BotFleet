@@ -14,9 +14,11 @@ const MAX_UPSTREAM_RESPONSE_BYTES = 15 * 1024 * 1024;
 export type AvatarImageProvider = "minimax" | "openai";
 
 const MINIMAX_IMAGE_API = process.env.OMB_MINIMAX_IMAGE_API || "https://api.minimax.io/v1";
-const MINIMAX_IMAGE_MODEL = "dall-e-3";
+const MINIMAX_IMAGE_MODEL = "image-01";
+const MINIMAX_IMAGE_ENDPOINT = `${MINIMAX_IMAGE_API}/image_generation`;
 const OPENAI_IMAGE_API = "https://api.openai.com/v1";
 const OPENAI_IMAGE_MODEL = "gpt-image-2";
+const OPENAI_IMAGE_ENDPOINT = `${OPENAI_IMAGE_API}/images/generations`;
 
 export const avatarGenerationRequestSchema = z.object({
   prompt: z.string().trim().max(AVATAR_DIRECTION_MAX_CHARS).default(""),
@@ -24,6 +26,14 @@ export const avatarGenerationRequestSchema = z.object({
 
 const generatedImageResponseSchema = z.object({
   data: z.array(z.object({ b64_json: z.string().min(1) })).min(1),
+});
+/** MiniMax's `image-01` with `response_format: "base64"` returns an array of
+ * base64 PNG strings nested under `data.image_base64` (not OpenAI's flat
+ * `image_base64`, not OpenAI's `data[].b64_json`). Accept the documented
+ * MiniMax shape first, then the two OpenAI-shaped fallbacks so a future
+ * MiniMax response tweak doesn't 502 every existing call. */
+const minimaxBase64ImageResponseSchema = z.object({
+  data: z.object({ image_base64: z.array(z.string().min(1)).min(1) }),
 });
 
 type AvatarIdentity = Pick<BotRecord, "name" | "title" | "description">;
@@ -63,7 +73,7 @@ export function avatarGenerationPrompt(bot: AvatarIdentity, direction: string): 
 
 export interface GeneratedAvatarImage {
   bytes: Buffer;
-  mime: "image/webp";
+  mime: "image/png" | "image/webp";
 }
 
 /**
@@ -120,21 +130,24 @@ export async function generateAvatarImage(
     );
   }
 
-  // OpenAI's gpt-image-2 path keeps its original `output_format: "webp"` body
-  // and returns webp bytes; the MiniMax surface uses an OpenAI-compatible
-  // dall-e-3-shaped request that returns b64 JSON.  Dispatching the body
-  // keeps both providers honest about what they actually accept.
+  // Two genuinely different surfaces: MiniMax's `image-01` lives at
+  // `/v1/image_generation` with `response_format: "base64"` and returns an
+  // array of base64 PNG strings; OpenAI's `gpt-image-2` lives at
+  // `/v1/images/generations` with `output_format: "webp"` and returns the
+  // `data[].b64_json` webp payload.  Each path keeps its native body and
+  // response parser so a wrong endpoint or model would surface as a 502
+  // upstream error, not a silent 0-byte image.
   const isMiniMax = provider === "minimax";
-  const url = isMiniMax ? `${MINIMAX_IMAGE_API}/images/generations` : `${OPENAI_IMAGE_API}/images/generations`;
+  const url = isMiniMax ? MINIMAX_IMAGE_ENDPOINT : OPENAI_IMAGE_ENDPOINT;
   const model = isMiniMax ? MINIMAX_IMAGE_MODEL : OPENAI_IMAGE_MODEL;
   const errorPrefix = isMiniMax ? "MiniMax" : "OpenAI";
   const body = isMiniMax
     ? JSON.stringify({
         model,
         prompt: avatarGenerationPrompt(bot, direction),
-        size: "1024x1024",
-        quality: "low",
-        response_format: "b64_json",
+        response_format: "base64",
+        image_size: "1024x1024",
+        n: 1,
       })
     : JSON.stringify({
         model,
@@ -193,11 +206,36 @@ export async function generateAvatarImage(
   } catch {
     throw Object.assign(new Error(`${errorPrefix} returned an invalid image response`), { status: 502 });
   }
-  const parsed = generatedImageResponseSchema.safeParse(parsedJson);
-  if (!parsed.success) {
-    throw Object.assign(new Error(`${errorPrefix} returned no generated image`), { status: 502 });
+  // MiniMax returns PNG when `response_format: "base64"` (image-01's native
+  // format); OpenAI's gpt-image-2 with `output_format: "webp"` returns WebP.
+  // The MIME in the response must match the actual bytes — serving PNG with
+  // `Content-Type: image/webp` is rejected by browsers that sniff by magic.
+  let encoded: string;
+  let mime: "image/png" | "image/webp";
+  if (isMiniMax) {
+    const parsedMm = minimaxBase64ImageResponseSchema.safeParse(parsedJson);
+    const encodedMm = parsedMm.success
+      ? parsedMm.data.data.image_base64[0]!
+      : (() => {
+          // Defensive fallback: OpenAI-shaped `data[].b64_json` from a
+          // hypothetical future MiniMax response tweak still decodes, but
+          // the MIME stays PNG because that's what image-01 actually emits.
+          const parsedFallback = generatedImageResponseSchema.safeParse(parsedJson);
+          return parsedFallback.success ? parsedFallback.data.data[0]!.b64_json : null;
+        })();
+    if (!encodedMm) {
+      throw Object.assign(new Error(`${errorPrefix} returned no generated image`), { status: 502 });
+    }
+    encoded = encodedMm;
+    mime = "image/png";
+  } else {
+    const parsed = generatedImageResponseSchema.safeParse(parsedJson);
+    if (!parsed.success) {
+      throw Object.assign(new Error(`${errorPrefix} returned no generated image`), { status: 502 });
+    }
+    encoded = parsed.data.data[0]!.b64_json;
+    mime = "image/webp";
   }
-  const encoded = parsed.data.data[0]!.b64_json;
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0) {
     throw Object.assign(new Error(`${errorPrefix} returned invalid image data`), { status: 502 });
   }
@@ -205,5 +243,5 @@ export async function generateAvatarImage(
   if (bytes.byteLength === 0) {
     throw Object.assign(new Error(`${errorPrefix} returned an empty image`), { status: 502 });
   }
-  return { bytes, mime: "image/webp" };
+  return { bytes, mime };
 }

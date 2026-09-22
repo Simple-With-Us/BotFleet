@@ -10,7 +10,7 @@
 // on this machine, plus (async, best-effort) whatever PATH the user's
 // real login shell reports.
 import { execFile } from "node:child_process";
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, readdirSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, join } from "node:path";
 
@@ -148,7 +148,12 @@ export function resetPathCacheForTests(): void {
 /** Every `name` binary on the augmented PATH as absolute paths, in PATH
  * order (first = what a bare name would run). Used by the Engines panel's
  * "detected" dropdown and the /api/cli-candidates endpoint. A path-ish
- * name is echoed back as-is — it already IS a location. */
+ * name is echoed back as-is — it already IS a location.  Multiple PATH
+ * entries that resolve to the same file (symlinks, copies installed by
+ * different package managers that share an upstream tarball) are deduped
+ * by inode after symlink resolution, keeping PATH order: a bare `grok`
+ * invocation still hits the first match, and the picker only shows one
+ * row for the actual binary the user has. */
 export function findCliCandidates(name: string): string[] {
   if (!name || /[\n\r]/.test(name)) return [];
   if (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name)) return [name];
@@ -163,6 +168,31 @@ export function findCliCandidates(name: string): string[] {
         break;
       }
     }
+  }
+  return dedupeByInode(out);
+}
+
+/** Keep the first occurrence of each unique target file. Symlinks, npm-global
+ * duplicates, and copies that share an upstream tarball collapse to one row.
+ * PATH order is preserved because we walk the input in order and only emit
+ * a path whose inode we haven't seen.  macOS/Linux only; Windows uses
+ * fileIndex+volume unconditionally so this still collapses them on Win32. */
+function dedupeByInode(paths: string[]): string[] {
+  if (paths.length < 2) return paths;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of paths) {
+    try {
+      const real = realpathSync(p);
+      const stat = statSync(real);
+      const key = `${stat.dev}:${stat.ino}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+    } catch {
+      // A path that vanished between existsSync and statSync still surfaces
+      // to the caller — better to show a now-stale row than to silently drop.
+    }
+    out.push(p);
   }
   return out;
 }

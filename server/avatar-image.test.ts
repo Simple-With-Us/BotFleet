@@ -29,24 +29,39 @@ describe("avatar image generation", () => {
     expect(initial).toEqual({ avatarUrl: "/api/attachments/old.webp", avatarCrop: "circle" });
   });
 
-  it("uses one low-quality square MiniMax dall-e-3 request by default and decodes the b64 JSON body", async () => {
-    const bytes = Buffer.from("generated-webp");
+  it("uses MiniMax's native image_generation endpoint by default and decodes the PNG bytes it returns", async () => {
+    // image-01 emits PNG bytes when `response_format: "base64"`; the bytes
+    // themselves don't carry a magic prefix in this fixture but the dispatch
+    // contract still says "image/png" so browsers sniffing by magic accept it.
+    // MiniMax nests the array under `data.image_base64` (per the official
+    // image_generation response shape), unlike OpenAI's flat top-level array.
+    const bytes = Buffer.from("generated-png");
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      data: { image_base64: [bytes.toString("base64")] },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+
+    const result = await generateAvatarImage("sk-image", BOT, "blue robot", fetchMock);
+    expect(result).toEqual({ bytes, mime: "image/png" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.minimax.io/v1/image_generation");
+    expect(init?.headers).toMatchObject({ authorization: "Bearer sk-image" });
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      model: "image-01",
+      response_format: "base64",
+      image_size: "1024x1024",
+      n: 1,
+    });
+  });
+
+  it("falls back to the OpenAI data[].b64_json shape if MiniMax ever returns it (defensive)", async () => {
+    const bytes = Buffer.from("generated-png");
     const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
       data: [{ b64_json: bytes.toString("base64") }],
     }), { status: 200, headers: { "content-type": "application/json" } }));
 
     const result = await generateAvatarImage("sk-image", BOT, "blue robot", fetchMock);
-    expect(result).toEqual({ bytes, mime: "image/webp" });
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const [url, init] = fetchMock.mock.calls[0]!;
-    expect(url).toBe("https://api.minimax.io/v1/images/generations");
-    expect(init?.headers).toMatchObject({ authorization: "Bearer sk-image" });
-    expect(JSON.parse(String(init?.body))).toMatchObject({
-      model: "dall-e-3",
-      size: "1024x1024",
-      quality: "low",
-      response_format: "b64_json",
-    });
+    expect(result).toEqual({ bytes, mime: "image/png" });
   });
 
   it("still routes to OpenAI gpt-image-2 + webp when the operator picks that provider", async () => {
@@ -73,7 +88,7 @@ describe("avatar image generation", () => {
   });
 
   it("never exposes malformed upstream bodies as image data", async () => {
-    const malformed = vi.fn<typeof fetch>(async () => new Response('{"data":[]}', { status: 200 }));
+    const malformed = vi.fn<typeof fetch>(async () => new Response('{"image_base64":[]}', { status: 200 }));
     await expect(generateAvatarImage("sk-image", BOT, "", malformed))
       .rejects.toThrow("no generated image");
   });
