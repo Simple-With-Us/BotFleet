@@ -485,7 +485,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "turn/completed": {
             const t = p.turn ?? {};
-            settle(t.status === "completed", t.status === "completed" ? null : (t.error?.message ?? t.status ?? "failed"));
+            const reason = t.error?.message ?? t.status ?? "failed";
+            const unavailable = classifyError({ text: String(reason) }).reason === "unknown_model";
+            settle(t.status === "completed", t.status === "completed" ? null : unavailable
+              ? `Selected Codex model ${turn.model ?? "default"} is unavailable for this account or CLI.  Pick another model in bot settings.  ${reason}`
+              : reason);
             break;
           }
           case "error":
@@ -632,11 +636,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           : "text" in failure
             ? failure.text
             : String(failure);
-        const message = resumeFailure && failureMessage !== e.message
-          ? `${e.message}  ${failureMessage}`
-          : failureMessage;
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(failureMessage);
         const verdict = classifyError(failure);
+        const message = verdict.reason === "unknown_model"
+          ? `Selected Codex model ${turn.model ?? "default"} is unavailable for this account or CLI.  Pick another model in bot settings.  ${failureMessage}`
+          : resumeFailure && failureMessage !== e.message
+            ? `${e.message}  ${failureMessage}`
+            : failureMessage;
         if (!state.settled && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           const delayMs = computeBackoff(attempt);
           attempt++;

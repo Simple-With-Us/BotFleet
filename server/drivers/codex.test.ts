@@ -425,6 +425,18 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.some((event) => event.type === "session.started")).toBe(false);
   });
 
+  it("explains how to recover from an unavailable saved Codex model", async () => {
+    await create({ mode: "unknown-model" });
+
+    await instance.adapter.sendTurn({ threadId: "t-model-unavailable", text: "go", model: "gpt-6-luna" });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({ message: expect.stringMatching(/Selected Codex model gpt-6-luna is unavailable.*Pick another model in bot settings/s) });
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.some((event) => event.type === "turn.retrying")).toBe(false);
+  });
+
   it("surfaces an approval request and forwards the user's decision", async () => {
     await create({ mode: "approval" });
     const dump = join(scratch, "dump.json");

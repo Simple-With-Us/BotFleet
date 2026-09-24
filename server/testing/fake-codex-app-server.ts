@@ -152,6 +152,10 @@ process.stdin.on("data", (chunk) => {
         }
         break;
       case "thread/start":
+        if (mode === "unknown-model") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
+          break;
+        }
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
       case "turn/start": {
