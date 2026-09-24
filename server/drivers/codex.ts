@@ -487,9 +487,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const t = p.turn ?? {};
             const reason = t.error?.message ?? t.status ?? "failed";
             const unavailable = classifyError({ text: String(reason) }).reason === "unknown_model";
-            settle(t.status === "completed", t.status === "completed" ? null : unavailable
+            const failureMessage = unavailable
               ? `Selected Codex model ${turn.model ?? "default"} is unavailable for this account or CLI.  Pick another model in bot settings.  ${reason}`
-              : reason);
+              : reason;
+            if (t.status !== "completed" && unavailable) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: failureMessage });
+            }
+            settle(t.status === "completed", t.status === "completed" ? null : failureMessage);
             break;
           }
           case "error":
@@ -638,10 +642,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             : String(failure);
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(failureMessage);
         const verdict = classifyError(failure);
-        const message = verdict.reason === "unknown_model"
-          ? `Selected Codex model ${turn.model ?? "default"} is unavailable for this account or CLI.  Pick another model in bot settings.  ${failureMessage}`
-          : resumeFailure && failureMessage !== e.message
-            ? `${e.message}  ${failureMessage}`
+        const message = resumeFailure
+          ? failureMessage !== e.message ? `${e.message}  ${failureMessage}` : e.message
+          : verdict.reason === "unknown_model"
+            ? `Selected Codex model ${turn.model ?? "default"} is unavailable for this account or CLI.  Pick another model in bot settings.  ${failureMessage}`
             : failureMessage;
         if (!state.settled && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           const delayMs = computeBackoff(attempt);

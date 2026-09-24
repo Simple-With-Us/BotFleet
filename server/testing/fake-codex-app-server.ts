@@ -131,6 +131,8 @@ process.stdin.on("data", (chunk) => {
             id: msg.id,
             error: { code: -32603, message: "unexpected status 401 Unauthorized: Missing bearer" },
           });
+        } else if (mode === "resume-unknown-model") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
         } else if (mode === "resume-transient" && process.env.FAKE_CODEX_STATE) {
           let launched = 0;
           try {
@@ -198,6 +200,10 @@ process.stdin.on("data", (chunk) => {
           }
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+        if (mode === "async-unknown-model") {
+          notify("turn/completed", { turn: { status: "failed", error: { message: "model not found" } } });
+          break;
+        }
         const command = mode === "windows-command"
           ? [
               "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",

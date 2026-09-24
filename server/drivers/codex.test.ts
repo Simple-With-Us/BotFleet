@@ -437,6 +437,35 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.some((event) => event.type === "turn.retrying")).toBe(false);
   });
 
+  it("keeps fresh-session guidance when a missing model blocks session resume", async () => {
+    await create({ mode: "resume-unknown-model" });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-missing-model",
+      text: "continue",
+      model: "gpt-5.6-luna",
+      resumeCursor: "old-thread",
+    });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({ message: expect.stringMatching(/Start a fresh task or rewind this conversation/) });
+    expect(JSON.stringify(error)).not.toMatch(/Pick another model in bot settings/);
+    expect(done).toMatchObject({ ok: false, stopReason: "resume_failed" });
+  });
+
+  it("shows an asynchronous model rejection in the transcript", async () => {
+    await create({ mode: "async-unknown-model" });
+
+    await instance.adapter.sendTurn({ threadId: "t-async-missing-model", text: "go", model: "gpt-6-luna" });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({ message: expect.stringMatching(/Selected Codex model gpt-6-luna is unavailable.*Pick another model in bot settings/s) });
+    expect(done).toMatchObject({ ok: false, stopReason: expect.stringMatching(/Pick another model in bot settings/) });
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+  });
+
   it("surfaces an approval request and forwards the user's decision", async () => {
     await create({ mode: "approval" });
     const dump = join(scratch, "dump.json");
