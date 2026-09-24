@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import {
   decodeCodexSelection,
   encodeCodexSelection,
   OFFICIAL_CODEX_PROVIDER,
+  readCodexAppServerModelCatalog,
   readCodexModelCatalog,
   STATIC_CODEX_MODELS,
 } from "./codex-catalog.ts";
@@ -80,6 +81,20 @@ describe("readCodexModelCatalog", () => {
     const home = scratchHome({});
     const missingCli = join(home, "missing-codex-cli");
     expect(await readCodexModelCatalog({ HOME: home }, fetch, missingCli)).toEqual(STATIC_CODEX_MODELS);
+  });
+
+  it("ends a stalled app-server model probe instead of inventing availability", async () => {
+    chmodSync(FAKE_CLI, 0o755);
+    const home = scratchHome({});
+    const dumpPath = join(home, "calls.json");
+    const catalog = await readCodexAppServerModelCatalog(
+      FAKE_CLI,
+      { HOME: home, PATH: process.env.PATH, FAKE_CODEX_MODE: "models-hang", FAKE_CODEX_DUMP: dumpPath },
+      2_000,
+    );
+    expect(catalog).toBeNull();
+    const calls = JSON.parse(readFileSync(dumpPath, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("model/list");
   });
 
   it("uses every visible page from the installed Codex app-server catalog", async () => {

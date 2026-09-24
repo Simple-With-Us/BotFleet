@@ -90,6 +90,7 @@ process.stdin.on("data", (chunk) => {
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         break;
       case "model/list":
+        if (mode === "models-hang") break;
         if (msg.params?.cursor === "page-2") {
           out({
             jsonrpc: "2.0",
