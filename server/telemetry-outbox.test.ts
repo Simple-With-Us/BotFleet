@@ -86,6 +86,123 @@ describe("UsageTelemetryOutbox", () => {
     await restarted.dispose();
   });
 
+  it.each([400, 409] as const)("quarantines terminal HTTP %i and drains the next batch", async (status) => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const delivered: string[] = [];
+    const outbox = new UsageTelemetryOutbox({ path });
+    outbox.enqueue(destinationHash, batch("poison"));
+    outbox.enqueue(destinationHash, batch("later"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => {
+        const id = posted.events[0]!.eventId;
+        delivered.push(id);
+        return id === "poison"
+          ? { acknowledged: false, rejected: 0, terminalStatus: status }
+          : { acknowledged: true, rejected: 0 };
+      },
+    }));
+    await outbox.flushNow();
+
+    expect(delivered).toEqual(["poison", "later"]);
+    expect(outbox.status()).toMatchObject({
+      queuedBatches: 0,
+      terminalQuarantinedBatches: 1,
+      lastTerminalStatus: status,
+      lastTerminalAt: expect.any(String),
+    });
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.terminalQuarantine[0]).toMatchObject({
+      status,
+      entry: { batch: { events: [{ eventId: "poison" }] } },
+    });
+    await outbox.dispose();
+
+    const restarted = new UsageTelemetryOutbox({ path });
+    expect(restarted.status()).toMatchObject({
+      queuedBatches: 0,
+      terminalQuarantinedBatches: 1,
+      lastTerminalStatus: status,
+      lastTerminalAt: stored.terminalQuarantine[0].quarantinedAt,
+    });
+    await restarted.dispose();
+  });
+
+  it("keeps 429 and 503 at the queue head for retry", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    let now = 1_000;
+    let status = 429;
+    const delivered: string[] = [];
+    const outbox = new UsageTelemetryOutbox({ path, now: () => now, retryBaseMs: 10 });
+    outbox.enqueue(destinationHash, batch("first"));
+    outbox.enqueue(destinationHash, batch("later"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => {
+        delivered.push(posted.events[0]!.eventId);
+        return status === 200
+          ? { acknowledged: true, rejected: 0 }
+          : { acknowledged: false, rejected: 0 };
+      },
+    }));
+    await outbox.flushNow();
+    status = 503;
+    now += 10;
+    await outbox.flushNow();
+    expect(delivered).toEqual(["first", "first"]);
+    expect(outbox.status()).toMatchObject({ queuedBatches: 2, terminalQuarantinedBatches: 0 });
+    status = 200;
+    now += 20;
+    await outbox.flushNow();
+    expect(delivered).toEqual(["first", "first", "first", "later"]);
+    await outbox.dispose();
+  });
+
+  it("bounds terminal quarantine with an explicit eviction count", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const outbox = new UsageTelemetryOutbox({ path, maxQuarantinedBatches: 1 });
+    outbox.enqueue(destinationHash, batch("first"));
+    outbox.enqueue(destinationHash, batch("second"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async () => ({ acknowledged: false, rejected: 0, terminalStatus: 409 }),
+    }));
+    await outbox.flushNow();
+    expect(outbox.status()).toMatchObject({ terminalQuarantinedBatches: 1, terminalQuarantineEvictedBatches: 1 });
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.terminalQuarantine[0].entry.batch.events[0].eventId).toBe("second");
+    await outbox.dispose();
+  });
+
+  it("keeps a terminal batch queued when its quarantine write fails", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const outbox = new UsageTelemetryOutbox({
+      path,
+      retryBaseMs: 60_000,
+      writeState: (target, state) => {
+        if (state.terminalQuarantine.length) throw new Error("disk full");
+        writeFileSync(target, JSON.stringify(state));
+      },
+    });
+    outbox.enqueue(destinationHash, batch("must-survive"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async () => ({ acknowledged: false, rejected: 0, terminalStatus: 409 }),
+    }));
+    await outbox.flushNow();
+    expect(outbox.status()).toMatchObject({ queuedBatches: 1, terminalQuarantinedBatches: 0 });
+    await outbox.dispose();
+
+    const restarted = new UsageTelemetryOutbox({ path });
+    expect(restarted.status()).toMatchObject({ queuedBatches: 1, terminalQuarantinedBatches: 0 });
+    expect(JSON.parse(readFileSync(path, "utf8")).queue[0].batch.events[0].eventId).toBe("must-survive");
+    await restarted.dispose();
+  });
+
   it("does not replay a queued batch to a changed destination", async () => {
     const path = fixture();
     const oldHash = usageTelemetryDestinationHash("https://old.example.com/api/ingest/usage");

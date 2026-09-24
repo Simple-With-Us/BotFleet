@@ -302,11 +302,14 @@ function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?
   span.setAttribute("gen_ai.usage.cost", cost);
 }
 
+const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted"]);
+
 function endTurn(
   key: string,
   ok: boolean,
   usage?: { input?: number; output?: number; cachedInput?: number; cost?: number | null },
   billingMode?: "actual" | "estimated",
+  expectedStop = false,
 ): void {
   const turn = turns.get(key);
   reportedProviderErrors.delete(key);
@@ -317,7 +320,7 @@ function endTurn(
   if (usage?.output != null) turn.span.setAttribute("gen_ai.usage.output_tokens", usage.output);
   if (usage?.cachedInput != null) turn.span.setAttribute("gen_ai.usage.input_tokens.cached", usage.cachedInput);
   applyCost(turn.span, usage?.cost, billingMode);
-  if (!ok) turn.span.setStatus?.({ code: 2, message: "internal_error" });
+  if (!ok && !expectedStop) turn.span.setStatus?.({ code: 2, message: "internal_error" });
   turn.span.end();
   turns.delete(key);
 }
@@ -523,15 +526,16 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
     }
     case "turn.completed": {
       const runtimeErrorReported = reportedProviderErrors.has(key);
+      const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
+      const expectedStop = !event.ok && !runtimeErrorReported && EXPECTED_TURN_STOPS.has(stopReason);
       if (!event.ok) {
         // A failed turn is the thing an operator wants an Issue for.  Most
         // drivers report the failure only here — they never emit
         // runtime.error — so without this a broken engine was invisible.
-        const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
         // OpenAI-compatible, Grok, BoxAgent, and chat-completions drivers
         // report a user-initiated stop as "interrupted" rather than
         // "cancelled" — both are the expected, benign shape of a stop.
-        if (stopReason === "auth_required" || stopReason === "cancelled" || stopReason === "interrupted") {
+        if (expectedStop) {
           sink.addBreadcrumb?.({
             category: "botfleet.turn",
             message: `bot turn failed: ${stopReason}`,
@@ -545,7 +549,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           });
         }
       }
-      endTurn(key, event.ok, { ...event.usage, cost: event.cost }, event.billingMode);
+      endTurn(key, event.ok, { ...event.usage, cost: event.cost }, event.billingMode, expectedStop);
       break;
     }
     default:

@@ -34,6 +34,10 @@ const child = spawn(process.execPath, [join(staging, "server", "index.js")], {
     HOME: home,
     USERPROFILE: home,
     OMB_PORT: String(port),
+    // This fake loopback DSN exercises SDK loading without contacting the
+    // owner's Sentry project.  The staged server has no node_modules.
+    SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",
+    SENTRY_TRACES_SAMPLE_RATE: "0",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -92,6 +96,19 @@ if (listening) {
       publicHealth.sourceCommit !== undefined || JSON.stringify(actual).includes(owner.nonce)) {
     cleanup();
     throw new Error("Packaged runtime identity, authentication, or redaction contract failed");
+  }
+
+  // Health can pass even if the optional SDK failed to load.  Assert its
+  // actual packaged initialization path without emitting a test event.
+  const observabilityResponse = await fetch(`http://127.0.0.1:${port}/api/observability`, {
+    headers: { authorization: `Bearer ${owner.nonce}` },
+  });
+  const observability = observabilityResponse.ok ? await observabilityResponse.json() : null;
+  if (!observabilityResponse.ok || !observability?.configured || !observability?.enabled ||
+      observability?.source !== "env" || observability?.lastError !== null ||
+      observability?.host !== "127.0.0.1:1" || observability?.projectId !== "1") {
+    cleanup();
+    throw new Error("Packaged Sentry SDK did not initialize from the synthetic loopback DSN");
   }
 }
 

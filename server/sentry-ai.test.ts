@@ -442,24 +442,37 @@ describe("failed turns become Issues", () => {
   });
 
   it("does not Issue expected setup or cancel stop reasons", () => {
-    const { sink, exceptions, breadcrumbs } = recordingSink();
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "auth_required" }), sink);
     observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled", turnId: "turn-2" }), sink);
     expect(exceptions).toHaveLength(0);
     expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(2);
+    expect(spans.map((span) => span.status)).toEqual([undefined, undefined]);
+    expect(spans.every((span) => span.ended)).toBe(true);
   });
 
   it("does not Issue an 'interrupted' stop reason (openai-compat/Grok/BoxAgent stop shape)", () => {
     // Those drivers report a user-initiated stop as stopReason "interrupted"
     // rather than "cancelled" — this must be treated as the same expected,
     // benign shape of a stop, not sent to Sentry as an error.
-    const { sink, exceptions, breadcrumbs } = recordingSink();
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "interrupted" }), sink);
     expect(exceptions).toHaveLength(0);
     expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+    expect(spans[0].status).toBeUndefined();
+    expect(spans[0].ended).toBe(true);
+  });
+
+  it("keeps a provider error status when a later stop says cancelled", () => {
+    const { sink, exceptions, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "upstream HTTP 500" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(spans[0].status).toEqual({ code: 2, message: "internal_error" });
   });
 });
 

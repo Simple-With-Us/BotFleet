@@ -55,6 +55,10 @@ export interface TelemetryStatus {
   persistenceFailures: number;
   nonDurableBatches: number;
   corruptFilesQuarantined: number;
+  terminalQuarantinedBatches: number;
+  terminalQuarantineEvictedBatches: number;
+  lastTerminalStatus: 400 | 409 | null;
+  lastTerminalAt: string | null;
   lastAckAt: string | null;
   lastError: string | null;
 }
@@ -519,6 +523,10 @@ export class UsageTelemetryManager {
       persistenceFailures: 0,
       nonDurableBatches: 0,
       corruptFilesQuarantined: 0,
+      terminalQuarantinedBatches: 0,
+      terminalQuarantineEvictedBatches: 0,
+      lastTerminalStatus: null,
+      lastTerminalAt: null,
     };
     return {
       enabled: config !== null,
@@ -602,7 +610,7 @@ export class UsageTelemetryManager {
     endpoint: string,
     token: string,
     batch: DurableTelemetryBatch,
-  ): Promise<{ ok: boolean; error: string | null; acknowledged: boolean; rejected: number }> {
+  ): Promise<{ ok: boolean; error: string | null; acknowledged: boolean; rejected: number; terminalStatus?: 400 | 409 }> {
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -652,6 +660,8 @@ export class UsageTelemetryManager {
         error,
         acknowledged: false,
         rejected: 0,
+        ...(res.status === 400 ? { terminalStatus: 400 as const }
+          : res.status === 409 ? { terminalStatus: 409 as const } : {}),
       };
     } catch (err) {
       const reason = err instanceof Error && err.name ? err.name : "unknown";

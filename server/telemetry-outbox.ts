@@ -20,6 +20,7 @@ export interface DurableTelemetryBatch {
 export interface TelemetryDeliveryResult {
   acknowledged: boolean;
   rejected: number;
+  terminalStatus?: 400 | 409;
 }
 
 export interface TelemetryOutboxStatus {
@@ -34,6 +35,10 @@ export interface TelemetryOutboxStatus {
   persistenceFailures: number;
   nonDurableBatches: number;
   corruptFilesQuarantined: number;
+  terminalQuarantinedBatches: number;
+  terminalQuarantineEvictedBatches: number;
+  lastTerminalStatus: 400 | 409 | null;
+  lastTerminalAt: string | null;
 }
 
 const DurableTelemetryBatchSchema = z.object({
@@ -52,6 +57,12 @@ const QueuedBatchSchema = z.object({
   batch: DurableTelemetryBatchSchema,
 });
 
+const QuarantinedBatchSchema = z.object({
+  entry: QueuedBatchSchema,
+  status: z.union([z.literal(400), z.literal(409)]),
+  quarantinedAt: z.iso.datetime(),
+});
+
 const StoredOutboxSchema = z.object({
   version: z.literal(2),
   queue: z.array(QueuedBatchSchema),
@@ -62,6 +73,8 @@ const StoredOutboxSchema = z.object({
   failedAttempts: z.number().int().nonnegative(),
   persistenceFailures: z.number().int().nonnegative(),
   corruptFilesQuarantined: z.number().int().nonnegative(),
+  terminalQuarantine: z.array(QuarantinedBatchSchema).default([]),
+  terminalQuarantineEvictedBatches: z.number().int().nonnegative().default(0),
 });
 
 type StoredOutbox = z.infer<typeof StoredOutboxSchema>;
@@ -74,11 +87,12 @@ interface DeliveryContext {
 interface OutboxOptions {
   path: string;
   maxBatches?: number;
+  maxQuarantinedBatches?: number;
   now?: () => number;
   retryBaseMs?: number;
   retryMaxMs?: number;
   writeState?: (path: string, state: StoredOutbox) => void;
-  onDiagnostic?: (name: "delivery_failed" | "events_rejected" | "overflow_dropped" | "destination_changed" | "persistence_failed" | "corrupt_quarantined", count: number) => void;
+  onDiagnostic?: (name: "delivery_failed" | "events_rejected" | "overflow_dropped" | "destination_changed" | "persistence_failed" | "corrupt_quarantined" | "terminal_quarantined" | "terminal_quarantine_evicted", count: number) => void;
 }
 
 const SAFE_EVENT_KEYS = [
@@ -138,6 +152,8 @@ function emptyState(): StoredOutbox {
     failedAttempts: 0,
     persistenceFailures: 0,
     corruptFilesQuarantined: 0,
+    terminalQuarantine: [],
+    terminalQuarantineEvictedBatches: 0,
   };
 }
 
@@ -189,6 +205,7 @@ function sanitizeBatchForPersistence(batch: DurableTelemetryBatch): DurableTelem
 export class UsageTelemetryOutbox {
   private readonly path: string;
   private readonly maxBatches: number;
+  private readonly maxQuarantinedBatches: number;
   private readonly now: () => number;
   private readonly retryBaseMs: number;
   private readonly retryMaxMs: number;
@@ -205,6 +222,7 @@ export class UsageTelemetryOutbox {
   constructor(options: OutboxOptions) {
     this.path = options.path;
     this.maxBatches = Math.max(1, Math.floor(options.maxBatches ?? 500));
+    this.maxQuarantinedBatches = Math.max(1, Math.floor(options.maxQuarantinedBatches ?? 100));
     this.now = options.now ?? Date.now;
     this.retryBaseMs = Math.max(1, options.retryBaseMs ?? 1_000);
     this.retryMaxMs = Math.max(this.retryBaseMs, options.retryMaxMs ?? 300_000);
@@ -270,6 +288,10 @@ export class UsageTelemetryOutbox {
       persistenceFailures: this.state.persistenceFailures,
       nonDurableBatches: this.pendingDurability.size,
       corruptFilesQuarantined: this.state.corruptFilesQuarantined,
+      terminalQuarantinedBatches: this.state.terminalQuarantine.length,
+      terminalQuarantineEvictedBatches: this.state.terminalQuarantineEvictedBatches,
+      lastTerminalStatus: this.state.terminalQuarantine.at(-1)?.status ?? null,
+      lastTerminalAt: this.state.terminalQuarantine.at(-1)?.quarantinedAt ?? null,
     };
   }
 
@@ -342,6 +364,35 @@ export class UsageTelemetryOutbox {
         continue;
       }
       if (liveIndex < 0) continue;
+      if (result.terminalStatus === 400 || result.terminalStatus === 409) {
+        // Keep the original sanitized batch and event IDs for repair.  Move
+        // it atomically with queue removal so a failed write cannot lose it.
+        const previousQueue = this.state.queue.slice();
+        const previousQuarantine = this.state.terminalQuarantine.slice();
+        const previousEvictions = this.state.terminalQuarantineEvictedBatches;
+        this.state.terminalQuarantine.push({
+          entry: this.state.queue[liveIndex],
+          status: result.terminalStatus,
+          quarantinedAt: new Date(this.now()).toISOString(),
+        });
+        this.state.queue.splice(liveIndex, 1);
+        if (this.state.terminalQuarantine.length > this.maxQuarantinedBatches) {
+          this.state.terminalQuarantine.shift();
+          this.state.terminalQuarantineEvictedBatches += 1;
+        }
+        if (!this.persist()) {
+          this.state.queue = previousQueue;
+          this.state.terminalQuarantine = previousQuarantine;
+          this.state.terminalQuarantineEvictedBatches = previousEvictions;
+          this.schedule(this.retryBaseMs);
+          return;
+        }
+        this.diagnostic("terminal_quarantined", 1);
+        if (this.state.terminalQuarantineEvictedBatches > previousEvictions) {
+          this.diagnostic("terminal_quarantine_evicted", 1);
+        }
+        continue;
+      }
       const liveEntry = this.state.queue[liveIndex];
       liveEntry.attempts += 1;
       this.state.failedAttempts += 1;
@@ -405,7 +456,7 @@ export class UsageTelemetryOutbox {
   }
 
   private diagnostic(
-    name: "delivery_failed" | "events_rejected" | "overflow_dropped" | "destination_changed" | "persistence_failed" | "corrupt_quarantined",
+    name: "delivery_failed" | "events_rejected" | "overflow_dropped" | "destination_changed" | "persistence_failed" | "corrupt_quarantined" | "terminal_quarantined" | "terminal_quarantine_evicted",
     count: number,
   ): void {
     try {
