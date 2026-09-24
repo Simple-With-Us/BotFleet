@@ -989,6 +989,24 @@ describe("Store patchBot modelSelection", () => {
     expect(store.taskByThread(bot.id, bot.threadId)?.activeModelSelection).toBeUndefined();
   });
 
+  it("preserves activeModelSelection on inheriting tasks when only effort is stripped or changed", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.patchTask(bot.id, bot.threadId, {
+      activeModelSelection: { instanceId: "fallback", model: "fallback-model" },
+    });
+
+    // Update only effort on bot without changing instanceId or model
+    store.patchBot(bot.id, {
+      modelSelection: { ...bot.modelSelection, effort: undefined },
+    });
+
+    expect(store.taskByThread(bot.id, bot.threadId)?.activeModelSelection).toEqual({
+      instanceId: "fallback",
+      model: "fallback-model",
+    });
+  });
+
   it("preserves activeModelSelection on tasks with their own modelSelection override", () => {
     const store = new Store(selection);
     const bot = store.createBot();
