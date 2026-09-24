@@ -246,13 +246,14 @@ describe("list_routines", () => {
     const executeListRoutinesRequest = vi.fn(() => ({ status: 200, body: { routines: [] } }));
     const tools = createAgentTools(deps({ executeListRoutinesRequest }));
     await tools.list_routines(
-      call("list_routines", { fromBotId: "bot-other", fromThreadId: "thread-9" }),
+      call("list_routines", { fromBotId: "bot-other", fromThreadId: "thread-9", routine_id: "routine-7" }),
       ctx(),
       runtime,
     );
     expect(executeListRoutinesRequest).toHaveBeenCalledWith({
       fromBotId: "bot-self",
       fromThreadId: "thread-1",
+      routineId: "routine-7",
     });
   });
 

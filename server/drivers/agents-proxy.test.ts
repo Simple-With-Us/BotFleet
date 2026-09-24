@@ -319,6 +319,20 @@ describe("agents-proxy MCP surface", () => {
     expect(lastAuth).toBe(`Bearer ${TOKEN}`);
   });
 
+  it("requests full instructions by routine id while keeping the caller identity fixed", async () => {
+    routinesResponse = {
+      now: "2026-08-28T10:30:00.000Z",
+      timeZone: "Asia/Kolkata",
+      routine: { id: "routine-1", instructions: "Full redacted instructions" },
+    };
+    const res = await callTool("list_routines", { routine_id: "routine-1", fromBotId: "bot-other" });
+    expect(res.result.content[0].text).toContain("Full redacted instructions");
+    const query = new URL(lastRoutineQuery, "http://localhost").searchParams;
+    expect(query.get("routineId")).toBe("routine-1");
+    expect(query.get("fromBotId")).toBe("bot-asker");
+    expect(query.get("fromThreadId")).toBe("thread-asker-routine");
+  });
+
   it("proposes a weekly routine through a confirmation-only request", async () => {
     lastRoutineRequestBody = null;
     const res = await callTool("propose_routine", {

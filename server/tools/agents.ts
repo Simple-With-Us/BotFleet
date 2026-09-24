@@ -103,6 +103,7 @@ export interface AskBotRequestInput {
 export interface ListRoutinesRequestInput {
   fromBotId: string;
   fromThreadId?: string;
+  routineId?: string;
 }
 
 export interface DelegateBotRequestInput {
@@ -427,23 +428,28 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       };
     },
 
-    async list_routines(_call, ctx): Promise<TurnToolOutcome> {
+    async list_routines(call, ctx): Promise<TurnToolOutcome> {
+      const routineId = typeof call.arguments.routine_id === "string"
+        ? call.arguments.routine_id.trim()
+        : "";
       const result = await deps.executeListRoutinesRequest({
         fromBotId: ctx.botId,
         fromThreadId: ctx.threadId,
+        ...(routineId ? { routineId } : {}),
       });
       if (result.status !== 200) {
         const message = errorText(result.body, "routines are unavailable");
         return failed(JSON.stringify({ error: message }), message);
       }
       const routines = Array.isArray(result.body.routines) ? result.body.routines : [];
+      const routine = result.body.routine;
       return ok(
         JSON.stringify({
           now: result.body.now,
           timeZone: result.body.timeZone,
-          routines,
+          ...(routine ? { routine } : { routines }),
         }),
-        routines.length === 1 ? "1 routine" : `${routines.length} routines`,
+        routine ? "routine instructions" : routines.length === 1 ? "1 routine" : `${routines.length} routines`,
       );
     },
 

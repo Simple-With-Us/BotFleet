@@ -3823,6 +3823,7 @@ describe("harness HTTP API", () => {
     const bot = (await api("POST", "/api/bots", {})).body.bot;
     let routineId = "";
     let legacyRoutineId = "";
+    const bulkRoutineIds: string[] = [];
     try {
       const selected = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
@@ -3941,6 +3942,19 @@ describe("harness HTTP API", () => {
         schedule: { type: "daily", time: "10:00", weekdays: [1] },
       });
       legacyRoutineId = legacy.body.routine.id;
+      // Exercise the maximum list size with maximum-size instructions without
+      // logging or snapshotting any instruction text.
+      for (let index = 0; index < 98; index += 1) {
+        const bulk = await api("POST", "/api/routines", {
+          name: `Budget probe ${index}`,
+          prompt: "x".repeat(2_000),
+          botId: bot.id,
+          runOn: "maus",
+          enabled: false,
+          schedule: { type: "daily", time: "10:00", weekdays: [1] },
+        });
+        bulkRoutineIds.push(bulk.body.routine.id);
+      }
       expect(legacy.body.routine.schedule.timeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
       const listed = await fetch(
         `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}`,
@@ -3950,17 +3964,40 @@ describe("harness HTTP API", () => {
       const listedBody = z.object({
         routines: z.array(z.object({
           id: z.string(),
-          instructions: z.string(),
-          instructionsTruncated: z.boolean(),
+          instructionsPreview: z.string(),
+          instructionsPreviewTruncated: z.boolean(),
           schedule: z.object({ timeZone: z.string().optional() }).passthrough(),
         }).passthrough()),
       }).parse(await listed.json());
+      expect(listedBody.routines).toHaveLength(100);
+      expect(Buffer.byteLength(JSON.stringify(listedBody))).toBeLessThan(50_000);
       const legacyResult = listedBody.routines.find((routine) => routine.id === legacyRoutineId)!;
       expect(legacyResult.schedule.timeZone).toBeUndefined();
-      expect(legacyResult.instructions).not.toContain(fakeSecret);
+      expect(legacyResult.instructionsPreview).not.toContain(fakeSecret);
       expect(legacyResult.name).not.toContain(fakeNameSecret);
-      expect(legacyResult.instructions).toContain("redacted");
-      expect(legacyResult.instructionsTruncated).toBe(true);
+      expect(legacyResult.instructionsPreview).toContain("redacted");
+      expect(legacyResult.instructionsPreviewTruncated).toBe(true);
+
+      const detail = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}&routineId=${encodeURIComponent(legacyRoutineId)}`,
+        { headers: internalHeaders },
+      );
+      expect(detail.status).toBe(200);
+      const detailBody = z.object({ routine: z.object({ id: z.string(), instructions: z.string() }) }).passthrough().parse(await detail.json());
+      expect(detailBody.routine.id).toBe(legacyRoutineId);
+      expect(detailBody.routine.instructions.length).toBeGreaterThan(2_000);
+      expect(detailBody.routine.instructions).not.toContain(fakeSecret);
+      expect(detailBody.routine.instructions).toContain("redacted");
+      const hiddenDetail = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=${encodeURIComponent(bot.threadId)}&routineId=not-owned-by-this-bot`,
+        { headers: internalHeaders },
+      );
+      expect(hiddenDetail.status).toBe(404);
+      const wrongDetailThread = await fetch(
+        `${BASE}/api/internal/routines?fromBotId=${encodeURIComponent(bot.id)}&fromThreadId=not-this-bots-thread&routineId=${encodeURIComponent(legacyRoutineId)}`,
+        { headers: internalHeaders },
+      );
+      expect(wrongDetailThread.status).toBe(403);
 
       // Echoing the bot-facing listing into a normal time edit must not turn
       // its display-only harness zone into a stored recurrence zone.
@@ -4010,12 +4047,13 @@ describe("harness HTTP API", () => {
       });
       expect(wrongThread.status).toBe(403);
     } finally {
+      for (const bulkRoutineId of bulkRoutineIds) await api("DELETE", `/api/routines/${bulkRoutineId}`);
       if (legacyRoutineId) await api("DELETE", `/api/routines/${legacyRoutineId}`);
       if (routineId) await api("DELETE", `/api/routines/${routineId}`);
       await api("POST", `/api/bots/${bot.id}/interrupt`);
       await api("DELETE", `/api/bots/${bot.id}`);
     }
-  });
+  }, 60_000);
 
   it("validates the non-secret VPS alias and keeps old bots on Box by default", async () => {
     const before = await api("GET", "/api/bots");

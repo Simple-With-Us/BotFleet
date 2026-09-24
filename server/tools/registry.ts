@@ -448,8 +448,18 @@ const PROPOSE_ROUTINE_ACTION: HarnessTool = {
 const LIST_ROUTINES: HarnessTool = {
   name: "list_routines",
   description:
-    "List routines owned by this bot, including their ids, schedules, status, and next run. The result includes the computer's authoritative current time and timezone; use those when interpreting relative dates. Only call this when the user asks about routines or wants to change one.",
-  schema: { type: "object", additionalProperties: false, properties: {} },
+    "List routines owned by this bot with ids, schedules, status, next run, and short instruction previews.  The result includes the computer's authoritative current time and timezone; use those when interpreting relative dates.  To retrieve full instructions for one routine, call list_routines with its routine_id from the list.  Only call this when the user asks about routines or wants to change one.",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      routine_id: {
+        type: "string",
+        minLength: 1,
+        description: "Optional routine id from the list; returns full instructions for only that routine.",
+      },
+    },
+  },
   surfaces: { mcp: true, http: true },
   // Not a peer hop, so the recursion ceiling does not apply: a bot four
   // hops deep can still be asked what it has scheduled.  It rides the
@@ -458,7 +468,7 @@ const LIST_ROUTINES: HarnessTool = {
   sideEffect: "read",
   settles: "immediate",
   promptFragment:
-    "Use list_routines to read this bot's scheduled work, and treat the current time it returns as authoritative for relative dates.",
+    "Use list_routines to read this bot's scheduled work, and treat the current time it returns as authoritative for relative dates.  The list contains short instruction previews; pass a routine_id from the list to retrieve that routine's full instructions.",
 };
 
 /** The `create_bot` per-turn cap, shared so the two lanes cannot drift on

@@ -211,16 +211,21 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     };
   }
   if (name === "list_routines") {
+    const routineId = typeof args.routine_id === "string" ? args.routine_id.trim() : "";
     const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID });
+    if (routineId) query.set("routineId", routineId);
     const r = await api(`/api/internal/routines?${query.toString()}`);
     const routines = Array.isArray(r.routines) ? r.routines : [];
     const now = typeof r.now === "string" ? r.now : new Date().toISOString();
     const timeZone = typeof r.timeZone === "string" && r.timeZone ? r.timeZone : "local computer timezone";
+    if (r.routine) {
+      return { text: JSON.stringify({ now, timeZone, routine: r.routine }) };
+    }
     if (!routines.length) {
       return { text: `This bot has no routines. Current time: ${now}. Timezone: ${timeZone}.` };
     }
     return {
-      text: `This bot's routines (current time: ${now}; timezone: ${timeZone}):\n${JSON.stringify(routines, null, 2)}`,
+      text: JSON.stringify({ now, timeZone, routines }),
     };
   }
   if (name === "propose_routine") {

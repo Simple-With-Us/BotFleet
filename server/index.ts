@@ -3724,7 +3724,10 @@ const routineRequests = new RoutineRequestService({
   canPersist: routineProposalPersistence,
 });
 const ROUTINE_WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
-const agentRoutine = (routine: ReturnType<RoutineManager["listRoutines"]>[number]) => {
+const agentRoutine = (
+  routine: ReturnType<RoutineManager["listRoutines"]>[number],
+  includeInstructions = false,
+) => {
   // Routines created in the calendar predate chat-card redaction and may
   // contain a credential in their instructions. The list result is handed
   // back to the model, so scrub the complete value before taking its preview.
@@ -3733,8 +3736,12 @@ const agentRoutine = (routine: ReturnType<RoutineManager["listRoutines"]>[number
   return {
     id: routine.id,
     name: safeName,
-    instructions: safeInstructions.slice(0, 2_000),
-    instructionsTruncated: safeInstructions.length > 2_000,
+    ...(includeInstructions
+      ? { instructions: safeInstructions }
+      : {
+          instructionsPreview: safeInstructions.slice(0, 160),
+          instructionsPreviewTruncated: safeInstructions.length > 160,
+        }),
     enabled: routine.enabled,
     runOn: routine.runOn,
     durationMinutes: routine.durationMinutes,
@@ -4081,6 +4088,7 @@ export function executeListAgentsRequest(input: { selfId: string }): {
 export function executeListRoutinesRequest(input: {
   fromBotId: string;
   fromThreadId?: string;
+  routineId?: string;
 }): { status: number; body: Record<string, unknown> } {
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 403, body: { error: "unknown sender" } };
@@ -4088,15 +4096,27 @@ export function executeListRoutinesRequest(input: {
   if (!connectorThread(from.id, fromThreadId)) {
     return { status: 403, body: { error: "source conversation does not belong to sender" } };
   }
+  const ownedRoutines = (routines?.listRoutines() ?? []).filter((routine) => routine.botId === from.id);
+  if (input.routineId) {
+    const routine = ownedRoutines.find((candidate) => candidate.id === input.routineId);
+    if (!routine) return { status: 404, body: { error: "routine not found" } };
+    return {
+      status: 200,
+      body: {
+        now: new Date().toISOString(),
+        timeZone: routineTimeZone(),
+        routine: agentRoutine(routine, true),
+      },
+    };
+  }
   return {
     status: 200,
     body: {
       now: new Date().toISOString(),
       timeZone: routineTimeZone(),
-      routines: (routines?.listRoutines() ?? [])
-        .filter((routine) => routine.botId === from.id)
+      routines: ownedRoutines
         .slice(0, 100)
-        .map(agentRoutine),
+        .map((routine) => agentRoutine(routine)),
     },
   };
 }
@@ -6797,9 +6817,11 @@ const server = createServer(async (req, res) => {
       }
       if (method === "GET" && path === "/api/internal/routines") {
         const fromThreadId = url.searchParams.get("fromThreadId");
+        const routineId = url.searchParams.get("routineId");
         const result = executeListRoutinesRequest({
           fromBotId: String(url.searchParams.get("fromBotId") ?? ""),
           ...(fromThreadId ? { fromThreadId } : {}),
+          ...(routineId ? { routineId } : {}),
         });
         return json(res, result.status, result.body);
       }
