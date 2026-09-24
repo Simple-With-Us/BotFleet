@@ -13,18 +13,19 @@ import { mergeLocalInject } from "./local-inject.ts";
 
 /**
  * Compatibility rows used only when the installed Codex app-server cannot
- * provide its live catalog.  This list is a source fallback, not proof that
- * every row is available for the current account or transport.
+ * provide its live catalog.  The slugs matched this Mac's visible ChatGPT
+ * OAuth model/list on 2026-09-24; the inexpensive Luna tier remains the
+ * fallback default.  This snapshot is not proof of availability for another
+ * account or a later CLI version.
  */
 export const STATIC_CODEX_MODELS: ModelCatalog = {
-  default: "gpt-6-luna",
+  default: "gpt-5.6-luna",
   options: [
     { id: "gpt-6-astra", label: "GPT-6 Astra", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-6-sol", label: "GPT-6 Sol", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
+    { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
     { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-6-luna", label: "GPT-6 Luna", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
+    { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
     { id: "gpt-5.5", label: "GPT-5.5", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
   ],
 };
 
