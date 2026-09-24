@@ -227,7 +227,7 @@ final class Session: ObservableObject {
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
 
-    private static let connectionKey = "companion.connection"
+    static let connectionKey = "companion.connection"
 
     // MARK: - Pairing
 
