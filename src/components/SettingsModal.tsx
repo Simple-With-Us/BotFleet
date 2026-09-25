@@ -3,7 +3,7 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
+import { Activity, AlertTriangle, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -1111,6 +1111,20 @@ export function SettingsModal() {
           </div>
 
           <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
+            {state.config?.configWarnings && state.config.configWarnings.length > 0 && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2.5 text-[12.5px] leading-relaxed text-warning"
+              >
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                <span>
+                  {state.config.configWarnings.length}{" "}
+                  config field{state.config.configWarnings.length === 1 ? "" : "s"} in config.json could not be
+                  read and {state.config.configWarnings.length === 1 ? "was" : "were"} ignored — the rest of your
+                  settings loaded normally.  Check the server log for details.
+                </span>
+              </div>
+            )}
             {section === "general" && (
               <>
                 <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">

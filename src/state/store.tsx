@@ -527,6 +527,12 @@ export interface ConfigStatus {
     hasError: boolean;
     pendingProviderReload: boolean;
   };
+  /** Top-level config.json fields the last load had to drop, `"field:
+   * reason"` each — the boot warning surfaced structurally instead of
+   * console-only, so a banner can say "N config fields were ignored"
+   * instead of nothing at all.  Empty (or absent, on an older harness)
+   * after a clean load. */
+  configWarnings?: string[];
 }
 
 export type { RoomTerminology };
@@ -551,12 +557,13 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "configWarnings"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
   return {
     xai: frame.xai,
+    configWarnings: frame.configWarnings,
     deepseek: frame.deepseek,
     composio: frame.composio,
     box: frame.box,
@@ -1344,8 +1351,14 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       // every server-side append chains onto (and becomes) the active leaf
       const next = updateBot(state, bot.id, (b) => {
+        // An edit's fork (or any message) can reach the client twice — once
+        // as the POST response, once as the canonical SSE frame — in either
+        // order, and a reconnect can redeliver an already-known message
+        // too. Reverting the active leaf back to a repeat would hide a
+        // newer reply that already won that race and became the active
+        // leaf; a duplicate must be a no-op (upstream OpenMausBot #1387).
         if (b.messages.some((m) => m.id === action.message.id)) {
-          return { ...b, activeLeafId: action.message.id };
+          return b;
         }
         let messages = [...b.messages, action.message];
         // base64 screen frames are big; a long computer-use session would

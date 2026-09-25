@@ -976,3 +976,57 @@ describe("paginated scrollback", () => {
     expect(fresh.loadingEarlier).toEqual({});
   });
 });
+
+// Checked against upstream OpenMausBot #1387 ("an edited message not
+// appearing until the server round trip" / "stable retry IDs and stale
+// response isolation"). BotFleet edits by forking the message server-side
+// (`POST .../edit` → `store.branchMessage`, see server/index.ts) and the
+// fork reaches the client as an ordinary `messageAdded` SSE frame — there
+// is no client-side optimistic echo to reconcile, and the server's
+// synchronous `bot.busy` gate on that same route already refuses a second
+// edit while the first fork's turn is still in flight, so two edits can
+// never race each other. What upstream's fix and BotFleet's mechanism do
+// share is the other half of #1387: the fork message itself can reach the
+// client twice (the POST's own response plus the canonical SSE frame,
+// or a reconnect replay), in either order, and a naive `messageAdded`
+// used to treat any repeat as "make this the active leaf again" — which
+// could revert onto a fork after its reply had already taken over as the
+// active leaf.
+describe("messageAdded (upstream OpenMausBot #1387)", () => {
+  const root: Message = { id: "root", role: "bot", kind: "text", text: "Ready", at: 1 };
+  const bot = {
+    id: "echo",
+    threadId: "t1",
+    name: "Echo",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green" as const,
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages: [root],
+    activeLeafId: root.id,
+  } satisfies Bot;
+  const state = { ...initialState, bots: [bot], selectedId: bot.id };
+
+  it("an edit's fork becomes the active leaf as soon as it arrives — no need to wait out the rest of the round trip", () => {
+    const fork: Message = { id: "q2", role: "user", kind: "text", text: "second try", at: 2, parentId: root.id };
+    const next = reducer(state, { type: "messageAdded", threadId: "t1", message: fork });
+    expect(next.bots[0]?.messages.map((m) => m.id)).toEqual([root.id, fork.id]);
+    expect(next.bots[0]?.activeLeafId).toBe(fork.id);
+  });
+
+  it("a stale repeat of a superseded edit's fork does not clobber the reply that already won the race", () => {
+    const fork: Message = { id: "q2", role: "user", kind: "text", text: "second try", at: 2, parentId: root.id };
+    const withFork = reducer(state, { type: "messageAdded", threadId: "t1", message: fork });
+    const reply: Message = { id: "a2", role: "bot", kind: "text", text: "new answer", at: 3, parentId: fork.id };
+    const answered = reducer(withFork, { type: "messageAdded", threadId: "t1", message: reply });
+    expect(answered.bots[0]?.activeLeafId).toBe(reply.id);
+
+    // the fork's own POST response lands last (or an SSE reconnect
+    // redelivers it) — a plain repeat, not a new message
+    const stale = reducer(answered, { type: "messageAdded", threadId: "t1", message: fork });
+    expect(stale.bots[0]?.activeLeafId).toBe(reply.id);
+    expect(stale.bots[0]?.messages.map((m) => m.id)).toEqual([root.id, fork.id, reply.id]);
+  });
+});

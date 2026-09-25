@@ -342,8 +342,7 @@ struct ChatListView: View {
             // a bot that stopped for you grows out of the island
             .overlay(alignment: .top) {
                 NeedsYouIsland(
-                    update: session.state.updates.first { $0.kind == .needsYou },
-                    hasIsland: IslandGeometry.hasIsland(topInset: geo.safeAreaInsets.top)
+                    update: session.state.updates.first { $0.kind == .needsYou }
                 ) { chat in open(chat) }
             }
         }

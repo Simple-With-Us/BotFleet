@@ -501,6 +501,84 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
   };
 }
 
+/** One top-level config.json section `loadConfig()` could not trust: which
+ * key, and why. */
+export interface ConfigFieldWarning {
+  field: string;
+  reason: string;
+}
+
+export interface StoredConfigResult {
+  config: AppConfig;
+  /** Empty when every section validated. */
+  warnings: ConfigFieldWarning[];
+}
+
+/** Validate a stored config.json one top-level section at a time, instead of
+ * as a single all-or-nothing document the way `parseStoredConfig` above
+ * does.
+ *
+ * `appConfigSchema.safeParse` on the whole object means one bad field
+ * anywhere — a hand-edited `rooms.turnTimeoutMinutes`, a stale enum value
+ * from a retired feature — fails the entire parse, and `loadConfig()`'s old
+ * catch-all turned that into silent, total data loss: every credential,
+ * every bot override, everything ever saved to ~/.botfleet/config.json,
+ * discarded in favor of empty defaults, with nothing printed anywhere
+ * (upstream OpenMausBot #1797/#1798).
+ *
+ * `appConfigSchema` is a flat `z.object` of independently-schema'd named
+ * sections — there is no top-level `.refine`/cross-field rule; those live
+ * one level down inside a section's own schema (e.g. `ingress.publicUrl`),
+ * or after the parse in `parseConfigPatch`'s post-parse checks, neither of
+ * which this function touches — so each section can be validated against
+ * its own piece of the schema without seeing the rest of the document. A
+ * section that fails is dropped and named; every section that validates
+ * survives untouched. An unrecognized top-level key is dropped without a
+ * warning, exactly as the strict parse already did (zod's default
+ * `z.object` behavior strips unknown keys). Never writes anything back —
+ * the caller decides whether and when to persist. */
+export function parseStoredConfigLeniently(value: JsonValue): StoredConfigResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      config: {},
+      warnings: [{ field: "config.json", reason: "the top-level value must be an object" }],
+    };
+  }
+  const raw = value as JsonObject;
+  const shape = appConfigSchema.shape;
+  const kept: JsonObject = {};
+  const warnings: ConfigFieldWarning[] = [];
+  for (const field of Object.keys(raw)) {
+    if (!Object.hasOwn(shape, field)) continue; // unknown key: silently dropped, unchanged from before
+    const result = shape[field as keyof typeof shape].safeParse(raw[field]);
+    if (result.success) {
+      kept[field] = raw[field];
+    } else {
+      warnings.push({ field, reason: schemaIssue(result.error, "invalid value") });
+    }
+  }
+  const parsed = appConfigSchema.safeParse(kept);
+  if (!parsed.success) {
+    // Every surviving field just validated on its own above; reaching here
+    // would mean a cross-field rule this function's contract says does not
+    // exist at this level. Fail closed rather than throw: an unexpected
+    // rejection must not resurrect the silent-discard bug this exists to fix.
+    return {
+      config: {},
+      warnings: [...warnings, { field: "config.json", reason: schemaIssue(parsed.error, "could not be read") }],
+    };
+  }
+  return {
+    config: {
+      ...parsed.data,
+      conversationMode: parsed.data.conversationMode === undefined
+        ? undefined
+        : parseConversationMode(parsed.data.conversationMode),
+    },
+    warnings,
+  };
+}
+
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     for (const section of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
@@ -924,12 +1002,42 @@ export function migrateComputerProvidersConfig(cfg: AppConfig): boolean {
   return true;
 }
 
+/** Field-and-reason for every section the last `loadConfig()` call had to
+ * drop, so a boot warning can reach the Settings UI the same way the
+ * Infisical and Sentry boot lines already do (see `configStatus()` in
+ * server/index.ts). Empty after a clean load, a first run, or before the
+ * first `loadConfig()` call. */
+let lastConfigLoadWarnings: ConfigFieldWarning[] = [];
+
+export function configLoadWarnings(): readonly ConfigFieldWarning[] {
+  return lastConfigLoadWarnings;
+}
+
 export function loadConfig(): AppConfig {
   let cfg: AppConfig = {};
+  lastConfigLoadWarnings = [];
   try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
-  } catch {
-    /* first run — env fallbacks below */
+    const raw = parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8"));
+    const result = parseStoredConfigLeniently(raw);
+    cfg = result.config;
+    if (result.warnings.length > 0) {
+      lastConfigLoadWarnings = result.warnings;
+      const detail = result.warnings.map((w) => `${w.field} (${w.reason})`).join(", ");
+      console.warn(
+        `[config] ignored ${result.warnings.length} invalid config.json field(s), kept the rest: ${detail}`,
+      );
+    }
+  } catch (error) {
+    // ENOENT (no config.json yet) is a first run, not a problem — stay
+    // silent and fall through to the env fallbacks below. Anything else
+    // (unreadable JSON, a non-object root) means a file existed and none of
+    // it could be trusted, which is exactly the silent-discard failure mode
+    // this function exists to stop being silent about.
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      const reason = error instanceof Error ? error.message : String(error);
+      lastConfigLoadWarnings = [{ field: "config.json", reason }];
+      console.warn(`[config] could not read config.json, starting from defaults: ${reason}`);
+    }
   }
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file

@@ -145,6 +145,7 @@ import {
 import { computerReach } from "./computer-capability.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 import {
+  configLoadWarnings,
   ensureDirs,
   instanceConfigs,
   loadConfig,
@@ -6009,6 +6010,12 @@ function configStatus() {
       hasError: Boolean(vault.lastError),
       pendingProviderReload: vault.pendingProviderReload,
     },
+    // Named fields dropped from the last config.json read — the same class
+    // of boot-time problem the Infisical and Sentry lines above report, just
+    // surfaced structurally instead of console-only, so the Settings UI can
+    // say "N config fields were ignored" instead of nothing at all (upstream
+    // OpenMausBot #1797/#1798).  Empty on a clean load.
+    configWarnings: configLoadWarnings().map((w) => `${w.field}: ${w.reason}`),
     autoUpdate: {
       enabled: cfg.autoUpdate?.enabled ?? false,
       lastCheckMs: cfg.autoUpdate?.lastCheckMs ?? null,

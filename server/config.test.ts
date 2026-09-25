@@ -1,13 +1,14 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DATA_DIR,
   migrateLegacyElevenLabsTtsProvider,
   migrateComputerProvidersConfig,
   allowedBotComputers,
+  configLoadWarnings,
   filterAllowedComputers,
   instanceConfigs,
   isValidSshAlias,
@@ -15,6 +16,7 @@ import {
   localVmMaxInstances,
   parseConfigPatch,
   parseStoredConfig,
+  parseStoredConfigLeniently,
   saveConfig,
   roomTurnTimeoutMinutes,
   showToolCallsEnabled,
@@ -153,6 +155,110 @@ describe("configuration boundaries", () => {
 
   it.each(["one-per-bot", "windows", 1, null])("rejects an invalid Local VM mode: %j", (mode) => {
     expect(() => parseConfigPatch({ localVm: { mode } })).toThrow("localVm.mode");
+  });
+});
+
+// Upstream OpenMausBot #1797/#1798: one bad top-level config.json field must
+// not revert the whole file to defaults. `parseStoredConfig`/`loadConfig`'s
+// old catch-all did exactly that — a single hand-edited or stale field
+// anywhere failed the whole `safeParse` and silently discarded every saved
+// credential and bot override. `parseStoredConfigLeniently` validates each
+// top-level section independently instead.
+describe("lenient config loading (upstream OpenMausBot #1797/#1798)", () => {
+  it("keeps every valid section and drops only the invalid ones, naming each", () => {
+    const result = parseStoredConfigLeniently({
+      xai: { key: "good-key" },
+      rooms: { turnTimeoutMinutes: 0 }, // below MIN_ROOM_TURN_TIMEOUT_MINUTES
+      unrelated: { secret: "not part of the config contract" },
+    });
+    expect(result.config).toEqual({ xai: { key: "good-key" } });
+    expect(result.warnings).toEqual([{ field: "rooms", reason: expect.stringContaining("turnTimeoutMinutes") }]);
+  });
+
+  it("logs nothing on a fully valid file", () => {
+    expect(parseStoredConfigLeniently({ xai: { key: "good-key" }, deepseek: { key: "also-good" } })).toEqual({
+      config: { xai: { key: "good-key" }, deepseek: { key: "also-good" } },
+      warnings: [],
+    });
+  });
+
+  it("fails closed (empty config, one warning) when the root itself is not an object", () => {
+    expect(parseStoredConfigLeniently(null)).toEqual({
+      config: {},
+      warnings: [{ field: "config.json", reason: expect.any(String) }],
+    });
+    expect(parseStoredConfigLeniently([1, 2])).toEqual({
+      config: {},
+      warnings: [{ field: "config.json", reason: expect.any(String) }],
+    });
+  });
+
+  describe("loadConfig()", () => {
+    beforeEach(() => {
+      mkdirSync(DATA_DIR, { recursive: true });
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    });
+    afterEach(() => {
+      rmSync(join(DATA_DIR, "config.json"), { force: true });
+    });
+
+    it("keeps every valid field, drops only the invalid one, and warns once naming it", () => {
+      writeFileSync(
+        join(DATA_DIR, "config.json"),
+        JSON.stringify({
+          xai: { key: "good-key" },
+          rooms: { turnTimeoutMinutes: 0 },
+        }),
+      );
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const cfg = loadConfig();
+        expect(cfg.xai?.key).toBe("good-key");
+        expect(cfg.rooms).toBeUndefined();
+        expect(configLoadWarnings()).toEqual([{ field: "rooms", reason: expect.stringContaining("turnTimeoutMinutes") }]);
+        const configWarnLines = warn.mock.calls.filter((call) => String(call[0]).startsWith("[config]"));
+        expect(configWarnLines).toHaveLength(1);
+        expect(String(configWarnLines[0]?.[0])).toContain("rooms");
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("never rewrites config.json for a dropped field — the raw file is untouched", () => {
+      const raw = JSON.stringify({ xai: { key: "good-key" }, rooms: { turnTimeoutMinutes: 0 } });
+      writeFileSync(join(DATA_DIR, "config.json"), raw);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        loadConfig();
+      } finally {
+        warn.mockRestore();
+      }
+      expect(readFileSync(join(DATA_DIR, "config.json"), "utf8")).toBe(raw);
+    });
+
+    it("logs nothing and reports no warnings for a fully valid file", () => {
+      writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({ xai: { key: "good-key" } }));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const cfg = loadConfig();
+        expect(cfg.xai?.key).toBe("good-key");
+        expect(configLoadWarnings()).toEqual([]);
+        expect(warn.mock.calls.filter((call) => String(call[0]).startsWith("[config]"))).toHaveLength(0);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("stays silent on a first run (no config.json yet)", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        loadConfig();
+        expect(configLoadWarnings()).toEqual([]);
+        expect(warn.mock.calls.filter((call) => String(call[0]).startsWith("[config]"))).toHaveLength(0);
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 });
 
