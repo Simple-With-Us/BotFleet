@@ -238,6 +238,7 @@ import { flushNativeTee } from "./drivers/native.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
+import { lastInterruptedChatStarter } from "./update-turn-starter.ts";
 import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
@@ -7301,19 +7302,25 @@ async function resumeInterruptedChatTurns(
         );
         continue;
       }
-      const resumeMessages = store.messagesFor(resumeThreadId);
+      const resumeMessages = store.activePath(resumeThreadId);
       const resumePrompt =
-        resumeMessages.find((message) => message.id === entry.promptMessageId) ??
-        [...resumeMessages]
-          .reverse()
-          .find((message) => message.role === "user" && message.kind === "text" && message.text);
+        resumeMessages.find((message) => message.id === entry.promptMessageId &&
+          (message.role === "user" || (message.role === "system" && message.automationSource === "delegation"))) ??
+        lastInterruptedChatStarter(resumeMessages);
       if (!resumePrompt?.text) {
         console.log(`[${context}] no resumable prompt for bot ${resumeBot.id} on thread ${resumeThreadId}`);
         continue;
       }
       await startTurn(resumeBot.id, resumePrompt.text, {
         threadId: resumeThreadId,
-        userMessage: resumeMessages.some((message) => message.id === resumePrompt.id) ? resumePrompt : undefined,
+        userMessage: resumePrompt,
+        automationSource: resumePrompt.automationSource,
+        ...(resumePrompt.automationSource === "delegation" ? {
+          commsDepth: 1,
+          unattended: isUnattended(resumeBot.id),
+          from: resumePrompt.from,
+          comm: resumePrompt.comm,
+        } : {}),
       });
       console.log(`[${context}] re-dispatched interrupted turn for bot ${resumeBot.id}`);
     } catch (err) {
@@ -7410,9 +7417,7 @@ async function beginRuntimeQuiesce(force = false) {
           botId: bot.id,
           threadId: liveThreadId,
         };
-        const promptMessage = [...store.messagesFor(liveThreadId)]
-          .reverse()
-          .find((message) => message.role === "user" && message.kind === "text" && message.text);
+        const promptMessage = lastInterruptedChatStarter(store.activePath(liveThreadId));
         if (promptMessage?.text) {
           entry.promptMessageId = promptMessage.id;
           entry.promptText = promptMessage.text;
