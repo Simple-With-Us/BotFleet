@@ -18,12 +18,54 @@ export type AssemblyAITranscriptionSession = {
 
 const SAMPLE_RATE = 16_000;
 const STREAMING_ENDPOINT = "wss://streaming.assemblyai.com/v3/ws";
+const DEFAULT_SPEECH_MODEL = "u3-rt-pro";
 const streamingMessageSchema = z.object({
   type: z.string(),
   transcript: z.string().optional(),
   turn_order: z.coerce.number().optional(),
   end_of_turn: z.boolean().optional(),
 });
+
+export interface AssemblyAIStreamingUrlParams {
+  token: string;
+  /** Speech model id; defaults to `u3-rt-pro` (Universal-3.5 Pro Realtime). */
+  speechModel?: string;
+  /** Per-call keyterm vocabulary; each entry becomes its own repeated
+   * `keyterms_prompt` query parameter (AssemblyAI's `doseq=True` shape).
+   * Filtered for non-empty trimmed strings; capped at 100. */
+  keyterms?: readonly string[];
+  /** Server-side endpointing. The streaming model finalizes a turn after
+   * this many milliseconds of trailing silence. Clamped server-side to
+   * 50–10 000 ms; default 400. */
+  minTurnSilenceMs?: number;
+}
+
+/** Build the v3 streaming URL. Exported for testability — callers go through
+ * `startAssemblyAITranscription`, which mints the token and opens the socket. */
+export function buildAssemblyAIStreamingUrl({
+  token,
+  speechModel = DEFAULT_SPEECH_MODEL,
+  keyterms,
+  minTurnSilenceMs,
+}: AssemblyAIStreamingUrlParams): string {
+  const params = new URLSearchParams({
+    sample_rate: String(SAMPLE_RATE),
+    speech_model: speechModel,
+    format_turns: "true",
+    token,
+  });
+  if (typeof minTurnSilenceMs === "number" && Number.isFinite(minTurnSilenceMs) && minTurnSilenceMs > 0) {
+    params.set("min_turn_silence", String(Math.round(minTurnSilenceMs)));
+  }
+  if (keyterms?.length) {
+    const cleaned = keyterms
+      .map((term) => term.trim())
+      .filter((term) => term.length > 0)
+      .slice(0, 100);
+    for (const term of cleaned) params.append("keyterms_prompt", term);
+  }
+  return `${STREAMING_ENDPOINT}?${params.toString()}`;
+}
 
 export function mergeAssemblyAITurn(
   current: AssemblyAITranscript,
@@ -67,20 +109,25 @@ export async function startAssemblyAITranscription({
   getToken,
   onTurn,
   onError,
+  keyterms,
+  minTurnSilenceMs,
+  speechModel,
 }: {
   stream: MediaStream;
   getToken: () => Promise<{ token: string }>;
   onTurn: (turn: AssemblyAITurn) => void;
   onError: (message: string) => void;
+  /** Optional vocabulary; passed as repeated `keyterms_prompt` query params. */
+  keyterms?: readonly string[];
+  /** Optional server-side endpointing in milliseconds. */
+  minTurnSilenceMs?: number;
+  /** Optional speech model override; defaults to `u3-rt-pro`. */
+  speechModel?: string;
 }): Promise<AssemblyAITranscriptionSession> {
   const { token } = await getToken();
-  const query = new URLSearchParams({
-    sample_rate: String(SAMPLE_RATE),
-    speech_model: "u3-rt-pro",
-    format_turns: "true",
-    token,
-  });
-  const socket = new WebSocket(`${STREAMING_ENDPOINT}?${query}`);
+  const socket = new WebSocket(
+    buildAssemblyAIStreamingUrl({ token, keyterms, minTurnSilenceMs, speechModel }),
+  );
   const connected = new Promise<void>((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error("AssemblyAI took too long to connect.")), 10_000);
     socket.addEventListener("open", () => {
