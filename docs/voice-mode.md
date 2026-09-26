@@ -1,22 +1,31 @@
 # Voice in BotFleet
 
-Decision doc, 2026-08-14. How bots speak, and how you hold a conversation with
-one.
+Decision doc, originally 2026-08-14; updated 2026-09-26 with the cross-platform
+STT unlock, keyterms vocabulary, and MiniMax TTS as the default voice provider.
+How bots speak, and how you hold a conversation with one.
 
 ## Shape
 
 ```
-Renderer (src/)                        Harness (server/)
-├── lib/tts/index.ts   the speaker     ├── tts/speech-text.ts  markdown → speakable
-│     queue · prefetch · interrupt     └── tts/elevenlabs.ts   verify · voices · synthesize
-└── components/CallView.tsx
-      Apple STT endpointing            POST /api/tts/prepare → utterances
-                                       POST /api/tts/speak   → mp3 bytes
+Renderer (src/)                           Harness (server/)
+├── lib/tts/index.ts      the speaker     ├── tts/speech-text.ts  markdown → speakable
+│     queue · prefetch · interrupt        ├── tts/elevenlabs.ts   verify · voices · synthesize
+├── lib/call-stt.ts       provider-agn.   └── tts/minimax.ts      MiniMax TTS (default since PR #513)
+│     apple | assemblyai sessions
+├── lib/transcription-provider.ts
+│     pickSTTProvider(...)
+└── components/CallView.tsx, GroupCallView.tsx, Composer.tsx
+       Apple STT (SFSpeechRecognizer)     POST /api/tts/prepare → utterances
+       or AssemblyAI Universal Streaming    POST /api/tts/speak   → mp3 bytes
+                                       GET/PUT /api/config   ← → callStt.{provider, keyterms}
 ```
 
-One voice provider: **ElevenLabs, bring your own key**. No local model, no
-second provider, no fallback ladder — if there is no key, voice is off and the
-buttons say so.
+Two STT providers for voice mode: **Apple SFSpeechRecognizer** on macOS, and
+**AssemblyAI Universal Streaming** everywhere. Voice TTS providers are
+**ElevenLabs** and **MiniMax** (MiniMax is the default as of PR #513).
+No local STT model, no fallback ladder — if a call-mode provider is
+unreachable, the picker surfaces a clear "no-provider" state with the exact
+missing dependency.
 
 ## Why the key stays on the harness
 
@@ -52,14 +61,23 @@ the two of them talk forever. So the mic is live only when the bot is not
 speaking, and interrupting is a tap, the Space bar, or Escape. Full-duplex
 barge-in needs AEC on the capture path — a real follow-up, not a footnote.
 
-**Turn detection stays native and local.** A buffer-backed
-`SFSpeechRecognizer` does not emit `isFinal` just because the speaker becomes
-quiet; it finalizes only after its audio stream ends. Call mode therefore starts
-the native helper with a silence timeout. Once a non-empty transcript stops
-changing for 850ms, the helper stops capture and calls `endAudio()`, which
-produces the final transcript sent to the renderer. Composer dictation omits the
-timeout and keeps its press-to-stop behavior. No cloud STT or bundled VAD model
-is involved.
+**Two STT providers, picked once per call.** Apple SFSpeechRecognizer stays the
+default on macOS — on-device, free, no API spend. The moment an AssemblyAI key
+is configured, the renderer swaps to AssemblyAI's Universal Streaming endpoint
+for both 1:1 calls and group rooms. Windows and Linux users get voice calls
+the day they paste a key into Settings. The picker lives in
+`src/lib/transcription-provider.ts` and resolves platform + capability + the
+user's explicit preference to `apple | assemblyai | no-provider`. Per-call
+custom vocabulary (`keyterms_prompt`, up to 100 terms) is sourced from
+`bot.displayName` plus a small global list in AppConfig — by the time the
+streaming WebSocket opens, the model already knows how to spell "BotFleet",
+"Mavis", every bot's name, and any product jargon the user has added.
+
+**Turn detection.** Apple STT finalizes when its audio stream ends, which is why the
+existing local helper only emits after a silence timeout (~850ms). AssemblyAI's
+streaming model does the same job server-side via `min_turn_silence`, configured
+to the same 850ms. Composer dictation omits the timeout and keeps its
+press-to-stop behavior.
 
 **Narration is what makes it bearable.** An agent turn is 5–60 seconds of tool
 calls, and silence that long reads as a dropped call. Every activity chip the
@@ -93,11 +111,16 @@ delegate real work to specialists over `ask_bot` — no new machinery required.
 
 ## Known gaps
 
-- **Calls are macOS-only**, because dictation is. The voice half works everywhere.
 - **Rooms don't speak yet**, though per-bot voices already exist (`bot.voice`).
-- **No spend meter.** ElevenLabs bills per character. Auto-speak is off by
-  default partly for that reason, but the app should eventually show usage.
+  (Rooms *do* now use the same cloud STT pipeline for dictation as 1:1 calls.)
+- **No spend meter.** ElevenLabs bills per character, AssemblyAI bills per
+  streaming minute. Auto-speak is off by default partly for that reason, but
+  the app should eventually show usage for both.
 - **No voice barge-in** — see half-duplex above.
+- **No transcript polish** — Lane 1+2 ships raw AssemblyAI transcripts (already
+  formatted via `format_turns: true`). Lane 3 ("Optimize responses for spoken
+  word format") will pipe final transcripts through the bot's MiniMax-M3 model
+  for punctuation cleanup and acronym normalization before sending to the agent.
 
 ## Failure boundaries
 
@@ -109,5 +132,14 @@ delegate real work to specialists over `ask_bot` — no new machinery required.
   `listening` phase.
 - Leaving the bot view owns and ends its call. A hidden overlay cannot leave a
   microphone session or a stale `currentCall` behind.
+- `startCall` / `endCall` in `src/lib/call.ts` keep firing `window.ogb.speechStop()`
+  for backwards compatibility with Apple STT; the assembled component unmounts
+  in the same tick and tears down its `STTSession` (Apple or AssemblyAI)
+  through its own effect cleanup.
+- The cloud STT session mints a 480-second `streaming.assemblyai.com/v3/token`
+  right before opening the WebSocket and disposes the session on `stop()`; the
+  API key never leaves the Electron main process. AssemblyAI's pricing is
+  per-streaming-minute at the model the user selected (default
+  `u3-rt-pro` = Universal-3.5 Pro Realtime).
 - Synthesis requests are abortable from the renderer and individual utterances
   are capped server-side to bound accidental hosted-voice spend.

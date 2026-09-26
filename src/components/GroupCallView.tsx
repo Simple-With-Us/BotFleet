@@ -14,6 +14,8 @@ import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
+import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { BotMascot } from "./Avatar";
@@ -58,7 +60,7 @@ function questionIn(messages: Message[]): Message | undefined {
 }
 
 function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const speech = useSpeech();
   const initialPhase: Phase = group.busyBotId ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
@@ -103,6 +105,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   const listenWhenDrained = useRef(false);
   const listenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const allowBargeIn = useRef(false);
+  // The STT provider session is chosen once per group call and reused across
+  // every listen cycle. Picks apple (macOS without a cloud key) vs assemblyai
+  // (cross-platform, or macOS-with-key per the picker default). The same
+  // `useOnCall` micro-task lifecycle means a session can outlive one render
+  // but the cleanup hook releases it before the timer ref is reset.
+  const sttSessionRef = useRef<STTSession | null>(null);
 
   const move = useCallback((next: Phase) => {
     phaseRef.current = next;
@@ -110,7 +118,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   }, []);
 
   const hush = useCallback(() => {
-    void window.ogb?.speechStop();
+    void sttSessionRef.current?.stop();
   }, []);
 
   const listen = useCallback(() => {
@@ -119,7 +127,9 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     setSpeakingMemberId(null);
     setHeard("");
     setNote(null);
-    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    const session = sttSessionRef.current;
+    if (!session) return;
+    session.start({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
       if (alive.current && currentCall() === group.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
@@ -202,9 +212,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   }, [group.id]);
 
   useEffect(() => {
-    const bridge = window.ogb;
-    if (!bridge) return;
-    const offTranscript = bridge.onSpeechTranscript((line) => {
+    let detached = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
+    let session: STTSession | null = null;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
       if (!alive.current || currentCall() !== group.id || phaseRef.current !== "listening") return;
       if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
@@ -307,11 +320,14 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       move(busyRef.current ? "working" : "sending");
       dispatch({ type: "sendGroup", groupId: group.id, text: routed.text });
       scheduleListen(false, 600);
-    });
-    const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
+    };
+
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       if (!alive.current || currentCall() !== group.id) return;
       if (code === 2) {
-        setNote("Calls need macOS dictation, which isn't available here yet.");
+        setNote(
+          "Calls need a working dictation provider. Add an AssemblyAI key in Settings, or use BotFleet for macOS.",
+        );
         return;
       }
       if (code === 1) {
@@ -322,14 +338,50 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
         );
         return;
       }
-      if (phaseRef.current === "listening") listen();
+      if (phaseRef.current === "listening" && alive.current) listen();
+    };
+
+    (async () => {
+      const bridge = window.ogb;
+      if (!bridge || detached) return;
+      const status = await bridge.transcription?.status?.().catch(() => undefined);
+      const hostPlatform = bridge.platform ?? "unknown";
+      const choice: ProviderChoice = pickSTTProvider({
+        cloudSttConfigured: Boolean(status?.configured),
+        appleSpeechAvailable: hostPlatform === "darwin",
+        platform: hostPlatform,
+        explicitPreference: state.config?.callStt?.provider,
+      });
+      if (choice.provider === null) {
+        if (alive.current && currentCall() === group.id) {
+          setNote(
+            choice.missing === "cloud-stt-key"
+              ? "Add an AssemblyAI API key in Settings to use voice on this computer."
+              : "Dictation isn't available in this app build. Restart or update BotFleet.",
+          );
+        }
+        return;
+      }
+      if (detached || !alive.current) return;
+      const created = createSTTSession(choice.provider);
+      sttSessionRef.current = created;
+      session = created;
+      offTranscript = created.onTranscript(handleTranscript);
+      offEnd = created.onEnd(handleEnd);
+      if (group.busyBotId && !approval && !question) move("working");
+      else listen();
+    })().catch((error) => {
+      if (alive.current && currentCall() === group.id) {
+        setNote(error instanceof Error ? error.message : String(error));
+      }
     });
-    if (group.busyBotId && !approval && !question) move("working");
-    else listen();
+
     return () => {
+      detached = true;
       offTranscript();
       offEnd();
-      void window.ogb?.speechStop();
+      void session?.stop();
+      if (sttSessionRef.current === session) sttSessionRef.current = null;
     };
     // Live busy/card changes are handled below without restarting native capture.
     // eslint-disable-next-line react-hooks/exhaustive-deps

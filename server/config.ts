@@ -427,6 +427,16 @@ export interface AppConfig {
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
   tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
+   *  falls back to platform defaults when `provider` is absent (Apple on
+   *  macOS without a cloud key, AssemblyAI on every other platform, and
+   *  AssemblyAI on macOS the moment a key lands). `keyterms` is the global
+   *  vocabulary the model is told to spell correctly — bot names, model
+   *  handles, product jargon that `format_turns` alone still mangles. */
+  callStt?: {
+    provider?: "apple" | "assemblyai";
+    keyterms?: string[];
+  };
   imageGen?: { key?: string; credentialStorage?: "external" };
   autoUpdate?: {
     enabled?: boolean;
