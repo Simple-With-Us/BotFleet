@@ -829,8 +829,12 @@ const MessagesList = memo(function MessagesList({
               // system message the same way it forks a user one
               // (store.branchMessage), so its siblings must stay selectable
               // and its edit state must actually render, not just be armed.
-              const systemEditing = m.role === "system" && editingId === m.id;
-              const systemVersions = m.role === "system" ? messageVersions(bot, m) : [m];
+              const delegationView = delegationMessageView(m.role, m.text ?? "", m.from?.name, m.automationSource);
+              // Legacy delegation starters were stored as user messages but
+              // now render as cards. Keep their editor and branches reachable.
+              const cardStarter = m.role === "system" || Boolean(delegationView);
+              const systemEditing = cardStarter && editingId === m.id;
+              const systemVersions = cardStarter ? messageVersions(bot, m) : [m];
               const systemVersionIndex = systemVersions.findIndex((v) => v.id === m.id);
               const withSystemChrome = (card: ReactNode) => {
                 if (systemEditing) {
@@ -890,7 +894,6 @@ const MessagesList = memo(function MessagesList({
                   </div>
                 );
               };
-              const delegationView = delegationMessageView(m.role, m.text ?? "", m.from?.name, m.automationSource);
               if (delegationView) {
                 return withSystemChrome(
                   <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
