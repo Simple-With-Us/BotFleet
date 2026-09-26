@@ -1624,9 +1624,9 @@ export class Store {
 
   /** Fork the conversation: a new message that replaces `sourceId`
    * (same parent, new text) and becomes the active leaf.  Preserves the
-   * source's role and automationSource — regenerating or editing an
-   * auto-delivered instruction (role="system") must produce another
-   * system-attributed prompt, not a fabricated human user bubble. */
+   * source's role, automationSource, sender, and peer-thread link —
+   * regenerating or editing an auto-delivered delegation must remain a
+   * system-attributed, navigable bot-to-bot prompt. */
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
@@ -1640,6 +1640,8 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      from: source.from ? { ...source.from } : undefined,
+      comm: source.comm ? { ...source.comm } : undefined,
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);

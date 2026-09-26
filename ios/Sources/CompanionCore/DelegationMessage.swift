@@ -10,14 +10,15 @@ public struct DelegationMessageView: Equatable, Sendable {
     public static let prefixStart = "[Delegated by @"
     public static let prefixMid = ", another bot in this BotFleet workspace. Do the work and reply directly.]"
 
-    public static func isDelegation(_ text: String?, automationSource: String? = nil) -> Bool {
+    public static func isDelegation(_ text: String?, role: Message.Role, automationSource: String? = nil) -> Bool {
         if automationSource == "delegation" { return true }
-        guard let text else { return false }
+        guard role == .user || role == .system, let text else { return false }
         return text.hasPrefix(prefixStart) && text.contains(prefixMid)
     }
 
     public static func parse(
         _ text: String?,
+        role: Message.Role,
         fromName: String? = nil,
         automationSource: String? = nil
     ) -> DelegationMessageView? {
@@ -40,7 +41,8 @@ public struct DelegationMessageView: Equatable, Sendable {
             return nil
         }
 
-        if trimmed.hasPrefix(prefixStart), let midRange = trimmed.range(of: prefixMid) {
+        if (role == .user || role == .system || automationSource == "delegation"),
+           trimmed.hasPrefix(prefixStart), let midRange = trimmed.range(of: prefixMid) {
             let senderStart = trimmed.index(trimmed.startIndex, offsetBy: prefixStart.count)
             let senderName = String(trimmed[senderStart..<midRange.lowerBound]).trimmingCharacters(in: .whitespaces)
             guard !senderName.isEmpty else { return nil }

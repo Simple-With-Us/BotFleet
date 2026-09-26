@@ -12,14 +12,16 @@ export interface DelegationMessageView {
 }
 
 /** Check if a message represents a bot-to-bot delegation turn. */
-export function isDelegationMessage(message: { text?: string; automationSource?: string }): boolean {
+export function isDelegationMessage(message: { role: "user" | "system" | "bot"; text?: string; automationSource?: string }): boolean {
   if (message.automationSource === "delegation") return true;
+  if (message.role !== "user" && message.role !== "system") return false;
   const text = message.text ?? "";
   return text.startsWith(DELEGATION_PREFIX_START) && text.includes(DELEGATION_PREFIX_MID);
 }
 
 /** Parse a stored delegation prompt into the smaller view shown in chat. */
 export function delegationMessageView(
+  role: "user" | "system" | "bot",
   text: string,
   fromName?: string,
   automationSource?: string,
@@ -27,7 +29,8 @@ export function delegationMessageView(
   const trimmed = text.trim();
   if (!trimmed && automationSource !== "delegation") return null;
 
-  if (trimmed.startsWith(DELEGATION_PREFIX_START) && trimmed.includes(DELEGATION_PREFIX_MID)) {
+  if ((role === "user" || role === "system" || automationSource === "delegation") &&
+      trimmed.startsWith(DELEGATION_PREFIX_START) && trimmed.includes(DELEGATION_PREFIX_MID)) {
     const midIndex = trimmed.indexOf(DELEGATION_PREFIX_MID);
     const senderName = trimmed.slice(DELEGATION_PREFIX_START.length, midIndex).trim();
     if (!senderName) return null;

@@ -4,7 +4,7 @@ import XCTest
 final class DelegationMessageTests: XCTestCase {
     func testParsesDelegationWithReason() {
         let text = "[Delegated by @Compiler, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nRun the test suite\n\n[Reason: User requested build verification]"
-        let view = DelegationMessageView.parse(text)
+        let view = DelegationMessageView.parse(text, role: .system)
         XCTAssertNotNil(view)
         XCTAssertEqual(view?.senderName, "Compiler")
         XCTAssertEqual(view?.reason, "User requested build verification")
@@ -15,7 +15,7 @@ final class DelegationMessageTests: XCTestCase {
 
     func testParsesDelegationWithoutReason() {
         let text = "[Delegated by @Fixer, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nInvestigate outage"
-        let view = DelegationMessageView.parse(text)
+        let view = DelegationMessageView.parse(text, role: .system)
         XCTAssertNotNil(view)
         XCTAssertEqual(view?.senderName, "Fixer")
         XCTAssertNil(view?.reason)
@@ -26,7 +26,7 @@ final class DelegationMessageTests: XCTestCase {
 
     func testParsesAutomationSourceDelegation() {
         let text = "Investigate error logs"
-        let view = DelegationMessageView.parse(text, fromName: "Monitor", automationSource: "delegation")
+        let view = DelegationMessageView.parse(text, role: .system, fromName: "Monitor", automationSource: "delegation")
         XCTAssertNotNil(view)
         XCTAssertEqual(view?.senderName, "Monitor")
         XCTAssertEqual(view?.headline, "Delegated by @Monitor")
@@ -34,7 +34,10 @@ final class DelegationMessageTests: XCTestCase {
     }
 
     func testIgnoresOrdinaryChat() {
-        XCTAssertNil(DelegationMessageView.parse("Hello world"))
-        XCTAssertFalse(DelegationMessageView.isDelegation("Hello world"))
+        XCTAssertNil(DelegationMessageView.parse("Hello world", role: .user))
+        XCTAssertFalse(DelegationMessageView.isDelegation("Hello world", role: .user))
+        let quote = "[Delegated by @Compiler, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nQuoted reply"
+        XCTAssertNil(DelegationMessageView.parse(quote, role: .bot))
+        XCTAssertFalse(DelegationMessageView.isDelegation(quote, role: .bot))
     }
 }

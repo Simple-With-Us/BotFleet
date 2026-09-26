@@ -1234,7 +1234,7 @@ struct MessageRow: View {
     private var content: some View {
         switch message.kind {
         case .text:
-            if let delegation = DelegationMessageView.parse(message.text, fromName: message.from?.name, automationSource: message.automationSource) {
+            if let delegation = DelegationMessageView.parse(message.text, role: message.role, fromName: message.from?.name, automationSource: message.automationSource) {
                 ChannelEventCard(
                     headline: delegation.headline,
                     subtitle: delegation.subtitle,
@@ -1421,7 +1421,7 @@ struct TextBubble: View {
     }
 
     var body: some View {
-        let mine = message.role == .user && !DelegationMessageView.isDelegation(message.text, automationSource: message.automationSource)
+        let mine = message.role == .user && !DelegationMessageView.isDelegation(message.text, role: message.role, automationSource: message.automationSource)
         let customCard = parsedDiff != nil || parsedTable != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from

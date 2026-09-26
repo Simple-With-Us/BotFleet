@@ -890,7 +890,7 @@ const MessagesList = memo(function MessagesList({
                   </div>
                 );
               };
-              const delegationView = delegationMessageView(m.text ?? "", m.from?.name, m.automationSource);
+              const delegationView = delegationMessageView(m.role, m.text ?? "", m.from?.name, m.automationSource);
               if (delegationView) {
                 return withSystemChrome(
                   <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,

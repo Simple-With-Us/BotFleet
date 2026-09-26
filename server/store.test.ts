@@ -454,6 +454,28 @@ describe("Store", () => {
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
   });
 
+  it("branchMessage preserves delegated sender and channel metadata", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const from = { botId: "sender", name: "Compiler", color: "blue" };
+    const comm = { groupId: "peer-thread", withBotId: "sender", withName: "Compiler", withColor: "blue" };
+    const original = store.appendMessage(bot.threadId, {
+      role: "system", kind: "text", text: "Run CI",
+      automationSource: "delegation", from, comm,
+    });
+
+    const edited = store.branchMessage(bot.threadId, original.id, "Run tests")!;
+    expect(edited).toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+    expect(edited.from).not.toBe(original.from);
+    expect(edited.comm).not.toBe(original.comm);
+    const regenerated = store.branchMessage(bot.threadId, edited.id, "Run tests")!;
+    expect(regenerated).toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.messagesFor(bot.threadId).find((message) => message.id === regenerated.id))
+      .toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+  });
+
   it("setActiveLeaf switches branches and descends to the newest leaf", () => {
     const store = new Store(selection);
     const bot = store.createBot();
