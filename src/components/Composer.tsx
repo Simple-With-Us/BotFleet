@@ -1,3 +1,5 @@
+import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { pickSTTProvider } from "@/lib/transcription-provider";
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
@@ -209,6 +211,11 @@ export function Composer({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // what was typed before the mic went on — partials append after it
   const baseText = useRef("");
+  // Long-lived STT session for push-to-talk dictation. Created lazily on
+  // first mic-on so the cloud-side assemblyai session only spins up when a
+  // user explicitly opts into dictation. Composer is much simpler than
+  // CallView: no queue, no approvals, just one ongoing capture turn at a time.
+  const sttSessionRef = useRef<STTSession | null>(null);
 
   // image paste is offered only when every bot that will actually answer
   // can open one. sendGroup routes to mentions, else the room default —
@@ -369,33 +376,89 @@ export function Composer({
   // helper runs; the final transcript stays in the box, ready to edit/send
   useEffect(() => {
     if (!recording) return;
+    let detached = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
     const bridge = window.ogb;
     if (!bridge) {
       setRecording(false);
       return;
     }
     setSpeechError(null);
-    const offTranscript = bridge.onSpeechTranscript((line) => {
+    let session: STTSession | null = sttSessionRef.current;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
       if (typeof line.text === "string") {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
-    });
-    const offEnd = bridge.onSpeechEnd(({ code }) => {
+    };
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       setRecording(false);
       if (code === 2) {
-        setSpeechError("Dictation is only available on macOS for now.");
+        setSpeechError(
+          reason === "no-provider"
+            ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+            : "Dictation needs a working provider. Add an AssemblyAI key or use BotFleet for macOS.",
+        );
       } else if (code === 1) {
         setSpeechError(
-          "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
+          reason === "helper-build-failed"
+            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+            : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
         );
       }
-    });
-    void bridge.speechStart();
+    };
+
+    const wireExisting = async () => {
+      if (!session) {
+        const status = await bridge.transcription?.status?.().catch(() => undefined);
+        const hostPlatform = bridge.platform ?? "unknown";
+        const choice = pickSTTProvider({
+          cloudSttConfigured: Boolean(status?.configured),
+          appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
+          platform: hostPlatform,
+          explicitPreference: state.config?.callStt?.provider,
+        });
+        if (choice.provider === null) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(
+              choice.missing === "cloud-stt-key"
+                ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+                : "Dictation isn't available in this app build.",
+            );
+          }
+          return;
+        }
+        if (detached) return;
+        try {
+          session = createSTTSession(choice.provider);
+          sttSessionRef.current = session;
+        } catch (error) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(error instanceof Error ? error.message : String(error));
+          }
+          return;
+        }
+      }
+      offTranscript = session.onTranscript(handleTranscript);
+      offEnd = session.onEnd(handleEnd);
+      session.start().catch(() => {
+        if (!detached) {
+          setRecording(false);
+          setSpeechError("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+        }
+      });
+    };
+    void wireExisting();
+
     return () => {
+      detached = true;
       offTranscript();
       offEnd();
-      void bridge.speechStop();
+      void session?.stop();
     };
   }, [recording]);
 
