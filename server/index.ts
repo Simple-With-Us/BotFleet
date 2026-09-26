@@ -6515,6 +6515,9 @@ function configStatus() {
       source: diagnostics.source,
       environment: diagnostics.environment,
       tracesSampleRate: diagnostics.tracesSampleRate,
+      aiTracesSampleRate: diagnostics.aiTracesSampleRate,
+      httpTracesSampleRate: diagnostics.httpTracesSampleRate,
+      uiTracesSampleRate: diagnostics.uiTracesSampleRate,
       logsEnabled: diagnostics.logsEnabled,
     },
     // Same rule as the block above, for the same reason: booleans and counts

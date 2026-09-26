@@ -157,6 +157,27 @@ describe("observability status resolution", () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     expect(observability.getStatus().tracesSampleRate).toBe(0.2);
   });
+
+  it("reports explicit and defaulted separate trace sample rates", async () => {
+    useConfig({
+      observability: {
+        sentryDsn: CONFIG_DSN,
+        aiTracesSampleRate: 0.8,
+        httpTracesSampleRate: 0.05,
+        uiTracesSampleRate: 0.15,
+      },
+    });
+    const status = observability.getStatus();
+    expect(status.aiTracesSampleRate).toBe(0.8);
+    expect(status.httpTracesSampleRate).toBe(0.05);
+    expect(status.uiTracesSampleRate).toBe(0.15);
+
+    useConfig({ observability: { sentryDsn: CONFIG_DSN } });
+    const defaulted = observability.getStatus();
+    expect(defaulted.aiTracesSampleRate).toBe(1.0);
+    expect(defaulted.httpTracesSampleRate).toBe(0.1);
+    expect(defaulted.uiTracesSampleRate).toBe(0.1);
+  });
 });
 
 describe("observability kill switch", () => {

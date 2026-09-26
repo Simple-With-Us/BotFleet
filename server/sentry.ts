@@ -19,6 +19,9 @@ export interface SentryRuntimeInput {
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled: boolean;
   source: SentrySource;
 }
@@ -32,6 +35,9 @@ export interface SentryRuntimeState {
   projectId: string | null;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate: number;
+  httpTracesSampleRate: number;
+  uiTracesSampleRate: number;
   logsEnabled: boolean;
   profilingAvailable: boolean;
   lastError: string | null;
@@ -44,6 +50,9 @@ const DORMANT: SentryRuntimeState = {
   projectId: null,
   environment: "production",
   tracesSampleRate: 0,
+  aiTracesSampleRate: 0,
+  httpTracesSampleRate: 0,
+  uiTracesSampleRate: 0,
   logsEnabled: false,
   profilingAvailable: false,
   lastError: null,
@@ -378,12 +387,28 @@ export async function applySentryConfig(input: SentryRuntimeInput): Promise<Sent
 
 async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<SentryRuntimeState> {
   const parsed = input.dsn ? describeDsn(input.dsn) : null;
+  const aiRate =
+    input.aiTracesSampleRate !== undefined && Number.isFinite(input.aiTracesSampleRate)
+      ? Math.min(Math.max(input.aiTracesSampleRate, 0), 1)
+      : 1.0;
+  const httpRate =
+    input.httpTracesSampleRate !== undefined && Number.isFinite(input.httpTracesSampleRate)
+      ? Math.min(Math.max(input.httpTracesSampleRate, 0), 1)
+      : 0.1;
+  const uiRate =
+    input.uiTracesSampleRate !== undefined && Number.isFinite(input.uiTracesSampleRate)
+      ? Math.min(Math.max(input.uiTracesSampleRate, 0), 1)
+      : 0.1;
+
   const base: Omit<SentryRuntimeState, "active"> = {
     source: input.source,
     host: parsed?.host ?? null,
     projectId: parsed?.projectId ?? null,
     environment: input.environment,
     tracesSampleRate: input.tracesSampleRate,
+    aiTracesSampleRate: aiRate,
+    httpTracesSampleRate: httpRate,
+    uiTracesSampleRate: uiRate,
     logsEnabled: input.logsEnabled,
     profilingAvailable: false,
     lastError: null,
@@ -415,6 +440,9 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     dsnDigest(input.dsn),
     input.environment,
     String(input.tracesSampleRate),
+    String(aiRate),
+    String(httpRate),
+    String(uiRate),
     input.logsEnabled ? "logs" : "nologs",
     genAiCollection ? "ai-data-on" : "ai-data-off",
     "stream-genai",
@@ -446,6 +474,45 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
       dsn: input.dsn,
       environment: input.environment,
       tracesSampleRate: input.tracesSampleRate,
+      tracesSampler: (samplingContext: {
+        parentSampled?: boolean;
+        name?: string;
+        op?: string;
+        attributes?: Record<string, unknown>;
+      }) => {
+        if (samplingContext.parentSampled !== undefined) {
+          return samplingContext.parentSampled;
+        }
+        const op = samplingContext.attributes?.["sentry.op"] ?? samplingContext.op;
+        const opStr = typeof op === "string" ? op : "";
+        const name = typeof samplingContext.name === "string" ? samplingContext.name : "";
+
+        if (
+          opStr.startsWith("gen_ai.") ||
+          name.startsWith("gen_ai.") ||
+          opStr === "tool" ||
+          name.startsWith("execute_tool")
+        ) {
+          return aiRate;
+        }
+
+        if (
+          opStr.startsWith("http.server") ||
+          opStr === "http" ||
+          /^(GET|POST|PATCH|PUT|DELETE|HEAD|OPTIONS) /.test(name)
+        ) {
+          if (name.includes("/healthz") || name.includes("/api/telemetry/status")) {
+            return Math.min(httpRate, 0.01);
+          }
+          return httpRate;
+        }
+
+        if (opStr.startsWith("http.client")) {
+          return httpRate;
+        }
+
+        return input.tracesSampleRate;
+      },
       enableLogs: true,
       integrations,
       // Every payload kind the client sends passes the webhook-secret scrub:
@@ -510,6 +577,9 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
   if (env.VITEST === "true" || env.NODE_ENV === "test") return false;
   const dsn = sentryDsnFromEnv(env);
   const tracesSampleRate = Number(env.SENTRY_TRACES_SAMPLE_RATE ?? "0.2");
+  const aiTracesSampleRate = Number(env.SENTRY_AI_TRACES_SAMPLE_RATE ?? "1.0");
+  const httpTracesSampleRate = Number(env.SENTRY_HTTP_TRACES_SAMPLE_RATE ?? "0.1");
+  const uiTracesSampleRate = Number(env.SENTRY_UI_TRACES_SAMPLE_RATE ?? "0.1");
   return (await applySentryConfig({
     dsn: dsn ?? null,
     enabled: true,
@@ -517,6 +587,15 @@ export async function initSentry(env: NodeJS.ProcessEnv = process.env): Promise<
     tracesSampleRate: Number.isFinite(tracesSampleRate)
       ? Math.min(Math.max(tracesSampleRate, 0), 1)
       : 0.2,
+    aiTracesSampleRate: Number.isFinite(aiTracesSampleRate)
+      ? Math.min(Math.max(aiTracesSampleRate, 0), 1)
+      : 1.0,
+    httpTracesSampleRate: Number.isFinite(httpTracesSampleRate)
+      ? Math.min(Math.max(httpTracesSampleRate, 0), 1)
+      : 0.1,
+    uiTracesSampleRate: Number.isFinite(uiTracesSampleRate)
+      ? Math.min(Math.max(uiTracesSampleRate, 0), 1)
+      : 0.1,
     logsEnabled: true,
     source: dsn ? "env" : "none",
   })).active;

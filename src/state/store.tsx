@@ -518,6 +518,9 @@ export interface ConfigStatus {
     source: "env" | "config" | "none" | "infisical";
     environment: string;
     tracesSampleRate: number;
+    aiTracesSampleRate?: number;
+    httpTracesSampleRate?: number;
+    uiTracesSampleRate?: number;
     logsEnabled: boolean;
   };
   /** Infisical secret-store status.  Booleans and counts only — the project

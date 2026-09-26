@@ -53,6 +53,7 @@ export interface RuntimeObservability {
   dsn?: string | null;
   environment?: string;
   tracesSampleRate?: number;
+  uiTracesSampleRate?: number;
 }
 
 /** How the renderer asks the harness what it resolved. */
@@ -558,7 +559,7 @@ function applyRuntimeObservability(data: RuntimeObservability | null): void {
   buildTimeClientActive = false;
 
   const environment = data.environment?.trim() || "production";
-  const reportedRate = data.tracesSampleRate;
+  const reportedRate = data.uiTracesSampleRate ?? data.tracesSampleRate;
   const resolvedRate = reportedRate !== undefined && Number.isFinite(reportedRate) ? reportedRate : 0.2;
   const tracesSampleRate = Math.min(Math.max(resolvedRate, 0), 1);
 

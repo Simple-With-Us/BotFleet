@@ -145,6 +145,63 @@ describe("Sentry AI data collection kill-switch", () => {
   });
 });
 
+describe("Sentry tracesSampler dynamic rates", () => {
+  it("samples AI spans with aiRate and routine HTTP spans with httpRate", async () => {
+    let initOpts: Record<string, unknown> | null = null;
+    const sdk = {
+      init(opts: Record<string, unknown>) {
+        initOpts = opts;
+      },
+      close() {
+        return Promise.resolve(true);
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+    } as unknown as typeof import("@sentry/node");
+    setSentryLoaderForTests(async () => sdk);
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      aiTracesSampleRate: 1.0,
+      httpTracesSampleRate: 0.05,
+      uiTracesSampleRate: 0.1,
+      logsEnabled: false,
+      source: "config",
+    });
+    expect(initOpts).toBeTruthy();
+    const sampler = (initOpts as unknown as { tracesSampler: (ctx: Record<string, unknown>) => number | boolean }).tracesSampler;
+    expect(typeof sampler).toBe("function");
+
+    // Parent sampled decision inherited
+    expect(sampler({ parentSampled: true })).toBe(true);
+    expect(sampler({ parentSampled: false })).toBe(false);
+
+    // AI operations sampled at aiRate (1.0)
+    expect(sampler({ attributes: { "sentry.op": "gen_ai.chat" } })).toBe(1.0);
+    expect(sampler({ attributes: { "sentry.op": "gen_ai.invoke_agent" } })).toBe(1.0);
+    expect(sampler({ attributes: { "sentry.op": "gen_ai.execute_tool" } })).toBe(1.0);
+    expect(sampler({ name: "gen_ai.chat" })).toBe(1.0);
+
+    // HTTP server endpoints sampled at httpRate (0.05)
+    expect(sampler({ attributes: { "sentry.op": "http.server" }, name: "POST /api/chat" })).toBe(0.05);
+    expect(sampler({ name: "GET /api/bots" })).toBe(0.05);
+
+    // Routine health check endpoints heavily sampled / throttled
+    expect(sampler({ name: "GET /healthz" })).toBe(0.01);
+    expect(sampler({ name: "GET /api/telemetry/status" })).toBe(0.01);
+
+    // Outbound HTTP requests sampled at httpRate
+    expect(sampler({ attributes: { "sentry.op": "http.client" } })).toBe(0.05);
+
+    // Other / fallback spans sampled at general rate (0.2)
+    expect(sampler({ name: "custom.operation" })).toBe(0.2);
+  });
+});
+
 describe("webhook secrets never reach Sentry", () => {
   // Fake values in the real shapes: an endpoint id and a whsec_ secret.
   const endpoint = "wh_abc";

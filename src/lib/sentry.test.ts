@@ -165,6 +165,23 @@ describe("renderer diagnostics refresh", () => {
     });
   });
 
+  it("prefers uiTracesSampleRate over tracesSampleRate when reported by the runtime", async () => {
+    harness.answer({
+      enabled: true,
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.05,
+    });
+    await initSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.05,
+    });
+  });
+
   it("closes the client when the kill switch goes off, and starts nothing", async () => {
     harness.answer({ enabled: true, dsn: RUNTIME_DSN, environment: "production", tracesSampleRate: 0.2 });
     await initSentryFromRuntime();
