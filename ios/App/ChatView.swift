@@ -1113,9 +1113,15 @@ struct MessageRow: View {
             content
 
             if let comm = message.comm {
-                Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.secondary)
+                if message.automationSource == "delegation" {
+                    Label("From @\(comm.withName)", systemImage: "arrow.down.left.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                } else {
+                    Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                }
             }
 
             // Stay up while `message.queued` is true, even after `bot.busy`

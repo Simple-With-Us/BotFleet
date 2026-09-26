@@ -237,7 +237,7 @@ import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { flushNativeTee } from "./drivers/native.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
-import { promptWithReply, transcriptText } from "./replies.ts";
+import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
 import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
@@ -8233,8 +8233,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const userName = cfg.profile?.name?.trim() || "User";
       const lines: string[] = [`# ${title}`, ""];
       for (const msg of messages) {
-        const who =
-          msg.role === "user" ? userName : msg.role === "system" ? "Scheduled Run" : (msg.from?.name ?? bot?.name ?? "Bot");
+        const who = exportMessageSpeaker(msg, userName, bot?.name);
         if (msg.kind === "text" && msg.text) lines.push(`**${who}:**`, "", msg.text, "");
         else if (msg.kind === "activity" && msg.tool) lines.push(`> ${msg.tool.name}`, "");
         else if (msg.kind === "screen") lines.push("> [screen capture]", "");
