@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { BACKOFF_BASE_MS, RETRY_MAX_ATTEMPTS, classifyError, computeBackoff } from "./retry.ts";
+import { BACKOFF_BASE_MS, RETRY_MAX_ATTEMPTS, classifyError, computeBackoff, type ErrorClassification } from "./retry.ts";
 
 describe("classifyError", () => {
   it("calls provider rate limits transient", () => {
@@ -76,8 +76,16 @@ describe("classifyError", () => {
 
   it("never retries a signal kill or interrupt", () => {
     expect(classifyError({ exitCode: -1 })).toEqual({ transient: false, reason: "interrupted" });
-    expect(classifyError(new Error("interrupted"))).toEqual({ transient: false, reason: "interrupted" });
+    expect(classifyError(new Error("interrupted by user"))).toEqual({ transient: false, reason: "interrupted" });
     expect(classifyError(new Error("turn cancelled by user"))).toEqual({ transient: false, reason: "interrupted" });
+  });
+
+  it("no longer terminal-interrupts on the bare word alone", () => {
+    // Narrowed to the drivers' own stop-path phrases ("interrupted by
+    // user"/"cancelled by user") so a transient reconnect message that
+    // merely contains the word "interrupted" isn't swallowed into a
+    // permanent give-up before the transient vocabulary gets a look at it.
+    expect(classifyError(new Error("stream interrupted"))).not.toEqual({ transient: false, reason: "interrupted" });
   });
 
   it("prefers the transient reading when stderr carries both shapes", () => {
@@ -129,6 +137,31 @@ describe("classifyError", () => {
     expect(classifyError(new Error("error(500)"))).toMatchObject({ transient: true, reason: "server_error" });
     expect(classifyError(new Error("service temporarily unavailable"))).toMatchObject({ transient: true, reason: "server_error" });
     expect(classifyError(new Error("error: 401 Unauthorized: missing bearer"))).toMatchObject({ transient: false, reason: "auth" });
+  });
+  // 2026-09-25 fix: classifyError used to check transient-before-terminal for
+  // a CliExit but terminal-before-transient for an Error/{text} — so the same
+  // failure message classified differently purely because of which shape a
+  // driver happened to wrap it in.  Every string below must now land on the
+  // identical verdict whether it arrives as a thrown Error, a bare
+  // `{ text }`, or a CLI exit report (`{ exitCode, stderr }`).
+  const SHAPE_INVARIANT_CASES: Array<[string, ErrorClassification]> = [
+    ["unexpected status 503", { transient: true, reason: "server_error" }],
+    ["unexpected status 429", { transient: true, reason: "rate_limited" }],
+    ["unexpected status 401", { transient: false, reason: "auth" }],
+    ["rate limit reached for this month", { transient: false, reason: "quota" }],
+    ["RESOURCE_EXHAUSTED capacity", { transient: false, reason: "quota" }],
+    ["overloaded", { transient: true, reason: "overloaded" }],
+    ["stream interrupted", { transient: false, reason: "unknown" }],
+    ["interrupted by user", { transient: false, reason: "interrupted" }],
+    ["ECONNRESET", { transient: true, reason: "connection_reset" }],
+    ["timeout waiting for response", { transient: true, reason: "timeout" }],
+    ["Invalid params", { transient: false, reason: "unknown" }],
+  ];
+
+  it.each(SHAPE_INVARIANT_CASES)("classifies %j identically as Error / {text} / CliExit", (text, expected) => {
+    expect(classifyError(new Error(text))).toEqual(expected);
+    expect(classifyError({ text })).toEqual(expected);
+    expect(classifyError({ exitCode: 1, stderr: text })).toEqual(expected);
   });
 });
 
