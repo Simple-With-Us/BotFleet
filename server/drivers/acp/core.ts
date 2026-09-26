@@ -65,6 +65,7 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import { getBool } from "../../feature-flags.ts";
 
 const acpNonemptyString = z.string().min(1);
 
@@ -417,6 +418,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
+  // Experimental V2 driver rollout gate — when this flips to `true` the V2
+  // session runtime in `acp/core.v2.ts` will be wired in here.  Today the
+  // flag is `false` and the branch is a single boot-time log line so the
+  // OpenFeature path is exercised on every ACP harness boot, not just the
+  // first turn.  See `docs/feature-flags.md`.
+  void (async () => {
+    const experimental = await getBool("harness.experimentalAcpDriverV2", false);
+    if (experimental) console.info(`[acp:${DRIVER_KIND}] experimentalAcpDriverV2 flag=true (V2 runtime placeholder)`);
+  })();
 
   return {
     driverKind: DRIVER_KIND,
