@@ -132,6 +132,7 @@ Protocol: /Users/jay/apps/EFFORT-LOG-PROTOCOL.md (canonical). Live board: this f
 (mirror: docs/EFFORT-LOG.md in the repo). As of 2026-08-29.
 
 ## In Progress
+- **2026-09-26 — CODEX — IN PROGRESS — Public site workflow, beta copy, and links (board `e7e4bceb`, issue #668, branch `codex/public-copy`, worktree `~/apps/botfleet-codex-public-copy`).**  Scope is `apps/site` marketing content only; no native app or deployment changes.
 - **2026-09-26 - BF-MONITOR - PLANNED - [BF] Bot-to-bot delegations render as blue user bubbles instead of expandable cards in peer channels.** <!-- wb-agent-report:a807f3c7f319499a80607e5e5f24b1e1 -->
 - **2026-09-25 - CLAUDE - IN_PROGRESS - [BF][CLAUDE] Native protocol tee redacts every stdout line synchronously with no size cap; Grok HTTP 120 s abort races the 180 s round deadline.** <!-- wb-agent-report:165491bed9364874aab8113c5c375361 -->
 - **2026-09-25 - CLAUDE - IN_PROGRESS - [BF][CLAUDE] pi driver: failed set_model leaks the child and wedges the thread; stderr never drained; failed switch_session answers on an empty session.** <!-- wb-agent-report:4b6f454375fe4ab0b97daac51d308c2b -->
