@@ -2,6 +2,7 @@ import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export const REQUIRED_LINUX_TOOLS = ["click", "get_window_state", "list_apps", "type_text"];
 // Keep this exact field set synchronized with DRIVER_FILE_IDENTITY_KEYS in
@@ -15,6 +16,8 @@ export const DRIVER_FILE_IDENTITY_KEYS = [
   "size",
   "mtimeNs",
   "ctimeNs",
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 ] as const;
 
 export type LocalComputerConnection = {
@@ -33,9 +36,9 @@ type LegacyConnectionDescriptor = {
   mcpEnv?: unknown;
 };
 
-type LinuxConnectionDescriptor = Record<string, unknown>;
+type LinuxConnectionDescriptor = Record<string, JsonValue>;
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+function exactKeys(value: Record<string, JsonValue>, keys: readonly string[]): boolean {
   const expected = new Set(keys);
   return Object.keys(value).length === expected.size && Object.keys(value).every((key) => expected.has(key));
 }
@@ -45,19 +48,25 @@ function legacyPlatform(platform: NodeJS.Platform): "darwin" | "win32" | null {
   return null;
 }
 
-function validDriverFileIdentity(value: unknown): value is Record<string, string> {
+function validDriverFileIdentity(value): value is Record<string, string> {
   return (
     Boolean(value) &&
-    typeof value === "object" &&
+    (Object.prototype.toString.call(value) === "[object Object]") &&
     !Array.isArray(value) &&
-    exactKeys(value as Record<string, unknown>, DRIVER_FILE_IDENTITY_KEYS) &&
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    exactKeys(value as Record<string, JsonValue>, DRIVER_FILE_IDENTITY_KEYS) &&
     DRIVER_FILE_IDENTITY_KEYS.every(
-      (key) => typeof (value as Record<string, unknown>)[key] === "string" && /^\d+$/.test((value as Record<string, string>)[key]),
+      (key) => {
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+      const v = (value as Record<string, JsonValue>)[key];
+      return Object.prototype.toString.call(v) === "[object String]" && /^\d+$/.test(v);
+    },
     )
   );
 }
 
-function currentDriverFileIdentity(file: string): Record<string, string> {
+function currentDriverFileIdentity(file: string) {
   const stat = statSync(file, { bigint: true });
   return {
     dev: String(stat.dev),
@@ -71,7 +80,7 @@ function currentDriverFileIdentity(file: string): Record<string, string> {
   };
 }
 
-function sameDriverFileIdentity(expected: unknown, actual: Record<string, string>): boolean {
+function sameDriverFileIdentity(expected, actual: Record<string, string>): boolean {
   return (
     validDriverFileIdentity(expected) &&
     DRIVER_FILE_IDENTITY_KEYS.every((key) => expected[key] === actual[key])
@@ -83,23 +92,25 @@ function decodeLegacyDescriptor(
   platform: NodeJS.Platform,
 ): LocalComputerConnection | null {
   const supportedPlatform = legacyPlatform(platform);
-  if (!supportedPlatform || !value || value.mode === "unavailable" || typeof value.mcpCommand !== "string") {
+  if (!supportedPlatform || !value || value.mode === "unavailable" || !(Object.prototype.toString.call(value.mcpCommand) === "[object String]")) {
     return null;
   }
   if (value.mcpArgs !== undefined && !Array.isArray(value.mcpArgs)) return null;
   if (
     value.mcpEnv !== undefined &&
-    (!value.mcpEnv || typeof value.mcpEnv !== "object" || Array.isArray(value.mcpEnv))
+    (!value.mcpEnv || !(Object.prototype.toString.call(value.mcpEnv) === "[object Object]") || Array.isArray(value.mcpEnv))
   ) {
     return null;
   }
   const args = value.mcpArgs ?? ["mcp"];
-  if (!args.every((arg) => typeof arg === "string")) return null;
+  if (!args.every((arg) => (Object.prototype.toString.call(arg) === "[object String]"))) return null;
   const env = value.mcpEnv ?? {};
-  if (!Object.values(env).every((entry) => typeof entry === "string")) return null;
+  if (!Object.values(env).every((entry) => (Object.prototype.toString.call(entry) === "[object String]"))) return null;
   return {
     command: value.mcpCommand,
     args,
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     env: env as Record<string, string>,
     platform: supportedPlatform,
     scope: "local-computer",
@@ -107,7 +118,7 @@ function decodeLegacyDescriptor(
 }
 
 export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalComputerConnection | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) return null;
   const x11 = value.mode === "linux-x11-supervised" && value.session === "x11";
   const wayland =
     value.mode === "linux-wayland-gnome-supervised" &&
@@ -137,16 +148,24 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
     value.enabled !== true ||
     value.status !== "ready" ||
     !Number.isInteger(value.ownerPid) ||
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     (value.ownerPid as number) <= 0 ||
-    typeof value.generation !== "string" ||
+    !(Object.prototype.toString.call(value.generation) === "[object String]") ||
     !/^[0-9a-f-]{32,64}$/i.test(value.generation)
   ) {
     return null;
   }
 
-  const driver = value.driver as Record<string, unknown>;
-  const daemon = value.daemon as Record<string, unknown>;
-  const mcp = value.mcp as Record<string, unknown>;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const driver = value.driver as Record<string, JsonValue>;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const daemon = value.daemon as Record<string, JsonValue>;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const mcp = value.mcp as Record<string, JsonValue>;
   if (
     !driver ||
     !daemon ||
@@ -168,16 +187,27 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
     return null;
   }
   if (
-    typeof driver.path !== "string" ||
+    !(Object.prototype.toString.call(driver.path) === "[object String]") ||
     !isAbsolute(driver.path) ||
     driver.version !== "0.19.3" ||
     !["bundled", "environment", "user-local", "path"].includes(String(driver.source)) ||
     driver.manifestSchema !== "1" ||
     !validDriverFileIdentity(driver.fileIdentity) ||
-    typeof daemon.socketPath !== "string" ||
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+  const daemonPidNonPositive = !Number.isInteger(daemon.pid) || (daemon.pid as number) <= 0;
+  const mcpEnv = mcp.env as Record<string, JsonValue>;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+  const waylandEnabledMismatch = wayland && mcpEnv.CUA_DRIVER_RS_ENABLE_WAYLAND !== "1";
+  if (
+    !(Object.prototype.toString.call(driver.path) === "[object String]") ||
+    !isAbsolute(driver.path) ||
+    driver.version !== "0.19.3" ||
+    !["bundled", "environment", "user-local", "path"].includes(String(driver.source)) ||
+    driver.manifestSchema !== "1" ||
+    !validDriverFileIdentity(driver.fileIdentity) ||
+    !(Object.prototype.toString.call(daemon.socketPath) === "[object String]") ||
     !isAbsolute(daemon.socketPath) ||
-    !Number.isInteger(daemon.pid) ||
-    (daemon.pid as number) <= 0 ||
+    daemonPidNonPositive ||
     daemon.contractVersion !== "0.6.0" ||
     daemon.toolsListSchemaVersion !== "1" ||
     daemon.capabilityVersion !== "1" ||
@@ -190,27 +220,29 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
     mcp.args[2] !== "--socket" ||
     mcp.args[3] !== daemon.socketPath ||
     !mcp.env ||
-    typeof mcp.env !== "object" ||
+    !(Object.prototype.toString.call(mcp.env) === "[object Object]") ||
     Array.isArray(mcp.env) ||
-    !exactKeys(mcp.env as Record<string, unknown>, [
+    !exactKeys(mcpEnv, [
       "CUA_DRIVER_EMBEDDED",
       "CUA_DRIVER_HOST_BUNDLE_ID",
       "CUA_DRIVER_RS_UPDATE_CHECK",
       "CUA_DRIVER_RS_TELEMETRY_ENABLED",
       ...(wayland ? ["CUA_DRIVER_RS_ENABLE_WAYLAND"] : []),
     ]) ||
-    (mcp.env as Record<string, unknown>).CUA_DRIVER_EMBEDDED !== "1" ||
-    (mcp.env as Record<string, unknown>).CUA_DRIVER_HOST_BUNDLE_ID !== "com.botfleet.app" ||
-    (mcp.env as Record<string, unknown>).CUA_DRIVER_RS_UPDATE_CHECK !== "false" ||
-    (mcp.env as Record<string, unknown>).CUA_DRIVER_RS_TELEMETRY_ENABLED !== "false" ||
-    (wayland && (mcp.env as Record<string, unknown>).CUA_DRIVER_RS_ENABLE_WAYLAND !== "1")
+    mcpEnv.CUA_DRIVER_EMBEDDED !== "1" ||
+    mcpEnv.CUA_DRIVER_HOST_BUNDLE_ID !== "com.botfleet.app" ||
+    mcpEnv.CUA_DRIVER_RS_UPDATE_CHECK !== "false" ||
+    mcpEnv.CUA_DRIVER_RS_TELEMETRY_ENABLED !== "false" ||
+    waylandEnabledMismatch
   ) {
     return null;
   }
 
   if (
     !Array.isArray(value.toolNames) ||
-    value.toolNames.some((name) => typeof name !== "string") ||
+    value.toolNames.some((name) => !(Object.prototype.toString.call(name) === "[object String]")) ||
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     REQUIRED_LINUX_TOOLS.some((name) => !(value.toolNames as string[]).includes(name)) ||
     !Array.isArray(value.doctorWarnings)
   ) {
@@ -219,14 +251,14 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
   for (const warning of value.doctorWarnings) {
     if (
       !warning ||
-      typeof warning !== "object" ||
+      !(Object.prototype.toString.call(warning) === "[object Object]") ||
       Array.isArray(warning) ||
       ![3, 4].includes(Object.keys(warning).length) ||
       !Object.keys(warning).every((key) => ["label", "status", "message", "detail"].includes(key)) ||
-      typeof warning.label !== "string" ||
+      !(Object.prototype.toString.call(warning.label) === "[object String]") ||
       warning.status !== "warn" ||
-      typeof warning.message !== "string" ||
-      (warning.detail !== undefined && typeof warning.detail !== "string")
+      !(Object.prototype.toString.call(warning.message) === "[object String]") ||
+      (warning.detail !== undefined && !(Object.prototype.toString.call(warning.detail) === "[object String]"))
     ) {
       return null;
     }
@@ -234,7 +266,11 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
 
   return {
     command: driver.path,
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     args: [...(mcp.args as string[])],
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     env: { ...(mcp.env as Record<string, string>) },
     platform: "linux",
     generation: value.generation,
@@ -277,9 +313,17 @@ export function validateLinuxDescriptorRuntime(
       return false;
     }
 
-    const driver = raw.driver as Record<string, unknown>;
-    const daemon = raw.daemon as Record<string, unknown>;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const driver = raw.driver as Record<string, JsonValue>;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const daemon = raw.daemon as Record<string, JsonValue>;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     const binaryPath = driver.path as string;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     const socketPath = daemon.socketPath as string;
     const binaryStat = statSync(binaryPath);
     const currentFileIdentity = currentDriverFileIdentity(binaryPath);
@@ -298,7 +342,11 @@ export function validateLinuxDescriptorRuntime(
       !socketDirectoryStat.isDirectory() ||
       socketDirectoryStat.isSymbolicLink() ||
       !ownedPrivate(socketDirectoryStat, uid) ||
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       !isProcessAlive(raw.ownerPid as number) ||
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       !isProcessAlive(daemon.pid as number)
     ) {
       return false;

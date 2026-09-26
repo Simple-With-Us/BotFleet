@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { AppConfig } from "./config.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export type ConnectorFailureKind =
   | "authentication"
@@ -53,15 +54,17 @@ interface ReadinessProbeOptions<ServiceState> {
 
 const MAX_SUCCESS_HISTORY = 64;
 
-function taggedNumber(error: unknown, field: "status" | "upstreamStatus"): number | undefined {
-  if (!error || typeof error !== "object" || !(field in error)) return undefined;
-  const value = Number((error as Record<string, unknown>)[field]);
+function taggedNumber(error, field: "status" | "upstreamStatus"): number | undefined {
+  if (!error || !(Object.prototype.toString.call(error) === "[object Object]") || !(field in error)) return undefined;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const value = Number((error as Record<string, JsonValue>)[field]);
   return Number.isFinite(value) ? value : undefined;
 }
 
 /** Convert provider failures into a fixed, secret-free status.  The upstream
  * response body and URL are intentionally never copied into the API result. */
-export function safeConnectorFailure(error: unknown): { kind: ConnectorFailureKind; message: string } {
+export function safeConnectorFailure(error) {
   const upstreamStatus = taggedNumber(error, "upstreamStatus") ?? taggedNumber(error, "status");
   if (upstreamStatus === 401) {
     return { kind: "authentication", message: "The connected-apps credential was rejected." };

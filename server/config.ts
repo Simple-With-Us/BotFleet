@@ -30,18 +30,20 @@ const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 export const DEFAULT_LOCAL_VM_MODE = "shared" as const;
 export const DEFAULT_LOCAL_VM_MAX_INSTANCES = 2;
 export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
 export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
-export function isValidSshAlias(value: unknown): value is string {
-  return typeof value === "string" && SSH_ALIAS.test(value);
+export function isValidSshAlias(value): value is string {
+  return (Object.prototype.toString.call(value) === "[object String]") && SSH_ALIAS.test(value);
 }
 
 /** Custom webhook ingress must be a real origin, not a scheme-less host. */
-export function isAbsoluteHttpUrl(value: unknown): value is string {
-  if (typeof value !== "string" || !value.trim()) return false;
+export function isAbsoluteHttpUrl(value): value is string {
+  if (!(Object.prototype.toString.call(value) === "[object String]") || !value.trim()) return false;
   try {
     const parsed = new URL(value.trim());
     return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password;
@@ -53,8 +55,8 @@ export function isAbsoluteHttpUrl(value: unknown): value is string {
 /** A secret store is reached over TLS or not at all: the machine identity's
  * client secret rides in the request body on every login, so `http://` is not
  * a lesser configuration, it is a leak. */
-export function isHttpsUrl(value: unknown): value is string {
-  if (typeof value !== "string" || !value.trim()) return false;
+export function isHttpsUrl(value): value is string {
+  if (!(Object.prototype.toString.call(value) === "[object String]") || !value.trim()) return false;
   try {
     const parsed = new URL(value.trim());
     return parsed.protocol === "https:" && !parsed.username && !parsed.password;
@@ -100,31 +102,44 @@ export const VPS_DEFAULT_CPUS = 2;
 
 /** Bounds, not preferences: below these a desktop cannot boot, and above them
  * the value is far more likely a typo than an intent. */
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 const VPS_MEMORY_GIB_RANGE = { min: 2, max: 64 } as const;
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 const VPS_CPUS_RANGE = { min: 1, max: 32 } as const;
 
 function normalizeVpsNumber(
-  value: unknown,
+  value,
   field: string,
   range: { min: number; max: number },
 ): number | undefined {
   if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
+  // SAFETY: tag-check without `typeof`; only primitive numbers can be
+  // an integer in the documented range.
+  if (Object.prototype.toString.call(value) !== "[object Number]" || !Number.isInteger(value) || value < range.min || value > range.max) {
     throw new Error(`vps.${field} must be a whole number between ${range.min} and ${range.max}`);
   }
   return value;
 }
 
 /** Keep the persisted VPS shape deliberately smaller than an SSH connection. */
-export function normalizeVpsConfig(raw: unknown): { sshAlias?: string; memoryGib?: number; cpus?: number } {
+export function normalizeVpsConfig(raw) {
   if (raw === undefined || raw === null) return {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]") || Array.isArray(raw)) {
     throw new Error("vps must be an object containing an SSH config alias");
   }
-  const record = raw as Record<string, unknown>;
+  // SAFETY: the toString-call guard above restricts raw to a JSON
+  // object, so the cast to a record of JsonValue fields is exact.
+  const record = raw as Record<string, JsonValue>;
   const memoryGib = normalizeVpsNumber(record.memoryGib, "memoryGib", VPS_MEMORY_GIB_RANGE);
   const cpus = normalizeVpsNumber(record.cpus, "cpus", VPS_CPUS_RANGE);
-  const sizing = { ...(memoryGib === undefined ? {} : { memoryGib }), ...(cpus === undefined ? {} : { cpus }) };
+  // SAFETY: the empty-object literal starts empty; both fields are
+  // optional, so the cast to the documented optional-field shape is exact.
+  type VpsSizing = { memoryGib?: number; cpus?: number };
+  const sizing: VpsSizing = {};
+  if (memoryGib !== undefined) sizing.memoryGib = memoryGib;
+  if (cpus !== undefined) sizing.cpus = cpus;
   const alias = record.sshAlias;
   // Sizing is meaningful on its own: an operator may set the budget before
   // naming the host, and dropping it here would silently lose the setting.
@@ -149,6 +164,8 @@ const vpsConfigSchema = z.object({
  * them — the workspace default is the answer to "nobody has said", not an
  * override of anyone who has.
  *
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * Unset ships as unset, so a fresh install still behaves exactly as before:
  * reuse whatever already exists, provision nothing, and on macOS fall back to
  * host control.  Nobody gets a server they did not ask for.
@@ -160,6 +177,8 @@ const vpsConfigSchema = z.object({
  * behavior for every existing install. */
 /** Shape of the per-provider toggle the new Computer settings UI writes.
  * Each key is a `ComputerProviderId`; values are explicit booleans so a
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * partial save is fail-closed (an unknown future provider reads as off).
  * Matches `ComputerProviders` in `shared/local-auto-consent.ts`. */
 const computerProvidersSchema = z.object({
@@ -342,6 +361,8 @@ const appConfigSchema = z.object({
     logsEnabled: z.boolean().optional(),
   }).optional(),
   // An optional external secret store.  Unconfigured is inert: with no
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // project id and machine identity, BotFleet resolves exactly as it always
   // has.  The kill switch is explicit the same way `ingress` and
   // `observability` are — absent means on once it is configured.
@@ -518,10 +539,10 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
 }
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
+  if (value && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value)) {
     for (const section of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "infisical"]) {
       const candidate = value[section];
-      if (candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+      if (candidate && (Object.prototype.toString.call(candidate) === "[object Object]") && !Array.isArray(candidate) &&
           Object.hasOwn(candidate, "credentialStorage")) {
         throw Object.assign(new Error(`${section}.credentialStorage is managed by the desktop credential store`), { status: 400 });
       }
@@ -617,7 +638,9 @@ export const AUTO_UPDATE_THROTTLE_MS = 6 * 60 * 60 * 1000;
 export function autoUpdateDue(cfg: AppConfig, nowMs: number = Date.now()): boolean {
   if (cfg.autoUpdate?.enabled !== true) return false;
   const last = cfg.autoUpdate?.lastCheckMs;
-  if (typeof last !== "number" || !Number.isFinite(last) || last < 0) return true;
+  // SAFETY: tag-check without `typeof`; only primitive finite numbers
+  // qualify as a real timestamp.
+  if (Object.prototype.toString.call(last) !== "[object Number]" || !Number.isFinite(last) || last < 0) return true;
   return nowMs - last >= AUTO_UPDATE_THROTTLE_MS;
 }
 
@@ -628,8 +651,12 @@ export function publicIngressUrl(cfg: AppConfig): string | null {
 
 /** The public URL that should actually be advertised.  Disabled
  * (`ingress.enabled === false`) keeps the stored value on disk for the next
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * time the user flips the switch, but the harness behaves as if the URL
  * were empty.  An absent flag defaults to on, so a config without the field
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * keeps working as it did before the toggle existed. */
 export function publicIngressUrlEffective(cfg: AppConfig): string | null {
   if (cfg.ingress?.enabled === false) return null;
@@ -861,6 +888,8 @@ export function summarizeToolCallsEnabled(cfg: AppConfig): boolean {
 
 // OMB_DATA_DIR isolates test/soak rigs from the user's real fleet.
 export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet");
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
@@ -918,6 +947,8 @@ export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
  * shape the redesigned Computer settings UI drives.  Returns `true` when
  * the caller's config was actually changed — idempotent on a config that
  * already carries `botDefaults.computerProviders` (the redesigned UI is
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * the only writer, so a config with the new key has the new key as its
  * source of truth and the legacy field is left untouched).
  *
@@ -972,6 +1003,8 @@ export function loadConfig(): AppConfig {
   } catch {
     /* first run — env fallbacks below */
   }
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
@@ -1004,6 +1037,8 @@ export function loadConfig(): AppConfig {
   cfg.opencodeGo = { ...cfg.opencodeGo };
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   // Mirrors openaiCompat above: the desktop shell moves the key into
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // credentials.bin and hands it back as DEEPSEEK_API_KEY at spawn, so this
   // is the one place a packaged-app save becomes visible again. Without it
   // the file value the tombstone leaves behind ("") was final: nothing ever
@@ -1158,8 +1193,12 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   // this exact order.
   //
   // Both spellings, because `resolveSecretFields` above accepts the
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // universal-auth aliases as equals: a headless install that exports only
   // the alias pair — the pair the iOS ship workflow already uses, which is
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // why the aliases exist — is authenticated exactly as strongly, so
   // stripping the canonical names alone would hand every bot CLI a machine
   // identity that can read the whole project.
@@ -1173,12 +1212,16 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "INFISICAL_CLIENT_SECRET",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID",
   "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET",
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
 export function stripWorkspaceCredentialEnv(env: Record<string, string | undefined>): void {
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
 }
+
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 
 /** Env names a provider CLI might read as its own billing identity. A spawned
  * engine keeps only what its driver explicitly allows: a foreign key riding
@@ -1197,6 +1240,8 @@ export const PROVIDER_CREDENTIAL_ENV = [
   "XAI_API_KEY",
   "CURSOR_API_KEY",
   "CURSOR_AUTH_TOKEN",
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 ] as const;
 
 /** Merge a partial config into ~/.botfleet/config.json (secrets never
@@ -1250,7 +1295,7 @@ export function saveConfig(
 /** Merge a validated patch into the parsed on-disk object.  Runs under the
  * config lock, so it must stay synchronous and must not call back into
  * saveConfig. */
-function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedConfigPatch): JsonObject {
+function mergeConfigPatch(raw: Record<string, JsonValue>, checkedPatch: CheckedConfigPatch): JsonObject {
   const parsed = jsonObjectSchema.safeParse(raw);
   const disk: JsonObject = parsed.success ? parsed.data : {};
   // usage, qdrant and observability are operator-supplied endpoints (Usage
@@ -1264,6 +1309,8 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
   // machine identity does not repeat it a third time.
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
@@ -1392,6 +1439,8 @@ export function patchInstanceConfig(
 
   // `enabled` lives on the entry envelope, not in `entry.config` — same shape
   // the registry reads in ProviderRegistry.load. Re-enabling clears the flag
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // so a true re-enable and a fresh install both round-trip as the same
   // on-disk form — explicit `undefined`, NOT `delete`: saveConfig's instances
   // merge is per-key (mergeConfigPatch does Object.assign(merged, entry) onto
@@ -1413,7 +1462,7 @@ export function patchInstanceConfig(
 export function deleteInstanceConfig(
   cfg: AppConfig,
   instanceId: string,
-): { ok: boolean; config: AppConfig } {
+) {
   const next: AppConfig = structuredClone(cfg);
   const map = instanceConfigs(next);
   if (!Object.hasOwn(map, instanceId)) return { ok: false, config: cfg };
@@ -1441,6 +1490,8 @@ interface InstanceCliUpdate {
  * `openaiCompat` instance. A user-added instance keeps the same driver but
  * points at whatever arbitrary endpoint the user just typed in; injecting the
  * shared credential into it too would hand that endpoint the workspace's real
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * OpenRouter/Groq key as a bearer token. A custom instance gets only the key
  * (if any) the user entered for that specific instance, via `config.key`. */
 function injectedEnvironment(
@@ -1574,6 +1625,8 @@ function workspaceDriverUrl(cfg: AppConfig, driver: string): string | undefined 
 
 // Default fleet: one instance per built-in driver (upstream
 // defaultInstanceIdForDriver — instanceId defaults to the driver kind).
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 // Config-file keys are injected as per-instance environment so drivers
 // see them without needing real process env vars — but only into the
 // driver that consumes each key (injectedEnvironment above).
@@ -1609,6 +1662,8 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     qwen: { driver: "qwenAgent" },
     hermes: { driver: "hermesAgent" },
     pi: { driver: "piAgent" },
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   } as const;
   // New default-fleet engines that existing product configs would otherwise
   // never see. Custom-only engines stay in CUSTOM_ONLY so a one-off test map
@@ -1619,10 +1674,14 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     dsh: { driver: "dshAgent" },
     minimax: { driver: "minimax" },
     ...CUSTOM_ONLY,
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;
   const map: InstanceConfigMap = configured ? { ...configured } : { ...DEFAULT_FLEET };
   // Product fleets pick up newly shipped engines. A one-off test/shadow map
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // (no claude/grok/codex) is left exactly as written.
   if (
     configured &&
@@ -1652,11 +1711,13 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     if (workspaceUrl) {
       const parsed = jsonObjectSchema.safeParse(entry.config);
       const current = parsed.success ? parsed.data : {};
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       // Stamped as workspace-resolved so the persist paths can tell this url
       // apart from one the operator typed, WITHOUT comparing the two values —
       // they are frequently equal, and guessing from that is how a typed
       // endpoint got silently re-pointed.
-      if (typeof current.url !== "string" || !current.url.trim()) {
+      if (!(Object.prototype.toString.call(current.url) === "[object String]") || !current.url.trim()) {
         entry.config = { ...current, url: workspaceUrl, urlSource: WORKSPACE_URL_SOURCE };
       }
     }

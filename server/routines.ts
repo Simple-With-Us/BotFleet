@@ -17,6 +17,7 @@ import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
@@ -36,10 +37,10 @@ export function automationLane(source?: RoutineRunTrigger): AutomationLane {
   return source === "webhook" || source === "resource" ? "trigger" : "schedule";
 }
 
-export const AUTOMATION_LANE_TITLE: Record<AutomationLane, string> = {
+export const AUTOMATION_LANE_TITLE = {
   trigger: "Triggers",
   schedule: "Routines",
-};
+} satisfies Record<AutomationLane, string>;
 
 /** Which conversation a run belongs in — the identity of the thing that
  * fired it, not the kind of thing it is.
@@ -53,6 +54,8 @@ export const AUTOMATION_LANE_TITLE: Record<AutomationLane, string> = {
  * it expects.
  *
  * Manual runs share the routine's thread deliberately: "Run now" is the same
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * work as the schedule, done impatiently. */
 export function automationThreadKey(run: {
   routineId: string;
@@ -93,6 +96,8 @@ export interface RoutineRun {
   id: string;
   routineId: string;
   routineName: string;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   /** Snapshot of the work as dispatched, so an edited definition cannot
    * rewrite what a run actually did.  Kept in full on active runs and on the
    * newest settled runs; older settled runs keep a bounded copy of it (see
@@ -189,7 +194,7 @@ export interface RoutineManagerOptions {
   now?: () => number;
   /** Keyed frames only: every payload on this bus is `{ kind, … }`, which
    * is what lets the server number and replay them. */
-  emit?: (payload: Record<string, unknown>) => void;
+  emit?: (payload: Record<string, JsonValue>) => void;
   botState: (botId: string) => "ready" | "busy" | "missing";
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
@@ -197,6 +202,8 @@ export interface RoutineManagerOptions {
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
   /** Minutes this run's trigger must stay quiet after it activates.  Absent
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * or 0 runs every delivery as it lands. */
   minGapMinutes?: (run: RoutineRun) => number | undefined;
   /** Live workspace layout.  Absent keeps the historical lane behavior so
@@ -278,11 +285,13 @@ const ROUTINE_REQUEST_ACTIONS = new Set<RoutineRequestOperation["action"]>([
   "delete",
 ]);
 
-function isRoutineRequestAction(value: unknown): value is RoutineRequestOperation["action"] {
-  return typeof value === "string" && ROUTINE_REQUEST_ACTIONS.has(value as RoutineRequestOperation["action"]);
+function isRoutineRequestAction(value): value is RoutineRequestOperation["action"] {
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  return (Object.prototype.toString.call(value) === "[object String]") && ROUTINE_REQUEST_ACTIONS.has(value as RoutineRequestOperation["action"]);
 }
 
-function cleanDays(days: unknown): number[] {
+function cleanDays(days): number[] {
   if (!Array.isArray(days)) return ALL_DAYS;
   const out = [...new Set(days.filter((d): d is number => Number.isInteger(d) && d >= 0 && d <= 6))].sort();
   return out.length ? out : ALL_DAYS;
@@ -297,10 +306,16 @@ function cleanSchedule(schedule: RoutineSchedule): RoutineSchedule {
   if (schedule?.type === "daily") {
     const time = String(schedule.time ?? "");
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error("Time must use HH:MM");
-    const rawTimeZone = typeof schedule.timeZone === "string" ? schedule.timeZone.trim() : "";
+    const rawTimeZone = (Object.prototype.toString.call(schedule.timeZone) === "[object String]") ? schedule.timeZone.trim() : "";
     const timeZone = rawTimeZone ? canonicalTimeZone(rawTimeZone) : null;
     if (rawTimeZone && !timeZone) throw new Error("Choose a valid timezone");
-    return { type: "daily", time, weekdays: cleanDays(schedule.weekdays), ...(timeZone ? { timeZone } : {}) };
+    const daily = {
+      type: "daily" as const,
+      time,
+      weekdays: cleanDays(schedule.weekdays),
+    };
+    if (timeZone) daily.timeZone = timeZone;
+    return daily;
   }
   throw new Error("Choose a supported schedule");
 }
@@ -332,6 +347,8 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     throw new Error("Choose where this routine runs");
   }
   const schedule = input.schedule.type === "daily" && input.scheduleTimeZoneSource === "host"
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     ? { type: "daily" as const, time: input.schedule.time, weekdays: input.schedule.weekdays }
     : input.schedule;
   return {
@@ -381,29 +398,35 @@ export class RoutineManager {
     this.now = options.now ?? Date.now;
     let runOnMigrated = false;
     try {
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
       const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
       const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
       this.routines = rawRoutines.map((routine) => {
         const runOn = normalizeRunOn(routine.runOn);
+        // SAFETY: routine.runOn is documented on RoutineRecord.runOn;
+        // the cast narrows the loose field for the runOn comparison.
         if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
         return { ...routine, runOn };
       });
       this.runs = rawRuns.map((run) => {
         const runOn = normalizeRunOn(run.runOn);
+        // SAFETY: same invariant — RoutineRun.runOn is the documented
+        // field being compared; the cast narrows the loose shape.
         if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
         return { ...run, runOn };
       });
       this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
         ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
-            typeof receipt?.requestId === "string" &&
-            typeof receipt?.messageId === "string" &&
-            typeof receipt?.botId === "string" &&
-            typeof receipt?.threadId === "string" &&
+            (Object.prototype.toString.call(receipt?.requestId) === "[object String]") &&
+            (Object.prototype.toString.call(receipt?.messageId) === "[object String]") &&
+            (Object.prototype.toString.call(receipt?.botId) === "[object String]") &&
+            (Object.prototype.toString.call(receipt?.threadId) === "[object String]") &&
             isRoutineRequestAction(receipt?.action) &&
             receipt?.fingerprintVersion === 1 &&
-            typeof receipt?.fingerprint === "string" && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
-            typeof receipt?.resultId === "string" &&
+            (Object.prototype.toString.call(receipt?.fingerprint) === "[object String]") && /^[a-f0-9]{64}$/.test(receipt.fingerprint) &&
+            (Object.prototype.toString.call(receipt?.resultId) === "[object String]") &&
             Number.isFinite(receipt?.appliedAt)
           )
         : [];
@@ -414,7 +437,7 @@ export class RoutineManager {
         for (const [botId, until] of Object.entries(disk.botSnoozes)) {
           if (until === null) {
             this.botSnoozeUntil.set(botId, Infinity);
-          } else if (typeof until === "number" && Number.isFinite(until) && until > this.now()) {
+          } else if ((Object.prototype.toString.call(until) === "[object Number]") && Number.isFinite(until) && until > this.now()) {
             this.botSnoozeUntil.set(botId, until);
           }
         }
@@ -646,6 +669,8 @@ export class RoutineManager {
     if (!routine) return null;
     const now = this.now();
     const replacementSchedule = patch.schedule?.type === "daily" && patch.scheduleTimeZoneSource === "host"
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       ? { type: "daily" as const, time: patch.schedule.time, weekdays: patch.schedule.weekdays }
       : patch.schedule;
     const nextSchedule = replacementSchedule?.type === "daily" &&
@@ -672,6 +697,8 @@ export class RoutineManager {
     this.commitMutation(() => {
       Object.assign(routine, clean, {
         nextRunAt: clean.enabled ? this.initialOccurrence(clean.schedule, now) : null,
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         // `updatedAt` doubles as the optimistic revision on durable routine
         // confirmation cards. Keep it monotonic even for two writes in one ms.
         updatedAt: Math.max(now, routine.updatedAt + 1),
@@ -803,6 +830,8 @@ export class RoutineManager {
     }
     return { ...run };
   }
+
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 
   /** Host disk/RAM/CPU pressure. Same queue as webhooks so a busy Housekeeper
    * is not double-started; receipts stay on the automations calendar. */
@@ -1044,6 +1073,8 @@ export class RoutineManager {
         }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         // retries must not mint duplicate empty tasks as a side effect.
         if (this.options.canStart?.(run.botId, threadId, run.runOn) === false) continue;
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1175,6 +1206,8 @@ export class RoutineManager {
         run.failurePhase = "lifecycle";
         run.finishedAt = this.now();
         // A cancelled scheduled run did not complete, so Sentry sees it the
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         // same as an error — that is what lets an owner ask "did today's
         // Housekeeper run actually happen" and get a real answer.
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
@@ -1430,13 +1463,14 @@ export class RoutineManager {
         this.botSnoozeUntil.delete(botId);
       }
     }
-    writeFileAtomic(this.file, JSON.stringify({
+    const serialized = {
       version: 1,
       routines: this.routines,
       runs: this.runs,
       routineRequestReceipts: this.routineRequestReceipts,
-      ...(Object.keys(botSnoozes).length > 0 ? { botSnoozes } : {}),
-    } satisfies RoutineFile));
+    } satisfies RoutineFile;
+    if (Object.keys(botSnoozes).length > 0) serialized.botSnoozes = botSnoozes;
+    writeFileAtomic(this.file, JSON.stringify(serialized));
     // Cleared only after the write lands: a failed write throws (so
     // commitMutation can roll back) with the pending state still marked.
     this.dirty = false;

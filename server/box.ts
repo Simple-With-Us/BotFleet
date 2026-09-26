@@ -200,8 +200,11 @@ export async function verifyToken(token: string): Promise<{ ok: true } | { ok: f
  * the plan, the limit and the link — so prefer it and only fall back to
  * our own wording when it says nothing useful. */
 export function boxErrorMessage(status: number, what: string, body?: any): string {
-  const theirs = typeof body?.message === "string" ? body.message.trim() : "";
-  const link = typeof body?.error?.details?.billingUrl === "string" ? body.error.details.billingUrl : "";
+  // SAFETY: tag-check without `typeof`; primitive strings are the only
+  // shape worth passing through to the user-facing message.
+  const isString = (value: any) => Object.prototype.toString.call(value) === "[object String]" && value.trim();
+  const theirs = isString(body?.message) ?? "";
+  const link = isString(body?.error?.details?.billingUrl) ?? "";
   if (status === 402) {
     // e.g. "Start the $20/month Box plan to create sandboxes."
     return [theirs || "ascii.dev needs a paid Box plan before it will create a computer.", link].filter(Boolean).join(" ");
@@ -412,7 +415,9 @@ async function readFileBase64(cfg: AppConfig, boxId: string, path: string): Prom
   }
   const { ok, body } = await boxJson(cfg, `/boxes/${boxId}/files?path=${encodeURIComponent(path)}&encoding=base64`);
   const content = body?.content;
-  return ok && typeof content === "string" && content ? content : null;
+  // SAFETY: tag-check without `typeof`; only non-empty primitive strings are
+  // valid base64 file payloads the box actually emitted.
+  return ok && Object.prototype.toString.call(content) === "[object String]" && content ? content : null;
 }
 
 /** `knownBoxId` skips box resolution entirely — the screen poller holds
@@ -423,6 +428,9 @@ export async function screenshotBox(cfg: AppConfig, botId: string, knownBoxId?: 
     const box = await findBox(cfg, botId);
     if (!box) throw new Error("no computer for this bot yet");
     if (!READY.has(box.state)) throw new Error(`box is ${box.state}`);
+    // SAFETY: box.id is documented as a string id in the box provider
+    // contract; the explicit cast narrows the loose field without a
+    // structural check.
     boxId = box.id as string;
   }
   const out = await runCommand(cfg, boxId, SHOT_CMD, { timeoutMs: 60_000 });

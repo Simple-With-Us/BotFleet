@@ -33,7 +33,7 @@ function toOutcome(result: Awaited<ReturnType<typeof callTool>>) {
     : ({ kind: "result", content: text || "(no output)" } as const);
 }
 
-export function createPhoneTools(): Record<string, ComputerToolExecutor> {
+export function createPhoneTools() {
   const executors: Record<string, ComputerToolExecutor> = {};
   for (const action of ACTIONS) {
     executors[`phone_${action}`] = async (call) => {

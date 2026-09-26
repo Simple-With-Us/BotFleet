@@ -132,14 +132,14 @@ export class ComputerControl {
    * itself — it only surfaces the plea. A reason shouted while the person
    * is already driving is kept, but must not clobber an earlier one they
    * may still be reading. */
-  requestHelp(botId: string, reason: unknown): ControlSnapshot {
+  requestHelp(botId: string, reason): ControlSnapshot {
     return this.requestHelpLease(botId, reason).snapshot;
   }
 
   /** Open a help request and return the lease that owns it. A proxy uses
    * this id to expire only its own unanswered plea when its wait ends. */
-  requestHelpLease(botId: string, reason: unknown): { snapshot: ControlSnapshot; requestId: string } {
-    const text = typeof reason === "string" ? reason.trim().slice(0, MAX_REASON_CHARS) : "";
+  requestHelpLease(botId: string, reason) {
+    const text = (Object.prototype.toString.call(reason) === "[object String]") ? reason.trim().slice(0, MAX_REASON_CHARS) : "";
     const entry = this.entries.get(botId) ?? {
       heldSinceMs: null,
       helpReason: null,
@@ -166,7 +166,7 @@ export class ComputerControl {
 
   /** Expire an unanswered plea. The id comparison prevents an old proxy's
    * timeout from dismissing a newer request for the same bot. */
-  expireHelp(botId: string, requestId: unknown): ControlSnapshot {
+  expireHelp(botId: string, requestId): ControlSnapshot {
     const entry = this.entries.get(botId);
     if (!entry || entry.helpRequestId !== requestId) return this.snapshot(botId);
     entry.helpReason = null;

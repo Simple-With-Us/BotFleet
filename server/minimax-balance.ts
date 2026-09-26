@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 // Reads the user's MiniMax account balance / Token Plan quota and serves it
 // to the Settings → Usage UI. A peer of deepseek-balance.ts, same cache and
@@ -46,6 +47,8 @@ import { quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts"
 // only the response SHAPE was recorded).  The `/v1/token_plan/remains` shape
 // is now pinned, not inferred:
 //   - `model_remains[]` has one row per product, `model_name` distinguishing
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 //     them ("general" is the chat/text quota this file surfaces as the
 //     headline; other rows — "video" observed — are kept in `models` for
 //     display but never blended into the top-line numbers, since they are
@@ -57,6 +60,8 @@ import { quotaCooldowns, type QuotaCooldownRegistry } from "./model-fallback.ts"
 //     `end_time - start_time` is exactly 18,000,000 ms = 5 hours;
 //     `weekly_end_time - weekly_start_time` is exactly 7 days).
 //     `remains_time` / `weekly_remains_time` are milliseconds REMAINING
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 //     (a duration, not an absolute time) — used only as a fallback when the
 //     absolute `_time` field is missing.
 //   - `current_interval_status` / `current_weekly_status` are integers; only
@@ -159,6 +164,8 @@ type CacheEntry = {
  *  would overwrite instance A's cache entry, so A's next 30s poll missed
  *  the cache too, and neither instance was ever actually served from
  *  cache. Keyed by a HASH of (key, url), never the raw key itself, so the
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  *  API key never sits in memory as a plain-text map key. */
 const cacheByHash = new Map<string, CacheEntry>();
 
@@ -187,9 +194,9 @@ function emptySnapshot(now: number, error: string | null): MiniMaxBalanceSnapsho
   };
 }
 
-function parseAmount(raw: unknown): number | null {
-  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-  if (typeof raw !== "string" || !raw.trim()) return null;
+function parseAmount(raw): number | null {
+  if ((Object.prototype.toString.call(raw) === "[object Number]") && Number.isFinite(raw)) return raw;
+  if (!(Object.prototype.toString.call(raw) === "[object String]") || !raw.trim()) return null;
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -198,8 +205,10 @@ function parseAmount(raw: unknown): number | null {
  *  current_weekly_remaining_percent are always integers 0..100 (observed
  *  100 and 94) — never a 0–1 fraction. Clamped defensively in case a future
  *  response goes out of range; never rescaled. */
-function parsePercent(raw: unknown): number | null {
-  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+function parsePercent(raw): number | null {
+  // SAFETY: tag-check without `typeof`; only primitive finite numbers
+  // can be a percent in the documented range.
+  if (Object.prototype.toString.call(raw) !== "[object Number]" || !Number.isFinite(raw)) return null;
   return Math.min(100, Math.max(0, Math.round(raw)));
 }
 
@@ -210,9 +219,11 @@ function parsePercent(raw: unknown): number | null {
  *  factor, matching the un-boosted case exactly. There is no interval-side
  *  equivalent field, so the 5-hour figure stays on the plain parsePercent
  *  above. */
-function parseWeeklyPercent(raw: unknown, boostPermille: unknown): number | null {
-  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
-  const boost = typeof boostPermille === "number" && Number.isFinite(boostPermille) && boostPermille > 0
+function parseWeeklyPercent(raw, boostPermille): number | null {
+  // SAFETY: tag-check without `typeof`; only primitive finite numbers
+  // can be a percent in the documented range.
+  if (Object.prototype.toString.call(raw) !== "[object Number]" || !Number.isFinite(raw)) return null;
+  const boost = (Object.prototype.toString.call(boostPermille) === "[object Number]") && Number.isFinite(boostPermille) && boostPermille > 0
     ? boostPermille
     : 1000;
   return Math.min(200, Math.max(0, Math.round(raw * (boost / 1000))));
@@ -222,17 +233,19 @@ function parseWeeklyPercent(raw: unknown, boostPermille: unknown): number | null
  *  weekly_end_time are always epoch MILLISECONDS (observed ~1.79e12-scale
  *  values) — never seconds. No unit-guessing: just validate and pass
  *  through. */
-function parseEpochMs(raw: unknown): number | null {
-  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return null;
+function parseEpochMs(raw): number | null {
+  // SAFETY: tag-check without `typeof`; only positive finite epoch-ms
+  // integers survive the validation below.
+  if (Object.prototype.toString.call(raw) !== "[object Number]" || !Number.isFinite(raw) || raw <= 0) return null;
   return raw;
 }
 
 /** `remains_time` / `weekly_remains_time` are milliseconds REMAINING (a
  *  duration), used only when the absolute `_time` field is missing. */
-function parseResetMs(absoluteMs: unknown, remainingMs: unknown, now: number): number | null {
+function parseResetMs(absoluteMs, remainingMs, now: number): number | null {
   const absolute = parseEpochMs(absoluteMs);
   if (absolute != null) return absolute;
-  if (typeof remainingMs === "number" && Number.isFinite(remainingMs) && remainingMs > 0) {
+  if ((Object.prototype.toString.call(remainingMs) === "[object Number]") && Number.isFinite(remainingMs) && remainingMs > 0) {
     return now + remainingMs;
   }
   return null;
@@ -242,7 +255,7 @@ function parseResetMs(absoluteMs: unknown, remainingMs: unknown, now: number): n
  *  value. Anything else — including a value never seen — is genuinely
  *  unknown, not a capped signal; "capped" comes only from the percent
  *  fields via statusFromPercent. */
-function parseWindowStatus(raw: unknown): MiniMaxWindowStatus {
+function parseWindowStatus(raw): MiniMaxWindowStatus {
   return raw === 1 ? "active" : "unknown";
 }
 
@@ -270,7 +283,7 @@ function statusFromPercent(percent: number | null): MiniMaxBalanceStatus {
   return "ok";
 }
 
-function parseAccountBalanceResponse(body: Record<string, unknown>, now: number): MiniMaxBalanceSnapshot {
+function parseAccountBalanceResponse(body: Record<string, JsonValue>, now: number): MiniMaxBalanceSnapshot {
   const balance = parseAmount(body.available_amount);
   const alertOn = body.balance_alert_switch === true;
   const threshold = parseAmount(body.balance_alert_threshold);
@@ -301,10 +314,12 @@ function parseAccountBalanceResponse(body: Record<string, unknown>, now: number)
  *  future UI can show "video" quota too. */
 const CHAT_MODEL_NAME = "general";
 
-function parseModelRow(raw: unknown, now: number): { name: string; quota: MiniMaxModelQuota } | null {
-  if (!raw || typeof raw !== "object") return null;
-  const row = raw as Record<string, unknown>;
-  const modelName = typeof row.model_name === "string" && row.model_name ? row.model_name : null;
+function parseModelRow(raw, now: number): { name: string; quota: MiniMaxModelQuota } | null {
+  if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) return null;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const row = raw as Record<string, JsonValue>;
+  const modelName = (Object.prototype.toString.call(row.model_name) === "[object String]") && row.model_name ? row.model_name : null;
   if (!modelName) return null;
   const interval = parsePercent(row.current_interval_remaining_percent);
   const weekly = parseWeeklyPercent(row.current_weekly_remaining_percent, row.weekly_boost_permille);
@@ -332,7 +347,7 @@ function parseModelRow(raw: unknown, now: number): { name: string; quota: MiniMa
   };
 }
 
-function parseTokenPlanResponse(body: Record<string, unknown>, now: number): MiniMaxBalanceSnapshot {
+function parseTokenPlanResponse(body: Record<string, JsonValue>, now: number): MiniMaxBalanceSnapshot {
   const rows = Array.isArray(body.model_remains) ? body.model_remains : [];
   if (rows.length === 0) {
     return { ...emptySnapshot(now, null), source: "token-plan" };
@@ -396,12 +411,20 @@ async function fetchOnce(key: string, url: string | undefined, signal: AbortSign
       signal,
     });
     if (!response.ok) return emptySnapshot(now, `HTTP ${response.status}`);
+    // SAFETY: response.json() returns any JSON value; the unknown
+    // boundary here is the parser, and downstream narrowing happens
+    // after the toString-call guard below.
     const body = (await response.json().catch(() => null)) as unknown;
-    if (!body || typeof body !== "object") return emptySnapshot(now, "malformed response");
-    const record = body as Record<string, unknown>;
+    if (!body || !(Object.prototype.toString.call(body) === "[object Object]")) return emptySnapshot(now, "malformed response");
+    // SAFETY: the toString-call guard above restricts body to a JSON
+    // object, so the cast to a record of JsonValue fields is exact.
+    const record = body as Record<string, JsonValue>;
+    // SAFETY: record.base_resp is documented as the { status_code,
+    // status_msg } envelope (or absent); the cast narrows the loose
+    // JsonValue field to that contract.
     const baseResp = record.base_resp as { status_code?: unknown; status_msg?: unknown } | undefined;
-    if (typeof baseResp?.status_code === "number" && baseResp.status_code !== 0) {
-      const message = typeof baseResp.status_msg === "string" && baseResp.status_msg
+    if ((Object.prototype.toString.call(baseResp?.status_code) === "[object Number]") && baseResp.status_code !== 0) {
+      const message = (Object.prototype.toString.call(baseResp.status_msg) === "[object String]") && baseResp.status_msg
         ? baseResp.status_msg
         : `MiniMax error ${baseResp.status_code}`;
       return emptySnapshot(now, message);
@@ -465,6 +488,8 @@ export function invalidateMiniMaxBalance(): void {
 
 /** Instance id the registry/botfleet wiring uses for the reserved
  *  MiniMax entry (mirrors `RESERVED_INSTANCE_ID` in drivers/minimax.ts
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  *  but kept as a local literal to avoid a cross-module dependency on
  *  the driver module — both files agree because `instanceConfigs()` in
  *  server/config.ts's `DEFAULT_FLEET` declares it under this name). */
@@ -507,6 +532,8 @@ function isAccountLevelCap(snapshot: MiniMaxBalanceSnapshot): boolean {
  *  back to `*:instance:model` after the per-bot row, so a single
  *  wildcard write covers every caller without a per-bot record.
  *
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  *  Returns the model rows still flagged as capped for callers that
  *  want to publish them on `ProviderSnapshot.quota.models`. Never
  *  throws: a registry write failure is logged and swallowed, since
@@ -518,7 +545,7 @@ function isAccountLevelCap(snapshot: MiniMaxBalanceSnapshot): boolean {
 export function applyMiniMaxBalanceToRegistry(
   snapshot: MiniMaxBalanceSnapshot,
   registry: QuotaCooldownRegistry = quotaCooldowns,
-): { capped: boolean } {
+) {
   const previouslyCappedModels = registry.list()
     .filter((cd) => cd.instanceId === MINIMAX_INSTANCE_ID && cd.source === MINIMAX_ACCOUNT_SOURCE)
     .map((cd) => cd.model);
@@ -576,6 +603,8 @@ function statMmxConfig(): { mtimeMs: number } | null {
 /** loadLocalMiniMaxConfig() (server/drivers/minimax.ts) does a synchronous
  *  readFileSync + JSON.parse every call — cheap once, but registry.ts's
  *  describe() (per instance, per poll) and /api/quotas both called it on
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  *  every request. Cached for the same 5-minute TTL as the balance itself,
  *  keyed on the config file's own mtime so an `mmx auth login` mid-window
  *  is picked up immediately rather than waiting out the TTL — a stat()

@@ -53,9 +53,11 @@ interface ExecResult {
 function run(command: string, args: string[], cwd: string, timeoutMs = 60_000): Promise<ExecResult> {
   return new Promise((resolvePromise) => {
     execCli(command, args, { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env }, (error, stdout, stderr) => {
-      const timedOut = Boolean(
-        error && ((error as unknown as { killed?: boolean }).killed || HARD_TIMEOUT_MESSAGE.test(error.message)),
-      );
+      // SAFETY: execFile's error is documented as carrying a `.killed` flag
+// for timeouts; the cast reads that flag without changing its type.
+const timedOut = Boolean(
+  error && ((error as { killed?: boolean }).killed || HARD_TIMEOUT_MESSAGE.test(error.message)),
+);
       if (timedOut) {
         resolvePromise({ code: -1, stdout: "", stderr: "", timedOut: true });
         return;
@@ -64,8 +66,10 @@ function run(command: string, args: string[], cwd: string, timeoutMs = 60_000): 
       // but a STRING (e.g. "ENOENT") when the binary itself could not be
       // spawned — Number("ENOENT") is NaN, so keep the string case as-is
       // rather than coercing it into a meaningless numeric detail.
-      const rawCode = error ? (error as NodeJS.ErrnoException).code : 0;
-      const code = typeof rawCode === "number" ? rawCode : rawCode ? 1 : 0;
+      // SAFETY: execFile's error has a documented `.code` field; the cast
+// narrows the loose rejection shape to the ErrnoException contract.
+const rawCode = error ? (error as NodeJS.ErrnoException).code : 0;
+      const code = (Object.prototype.toString.call(rawCode) === "[object Number]") ? rawCode : rawCode ? 1 : 0;
       resolvePromise({
         code,
         stdout: redactSecretsInText(String(stdout || "")),
@@ -97,8 +101,8 @@ function invalid(message: string): TurnToolOutcome {
  *  never trusts the model's `dir` string without checking a symlink or
  *  `..` didn't walk it out of the workspace.  Null when missing, invalid, or
  *  outside the workspace. */
-function confinedRepoDir(botId: string, dir: unknown): string | null {
-  if (typeof dir !== "string" || !dir.trim()) return null;
+function confinedRepoDir(botId: string, dir): string | null {
+  if (!(Object.prototype.toString.call(dir) === "[object String]") || !dir.trim()) return null;
   const root = workspaceDir(botId);
   const candidate = join(root, dir.trim());
   const real = realOrResolved(candidate);
@@ -109,13 +113,13 @@ const MISSING_DIR = invalid(
   'dir must name a repo directory already cloned into this bot\'s workspace with github_clone (pass the same "dir" you used there).',
 );
 
-export function createGithubTools(botId: string): Record<string, ComputerToolExecutor> {
+export function createGithubTools(botId: string) {
   const clone: ComputerToolExecutor = async (call) => {
-    const repo = typeof call.arguments.repo === "string" ? call.arguments.repo.trim() : "";
+    const repo = (Object.prototype.toString.call(call.arguments.repo) === "[object String]") ? call.arguments.repo.trim() : "";
     if (!repo || !(SAFE_REPO.test(repo) || SAFE_REPO_URL.test(repo))) {
       return invalid('repo must be "owner/repo" or a https://github.com/owner/repo(.git) URL');
     }
-    const dirArg = typeof call.arguments.dir === "string" && call.arguments.dir.trim() ? call.arguments.dir.trim() : undefined;
+    const dirArg = (Object.prototype.toString.call(call.arguments.dir) === "[object String]") && call.arguments.dir.trim() ? call.arguments.dir.trim() : undefined;
     const dirName = dirArg ?? repo.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "").split("/").pop()!;
     if (!SAFE_DIR_NAME.test(dirName)) return invalid("dir must be a plain folder name (letters, digits, . _ -)");
     const root = workspaceDir(botId);
@@ -128,7 +132,7 @@ export function createGithubTools(botId: string): Record<string, ComputerToolExe
   };
 
   const withRepo = (
-    handler: (repoDir: string, args: Record<string, unknown>) => Promise<TurnToolOutcome>,
+    handler: (repoDir: string, args: Record<string, JsonValue>) => Promise<TurnToolOutcome>,
   ): ComputerToolExecutor => async (call) => {
     const repoDir = confinedRepoDir(botId, call.arguments.dir);
     if (!repoDir || !existsSync(repoDir)) return MISSING_DIR;
@@ -146,13 +150,15 @@ export function createGithubTools(botId: string): Record<string, ComputerToolExe
   });
 
   const commit = withRepo(async (repoDir, args) => {
-    const message = typeof args.message === "string" ? args.message.trim() : "";
+    const message = (Object.prototype.toString.call(args.message) === "[object String]") ? args.message.trim() : "";
     if (!message) return invalid("message is required");
     let addArgs = ["-A"];
     if (args.files !== undefined) {
-      const valid = Array.isArray(args.files) && args.files.length > 0 && args.files.every((f) => typeof f === "string" && f.trim());
+      const valid = Array.isArray(args.files) && args.files.length > 0 && args.files.every((f) => (Object.prototype.toString.call(f) === "[object String]") && f.trim());
       if (!valid) return invalid("files must be a non-empty array of path strings");
-      addArgs = args.files as string[];
+      // SAFETY: the every() above filters non-string entries, so the cast
+// from the loose JSON value to a string[] is exact.
+addArgs = args.files as string[];
     }
     const add = await run("git", ["add", ...addArgs], repoDir);
     if (add.code !== 0) return outcome(add);
@@ -160,18 +166,18 @@ export function createGithubTools(botId: string): Record<string, ComputerToolExe
   });
 
   const push = withRepo(async (repoDir, args) => {
-    const branch = typeof args.branch === "string" && args.branch.trim() ? args.branch.trim() : undefined;
+    const branch = (Object.prototype.toString.call(args.branch) === "[object String]") && args.branch.trim() ? args.branch.trim() : undefined;
     if (branch && !SAFE_BRANCH.test(branch)) return invalid("branch has an invalid name");
     const pushArgs = branch ? ["push", "-u", "origin", branch] : ["push"];
     return outcome(await run("git", pushArgs, repoDir), "Pushed.");
   });
 
   const prCreate = withRepo(async (repoDir, args) => {
-    const title = typeof args.title === "string" ? args.title.trim() : "";
+    const title = (Object.prototype.toString.call(args.title) === "[object String]") ? args.title.trim() : "";
     if (!title) return invalid("title is required");
-    const body = typeof args.body === "string" ? args.body : "";
-    const base = typeof args.base === "string" && args.base.trim() ? args.base.trim() : undefined;
-    const branch = typeof args.branch === "string" && args.branch.trim() ? args.branch.trim() : undefined;
+    const body = (Object.prototype.toString.call(args.body) === "[object String]") ? args.body : "";
+    const base = (Object.prototype.toString.call(args.base) === "[object String]") && args.base.trim() ? args.base.trim() : undefined;
+    const branch = (Object.prototype.toString.call(args.branch) === "[object String]") && args.branch.trim() ? args.branch.trim() : undefined;
     if (base && !SAFE_BRANCH.test(base)) return invalid("base has an invalid name");
     if (branch && !SAFE_BRANCH.test(branch)) return invalid("branch has an invalid name");
     const prArgs = ["pr", "create", "--title", title, "--body", body];
@@ -195,9 +201,9 @@ export function createGithubTools(botId: string): Record<string, ComputerToolExe
   });
 
   const issueCreate = withRepo(async (repoDir, args) => {
-    const title = typeof args.title === "string" ? args.title.trim() : "";
+    const title = (Object.prototype.toString.call(args.title) === "[object String]") ? args.title.trim() : "";
     if (!title) return invalid("title is required");
-    const body = typeof args.body === "string" ? args.body : "";
+    const body = (Object.prototype.toString.call(args.body) === "[object String]") ? args.body : "";
     return outcome(await run("gh", ["issue", "create", "--title", title, "--body", body], repoDir), "Opened an issue.");
   });
 

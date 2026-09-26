@@ -19,6 +19,7 @@
 //     surface an hour later.
 
 import type { ModelSelection } from "./contracts.ts";
+import type { GroupRecord } from "./store.ts";
 
 export interface RoomRound {
   groupId: string;
@@ -76,7 +77,7 @@ export function cancelRoomRounds(predicate: (round: RoomRound) => boolean): numb
 
 export interface RoomQueueStore {
   bot(botId: string): { id: string; busy?: boolean } | null | undefined;
-  group(groupId: string): unknown;
+  group(groupId: string): GroupRecord | null | undefined;
 }
 
 /** Run every waiting round whose bot is now idle.

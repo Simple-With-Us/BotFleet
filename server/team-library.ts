@@ -77,17 +77,17 @@ export function unconfiguredTeamCatalog(): TeamCatalog {
 
 type Fetcher = typeof fetch;
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const isRecord = (value): value is Record<string, JsonValue> =>
+  Boolean(value) && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value);
 
-function text(value: unknown, field: string, max: number): string {
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${field} is required`);
+function text(value, field: string, max: number): string {
+  if (!(Object.prototype.toString.call(value) === "[object String]") || !value.trim()) throw new Error(`${field} is required`);
   const normalized = value.trim();
   if (normalized.length > max) throw new Error(`${field} is too long`);
   return normalized;
 }
 
-function relativeFile(value: unknown, field: string, suffix: string, prefix: string): string {
+function relativeFile(value, field: string, suffix: string, prefix: string): string {
   const path = text(value, field, 300);
   if (
     path.startsWith("/") ||
@@ -101,13 +101,13 @@ function relativeFile(value: unknown, field: string, suffix: string, prefix: str
   return path;
 }
 
-function stringList(value: unknown, field: string, maxItems: number): string[] {
+function stringList(value, field: string, maxItems: number): string[] {
   if (!Array.isArray(value) || value.length > maxItems) throw new Error(`${field} is invalid`);
   return value.map((item, index) => text(item, `${field}[${index}]`, 100));
 }
 
 /** Validate the remotely maintained index before any of it reaches the renderer. */
-export function parseTeamCatalog(value: unknown, repositoryUrl: string): TeamCatalog {
+export function parseTeamCatalog(value, repositoryUrl: string): TeamCatalog {
   if (!isRecord(value) || value.format !== "botfleet.catalog" || value.version !== 1) {
     throw new Error("The team library catalog is not supported");
   }
@@ -125,23 +125,25 @@ export function parseTeamCatalog(value: unknown, repositoryUrl: string): TeamCat
     slugs.add(slug);
     const prefix = `teams/${slug}/`;
     const requires = isRecord(raw.requires) ? raw.requires : {};
-    return {
+    const out = {
       slug,
       name: text(raw.name, `${field}.name`, 100),
       summary: text(raw.summary, `${field}.summary`, 300),
       category: text(raw.category, `${field}.category`, 80),
-      ...(typeof raw.outcome === "string" ? { outcome: text(raw.outcome, `${field}.outcome`, 300) } : {}),
-      ...(typeof raw.setupMinutes === "number" && Number.isSafeInteger(raw.setupMinutes) && raw.setupMinutes > 0 && raw.setupMinutes <= 240
-        ? { setupMinutes: raw.setupMinutes }
-        : {}),
-      ...(typeof raw.featured === "boolean" ? { featured: raw.featured } : {}),
-      ...(raw.package !== undefined
-        ? { package: relativeFile(raw.package, `${field}.package`, ".md", "packages/") }
-        : {}),
-      manifest: relativeFile(raw.manifest, `${field}.manifest`, ".mausteam.json", prefix),
-      readme: relativeFile(raw.readme, `${field}.readme`, "README.md", prefix),
+    };
+if ((Object.prototype.toString.call(raw.outcome) === "[object String]")) out.outcome = text(raw.outcome, `${field}.outcome`, 300);
+if ((Object.prototype.toString.call(raw.setupMinutes) === "[object Number]") && Number.isSafeInteger(raw.setupMinutes) && raw.setupMinutes > 0 && raw.setupMinutes <= 240) {
+  out.setupMinutes = raw.setupMinutes;
+}
+if (Object.prototype.toString.call(raw.featured) === "[object Boolean]") out.featured = raw.featured;
+const manifestFile = relativeFile(raw.manifest, `${field}.manifest`, ".mausteam.json", prefix);
+const readmeFile = relativeFile(raw.readme, `${field}.readme`, "README.md", prefix);
+if (raw.package !== undefined) out.package = relativeFile(raw.package, `${field}.package`, ".md", "packages/");
+out.manifest = manifestFile;
+out.readme = readmeFile;
+return out;
       members:
-        typeof raw.members === "number" && Number.isSafeInteger(raw.members) && raw.members > 0 && raw.members <= 200
+        (Object.prototype.toString.call(raw.members) === "[object Number]") && Number.isSafeInteger(raw.members) && raw.members > 0 && raw.members <= 200
           ? raw.members
           : (() => { throw new Error(`${field}.members is invalid`); })(),
       skills: Array.isArray(raw.skills)
@@ -207,7 +209,7 @@ export async function fetchTeamCatalog(
 export type ParsedShareableTeam = ParsedTeamManifest | ParsedBotPackage;
 
 function parseShareable(value: JsonValue | string): ParsedShareableTeam {
-  if (typeof value === "string") return parseBotPackage(value);
+  if ((Object.prototype.toString.call(value) === "[object String]")) return parseBotPackage(value);
   return isBotPackage(value) ? parseBotPackage(value) : parseTeamManifest(value);
 }
 

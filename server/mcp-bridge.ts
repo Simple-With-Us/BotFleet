@@ -138,15 +138,15 @@ export interface BridgeOptions {
 /** Collect a byte stream into complete newline-terminated lines. MCP's
  * stdio transport is one JSON-RPC frame per line, so line boundaries are
  * the only safe place to inspect — or inject — anything. */
-export function createLineSplitter(onLine: (line: string) => void): {
-  push: (chunk: Buffer | string) => void;
-  flush: () => void;
-} {
+export function createLineSplitter(onLine: (line: string) => void) {
   let pending = "";
   const decoder = new StringDecoder("utf8");
   return {
     push(chunk) {
-      pending += typeof chunk === "string" ? chunk : decoder.write(chunk);
+      // SAFETY: the chunk is either a UTF-8 string or a Buffer; the
+      // StringDecoder keeps multi-byte UTF-8 sequences coherent across
+      // chunk boundaries, which is the only place it is correct.
+      pending += Object.prototype.toString.call(chunk) === "[object String]" ? chunk : decoder.write(chunk);
       let newline: number;
       while ((newline = pending.indexOf("\n")) !== -1) {
         const line = pending.slice(0, newline);

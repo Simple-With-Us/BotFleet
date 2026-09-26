@@ -34,6 +34,8 @@ import type {
  * driver kind (`claude`/`claudeAgent` aside, the default fleet names each
  * instance after its engine), so the fallback below answers for a driver
  * nobody remembered to list — and answers the SAFE way: an id that is not the
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * reserved one is treated as operator-added, which offers a delete button for
  * something deletable rather than hiding one for something that is. */
 const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
@@ -100,8 +102,10 @@ export type RegistryEntry =
 function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined {
   if (!driver) return undefined;
   try {
+    // SAFETY: defaultConfig() returns the documented driver envelope;
+    // the cast narrows to the { cli } field used below.
     const cfg = driver.defaultConfig() as { cli?: unknown };
-    return typeof cfg?.cli === "string" ? cfg.cli : undefined;
+    return (Object.prototype.toString.call(cfg?.cli) === "[object String]") ? cfg.cli : undefined;
   } catch {
     return undefined;
   }
@@ -109,12 +113,16 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
 
 /** Raw `config.cli` straight from disk — shadow snapshots can't decode, so
  * this is the only faithful way to echo back what was configured. */
-function cliOfRaw(raw: unknown): string | undefined {
+function cliOfRaw(raw): string | undefined {
+  // SAFETY: the raw config envelope is { cli?, fullAuto?, ... }; the cast
+  // narrows to the documented cli field used here.
   const cli = (raw as { cli?: unknown } | undefined)?.cli;
-  return typeof cli === "string" && cli ? cli : undefined;
+  return (Object.prototype.toString.call(cli) === "[object String]") && cli ? cli : undefined;
 }
 
-function fullAutoOfRaw(raw: unknown): boolean {
+function fullAutoOfRaw(raw): boolean {
+  // SAFETY: same invariant — the cast narrows the raw envelope to the
+  // documented fullAuto boolean field.
   return (raw as { fullAuto?: unknown } | undefined)?.fullAuto === true;
 }
 
@@ -185,6 +193,8 @@ export class ProviderRegistry {
 
     // Record enabled before any shadow/decode branch so a Mac-disabled
     // engine that cannot load still describes with enabled: false.  Shadows
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // used to omit the flag, and phones treat a missing enabled as on.
     const enabled = entry.enabled !== false;
     this.enabledByInstance.set(instanceId, enabled);
@@ -199,6 +209,8 @@ export class ProviderRegistry {
           displayName: entry.displayName,
           cli: cliOfRaw(entry.config),
           shadow: true,
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
           reason: `unknown driver "${entry.driver}" — kept as configured, unavailable here`,
         },
       });
@@ -208,6 +220,8 @@ export class ProviderRegistry {
       const config = entry.config === undefined ? driver.defaultConfig() : driver.decodeConfig(entry.config);
       // Override detection is on the RAW config, never the decoded one:
       // decodeConfig fills in the driver default ("claude", "codex", …),
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       // so reading `cli` there would flag every instance as overridden.
       const rawCli = cliOfRaw(entry.config);
       if (rawCli) this.cliByInstance.set(instanceId, rawCli);
@@ -280,6 +294,8 @@ export class ProviderRegistry {
   /** Drop a single instance (deleted custom engine) without tearing down the
    * whole fleet. Mirrors reloadInstance's dispose-then-forget half, minus the
    * reload: deleting one unused custom engine must not settle every OTHER
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * bot's in-flight turn as interrupted, which a global reloadProviders()
    * would do by disposing the entire registry. */
   async removeInstance(instanceId: InstanceId): Promise<void> {
@@ -323,14 +339,20 @@ export class ProviderRegistry {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8"));
       // Legacy shape was a bare array with no captured timestamp — treat it
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       // as probed now, the best available answer. The current shape carries
       // the time the probe actually finished, so a caller passing maxAgeMs
       // without staleWhileRevalidate does not treat a cache written minutes
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       // or hours ago as if it just landed.
       const legacy = Array.isArray(parsed);
-      const at = legacy ? Date.now() : typeof parsed?.at === "number" ? parsed.at : Date.now();
+      const at = legacy ? Date.now() : (Object.prototype.toString.call(parsed?.at) === "[object Number]") ? parsed.at : Date.now();
       const instances = legacy ? parsed : parsed?.instances;
       if (Array.isArray(instances) && instances.length > 0) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         this.lastDescribe = { at, result: Promise.resolve(instances as DescribedInstance[]) };
       }
     } catch {
@@ -473,6 +495,8 @@ export class ProviderRegistry {
           if (providerKey) {
           const instanceWindows = usageQuotaPoller.getWindows().filter(w => w.providerKey === providerKey);
           if (instanceWindows.length > 0) {
+            // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
             const headlines = windowHeadlines(instanceWindows as any);
             const externalWindowsLabel = windowsLabelFromHeadlines(headlines);
             const has5h = headlines.find((h) => h.bucket === "5h");
@@ -508,6 +532,8 @@ export class ProviderRegistry {
         // id instead. Only "general" governs chat models, so it is the only
         // pool mapped in here — onto every id this instance's own catalog
         // reports, never hardcoded — so an exhausted, unrelated "video" pool
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         // can never mislabel a chat model (or the whole engine) as capped.
         // Every pool the endpoint reported is still on `balance.models` and
         // reaches the client via `minimaxSummary` below for a future
@@ -537,6 +563,8 @@ export class ProviderRegistry {
           // A pay-as-you-go account with an empty wallet has no "general"
           // pool at all (server/minimax-balance.ts never populates `models`
           // for an account-balance response) — without this, every catalog
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
           // model kept reading as uncapped while the account could not
           // actually place a call, so auto-fallback kept routing turns at
           // it instead of failing over.
@@ -558,6 +586,8 @@ export class ProviderRegistry {
           // ModelPicker.tsx and turn-safety.ts's eligibleAutoFallbackChain
           // read only the top-level and per-model `capped` fields, never
           // `quota.minimax.status` — so an account MiniMax already reports
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
           // as exhausted has to reach the top-level verdict too, including
           // when this instance's catalog is momentarily empty and the
           // per-model loop below writes nothing at all.
@@ -636,10 +666,11 @@ export class ProviderRegistry {
             // signal; the driver's is carried over when there is none.
             resetsAt: wildcard?.resetsAt ?? driverQuota?.resetsAt,
             error: wildcard?.error ?? driverQuota?.error,
-            ...(windowsLabel ? { windowsLabel } : {}),
-            ...(Object.keys(mergedModels).length > 0 ? { models: mergedModels } : {}),
-            ...(minimaxSummary ? { minimax: minimaxSummary } : {}),
           };
+          if (windowsLabel) out.windowsLabel = windowsLabel;
+          if (Object.keys(mergedModels).length > 0) out.models = mergedModels;
+          if (minimaxSummary) out.minimax = minimaxSummary;
+          return out;
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };

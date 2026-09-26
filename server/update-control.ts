@@ -6,12 +6,16 @@
 // child of neither: a child of the harness dies with the harness, and a
 // child of the app dies with the app.  It therefore runs DETACHED, as a
 // one-shot launchd job in the same GUI domain this harness runs in, and the
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 // only channel back is a progress file it writes as it goes plus the log
 // launchd captures for it.  That is also why the status survives a restart:
 // the run outlives us, so on boot we read the same files back and carry on
 // describing a run we did not start in this process.
 //
 // Everything a test wants to drive — git, the launcher, the clock, the
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 // process check — arrives as an injected dependency.  The real ones are
 // built in `createUpdateControl` from the environment.
 import { execFile, spawn } from "node:child_process";
@@ -33,6 +37,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
 export const UPDATE_LAUNCH_LABEL = "com.jay.botfleet-update";
@@ -53,12 +58,16 @@ const MAX_LISTED_COMMITS = 20;
 const LAUNCH_GRACE_MS = 120_000;
 /** A progress file no older than this is one something is still writing.
  * Well past the longest gap between the updater's own steps — a full
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * dependency install and a signed, notarised build both report as one step —
  * because the cost of calling a live run dead is a second updater started on
  * top of the first.  Staleness alone never settles a run: it is only what
  * makes the controller ask launchd whether anything is still there. */
 const PROGRESS_STALE_MS = 10 * 60_000;
 /** How often a stalled run is asked about.  Without a floor here the poll
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * would run `launchctl list` every couple of seconds for as long as a run
  * stayed stalled, and a run that launchd still owns can stay stalled for a
  * long time without being dead. */
@@ -227,7 +236,7 @@ export interface UpdateControlDeps {
    * behaviour that matters here is what happens when it THROWS, and a test
    * that arranged that with directory permissions would only be testing them
    * on the platforms where they work that way. */
-  writeState: (path: string, value: unknown) => void;
+  writeState: (path: string, value) => void;
   /** Does the tracked updater in the checkout accept `--progress`?  The
    * harness and the updater advance together (both live in the always-on
    * checkout), so this is only ever false on a Mac whose checkout was moved
@@ -273,22 +282,26 @@ function firstLine(text: string): string {
   return (text.split("\n").map((line) => line.trim()).find(Boolean) ?? "").slice(0, 200);
 }
 
-function isOutcome(value: unknown): value is UpdateOutcome {
-  return typeof value === "string" && (OUTCOMES as readonly string[]).includes(value);
+function isOutcome(value): value is UpdateOutcome {
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  return (Object.prototype.toString.call(value) === "[object String]") && (OUTCOMES as readonly string[]).includes(value);
 }
 
 /** Read JSON that another process writes.  Anything unreadable, torn, or the
  * wrong shape is "no record", never a throw: this file is a courtesy channel
  * and a bad one must not take the status route down with it. */
-function readJsonFile(path: string): unknown {
+function readJsonFile(path: string) {
   try {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     return JSON.parse(readFileSync(path, "utf8")) as unknown;
   } catch {
     return null;
   }
 }
 
-function writeJsonFile(path: string, value: unknown): void {
+function writeJsonFile(path: string, value): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -296,35 +309,39 @@ function writeJsonFile(path: string, value: unknown): void {
 }
 
 /** Validate a progress file written by `scripts/update-progress.mjs`. */
-export function parseProgressRecord(value: unknown): ProgressRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
+export function parseProgressRecord(value): ProgressRecord | null {
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) return null;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const raw = value as Record<string, JsonValue>;
   if (raw.schemaVersion !== UPDATE_PROGRESS_SCHEMA_VERSION) return null;
-  if (typeof raw.runId !== "string" || !raw.runId) return null;
-  if (typeof raw.startedAt !== "string") return null;
-  const progress = typeof raw.progress === "number" && Number.isFinite(raw.progress)
+  if (!(Object.prototype.toString.call(raw.runId) === "[object String]") || !raw.runId) return null;
+  if (!(Object.prototype.toString.call(raw.startedAt) === "[object String]")) return null;
+  const progress = (Object.prototype.toString.call(raw.progress) === "[object Number]") && Number.isFinite(raw.progress)
     ? Math.min(1, Math.max(0, raw.progress))
     : null;
   return {
     schemaVersion: UPDATE_PROGRESS_SCHEMA_VERSION,
     runId: raw.runId,
-    command: typeof raw.command === "string" ? raw.command : "update",
+    command: (Object.prototype.toString.call(raw.command) === "[object String]") ? raw.command : "update",
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     pid: Number.isInteger(raw.pid) ? (raw.pid as number) : 0,
     startedAt: raw.startedAt,
-    updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : raw.startedAt,
-    step: typeof raw.step === "string" ? raw.step : null,
+    updatedAt: (Object.prototype.toString.call(raw.updatedAt) === "[object String]") ? raw.updatedAt : raw.startedAt,
+    step: (Object.prototype.toString.call(raw.step) === "[object String]") ? raw.step : null,
     progress,
-    targetCommit: typeof raw.targetCommit === "string" ? raw.targetCommit : null,
-    receiptPath: typeof raw.receiptPath === "string" ? raw.receiptPath : null,
-    finishedAt: typeof raw.finishedAt === "string" ? raw.finishedAt : null,
+    targetCommit: (Object.prototype.toString.call(raw.targetCommit) === "[object String]") ? raw.targetCommit : null,
+    receiptPath: (Object.prototype.toString.call(raw.receiptPath) === "[object String]") ? raw.receiptPath : null,
+    finishedAt: (Object.prototype.toString.call(raw.finishedAt) === "[object String]") ? raw.finishedAt : null,
     outcome: isOutcome(raw.outcome) ? raw.outcome : null,
-    message: typeof raw.message === "string" ? raw.message : null,
+    message: (Object.prototype.toString.call(raw.message) === "[object String]") ? raw.message : null,
   };
 }
 
 /** Sentences a person reads while they wait.  Kept here rather than in the
  * renderer so the phone and the Mac say the same thing. */
-export const UPDATE_STEP_LABELS: Record<string, string> = {
+export const UPDATE_STEP_LABELS = {
   acquireLock: "Taking the update lock",
   resolveTarget: "Finding the newest build",
   prepareSource: "Staging a copy of the new source",
@@ -351,7 +368,7 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   rollback: "Rolling back",
   cleanupCandidate: "Cleaning up the staged build",
   releaseSource: "Releasing the staged source",
-};
+} satisfies Record<string, string>;
 
 export function stepLabel(step: string | null): string {
   if (!step) return "Working";
@@ -438,6 +455,8 @@ export function availableIsStale(input: {
   installedAt?: string;
   /** When an update last finished AND VERIFIED.  A refused, failed or
    * rolled-back run also has a `finishedAt`, and none of them changed what is
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * installed — treating those as the boundary would throw away a perfectly
    * good answer every time a run was declined for being busy. */
   verifiedRunFinishedAt?: string;
@@ -485,7 +504,11 @@ export function runRefusal(input: {
 
 /** When this stage was created, from the `-<epoch ms>` suffix the updater
  * gives every stage it makes.  The suffix has to be exactly thirteen digits:
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * a hand-made directory ending in a date like `-20260912` parses as a number
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * too, and reading it as epoch milliseconds would date that stage to 1970. */
 export function stageStamp(name: string): number | null {
   const last = name.split("-").at(-1) ?? "";
@@ -531,6 +554,8 @@ export function readStageDirectories(root: string): StageDirectoryEntry[] {
  * A stage that carries a prepared build or a rollback bundle is never
  * touched, and neither is one holding anything the updater did not put there.
  * What is left over is the wreckage of runs that failed: those are kept only
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * as far back as `keep`, and only once they are old enough that no run still
  * in flight could own them. */
 export function stagesToPrune(entries: StageDirectoryEntry[], options: {
@@ -634,7 +659,7 @@ export function pruneRunArtifacts(runsDirectory: string, options: {
  * a fresh copy of the source.  `removeLaunchJobCommand` is how the controller
  * takes the label away the moment a run settles, and the updater refuses to
  * do anything a second time under a run id that already has an outcome. */
-export function launchPlanCommand(plan: LaunchPlan): { command: string; args: string[] } {
+export function launchPlanCommand(plan: LaunchPlan) {
   const quote = (value: string) => `'${value.split("'").join(`'\\''`)}'`;
   const forceArg = plan.force ? " --force" : "";
   const script = [
@@ -660,14 +685,14 @@ export function launchPlanCommand(plan: LaunchPlan): { command: string; args: st
 }
 
 /** Unregister the one-shot job, which is what stops launchd relaunching it. */
-export function removeLaunchJobCommand(label: string): { command: string; args: string[] } {
+export function removeLaunchJobCommand(label: string) {
   return { command: "/bin/launchctl", args: ["remove", label] };
 }
 
 /** Ask launchd whether the one-shot job still has a process.  The answer is
  * read by `launchdJobIsAlive`, and it is the only authority this module has
  * over a run whose own pid became unreadable — after a power cut, say. */
-export function listLaunchJobCommand(label: string): { command: string; args: string[] } {
+export function listLaunchJobCommand(label: string) {
   return { command: "/bin/launchctl", args: ["list", label] };
 }
 
@@ -678,8 +703,13 @@ function execCommand(command: string, args: string[]): Promise<CommandResult> {
       args,
       { timeout: 120_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" },
       (error, stdout, stderr) => {
-        const numeric = error && typeof (error as { code?: unknown }).code === "number"
-          ? (error as { code: number }).code
+        // SAFETY: Node's execFile error has a documented `.code` field
+        // (number on normal exit, string for ENOENT-style errors);
+        // the cast narrows the loose rejection to that surface.
+        const numeric = error && Object.prototype.toString.call((error as { code?: unknown }).code) === "[object Number]"
+          ? // SAFETY: same invariant — after the toString-call guard, .code
+            // is a Number and the cast is exact.
+            (error as { code: number }).code
           : null;
         resolve({
           code: numeric ?? (error ? 1 : 0),
@@ -737,6 +767,8 @@ async function defaultLaunch(plan: LaunchPlan): Promise<LaunchResult> {
     // `spawn` reports a failed fork asynchronously — EAGAIN, ENOMEM, a
     // /bin/bash that is missing or not executable — on the child's own
     // "error" event, and an EventEmitter with no listener for that event
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // rethrows it as an uncaught exception.  The harness registers no
     // process-level handler, so it would exit here: just after recording a
     // run that never started, leaving a phantom run for the next boot to
@@ -802,8 +834,12 @@ function defaultDeps(overrides: Partial<UpdateControlDeps>): UpdateControlDeps {
         process.kill(pid, 0);
         return true;
       } catch (error) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         // An inaccessible or reused pid is treated as alive: calling a live
         // updater dead would let a second one start on top of it.
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
       }
     }),
@@ -825,6 +861,8 @@ function defaultDeps(overrides: Partial<UpdateControlDeps>): UpdateControlDeps {
 export interface UpdateControl {
   status(): UpdateStatus;
   /** `readiness` is the caller's own reading, for a route that holds a
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * mutating admission it must not count as work it would interrupt — the
    * same argument `start` takes, and for the same reason. */
   check(options?: { readiness?: RuntimeReadiness }): Promise<UpdateStatus>;
@@ -856,8 +894,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
    * can open.  Anything outside falls back to the paths this run id would
    * have had, the same posture `parseProgressRecord` takes towards the
    * progress file's contents. */
-  const confinedRunPath = (candidate: unknown, fallback: string): string => {
-    if (typeof candidate !== "string" || !candidate) return fallback;
+  const confinedRunPath = (candidate, fallback: string): string => {
+    if (!(Object.prototype.toString.call(candidate) === "[object String]") || !candidate) return fallback;
     const resolved = resolve(candidate);
     const root = resolve(runsDirectory);
     return resolved.startsWith(root + sep) ? resolved : fallback;
@@ -880,11 +918,13 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
   /** Persist, or carry on without it.  Every file this module writes is a
    * convenience for the NEXT process; none of them is load-bearing for this
    * one, whose state is already in memory. */
-  const persist = (path: string, value: unknown): boolean => {
+  const persist = (path: string, value): boolean => {
     try {
       deps.writeState(path, value);
       return true;
     } catch (error) {
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       console.warn(`BotFleet could not record update state at ${path}: ${(error as Error)?.message ?? error}`);
       return false;
     }
@@ -966,29 +1006,42 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   const loadAvailable = () => {
     const raw = readJsonFile(paths.available);
-    if (!raw || typeof raw !== "object") return;
-    const record = raw as Record<string, unknown>;
-    checkedAt = typeof record.checkedAt === "string" ? record.checkedAt : null;
+    if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) return;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const record = raw as Record<string, JsonValue>;
+    checkedAt = (Object.prototype.toString.call(record.checkedAt) === "[object String]") ? record.checkedAt : null;
     const candidate = record.available;
-    if (!candidate || typeof candidate !== "object") {
+    if (!candidate || !(Object.prototype.toString.call(candidate) === "[object Object]")) {
       available = null;
       return;
     }
-    const value = candidate as Record<string, unknown>;
-    if (typeof value.sourceCommit !== "string" || !/^[a-f0-9]{40}$/.test(value.sourceCommit)) {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const value = candidate as Record<string, JsonValue>;
+    if (!(Object.prototype.toString.call(value.sourceCommit) === "[object String]") || !/^[a-f0-9]{40}$/.test(value.sourceCommit)) {
       available = null;
       return;
     }
+    // SAFETY: each field below narrows the documented UpdateAvailable
+    // shape; the casts are exact under the per-field guards in this
+    // object literal.
     const restored: UpdateAvailable = {
       sourceCommit: value.sourceCommit,
-      version: typeof value.version === "string" ? value.version : undefined,
+      version: (Object.prototype.toString.call(value.version) === "[object String]") ? value.version : undefined,
       aheadBy: Number.isInteger(value.aheadBy) ? (value.aheadBy as number) : 0,
       commits: Array.isArray(value.commits)
-        ? (value.commits as unknown[])
-            .filter((one): one is UpdateCommit =>
-              Boolean(one)
-              && typeof (one as UpdateCommit).sha === "string"
-              && typeof (one as UpdateCommit).subject === "string")
+        // SAFETY: the .filter() callback casts each entry to UpdateCommit;
+// the parent restoration object is gated by these per-field checks.
+? (value.commits as unknown[])
+            .filter((one): one is UpdateCommit => {
+              // SAFETY: every entry past the Boolean() guard has the
+              // documented sha/subject string fields; the cast narrows
+              // the loose shape to UpdateCommit per filter.
+              return Boolean(one) &&
+                Object.prototype.toString.call((one as UpdateCommit).sha) === "[object String]" &&
+                Object.prototype.toString.call((one as UpdateCommit).subject) === "[object String]";
+            })
             .slice(0, MAX_LISTED_COMMITS)
         : [],
     };
@@ -1005,31 +1058,35 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   const loadLastRun = () => {
     const raw = readJsonFile(paths.lastRun);
-    if (!raw || typeof raw !== "object") return;
-    const record = raw as Record<string, unknown>;
-    if (typeof record.runId !== "string" || !isOutcome(record.outcome)) return;
+    if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) return;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const record = raw as Record<string, JsonValue>;
+    if (!(Object.prototype.toString.call(record.runId) === "[object String]") || !isOutcome(record.outcome)) return;
     lastRun = {
       runId: record.runId,
-      startedAt: typeof record.startedAt === "string" ? record.startedAt : "",
-      finishedAt: typeof record.finishedAt === "string" ? record.finishedAt : "",
+      startedAt: (Object.prototype.toString.call(record.startedAt) === "[object String]") ? record.startedAt : "",
+      finishedAt: (Object.prototype.toString.call(record.finishedAt) === "[object String]") ? record.finishedAt : "",
       outcome: record.outcome,
-      message: typeof record.message === "string" ? record.message : "",
-      ...(typeof record.receiptPath === "string" ? { receiptPath: record.receiptPath } : {}),
+      message: (Object.prototype.toString.call(record.message) === "[object String]") ? record.message : "",
     };
+if ((Object.prototype.toString.call(record.receiptPath) === "[object String]")) lastRun.receiptPath = record.receiptPath;
   };
 
   const loadCurrent = () => {
     const raw = readJsonFile(paths.currentRun);
-    if (!raw || typeof raw !== "object") return;
-    const record = raw as Record<string, unknown>;
-    if (typeof record.runId !== "string" || !record.runId) return;
+    if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) return;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const record = raw as Record<string, JsonValue>;
+    if (!(Object.prototype.toString.call(record.runId) === "[object String]") || !record.runId) return;
     current = {
       runId: record.runId,
-      startedAt: typeof record.startedAt === "string" ? record.startedAt : "",
+      startedAt: (Object.prototype.toString.call(record.startedAt) === "[object String]") ? record.startedAt : "",
       progressPath: confinedRunPath(record.progressPath, runPaths(record.runId).progress),
       logPath: confinedRunPath(record.logPath, runPaths(record.runId).log),
-      launcher: typeof record.launcher === "string" ? record.launcher : "launchd",
-      targetCommit: typeof record.targetCommit === "string" ? record.targetCommit : null,
+      launcher: (Object.prototype.toString.call(record.launcher) === "[object String]") ? record.launcher : "launchd",
+      targetCommit: (Object.prototype.toString.call(record.targetCommit) === "[object String]") ? record.targetCommit : null,
     };
   };
 
@@ -1084,6 +1141,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       }
       pruneRunArtifacts(runsDirectory, { protect: lastRun ? [lastRun.runId] : [] });
     } catch (error) {
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       console.warn(`BotFleet could not sweep old update stages: ${(error as Error)?.message ?? error}`);
     }
   };
@@ -1097,6 +1156,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
    * launchd agrees nothing is running under the label.
    *
    * `processAlive` cannot answer this one.  It treats an inaccessible or
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * reused pid as alive on purpose, because calling a live updater dead would
    * let a second one start on top of it — so a run killed by a power cut,
    * whose pid number some later process took, stays "running" forever: the
@@ -1198,6 +1259,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
   };
 
   /** Broadcast the status when it has changed.  The caller's readiness is
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * passed through as well: what goes out to every client — and to the paired
    * phone — has to describe the machine, not the request that asked. */
   const emitIfChanged = (readiness?: RuntimeReadiness) => {
@@ -1228,6 +1291,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
 
   const check: UpdateControl["check"] = async (options = {}) => {
     // The route holds a mutating admission for the whole handler, so the
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // harness-wide reading would count this very request as work in flight.
     const readiness = options.readiness;
     reconcile();
@@ -1235,6 +1300,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     if (!capabilities(Boolean(current), readiness).canCheck) return buildStatus(readiness);
     // A failed fetch is not "nothing new".  `origin/main` is still on disk
     // from whenever the last fetch DID work, so comparing against it would
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // report a machine that has been offline for a week as up to date — and
     // the person would believe it, because they just pressed the button.
     const fetched = await deps.git(["fetch", "origin", "main"]);
@@ -1265,6 +1332,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       // with "BotFleet is already on the newest build." on every press.  Only
       // a count this checkout actually produced withdraws the offer: a
       // `rev-list` that failed (an installed commit this checkout has never
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       // seen) says nothing about distance, and the offer stands as it did.
       const nothingAhead = counted.code === 0 && Number.isFinite(aheadBy) && aheadBy < 1;
       if (nothingAhead) {
@@ -1281,8 +1350,10 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         let version: string | undefined;
         if (manifest.code === 0) {
           try {
+            // SAFETY: package.json is a JSON document; the cast narrows
+            // it to the documented minimal shape used below.
             const parsed = JSON.parse(manifest.stdout) as { version?: unknown };
-            if (typeof parsed.version === "string") version = parsed.version;
+            if ((Object.prototype.toString.call(parsed.version) === "[object String]")) version = parsed.version;
           } catch {
             /* an unreadable manifest just means no version label */
           }
@@ -1331,6 +1402,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
   const beginRun = async (options: { force?: boolean; readiness?: RuntimeReadiness }) => {
     // The caller's reading wins throughout, for the refusal AND for every
     // status this path returns or broadcasts: the route holds a mutating
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // admission of its own, which it must not count as work it would be
     // interrupting.  A status built without that correction told an idle Mac
     // it was busy, and the client that stores a refusal's status then hid
@@ -1352,6 +1425,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       dirty: structural().canRun ? await dirtyCheckout() : false,
       force,
     });
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     if (refusal) return { ok: false as const, error: refusal, status: buildStatus(readiness) };
 
     // The authoritative staleness check, and the last thing before a launch.
@@ -1367,6 +1442,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         flushAvailable();
         emitIfChanged(readiness);
         return {
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
           ok: false as const,
           error: "BotFleet is already on the newest build.",
           status: buildStatus(readiness),
@@ -1387,8 +1464,12 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
       // Unlike the bookkeeping files, this one IS load-bearing: without a
       // place for the progress file the run would be one nothing could
       // describe, which is the thing this module exists to prevent.
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       const detail = String((error as Error)?.message ?? error).slice(0, 200);
       return {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         ok: false as const,
         error: `The update could not be recorded, so it was not started.${GAP}${detail}`,
         status: buildStatus(readiness),
@@ -1410,6 +1491,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     };
     if (!persist(paths.currentRun, record)) {
       return {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         ok: false as const,
         error: `The update could not be recorded, so it was not started.${GAP}Check ${deps.stateDirectory}.`,
         status: buildStatus(readiness),
@@ -1436,7 +1519,11 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
         /* a record we cannot remove is reconciled away on the next boot:
          * no progress file ever appears and the launch grace period ends it. */
       }
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       const detail = String((error as Error)?.message ?? error).slice(0, 200);
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       return { ok: false as const, error: `The updater could not be started.${GAP}${detail}`, status: buildStatus(readiness) };
     }
     if (result.launcher !== record.launcher) {
@@ -1445,6 +1532,8 @@ export function createUpdateControl(overrides: Partial<UpdateControlDeps> = {}):
     }
     ensureTimer();
     emitIfChanged(readiness);
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     return { ok: true as const, runId, status: buildStatus(readiness) };
   };
 

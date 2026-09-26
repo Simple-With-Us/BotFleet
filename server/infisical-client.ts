@@ -15,6 +15,7 @@
 // this file cannot quietly start leaking a credential just by adding detail
 // to a thrown message.
 import { redactSecretsInText } from "./redact.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -34,7 +35,7 @@ function httpError(fallback: string, status: number): InfisicalError {
   return new InfisicalError(`${fallback}: HTTP ${status}`, status);
 }
 
-function isTimeoutError(err: unknown): boolean {
+function isTimeoutError(err): boolean {
   if (err instanceof Error) {
     return (
       err.name === "TimeoutError" ||
@@ -46,7 +47,7 @@ function isTimeoutError(err: unknown): boolean {
   return false;
 }
 
-function toInfisicalError(err: unknown, operation: string, timeoutMs: number): InfisicalError {
+function toInfisicalError(err, operation: string, timeoutMs: number): InfisicalError {
   if (err instanceof InfisicalError) return err;
   if (isTimeoutError(err)) {
     return new InfisicalError(`Infisical ${operation} timed out after ${timeoutMs} ms`, 504);
@@ -95,8 +96,10 @@ export async function login({
     if (isTimeoutError(err)) throw toInfisicalError(err, "login", timeoutMs);
     throw new InfisicalError("Infisical login failed: invalid response body", 502);
   }
-  const body = rawBody && typeof rawBody === "object" ? (rawBody as { accessToken?: unknown }) : null;
-  const token = body && typeof body.accessToken === "string" ? body.accessToken : "";
+  // SAFETY: the toString-call guard above restricts rawBody to a JSON
+  // object, so the cast to the documented envelope is exact.
+  const body = rawBody && (Object.prototype.toString.call(rawBody) === "[object Object]") ? (rawBody as { accessToken?: unknown }) : null;
+  const token = body && (Object.prototype.toString.call(body.accessToken) === "[object String]") ? body.accessToken : "";
   if (!token) throw new InfisicalError("Infisical login response carried no accessToken", 502);
   return token;
 }
@@ -163,7 +166,9 @@ export async function listSecrets({
     if (isTimeoutError(err)) throw toInfisicalError(err, "secrets list", timeoutMs);
     throw new InfisicalError("Infisical secrets list failed: invalid response body", 502);
   }
-  const body = listRawBody && typeof listRawBody === "object" ? (listRawBody as { secrets?: unknown }) : null;
+  // SAFETY: same invariant — the toString-call guard restricts
+  // listRawBody to a JSON object, so the cast is exact.
+  const body = listRawBody && (Object.prototype.toString.call(listRawBody) === "[object Object]") ? (listRawBody as { secrets?: unknown }) : null;
   if (!Array.isArray(body?.secrets)) {
     throw new InfisicalError("Infisical secrets list response carried no secrets array", 502);
   }
@@ -171,18 +176,18 @@ export async function listSecrets({
   const names: string[] = [];
   const values = new Map<string, string>();
   for (const row of rows) {
-    if (!row || typeof row !== "object") continue;
+    if (!row || !(Object.prototype.toString.call(row) === "[object Object]")) continue;
     // SAFETY: guarded on the line above — `row` is a non-null object here,
     // and `secretKey` is read as `unknown` and re-checked with `typeof`
     // immediately below before it is ever used as a name.
-    const key = (row as Record<string, unknown>).secretKey;
-    if (typeof key !== "string" || !key) continue;
+    const key = (row as Record<string, JsonValue>).secretKey;
+    if (!(Object.prototype.toString.call(key) === "[object String]") || !key) continue;
     names.push(key);
     if (!viewValues) continue;
     // SAFETY: as above — read as `unknown`, only ever used once confirmed
     // to be a non-empty string.
-    const value = (row as Record<string, unknown>).secretValue;
-    if (typeof value === "string" && value.length > 0) values.set(key, value);
+    const value = (row as Record<string, JsonValue>).secretValue;
+    if ((Object.prototype.toString.call(value) === "[object String]") && value.length > 0) values.set(key, value);
   }
   return { names, values };
 }

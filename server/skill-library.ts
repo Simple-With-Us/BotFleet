@@ -4,6 +4,7 @@
 // declared trigger terms and mounted capabilities.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export interface SkillManifest {
   id: string;
@@ -23,23 +24,25 @@ export interface BundledSkill {
 
 const SAFE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
-function strings(value: unknown): string[] | null {
-  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim())
+function strings(value): string[] | null {
+  return Array.isArray(value) && value.every((item) => (Object.prototype.toString.call(item) === "[object String]") && item.trim())
     ? value.map((item) => item.trim())
     : null;
 }
 
-export function parseSkillManifest(value: unknown, directory: string): SkillManifest {
-  if (!value || typeof value !== "object") throw new Error(`${directory}/manifest.json is invalid`);
-  const raw = value as Record<string, unknown>;
-  const id = typeof raw.id === "string" ? raw.id : "";
+export function parseSkillManifest(value, directory: string): SkillManifest {
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]")) throw new Error(`${directory}/manifest.json is invalid`);
+  // SAFETY: the toString-call guard above restricts value to a JSON
+  // object, so the cast to a record of JsonValue fields is exact.
+  const raw = value as Record<string, JsonValue>;
+  const id = (Object.prototype.toString.call(raw.id) === "[object String]") ? raw.id : "";
   const triggerTerms = strings(raw.triggerTerms);
   const requiredCapabilities = strings(raw.requiredCapabilities);
   if (!SAFE_ID.test(id) || id !== basename(directory)) throw new Error(`${directory}/manifest.json has an invalid id`);
-  if (typeof raw.name !== "string" || !raw.name.trim()) throw new Error(`${directory}/manifest.json has no name`);
-  if (typeof raw.version !== "string" || !/^\d+\.\d+\.\d+$/.test(raw.version)) throw new Error(`${directory}/manifest.json has an invalid version`);
-  if (typeof raw.description !== "string" || !raw.description.trim()) throw new Error(`${directory}/manifest.json has no description`);
-  if (typeof raw.defaultEnabled !== "boolean") throw new Error(`${directory}/manifest.json has no defaultEnabled flag`);
+  if (!(Object.prototype.toString.call(raw.name) === "[object String]") || !raw.name.trim()) throw new Error(`${directory}/manifest.json has no name`);
+  if (!(Object.prototype.toString.call(raw.version) === "[object String]") || !/^\d+\.\d+\.\d+$/.test(raw.version)) throw new Error(`${directory}/manifest.json has an invalid version`);
+  if (!(Object.prototype.toString.call(raw.description) === "[object String]") || !raw.description.trim()) throw new Error(`${directory}/manifest.json has no description`);
+  if (Object.prototype.toString.call(raw.defaultEnabled) !== "[object Boolean]") throw new Error(`${directory}/manifest.json has no defaultEnabled flag`);
   if (!triggerTerms?.length) throw new Error(`${directory}/manifest.json has no trigger terms`);
   if (!requiredCapabilities) throw new Error(`${directory}/manifest.json has invalid capabilities`);
   return {

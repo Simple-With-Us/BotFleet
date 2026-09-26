@@ -3,6 +3,7 @@
 // (delegate_bot) and any future peer flow reuse the same UX without a copy.
 
 import { sectionKey, type BotRecord, type GroupRecord, type Message, type Store } from "./store.ts";
+import type { JsonObject } from "./schema.ts";
 
 /** What a peer-exchange helper needs from the outside world:
  * the store (for persisted messages + groups) and the SSE broadcasters
@@ -10,7 +11,7 @@ import { sectionKey, type BotRecord, type GroupRecord, type Message, type Store 
 export interface CommsBus {
   store: Store;
   /** SSE broadcast (kind: "message" envelope). */
-  broadcast: (payload: Record<string, unknown>) => void;
+  broadcast: (payload: JsonObject) => void;
   /** SSE broadcast (kind: "group" envelope) for a single group. */
 }
 

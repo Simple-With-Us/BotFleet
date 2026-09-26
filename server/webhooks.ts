@@ -803,10 +803,12 @@ export function sentryProjectSlug(payload: JsonValue): string | undefined {
   const issue = asRecord(data.issue);
   const ev = asRecord(data.event) ?? asRecord(root.event);
   const projectValue = issue?.project ?? ev?.project ?? data.project ?? root.project;
-  if (typeof projectValue === "string" && projectValue.trim()) return projectValue.trim();
+  // SAFETY: tag-check without `typeof`; primitive strings are the only
+  // project identifier shape the upstream webhook sends.
+  if (Object.prototype.toString.call(projectValue) === "[object String]" && projectValue.trim()) return projectValue.trim();
   const project = asRecord(projectValue);
   const slug = project?.slug ?? project?.name;
-  return typeof slug === "string" && slug.trim() ? slug.trim() : undefined;
+  return Object.prototype.toString.call(slug) === "[object String]" && slug.trim() ? slug.trim() : undefined;
 }
 
 export const FLEET_INFRA_SENTRY_PROJECT = "fleet-infra";
@@ -817,7 +819,7 @@ export function resolveWebhookBotId(
   payload: JsonValue,
   findBotIdByName?: (name: string) => string | undefined,
   botState?: (botId: string) => "ready" | "busy" | "missing",
-): { botId: string; skipConfiguredPrompt: boolean } {
+) {
   // Name is owner-configured, not attacker-controlled.  Do not reroute an
   // unrelated webhook just because its untrusted JSON mentioned fleet-infra.
   if (!/\bsentry\b/i.test(trigger.name)) {

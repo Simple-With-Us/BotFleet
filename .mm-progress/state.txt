@@ -1,0 +1,3 @@
+Started: Sat Sep 26 16:07:33 CDT 2026
+Baseline: 1170 errors across 84 files (tts/speech-text.ts clean)
+Plan: small files first, then medium, then index.ts last

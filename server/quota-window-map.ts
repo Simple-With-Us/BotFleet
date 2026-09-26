@@ -70,7 +70,7 @@ export const QUOTA_PROVIDERS: ReadonlySet<string> = new Set([
  *  canonical key above.  Grok Bot is deliberately absent: it is excluded by
  *  its own check in each of the three places that read a window, and aliasing
  *  it onto `xai` would hand Grok CLI another product's allowance. */
-export const QUOTA_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+export const QUOTA_PROVIDER_ALIASES = {
   claude: "anthropic",
   "claude-code": "anthropic",
   chatgpt: "openai",
@@ -82,7 +82,7 @@ export const QUOTA_PROVIDER_ALIASES: Readonly<Record<string, string>> = {
   grok: "xai",
   "grok-build": "xai",
   "minimax-code": "minimax",
-};
+} satisfies Readonly<Record<string, string>>;
 
 /** Providers a collector somewhere in the fleet reads but BotFleet has no
  *  engine for.  Kimi is here because AgentBar does implement a reader for it
@@ -116,7 +116,7 @@ export function canonicalQuotaProvider(window: QuotaProviderIdentity): string {
  *  and the engine's own row is the only place its reason can be shown.
  *  Deliberately not derived from `driverKindsForWindow` — that function reads
  *  a window's text and cannot be asked "which provider is this engine?". */
-const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
+const DRIVER_KIND_PROVIDERS = {
   claudeAgent: "anthropic",
   codex: "openai",
   codexAgent: "openai",
@@ -129,7 +129,7 @@ const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
   deepseek: "deepseek",
   deepseekAgent: "deepseek",
   dshAgent: "dsh",
-};
+} satisfies Readonly<Record<string, string>>;
 
 export function quotaProviderForDriver(driverKind: string): string | null {
   return lookupOwn(DRIVER_KIND_PROVIDERS, driverKind) ?? null;
@@ -232,7 +232,7 @@ export interface EngineMeterNote {
   copy: string;
 }
 
-export const ENGINE_METER_NOTES: Readonly<Record<string, EngineMeterNote>> = {
+export const ENGINE_METER_NOTES = {
   piAgent: {
     kind: "metered",
     copy: "metered by whichever provider you've registered (cloud or local) — no fleet-wide quota window",
@@ -257,7 +257,7 @@ export const ENGINE_METER_NOTES: Readonly<Record<string, EngineMeterNote>> = {
     kind: "metered",
     copy: "billed on your Box account's own compute usage, not a token quota BotFleet tracks",
   },
-};
+} satisfies Readonly<Record<string, EngineMeterNote>>;
 
 export function engineMeterNote(driverKind: string): EngineMeterNote | null {
   return lookupOwn(ENGINE_METER_NOTES, driverKind) ?? null;
@@ -282,7 +282,7 @@ const THIRD_PARTY_FAMILIES = [...CLAUDE_FAMILIES, "gpt"];
  *  A family the map does not know is passed through unchanged rather than
  *  dropped, so a producer that starts publishing a new family name still
  *  matches any catalog model whose own type is spelled the same way. */
-export const MODEL_TYPE_FAMILIES: Readonly<Record<string, string[]>> = {
+export const MODEL_TYPE_FAMILIES = {
   opus: ["claude-opus"],
   sonnet: ["claude-sonnet"],
   haiku: ["claude-haiku"],
@@ -298,7 +298,7 @@ export const MODEL_TYPE_FAMILIES: Readonly<Record<string, string[]>> = {
   grok: ["grok"],
   cursor: ["cursor"],
   deepseek: ["deepseek"],
-};
+} satisfies Readonly<Record<string, string[]>>;
 
 export function familiesForWindow(window: QuotaWindowMatch): string[] {
   const label = window.label.toLowerCase();

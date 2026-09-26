@@ -48,7 +48,7 @@ export interface AppendQueueOptions<Context> {
   maxQueuedBytes?: number;
   /** A write that threw.  The queue never throws at its caller and never
    * retries: the entry is gone, and this is where that is reported. */
-  onWriteError?: (context: Context, error: unknown) => void;
+  onWriteError?: (context: Context, error) => void;
   /** An entry evicted under pressure.  Never written, so a caller that keeps
    * a "the log is incomplete" marker arms it here too. */
   onDropped?: (context: Context) => void;
@@ -73,7 +73,7 @@ interface QueuedAppend<Context> {
 export class BoundedAppendQueue<Context> {
   private readonly write: (file: string, data: string) => Promise<void>;
   private readonly maxQueuedBytes: number;
-  private readonly onWriteError: (context: Context, error: unknown) => void;
+  private readonly onWriteError: (context: Context, error) => void;
   private readonly onDropped: (context: Context) => void;
   private readonly onWritten: (context: Context) => void;
   private readonly now: () => number;

@@ -314,12 +314,13 @@ function normalizeSchedule(schedule: RoutineToolScheduleInput, now: number, defa
     return number;
   });
   const timeZone = schedule.timeZone ?? defaultTimeZone;
-  return {
-    type: "daily",
+  const daily = {
+    type: "daily" as const,
     time: schedule.time,
     weekdays: [...new Set(weekdays)].sort(),
-    ...(timeZone ? { timeZone } : {}),
   };
+if (timeZone) daily.timeZone = timeZone;
+return daily;
 }
 
 function normalizeDefinition(input: RoutineToolDefinitionInput, now: number, defaultTimeZone: string): RoutineRequestDefinition {
@@ -392,12 +393,15 @@ function normalizedOperation(
 function asSchedule(schedule: RoutineRequestSchedule): RoutineSchedule {
   return schedule.type === "once"
     ? { type: "once", at: schedule.at }
-    : {
-        type: "daily",
-        time: schedule.time,
-        weekdays: [...schedule.weekdays],
-        ...(schedule.timeZone ? { timeZone: schedule.timeZone } : {}),
-      };
+    : (() => {
+        const daily = {
+          type: "daily" as const,
+          time: schedule.time,
+          weekdays: [...schedule.weekdays],
+        };
+        if (schedule.timeZone) daily.timeZone = schedule.timeZone;
+        return daily;
+      })();
 }
 
 function nextForOperation(operation: RoutineRequestOperation, manager: RoutineManager, now: number): number | null {

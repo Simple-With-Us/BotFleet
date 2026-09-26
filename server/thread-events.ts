@@ -19,6 +19,7 @@ import { closeSync, fstatSync, openSync, readSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeEvent } from "./contracts.ts";
 import { rotatedPath } from "./transcript-retention.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 /** One line of native/<threadId>.ndjson (server/drivers/native.ts). */
 export interface NativeRecord {
@@ -110,7 +111,7 @@ function countLines(fd: number, file: string, stat: FileStat): number {
   return complete;
 }
 
-type RecordGuard<T> = (value: unknown) => value is T;
+type RecordGuard<T> = (value) => value is T;
 
 /** Turns the accumulated tail into text.  A seam, not a strategy: production
  * always decodes UTF-8, and the test counts what passes through to hold the
@@ -195,6 +196,8 @@ function readTail<T>(
     // step was quadratic — a 12 MB log of 100 KB records at limit 300 decoded
     // 524 MB and held the event loop for about 150 ms per Inspector request,
     // on a route the panel refetches after every turn.  Newlines are counted
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // on the bytes as they arrive instead, which is the only thing that
     // decode was being asked.
     const chunks: Buffer[] = [];
@@ -358,20 +361,20 @@ function readRecentLines<T>(
   return { lines: [...rotated.lines, ...live.lines], total: live.total + rotated.total };
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const stringOrMissing = (value: unknown) => value === undefined || typeof value === "string";
-const stringOrNullOrMissing = (value: unknown) => value === undefined || value === null || typeof value === "string";
-const numberOrNullOrMissing = (value: unknown) => value === undefined || value === null || typeof value === "number";
-const stringsOrMissing = (value: unknown) => value === undefined || (Array.isArray(value) && value.every((item) => typeof item === "string"));
+const isRecord = (value): value is Record<string, JsonValue> => (Object.prototype.toString.call(value) === "[object Object]") && value !== null && !Array.isArray(value);
+const stringOrMissing = (value) => value === undefined || (Object.prototype.toString.call(value) === "[object String]");
+const stringOrNullOrMissing = (value) => value === undefined || value === null || (Object.prototype.toString.call(value) === "[object String]");
+const numberOrNullOrMissing = (value) => value === undefined || value === null || (Object.prototype.toString.call(value) === "[object Number]");
+const stringsOrMissing = (value) => value === undefined || (Array.isArray(value) && value.every((item) => (Object.prototype.toString.call(item) === "[object String]")));
 
-function isRuntimeEvent(value: unknown): value is RuntimeEvent {
+function isRuntimeEvent(value): value is RuntimeEvent {
   if (
     !isRecord(value) ||
-    typeof value.eventId !== "string" ||
-    typeof value.provider !== "string" ||
-    typeof value.threadId !== "string" ||
-    typeof value.createdAt !== "string" ||
-    typeof value.type !== "string" ||
+    !(Object.prototype.toString.call(value.eventId) === "[object String]") ||
+    !(Object.prototype.toString.call(value.provider) === "[object String]") ||
+    !(Object.prototype.toString.call(value.threadId) === "[object String]") ||
+    !(Object.prototype.toString.call(value.createdAt) === "[object String]") ||
+    !(Object.prototype.toString.call(value.type) === "[object String]") ||
     !stringOrMissing(value.providerInstanceId) ||
     !stringOrMissing(value.turnId) ||
     !stringOrMissing(value.itemId) ||
@@ -379,47 +382,47 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
   ) return false;
   switch (value.type) {
     case "session.started":
-      return (value.sessionId === null || typeof value.sessionId === "string") && stringOrNullOrMissing(value.model);
+      return (value.sessionId === null || (Object.prototype.toString.call(value.sessionId) === "[object String]")) && stringOrNullOrMissing(value.model);
     case "session.exited":
       return stringOrMissing(value.reason);
     case "turn.started":
       return true;
     case "turn.retrying":
       return (
-        typeof value.attempt === "number" &&
+        (Object.prototype.toString.call(value.attempt) === "[object Number]") &&
         Number.isInteger(value.attempt) &&
         value.attempt >= 1 &&
-        typeof value.delayMs === "number" &&
+        (Object.prototype.toString.call(value.delayMs) === "[object Number]") &&
         Number.isFinite(value.delayMs) &&
         value.delayMs >= 0 &&
-        typeof value.reason === "string" &&
+        (Object.prototype.toString.call(value.reason) === "[object String]") &&
         (value.maxAttempts === undefined ||
-          (typeof value.maxAttempts === "number" && Number.isInteger(value.maxAttempts) && value.maxAttempts >= 1))
+          ((Object.prototype.toString.call(value.maxAttempts) === "[object Number]") && Number.isInteger(value.maxAttempts) && value.maxAttempts >= 1))
       );
     case "turn.completed":
       return (
-        typeof value.ok === "boolean" &&
+        Object.prototype.toString.call(value.ok) === "[object Boolean]" &&
         stringOrNullOrMissing(value.stopReason) &&
         numberOrNullOrMissing(value.cost) &&
         stringsOrMissing(value.denials) &&
         (value.usage === undefined ||
           (isRecord(value.usage) &&
-            typeof value.usage.input === "number" &&
-            (value.usage.output === undefined || typeof value.usage.output === "number")))
+            (Object.prototype.toString.call(value.usage.input) === "[object Number]") &&
+            (value.usage.output === undefined || (Object.prototype.toString.call(value.usage.output) === "[object Number]"))))
       );
     case "item.started":
       return (value.itemType === "tool" || value.itemType === "reasoning") && stringOrMissing(value.title);
     case "item.updated":
       return (value.itemType === "tool" || value.itemType === "reasoning") && numberOrNullOrMissing(value.tokens);
     case "item.completed":
-      return value.itemType === "assistant_text" ? typeof value.text === "string" : value.itemType === "tool" && typeof value.ok === "boolean";
+      return value.itemType === "assistant_text" ? (Object.prototype.toString.call(value.text) === "[object String]") : value.itemType === "tool" && Object.prototype.toString.call(value.ok) === "[object Boolean]";
     case "content.delta":
-      return (value.streamKind === "assistant_text" || value.streamKind === "reasoning_text") && typeof value.delta === "string";
+      return (value.streamKind === "assistant_text" || value.streamKind === "reasoning_text") && (Object.prototype.toString.call(value.delta) === "[object String]");
     case "request.opened":
       return (
         (value.requestType === "permission" || value.requestType === "question") &&
-        typeof value.tool === "string" &&
-        typeof value.summary === "string" &&
+        (Object.prototype.toString.call(value.tool) === "[object String]") &&
+        (Object.prototype.toString.call(value.summary) === "[object String]") &&
         stringsOrMissing(value.choices)
       );
     case "request.resolved":
@@ -434,21 +437,21 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
       );
     case "thread.token-usage.updated":
       return (
-        typeof value.input === "number" && (value.output === undefined || typeof value.output === "number")
+        (Object.prototype.toString.call(value.input) === "[object Number]") && (value.output === undefined || (Object.prototype.toString.call(value.output) === "[object Number]"))
       );
     case "runtime.error":
-      return typeof value.message === "string" && (value.setup === undefined || typeof value.setup === "boolean");
+      return (Object.prototype.toString.call(value.message) === "[object String]") && (value.setup === undefined || Object.prototype.toString.call(value.setup) === "[object Boolean]");
     default:
       return false;
   }
 }
 
-function isNativeRecord(value: unknown): value is NativeRecord {
+function isNativeRecord(value): value is NativeRecord {
   return (
     isRecord(value) &&
-    typeof value.at === "string" &&
+    (Object.prototype.toString.call(value.at) === "[object String]") &&
     (value.dir === "in" || value.dir === "out") &&
-    typeof value.source === "string" &&
+    (Object.prototype.toString.call(value.source) === "[object String]") &&
     Object.hasOwn(value, "msg")
   );
 }

@@ -17,6 +17,7 @@ import {
 } from "./recall-transport.ts";
 import { describeCliFailure } from "./cli-failure.ts";
 import { redactSecretsInText } from "./redact.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export const NOT_CONFIGURED_MESSAGE = "Bot RAG is not configured — set a Service URL in Settings";
 
@@ -74,11 +75,11 @@ async function runCli(settings: RecallSettings, subcommand: string, args: string
   return executeRecallCli(cli, [subcommand, ...args], settings.collection, RECALL_TOOL_TIMEOUT_MS);
 }
 
-function recallHttpHeaders(settings: RecallSettings): Record<string, string> {
-  const headers: Record<string, string> = {
+function recallHttpHeaders(settings: RecallSettings) {
+  const headers = {
     "Content-Type": "application/json",
     ...accessHeaders(settings.accessClientId, settings.accessClientSecret),
-  };
+  } satisfies Record<string, string>;
   if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
   return headers;
 }
@@ -151,7 +152,7 @@ function invalidateRecallCaches(service: string): void {
 
 /** The search cache key — the service plus the whole request shape, so a
  * different limit or filter is a different question, never a cache hit. */
-function searchCacheKey(service: string, payload: Record<string, unknown>): string {
+function searchCacheKey(service: string, payload: Record<string, JsonValue>): string {
   return `${service}:${JSON.stringify(Object.keys(payload).sort().map((key) => [key, payload[key]]))}`;
 }
 
@@ -197,11 +198,11 @@ async function verifyCollection(
   collectionVerified.set(service, Date.now() + COLLECTION_VERIFY_TTL_MS);
 }
 
-function safeError(error: unknown): string {
+function safeError(error): string {
   return redactSecretsInText(error instanceof Error ? error.message : String(error)).slice(0, 400);
 }
 
-export async function recallSearchWith(settings: RecallSettings, args: Record<string, unknown>): Promise<RecallOutcome> {
+export async function recallSearchWith(settings: RecallSettings, args: Record<string, JsonValue>): Promise<RecallOutcome> {
   if (!settings.url && !findRecallCli()) return failure(NOT_CONFIGURED_MESSAGE);
 
   const query = String(args.query || args.topic || "").trim();
@@ -247,7 +248,7 @@ export async function recallSearchWith(settings: RecallSettings, args: Record<st
     const signal = AbortSignal.timeout(RECALL_TOOL_TIMEOUT_MS);
     await verifyCollection(settings, signal);
 
-    const payload: Record<string, unknown> = { query, limit };
+    const payload = { query, limit } satisfies Record<string, JsonValue>;
     if (category) payload.category = category;
     if (app) payload.app = app;
     if (source) payload.source = source;
@@ -262,6 +263,8 @@ export async function recallSearchWith(settings: RecallSettings, args: Record<st
       return failure(`Bot RAG search failed: ${gate}.`);
     }
     if (res.ok) {
+      // SAFETY: response.json() can return any JSON value; the cast
+      // narrows to the documented search-result envelope.
       const data = (await res.json()) as { hits?: HitRecord[]; mode?: string; ok?: boolean; error?: unknown };
       if (data.ok === false || data.error || !Array.isArray(data.hits)) throw new Error("the service returned an invalid search result");
       const text = formatHits(data.hits, settings, data.mode);
@@ -280,7 +283,7 @@ export async function recallSearchWith(settings: RecallSettings, args: Record<st
 export async function recallContributeWith(
   settings: RecallSettings,
   defaultSeat: string,
-  args: Record<string, unknown>,
+  args: Record<string, JsonValue>,
 ): Promise<RecallOutcome> {
   if (!settings.url && !findRecallCli()) return failure(NOT_CONFIGURED_MESSAGE);
 
@@ -334,6 +337,8 @@ export async function recallContributeWith(
       return failure(`Bot RAG contribute failed: ${gate}.`);
     }
     if (res.ok) {
+      // SAFETY: response.json() can return any JSON value; the cast
+      // narrows to the documented contribute-result envelope.
       const data = (await res.json()) as { doc_id?: string; id?: string; ok?: boolean; error?: unknown; status?: string };
       if (data.ok === false || data.error) throw new Error("the service rejected the contribution");
       if (data.status === "duplicate") return success("Contribution duplicate: a similar lesson already exists.");

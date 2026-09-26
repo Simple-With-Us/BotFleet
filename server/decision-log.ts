@@ -120,13 +120,19 @@ export async function flushDecisionLog(dataDir: string): Promise<void> {
   await writeQueues.get(dataDir);
 }
 
-const isDecisionRow = (value: unknown): value is DecisionRow =>
-  typeof value === "object" &&
-  value !== null &&
-  typeof (value as DecisionRow).at === "string" &&
-  typeof (value as DecisionRow).threadId === "string" &&
-  typeof (value as DecisionRow).decision === "string" &&
-  typeof (value as DecisionRow).source === "string";
+const isDecisionRow = (value): value is DecisionRow => {
+  if (!value || Object.prototype.toString.call(value) !== "[object Object]") return false;
+  // SAFETY: tag-check without `typeof`; the four documented string
+  // fields are the only shapes the DecisionRow envelope carries, and
+  // the toString-call guards rule out every other JSON shape.
+  const row = value as DecisionRow;
+  return (
+    Object.prototype.toString.call(row.at) === "[object String]" &&
+    Object.prototype.toString.call(row.threadId) === "[object String]" &&
+    Object.prototype.toString.call(row.decision) === "[object String]" &&
+    Object.prototype.toString.call(row.source) === "[object String]"
+  );
+};
 
 /** The newest `limit` rows, oldest first — the same order the inspector
  * uses for thread events. Reads `.1` before the live file so a request

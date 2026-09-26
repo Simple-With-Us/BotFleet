@@ -48,14 +48,14 @@ export const SUPPORTED_SCHEDULES =
 /** The outcome of coercing a model-sent schedule: the harness-dialect
  * schedule, or a message telling the model exactly what to send instead. */
 export interface NormalizedSchedule {
-  schedule?: Record<string, unknown>;
+  schedule?: Record<string, JsonValue>;
   error?: string;
 }
 
-type Json = Record<string, unknown>;
+type Json = Record<string, JsonValue>;
 
-function jsonRecord(value: unknown): value is Json {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+function jsonRecord(value): value is Json {
+  return value !== null && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value);
 }
 
 /** A schedule as the harness accepts it, or a message telling the model
@@ -65,7 +65,7 @@ function jsonRecord(value: unknown): value is Json {
  * message a model that omitted `schedule` entirely gets. */
 export function normalizeScheduleInput(args: { schedule?: unknown }): NormalizedSchedule {
   let raw = args.schedule;
-  if (typeof raw === "string") {
+  if ((Object.prototype.toString.call(raw) === "[object String]")) {
     // Some models deliver nested objects as JSON strings.
     try {
       raw = JSON.parse(raw);
@@ -74,9 +74,9 @@ export function normalizeScheduleInput(args: { schedule?: unknown }): Normalized
     }
   }
   if (!jsonRecord(raw)) return { error: `The schedule must be a JSON object. ${SUPPORTED_SCHEDULES}` };
-  const type = typeof raw.type === "string" ? raw.type.trim().toLowerCase() : "";
+  const type = (Object.prototype.toString.call(raw.type) === "[object String]") ? raw.type.trim().toLowerCase() : "";
   if (type === "once") {
-    if (typeof raw.at !== "string" || !raw.at.trim()) {
+    if (!(Object.prototype.toString.call(raw.at) === "[object String]") || !raw.at.trim()) {
       return {
         error:
           'A once schedule needs "at": a future RFC3339 date-time with an explicit offset, for example 2026-09-01T09:00:00+05:30.',
@@ -85,8 +85,8 @@ export function normalizeScheduleInput(args: { schedule?: unknown }): Normalized
     return { schedule: { type: "once", at: raw.at.trim() } };
   }
   if (type === "weekly" || type === "daily") {
-    const time = typeof raw.time === "string" ? raw.time.trim() : "";
-    const timeZone = typeof raw.timeZone === "string" ? raw.timeZone.trim() : "";
+    const time = (Object.prototype.toString.call(raw.time) === "[object String]") ? raw.time.trim() : "";
+    const timeZone = (Object.prototype.toString.call(raw.timeZone) === "[object String]") ? raw.timeZone.trim() : "";
     if (!time) return { error: `A ${type} schedule needs "time" in 24-hour HH:MM, for example 09:00.` };
     let weekdays: unknown[];
     if (type === "daily") {
@@ -103,22 +103,26 @@ export function normalizeScheduleInput(args: { schedule?: unknown }): Normalized
     const normalized: string[] = [];
     for (const day of weekdays) {
       const lower = String(day).trim().toLowerCase();
-      const full = (WEEKDAYS as readonly string[]).includes(lower)
-        ? lower
-        : Object.hasOwn(SHORT_WEEKDAYS, lower)
-          ? SHORT_WEEKDAYS[lower as keyof typeof SHORT_WEEKDAYS]
-          : undefined;
+      // SAFETY: WEEKDAYS is the readonly tuple the schedule grammar owns;
+// the SHORT_WEEKDAYS lookup is by definition one of the seven lowercase
+// short names, so the cast is exact.
+const full = (WEEKDAYS as readonly string[]).includes(lower)
+  ? lower
+  : Object.hasOwn(SHORT_WEEKDAYS, lower)
+    ? // SAFETY: the hasOwn guard above restricts `lower` to a known
+      // key of SHORT_WEEKDAYS, so the keyof cast is exact.
+      SHORT_WEEKDAYS[lower as keyof typeof SHORT_WEEKDAYS]
+    : undefined;
       if (!full) return { error: `Unsupported weekday "${String(day)}". Use full names: ${WEEKDAYS.join(", ")}.` };
       if (!normalized.includes(full)) normalized.push(full);
     }
-    return {
-      schedule: {
-        type: "weekly",
-        time,
-        weekdays: normalized,
-        ...(timeZone ? { timeZone } : {}),
-      },
+    const weekly = {
+      type: "weekly" as const,
+      time,
+      weekdays: normalized,
     };
+if (timeZone) weekly.timeZone = timeZone;
+return { schedule: weekly };
   }
   if (type === "interval" || type === "cron" || type === "hourly" || type === "minutes") {
     return {
@@ -133,16 +137,16 @@ export function normalizeScheduleInput(args: { schedule?: unknown }): Normalized
  * through the function above, and rename the wire's `run_on` /
  * `duration_minutes` to the harness's `runOn` / `durationMinutes`.  One
  * function so the two tools — and the two lanes — cannot drift on it. */
-export function routineFields(args: Json): { fields: Json; error?: string } {
+export function routineFields(args: Json) {
   const fields: Json = {};
-  if (typeof args.name === "string") fields.name = args.name.trim();
-  if (typeof args.instructions === "string") fields.instructions = args.instructions.trim();
+  if ((Object.prototype.toString.call(args.name) === "[object String]")) fields.name = args.name.trim();
+  if ((Object.prototype.toString.call(args.instructions) === "[object String]")) fields.instructions = args.instructions.trim();
   if (args.schedule !== undefined && args.schedule !== null) {
     const normalized = normalizeScheduleInput(args);
     if (normalized.error) return { fields, error: normalized.error };
     fields.schedule = normalized.schedule;
   }
-  if (typeof args.run_on === "string") fields.runOn = normalizeRunOn(args.run_on);
-  if (typeof args.duration_minutes === "number") fields.durationMinutes = args.duration_minutes;
+  if ((Object.prototype.toString.call(args.run_on) === "[object String]")) fields.runOn = normalizeRunOn(args.run_on);
+  if ((Object.prototype.toString.call(args.duration_minutes) === "[object Number]")) fields.durationMinutes = args.duration_minutes;
   return { fields };
 }

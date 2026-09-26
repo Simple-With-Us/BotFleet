@@ -35,6 +35,7 @@ import {
 } from "./config.ts";
 import { augmentedPath } from "./env-path.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 /** The per-desktop budget for one managed VPS container.  The run arguments
  * and the inspect matcher are both derived from this one value, so a desktop
@@ -111,6 +112,8 @@ export async function vpsRemoveTargetIfPresent(
     runner(vpsDockerArgs(alias, args), { timeoutMs });
   try {
     const stdout = (await run(["inspect", target.containerName])).stdout;
+    // SAFETY: docker inspect prints a JSON array of inspected records;
+    // the cast narrows to the documented envelope below.
     const inspected = JSON.parse(stdout) as Array<{
       Config?: { Labels?: Record<string, string> };
       State?: { Running?: boolean };
@@ -474,9 +477,9 @@ function hasNoHostMounts(detail: {
 
 function hasNoPublishedPorts(config: {
   NetworkMode?: string;
-  PortBindings?: Record<string, unknown> | null;
+  PortBindings?: Record<string, JsonValue> | null;
   PublishAllPorts?: boolean;
-} | undefined, networks?: Record<string, unknown> | null): boolean {
+} | undefined, networks?: Record<string, JsonValue> | null): boolean {
   if (!config) return false;
   const networkMode = (config.NetworkMode ?? "").toLowerCase();
   if (!["default", "bridge"].includes(networkMode)) return false;
@@ -528,7 +531,9 @@ async function computeVpsComputerStatus(
 
   let inspectedImageId: string | null = null;
   try {
-    const inspected = JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout) as Array<{
+    // SAFETY: docker image inspect prints a JSON array of inspected
+      // records; the cast narrows to the documented envelope below.
+      const inspected = JSON.parse((await run(["image", "inspect", VPS_IMAGE])).stdout) as Array<{
       Id?: string;
       id?: string;
       Config?: { Labels?: Record<string, string> };
@@ -558,7 +563,7 @@ async function computeVpsComputerStatus(
         Binds?: string[] | null;
         VolumesFrom?: string[] | null;
         NetworkMode?: string;
-        PortBindings?: Record<string, unknown> | null;
+        PortBindings?: Record<string, JsonValue> | null;
         PublishAllPorts?: boolean;
       };
       Id?: string;
@@ -572,6 +577,8 @@ async function computeVpsComputerStatus(
     let lastMissing: unknown;
     for (const name of containerNameCandidatesForTarget(target, botId)) {
       try {
+        // SAFETY: docker inspect prints a JSON array of inspected
+        // records; the cast narrows to the InspectedContainer envelope.
         inspected = JSON.parse((await run(["inspect", name])).stdout) as InspectedContainer[];
         status.container_name = name;
         lastMissing = undefined;
@@ -644,6 +651,8 @@ async function computeVpsComputerStatus(
           cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: containerRef }),
           15_000,
         );
+        // SAFETY: the runtime prints a JSON health-report envelope; the cast
+        // narrows to the documented schema_version/overall/checks shape.
         const report = JSON.parse(health.stdout) as {
           schema_version?: string;
           overall?: string;
@@ -1087,11 +1096,7 @@ export function vpsContainerMcpArgs(alias: string, containerName: string): strin
   );
 }
 
-export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: string): {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-} {
+export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: string) {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw new Error("VPS is not configured — add an SSH config alias first");
   const target = vpsTargetFor(cfg, botId);

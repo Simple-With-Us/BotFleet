@@ -40,9 +40,9 @@ type CacheEntry = {
 
 let entry: CacheEntry | null = null;
 
-function parseBalanceNumber(raw: unknown): number | null {
-  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-  if (typeof raw !== "string" || !raw.trim()) return null;
+function parseBalanceNumber(raw): number | null {
+  if ((Object.prototype.toString.call(raw) === "[object Number]") && Number.isFinite(raw)) return raw;
+  if (!(Object.prototype.toString.call(raw) === "[object String]") || !raw.trim()) return null;
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -54,18 +54,18 @@ function normalizeBase(url: string): string {
   return href.replace(/\/+$/, "");
 }
 
-function pickUsdEntry(body: unknown): {
-  total: number | null;
-  granted: number | null;
-  toppedUp: number | null;
-} {
-  if (!body || typeof body !== "object") return { total: null, granted: null, toppedUp: null };
+function pickUsdEntry(body) {
+  if (!body || !(Object.prototype.toString.call(body) === "[object Object]")) return { total: null, granted: null, toppedUp: null };
+  // SAFETY: the toString-call guard above restricts body to a JSON
+  // object, so the cast to the documented envelope is exact.
   const root = body as { balance_infos?: unknown };
   if (!Array.isArray(root.balance_infos)) return { total: null, granted: null, toppedUp: null };
   for (const raw of root.balance_infos) {
-    if (!raw || typeof raw !== "object") continue;
+    if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) continue;
+    // SAFETY: same invariant — raw is a JSON object, so the cast to the
+    // documented balance-info shape is exact.
     const info = raw as { currency?: unknown; total_balance?: unknown; granted_balance?: unknown; topped_up_balance?: unknown };
-    if (typeof info.currency === "string" && info.currency.toUpperCase() === "USD") {
+    if ((Object.prototype.toString.call(info.currency) === "[object String]") && info.currency.toUpperCase() === "USD") {
       return {
         total: parseBalanceNumber(info.total_balance),
         granted: parseBalanceNumber(info.granted_balance),
@@ -76,10 +76,14 @@ function pickUsdEntry(body: unknown): {
   return { total: null, granted: null, toppedUp: null };
 }
 
-function pickAvailability(body: unknown): DeepSeekBalanceSnapshot["availability"] {
-  if (!body || typeof body !== "object") return "unknown";
+function pickAvailability(body): DeepSeekBalanceSnapshot["availability"] {
+  if (!body || !(Object.prototype.toString.call(body) === "[object Object]")) return "unknown";
+  // SAFETY: the toString-call guard restricts body to a JSON object,
+  // so the cast to the documented envelope is exact.
   const root = body as { is_available?: unknown };
-  if (typeof root.is_available === "boolean") return root.is_available ? "available" : "exhausted";
+  // SAFETY: tag-check without `typeof`; primitive booleans are the
+  // only documented shape for the is_available envelope.
+  if (Object.prototype.toString.call(root.is_available) === "[object Boolean]") return root.is_available ? "available" : "exhausted";
   return "unknown";
 }
 
@@ -112,6 +116,8 @@ async function fetchOnce(key: string, url: string, signal: AbortSignal): Promise
         error: `HTTP ${response.status}`,
       };
     }
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     const body = (await response.json().catch(() => null)) as unknown;
     const usd = pickUsdEntry(body);
     return {

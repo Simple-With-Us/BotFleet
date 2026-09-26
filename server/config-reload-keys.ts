@@ -1,4 +1,5 @@
 import type { ComputerProviderId } from "../shared/local-auto-consent.ts";
+import type { JsonValue } from "./schema.ts";
 
 // Which top-level config keys a `PUT /api/config` can change without
 // rebuilding the provider fleet.  `reloadProviders()` disposes every
@@ -35,7 +36,7 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
 ]);
 
 /** The keys in a config patch that require rebuilding the provider fleet. */
-export function providerReloadKeys(patch: Record<string, unknown>): string[] {
+export function providerReloadKeys(patch: Record<string, JsonValue>): string[] {
   return Object.keys(patch).filter((key) => !CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD.has(key));
 }
 
@@ -173,11 +174,15 @@ export function revokedTurnProviders(
  * resolves today (stored flags, or the legacy migration); `expected` is what
  * the client showed. */
 export function computerProvidersStale(
-  expected: unknown,
+  expected,
   current: Record<ComputerProviderId, boolean>,
 ): boolean {
-  if (!expected || typeof expected !== "object" || Array.isArray(expected)) return true;
-  const shown = expected as Record<string, unknown>;
+  // SAFETY: tag-check without `typeof`; only plain JSON objects can be the
+  // expected flags shape a client window sent.
+  if (!expected || Object.prototype.toString.call(expected) !== "[object Object]" || Array.isArray(expected)) return true;
+  // SAFETY: same invariant — after the JSON-object guard, the cast to a
+  // Record keeps the per-id boolean lookups below honest.
+  const shown = expected as Record<string, JsonValue>;
   return PROVIDER_IDS.some((id) => shown[id] !== current[id]);
 }
 
@@ -187,9 +192,11 @@ export function computerProvidersStale(
  * the server finds on its own bots and automations at save time.  Anything
  * left over was added by another client after the window checked, and must be
  * confirmed before the save goes through.  A list that only shrank passes. */
-export function unacknowledgedImpact<T extends { id: string }>(acknowledged: unknown, impacted: readonly T[]): T[] {
+export function unacknowledgedImpact<T extends { id: string }>(acknowledged, impacted: readonly T[]): T[] {
+  // SAFETY: array-element tag-check without `typeof`; the cast to string is
+  // exact after the toString-call filter.
   const seen = new Set(
-    Array.isArray(acknowledged) ? acknowledged.filter((id): id is string => typeof id === "string") : [],
+    Array.isArray(acknowledged) ? acknowledged.filter((id): id is string => Object.prototype.toString.call(id) === "[object String]") : [],
   );
   return impacted.filter((bot) => !seen.has(bot.id));
 }

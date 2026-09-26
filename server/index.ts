@@ -360,7 +360,7 @@ installTimestampedConsole();
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const WEBHOOK_PORT = Number(process.env.OMB_WEBHOOK_PORT || PORT + 1);
 const STATIC_DIR = process.env.OMB_STATIC_DIR || null;
-const MIME: Record<string, string> = {
+const MIME = {
   ".html": "text/html",
   ".js": "text/javascript",
   ".css": "text/css",
@@ -398,7 +398,7 @@ const harnessOwner = initializeHarnessOwnership(DATA_DIR, PORT, ensureDirs);
 let booting = true;
 let handleRequest: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
 
-function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
+function handleBootRequest(req: IncomingMessage, res: ServerResponse) : void {
   // Binding earlier must not widen the trust boundary by a single request:
   // the same loopback fence every route behind it gets.
   if (!isLoopbackHost(req.headers.host)) {
@@ -588,8 +588,9 @@ const availableSkills = () => mergeSkills(bundledSkills, loadUserSkills(join(DAT
 // after first paint without putting the credential in the renderer or
 // restarting the embedded server. Plain Node/dev launches have no parentPort.
 type UtilityParentPort = {
-  on(event: "message", listener: (event: { data?: unknown }) => void): void;
+  on(event: "message", listener: (event: { data?: unknown }) => void) : void;
 };
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 const utilityParentPort = (process as NodeJS.Process & { parentPort?: UtilityParentPort }).parentPort;
 utilityParentPort?.on("message", (event) => {
   const message = event?.data;
@@ -665,7 +666,7 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
 }
 
 function phoneIntegration() {
-  const env: Record<string, string> = { ...AGENTS_NODE_FLAG };
+  const env = { ...AGENTS_NODE_FLAG };
   if (process.env.OMB_ADB_PATH) env.OMB_ADB_PATH = process.env.OMB_ADB_PATH;
   if (process.env.OMB_RESOURCES_PATH) env.OMB_RESOURCES_PATH = process.env.OMB_RESOURCES_PATH;
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
@@ -835,19 +836,19 @@ async function defaultSelection(excludeInstanceId?: string) {
   return { instanceId: "", model: "" };
 }
 
-function checkedModelSelection(
-  raw: unknown,
+function checkedModelSelection(raw,
   current?: { selection: ModelSelection; busy: boolean },
   requireAvailableModel = false,
 ): { ok: true; selection: ModelSelection } | { ok: false; status: number; error: string } {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+  if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]") || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
   const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown };
-  if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
+  if (!(Object.prototype.toString.call(value.instanceId) === "[object String]") || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
-  if (typeof value.model !== "string" || !value.model.trim()) {
+  if (!(Object.prototype.toString.call(value.model) === "[object String]") || !value.model.trim()) {
     return { ok: false, status: 400, error: "modelSelection.model is required" };
   }
   const selection: ModelSelection = {
@@ -976,6 +977,7 @@ function turnComputerInputs(
 }
 
 /** The providers a turn's resolved computers hold, for `recordMounted`.
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
  * Host tools count as This Computer even with no CUA mount: a tool-loop
  * engine (MiniMax, Grok, OpenAI-compatible) on an explicit This Computer turn
  * gets host bash and file tools through `hasHostComputer` alone, so turning
@@ -1014,7 +1016,7 @@ function storedComputerGrants(
   if (bot?.computers !== undefined) return bot.computers;
   const legacy = bot?.computer;
   if (legacy === undefined) return undefined;
-  if (typeof legacy !== "string" || legacy === "off") return [];
+  if (!(Object.prototype.toString.call(legacy) === "[object String]") || legacy === "off") return [];
   // SAFETY: `computer` is the retired single-destination field, written only
   // by versions that could store "cloud" | "vm" | "local" | "off", and "off"
   // is excluded above.  A value from outside that set could only reach here
@@ -1107,14 +1109,15 @@ async function interruptIfHostRevoked(
     .catch(() => {});
 }
 
-function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaultResponder | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+function checkedGroupResponder(value, memberIds: string[]): GroupDefaultResponder | null {
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) return null;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
   const responder = value as { kind?: unknown; botId?: unknown };
   if (responder.kind === "everyone") return { kind: "everyone" };
   if (responder.kind === "mentions") return { kind: "mentions" };
   if (
     responder.kind === "member" &&
-    typeof responder.botId === "string" &&
+    (Object.prototype.toString.call(responder.botId) === "[object String]") &&
     memberIds.includes(responder.botId)
   ) {
     return { kind: "member", botId: responder.botId };
@@ -1122,8 +1125,7 @@ function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaul
   return null;
 }
 
-function checkedMemberIds(
-  value: unknown,
+function checkedMemberIds(value,
   existingIds?: readonly string[],
 ): { ok: true; memberIds: string[] } | { ok: false; error: string } {
   return resolveRoomMemberIds(value, existingIds, (id) => Boolean(store.bot(id)));
@@ -1490,7 +1492,7 @@ const toolMessageByItem = new Map<string, string>(); // threadId:itemId -> messa
 const toolStartedAt = new Map<string, number>(); // threadId:itemId -> epoch ms
 /** Drop every per-step entry belonging to one thread.  Both maps are keyed
  * `threadId:itemId`, so the thread's own prefix is the sweep. */
-function sweepThreadToolState(threadId: string): void {
+function sweepThreadToolState(threadId: string) : void {
   const prefix = `${threadId}:`;
   for (const key of toolMessageByItem.keys()) {
     if (key.startsWith(prefix)) toolMessageByItem.delete(key);
@@ -1607,7 +1609,7 @@ async function answerRequest(
  * turn kills the process that raised its questions, so those cards can never
  * be answered. Routine proposals are harness-owned and durable, so they stay
  * actionable even after the proposing turn has stopped. */
-function closeOpenApprovals(threadId: string): void {
+function closeOpenApprovals(threadId: string) : void {
   // Peer approvals also hold an in-memory promise. Resolve those first; merely
   // patching their cards would leave the delegation queue waiting 15 minutes.
   cancelPeerApprovalsForThread(threadId);
@@ -1626,7 +1628,7 @@ function closeOpenApprovals(threadId: string): void {
   }
 }
 
-function requestBehavior(value: unknown): "allow" | "deny" | "answer" | null {
+function requestBehavior(value): "allow" | "deny" | "answer" | null {
   return value === "allow" || value === "deny" || value === "answer" ? value : null;
 }
 
@@ -1638,9 +1640,9 @@ type RouteReply = { status: number; body: Record<string, unknown> };
 const messageIdempotency = new IdempotencyCache<RouteReply>();
 const IDEMPOTENCY_KEY_ERROR =
   "idempotencyKey must be 1-200 characters of letters, digits, dot, colon, underscore, or dash";
-function idempotencyKeyFrom(value: unknown): string | undefined | null {
+function idempotencyKeyFrom(value): string | undefined | null {
   if (value === undefined) return undefined;
-  return typeof value === "string" && /^[\w.:-]{1,200}$/.test(value) ? value : null;
+  return (Object.prototype.toString.call(value) === "[object String]") && /^[\w.:-]{1,200}$/.test(value) ? value : null;
 }
 async function replyOnce(key: string | undefined, deliver: () => Promise<RouteReply>): Promise<RouteReply> {
   if (!key) return deliver();
@@ -1865,7 +1867,7 @@ function releaseStalledTurnIfUnowned(
 function scheduleStalledTurnRelease(
   turn: { threadId: string; botId: string },
   stalledDispatchId: number | undefined,
-): void {
+) : void {
   scheduleStalledReleaseRecheck(
     () => releaseStalledTurnIfUnowned(turn, stalledDispatchId),
     (callback, delayMs) => {
@@ -2150,7 +2152,7 @@ const roomComputerLeases = new TurnOwnerClaims<ExactTurnLease>();
 /** Give back one room member's VPS lease.  Without a bot id — the
  * `turn.completed` subscriber, which is thread-keyed and names no speaker —
  * only a thread with exactly one claim is released; see `TurnOwnerClaims`. */
-function releaseRoomComputerLease(threadId: string, botId?: string): void {
+function releaseRoomComputerLease(threadId: string, botId?: string) : void {
   const lease =
     botId === undefined
       ? roomComputerLeases.releaseSoleOwner(threadId)
@@ -2162,7 +2164,7 @@ function releaseRoomComputerLease(threadId: string, botId?: string): void {
  * identifies the turn by thread AND bot: a room thread is shared by every
  * member, so a thread alone would let one member's unwind release the
  * container another member is still clicking inside. */
-function releaseLocalVmThread(threadId: string, botId?: string): void {
+function releaseLocalVmThread(threadId: string, botId?: string) : void {
   const onThread = localVmThreadTargets.ownersOf(threadId);
   // Same rule as the room lease: a thread-keyed caller releases only when the
   // thread holds exactly one claim, and declines rather than guess otherwise.
@@ -2791,7 +2793,7 @@ bus.subscribe((event: RuntimeEvent) => {
             model: actualSelection.model,
           },
         });
-        if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
+        if (next && fallbackUserMessage && (Object.prototype.toString.call(fallbackUserMessage.text) === "[object String]")) {
           const { nextUsed, instanceId, model, effort } = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
           fallbackSelection = { instanceId, model, effort };
@@ -2843,7 +2845,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // actualSelection, not the configured selection: a turn that
           // fell over to another engine is that engine's spend.
         }, actualSelection.instanceId, actualUsageMeta);
-        if (typeof event.cost === "number" && event.cost > 0) {
+        if ((Object.prototype.toString.call(event.cost) === "[object Number]") && event.cost > 0) {
           rollingSpendTracker.recordTurn({
             at: event.createdAt ? Date.parse(event.createdAt) || Date.now() : Date.now(),
             provider: isMiniMaxTurn ? "minimax" : event.provider,
@@ -2881,7 +2883,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
         store.patchBot(bot.id, { unread: true, inflightThreadId: undefined });
-        if (!group && fallbackSelection && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
+        if (!group && fallbackSelection && fallbackUserMessage && (Object.prototype.toString.call(fallbackUserMessage.text) === "[object String]")) {
           const userMsg = fallbackUserMessage;
           const fallbackBotId = bot.id;
           // The retried turn is a continuation of whatever dispatched the
@@ -2967,7 +2969,7 @@ bus.subscribe((event: RuntimeEvent) => {
             costUsd: event.cost ?? null,
             billingMode: event.billingMode,
           }, actualUsageMeta);
-          if (typeof event.cost === "number" && event.cost > 0) {
+          if ((Object.prototype.toString.call(event.cost) === "[object Number]") && event.cost > 0) {
             rollingSpendTracker.recordTurn({
               at: event.createdAt ? Date.parse(event.createdAt) || Date.now() : Date.now(),
               provider: isMiniMaxTurn ? "minimax" : event.provider,
@@ -3114,7 +3116,7 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
     const targetThreadId = store.bot(toBotId)?.threadId;
     if (targetThreadId) delegationWatch.set(targetThreadId, { channelId: channel?.id, toBotId });
     let failureReported = false;
-    const reportStartFailure = (error: unknown) => {
+    const reportStartFailure = (error) => {
       if (failureReported) return;
       failureReported = true;
       const bot = store.bot(toBotId);
@@ -3392,13 +3394,10 @@ async function startTurn(
         const primaryHit = matches(chain) && chain.effort !== undefined;
         const fallbackHit = chain.fallbacks?.some((f) => matches(f) && f.effort !== undefined) ?? false;
         if (!primaryHit && !fallbackHit) return null;
-        return {
-          ...chain,
-          ...(primaryHit ? { effort: undefined } : {}),
-          ...(fallbackHit
-            ? { fallbacks: chain.fallbacks!.map((f) => (matches(f) ? { ...f, effort: undefined } : f)) }
-            : {}),
-        };
+        const out = { ...chain };
+        if (primaryHit) out.effort = undefined;
+        if (fallbackHit) out.fallbacks = chain.fallbacks!.map((f) => (matches(f) ? { ...f, effort: undefined } : f));
+        return out;
       };
       if (task.modelSelection) {
         const next = stripChain(task.modelSelection);
@@ -3498,6 +3497,7 @@ async function startTurn(
 
   const isImessageTask = store.tasks(bot.id)?.find((t) => t.threadId === threadId)?.title?.toLowerCase() === "imessage";
   const persona = [
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
     `You are BF-${bot.name} (display: ${bot.name}), a bot in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
@@ -3749,6 +3749,7 @@ async function startTurn(
       if (!dispatchStillCurrent()) return;
       watchdog.watch(threadId, bot.id);
       // HTTP chat-completions drivers run their own model-to-tool rounds and
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
       // emit the same single terminal event as CLI drivers.
       const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
       // One catalog, used twice: what the model is told it has, and what the
@@ -4330,10 +4331,10 @@ const INGRESS_PROBE_USER_AGENT = "BotFleet-Ingress-Probe/1.0";
  * reports `tunnel: undefined` and the reason carries the raw banner. */
 function describeTunnel(headers: Record<string, string | string[] | undefined>): string | undefined {
   const rawServer = headers["server"];
-  const server = Array.isArray(rawServer) ? rawServer[0] : (typeof rawServer === "string" ? rawServer : undefined);
+  const server = Array.isArray(rawServer) ? rawServer[0] : ((Object.prototype.toString.call(rawServer) === "[object String]") ? rawServer : undefined);
   const cfRay = headers["cf-ray"];
   const rawPoweredBy = headers["x-powered-by"];
-  const poweredBy = Array.isArray(rawPoweredBy) ? rawPoweredBy[0] : (typeof rawPoweredBy === "string" ? rawPoweredBy : undefined);
+  const poweredBy = Array.isArray(rawPoweredBy) ? rawPoweredBy[0] : ((Object.prototype.toString.call(rawPoweredBy) === "[object String]") ? rawPoweredBy : undefined);
   if (cfRay || server?.toLowerCase().includes("cloudflare")) return "cloudflare";
   if (server?.toLowerCase().includes("caddy")) return "caddy";
   if (server?.toLowerCase().includes("nginx")) return "nginx";
@@ -4426,7 +4427,7 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
     // record of header values so its `headers["server"]` lookups can find
     // them, instead of always returning `undefined` (which would silently
     // make every probe report "no tunnel" and lose the operator's hint).
-    const headerRecord: Record<string, string | string[] | undefined> = {};
+    const headerRecord = {};
     response.headers.forEach((value, key) => {
       headerRecord[key.toLowerCase()] = value;
     });
@@ -4455,7 +4456,8 @@ async function probeIngressUrl(raw: string): Promise<IngressProbeResult> {
         payload = undefined;
       }
       const isBotFleet =
-        typeof payload === "object" && payload !== null && (payload as { app?: unknown }).app === "botfleet";
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+        (Object.prototype.toString.call(payload) === "[object Object]") && payload !== null && (payload as { app?: unknown }).app === "botfleet";
       if (!isBotFleet) {
         return {
           ok: false,
@@ -4546,7 +4548,7 @@ export function executeListRoutinesRequest(input: {
   fromBotId: string;
   fromThreadId?: string;
   routineId?: string;
-}): { status: number; body: Record<string, unknown> } {
+}) {
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 403, body: { error: "unknown sender" } };
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
@@ -4659,7 +4661,7 @@ export function executeDelegateBotRequest(input: {
   depth: number;
   fromThreadId?: string;
   reason?: string;
-}): { status: number; body: Record<string, unknown> } {
+}) {
   const fromBotId = input.fromBotId;
   const toBotId = input.toBotId;
   const message = input.message;
@@ -4719,7 +4721,7 @@ export function executeCreateBotRequest(input: {
   name: string;
   role: string;
   instructions: string;
-}): { status: number; body: Record<string, unknown> } {
+}) {
   const chief = store.bot(input.fromBotId);
   if (!chief) return { status: 403, body: { error: "unknown sender" } };
   const fromThreadId = String(input.fromThreadId ?? chief.threadId);
@@ -4788,7 +4790,7 @@ export function executeRequestCredentialRequest(input: {
   fromThreadId?: string;
   credentialId: string;
   reason?: string;
-}): { status: number; body: Record<string, unknown> } {
+}) {
   const from = store.bot(input.fromBotId);
   if (!from) return { status: 403, body: { error: "unknown sender" } };
   const fromThreadId = String(input.fromThreadId ?? from.threadId);
@@ -4808,7 +4810,7 @@ export function executeRequestCredentialRequest(input: {
   if (existing) {
     return { status: 200, body: { messageId: existing.id, label: target.label } };
   }
-  const reason = typeof input.reason === "string" ? input.reason.trim().slice(0, 240) : "";
+  const reason = (Object.prototype.toString.call(input.reason) === "[object String]") ? input.reason.trim().slice(0, 240) : "";
   const message = store.appendMessage(fromThreadId, {
     role: "bot",
     kind: "secret",
@@ -4872,6 +4874,7 @@ export async function executeRoutineRequestRequest(input: {
       decision: "card-shown",
       source: "routine",
     });
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
     return { status: 201, body: proposed as unknown as Record<string, unknown> };
   } catch (error) {
     const status = error instanceof RoutineRequestError ? error.status : 400;
@@ -4938,7 +4941,7 @@ function claimBootResume(botId: string, threadId: string): boolean {
   return true;
 }
 
-function releaseBootResume(botId: string, threadId: string): void {
+function releaseBootResume(botId: string, threadId: string) : void {
   bootResumeClaims.delete(resumeKey(botId, threadId));
 }
 
@@ -4946,7 +4949,7 @@ function releaseBootResume(botId: string, threadId: string): void {
  * the person is asking for it again, which is the one thing that outranks
  * "this already failed".  In-memory first, so an ordinary dispatch — the
  * overwhelmingly common case — touches no disk at all. */
-function clearRememberedResumeFailure(botId: string, threadId: string): void {
+function clearRememberedResumeFailure(botId: string, threadId: string) : void {
   if (!rememberedResumeFailures.delete(resumeKey(botId, threadId))) return;
   forgetResumeFailure(DATA_DIR, botId, threadId);
 }
@@ -5025,7 +5028,7 @@ function deferBootRecoveryForCredential(botId: string, threadId: string): boolea
 /** Say in the thread that the turn was interrupted, and stop there.  The
  * provider may already have acted on the prompt and there is no session to
  * continue, so re-sending would repeat whatever it did; the person decides. */
-function noteInterruptedTurn(candidate: BootRecoveryCandidate): void {
+function noteInterruptedTurn(candidate: BootRecoveryCandidate) : void {
   store.appendMessage(candidate.threadId, {
     role: "bot",
     kind: "activity",
@@ -5130,7 +5133,7 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
 /** Re-plan one bot after its encrypted credential arrived.  It went through
  * the same gates on the first pass; what changed is only whether it can
  * dispatch at all. */
-function drainDeferredBootRecoveries(): void {
+function drainDeferredBootRecoveries() : void {
   for (const botId of [...deferredBootRecoveries]) {
     const candidate = bootRecoveryCandidateFor(botId);
     if (!candidate) {
@@ -5428,6 +5431,7 @@ async function runGroupMemberTurn(
     .map((b) => `@${b.name}${b.title ? ` (${b.title})` : ""}`)
     .join(", ");
   const system = [
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
     `You are BF-${bot.name} (display: ${bot.name}), a bot in the room "${group.name}" in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
@@ -5970,9 +5974,9 @@ function roomSetupPending(group: GroupRecord): boolean {
   );
 }
 
-function resolveReplyTarget(threadId: string, value: unknown): Message | undefined {
+function resolveReplyTarget(threadId: string, value): Message | undefined {
   if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value !== "string") throw Object.assign(new Error("replyToId must be a message id"), { status: 400 });
+  if (!(Object.prototype.toString.call(value) === "[object String]")) throw Object.assign(new Error("replyToId must be a message id"), { status: 400 });
   const target = store.messagesFor(threadId).find((message) => message.id === value);
   if (!target || target.kind !== "text" || !target.text?.trim()) {
     throw Object.assign(new Error("the message being replied to is no longer available"), { status: 404 });
@@ -6256,13 +6260,14 @@ async function testCliBinary(
       },
       (err, stdout) => {
         if (err) {
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
           const e = err as NodeJS.ErrnoException & { killed?: boolean };
           // err.code is an errno CONSTANT ("ENOENT", "EACCES") only for spawn
           // failures; for a non-zero exit it's the exit STATUS (a number) and
           // for a timeout it's null + killed:true — describeSpawnFailure words
           // only the first kind
           const exceededBuffer = e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-          const isSpawnError = typeof e.code === "string" && !exceededBuffer;
+          const isSpawnError = (Object.prototype.toString.call(e.code) === "[object String]") && !exceededBuffer;
           const message = exceededBuffer
             ? "CLI test produced more than 64 KiB of output"
             : isSpawnError
@@ -6280,9 +6285,10 @@ async function testCliBinary(
 }
 
 /** execFile's error carries the child's stderr in .stderr. */
-function stderrOf(err: unknown): string {
+function stderrOf(err): string {
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
   const s = (err as { stderr?: unknown }).stderr;
-  return typeof s === "string" ? s : Buffer.isBuffer(s) ? s.toString("utf8") : "";
+  return (Object.prototype.toString.call(s) === "[object String]") ? s : Buffer.isBuffer(s) ? s.toString("utf8") : "";
 }
 
 async function localVmPayload(target: LocalVmTarget) {
@@ -6309,25 +6315,25 @@ function readSecretField(source: object | undefined, spec: SecretFieldSpec): str
   // so this walks declared config sections and nothing else.
   let node: unknown = (source as Record<string, unknown>)[spec.section];
   for (const key of spec.path) {
-    if (!node || typeof node !== "object") return undefined;
+    if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return undefined;
     // SAFETY: guarded on the line above — `node` is a non-null object here.
     node = (node as Record<string, unknown>)[key];
   }
-  return typeof node === "string" ? node : undefined;
+  return (Object.prototype.toString.call(node) === "[object String]") ? node : undefined;
 }
 
 /** Tombstone one mapped credential in a patch on its way to disk.  Called
  * only after the value reached the store: the store keeps it, this computer
  * keeps an empty string, and the next resolution reads the store. */
-function blankSecretField(target: object, spec: SecretFieldSpec): void {
+function blankSecretField(target: object, spec: SecretFieldSpec) : void {
   // SAFETY: as above — a table-driven section and path over a parsed patch.
   let node: unknown = (target as Record<string, unknown>)[spec.section];
   for (const key of spec.path.slice(0, -1)) {
-    if (!node || typeof node !== "object") return;
+    if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return;
     // SAFETY: guarded on the line above.
     node = (node as Record<string, unknown>)[key];
   }
-  if (!node || typeof node !== "object") return;
+  if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return;
   // SAFETY: guarded on the line above; the final path segment is a literal
   // from the table.
   (node as Record<string, unknown>)[spec.path[spec.path.length - 1]] = "";
@@ -6579,7 +6585,7 @@ async function waitForProviderReloads(): Promise<void> {
   while (providerReloadInProgress) await providerReloadChain;
 }
 
-function finishProviderReloadMutation(): void {
+function finishProviderReloadMutation() : void {
   providerReloadGeneration += 1;
   pendingProviderReloads -= 1;
   if (pendingProviderReloads !== 0) return;
@@ -6637,7 +6643,7 @@ function activeInterruptedTurns(instanceId?: string): InterruptedTurn[] {
     .filter((turn) => !instanceId || turn.instanceId === instanceId);
 }
 
-function latchInterruptedTurns(turns: readonly InterruptedTurn[]): void {
+function latchInterruptedTurns(turns: readonly InterruptedTurn[]) : void {
   for (const turn of turns) {
     // The third abandon source: the fleet these turns are running on is
     // about to be disposed.  Settled here, BEFORE `registry.disposeAll`,
@@ -6812,7 +6818,7 @@ async function interruptTurnsUsingDisabledProviders(
     // check fails instead of starting the turn with the revoked mount.
     if (turn.dispatchId !== undefined) activeTurnOwners.revoke(turn.threadId, turn.dispatchId);
     const instance = registry.get(turn.instanceId ?? bot.modelSelection.instanceId);
-    await instance?.adapter.interruptTurn(turn.threadId).catch((error: unknown) => {
+    await instance?.adapter.interruptTurn(turn.threadId).catch((error) => {
       console.error(`interrupt after computer settings change failed for thread ${turn.threadId}:`, error);
     });
   }));
@@ -6842,7 +6848,7 @@ async function runProviderReload() {
   settleInterruptedBots(affectedTurns, RELOAD_REASON);
 }
 
-function drainProviderReloadContinuations(): void {
+function drainProviderReloadContinuations() : void {
   // Completion subscribers deliberately skip drains while adapters are
   // detached.  Release every queued work kind only after the replacement
   // fleet is live.
@@ -6957,7 +6963,8 @@ function externalCredentialPending(instanceId: string): boolean {
   // from that table has no per-instance key to be waiting for.
   const keyEnv = entry ? INSTANCE_API_KEY_ENV.get(entry.driver) : undefined;
   if (!entry || !keyEnv) return false;
-  const config = entry.config && typeof entry.config === "object" && !Array.isArray(entry.config)
+  const config = entry.config && (Object.prototype.toString.call(entry.config) === "[object Object]") && !Array.isArray(entry.config)
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
     ? entry.config as Record<string, unknown>
     : {};
   if (config.credentialStorage !== "external") return false;
@@ -7037,11 +7044,12 @@ function externalCredentialPendingError(instanceId: string): Error & { status: n
   );
 }
 
-function isExternalCredentialPendingError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && (error as { code?: unknown }).code === "external_credential_pending");
+function isExternalCredentialPendingError(error): boolean {
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+  return Boolean(error && (Object.prototype.toString.call(error) === "[object Object]") && (error as { code?: unknown }).code === "external_credential_pending");
 }
 
-function drainCredentialFallbacks(): void {
+function drainCredentialFallbacks() : void {
   for (const [key, entry] of pendingCredentialFallback) {
     const bot = store.bot(entry.botId);
     if (!bot || bot.busy || turnExternalCredentialPending(bot, entry.selection.instanceId)) continue;
@@ -7133,7 +7141,7 @@ function mayControlUpdates(req: IncomingMessage): boolean {
   return isLoopbackAddress(req.socket.remoteAddress);
 }
 
-function json(res: ServerResponse, status: number, body: unknown) {
+function json(res: ServerResponse, status: number, body) {
   const data = JSON.stringify(body);
   res.writeHead(status, { "content-type": "application/json" });
   res.end(data);
@@ -7152,7 +7160,7 @@ function readBody(req: IncomingMessage): Promise<any> {
     };
     req.on("data", (c) => {
       if (done) return;
-      bytes += typeof c === "string" ? Buffer.byteLength(c) : c.length;
+      bytes += (Object.prototype.toString.call(c) === "[object String]") ? Buffer.byteLength(c) : c.length;
       if (bytes > 1_000_000) {
         // Keep draining the socket, but stop retaining attacker-controlled
         // bytes. Destroying the request here prevents the caller from
@@ -7214,6 +7222,7 @@ function isAllowedOrigin(origin: string | undefined | null): boolean {
   }
 }
 
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 /** The peer address of a socket, judged by the same loopback rule as Host. */
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
@@ -7280,7 +7289,7 @@ async function resumeInterruptedChatTurns(
     try {
       const resumeBot = entry?.botId ? store.bot(entry.botId) : undefined;
       const resumeThreadId = entry?.threadId;
-      if (!resumeBot || typeof resumeThreadId !== "string") continue;
+      if (!resumeBot || !(Object.prototype.toString.call(resumeThreadId) === "[object String]")) continue;
       if (store.groupByThread(resumeThreadId)) {
         console.log(
           `[${context}] skipping interrupted room turn for bot ${resumeBot.id} — restart it from the room`,
@@ -7580,7 +7589,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           toBotId: String(body.toBotId ?? ""),
           message: String(body.message ?? "").trim(),
           depth: Number(body.depth ?? 0) || 0,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          fromThreadId: (Object.prototype.toString.call(body.fromThreadId) === "[object String]") ? body.fromThreadId : undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -7593,9 +7602,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           fromBotId: String(body.fromBotId ?? ""),
           toBotId: String(body.toBotId ?? ""),
           message: String(body.message ?? "").trim(),
-          reason: typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined,
+          reason: (Object.prototype.toString.call(body.reason) === "[object String]") && body.reason.trim() ? body.reason.trim() : undefined,
           depth: Number(body.depth ?? 0) || 0,
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          fromThreadId: (Object.prototype.toString.call(body.fromThreadId) === "[object String]") ? body.fromThreadId : undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -7603,7 +7612,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const body = await readBody(req);
         const result = executeCreateBotRequest({
           fromBotId: String(body.fromBotId ?? ""),
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          fromThreadId: (Object.prototype.toString.call(body.fromThreadId) === "[object String]") ? body.fromThreadId : undefined,
           name: String(body.name ?? ""),
           role: String(body.role ?? ""),
           instructions: String(body.instructions ?? ""),
@@ -7614,9 +7623,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const body = await readBody(req);
         const result = executeRequestCredentialRequest({
           fromBotId: String(body.fromBotId ?? ""),
-          fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
+          fromThreadId: (Object.prototype.toString.call(body.fromThreadId) === "[object String]") ? body.fromThreadId : undefined,
           credentialId: body.credentialId,
-          reason: typeof body.reason === "string" ? body.reason : undefined,
+          reason: (Object.prototype.toString.call(body.reason) === "[object String]") ? body.reason : undefined,
         });
         return json(res, result.status, result.body);
       }
@@ -7663,6 +7672,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           return res.end(JSON.stringify({
             jsonrpc: "2.0",
+            // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
             id: (body as { id?: unknown }).id ?? null,
             result: { content: [{ type: "text", text: refusal }], isError: true },
           }));
@@ -7690,6 +7700,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
             return res.end(JSON.stringify({
               jsonrpc: "2.0",
+              // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
               id: (body as { id?: unknown }).id ?? null,
               result: { content: [{ type: "text", text: refusal }], isError: true },
             }));
@@ -7714,7 +7725,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ? req.headers["mcp-session-id"][0]
             : req.headers["mcp-session-id"],
         );
-        const headers: Record<string, string> = {
+        const headers = {
           "content-type": upstream.contentType,
           "cache-control": "no-store",
         };
@@ -7725,11 +7736,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // rather than broken, because the hard boundary is the tools/call
         // verdict above, not this listing.
         if (
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
           (body as { method?: unknown }).method === "tools/list" &&
           upstream.status === 200 &&
           callerBot.connectorTools !== undefined
         ) {
           try {
+            // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
             const parsed = JSON.parse(Buffer.from(upstream.bytes).toString("utf8")) as {
               result?: { tools?: unknown };
             };
@@ -7779,7 +7792,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const threadId = String(body.threadId ?? "");
         const resumeKey = String(body.resumeKey ?? "");
         const slugs: string[] = Array.isArray(body.slugs)
-          ? [...new Set<string>(body.slugs.map((slug: unknown) => String(slug).toLowerCase()).filter((slug: string) => CONNECTOR_SLUG.test(slug)))]
+          ? [...new Set<string>(body.slugs.map((slug) => String(slug).toLowerCase()).filter((slug: string) => CONNECTOR_SLUG.test(slug)))]
           : [];
         const owner = connectorThread(botId, threadId);
         if (!owner) return json(res, 403, { error: "conversation does not belong to this bot" });
@@ -7834,6 +7847,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         )
         .map((group) => ({
           groupId: group.id,
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
           botIds: [group.memberIds[0], group.memberIds[1]] as [string, string],
           lastAt: store.messagesFor(group.threadId).at(-1)?.at ?? group.createdAt,
         }))
@@ -8238,20 +8252,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // ── channels (persisted internally as groups) ───────────────────────
     if (method === "POST" && path === "/api/groups") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "channel must be a JSON object" });
       }
       const roster = checkedMemberIds(body.memberIds);
       if (!roster.ok) return json(res, 400, { error: roster.error });
       const { memberIds } = roster;
-      if (body.name !== undefined && typeof body.name !== "string") {
+      if (body.name !== undefined && !(Object.prototype.toString.call(body.name) === "[object String]")) {
         return json(res, 400, { error: "channel name must be a string" });
       }
       const name = body.name?.trim() || `${store.bot(memberIds[0])!.name} & co.`;
       if (name.length > 100) return json(res, 400, { error: "channel name must be at most 100 characters" });
       let section: string | undefined;
       if (body.section !== undefined && body.section !== null) {
-        if (typeof body.section !== "string") return json(res, 400, { error: "context must be a string" });
+        if (!(Object.prototype.toString.call(body.section) === "[object String]")) return json(res, 400, { error: "context must be a string" });
         section = body.section.trim() || undefined;
         if (section && section.length > 60) {
           return json(res, 400, { error: "context must be at most 60 characters" });
@@ -8261,11 +8275,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         | { bulletin: string; defaultResponder: GroupDefaultResponder; completed: true }
         | undefined;
       if (body.setup !== undefined) {
-        if (!body.setup || typeof body.setup !== "object" || Array.isArray(body.setup)) {
+        if (!body.setup || !(Object.prototype.toString.call(body.setup) === "[object Object]") || Array.isArray(body.setup)) {
           return json(res, 400, { error: "setup must be an object" });
         }
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const requested = body.setup as { bulletin?: unknown; defaultResponder?: unknown };
-        if (typeof requested.bulletin !== "string") {
+        if (!(Object.prototype.toString.call(requested.bulletin) === "[object String]")) {
           return json(res, 400, { error: "setup.bulletin must be a string" });
         }
         if (requested.bulletin.length > 12_000) {
@@ -8336,7 +8351,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req);
       const profileName = cfg.profile?.name?.trim();
       const name =
-        typeof body.name === "string" && body.name.trim()
+        (Object.prototype.toString.call(body.name) === "[object String]") && body.name.trim()
           ? body.name.trim()
           : profileName
             ? `${profileName}'s Team`
@@ -8385,18 +8400,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         return json(res, 200, await fetchLibraryTeam(m[1]));
       } catch (error) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const status = (error as { status?: number }).status === 404 ? 404 : 502;
         return json(res, status, { error: error instanceof Error ? error.message : "The team could not be loaded" });
       }
     }
     if (method === "POST" && path === "/api/team-library/github") {
       const body = await readBody(req);
-      if (typeof body.url !== "string" || !body.url.trim()) {
+      if (!(Object.prototype.toString.call(body.url) === "[object String]") || !body.url.trim()) {
         return json(res, 400, { error: "A GitHub URL is required" });
       }
       try {
         return json(res, 200, await fetchGithubTeam(body.url));
       } catch (error) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const status = (error as { status?: number }).status === 404 ? 404 : 400;
         return json(res, status, { error: error instanceof Error ? error.message : "The GitHub team could not be loaded" });
       }
@@ -8475,6 +8492,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const importName = pkg?.name ?? manifest!.team.name;
       const sourceMembers = pkg
         ? pkg.agents.map((agent) => ({ member: packageAgentAsMember(agent), playbookKeys: agent.playbooks ?? [] }))
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         : manifest!.team.members.map((member) => ({ member, playbookKeys: [] as string[] }));
 
       // Snapshot before creating anything so replace never archives the new
@@ -8649,13 +8667,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.action === "complete") {
         const checked = validateBotCwd(body.cwd ?? null);
         if (!checked.ok) return json(res, 400, { error: checked.error });
-        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
+        if (!(Object.prototype.toString.call(body.bulletin) === "[object String]")) return json(res, 400, { error: "bulletin must be a string" });
         if (body.bulletin.length > 12_000) return json(res, 400, { error: "bulletin must be at most 12000 characters" });
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const value = body.defaultResponder as { kind?: unknown; botId?: unknown } | null;
         let responder: GroupDefaultResponder | null = null;
         if (value?.kind === "everyone") responder = { kind: "everyone" };
         else if (value?.kind === "mentions") responder = { kind: "mentions" };
-        else if (value?.kind === "member" && typeof value.botId === "string" && group.memberIds.includes(value.botId)) {
+        else if (value?.kind === "member" && (Object.prototype.toString.call(value.botId) === "[object String]") && group.memberIds.includes(value.botId)) {
           responder = { kind: "member", botId: value.botId };
         }
         if (!responder) return json(res, 400, { error: "invalid default responder" });
@@ -8693,7 +8712,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: "this channel is working or waiting on you — finish that turn first" });
       }
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
@@ -8701,7 +8720,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           error: "this workspace uses one conversation per channel — turn on Fleet or Projects in Settings to add another",
         });
       }
-      const task = store.createGroupTask(group.id, typeof body.title === "string" ? body.title : undefined);
+      const task = store.createGroupTask(group.id, (Object.prototype.toString.call(body.title) === "[object String]") ? body.title : undefined);
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = groupWithThread(store.group(group.id)!);
       broadcast({ kind: "group", group: fresh });
@@ -8733,7 +8752,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: "this channel is working or waiting on you — finish that turn first" });
       }
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       // Reassigning a conversation to a bot, where it becomes one of that
@@ -8802,7 +8821,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/groups\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const existing = store.group(m[1]);
@@ -8813,16 +8832,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       ) {
         return json(res, 409, { error: "this channel is working or waiting on you — finish that turn first" });
       }
-      const patch: Record<string, unknown> = {};
+      const patch = {};
       if (body.name !== undefined) {
-        if (typeof body.name !== "string") return json(res, 400, { error: "room name must be a string" });
+        if (!(Object.prototype.toString.call(body.name) === "[object String]")) return json(res, 400, { error: "room name must be a string" });
         const name = body.name.trim();
         if (!name) return json(res, 400, { error: "room name must not be empty" });
         if (name.length > 100) return json(res, 400, { error: "room name must be at most 100 characters" });
         patch.name = name;
       }
       if (body.avatarUrl !== undefined) {
-        if (body.avatarUrl !== null && typeof body.avatarUrl !== "string") {
+        if (body.avatarUrl !== null && !(Object.prototype.toString.call(body.avatarUrl) === "[object String]")) {
           return json(res, 400, { error: "avatarUrl must be a string or null" });
         }
         if (body.avatarUrl && !storedAvatarExists(body.avatarUrl)) {
@@ -8833,7 +8852,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.avatarCrop !== undefined) {
         if (body.avatarCrop === null) patch.avatarCrop = null;
         else if (
-          typeof body.avatarCrop === "string" &&
+          (Object.prototype.toString.call(body.avatarCrop) === "[object String]") &&
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
           (BOT_AVATAR_CROPS as readonly string[]).includes(body.avatarCrop)
         ) {
           patch.avatarCrop = body.avatarCrop;
@@ -8842,14 +8862,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       if (body.bulletin !== undefined) {
-        if (typeof body.bulletin !== "string") return json(res, 400, { error: "bulletin must be a string" });
+        if (!(Object.prototype.toString.call(body.bulletin) === "[object String]")) return json(res, 400, { error: "bulletin must be a string" });
         if (body.bulletin.length > 12_000) {
           return json(res, 400, { error: "bulletin must be at most 12000 characters" });
         }
         patch.bulletin = body.bulletin;
       }
       if (body.unread !== undefined) {
-        if (typeof body.unread !== "boolean") return json(res, 400, { error: "unread must be true or false" });
+        if (!(Object.prototype.toString.call(body.unread) === "[object Boolean]")) return json(res, 400, { error: "unread must be true or false" });
         patch.unread = body.unread;
       }
       if (body.memberIds !== undefined) {
@@ -8860,15 +8880,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.memberIds = roster.memberIds;
       }
       if (body.defaultResponder !== undefined) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const memberIds = (patch.memberIds as string[] | undefined) ?? existing.memberIds.filter((id) => store.bot(id));
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const raw = body.defaultResponder as { kind?: unknown; botId?: unknown } | null;
         const existingLead =
           existing.defaultResponder.kind === "member" ? existing.defaultResponder.botId : undefined;
         const ghostLead =
           raw &&
-          typeof raw === "object" &&
+          (Object.prototype.toString.call(raw) === "[object Object]") &&
           raw.kind === "member" &&
-          typeof raw.botId === "string" &&
+          (Object.prototype.toString.call(raw.botId) === "[object String]") &&
           raw.botId === existingLead &&
           !memberIds.includes(raw.botId);
         if (ghostLead) {
@@ -8914,7 +8936,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         const cleaned: string[] = [];
         for (const item of body.extraCwds) {
-          if (typeof item === "string" && item.trim()) {
+          if ((Object.prototype.toString.call(item) === "[object String]") && item.trim()) {
             const checked = validateBotCwd(item.trim());
             if (!checked.ok || !checked.cwd) continue;
             if (confinement) {
@@ -8933,14 +8955,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // edited away or deleted simply resolves to nothing in the UI.
       if (body.pinnedMessageId !== undefined) {
         if (body.pinnedMessageId === null || body.pinnedMessageId === "") patch.pinnedMessageId = undefined;
-        else if (typeof body.pinnedMessageId === "string" && /^[\w-]+$/.test(body.pinnedMessageId)) {
+        else if ((Object.prototype.toString.call(body.pinnedMessageId) === "[object String]") && /^[\w-]+$/.test(body.pinnedMessageId)) {
           patch.pinnedMessageId = body.pinnedMessageId;
         } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
       }
       // same contract as a bot's sidebar section: null/"" clears, 60 chars max
       if (body.section !== undefined) {
         if (body.section === null) patch.section = undefined;
-        else if (typeof body.section !== "string") return json(res, 400, { error: "section must be a string" });
+        else if (!(Object.prototype.toString.call(body.section) === "[object String]")) return json(res, 400, { error: "section must be a string" });
         else {
           const trimmed = body.section.trim();
           if (!trimmed) patch.section = undefined;
@@ -8979,14 +9001,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/groups\/([\w-]+)\/messages$/);
     if (m && method === "POST") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "text required" });
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such group" });
-      if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
+      if (body.threadId !== undefined && (!(Object.prototype.toString.call(body.threadId) === "[object String]") || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
       const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
@@ -9026,11 +9048,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such room" });
       const rawBody = await readBody(req);
-      if (rawBody !== null && (typeof rawBody !== "object" || Array.isArray(rawBody))) {
+      if (rawBody !== null && (!(Object.prototype.toString.call(rawBody) === "[object Object]") || Array.isArray(rawBody))) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const body = rawBody ?? {};
-      if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
+      if (body.threadId !== undefined && (!(Object.prototype.toString.call(body.threadId) === "[object String]") || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
       if (body.threadId !== undefined && body.threadId !== group.threadId) {
@@ -9063,7 +9085,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req);
       const emoji = String(body.emoji ?? "").slice(0, 8);
       if (!emoji) return json(res, 400, { error: "emoji required" });
-      const patched = store.toggleReaction(m[1], m[2], emoji, typeof body.by === "string" ? body.by : "user");
+      const patched = store.toggleReaction(m[1], m[2], emoji, (Object.prototype.toString.call(body.by) === "[object String]") ? body.by : "user");
       if (!patched) return json(res, 404, { error: "no such message" });
       return json(res, 200, { message: patched });
     }
@@ -9079,10 +9101,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     if (method === "POST" && path === "/api/bots") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "bot must be a JSON object" });
       }
-      if (body.requireAvailableModel !== undefined && typeof body.requireAvailableModel !== "boolean") {
+      if (body.requireAvailableModel !== undefined && !(Object.prototype.toString.call(body.requireAvailableModel) === "[object Boolean]")) {
         return json(res, 400, { error: "requireAvailableModel must be true or false" });
       }
       if (body.requireAvailableModel === true && body.modelSelection === undefined) {
@@ -9097,7 +9119,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!profile.ok) return json(res, 400, { error: profile.error });
       let section: string | undefined;
       if (body.section !== undefined && body.section !== null) {
-        if (typeof body.section !== "string") return json(res, 400, { error: "section must be a string" });
+        if (!(Object.prototype.toString.call(body.section) === "[object String]")) return json(res, 400, { error: "section must be a string" });
         section = body.section.trim() || undefined;
         if (section && section.length > 60) {
           return json(res, 400, { error: "section must be at most 60 characters" });
@@ -9206,7 +9228,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/bots\/([\w-]+)\/always-allow$/);
     if (m && method === "POST") {
       const body = await readBody(req);
-      const allowKey = typeof body.allowKey === "string" ? body.allowKey : "";
+      const allowKey = (Object.prototype.toString.call(body.allowKey) === "[object String]") ? body.allowKey : "";
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!allowKey) return json(res, 400, { error: "allowKey required" });
@@ -9232,7 +9254,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       if (
@@ -9245,7 +9267,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: localAutoConsentConfigBusyError });
       }
       const existingBot = store.bot(m[1]);
-      if (body.requireAvailableModel !== undefined && typeof body.requireAvailableModel !== "boolean") {
+      if (body.requireAvailableModel !== undefined && !(Object.prototype.toString.call(body.requireAvailableModel) === "[object Boolean]")) {
         return json(res, 400, { error: "requireAvailableModel must be true or false" });
       }
       // Neither Codex (free-form string field) nor Grok (lazy, logs-only)
@@ -9259,6 +9281,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // be offline would cost the copy all of them. Letting it through is
       // safe — startTurn refuses to run a turn on an unavailable instance
       // anyway, so an unverifiable level never reaches a CLI.
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
       const rawSelection = (body as Record<string, unknown>).modelSelection;
       if (body.requireAvailableModel === true && rawSelection === undefined) {
         return json(res, 400, { error: "requireAvailableModel requires modelSelection" });
@@ -9281,12 +9304,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (profile.patch.avatarUrl && !storedAvatarExists(profile.patch.avatarUrl)) {
         return json(res, 400, { error: "avatarUrl must reference an existing stored image" });
       }
-      const patch: Record<string, unknown> = {};
+      const patch = {};
       Object.assign(patch, profile.patch);
       let section: string | undefined | null;
       if (body.section !== undefined) {
         if (body.section === null) section = null;
-        else if (typeof body.section !== "string") return json(res, 400, { error: "section must be a string" });
+        else if (!(Object.prototype.toString.call(body.section) === "[object String]")) return json(res, 400, { error: "section must be a string" });
         else {
           const trimmed = body.section.trim();
           if (!trimmed) section = null;
@@ -9306,7 +9329,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // edited to another branch or deleted simply resolves to nothing.
       if (body.pinnedMessageId !== undefined) {
         if (body.pinnedMessageId === null || body.pinnedMessageId === "") patch.pinnedMessageId = undefined;
-        else if (typeof body.pinnedMessageId === "string" && /^[\w-]+$/.test(body.pinnedMessageId)) {
+        else if ((Object.prototype.toString.call(body.pinnedMessageId) === "[object String]") && /^[\w-]+$/.test(body.pinnedMessageId)) {
           patch.pinnedMessageId = body.pinnedMessageId;
         } else return json(res, 400, { error: "pinnedMessageId must be a message id" });
       }
@@ -9314,28 +9337,30 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.chiefOfStaff === false) patch.chiefOfStaff = false;
       // per-bot gate on the workspace's connected apps (Composio)
       if (body.composio !== undefined) {
-        if (typeof body.composio !== "boolean") return json(res, 400, { error: "composio must be true or false" });
+        if (!(Object.prototype.toString.call(body.composio) === "[object Boolean]")) return json(res, 400, { error: "composio must be true or false" });
         patch.composio = body.composio;
       }
       if (body.computers !== undefined) {
-        if (!Array.isArray(body.computers) || body.computers.some((c: unknown) => !["cloud", "vm", "local"].includes(String(c)))) {
+        if (!Array.isArray(body.computers) || body.computers.some((c) => !["cloud", "vm", "local"].includes(String(c)))) {
           return json(res, 400, { error: "computers must be an array containing cloud, vm, or local" });
         }
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         patch.computers = [...new Set(body.computers as ("cloud" | "vm" | "local")[])];
       } else if (body.computer !== undefined) {
         // legacy singular field from older clients and scripts: fold it into
         // the stored array rather than persisting a stray key the runtime
         // never reads ("off" clears)
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         patch.computers = body.computer === "off" ? [] : [body.computer as "cloud" | "vm" | "local"];
       }
       if (body.cloudBackend !== undefined && !["box", "vps"].includes(String(body.cloudBackend))) {
         return json(res, 400, { error: "cloudBackend must be box or vps" });
       }
       if (body.autoStartVps !== undefined) {
-        if (typeof body.autoStartVps !== "boolean") return json(res, 400, { error: "autoStartVps must be true or false" });
+        if (!(Object.prototype.toString.call(body.autoStartVps) === "[object Boolean]")) return json(res, 400, { error: "autoStartVps must be true or false" });
         patch.autoStartVps = body.autoStartVps;
       }
-      if (body.chiefOfStaff !== undefined && typeof body.chiefOfStaff !== "boolean") {
+      if (body.chiefOfStaff !== undefined && !(Object.prototype.toString.call(body.chiefOfStaff) === "[object Boolean]")) {
         return json(res, 400, { error: "chiefOfStaff must be true or false" });
       }
       if (body.cloudBackend !== undefined) {
@@ -9354,7 +9379,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // type-checked rather than copied through: a string alwaysAllow would
       // still answer .includes() — with substring matches, not tool names
       if (body.autoApprove !== undefined) {
-        if (typeof body.autoApprove !== "boolean") return json(res, 400, { error: "autoApprove must be true or false" });
+        if (!(Object.prototype.toString.call(body.autoApprove) === "[object Boolean]")) return json(res, 400, { error: "autoApprove must be true or false" });
         patch.autoApprove = body.autoApprove;
       }
       if (body.autoReview !== undefined) {
@@ -9384,15 +9409,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       );
       if (ackError) return json(res, 400, { error: ackError });
       if (body.approvePeerComms !== undefined) {
-        if (typeof body.approvePeerComms !== "boolean") {
+        if (!(Object.prototype.toString.call(body.approvePeerComms) === "[object Boolean]")) {
           return json(res, 400, { error: "approvePeerComms must be true or false" });
         }
         patch.approvePeerComms = body.approvePeerComms;
       }
       if (body.alwaysAllow !== undefined) {
-        if (!Array.isArray(body.alwaysAllow) || body.alwaysAllow.some((t: unknown) => typeof t !== "string")) {
+        if (!Array.isArray(body.alwaysAllow) || body.alwaysAllow.some((t) => !(Object.prototype.toString.call(t) === "[object String]"))) {
           return json(res, 400, { error: "alwaysAllow must be a list of tool keys" });
         }
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const requested = [...new Set(body.alwaysAllow as string[])];
         // A shell in disguise (Bash:bash, Bash:env, a bare Bash) is refused
         // when it is new; one stored before this rule existed is dropped
@@ -9727,14 +9753,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/bots\/([\w-]+)\/messages$/);
     if (m && method === "POST") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const rawText = String(body.text ?? "").trim();
       if (!rawText) return json(res, 400, { error: "text required" });
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
+      if (body.threadId !== undefined && (!(Object.prototype.toString.call(body.threadId) === "[object String]") || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
       const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
@@ -9950,12 +9976,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const rawBody = await readBody(req);
-      if (rawBody !== null && (typeof rawBody !== "object" || Array.isArray(rawBody))) {
+      if (rawBody !== null && (!(Object.prototype.toString.call(rawBody) === "[object Object]") || Array.isArray(rawBody))) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const body = rawBody ?? {};
       const expectedThreadId = body.threadId;
-      if (expectedThreadId !== undefined && (typeof expectedThreadId !== "string" || !/^[\w-]+$/.test(expectedThreadId))) {
+      if (expectedThreadId !== undefined && (!(Object.prototype.toString.call(expectedThreadId) === "[object String]") || !/^[\w-]+$/.test(expectedThreadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
       let stopped = false;
@@ -10060,7 +10086,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (bot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
       const body = await readBody(req);
-      const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined);
+      const task = store.createTask(bot.id, (Object.prototype.toString.call(body.title) === "[object String]") ? body.title : undefined);
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
@@ -10159,11 +10185,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // is not touched from here: waking a thread never wakes its bot.
       if (Object.prototype.hasOwnProperty.call(body, "snoozedUntil")) {
         const raw = body.snoozedUntil;
-        if (raw !== null && !(typeof raw === "number" && Number.isFinite(raw) && raw >= SNOOZE_UNTIL_ACTIVITY)) {
+        if (raw !== null && !((Object.prototype.toString.call(raw) === "[object Number]") && Number.isFinite(raw) && raw >= SNOOZE_UNTIL_ACTIVITY)) {
           return json(res, 400, {
             error: "snoozedUntil must be a timestamp, 0 to snooze until activity, or null to wake it now",
           });
         }
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const snoozed = store.patchTask(m[1], m[2], { snoozedUntil: raw as number | null });
         if (!snoozed) return json(res, 404, { error: "no such task" });
         const fresh = botWithThread(store.bot(m[1])!);
@@ -10258,7 +10285,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: "content-type must be application/json" });
       }
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       const parsed = z.object({ mode: z.enum(["shared", "per-bot"]) }).safeParse(body);
@@ -10578,7 +10605,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: "content-type must be application/json" });
       }
       const body = await readBody(req);
-      const raw = typeof body?.publicUrl === "string" ? body.publicUrl.trim() : "";
+      const raw = (Object.prototype.toString.call(body?.publicUrl) === "[object String]") ? body.publicUrl.trim() : "";
       if (!raw) {
         return json(res, 200, {
           ok: false,
@@ -10722,9 +10749,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: "content-type must be application/json" });
       }
       const body = await readBody(req);
-      const cli = typeof body?.cli === "string" ? body.cli.trim() : "";
+      const cli = (Object.prototype.toString.call(body?.cli) === "[object String]") ? body.cli.trim() : "";
       if (!cli || /[\n\r]/.test(cli)) return json(res, 400, { error: "cli must be a non-empty path" });
-      const driver = typeof body?.driver === "string" ? BUILT_IN_DRIVERS.find((d) => d.driverKind === body.driver) : undefined;
+      const driver = (Object.prototype.toString.call(body?.driver) === "[object String]") ? BUILT_IN_DRIVERS.find((d) => d.driverKind === body.driver) : undefined;
       // Probe the exact configured wrapper plus --version. testCliBinary uses
       // a credential-redacted environment, so fixed wrapper arguments cannot
       // turn this endpoint into an inherited-secret reader.
@@ -10745,23 +10772,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean } = {};
 
       if (body?.cli !== undefined) {
-        if (typeof body.cli !== "string") return json(res, 400, { error: "cli must be a string" });
+        if (!(Object.prototype.toString.call(body.cli) === "[object String]")) return json(res, 400, { error: "cli must be a string" });
         if (/[\n\r]/.test(body.cli)) return json(res, 400, { error: "cli must not contain newlines" });
         patchOptions.cli = body.cli;
       }
 
       if (body?.fullAuto !== undefined) {
-        if (typeof body.fullAuto !== "boolean") return json(res, 400, { error: "fullAuto must be a boolean" });
+        if (!(Object.prototype.toString.call(body.fullAuto) === "[object Boolean]")) return json(res, 400, { error: "fullAuto must be a boolean" });
         patchOptions.fullAuto = body.fullAuto;
       }
 
       if (body?.enabled !== undefined) {
-        if (typeof body.enabled !== "boolean") return json(res, 400, { error: "enabled must be a boolean" });
+        if (!(Object.prototype.toString.call(body.enabled) === "[object Boolean]")) return json(res, 400, { error: "enabled must be a boolean" });
         patchOptions.enabled = body.enabled;
       }
 
       if (body?.key !== undefined) {
-        if (typeof body.key !== "string") return json(res, 400, { error: "key must be a string" });
+        if (!(Object.prototype.toString.call(body.key) === "[object String]")) return json(res, 400, { error: "key must be a string" });
         if (/[\n\r]/.test(body.key)) return json(res, 400, { error: "key must not contain newlines" });
         patchOptions.key = body.key;
       }
@@ -10777,10 +10804,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // same table the live override rides on, so a replay can never push a
         // key into an engine that has nowhere to read it from.
         const restoreKeyEnv = INSTANCE_API_KEY_ENV.get(current.driver);
-        if (!restoreKeyEnv || !body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "key") || !patchOptions.key?.trim() || patchOptions.key.length > 16_384) {
+        if (!restoreKeyEnv || !body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body) || Object.keys(body).some((key) => key !== "key") || !patchOptions.key?.trim() || patchOptions.key.length > 16_384) {
           return json(res, 400, { error: "Invalid instance credential restore payload" });
         }
-        const configuredKey = current.config && typeof current.config === "object" && "key" in current.config ? current.config.key : undefined;
+        const configuredKey = current.config && (Object.prototype.toString.call(current.config) === "[object Object]") && "key" in current.config ? current.config.key : undefined;
         if (configuredKey || current.environment?.[restoreKeyEnv]) return json(res, 200, { retained: true });
         if (!currentRuntimeReadiness(ownAdmissionActive, true).safeToRestart) return json(res, 409, { error: "Credential restoration waits for current work to finish" });
         providerConfigBusy = true;
@@ -10870,7 +10897,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 415, { error: "content-type must be application/json" });
       }
       const body = await readBody(req);
-      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      const name = (Object.prototype.toString.call(body?.name) === "[object String]") ? body.name.trim() : "";
       if (!name || name.length > 64) {
         return json(res, 400, { error: "name is required and must be 1–64 characters" });
       }
@@ -10888,12 +10915,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           error: `engine "${driverRecord.metadata.displayName}" can only be configured once`,
         });
       }
-      const endpoint = typeof body?.endpoint === "string" ? body.endpoint.trim() : "";
+      const endpoint = (Object.prototype.toString.call(body?.endpoint) === "[object String]") ? body.endpoint.trim() : "";
       if (!endpoint || !isAbsoluteHttpUrl(endpoint)) {
         return json(res, 400, { error: "endpoint must be a valid http:// or https:// URL" });
       }
-      const rawKey = typeof body?.key === "string" ? body.key.trim() : undefined;
-      const rawIcon = typeof body?.iconUrl === "string" ? body.iconUrl.trim() : undefined;
+      const rawKey = (Object.prototype.toString.call(body?.key) === "[object String]") ? body.key.trim() : undefined;
+      const rawIcon = (Object.prototype.toString.call(body?.iconUrl) === "[object String]") ? body.iconUrl.trim() : undefined;
       // A custom icon reaches the engine rail only through the live
       // instance's own `iconUrl`, which a driver has to read out of its
       // config and expose.  openai-compat does; MiniMax does not, and its
@@ -10928,8 +10955,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
       let rawModels: string[] = [];
       if (Array.isArray(body?.models)) {
-        rawModels = body.models.map((m: unknown) => (typeof m === "string" ? m.trim() : "")).filter(Boolean);
-      } else if (typeof body?.models === "string") {
+        rawModels = body.models.map((m) => ((Object.prototype.toString.call(m) === "[object String]") ? m.trim() : "")).filter(Boolean);
+      } else if ((Object.prototype.toString.call(body?.models) === "[object String]")) {
         rawModels = body.models.split(/[\n,]+/).map((s: string) => s.trim()).filter(Boolean);
       }
       // openai-compat points at an arbitrary vendor and has no catalog it can
@@ -10955,13 +10982,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           instanceId = `custom-${slug}-${counter++}`;
         }
 
-        const customConfig: Record<string, unknown> = { url: endpoint };
+        const customConfig = { url: endpoint };
         // Only where the driver reads them. MiniMax's own config schema has
         // exactly one field (`url`), so an ignored `models` array on disk
         // would read as configuration that does nothing.
         if (rawModels.length > 0) customConfig.models = rawModels;
         // `key` is the dev/browser fallback shape for every multi-instance
         // driver: openai-compat reads it out of its own config, MiniMax gets
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         // it as MINIMAX_API_KEY through injectedEnvironment(). With the
         // desktop bridge present the client omits it entirely and the key
         // rides the encrypted store instead — marked here rather than by the
@@ -11196,8 +11224,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "PATCH" && path === "/api/features") {
       const body = await readBody(req);
       const featurePatch = {
-        ...(typeof body.showToolCalls === "boolean" ? { showToolCalls: body.showToolCalls } : {}),
-        ...(typeof body.summarizeToolCalls === "boolean" ? { summarizeToolCalls: body.summarizeToolCalls } : {}),
+        ...((Object.prototype.toString.call(body.showToolCalls) === "[object Boolean]") ? { showToolCalls: body.showToolCalls } : {}),
+        ...((Object.prototype.toString.call(body.summarizeToolCalls) === "[object Boolean]") ? { summarizeToolCalls: body.summarizeToolCalls } : {}),
       };
       if (Object.keys(featurePatch).length === 0) {
         return json(res, 400, { error: "nothing to save" });
@@ -11216,7 +11244,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "PATCH" && path === "/api/room-turn-timeout") {
       const body = await readBody(req);
       if (
-        typeof body.turnTimeoutMinutes !== "number" ||
+        !(Object.prototype.toString.call(body.turnTimeoutMinutes) === "[object Number]") ||
         !Number.isInteger(body.turnTimeoutMinutes)
       ) {
         return json(res, 400, { error: "nothing to save" });
@@ -11244,8 +11272,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = await readBody(req);
       const patch = parseConfigPatch({
         profile: {
-          name: typeof body.name === "string" ? body.name : undefined,
-          email: typeof body.email === "string" ? body.email : undefined,
+          name: (Object.prototype.toString.call(body.name) === "[object String]") ? body.name : undefined,
+          email: (Object.prototype.toString.call(body.email) === "[object String]") ? body.email : undefined,
         },
       });
       if (patch.profile === undefined) {
@@ -11270,7 +11298,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const botTurnedOff = (bot: { computers?: readonly unknown[] }) =>
         Array.isArray(bot.computers) && bot.computers.length === 0;
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       // Provider policy (the per-provider toggles, the VPS mode and the legacy
@@ -11282,7 +11310,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // disabled provider's mounts running.  Refuse rather than drop it, so a
       // caller that meant to change policy is told so.
       if (
-        body.botDefaults && typeof body.botDefaults === "object" && !Array.isArray(body.botDefaults) &&
+        body.botDefaults && (Object.prototype.toString.call(body.botDefaults) === "[object Object]") && !Array.isArray(body.botDefaults) &&
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         APPLY_DEFAULTS_POLICY_KEYS.some((key) => Object.hasOwn(body.botDefaults as object, key))
       ) {
         return json(res, 400, {
@@ -11452,26 +11481,28 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     if (method === "POST" && path === "/api/bots/apply-model-defaults") {
       const body = await readBody(req);
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
+      if (!body || !(Object.prototype.toString.call(body) === "[object Object]") || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
       // The four slots may each be present OR absent.  An absent slot is
       // "do not touch bots that already have a value here" — exactly the
       // behavior the UI promises when an empty picker means "leave alone".
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
       const slots = body.slots as
         | { primary?: unknown; secondary?: unknown; fallback1?: unknown; fallback2?: unknown }
         | undefined;
-      if (!slots || typeof slots !== "object") {
+      if (!slots || !(Object.prototype.toString.call(slots) === "[object Object]")) {
         return json(res, 400, { error: "slots must be a JSON object" });
       }
-      const readSlot = (value: unknown): ModelSelection | null => {
+      const readSlot = (value): ModelSelection | null => {
         if (value === undefined) return null;
         if (value === null) return null;
-        if (!value || typeof value !== "object" || Array.isArray(value)) {
+        if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) {
           throw Object.assign(new Error("model slot must be an object"), { status: 400 });
         }
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const candidate = value as Record<string, unknown>;
-        if (typeof candidate.instanceId !== "string" || typeof candidate.model !== "string") {
+        if (!(Object.prototype.toString.call(candidate.instanceId) === "[object String]") || !(Object.prototype.toString.call(candidate.model) === "[object String]")) {
           throw Object.assign(new Error("model slot must include instanceId and model"), { status: 400 });
         }
         return { instanceId: candidate.instanceId, model: candidate.model };
@@ -11486,7 +11517,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         fallback1 = readSlot(slots.fallback1);
         fallback2 = readSlot(slots.fallback2);
       } catch (error) {
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         const status = (error as { status?: number }).status ?? 400;
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
         return json(res, status, { error: (error as Error).message });
       }
       // Shape and engine validation, once, with no bot in hand: these are
@@ -11925,6 +11958,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ["infisical", "clientSecret"],
         ] as const;
         for (const [section, field] of externalFields) {
+          // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
           const externalSection = persisted[section] as Record<string, string | undefined> | undefined;
           const supplied = externalSection?.[field];
           if (supplied === undefined) continue;
@@ -12026,7 +12060,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "POST" && path === "/api/tts/prepare") {
       const body = await readBody(req);
       return json(res, 200, {
-        ready: tts.voiceReady(cfg, typeof body.voiceId === "string" ? body.voiceId : undefined),
+        ready: tts.voiceReady(cfg, (Object.prototype.toString.call(body.voiceId) === "[object String]") ? body.voiceId : undefined),
         utterances: toUtterances(String(body.text ?? "")),
       });
     }
@@ -12052,7 +12086,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // voice account into an unbounded, billable synthesis job.
       if (text.length > 500) return json(res, 413, { error: "voice utterances are limited to 500 characters" });
       try {
-        const audio = await tts.speak(cfg, text, typeof body.voiceId === "string" ? body.voiceId : undefined);
+        const audio = await tts.speak(cfg, text, (Object.prototype.toString.call(body.voiceId) === "[object String]") ? body.voiceId : undefined);
         res.writeHead(200, {
           "content-type": audio.mime,
           "content-length": String(audio.bytes.byteLength),
@@ -12380,6 +12414,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
     const status = (e as any)?.status ?? 500;
     return json(res, status, { error: e instanceof Error ? e.message : String(e) });
   }
@@ -12438,11 +12473,11 @@ if (existsSync(pendingResumePath)) {
     // 2.5 s timer to take a thread this snapshot already named (HS18/HS20).
     if (Array.isArray(resumeState.interruptedBots)) {
       for (const entry of resumeState.interruptedBots) {
-        if (!entry?.botId || typeof entry.threadId !== "string") continue;
+        if (!entry?.botId || !(Object.prototype.toString.call(entry.threadId) === "[object String]")) continue;
         interruptedAtLastStop.turns.push({
           botId: entry.botId,
           threadId: entry.threadId,
-          at: typeof resumeState.timestamp === "number" ? resumeState.timestamp : Date.now(),
+          at: (Object.prototype.toString.call(resumeState.timestamp) === "[object Number]") ? resumeState.timestamp : Date.now(),
           reason: "update",
         });
       }

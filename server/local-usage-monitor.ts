@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { RemoteQuotaWindow } from "./usage-quota.ts";
 import { canonicalQuotaProvider, isSupportedQuotaProvider, NEAR_CAP_PERCENT } from "./quota-window-map.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 const MAX_BYTES = 1_048_576;
 /** The producer rewrites the handoff every 300 seconds, at launch and on
@@ -19,22 +20,24 @@ export const LOCAL_QUOTA_MAX_AGE_MS = 3 * LOCAL_QUOTA_WRITE_INTERVAL_MS;
  *  gets, applied to a figure with no natural ceiling. */
 const MAX_ABSOLUTE = 1e12;
 const FILE_STATUSES = new Set(["available", "near_cap", "exhausted", "unknown"]);
-const record = (value: unknown): Record<string, unknown> | null =>
-  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-const text = (value: unknown, max = 200): string | null =>
-  typeof value === "string" && value.length <= max && !/[\x00-\x1f]/.test(value) ? value : null;
-const timestamp = (value: unknown): string | null => {
+const record = (value): Record<string, JsonValue> | null =>
+  value !== null && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value) ? // SAFETY: the toString-call + !Array.isArray() guards restrict
+    // value to a JSON object, so the cast to a record of JsonValue fields is exact.
+    value as Record<string, JsonValue> : null;
+const text = (value, max = 200): string | null =>
+  (Object.prototype.toString.call(value) === "[object String]") && value.length <= max && !/[\x00-\x1f]/.test(value) ? value : null;
+const timestamp = (value): string | null => {
   const valueText = text(value, 40);
   return valueText && Number.isFinite(Date.parse(valueText)) ? valueText : null;
 };
 /** Absolute figures are display extras, so a malformed one drops the field
  *  rather than the window: the percentage the row is really about has
  *  already passed the identical finite / non-negative / bounded check. */
-const amount = (value: unknown): number | null =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_ABSOLUTE ? value : null;
-const errorCode = (value: unknown): string => {
-  const shape = record(value);
-  return shape && typeof shape.code === "string" ? shape.code : "";
+const amount = (value): number | null =>
+  (Object.prototype.toString.call(value) === "[object Number]") && Number.isFinite(value) && value >= 0 && value <= MAX_ABSOLUTE ? value : null;
+const errorCode = (value): string => {
+  const envelope = record(value);
+  return envelope && (Object.prototype.toString.call(envelope.code) === "[object String]") ? envelope.code : "";
 };
 
 /** Why the quota grid is empty, so the UI can say so instead of showing
@@ -74,13 +77,13 @@ const MAX_REASON_LENGTH = 4_000;
  *  the engine's row saying nothing at all — the very thing this key exists to
  *  fix.  A control character is not whitespace and so survives the fold, and
  *  `text` still refuses it: that is not prose. */
-function issueReason(value: unknown): string | null {
-  if (typeof value !== "string" || value.length > MAX_REASON_LENGTH) return null;
+function issueReason(value): string | null {
+  if (!(Object.prototype.toString.call(value) === "[object String]") || value.length > MAX_REASON_LENGTH) return null;
   const message = text(value.replace(/\s+/g, " ").trim(), MAX_REASON_LENGTH);
   return message ? message.slice(0, MAX_ISSUE_LENGTH).trim() || null : null;
 }
 
-function parseQuotaIssues(value: unknown): Record<string, string> {
+function parseQuotaIssues(value) {
   const raw = record(value);
   if (!raw) return {};
   const issues: Record<string, string> = {};
@@ -99,7 +102,7 @@ const empty = (freshness: LocalQuotaFreshness): LocalQuotaSnapshot =>
  *  The producer's own verdict travels as `isExhausted` / `fileSkip` /
  *  `fileStatus`; `status` and `skip` stay derived so every existing display
  *  path keeps the meaning it has always had. */
-export function parseLocalQuotaPayload(value: unknown, now = Date.now()): LocalQuotaSnapshot {
+export function parseLocalQuotaPayload(value, now = Date.now()): LocalQuotaSnapshot {
   const payload = record(value);
   if (!payload || payload.format !== "usage-monitor-local-quotas" || payload.version !== 1) {
     return empty({ state: "unreadable" });
@@ -130,10 +133,10 @@ export function parseLocalQuotaPayload(value: unknown, now = Date.now()): LocalQ
     if (!id || !label || !occurredAt || seen.has(`${provider}:${id}`)) continue;
     const observedAge = now - Date.parse(occurredAt);
     if (observedAge < -60_000 || observedAge >= LOCAL_QUOTA_MAX_AGE_MS) continue;
-    if (percent !== undefined && percent !== null && (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100)) continue;
+    if (percent !== undefined && percent !== null && (Object.prototype.toString.call(percent) !== "[object Number]" || !Number.isFinite(percent) || percent < 0 || percent > 100)) continue;
     const resetAt = timestamp(row.resetAt);
     const resetPassed = resetAt !== null && Date.parse(resetAt) <= now;
-    const remainingPercent = row.remainingUnknown === true || resetPassed ? null : typeof percent === "number" ? percent : null;
+    const remainingPercent = row.remainingUnknown === true || resetPassed ? null : (Object.prototype.toString.call(percent) === "[object Number]") ? percent : null;
     const fileStatus = text(row.status, 20);
     seen.add(`${provider}:${id}`);
     windows.push({
@@ -170,7 +173,7 @@ export function parseLocalQuotaPayload(value: unknown, now = Date.now()): LocalQ
   return { windows, freshness: { state: "fresh", generatedAt, ageMs: age }, producer, issues };
 }
 
-export function parseLocalQuotaSnapshot(value: unknown, now = Date.now()): RemoteQuotaWindow[] {
+export function parseLocalQuotaSnapshot(value, now = Date.now()): RemoteQuotaWindow[] {
   return parseLocalQuotaPayload(value, now).windows;
 }
 

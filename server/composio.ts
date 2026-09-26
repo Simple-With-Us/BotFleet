@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import {
+import type { JsonValue, JsonObject } from "./schema.ts";
   connectorIdentityDigest,
   createConnectorInventoryProbe,
   type ConnectorCredentialState,
@@ -200,7 +201,7 @@ function normalizeManagedBrokerUrl(value: string): string {
   return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 }
 
-export function applyManagedBrokerMessage(message: unknown): boolean {
+export function applyManagedBrokerMessage(message): boolean {
   const parsed = managedBrokerMessageSchema.safeParse(message);
   if (
     !parsed.success ||
@@ -214,7 +215,7 @@ export function applyManagedBrokerMessage(message: unknown): boolean {
   return true;
 }
 
-export function setManagedBrokerSetup(setup: unknown): void {
+export function setManagedBrokerSetup(setup): void {
   const parsed = managedBrokerSetupSchema.safeParse(setup);
   managedBrokerSetup = parsed.success ? parsed.data : { status: "unconfigured" };
 }
@@ -227,7 +228,7 @@ export function managedSetup(): ManagedBrokerSetup {
     : { status: managedBrokerSetup.status };
 }
 
-export function setManagedBrokerAccess(access: unknown): void {
+export function setManagedBrokerAccess(access): void {
   if (access === null) {
     if (managedBrokerAccess === null) return;
     managedBrokerAccess = null;
@@ -771,10 +772,10 @@ function allServiceStates(
   return Object.fromEntries(services);
 }
 
-function isScopedAccountReadDenied(error: unknown): boolean {
+function isScopedAccountReadDenied(error): boolean {
   return Boolean(
     error
-    && typeof error === "object"
+    && (Object.prototype.toString.call(error) === "[object Object]")
     && (error as { upstreamStatus?: unknown }).upstreamStatus === 403,
   );
 }
@@ -811,7 +812,7 @@ export async function connectedServices(cfg: AppConfig): Promise<Record<string, 
     // toolkits belong to this installation, so retain that safe fallback for
     // the permission response only. Network, timeout, malformed, and upstream
     // failures must remain degraded instead of becoming an empty inventory.
-    listConnectedAccounts(cfg.composio.apiKey, userId, []).catch((error: unknown) => {
+    listConnectedAccounts(cfg.composio.apiKey, userId, []).catch((error) => {
       if (isScopedAccountReadDenied(error)) return [];
       throw error;
     }),

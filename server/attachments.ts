@@ -19,7 +19,7 @@ export const FILE_MAX_BYTES = 25 * 1024 * 1024;
  * HTML/JS are refused so the serve route cannot become an XSS host.
  * SVG is allowed as an image (avatars and chat previews use <img>), and
  * GET serves it with nosniff plus a sandbox CSP. */
-const ATTACHMENT_MIMES: Record<string, string> = {
+const ATTACHMENT_MIMES = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
   "image/gif": ".gif",
@@ -46,7 +46,7 @@ const ATTACHMENT_MIMES: Record<string, string> = {
   "application/vnd.ms-excel": ".xls",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
   "application/octet-stream": ".bin",
-};
+} satisfies Record<string, string>;
 
 export function extensionForMime(mime: string | undefined): string | null {
   if (!mime) return null;

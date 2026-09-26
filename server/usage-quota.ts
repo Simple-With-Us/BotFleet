@@ -97,7 +97,7 @@ const MAX_LOCAL_COOLDOWN_MS = 8 * 86_400_000;
  *  than this file is written, and those pollers own their cooldowns. */
 const LOCAL_ROUTING_EXCLUDED_KINDS = new Set(["antigravityAgent", "minimax", "minimaxAgent"]);
 const LOCAL_ROUTING_EXCLUDED_PROVIDERS = new Set(["google-antigravity", "minimax"]);
-const NAMED_WINDOW_LENGTHS: Readonly<Record<string, number>> = {
+const NAMED_WINDOW_LENGTHS = {
   hourly: 3_600_000,
   daily: 86_400_000,
   session: 5 * 3_600_000,
@@ -105,7 +105,7 @@ const NAMED_WINDOW_LENGTHS: Readonly<Record<string, number>> = {
   week: 7 * 86_400_000,
   monthly: 30 * 86_400_000,
   month: 30 * 86_400_000,
-};
+} satisfies Readonly<Record<string, number>>;
 
 /** How long one window lasts, from its own token, for a capped row that did
  *  not say when it resets.  An unrecognised token ("billing-cycle", whose
@@ -248,7 +248,7 @@ export class UsageQuotaPoller {
     return { ...this.localFreshness, producer: this.localProducer, issues: this.localIssues };
   }
 
-  getStatus(): { lastError: string | null; lastOkAt: string | null; windowCount: number } {
+  getStatus() {
     return {
       lastError: this.lastError,
       lastOkAt: this.lastOkAt,
@@ -376,8 +376,18 @@ export class UsageQuotaPoller {
           headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": "BotFleet/1.0" },
           signal: AbortSignal.timeout(10_000),
         });
+        // SAFETY: response.json() can return any JSON value; the brace of
+        // `ok` / not-`ok` types is the discriminated union the downstream
+        // applyPayload expects, and the cast is the boundary that lets us
+        // type-narrow from there.
         const body = (await response.json().catch(() => null)) as QuotaWindowsPayload | { error?: string } | null;
-        if (!response.ok || !body || typeof body !== "object" || !("ok" in body) || body.ok !== true) {
+        if (
+          !response.ok ||
+          !body ||
+          Object.prototype.toString.call(body) !== "[object Object]" ||
+          !("ok" in body) ||
+          body.ok !== true
+        ) {
           this.lastError = `HTTP ${response.status}`;
           return;
         }

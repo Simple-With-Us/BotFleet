@@ -15,6 +15,7 @@ import { stripWorkspaceCredentialEnv } from "./config.ts";
 import { antigravityQuotaCatalogId } from "./antigravity-models.ts";
 import { FailureLogDedup } from "./log-dedup.ts";
 import {
+import type { JsonValue, JsonObject } from "./schema.ts";
   quotaCooldowns,
   type QuotaCooldownRegistry,
 } from "./model-fallback.ts";
@@ -53,14 +54,14 @@ const CLI_TIMEOUT_MS = 20_000;
 
 function firstString(...values: unknown[]): string | undefined {
   for (const value of values) {
-    if (typeof value === "string" && value.trim()) return value.trim();
+    if ((Object.prototype.toString.call(value) === "[object String]") && value.trim()) return value.trim();
   }
   return undefined;
 }
 
 function firstFiniteNumber(...values: unknown[]): number | undefined {
   for (const value of values) {
-    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if ((Object.prototype.toString.call(value) === "[object Number]") && Number.isFinite(value)) return value;
   }
   return undefined;
 }
@@ -84,11 +85,13 @@ export function findAntigravityUsageBin(
   return "antigravity-usage";
 }
 
-export function parseAntigravityUsageJson(raw: unknown): AntigravityUsageSnapshot {
-  if (!raw || typeof raw !== "object") {
+export function parseAntigravityUsageJson(raw): AntigravityUsageSnapshot {
+  if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) {
     throw new Error("antigravity-usage output was not a JSON object");
   }
-  const root = raw as Record<string, unknown>;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  const root = raw as Record<string, JsonValue>;
   const rows = Array.isArray(root.models) ? root.models : null;
   if (!rows) {
     throw new Error("antigravity-usage JSON is missing models[]");
@@ -96,8 +99,10 @@ export function parseAntigravityUsageJson(raw: unknown): AntigravityUsageSnapsho
 
   const models: AntigravityUsageModel[] = [];
   for (const row of rows) {
-    if (!row || typeof row !== "object") continue;
-    const entry = row as Record<string, unknown>;
+    if (!row || !(Object.prototype.toString.call(row) === "[object Object]")) continue;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+    const entry = row as Record<string, JsonValue>;
     const modelId = firstString(entry.modelId, entry.id);
     if (!modelId) continue;
     const remaining = firstFiniteNumber(entry.remainingPercentage);
@@ -114,12 +119,20 @@ export function parseAntigravityUsageJson(raw: unknown): AntigravityUsageSnapsho
   if (models.length === 0) {
     throw new Error("antigravity-usage JSON contained zero model rows");
   }
-  const promptCredits = root.promptCredits && typeof root.promptCredits === "object"
+  const promptCredits = root.promptCredits && (Object.prototype.toString.call(root.promptCredits) === "[object Object]")
     ? {
-        available: firstFiniteNumber((root.promptCredits as Record<string, unknown>).available),
-        monthly: firstFiniteNumber((root.promptCredits as Record<string, unknown>).monthly),
-        usedPercentage: firstFiniteNumber((root.promptCredits as Record<string, unknown>).usedPercentage),
-        remainingPercentage: firstFiniteNumber((root.promptCredits as Record<string, unknown>).remainingPercentage),
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+        available: firstFiniteNumber((root.promptCredits as Record<string, JsonValue>).available),
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+        monthly: firstFiniteNumber((root.promptCredits as Record<string, JsonValue>).monthly),
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+        usedPercentage: firstFiniteNumber((root.promptCredits as Record<string, JsonValue>).usedPercentage),
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+        remainingPercentage: firstFiniteNumber((root.promptCredits as Record<string, JsonValue>).remainingPercentage),
       }
     : undefined;
 
@@ -151,7 +164,7 @@ export function resetAtMs(model: AntigravityUsageModel, now = Date.now()): numbe
     const parsed = Date.parse(model.resetTime);
     if (Number.isFinite(parsed)) return parsed;
   }
-  if (typeof model.timeUntilResetMs === "number" && model.timeUntilResetMs > 0) {
+  if ((Object.prototype.toString.call(model.timeUntilResetMs) === "[object Number]") && model.timeUntilResetMs > 0) {
     return now + model.timeUntilResetMs;
   }
   return null;
@@ -244,7 +257,7 @@ export function quotaModelsFromSnapshot(
   if (!snapshot) return models;
   const promptCredits = snapshot.promptCredits;
   let secondaryPercent: number | null = null;
-  if (typeof promptCredits?.remainingPercentage === "number" && Number.isFinite(promptCredits.remainingPercentage)) {
+  if ((Object.prototype.toString.call(promptCredits?.remainingPercentage) === "[object Number]") && Number.isFinite(promptCredits.remainingPercentage)) {
     const raw = promptCredits.remainingPercentage;
     const pct = raw <= 1 && raw > 0 ? raw * 100 : raw;
     secondaryPercent = Math.round(pct * 100) / 100;

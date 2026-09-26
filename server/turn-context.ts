@@ -29,7 +29,7 @@ export interface TurnContextInput {
 export function engineIsFresh(input: {
   instanceId: string;
   lastInstanceId: string | undefined;
-  resumeCursors: Record<string, unknown>;
+  resumeCursors: Record<string, string>;
   transcript: Array<{ role: "user" | "assistant"; text: string }>;
 }): boolean {
   const { instanceId, lastInstanceId, resumeCursors, transcript } = input;
@@ -118,11 +118,7 @@ function clipUtf8(value: string, maxBytes: number): string {
   return buf.subarray(0, end).toString("utf8");
 }
 
-export function buildTurnContext(input: TurnContextInput): {
-  turnText: string;
-  /** false when the native session must not be resumed */
-  resume: boolean;
-} {
+export function buildTurnContext(input: TurnContextInput) {
   const { text, transcript, rewound, fresh, replaysNatively } = input;
   const resume = !rewound && !fresh;
   const replay = !resume && !replaysNatively && transcript.length > 0;

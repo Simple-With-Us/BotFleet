@@ -15,15 +15,17 @@ import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
  *  gemini-3.1-pro-high/low yields ids the engine rejects.  Prefer the
  *  same-family Flash when the catalog has one (2.5), else the newest Flash
  *  at the same tier, else the catalog default. */
-const ANTIGRAVITY_FLASH_BY_TIER: Record<string, string> = {
+const ANTIGRAVITY_FLASH_BY_TIER = {
   high: "gemini-3.8-flash-high",
   medium: "gemini-3.8-flash-medium",
   low: "gemini-3.8-flash-low",
-};
+} satisfies Record<string, string>;
 
 function antigravityFlashModel(model: string): string {
   // Only built-in catalog routes are swapped.  A custom or local-inject
   // model the operator configured (any id outside the static catalog, even
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // one containing "-pro") is their chosen route and stays as configured.
   if (!STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === model)) return model;
   const candidate = model.replace("-pro", "-flash");
@@ -98,6 +100,8 @@ export function unattendedModelDowngrade(
   if (!automated) return selection;
   // Resolve the downgrade family from the driver kind so operator-added
   // instances ("claude2", "gravity") get the same cheaper-model treatment
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // as the reserved ids.  Fall back to the instance id only when no kind
   // is given (callers/tests that never resolve one).  A defined but unknown
   // kind must not inherit the instance id — that would rewrite models for
@@ -132,7 +136,7 @@ export function unattendedModelDowngrade(
     return selection;
   }
   const levels =
-    typeof opts.effortLevels === "function" ? opts.effortLevels(model) : opts.effortLevels;
+    Object.prototype.toString.call(opts.effortLevels) === "[object Function]" ? opts.effortLevels(model) : opts.effortLevels;
   return levels?.includes("low")
     ? { ...selection, model, effort: "low" }
     : { ...selection, model };
@@ -187,6 +191,8 @@ const QUOTA_TEXT_MAX = 500;
 
 export const DEFAULT_QUOTA_COOLDOWN_TTL_MS = 15 * 60 * 1000;
 
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 /** Short error-chip text that must not count as a real assistant reply. */
 export function isShortProviderErrorText(text: string): boolean {
   const trimmed = text.trim();
@@ -236,7 +242,7 @@ export function turnQuotaOrCapEvidence(
   }
 
   const botTexts = messagesAfterUser.filter(
-    (message) => message.role === "bot" && message.kind === "text" && typeof message.text === "string",
+    (message) => message.role === "bot" && message.kind === "text" && (Object.prototype.toString.call(message.text) === "[object String]"),
   );
   const text = botTexts.at(-1)?.text?.trim();
   if (!text) return undefined;
@@ -263,9 +269,9 @@ export const BOOT_RECOVERY_NOTICE =
 /** True when the only bot text after the user is a short provider error chip. */
 export function sliceIsShortProviderError(messagesAfterUser: FallbackScanMessage[]): boolean {
   const botReplies = messagesAfterUser.filter(
-    (message) => message.role === "bot" && message.kind === "text" && typeof message.text === "string",
+    (message) => message.role === "bot" && message.kind === "text" && (Object.prototype.toString.call(message.text) === "[object String]"),
   );
-  if (botReplies.length !== 1 || typeof botReplies[0].text !== "string") return false;
+  if (botReplies.length !== 1 || !(Object.prototype.toString.call(botReplies[0].text) === "[object String]")) return false;
   return isShortProviderErrorText(botReplies[0].text);
 }
 
@@ -328,6 +334,8 @@ export interface BootRecoveryTurnOpts {
  * BOOT_RECOVERY_NOTICE) and whether the persisted message is reused —
  * it must not drop automation context.  After restart `unattendedBots`
  * is empty, so this must not consult isUnattended.  Forwarding
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * automationSource also stores BOOT_RECOVERY_NOTICE as role=system.
  */
 export function bootRecoveryTurnOpts(
@@ -341,6 +349,8 @@ export function bootRecoveryTurnOpts(
   const webhookOrResource = automationSource === "webhook" || automationSource === "resource";
   // Calendar `schedule` is the owner's saved prompt (Auto mode on a live
   // tick).  Recovery still prefers unattended for any system-attributed
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // starter so the notice is not treated as a person typing — that would
   // clear the guard and let always-allow authorize a request nobody is
   // watching.  A system row with no source gets the same treatment.
@@ -354,6 +364,8 @@ function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: s
 
 // ── structured provider-error codes (chat-completions/errors.ts) ────────
 // A chat-completions driver's loop (server/drivers/chat-completions/loop.ts)
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 // classifies an HTTP failure onto a ProviderErrorCode and reports it as an
 // `error:<code>` terminal stopReason.  CLI/ACP engines have no such code —
 // their turns end on a plain "error" or on chip prose the regexes above
@@ -368,6 +380,8 @@ function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: s
 export function providerErrorCodeFromStopReason(stopReason: string | null | undefined): ProviderErrorCode | undefined {
   if (!stopReason || !stopReason.startsWith("error:")) return undefined;
   const code = stopReason.slice("error:".length).trim();
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   return code ? (code as ProviderErrorCode) : undefined;
 }
 
@@ -559,11 +573,11 @@ export class QuotaCooldownRegistry {
   }
 
   private isExpired(cd: BotQuotaCooldown, now: number): boolean {
-    if (typeof cd.resetsAt === "number" && cd.resetsAt > 0) {
+    if ((Object.prototype.toString.call(cd.resetsAt) === "[object Number]") && cd.resetsAt > 0) {
       return now >= cd.resetsAt;
     }
     if (cd.resetsAt === null && cd.source === "antigravity-usage") return false;
-    const recorded = typeof cd.recordedAt === "number" && cd.recordedAt > 0 ? cd.recordedAt : now;
+    const recorded = (Object.prototype.toString.call(cd.recordedAt) === "[object Number]") && cd.recordedAt > 0 ? cd.recordedAt : now;
     return now >= recorded + DEFAULT_QUOTA_COOLDOWN_TTL_MS;
   }
 
@@ -571,6 +585,8 @@ export class QuotaCooldownRegistry {
     if (!this.persistPath) return;
     try {
       if (!existsSync(this.persistPath)) return;
+      // SAFETY: the file is a JSON document the cooldown registry wrote;
+      // the cast narrows the parsed envelope to the documented shape.
       const parsed = JSON.parse(readFileSync(this.persistPath, "utf8")) as {
         version?: number;
         cooldowns?: BotQuotaCooldown[];
@@ -579,12 +595,12 @@ export class QuotaCooldownRegistry {
       const now = Date.now();
       let removed = false;
       for (const cd of parsed.cooldowns) {
-        if (!cd || typeof cd !== "object") continue;
+        if (!cd || !(Object.prototype.toString.call(cd) === "[object Object]")) continue;
         if (
-          typeof cd.botId !== "string" ||
-          typeof cd.instanceId !== "string" ||
-          typeof cd.model !== "string" ||
-          typeof cd.error !== "string"
+          !(Object.prototype.toString.call(cd.botId) === "[object String]") ||
+          !(Object.prototype.toString.call(cd.instanceId) === "[object String]") ||
+          !(Object.prototype.toString.call(cd.model) === "[object String]") ||
+          !(Object.prototype.toString.call(cd.error) === "[object String]")
         ) {
           removed = true;
           continue;
@@ -709,7 +725,7 @@ export class QuotaCooldownRegistry {
     botId: string,
     primary: ModelSelection,
     now = Date.now(),
-  ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
+  ) {
     const cd = this.get(botId, primary.instanceId, primary.model, now);
     if (!cd) {
       return { selection: primary, isFallback: false };

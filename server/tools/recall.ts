@@ -8,6 +8,7 @@
 // hands in the resolved settings.
 
 import type { TurnToolOutcome } from "../contracts.ts";
+import type { JsonObject } from "../schema.ts";
 import type { RecallSettings } from "../recall-transport.ts";
 import { recallContributeWith, recallSearchWith, recallStatsWith, type RecallOutcome } from "../recall-tools.ts";
 import type { ComputerToolExecutor } from "./computer.ts";
@@ -32,7 +33,7 @@ function toOutcome(result: RecallOutcome): TurnToolOutcome {
  *  collection are chosen once in Settings, not per call — a model that
  *  tries to steer one call at a different collection gets told so
  *  instead of the argument being silently dropped. */
-function collectionMismatch(settings: RecallSettings, args: Record<string, unknown>): TurnToolOutcome | null {
+function collectionMismatch(settings: RecallSettings, args: JsonObject): TurnToolOutcome | null {
   if (args.collection && String(args.collection) !== settings.collection) {
     return {
       kind: "error",
@@ -43,7 +44,7 @@ function collectionMismatch(settings: RecallSettings, args: Record<string, unkno
   return null;
 }
 
-export function createRecallTools(options: RecallToolsOptions): Record<string, ComputerToolExecutor> {
+export function createRecallTools(options: RecallToolsOptions) {
   const recallSearch: ComputerToolExecutor = async (call) => {
     const mismatch = collectionMismatch(options.settings, call.arguments);
     if (mismatch) return mismatch;

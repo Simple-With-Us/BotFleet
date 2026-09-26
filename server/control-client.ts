@@ -57,7 +57,10 @@ export function createControlClient(options?: {
       const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(2_000) });
       if (!res.ok) return closed;
       const body: any = await res.json().catch(() => null);
-      if (!body || typeof body !== "object") return closed;
+      // SAFETY: any-typed JSON parse already loses shape; the proxy treats a
+      // non-object body as "no live state available" and the call returns
+      // closed (held: true) so the bot cannot drive during a harness hiccup.
+      if (!body || Object.prototype.toString.call(body) !== "[object Object]") return closed;
       return { held: body.held === true, helpOpen: body.helpOpen === true };
     } catch {
       return closed;
@@ -85,7 +88,10 @@ export function createControlClient(options?: {
         });
         if (!res.ok) return null;
         const body: any = await res.json().catch(() => null);
-        return typeof body?.requestId === "string" && body.requestId ? body.requestId : null;
+        // SAFETY: requestId is expected to be a JSON string from the proxy;
+// the proxy contract returns "" (a falsy empty string) when the call
+// had no live state, which we normalize to null for callers.
+return Object.prototype.toString.call(body?.requestId) === "[object String]" && body.requestId ? body.requestId : null;
       } catch {
         return null;
       }

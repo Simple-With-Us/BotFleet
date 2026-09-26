@@ -150,7 +150,10 @@ async function readNewLines(path: string, start: number, end: number, onLine: (l
   const stream = createReadStream(path, { start, end: end - 1, highWaterMark: READ_CHUNK_BYTES });
   let carry: Buffer | null = null;
   let consumed = start;
-  for await (const chunk of stream as AsyncIterable<Buffer>) {
+  // SAFETY: createReadStream returns a ReadStream whose async iterator yields
+// Buffer chunks under default options (no encoding); the cast narrows to the
+// shape consumed by the for-await body below.
+for await (const chunk of stream as AsyncIterable<Buffer>) {
     // Annotated, not inferred: `carry` is assigned out of `buffer` at the foot
     // of this loop, and letting both sides infer makes the pair circular.
     const buffer: Buffer = carry ? Buffer.concat([carry, chunk]) : chunk;
@@ -345,7 +348,7 @@ export class RollingSpendTracker {
     });
   }
 
-  getSpend(now = Date.now()): EngineSpendMap {
+  getSpend(now = Date.now()) {
     const t5h = now - FIVE_HOURS_MS;
     const t7d = now - SEVEN_DAYS_MS;
     // Prune entries older than 7 days

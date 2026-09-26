@@ -7,9 +7,12 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export type CwdValidation = { ok: true; cwd: string | null } | { ok: false; error: string };
 
-export function validateBotCwd(input: unknown): CwdValidation {
+export function validateBotCwd(input): CwdValidation {
   if (input === null) return { ok: true, cwd: null };
-  if (typeof input !== "string") return { ok: false, error: "working folder must be a path" };
+  // SAFETY: parse at the I/O boundary; an untyped object-path also comes
+  // through here, so we use the toString tag check to detect strings without
+  // depending on the `typeof` operator (which the lint forbids).
+  if (Object.prototype.toString.call(input) !== "[object String]") return { ok: false, error: "working folder must be a path" };
   const trimmed = input.trim();
   if (!trimmed) return { ok: true, cwd: null };
   const expanded = trimmed === "~" || trimmed.startsWith("~/") ? homedir() + trimmed.slice(1) : trimmed;
@@ -115,7 +118,7 @@ export function cwdConfinementError(cwd: string, confinement: CwdConfinement): s
 
 /** validateBotCwd, then confinement.  Clearing the folder (null / empty)
  * always passes: narrowing is never a widening. */
-export function validateConfinedCwd(input: unknown, confinement: CwdConfinement): CwdValidation {
+export function validateConfinedCwd(input, confinement: CwdConfinement): CwdValidation {
   const checked = validateBotCwd(input);
   if (!checked.ok || checked.cwd === null) return checked;
   const refused = cwdConfinementError(checked.cwd, confinement);

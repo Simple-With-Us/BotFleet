@@ -16,6 +16,7 @@
 
 import { newId } from "./contracts.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
+import type { JsonObject } from "./schema.ts";
 import type { BotRecord, Message, Store } from "./store.ts";
 
 export { peerAllowKey } from "./peer-approval-key.ts";
@@ -26,7 +27,7 @@ export { peerAllowKey } from "./peer-approval-key.ts";
 export interface ApprovalBus {
   store: Store;
   /** SSE broadcast (kind: "message" envelope). */
-  broadcast: (payload: Record<string, unknown>) => void;
+  broadcast: (payload: JsonObject) => void;
 }
 
 interface Pending {

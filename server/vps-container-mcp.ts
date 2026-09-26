@@ -21,7 +21,7 @@ try {
 const controlUrl = process.env.OMB_CONTROL_URL ?? "";
 const controlToken = process.env.OMB_CONTROL_TOKEN ?? "";
 
-runMcpBridge({
+const bridgeOptions = {
   command: "docker",
   args,
   label: "VPS Cua Driver",
@@ -29,5 +29,6 @@ runMcpBridge({
   // driver: a busy desktop mid-tool-call must never look dead, while an
   // unreachable VPS must, and `docker version` distinguishes exactly that.
   liveness: { command: "docker", args: vpsDockerArgs(sshAlias, ["version", "--format", "{{.Server.Version}}"]) },
-  ...(controlUrl && controlToken ? { gate: { url: controlUrl, token: controlToken } } : {}),
-});
+} satisfies Parameters<typeof runMcpBridge>[0];
+if (controlUrl && controlToken) bridgeOptions.gate = { url: controlUrl, token: controlToken };
+runMcpBridge(bridgeOptions);

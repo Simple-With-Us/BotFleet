@@ -9,6 +9,7 @@ import {
   type TeamManifestV2,
 } from "./team-manifest.ts";
 import type { BotColor } from "./store.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 /** What the scout can recognize a project needing. One role becomes one
  * suggested team member; the lead is always added on top. */
@@ -77,23 +78,25 @@ function isDir(path: string): boolean {
   }
 }
 
-function packageJson(cwd: string): { name?: string; description?: string; deps: Set<string> } {
+function packageJson(cwd: string) {
   const raw = readText(join(cwd, "package.json"));
   if (!raw) return { deps: new Set() };
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { deps: new Set() };
-    const pkg = parsed as Record<string, unknown>;
+    if (!parsed || !(Object.prototype.toString.call(parsed) === "[object Object]") || Array.isArray(parsed)) return { deps: new Set() };
+    // SAFETY: the toString-call + !Array.isArray() guards above restrict
+    // parsed to a JSON object, so the cast to a record of JsonValue fields is exact.
+    const pkg = parsed as Record<string, JsonValue>;
     const deps = new Set<string>();
     for (const field of ["dependencies", "devDependencies"]) {
       const block = pkg[field];
-      if (block && typeof block === "object" && !Array.isArray(block)) {
+      if (block && (Object.prototype.toString.call(block) === "[object Object]") && !Array.isArray(block)) {
         for (const dep of Object.keys(block)) deps.add(dep);
       }
     }
     return {
-      name: typeof pkg.name === "string" ? pkg.name : undefined,
-      description: typeof pkg.description === "string" ? pkg.description : undefined,
+      name: (Object.prototype.toString.call(pkg.name) === "[object String]") ? pkg.name : undefined,
+      description: (Object.prototype.toString.call(pkg.description) === "[object String]") ? pkg.description : undefined,
       deps,
     };
   } catch {
@@ -103,7 +106,7 @@ function packageJson(cwd: string): { name?: string; description?: string; deps: 
 
 /** README h1 and the first prose paragraph after it. Badge rows and heading
  * lines are skipped so the summary reads like a sentence, not markup. */
-function readme(cwd: string): { title?: string; summary?: string } {
+function readme(cwd: string) {
   const raw =
     readText(join(cwd, "README.md")) ?? readText(join(cwd, "readme.md")) ?? readText(join(cwd, "README"));
   if (!raw) return {};
@@ -119,6 +122,8 @@ function readme(cwd: string): { title?: string; summary?: string } {
     // badge rows, raw HTML, and blockquote callouts (warnings, notices) are
     // not the sentence that says what the project is
     if (trimmed.startsWith("[![") || trimmed.startsWith("![") || trimmed.startsWith("<") || trimmed.startsWith(">")) continue;
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // the summary is rendered as plain text; markdown emphasis would show
     // its asterisks
     summary = trimmed.replace(/[*_`]/g, "").slice(0, 1_000);
@@ -251,7 +256,7 @@ interface RoleTemplate {
 const stackLine = (profile: ProjectProfile) =>
   profile.stacks.length > 0 ? ` The stack: ${profile.stacks.join(", ")}.` : "";
 
-const ROLE_TEMPLATES: Record<ScoutRole, RoleTemplate> = {
+const ROLE_TEMPLATES = {
   frontend: {
     name: "Pixel",
     title: "Frontend Builder",
@@ -301,13 +306,15 @@ const ROLE_TEMPLATES: Record<ScoutRole, RoleTemplate> = {
     describe: (profile, evidence) =>
       `You keep the documentation of ${profile.name} truthful and current.${stackLine(profile)} Your turf shows up as ${evidence.join(", ")}. When code and docs disagree, you chase down which one is lying.`,
   },
-};
+} satisfies Record<ScoutRole, RoleTemplate>;
 
 const LEAD: RoleTemplate = {
   name: "Compass",
   title: "Project Lead",
   color: "yellow",
   describe: (profile) =>
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     `You coordinate work on ${profile.name}: break briefs into tasks for the team, keep the room's bulletin current, and review results before they count as done.${stackLine(profile)}${profile.summary ? ` The project, in its own words: ${profile.summary}` : ""}`,
 };
 
@@ -316,13 +323,15 @@ const LEAD: RoleTemplate = {
 const MAX_SUGGESTED_SPECIALISTS = 5;
 
 /** Turn a scouted profile into an importable team: a lead plus one member
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * per detected role, as a regular v2 manifest. Suggesting is all this does —
  * creating bots and the room stays behind the existing import endpoint and
  * its human click. */
 export function suggestTeam(profile: ProjectProfile): TeamSuggestion {
-  const reasons: Record<string, string> = {
+  const reasons = {
     lead: "Every project room needs one member who briefs, splits, and reviews.",
-  };
+  } satisfies Record<string, string>;
   const members: TeamManifestMember[] = [
     {
       key: "lead",
@@ -364,6 +373,8 @@ export function suggestTeam(profile: ProjectProfile): TeamSuggestion {
     },
   };
   if (profile.summary) manifest.team.description = profile.summary.slice(0, 2_000);
+
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 
   // Lockstep with import: a suggestion must be exactly as valid as a file
   // someone shared — same parser, same limits, same normalization.

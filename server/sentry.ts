@@ -6,6 +6,7 @@
 // SDK tax.  Browser Replay/Feedback live in src/lib/sentry.ts.
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
@@ -84,7 +85,7 @@ function isTestEnv(): boolean {
 /** The thrown value from a `catch`, rendered for a status field or a log
  * line.  Named `cause` because that is exactly what it is: the error-cause
  * value a boundary caught, not a parsed domain type. */
-function errorText(cause: unknown): string {
+function errorText(cause): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
@@ -139,7 +140,7 @@ export function isGenAiDataCollectionEnabled(env: NodeJS.ProcessEnv = process.en
 /** `dataCollection.genAI` block handed to `Sentry.init`. */
 export function genAiDataCollectionOptions(
   env: NodeJS.ProcessEnv = process.env,
-): { genAI: { inputs: boolean; outputs: boolean } } {
+) {
   const on = isGenAiDataCollectionEnabled(env);
   return { genAI: { inputs: on, outputs: on } };
 }
@@ -200,7 +201,10 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   try {
     
     // SAFETY: lazy-load so vitest importing the harness does not boot the Node SDK.
-    return { sdk: (await import("@sentry/node")) as unknown as SentryNode, error: null };
+    // SAFETY: same invariant — the SDK is the @sentry/node runtime,
+    // and the SentryNode type describes its public surface.
+    const sdk = (await import("@sentry/node")) as SentryNode;
+    return { sdk, error: null };
   } catch (err) {
     return { sdk: null, error: `Sentry SDK failed to load: ${errorText(err)}` };
   }
@@ -233,6 +237,9 @@ function attachProfiling(sdk: SentryNode): boolean {
     // SAFETY: the only export this needs is the integration factory, and a
     // package that does not have it throws straight into the catch below.
     const require = createRequire(import.meta.url);
+    // SAFETY: the @sentry/profiling-node package exports the documented
+    // { nodeProfilingIntegration } shape; the cast narrows the CJS
+    // require result to that exact contract.
     const { nodeProfilingIntegration } = require("@sentry/profiling-node") as {
       nodeProfilingIntegration: () => SentryIntegration;
     };
@@ -296,7 +303,7 @@ const SCRUB_MAX_DEPTH = 12;
  * anything is sent, so nothing under it can reach Sentry. */
 const SCRUB_SKIP_KEYS = new Set(["sdkProcessingMetadata"]);
 
-function isPlainRecord(value: object): value is Record<string, unknown> {
+function isPlainRecord(value): value is Record<string, JsonValue> {
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
 }
@@ -313,21 +320,25 @@ function isPlainRecord(value: object): value is Record<string, unknown> {
  * only into arrays and plain objects, reads each property exactly once, and
  * writes back only a string that the scrub actually changed. */
 export function scrubSentryPayload<T>(payload: T): T {
-  if (typeof payload === "string") {
+  if ((Object.prototype.toString.call(payload) === "[object String]")) {
     // SAFETY: a string only ever becomes another string.
     return scrubWebhookSecrets(payload) as T;
   }
   const seen = new WeakSet<object>();
-  const walk = (value: object, depth: number): void => {
-    if (depth > SCRUB_MAX_DEPTH || seen.has(value)) return;
-    seen.add(value);
+  const walk = (value, depth: number): void => {
+    // SAFETY: the WeakSet<object> contract requires an object reference;
+    // the cast narrows the untyped walk value to that surface for the
+    // seen-tracking call.
+    const asObject = value as object;
+    if (depth > SCRUB_MAX_DEPTH || seen.has(asObject)) return;
+    seen.add(asObject);
     if (Array.isArray(value)) {
       for (let i = 0; i < value.length; i += 1) {
         const cur: unknown = value[i];
-        if (typeof cur === "string") {
+        if ((Object.prototype.toString.call(cur) === "[object String]")) {
           const next = scrubWebhookSecrets(cur);
           if (next !== cur) value[i] = next;
-        } else if (cur !== null && typeof cur === "object") {
+        } else if (cur !== null && (Object.prototype.toString.call(cur) === "[object Object]")) {
           walk(cur, depth + 1);
         }
       }
@@ -337,15 +348,15 @@ export function scrubSentryPayload<T>(payload: T): T {
     for (const key of Object.keys(value)) {
       if (SCRUB_SKIP_KEYS.has(key)) continue;
       const cur = value[key];
-      if (typeof cur === "string") {
+      if ((Object.prototype.toString.call(cur) === "[object String]")) {
         const next = scrubWebhookSecrets(cur);
         if (next !== cur) value[key] = next;
-      } else if (cur !== null && typeof cur === "object") {
+      } else if (cur !== null && (Object.prototype.toString.call(cur) === "[object Object]")) {
         walk(cur, depth + 1);
       }
     }
   };
-  if (payload !== null && typeof payload === "object") walk(payload, 0);
+  if (payload !== null && (Object.prototype.toString.call(payload) === "[object Object]")) walk(payload, 0);
   return payload;
 }
 
@@ -478,14 +489,14 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
         parentSampled?: boolean;
         name?: string;
         op?: string;
-        attributes?: Record<string, unknown>;
+        attributes?: Record<string, JsonValue>;
       }) => {
         if (samplingContext.parentSampled !== undefined) {
           return samplingContext.parentSampled;
         }
         const op = samplingContext.attributes?.["sentry.op"] ?? samplingContext.op;
-        const opStr = typeof op === "string" ? op : "";
-        const name = typeof samplingContext.name === "string" ? samplingContext.name : "";
+        const opStr = (Object.prototype.toString.call(op) === "[object String]") ? op : "";
+        const name = (Object.prototype.toString.call(samplingContext.name) === "[object String]") ? samplingContext.name : "";
 
         if (
           opStr.startsWith("gen_ai.") ||

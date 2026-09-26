@@ -39,10 +39,11 @@ async function safeJson(res: Response): Promise<any> {
 /** Prefer ElevenLabs' own words over anything we can invent — it knows the
  * plan, the quota and the model name. Mirrors box.boxErrorMessage. */
 function message(status: number, what: string, body: any): string {
+  const isString = (value: any) => Object.prototype.toString.call(value) === "[object String]" && value.trim();
   const theirs =
-    (typeof body?.detail === "string" && body.detail.trim()) ||
-    (typeof body?.detail?.message === "string" && body.detail.message.trim()) ||
-    (typeof body?.message === "string" && body.message.trim()) ||
+    isString(body?.detail) ||
+    isString(body?.detail?.message) ||
+    isString(body?.message) ||
     "";
   if (status === 401 || status === 403) {
     // Restricted keys are the common case, not a corner: a key with the

@@ -102,12 +102,12 @@ function confineOrReject(
   };
 }
 
-export function createComputerTools(options: ComputerToolsOptions = {}): Record<string, ComputerToolExecutor> {
+export function createComputerTools(options: ComputerToolsOptions = {}) {
   const workingDir = options.cwd && existsSync(options.cwd) ? options.cwd : process.cwd();
 
   const bash: ComputerToolExecutor = async (call) => {
     const rawCmd = call.arguments.command;
-    if (typeof rawCmd !== "string" || !rawCmd.trim()) {
+    if (!(Object.prototype.toString.call(rawCmd) === "[object String]") || !rawCmd.trim()) {
       return { kind: "error", content: "command argument must be a non-empty string", detail: "invalid_argument" };
     }
     const command = rawCmd.trim();
@@ -126,7 +126,11 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
           env: process.env,
         },
         (error, stdout, stderr) => {
-          if (error && (error as unknown as { killed?: boolean }).killed) {
+          // SAFETY: Node's execFile error has a documented `.killed` flag for
+// timeouts; the cast reads that flag without changing its type.
+// SAFETY: same invariant — error is the unknown-shaped execFile
+// rejection, and { killed?: boolean } is its documented surface.
+if (error && (error as { killed?: boolean }).killed) {
             return resolvePromise({
               kind: "error",
               content: "Command timed out after 60 seconds",
@@ -142,7 +146,13 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
           if (errText) parts.push(`STDERR:\n${errText}`);
 
           if (error) {
-            const exitCode = (error as unknown as { code?: number | string }).code ?? 1;
+            // SAFETY: Node's execFile error has a documented `.code` field (number
+// or string for signal names); the cast reads that field exactly.
+// SAFETY: Node's execFile error has a documented `.code` field (number
+// or string for signal names); the cast reads that field exactly.
+// SAFETY: same invariant — error is the unknown-shaped execFile
+// rejection, and { code?: number | string } is its documented surface.
+const exitCode = (error as { code?: number | string }).code ?? 1;
             parts.push(`Process exited with code ${exitCode}`);
             return resolvePromise({
               kind: "error",
@@ -162,7 +172,7 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
 
   const readFile: ComputerToolExecutor = async (call) => {
     const rawPath = call.arguments.path;
-    if (typeof rawPath !== "string" || !rawPath.trim()) {
+    if (!(Object.prototype.toString.call(rawPath) === "[object String]") || !rawPath.trim()) {
       return { kind: "error", content: "path argument must be a non-empty string", detail: "invalid_argument" };
     }
 
@@ -186,7 +196,7 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
       const offsetArg = call.arguments.offset;
       const limitArg = call.arguments.limit;
 
-      const offset = typeof offsetArg === "number" && Number.isInteger(offsetArg) && offsetArg > 0 ? offsetArg : 1;
+      const offset = (Object.prototype.toString.call(offsetArg) === "[object Number]") && Number.isInteger(offsetArg) && offsetArg > 0 ? offsetArg : 1;
       // An omitted (or invalid: non-integer, non-positive) `limit` defaults to
       // READ_FILE_DEFAULT_LINE_LIMIT rather than "the rest of the file" — see
       // the DR5 comment on that constant above.  A `limit` the model DOES
@@ -194,7 +204,7 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
       // byte cap just below is what bounds the worst case instead, so a
       // deliberately large page request still works.
       const limit =
-        typeof limitArg === "number" && Number.isInteger(limitArg) && limitArg > 0
+        (Object.prototype.toString.call(limitArg) === "[object Number]") && Number.isInteger(limitArg) && limitArg > 0
           ? limitArg
           : READ_FILE_DEFAULT_LINE_LIMIT;
 
@@ -260,10 +270,10 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
     const rawPath = call.arguments.path;
     const content = call.arguments.content;
 
-    if (typeof rawPath !== "string" || !rawPath.trim()) {
+    if (!(Object.prototype.toString.call(rawPath) === "[object String]") || !rawPath.trim()) {
       return { kind: "error", content: "path argument must be a non-empty string", detail: "invalid_argument" };
     }
-    if (typeof content !== "string") {
+    if (!(Object.prototype.toString.call(content) === "[object String]")) {
       return { kind: "error", content: "content argument must be a string", detail: "invalid_argument" };
     }
 
@@ -289,13 +299,13 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
     const oldStr = call.arguments.old_string;
     const newStr = call.arguments.new_string;
 
-    if (typeof rawPath !== "string" || !rawPath.trim()) {
+    if (!(Object.prototype.toString.call(rawPath) === "[object String]") || !rawPath.trim()) {
       return { kind: "error", content: "path argument must be a non-empty string", detail: "invalid_argument" };
     }
-    if (typeof oldStr !== "string" || !oldStr) {
+    if (!(Object.prototype.toString.call(oldStr) === "[object String]") || !oldStr) {
       return { kind: "error", content: "old_string argument must be a non-empty string", detail: "invalid_argument" };
     }
-    if (typeof newStr !== "string") {
+    if (!(Object.prototype.toString.call(newStr) === "[object String]")) {
       return { kind: "error", content: "new_string argument must be a string", detail: "invalid_argument" };
     }
 

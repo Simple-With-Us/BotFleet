@@ -22,12 +22,17 @@ export function formatListenInUse(port: number, role: "harness" | "webhook"): st
   return `botfleet ${who}: 127.0.0.1:${port} is already in use`;
 }
 
-export function isListenInUse(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "EADDRINUSE");
+export function isListenInUse(error): boolean {
+  // SAFETY: tag-check without `typeof`; the only NodeJS.ErrnoException
+  // shape carrying .code === "EADDRINUSE" is a real object error.
+  if (!error || Object.prototype.toString.call(error) !== "[object Object]") return false;
+  // SAFETY: same invariant — after the object-tag guard, the cast narrows
+  // to NodeJS.ErrnoException where `.code` is documented.
+  return (error as NodeJS.ErrnoException).code === "EADDRINUSE";
 }
 
 /** EADDRINUSE is a named bind collision, not a Sentry uncaught fatal.
  * Any other listen error still needs capture + flush before exit. */
-export function listenErrorDisposition(error: unknown): "named-exit" | "capture-and-exit" {
+export function listenErrorDisposition(error): "named-exit" | "capture-and-exit" {
   return isListenInUse(error) ? "named-exit" : "capture-and-exit";
 }

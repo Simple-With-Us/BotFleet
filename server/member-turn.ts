@@ -4,12 +4,10 @@
 // while Grok silently runs its cloud default.
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
 
-export function memberTurnSelection(selection: ModelSelection): {
-  model: string;
-  effort?: EffortLevel;
-} {
-  return {
-    model: selection.model,
-    ...(selection.effort ? { effort: selection.effort } : {}),
-  };
+export function memberTurnSelection(selection: ModelSelection) {
+  const out = { model: selection.model };
+  if (selection.effort) {
+    return { model: selection.model, effort: selection.effort };
+  }
+  return out;
 }

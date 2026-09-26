@@ -20,11 +20,12 @@ if (!container || !/^[a-zA-Z0-9_.-]+$/.test(container) || !socket?.startsWith("/
 const controlUrl = process.env.OMB_CONTROL_URL ?? "";
 const controlToken = process.env.OMB_CONTROL_TOKEN ?? "";
 
-runMcpBridge({
+const bridgeOptions = {
   command: runtime,
   args: cuaExecArgs(["mcp", "--socket", socket], { container, interactive: true }),
   label: "Cua Driver",
-  // No liveness watchdog: the runtime CLI talks to a local daemon and fails
-  // fast on its own — there is no silent WAN peer to wedge on.
-  ...(controlUrl && controlToken ? { gate: { url: controlUrl, token: controlToken } } : {}),
-});
+} satisfies Parameters<typeof runMcpBridge>[0];
+// No liveness watchdog: the runtime CLI talks to a local daemon and fails
+// fast on its own — there is no silent WAN peer to wedge on.
+if (controlUrl && controlToken) bridgeOptions.gate = { url: controlUrl, token: controlToken };
+runMcpBridge(bridgeOptions);

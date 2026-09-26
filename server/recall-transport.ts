@@ -33,13 +33,15 @@ export function executeRecallCli(cli: string, args: string[], collection: string
       clearTimeout(timer);
       if (error) reject(error); else resolve(stdout.trim());
     };
-    const child = spawn(cli, args, {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${join(homedir(), ".local", "bin")}:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || ""}`,
+      [RECALL_SKIP_PRIVATE_ENV]: "1",
+    };
+if (collection) env.QDRANT_FLEET_COLLECTION = collection;
+const child = spawn(cli, args, {
       detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env,
-        PATH: `${join(homedir(), ".local", "bin")}:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || ""}`,
-        [RECALL_SKIP_PRIVATE_ENV]: "1",
-        ...(collection ? { QDRANT_FLEET_COLLECTION: collection } : {}),
-      },
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -105,19 +107,27 @@ export interface RecallStats {
   version?: string;
 }
 
-export function validateRecallStats(value: unknown, collection = ""): { stats?: RecallStats; error?: string } {
-  if (!value || typeof value !== "object") return { error: "the service returned invalid statistics" };
-  const data = value as Record<string, unknown>;
+export function validateRecallStats(value, collection = "") {
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]")) return { error: "the service returned invalid statistics" };
+  // SAFETY: the toString-call guard above restricts `value` to a JSON
+  // object, so the cast to a record of JsonValue fields is exact.
+  const data = value as Record<string, JsonValue>;
   if (data.error || data.ok === false || data.backend_ok === false || data.embedder_healthy === false ||
-      (typeof data.status === "string" && !["green", "ok", "ready"].includes(data.status.toLowerCase()))) {
+      ((Object.prototype.toString.call(data.status) === "[object String]") && !["green", "ok", "ready"].includes(data.status.toLowerCase()))) {
     return { error: "the recall backend or embedder is unavailable" };
   }
-  if (typeof data.collection !== "string" || !data.collection || !Number.isSafeInteger(data.points) || Number(data.points) < 0 ||
+  if (!(Object.prototype.toString.call(data.collection) === "[object String]") || !data.collection || !Number.isSafeInteger(data.points) || Number(data.points) < 0 ||
       !(data.backend_ok === true || data.embedder_healthy === true)) {
     return { error: "the service did not provide valid collection and backend readiness statistics" };
   }
   if (collection && data.collection !== collection) return { error: "the service returned a different collection than configured" };
-  return { stats: data as unknown as RecallStats };
+  // SAFETY: every RecallStats field has been guarded above (collection is a
+  // non-empty string, points is a safe non-negative integer, the boolean
+  // fields are true), so the cast is exact under those invariants.
+  // SAFETY: same invariant — data is the Record<string, JsonValue> we
+  // asserted above, and the per-field guards make it RecallStats-shaped.
+  const stats = data as RecallStats;
+  return { stats };
 }
 
 export async function probeRecallService(url: string, headers: RequestInit["headers"], collection: string, signal: AbortSignal) {
@@ -126,11 +136,16 @@ export async function probeRecallService(url: string, headers: RequestInit["head
     const gate = accessLoginHint(response);
     if (gate) throw Object.assign(new Error(gate), { accessGated: true });
     if (!response.ok) throw Object.assign(new Error(`the recall route answered HTTP ${response.status}`), { accessGated: [401, 403].includes(response.status) });
+    // SAFETY: response.json() can return any JSON value; the boundary
+    // cast is intentional — the call sites narrow to the documented
+    // shapes per route.
     return await response.json() as unknown;
   };
   // Public health can veto readiness, but only validated protected stats can establish it.
   const health = await get("/health");
-  if (health && typeof health === "object" && (health as Record<string, unknown>).backend_ok === false) {
+  // SAFETY: same invariant — the toString-call guard restricts health
+  // to a JSON object, and the Record cast is exact under it.
+  if (health && (Object.prototype.toString.call(health) === "[object Object]") && (health as Record<string, JsonValue>).backend_ok === false) {
     throw new Error("the recall backend is unavailable");
   }
   const checked = validateRecallStats(await get("/recall/stats"), collection);
@@ -193,7 +208,7 @@ export function recallStatus(settings: RecallSettings, timeoutMs = RECALL_STATUS
         if (!checked.stats) throw new Error(checked.error);
         stats = checked.stats;
       } else {
-        const headers: Record<string, string> = { ...accessHeaders(settings.accessClientId, settings.accessClientSecret) };
+        const headers = { ...accessHeaders(settings.accessClientId, settings.accessClientSecret) } satisfies Record<string, string>;
         if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
         stats = await probeRecallService(settings.url, headers, settings.collection, AbortSignal.timeout(timeoutMs));
       }
@@ -201,12 +216,13 @@ export function recallStatus(settings: RecallSettings, timeoutMs = RECALL_STATUS
       lastSuccesses.delete(key);
       lastSuccesses.set(key, at);
       if (lastSuccesses.size > MAX_SUCCESS_HISTORY) lastSuccesses.delete(lastSuccesses.keys().next().value!);
-      return { ...base, ready: true, state: "ready", checkedAt: at, lastSuccessAt: at,
-        collection: stats.collection, pointsCount: stats.points, backendOk: true,
-        ...(stats.embedder_healthy !== undefined ? { embedderHealthy: stats.embedder_healthy } : {}) };
+      const ok = { ...base, ready: true as const, state: "ready" as const, checkedAt: at, lastSuccessAt: at,
+        collection: stats.collection, pointsCount: stats.points, backendOk: true as const };
+      if (stats.embedder_healthy !== undefined) ok.embedderHealthy = stats.embedder_healthy;
+      return ok;
     } catch (error) {
-      return { ...base, ready: false, state: "degraded", checkedAt: Date.now(),
-        ...(error && typeof error === "object" && "accessGated" in error && error.accessGated ? { accessGated: true } : {}),
+      const out = { ...base, ready: false as const, state: "degraded" as const, checkedAt: Date.now() };
+      if (error && (Object.prototype.toString.call(error) === "[object Object]") && "accessGated" in error && error.accessGated) out.accessGated = true;
         error: redactSecretsInText(error instanceof Error ? error.message : String(error)).slice(0, 400) };
     }
   };

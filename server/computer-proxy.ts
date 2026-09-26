@@ -36,6 +36,7 @@ import {
   type CropRegion,
 } from "./computer-observation.ts";
 import { CONTROL_REFUSAL, createControlClient } from "./control-client.ts";
+import type { JsonValue } from "./schema.ts";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
@@ -317,7 +318,9 @@ async function fetchFrame(expectedBytes?: number): Promise<string | null> {
     );
     const body: any = await res.json().catch(() => null);
     const content = body?.content;
-    if (!res.ok || typeof content !== "string" || !content) return null;
+    // SAFETY: tag-check without `typeof`; only non-empty primitive strings
+    // are valid base64 file payloads the box actually emitted.
+    if (!res.ok || Object.prototype.toString.call(content) !== "[object String]" || !content) return null;
     return wholeImage(Buffer.from(content, "base64"), expectedBytes) ? content : null;
   } catch {
     return null;
@@ -355,9 +358,12 @@ function automationSummary(stdout: string): string {
     const encoded = stdout.match(/^CUA_RESULT\s+([^\s]+)$/m)?.[1];
     if (!encoded) return `Cua Driver ${REMOTE_CUA_VERSION}`;
     try {
-      const result = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as Record<string, unknown>;
+      // SAFETY: the cua-driver prints a base64-encoded JSON envelope on
+      // success; JSON.parse can only return a JsonValue, so the cast
+      // narrows to the documented record shape.
+      const result = JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as Record<string, JsonValue>;
       const details = [result.effect, result.route, result.escalation]
-        .filter((value): value is string => typeof value === "string" && Boolean(value))
+        .filter((value): value is string => Object.prototype.toString.call(value) === "[object String]" && Boolean(value))
         .slice(0, 3);
       return [`Cua Driver ${REMOTE_CUA_VERSION}`, ...details].join(" · ");
     } catch {
@@ -409,17 +415,17 @@ async function frameFrom(out: RunOut): Promise<Frame | null> {
   return { data: fetched, mime: "image/jpeg", hash, geometry };
 }
 
-const send = (obj: unknown): void => {
+const send = (obj: JsonValue): void => {
   process.stdout.write(JSON.stringify(obj) + "\n");
 };
-const text = (id: unknown, t: string, isError = false): void =>
+const text = (id, t: string, isError = false): void =>
   send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: t }], isError: isError || undefined } });
 
 /** An action result: the text plus the frame the action produced. When
  * the pixels are byte-identical to the frame the model just saw, the
  * image is dropped — it already has it, and it costs ~1.2k tokens. */
 function observed(
-  id: unknown,
+  id,
   note: string,
   frame: Frame | null,
   crop: CropRegion | null = null,
@@ -710,7 +716,7 @@ function actionShell(a: any): string | { error: string } {
 /** The whole point: one round trip carries geometry, the actions, the
  * settle, the capture and the frame bytes. */
 async function actAndObserve(
-  id: unknown,
+  id,
   actions: any[],
   note: string,
   args: any,
@@ -719,7 +725,10 @@ async function actAndObserve(
   const parts: string[] = [];
   for (const a of actions) {
     const shell = actionShell(a);
-    if (typeof shell !== "string") return text(id, shell.error, true);
+    // SAFETY: actionShell returns a string for success and an object
+    // shape with `.error` for the unknown-action case; the toString
+    // tag check distinguishes the two without `typeof`.
+    if (Object.prototype.toString.call(shell) !== "[object String]") return text(id, shell.error, true);
     // X11 needs a beat between steps — a click that focuses a field and
     // an immediate type will drop leading characters
     if (parts.length) parts.push(`sleep ${(ACTION_GAP_MS / 1000).toFixed(2)}`);
@@ -759,7 +768,7 @@ async function actAndObserve(
 }
 
 async function semanticActAndObserve(
-  id: unknown,
+  id,
   action: "click" | "fill",
   ref: string,
   value: string | undefined,
@@ -769,11 +778,9 @@ async function semanticActAndObserve(
     return text(id, "that browser ref is stale or unknown — take a new browser_snapshot", true);
   }
   const observe = wantsFrame(args);
-  const semantic = semanticBrowserCommand(action, {
-    ref,
-    ...(action === "fill" ? { text: value ?? "" } : {}),
-    url: semanticBrowserUrl,
-  });
+  const semanticArgs = { ref, url: semanticBrowserUrl } satisfies Parameters<typeof semanticBrowserCommand>[1];
+if (action === "fill") semanticArgs.text = value ?? "";
+const semantic = semanticBrowserCommand(action, semanticArgs);
   const guarded = `if ${semantic}; then SEM=ok; else SEM=failed; fi`;
   const command = [
     ENV,
@@ -802,7 +809,7 @@ async function semanticActAndObserve(
  * told when they finish, and the two that read nothing from the screen. */
 const OPEN_WHILE_DRIVEN = new Set(["computer_request_help", "computer_status", "observation_metrics"]);
 
-async function call(id: unknown, name: string, args: any) {
+async function call(id, name: string, args: any) {
   if (!OPEN_WHILE_DRIVEN.has(name) && (await control.state(true)).held) {
     return text(id, CONTROL_REFUSAL, true);
   }
@@ -880,8 +887,11 @@ async function call(id: unknown, name: string, args: any) {
       return text(id, "Semantic browser state is unavailable. Open Chrome with open_url, or use screenshot.", true);
     }
     try {
+      // SAFETY: the Cua Driver prints a SemanticBrowserSnapshot envelope
+      // on success; JSON.parse can only produce a JsonValue, so the
+      // cast narrows to the documented shape.
       const snapshot = JSON.parse(out.stdout) as SemanticBrowserSnapshot;
-      if (!Array.isArray(snapshot.elements) || typeof snapshot.url !== "string") throw new Error("invalid snapshot");
+      if (!Array.isArray(snapshot.elements) || Object.prototype.toString.call(snapshot.url) !== "[object String]") throw new Error("invalid snapshot");
       semanticBrowserUrl = snapshot.url;
       semanticBrowserRefs = new Set(snapshot.elements.map((element) => element.ref));
       observations.noteStructuredObservation();

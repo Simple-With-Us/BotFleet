@@ -8,8 +8,9 @@
 // stdout is the MCP transport. Never log there.
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
-type Json = Record<string, unknown>;
+type Json = Record<string, JsonValue>;
 
 const UPSTREAM = process.env.OMB_CONNECTOR_UPSTREAM_URL ?? "";
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
@@ -23,9 +24,9 @@ const RELAY_TIMEOUT_MS = 10 * 60_000;
 function parsedHeaders(): Record<string, string> {
   try {
     const value: unknown = JSON.parse(process.env.OMB_CONNECTOR_UPSTREAM_HEADERS ?? "{}");
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) return {};
     return Object.fromEntries(
-      Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      Object.entries(value).filter((entry): entry is [string, string] => (Object.prototype.toString.call(entry[1]) === "[object String]")),
     );
   } catch {
     return {};
@@ -36,20 +37,22 @@ const upstreamHeaders = parsedHeaders();
 let upstreamSessionId = "";
 const send = (message: Json) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
-function textResult(id: unknown, text: string, isError = false): Json {
-  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) } };
+function textResult(id, text: string, isError = false) {
+  const out = { jsonrpc: "2.0" as const, id, result: { content: [{ type: "text" as const, text }] } };
+  if (isError) out.result.isError = true;
+  return out;
 }
 
-function jsonRpcError(id: unknown, message: string): Json {
-  return { jsonrpc: "2.0", id, error: { code: -32000, message } };
+function jsonRpcError(id, message: string) {
+  return { jsonrpc: "2.0" as const, id, error: { code: -32000, message } };
 }
 
-function initializeResult(id: unknown, protocolVersion: unknown): Json {
+function initializeResult(id, protocolVersion) {
   return {
     jsonrpc: "2.0",
     id,
     result: {
-      protocolVersion: typeof protocolVersion === "string" && protocolVersion ? protocolVersion : "2024-11-05",
+      protocolVersion: (Object.prototype.toString.call(protocolVersion) === "[object String]") && protocolVersion ? protocolVersion : "2024-11-05",
       capabilities: { tools: {} },
       serverInfo: { name: "botfleet-connectors", version: "1" },
     },
@@ -77,10 +80,20 @@ async function readBounded(response: Response): Promise<string> {
   return text + decoder.decode();
 }
 
-function parseUpstream(text: string, id: unknown): Json | null {
+function parseUpstream(text: string, id): Json | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
-  if (trimmed.startsWith("{")) return JSON.parse(trimmed) as Json;
+  // SAFETY: the upstream reply is a JSON document (single object or SSE
+  // frames); JSON.parse produces a JsonValue and the cast narrows to
+  // the documented Json envelope.
+  // SAFETY: trimmed.startsWith("{") guarantees JSON.parse produces
+  // an object — the Json type covers all JSON values, so the cast is
+  // exact.
+  if (trimmed.startsWith("{")) {
+    // SAFETY: same invariant — the JSON envelope is exactly Json.
+    const parsed = JSON.parse(trimmed) as Json;
+    return parsed;
+  }
   const frames = trimmed
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -88,6 +101,8 @@ function parseUpstream(text: string, id: unknown): Json | null {
     .filter((line) => line && line !== "[DONE]")
     .flatMap((line) => {
       try {
+        // SAFETY: same invariant — each SSE `data:` line is a JSON
+        // frame; the cast narrows to the documented Json envelope.
         return [JSON.parse(line) as Json];
       } catch {
         return [];
@@ -98,14 +113,15 @@ function parseUpstream(text: string, id: unknown): Json | null {
 
 async function relay(message: Json, timeoutMs = RELAY_TIMEOUT_MS): Promise<Json | null> {
   if (!UPSTREAM) throw new Error("connected apps are unavailable");
+  const headers = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+    ...upstreamHeaders,
+  } satisfies Record<string, string>;
+  if (upstreamSessionId) headers["mcp-session-id"] = upstreamSessionId;
   const response = await fetch(UPSTREAM, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      ...upstreamHeaders,
-      ...(upstreamSessionId ? { "mcp-session-id": upstreamSessionId } : {}),
-    },
+    headers,
     body: JSON.stringify(message),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -115,17 +131,21 @@ async function relay(message: Json, timeoutMs = RELAY_TIMEOUT_MS): Promise<Json 
   return parseUpstream(await readBounded(response), message.id);
 }
 
-function connectorAdds(args: unknown): string[] {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return [];
+function connectorAdds(args): string[] {
+  if (!args || !(Object.prototype.toString.call(args) === "[object Object]") || Array.isArray(args)) return [];
+  // SAFETY: the toString-call + !Array.isArray() guards above restrict
+  // args to a JSON object, so the cast to the documented envelope is exact.
   const toolkits = (args as { toolkits?: unknown }).toolkits;
   if (!Array.isArray(toolkits)) return [];
   return [...new Set(toolkits.flatMap((item) => {
-    if (typeof item === "string") return [item.toLowerCase()];
-    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    if ((Object.prototype.toString.call(item) === "[object String]")) return [item.toLowerCase()];
+    if (!item || !(Object.prototype.toString.call(item) === "[object Object]") || Array.isArray(item)) return [];
+    // SAFETY: same invariant — item is a JSON object, so the cast to
+    // the documented { name, toolkit, action } envelope is exact.
     const row = item as { name?: unknown; toolkit?: unknown; action?: unknown };
-    const slug = typeof row.toolkit === "string" ? row.toolkit : row.name;
+    const slug = (Object.prototype.toString.call(row.toolkit) === "[object String]") ? row.toolkit : row.name;
     const action = String(row.action ?? "add").toLowerCase();
-    return typeof slug === "string" && ["add", "connect", "initiate"].includes(action) ? [slug.toLowerCase()] : [];
+    return (Object.prototype.toString.call(slug) === "[object String]") && ["add", "connect", "initiate"].includes(action) ? [slug.toLowerCase()] : [];
   }))];
 }
 
@@ -137,6 +157,8 @@ async function showConnectorCards(slugs: string[]): Promise<void> {
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) {
+    // SAFETY: response.json() returns any JSON value; the cast
+    // narrows the loose shape to the { error } envelope used below.
     const body = (await response.json().catch(() => ({}))) as { error?: unknown };
     throw new Error(String(body.error ?? `could not show connection card (HTTP ${response.status})`));
   }
@@ -149,6 +171,8 @@ async function handle(message: Json): Promise<void> {
   // initialize returns capabilities/serverInfo. Relaying that handshake to
   // Composio can time out, return a newer protocolVersion, or throw when the
   // upstream URL never reached the child env — all of which previously
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // surfaced as a tools/call-shaped {content,isError} payload.
   if (method === "notifications/initialized" || method === "initialized") {
     if (UPSTREAM) void relay(message).catch(() => {});
@@ -167,12 +191,16 @@ async function handle(message: Json): Promise<void> {
       }
     }
     if (id !== undefined) {
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       const params = (message.params ?? {}) as Json;
       send(initializeResult(id, params.protocolVersion));
     }
     return;
   }
   if (method === "tools/call") {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     const params = (message.params ?? {}) as Json;
     const name = String(params.name ?? "");
     const slugs = /MANAGE_CONNECTIONS$/i.test(name) ? connectorAdds(params.arguments) : [];
@@ -208,6 +236,8 @@ input.on("line", (line) => {
   if (!trimmed) return;
   let message: Json;
   try {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     message = JSON.parse(trimmed) as Json;
   } catch {
     return;

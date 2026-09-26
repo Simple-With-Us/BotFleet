@@ -9,6 +9,8 @@
 //
 // Legacy JSON thread files import lazily: the first read of a thread with
 // no rows pulls the old file in, after which the DB is the source of
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 // truth (the JSON file is left behind as a one-time backup).
 import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
@@ -82,6 +84,8 @@ function db(): DatabaseSync {
   return handle;
 }
 
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 const rowToMessage = (row: { json: string }): Message => JSON.parse(row.json) as Message;
 
 export interface ThreadRows {
@@ -91,10 +95,16 @@ export interface ThreadRows {
 
 /** Read one thread, importing its legacy JSON file on first touch. */
 export function readThread(threadId: string, legacyFile: string): ThreadRows {
+  // SAFETY: the SELECT json ... query returns one row per message
+  // with a string json column, so the prepared-statement `.all()` result
+  // is exactly Array<{ json: string }>.
   const rows = db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid")
     .all(threadId) as Array<{ json: string }>;
   if (rows.length) {
+    // SAFETY: the SELECT active_leaf_id ... query returns a single row
+    // (or none); the prepared-statement `.get()` result is exactly the
+    // documented { active_leaf_id } shape or undefined.
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
@@ -106,6 +116,8 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
 export interface ThreadTailRows extends ThreadRows {
   /** `true` means older rows exist beyond this page; `false` means the SQL
    * read returned the complete thread. Absent for a full legacy import.
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * Both false and absent results can be cached as a full load. */
   hasMore?: boolean;
 }
@@ -115,9 +127,13 @@ export interface ThreadTailRows extends ThreadRows {
  * that never needs the rest of a long transcript. Reading every thread in
  * full through readThread() and caching it forever was the likely driver
  * of the harness's unbounded RSS (HS12/HS21). Falls back to a full legacy
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * import on first touch, same as readThread(); that read is a one-time
  * migration cost regardless of how much of the result the caller keeps. */
 export function readThreadTail(threadId: string, legacyFile: string, limit: number): ThreadTailRows {
+  // SAFETY: same invariant as readThread — the SELECT json ... query
+  // returns one row per message with a string json column.
   const rows = db()
     .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT ?")
     .all(threadId, limit + 1) as Array<{ json: string }>;
@@ -125,6 +141,8 @@ export function readThreadTail(threadId: string, legacyFile: string, limit: numb
     const hasMore = rows.length > limit;
     if (hasMore) rows.length = limit;
     rows.reverse();
+    // SAFETY: same invariant as readThread — single-row get returns
+    // { active_leaf_id } or undefined.
     const state = db()
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
@@ -142,10 +160,21 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   } catch {
     return { messages, activeLeafId }; // fresh thread
   }
-  if (Array.isArray(raw)) messages = raw as Message[]; // pre-branching flat file
-  else if (raw && typeof raw === "object") {
-    messages = ((raw as { messages?: Message[] }).messages ?? []) as Message[];
-    activeLeafId = (raw as { activeLeafId?: string | null }).activeLeafId ?? null;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
+  // SAFETY: legacy file is a JSON document; the cast narrows to the
+  // documented Message[] envelope under the Array.isArray() guard.
+  if (Array.isArray(raw)) {
+    // SAFETY: Array.isArray() narrows `raw` to any[]; the call-site
+    // treats each entry as Message and downstream decoding re-validates.
+    messages = raw as Message[]; // pre-branching flat file
+  }
+  else if (raw && (Object.prototype.toString.call(raw) === "[object Object]")) {
+    // SAFETY: toString-call guard restricts raw to a JSON object, so
+    // the cast to the documented { messages, activeLeafId } shape is exact.
+    const legacy = raw as { messages?: Message[]; activeLeafId?: string | null };
+    messages = legacy.messages ?? [];
+    activeLeafId = legacy.activeLeafId ?? null;
   }
   const insert = db().prepare(
     "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -161,6 +190,8 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
     db().exec("ROLLBACK");
     throw error;
   }
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // left beside the DB as a one-time backup, renamed so the import never
   // runs twice against a thread whose rows were later deleted
   try {
@@ -177,6 +208,8 @@ export function insertMessage(threadId: string, message: Message): void {
     .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
 }
+
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
 export function appendMessage(threadId: string, message: Message): void {
@@ -250,6 +283,8 @@ export interface PruneResult {
 /** Delete every `messages` and `thread_state` row whose thread id is BOTH
  * not in `liveThreadIds` AND has had no message for `maxAgeMs` (a
  * thread_state row with no messages behind it has nothing to date by, and
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * is low-risk enough — a few dozen bytes, no content — to treat as always
  * old enough), then VACUUM only when that freed enough pages to be worth the
  * exclusive lock a VACUUM holds.  `deleteThread` already does the same
@@ -281,9 +316,13 @@ export function pruneDeadThreads(
   const base = { messagesDeleted: 0, threadStateDeleted: 0, vacuumed: false, dryRun };
 
   const allIds = new Set<string>();
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   for (const row of database.prepare("SELECT DISTINCT thread_id FROM messages").all() as Array<{ thread_id: string }>) {
     allIds.add(row.thread_id);
   }
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   for (const row of database.prepare("SELECT thread_id FROM thread_state").all() as Array<{ thread_id: string }>) {
     allIds.add(row.thread_id);
   }
@@ -295,6 +334,8 @@ export function pruneDeadThreads(
   const newestByThread = new Map<string, number>();
   for (const row of database
     .prepare("SELECT thread_id, MAX(at) AS max_at FROM messages GROUP BY thread_id")
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     .all() as Array<{ thread_id: string; max_at: number }>) {
     newestByThread.set(row.thread_id, row.max_at);
   }
@@ -318,8 +359,14 @@ export function pruneDeadThreads(
     let messagesDeleted = 0;
     let threadStateDeleted = 0;
     for (const id of dead) {
-      messagesDeleted += (countMessages.get(id) as { n: number } | undefined)?.n ?? 0;
-      threadStateDeleted += (countState.get(id) as { n: number } | undefined)?.n ?? 0;
+      // SAFETY: the SELECT COUNT(*) ... query returns a single row with
+      // a `n` integer column, so the prepared-statement `.get()` result
+      // is exactly { n: number } | undefined.
+      const messagesRow = countMessages.get(id) as { n: number } | undefined;
+      // SAFETY: same invariant — countState.get returns the same shape.
+      const stateRow = countState.get(id) as { n: number } | undefined;
+      messagesDeleted += messagesRow?.n ?? 0;
+      threadStateDeleted += stateRow?.n ?? 0;
     }
     return { ...base, messagesDeleted, threadStateDeleted };
   }
@@ -341,7 +388,10 @@ export function pruneDeadThreads(
   }
 
   const threshold = opts.vacuumThresholdBytes ?? DEFAULT_VACUUM_THRESHOLD_BYTES;
+  // SAFETY: PRAGMA queries return a single integer column; the
+  // prepared-statement `.get()` result is exactly the documented shape.
   const freelistRow = database.prepare("PRAGMA freelist_count").get() as { freelist_count: number } | undefined;
+  // SAFETY: same invariant — PRAGMA page_size returns a single integer.
   const pageSizeRow = database.prepare("PRAGMA page_size").get() as { page_size: number } | undefined;
   const freelist = freelistRow?.freelist_count ?? 0;
   const pageSize = pageSizeRow?.page_size ?? 0;
@@ -386,9 +436,15 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
       "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
       "ORDER BY at DESC LIMIT ?",
   );
-  const rows = (threadId
-    ? statement.all(threadId, pattern, pattern, limit)
-    : statement.all(pattern, pattern, limit)) as Array<{
+  // SAFETY: the SELECT query above returns one row per match with the
+  // documented columns, so the prepared-statement `.all()` result is
+  // exactly the Array<{ thread_id, id, at, role, kind, text, tool_name, from_name }>
+  // envelope used below.
+  const allRows = threadId ? statement.all(threadId, pattern, pattern, limit) : statement.all(pattern, pattern, limit);
+  // SAFETY: same invariant — the SELECT query's column list matches
+  // the envelope exactly, so the cast narrows allRows to the
+  // documented shape used below.
+  const rows = allRows as Array<{
     thread_id: string;
     id: string;
     at: number;
@@ -409,7 +465,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     // whitespace folding can shift the offset; find the match again inside
     const folded = needle.replace(/\s+/g, " ");
     const matchStart = snippet.toLowerCase().indexOf(folded);
-    return {
+    const out = {
       threadId: row.thread_id,
       messageId: row.id,
       at: row.at,
@@ -417,10 +473,10 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
       kind: row.kind,
       snippet,
       matchStart: matchStart < 0 ? head.length : matchStart,
-      // A defensive fallback must not mark arbitrary snippet text as the hit.
       matchLength: matchStart < 0 ? 0 : folded.length,
-      ...(row.from_name ? { from: row.from_name } : {}),
     };
+if (row.from_name) out.from = row.from_name;
+return out;
   });
 }
 

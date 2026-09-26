@@ -99,14 +99,17 @@ export function createBotPackageExport(input: {
       runOn: routine.runOn,
       schedule: routine.schedule.type === "once"
         ? { type: "once", at: routine.schedule.at }
-        : {
-            type: "daily",
-            time: routine.schedule.time,
-            weekdays: [...routine.schedule.weekdays],
-            ...(routine.schedule.timeZone && routine.scheduleTimeZoneSource !== "host"
-              ? { timeZone: routine.schedule.timeZone }
-              : {}),
-          },
+        : (() => {
+            const daily = {
+              type: "daily" as const,
+              time: routine.schedule.time,
+              weekdays: [...routine.schedule.weekdays],
+            };
+            if (routine.schedule.timeZone && routine.scheduleTimeZoneSource !== "host") {
+              daily.timeZone = routine.schedule.timeZone;
+            }
+            return daily;
+          })(),
       durationMinutes: routine.durationMinutes,
       enabledAfterInstall: false as const,
     }];

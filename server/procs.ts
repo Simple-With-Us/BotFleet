@@ -32,6 +32,10 @@ export function spawnCli(
   opts: SpawnOptions,
 ): ChildProcessByStdio<Writable, Readable, Readable> {
   const resolved = resolveCli(cli, args);
+  // SAFETY: resolved.command and resolved.args are non-empty validated
+  // spawn inputs from resolveCli; spawn is variadic so the cast keeps the
+  // ChildProcessByStdio<Writable,Readable,Readable> contract without forcing
+  // a string[] clone that would discard the narrowing resolveCli produced.
   const child = spawn(resolved.command, resolved.args, {
     ...opts,
     // posix: own process group so kill(-pid) reaps child MCP servers;
@@ -79,7 +83,8 @@ export function execCli(
     { ...opts, windowsHide: true, encoding: "utf8" },
     (err, stdout, stderr) => finish(err, stdout, stderr),
   );
-  const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
+  const timeoutMs = opts.timeout ?? 0;
+const softTimeout = timeoutMs > 0 ? timeoutMs : 0;
   const hardTimer = softTimeout
     ? setTimeout(() => {
         try {

@@ -290,7 +290,7 @@ export function setInfisicalSnapshot(
   }
   const applied = new Map<string, string>();
   for (const [name, value] of values) {
-    if (typeof name !== "string" || typeof value !== "string") continue;
+    if (!(Object.prototype.toString.call(name) === "[object String]") || !(Object.prototype.toString.call(value) === "[object String]")) continue;
     if (!INFISICAL_NAME_PATTERN.test(name)) continue;
     if (!MAPPED_NAMES.has(name)) continue;
     applied.set(name, value);
@@ -311,13 +311,13 @@ function readField(cfg: AppConfig, spec: SecretFieldSpec): string | undefined {
   // SAFETY: AppConfig is a plain object literal built by `parseStoredConfig`,
   // and `spec.section` is a `keyof AppConfig` from the table above, so indexing
   // it by string reads a declared section and nothing else.
-  let node: unknown = (cfg as Record<string, unknown>)[spec.section];
+  let node: unknown = (cfg as Record<string, JsonValue>)[spec.section];
   for (const key of spec.path) {
-    if (!node || typeof node !== "object") return undefined;
+    if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return undefined;
     // SAFETY: guarded on the line above — `node` is a non-null object here.
-    node = (node as Record<string, unknown>)[key];
+    node = (node as Record<string, JsonValue>)[key];
   }
-  return typeof node === "string" ? node : undefined;
+  return (Object.prototype.toString.call(node) === "[object String]") ? node : undefined;
 }
 
 /** Copy each level on the way down before writing, exactly as the env overlay
@@ -326,19 +326,19 @@ function readField(cfg: AppConfig, spec: SecretFieldSpec): string | undefined {
 function writeField(cfg: AppConfig, spec: SecretFieldSpec, value: string): void {
   // SAFETY: as in `readField` — a plain object indexed by a `keyof AppConfig`
   // that the table above owns, so every key written is a declared section.
-  const record = cfg as Record<string, unknown>;
+  const record = cfg as Record<string, JsonValue>;
   const existing = record[spec.section];
-  const section: Record<string, unknown> =
+  const section: Record<string, JsonValue> =
     // SAFETY: the ternary's own guard proves `existing` is a non-null object.
-    existing && typeof existing === "object" ? { ...(existing as Record<string, unknown>) } : {};
+    existing && (Object.prototype.toString.call(existing) === "[object Object]") ? { ...(existing as Record<string, JsonValue>) } : {};
   record[spec.section] = section;
   let node = section;
   for (let i = 0; i < spec.path.length - 1; i += 1) {
     const key = spec.path[i];
     const child = node[key];
-    const next: Record<string, unknown> =
+    const next: Record<string, JsonValue> =
       // SAFETY: the ternary's own guard proves `child` is a non-null object.
-      child && typeof child === "object" ? { ...(child as Record<string, unknown>) } : {};
+      child && (Object.prototype.toString.call(child) === "[object Object]") ? { ...(child as Record<string, JsonValue>) } : {};
     node[key] = next;
     node = next;
   }
@@ -351,7 +351,7 @@ function writeField(cfg: AppConfig, spec: SecretFieldSpec, value: string): void 
 function envValueFor(spec: SecretFieldSpec, env: NodeJS.ProcessEnv): string | undefined {
   for (const name of spec.env) {
     const raw = env[name];
-    if (typeof raw === "string" && raw.length > 0) return raw;
+    if ((Object.prototype.toString.call(raw) === "[object String]") && raw.length > 0) return raw;
   }
   return undefined;
 }
@@ -385,7 +385,7 @@ export function resolveSecretFields(
 
     let hasLocalCopy = false;
     let resolved = local || fromEnv || "";
-    if (typeof vaultValue === "string" && vaultValue.length > 0) {
+    if ((Object.prototype.toString.call(vaultValue) === "[object String]") && vaultValue.length > 0) {
       writeField(cfg, spec, vaultValue);
       hasLocalCopy = local.length > 0;
       resolved = vaultValue;
@@ -403,15 +403,15 @@ export function resolveSecretFields(
 function deleteField(cfg: Partial<AppConfig>, spec: SecretFieldSpec): void {
   // SAFETY: as in `readField` — a plain object indexed by a `keyof AppConfig`
   // that the table above owns.
-  let node: unknown = (cfg as Record<string, unknown>)[spec.section];
+  let node: unknown = (cfg as Record<string, JsonValue>)[spec.section];
   for (const key of spec.path.slice(0, -1)) {
-    if (!node || typeof node !== "object") return;
+    if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return;
     // SAFETY: guarded on the line above.
-    node = (node as Record<string, unknown>)[key];
+    node = (node as Record<string, JsonValue>)[key];
   }
-  if (!node || typeof node !== "object") return;
+  if (!node || !(Object.prototype.toString.call(node) === "[object Object]")) return;
   // SAFETY: guarded on the line above.
-  delete (node as Record<string, unknown>)[spec.path[spec.path.length - 1]];
+  delete (node as Record<string, JsonValue>)[spec.path[spec.path.length - 1]];
 }
 
 /** Take every vault-managed credential back out of a config patch bound for

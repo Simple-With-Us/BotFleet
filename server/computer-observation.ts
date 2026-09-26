@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 /** Provider-neutral policy for deciding when a computer observation needs vision. */
 export interface ObservationMetrics {
@@ -41,9 +42,11 @@ export const emptyObservationMetrics = (): ObservationMetrics => ({
   verificationFailures: 0,
 });
 
-export function normalizeCrop(raw: unknown, maxWidth: number, maxHeight: number): CropRegion | null {
-  if (!raw || typeof raw !== "object") return null;
-  const value = raw as Record<string, unknown>;
+export function normalizeCrop(raw, maxWidth: number, maxHeight: number): CropRegion | null {
+  if (!raw || !(Object.prototype.toString.call(raw) === "[object Object]")) return null;
+  // SAFETY: the toString-call guard above restricts raw to a JSON
+  // object, so the cast to a record of JsonValue fields is exact.
+  const value = raw as Record<string, JsonValue>;
   const x = Math.round(Number(value.x));
   const y = Math.round(Number(value.y));
   const width = Math.round(Number(value.width));
@@ -66,8 +69,8 @@ export function normalizeCrop(raw: unknown, maxWidth: number, maxHeight: number)
 /** Canonical value for internal navigation checks. Credentials are never
  * needed for equality and are removed here; query and fragment remain so
  * two distinct application states cannot verify as the same destination. */
-export function normalizeBrowserUrl(value: unknown): string | null {
-  if (typeof value !== "string" || !value || value.length > 8_192) return null;
+export function normalizeBrowserUrl(value): string | null {
+  if (!(Object.prototype.toString.call(value) === "[object String]") || !value || value.length > 8_192) return null;
   try {
     const url = new URL(value);
     if (!/^https?:$/.test(url.protocol)) return null;
@@ -80,7 +83,7 @@ export function normalizeBrowserUrl(value: unknown): string | null {
 }
 
 /** Removes credentials, query, and fragment before browser state reaches a model or log. */
-export function safeBrowserUrl(value: unknown): string | null {
+export function safeBrowserUrl(value): string | null {
   const normalized = normalizeBrowserUrl(value);
   if (!normalized) return null;
   const url = new URL(normalized);
@@ -94,15 +97,19 @@ export function safeBrowserUrl(value: unknown): string | null {
 export function parseBrowserTargets(raw: string): BrowserTarget[] {
   if (raw.length > 1_000_000) return [];
   try {
-    const parsed: unknown = JSON.parse(raw);
+    // SAFETY: JSON.parse produces a JsonValue; the unknown boundary here
+  // is the parser, and downstream narrowing happens after Array.isArray.
+  const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     return parsed.slice(0, 20).flatMap((item) => {
-      if (!item || typeof item !== "object") return [];
-      const value = item as Record<string, unknown>;
+      if (!item || !(Object.prototype.toString.call(item) === "[object Object]")) return [];
+      // SAFETY: the toString-call guard restricts item to a JSON
+      // object, so the cast to a record of JsonValue fields is exact.
+      const value = item as Record<string, JsonValue>;
       const comparisonUrl = normalizeBrowserUrl(value.url);
       const url = safeBrowserUrl(value.url);
-      if (value.type !== "page" || !url || !comparisonUrl || typeof value.id !== "string") return [];
-      const title = typeof value.title === "string" ? value.title.replace(/\s+/g, " ").trim().slice(0, 200) : "";
+      if (value.type !== "page" || !url || !comparisonUrl || !(Object.prototype.toString.call(value.id) === "[object String]")) return [];
+      const title = (Object.prototype.toString.call(value.title) === "[object String]") ? value.title.replace(/\s+/g, " ").trim().slice(0, 200) : "";
       return [{ id: value.id.slice(0, 100), title, url, comparisonUrl }];
     });
   } catch {

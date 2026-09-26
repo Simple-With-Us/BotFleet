@@ -27,13 +27,16 @@ export async function withMcpToolCallSpan<T>(
     {
       op: "mcp.server",
       name: `tools/call ${toolName}`,
-      attributes: {
-        "mcp.tool.name": toolName,
-        "mcp.method.name": "tools/call",
-        "mcp.transport": "stdio",
-        "network.transport": "pipe",
-        ...(opts.requestId != null ? { "mcp.request.id": String(opts.requestId) } : {}),
-      },
+      attributes: (() => {
+        const attrs = {
+          "mcp.tool.name": toolName,
+          "mcp.method.name": "tools/call",
+          "mcp.transport": "stdio",
+          "network.transport": "pipe",
+        } satisfies Record<string, string>;
+        if (opts.requestId != null) attrs["mcp.request.id"] = String(opts.requestId);
+        return attrs;
+      })(),
     },
     async (span) => {
       try {

@@ -398,10 +398,9 @@ function normalizeImageId(id: string | undefined): string | null {
   return id?.trim().replace(/^sha256:/, "") || null;
 }
 
-function inspectedImage(stdout: string): {
-  labels: Record<string, string> | undefined;
-  id: string | null;
-} {
+function inspectedImage(stdout: string) {
+  // SAFETY: the CLI prints a JSON array of inspected-image records;
+  // the cast narrows to the documented envelope shape.
   const parsed = JSON.parse(stdout) as Array<{
     Id?: string;
     id?: string;
@@ -504,6 +503,8 @@ export async function containerComputerStatus(
   try {
     const { stdout } = await runner(status.runtime, ["inspect", target.containerName]);
     if (status.runtime === "container") {
+      // SAFETY: the runtime CLI prints a JSON array of inspected
+      // records; the cast narrows to the documented envelope below.
       const inspected = JSON.parse(stdout) as Array<{
         configuration?: {
           image?: string | { reference?: string; descriptor?: { digest?: string } };
@@ -521,11 +522,11 @@ export async function containerComputerStatus(
       status.network = applePortsAreLocal(detail?.configuration?.publishedPorts) ? "loopback" : "unsafe";
       status.viewer_port = appleViewerPort(detail?.configuration?.publishedPorts, target.viewerPort);
       const appleImage =
-        typeof detail?.configuration?.image === "string"
+        (Object.prototype.toString.call(detail?.configuration?.image) === "[object String]")
           ? detail.configuration.image
           : detail?.configuration?.image?.reference ?? detail?.configuration?.imageReference;
       const appleImageId =
-        typeof detail?.configuration?.image === "object"
+        (Object.prototype.toString.call(detail?.configuration?.image) === "[object Object]")
           ? normalizeImageId(detail.configuration.image.descriptor?.digest)
           : null;
       status.imageMatches =
@@ -539,6 +540,8 @@ export async function containerComputerStatus(
         (resources?.memoryInBytes ?? 0) >= MEMORY_BYTES && resources?.cpus === CONTAINER_CPUS ? "hardened" : "unsafe";
       status.viewer_url = viewerUrl(viewerPassword(detail?.configuration?.environment), status.viewer_port);
     } else {
+      // SAFETY: same invariant — the runtime CLI prints a JSON array
+      // of inspected records; the cast narrows to the documented shape.
       const inspected = JSON.parse(stdout) as Array<{
         Config?: { Image?: string; Labels?: Record<string, string>; Env?: string[] };
         HostConfig?: DockerHardeningConfig & {
@@ -603,6 +606,8 @@ export async function containerComputerStatus(
         cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: target.containerName }),
         15_000,
       );
+      // SAFETY: the runtime prints a JSON health-report envelope; the cast
+      // narrows to the documented schema_version/overall/checks shape.
       const report = JSON.parse(health.stdout) as { schema_version?: string; overall?: string; checks?: unknown[] };
       if (
         report.schema_version !== "1" ||
@@ -1119,15 +1124,19 @@ export function containerComputerMcp(
   control?: { url: string; token: string },
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
 ): ContainerMcpLaunch {
+  // SAFETY: the env starts with one entry and grows by string-keyed
+  // assignments below; the cast to Record<string, string> is exact.
+  const env = { ELECTRON_RUN_AS_NODE: "1" } satisfies Record<string, string>;
+  if (control) {
+    env.OMB_CONTROL_URL = control.url;
+    env.OMB_CONTROL_TOKEN = control.token;
+  }
   return {
     command: process.execPath,
     args: [containerMcpPath, runtime, target.containerName, CUA_SOCKET],
     // The control pair rides in env, not argv — argv is world-readable
     // through `ps` for the life of the bridge.
-    env: {
-      ELECTRON_RUN_AS_NODE: "1",
-      ...(control ? { OMB_CONTROL_URL: control.url, OMB_CONTROL_TOKEN: control.token } : {}),
-    },
+    env,
   };
 }
 
@@ -1191,11 +1200,13 @@ export function setupCommands(
 export function computerProxyEnv(
   computer: { boxId?: string; token?: string; control?: { url: string; token: string } },
 ): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     OGB_BOX_ID: computer.boxId ?? "",
     OGB_BOX_TOKEN: computer.token ?? "",
-    ...(computer.control
-      ? { OMB_CONTROL_URL: computer.control.url, OMB_CONTROL_TOKEN: computer.control.token }
-      : {}),
   };
+  if (computer.control) {
+    env.OMB_CONTROL_URL = computer.control.url;
+    env.OMB_CONTROL_TOKEN = computer.control.token;
+  }
+  return env;
 }

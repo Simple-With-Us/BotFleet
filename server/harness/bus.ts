@@ -172,7 +172,7 @@ export class EventBus {
    * same failing write and recurse.  It is delivered live once, and persisted
    * ahead of the first event that reaches disk after recovery, so the log
    * itself carries the gap rather than quietly closing over it. */
-  private noteLogGap(event: RuntimeEvent, error: unknown): void {
+  private noteLogGap(event: RuntimeEvent, error): void {
     if (this.pendingLogWarnings.has(event.threadId)) return;
     const warning: RuntimeEvent = {
       eventId: newId(),

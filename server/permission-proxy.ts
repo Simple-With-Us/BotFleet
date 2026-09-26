@@ -13,6 +13,7 @@
 // stdout is the MCP channel — never console.log here.
 import { connect } from "node:net";
 import { randomUUID } from "node:crypto";
+import type { JsonValue } from "./schema.ts";
 
 const socketPath = process.argv[2] ?? "";
 
@@ -53,7 +54,7 @@ conn.on("data", (chunk) => {
   }
 });
 
-const send = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
+const send = (obj: JsonValue) => process.stdout.write(JSON.stringify(obj) + "\n");
 
 const TOOLS = [
   {

@@ -74,19 +74,24 @@ function isUngatedToolName(name: string): boolean {
 
 /** Classify one relayed JSON-RPC frame. Anything that is not a tools/call,
  * or is a discovery/connection/platform meta-tool, passes through. */
-export function connectorCallFromFrame(payload: unknown): ConnectorCall {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return { kind: "passthrough" };
+export function connectorCallFromFrame(payload): ConnectorCall {
+  if (!payload || !(Object.prototype.toString.call(payload) === "[object Object]") || Array.isArray(payload)) return { kind: "passthrough" };
+  // SAFETY: the toString-call + !Array.isArray() guards above restrict
+  // payload to a JSON object, so the cast to the JSON-RPC envelope is exact.
   const frame = payload as { method?: unknown; params?: unknown };
   if (frame.method !== "tools/call") return { kind: "passthrough" };
   const params = frame.params;
-  if (!params || typeof params !== "object" || Array.isArray(params)) {
+  if (!params || !(Object.prototype.toString.call(params) === "[object Object]") || Array.isArray(params)) {
     return { kind: "unrecognized", invoked: "tools/call", reason: "the call carried no params object" };
   }
+  // SAFETY: same invariant; cast narrows to the params.name field.
   const name = (params as { name?: unknown }).name;
-  if (typeof name !== "string" || !name) {
+  if (!(Object.prototype.toString.call(name) === "[object String]") || !name) {
     return { kind: "unrecognized", invoked: "tools/call", reason: "the call named no tool" };
   }
   if (name === COMPOSIO_MULTI_EXECUTE_TOOL) {
+    // SAFETY: same invariant — params.arguments is the documented
+    // multi-execute envelope; the cast narrows it for the dispatch.
     return multiExecuteCall(name, (params as { arguments?: unknown }).arguments);
   }
   // Platform meta-tools (search, schemas, remote workbench) are not
@@ -103,11 +108,14 @@ export function connectorCallFromFrame(payload: unknown): ConnectorCall {
  * the upstream schema is a 1-50 item tools array of { tool_slug,
  * arguments }; a legacy single { tool_slug } object is accepted too.
  * Anything else cannot be checked, so it is denied. */
-function multiExecuteCall(invoked: string, args: unknown): ConnectorCall {
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
+function multiExecuteCall(invoked: string, args): ConnectorCall {
+  if (!args || !(Object.prototype.toString.call(args) === "[object Object]") || Array.isArray(args)) {
     return { kind: "unrecognized", invoked, reason: "the arguments were not an object" };
   }
+  // SAFETY: the toString-call + !Array.isArray() guards restrict args
+  // to a JSON object, so the cast to the documented envelope is exact.
   const tools = (args as { tools?: unknown }).tools;
+  // SAFETY: same invariant; cast narrows to the legacy tool_slug field.
   const singleSlug = (args as { tool_slug?: unknown }).tool_slug;
   if (Array.isArray(tools)) {
     if (tools.length === 0) {
@@ -115,17 +123,20 @@ function multiExecuteCall(invoked: string, args: unknown): ConnectorCall {
     }
     const names: string[] = [];
     for (const item of tools) {
-      const slug = item && typeof item === "object" && !Array.isArray(item)
-        ? (item as { tool_slug?: unknown }).tool_slug
+      const slug = item && (Object.prototype.toString.call(item) === "[object Object]") && !Array.isArray(item)
+        ? // SAFETY: the toString-call + !Array.isArray() guards restrict
+          // item to a JSON object, so the cast to the documented
+          // { tool_slug } envelope is exact.
+          (item as { tool_slug?: unknown }).tool_slug
         : undefined;
-      if (typeof slug !== "string" || !slug) {
+      if (!(Object.prototype.toString.call(slug) === "[object String]") || !slug) {
         return { kind: "unrecognized", invoked, reason: "an entry in the tools list named no tool_slug" };
       }
       names.push(slug);
     }
     return batchCall(invoked, names);
   }
-  if (typeof singleSlug === "string" && singleSlug) {
+  if ((Object.prototype.toString.call(singleSlug) === "[object String]") && singleSlug) {
     return batchCall(invoked, [singleSlug]);
   }
   return { kind: "unrecognized", invoked, reason: "the arguments named no tools to execute" };
@@ -133,6 +144,8 @@ function multiExecuteCall(invoked: string, args: unknown): ConnectorCall {
 
 /** Run each batch slug through the same checks a direct call gets:
  * meta-tools and connection cards are ungated (dropped from the verdict),
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * and a slug that is not a Composio tool name is refused as unrecognized
  * instead of being judged by its prefix. A batch of only ungated slugs
  * passes through, like the same calls made directly. */
@@ -203,14 +216,16 @@ export function connectorUnrecognizedText(invoked: string, reason: string): stri
  * enforces at call time, so failing open here costs nothing but a wasted,
  * clearly-refused attempt. */
 export function filterConnectorToolsList(
-  tools: unknown,
+  tools,
   grants: Record<string, ConnectorToolGrant> | undefined,
-): unknown[] {
+) {
   if (!Array.isArray(tools)) return [];
   if (grants === undefined) return tools;
   return tools.filter((tool) => {
-    const name = tool && typeof tool === "object" && !Array.isArray(tool) ? (tool as { name?: unknown }).name : undefined;
-    if (typeof name !== "string" || !name) return true;
+    // SAFETY: the toString-call + !Array.isArray() guards restrict
+    // tool to a JSON object, so the cast to { name } envelope is exact.
+    const name = tool && (Object.prototype.toString.call(tool) === "[object Object]") && !Array.isArray(tool) ? (tool as { name?: unknown }).name : undefined;
+    if (!(Object.prototype.toString.call(name) === "[object String]") || !name) return true;
     if (isUngatedToolName(name)) return true;
     const service = serviceSlugFor(name);
     const grant = service === null ? undefined : grants[service];

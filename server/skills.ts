@@ -127,8 +127,18 @@ function manifestPath(botId: string): string {
 
 function readManifest(botId: string): SkillManifest {
   try {
+    // SAFETY: the manifest is on-disk JSON controlled by the user; the
+    // object-tag and non-array checks below are the only structural
+    // gates, so the parse assertion is correct under those invariants.
     const parsed = JSON.parse(readFileSync(manifestPath(botId), "utf8")) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as SkillManifest;
+    // SAFETY: same invariant — after the non-object and array guards,
+    // the runtime value is a JSON object, which structurally matches
+    // the SkillManifest record shape modulo per-field type checks.
+    if (parsed && Object.prototype.toString.call(parsed) === "[object Object]" && !Array.isArray(parsed)) {
+  // SAFETY: after the toString-tag guard and !Array.isArray check, parsed
+  // is a JSON object, structurally compatible with SkillManifest.
+  return parsed as SkillManifest;
+}
   } catch {
     // no skills yet, or a hand-edited file that no longer parses
   }

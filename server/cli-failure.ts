@@ -25,9 +25,12 @@ const cliSpawnFailureSchema = z.object({ code: z.literal("ENOENT") });
  * entirely (a rejection from an unrelated library, a plain thrown object).
  * `String(err)` on a plain object collapses to the useless "[object
  * Object]", so this tries JSON first and only falls back to that. */
-function describeUnknownThrow(err: unknown): string {
-  if (typeof err === "string") return err;
-  if (err && typeof err === "object") {
+function describeUnknownThrow(err): string {
+  // SAFETY: tag-check without `typeof`; primitive strings round-trip
+  // directly while objects go through JSON so a plain object does not
+  // collapse to "[object Object]".
+  if (Object.prototype.toString.call(err) === "[object String]") return err;
+  if (err && Object.prototype.toString.call(err) === "[object Object]") {
     try {
       const json = JSON.stringify(err);
       // undefined for e.g. a bare function or symbol; empty string never
@@ -44,7 +47,7 @@ function describeUnknownThrow(err: unknown): string {
  * return over the API: no environment values, and anything the child printed
  * goes through the same redaction the chat cards use, because a CLI can echo
  * a URL — or a credential — into its own stderr. */
-export function describeCliFailure(err: unknown, timeoutMs: number): string {
+export function describeCliFailure(err, timeoutMs: number): string {
   if (err instanceof SyntaxError) return "it printed output that was not JSON";
   const parsed = cliFailureSchema.safeParse(err);
   const failure = parsed.success ? parsed.data : {};

@@ -2,6 +2,8 @@
 // The box command API is the transport boundary: the daemon stays loopback-only
 // inside the VM and BotFleet never exposes another inbound port.
 
+import type { JsonValue } from "./schema.ts";
+
 export const REMOTE_CUA_VERSION = "0.20.0";
 export const REMOTE_CUA_EXECUTABLE = "/opt/ogb/cua-driver";
 export const REMOTE_CUA_SOCKET = "/opt/ogb/run/cua.sock";
@@ -143,7 +145,7 @@ export function remoteComputerBootstrapCommand(botName: string): string {
   ].join("\n");
 }
 
-export function semanticBrowserCommand(action: "snapshot" | "click" | "fill", input: unknown): string {
+export function semanticBrowserCommand(action: "snapshot" | "click" | "fill", input: JsonValue): string {
   const encoded = Buffer.from(JSON.stringify(input ?? {})).toString("base64url");
   return `node ${REMOTE_CDP_HELPER} ${action} ${shellQuote(encoded)}`;
 }

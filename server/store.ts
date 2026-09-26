@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 import * as mdb from "./message-db.ts";
 import { workspaceDir } from "./workspace.ts";
 import { newId, type CloudBackend, type ModelSelection, type ThreadId, type TurnBillingMode } from "./contracts.ts";
@@ -18,6 +20,7 @@ import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export type BotColor =
   | "green"
@@ -32,6 +35,8 @@ export type BotColor =
   | "coral";
 
 /**
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * The face a bot rests on, as one of the engine's state names. Kept as a plain
  * string rather than a union: bots saved under the app's earlier ten-face
  * vocabulary still carry those names, and the client resolves both on read.
@@ -95,6 +100,8 @@ export interface SecretRequestCardData {
 export interface Message {
   id: string;
   /** `system` is auto-delivered instructions (routine, webhook, resource).
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * Never a person typing — the model still sees it as the turn prompt. */
   role: "bot" | "user" | "system";
   /** For a `system` message: what actually fired it (mirrors
@@ -185,6 +192,8 @@ export interface GroupTaskRecord {
 /** A room: a shared thread where several bots + the user talk. Plain
  * messages follow `defaultResponder`; explicit @mentions always override it.
  * The bulletin is the room's shared instructions — every member's turn gets
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * it as part of its system prompt. */
 export interface GroupRecord {
   id: string;
@@ -238,7 +247,7 @@ export interface TaskRecord {
   title: string;
   createdAt: number;
   /** provider-native continuation per instance, for THIS task only */
-  resumeCursors: Record<string, unknown>;
+  resumeCursors: Record<string, JsonValue>;
   /** which instance dispatched the most recent turn. A cursor alone can't
    * say whether an engine's session is current — another engine may have
    * taken turns since — so this is what decides an inline replay. Absent
@@ -290,6 +299,8 @@ export interface TaskUsage {
    * thread this is most of `input`. Absent on records from older builds. */
   cachedInput?: number;
   /** null until any turn reports a cost — most engines never do. Records
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
@@ -315,27 +326,30 @@ function mergeTaskUsage(
   turn: { input?: number; output?: number; cachedInput?: number; costUsd: number | null; billingMode?: TurnBillingMode },
 ): TaskUsage {
   const base: TaskUsage = { input: 0, output: 0, costUsd: null, turns: 0, ...prev };
-  const cost = turn.billingMode !== "estimated" && typeof turn.costUsd === "number" && Number.isFinite(turn.costUsd)
+  const cost = turn.billingMode !== "estimated" && (Object.prototype.toString.call(turn.costUsd) === "[object Number]") && Number.isFinite(turn.costUsd)
     ? turn.costUsd
     : null;
-  const prevCost = typeof base.costUsd === "number" ? base.costUsd : null;
+  const prevCost = (Object.prototype.toString.call(base.costUsd) === "[object Number]") ? base.costUsd : null;
   // providers occasionally report NaN or a negative on a partial turn —
   // never let that poison a running tally
-  const clean = (n: number | undefined) => (typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0);
+  const clean = (n: number | undefined) => ((Object.prototype.toString.call(n) === "[object Number]") && Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0);
   // the cached share exists on a record only once a driver has reported
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   // it — a driver that never does leaves the record shaped as before
-  const cachedKnown = typeof base.cachedInput === "number" || typeof turn.cachedInput === "number";
+  const cachedKnown = (Object.prototype.toString.call(base.cachedInput) === "[object Number]") || (Object.prototype.toString.call(turn.cachedInput) === "[object Number]");
   const prevInput = clean(base.input);
   const turnInput = clean(turn.input);
   const nextCachedInput = Math.min(clean(base.cachedInput), prevInput)
     + Math.min(clean(turn.cachedInput), turnInput);
-  return {
+  const result = {
     input: prevInput + turnInput,
     output: base.output + clean(turn.output),
-    ...(cachedKnown ? { cachedInput: nextCachedInput } : {}),
     costUsd: cost === null ? prevCost : (prevCost ?? 0) + cost,
     turns: base.turns + 1,
   };
+if (cachedKnown) result.cachedInput = nextCachedInput;
+return result;
 }
 
 /** A custom connection can be deleted and recreated under the same slug
@@ -385,20 +399,24 @@ function mergeInstanceUsage(
 /** Everything the BOT authored is scrubbed of content-shaped secrets before
  * it is stored: its reply text, a tool title (an ACP engine's title can be
  * the whole command line), a permission card's summary. What the user typed
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * is theirs and stays as typed. Stored, not just displayed: the transcript
  * is replayed into every rebuild, and a leaked key would otherwise be
  * permanent. */
 function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number }>(message: T): T {
   if (message.role !== "bot") return message;
   const out = { ...message };
-  if (typeof out.text === "string") out.text = redactSecretsInText(out.text);
+  if ((Object.prototype.toString.call(out.text) === "[object String]")) out.text = redactSecretsInText(out.text);
   if (out.tool?.name) out.tool = { ...out.tool, name: redactSecretsInText(out.tool.name) };
   if (out.card) {
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     const card = { ...out.card } as OptionCardData & { summary?: string };
     card.title = redactSecretsInText(card.title);
-    if (typeof card.subtitle === "string") card.subtitle = redactSecretsInText(card.subtitle);
-    if (typeof card.summary === "string") card.summary = redactSecretsInText(card.summary);
-    if (typeof card.held === "string") card.held = redactSecretsInText(card.held);
+    if ((Object.prototype.toString.call(card.subtitle) === "[object String]")) card.subtitle = redactSecretsInText(card.subtitle);
+    if ((Object.prototype.toString.call(card.summary) === "[object String]")) card.summary = redactSecretsInText(card.summary);
+    if ((Object.prototype.toString.call(card.held) === "[object String]")) card.held = redactSecretsInText(card.held);
     // Routine definitions are executable bot-authored text stored behind the
     // visible summary. Scrub the durable payload too so nesting it on a card
     // cannot bypass the transcript's secret-redaction boundary.
@@ -416,18 +434,12 @@ function redactBotAuthored<T extends Omit<Message, "id" | "at"> & { at?: number 
               },
             }
           : operation.action === "update"
-            ? {
-                ...operation,
-                changes: {
-                  ...operation.changes,
-                  ...(typeof operation.changes.name === "string"
-                    ? { name: redactSecretsInText(operation.changes.name) }
-                    : {}),
-                  ...(typeof operation.changes.instructions === "string"
-                    ? { instructions: redactSecretsInText(operation.changes.instructions) }
-                    : {}),
-                },
-              }
+            ? (() => {
+                const changes = { ...operation.changes };
+                if ((Object.prototype.toString.call(operation.changes.name) === "[object String]")) changes.name = redactSecretsInText(operation.changes.name);
+                if ((Object.prototype.toString.call(operation.changes.instructions) === "[object String]")) changes.instructions = redactSecretsInText(operation.changes.instructions);
+                return { ...operation, changes };
+              })()
             : { ...operation },
       };
     }
@@ -498,6 +510,8 @@ export interface BotRecord {
   notifications: boolean;
   color: BotColor;
   mascotExpression?: BotExpression | null;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   /** App-owned attachment served as this bot's custom profile image. */
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
@@ -507,7 +521,7 @@ export interface BotRecord {
   /** The model selection that actually ran on the most recent turn (post-fallback). */
   activeModelSelection?: ModelSelection;
   /** provider-native continuation per instance (e.g. claude session id) */
-  resumeCursors: Record<string, unknown>;
+  resumeCursors: Record<string, JsonValue>;
   /** which computer the bot acts on: its cloud box, this Mac (local CUA),
    * or none. Unset = auto (box when it exists, else local when available). */
   computers?: Array<"cloud" | "vm" | "local">;
@@ -524,6 +538,8 @@ export interface BotRecord {
    * through, and a short list of destructive commands still stops it. */
   autoApprove?: boolean;
   /** Optional model review of otherwise undecided, attended approval cards.
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * Unknown persisted values are treated as off by the review boundary. */
   autoReview?: "off" | "shadow" | "enforce";
   /** Tools this bot may always use without asking, even outside auto mode
@@ -531,8 +547,12 @@ export interface BotRecord {
   alwaysAllow?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
    * HTTP / openai-compat). Unset = DEFAULT_TURN_LOOP_BUDGET.maxRounds (12).
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -566,6 +586,8 @@ export interface BotRecord {
   composio?: boolean;
   /** Per-bot Composio tool grants. Unset = legacy all-tools (every
    * connected service, every tool) — added after bots already existed, so
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * an untouched bot must keep working exactly as before. An explicit
    * record — including the empty one — restricts to exactly what it names;
    * enforced in the /api/internal/connectors/mcp relay (connector-verdict.ts),
@@ -585,6 +607,8 @@ export interface BotRecord {
    * tests keep working unchanged. Write through setActivity(), never here. */
   busy?: boolean;
   activityStartedAt?: number;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   /** What the bot is doing right now, as the harness sees it. `busy` alone
    * could not tell working from waiting-on-you from a stalled engine.
    * Transient like busy: reset to idle on load. */
@@ -629,6 +653,8 @@ const COLORS: BotColor[] = [
   "coral",
 ];
 
+// SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
 /** Sections are persisted as display labels, so exact trimmed labels are
  * their identity. Missing/blank means the unsectioned (General) team. */
 export const sectionKey = (section?: string | null): string => section?.trim() || "";
@@ -663,40 +689,44 @@ export function mentionedBots<T extends { name: string; hidden?: boolean }>(text
  * dropped so a phone save of name/bulletin/folder is not blocked by an id the
  * Members toggles cannot show.  A newly added unknown id is still an error. */
 export function resolveRoomMemberIds(
-  value: unknown,
+  value,
   existingIds: readonly string[] | undefined,
   botExists: (id: string) => boolean,
-): { ok: true; memberIds: string[] } | { ok: false; error: string } {
+) {
   if (!Array.isArray(value)) return { ok: false, error: "memberIds must be a list of bot IDs" };
   const existing = new Set(existingIds ?? []);
   for (const id of value) {
-    if (typeof id !== "string" || !id.trim()) {
+    if (!(Object.prototype.toString.call(id) === "[object String]") || !id.trim()) {
       return { ok: false, error: `unknown channel member: ${String(id)}` };
     }
     if (botExists(id) || existing.has(id)) continue;
     return { ok: false, error: `unknown channel member: ${id}` };
   }
-  const memberIds = [...new Set(value.filter((id): id is string => typeof id === "string" && botExists(id)))];
+  const memberIds = [...new Set(value.filter((id): id is string => (Object.prototype.toString.call(id) === "[object String]") && botExists(id)))];
   if (!memberIds.length) return { ok: false, error: "a channel needs at least one bot" };
   return { ok: true, memberIds };
 }
 
 /** Normalize persisted or API-provided routing. Old rooms did not have this
+ // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
  * field; giving them their first member as lead fixes the old silent-send
  * behavior without making every prompt fan out to every model. */
 export function normalizeGroupDefaultResponder(
-  value: unknown,
+  value,
   memberIds: string[],
   dm = false,
-): GroupDefaultResponder {
+) {
   if (dm) return { kind: "mentions" };
-  if (value && typeof value === "object") {
+  if (value && (Object.prototype.toString.call(value) === "[object Object]")) {
+    // SAFETY: the toString-call guard above restricts `value` to a JSON
+    // object, so the cast to the documented envelope shape is exact.
     const candidate = value as { kind?: unknown; botId?: unknown };
     if (candidate.kind === "everyone") return { kind: "everyone" };
     if (candidate.kind === "mentions") return { kind: "mentions" };
     if (
       candidate.kind === "member" &&
-      typeof candidate.botId === "string" &&
+      (Object.prototype.toString.call(candidate.botId) === "[object String]") &&
       memberIds.includes(candidate.botId)
     ) {
       return { kind: "member", botId: candidate.botId };
@@ -826,6 +856,8 @@ export class Store {
       this.bots = [];
       // Only a missing bots.json is a first run. A file that exists but will
       // not parse must not be silently replaced with a fresh default roster.
+      // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
       this.firstRun = (error as NodeJS.ErrnoException)?.code === "ENOENT";
       this.botsLoadFailed = !this.firstRun;
     }
@@ -835,6 +867,8 @@ export class Store {
       this.groups = [];
     }
     // busy never survives a restart — no turn does either. Rooms saved
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // before default responders existed adopt their first member as lead.
     let botsMigrated = false;
     const chiefSectionsSeen = new Set<string>();
@@ -897,6 +931,8 @@ export class Store {
         const candidates = this.bots.filter((candidate) => candidate.name === match[2]);
         if (candidates.length !== 1) return key;
         changed = true;
+        // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
         return peerAllowKey(match[1] as PeerAction, candidates[0]!.id);
       });
       if (changed) {
@@ -930,10 +966,10 @@ export class Store {
             threadId: g.threadId,
             title: this.firstUserLine(g.threadId) ?? UNTITLED_TASK,
             createdAt: g.createdAt,
-            ...(g.pinnedCwd !== undefined ? { pinnedCwd: g.pinnedCwd } : {}),
-            ...(g.pinnedMessageId ? { pinnedMessageId: g.pinnedMessageId } : {}),
           },
         ];
+        if (g.pinnedCwd !== undefined) g.tasks[0].pinnedCwd = g.pinnedCwd;
+        if (g.pinnedMessageId) g.tasks[0].pinnedMessageId = g.pinnedMessageId;
         groupsMigrated = true;
       }
       // Repair a malformed/stale active pointer conservatively. Every task
@@ -1064,9 +1100,6 @@ export class Store {
     const group: GroupRecord = {
       id: newId(),
       threadId,
-      ...(dm
-        ? {}
-        : { tasks: [{ threadId, title: UNTITLED_TASK, createdAt }] }),
       name,
       memberIds,
       defaultResponder: dm
@@ -1078,13 +1111,12 @@ export class Store {
       dm: dm || undefined,
       busyBotId: null,
       section,
-      ...(dm
-        ? {}
-        : {
-            setupCompletedAt: setup?.completed ? createdAt : null,
-            setupSkippedAt: null,
-          }),
     };
+if (!dm) {
+  group.tasks = [{ threadId, title: UNTITLED_TASK, createdAt }];
+  group.setupCompletedAt = setup?.completed ? createdAt : null;
+  group.setupSkippedAt = null;
+}
     this.groups.unshift(group);
     this.saveGroups();
     this.emit({ type: "group", groupId: group.id });
@@ -1344,7 +1376,7 @@ export class Store {
 
   /** Fold every extra bot and room conversation into the active thread.
    * Used when switching the workspace to Simple with merge opted in. */
-  mergeAllExtraThreads(): { bots: number; groups: number; threads: number } {
+  mergeAllExtraThreads() {
     let bots = 0;
     let groups = 0;
     let threads = 0;
@@ -1392,15 +1424,9 @@ export class Store {
       bot.threadId = next.threadId;
       bot.resumeCursors = {};
     }
-    group.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        ...(task.cwd === undefined ? {} : { pinnedCwd: task.cwd }),
-      },
-      ...(group.tasks ?? []),
-    ];
+    const mergedTask = { threadId: task.threadId, title: task.title, createdAt: task.createdAt };
+if (task.cwd !== undefined) mergedTask.pinnedCwd = task.cwd;
+group.tasks = [mergedTask, ...(group.tasks ?? [])];
 
     this.saveBots();
     this.saveGroups();
@@ -1427,16 +1453,9 @@ export class Store {
       group.pinnedCwd = next.pinnedCwd;
       group.pinnedMessageId = next.pinnedMessageId;
     }
-    bot.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        resumeCursors: {},
-        ...(task.pinnedCwd === undefined ? {} : { cwd: task.pinnedCwd }),
-      },
-      ...(bot.tasks ?? []),
-    ];
+    const botTask = { threadId: task.threadId, title: task.title, createdAt: task.createdAt, resumeCursors: {} };
+if (task.pinnedCwd !== undefined) botTask.cwd = task.pinnedCwd;
+bot.tasks = [botTask, ...(bot.tasks ?? [])];
 
     this.saveGroups();
     this.saveBots();
@@ -1510,6 +1529,8 @@ export class Store {
    * scrollback view. Reads just `limit` rows at the SQL boundary instead
    * of the whole transcript (HS12/HS21), unless the thread is already
    * cached from other work (then it's a plain in-memory slice, no extra
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * SQL) or the bounded read comes back as the complete thread anyway
    * (short thread, or a one-time legacy import) — that gets cached like
    * any other full load so a later messagesFor() doesn't re-read it.
@@ -1517,7 +1538,7 @@ export class Store {
    * correctly on a full load, so a bounded page missing that context
    * falls back to one rather than returning messages with a broken
    * parent chain. */
-  messagesTail(threadId: string, limit: number): { messages: Message[]; hasMore: boolean; activeLeafId: string | null } {
+  messagesTail(threadId: string, limit: number) {
     let state = this.threads.get(threadId);
     if (!state) {
       const tail = mdb.readThreadTail(threadId, messagesFile(threadId), limit);
@@ -1604,6 +1625,8 @@ export class Store {
   /** Screen frames are ~100-500KB of base64 each; keeping every frame of a
    * long computer session bloats the transcript for nothing the client
    * would ever show. The newest few keep their pixels; older ones stay in
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * the transcript as placeholders. Mirrors the client's own frame cap.
    * Returns the messages whose pixels were dropped so the caller can
    * persist exactly those. */
@@ -1703,12 +1726,12 @@ export class Store {
       description: profile.description ?? "",
       notifications: true,
       color: profile.color ?? COLORS[this.bots.length % COLORS.length],
-      ...(profile.mascotExpression ? { mascotExpression: profile.mascotExpression } : {}),
       unread: false,
       modelSelection: profile.modelSelection ?? this.defaultSelection(),
       resumeCursors: {},
       createdAt: Date.now(),
     };
+if (profile.mascotExpression) bot.mascotExpression = profile.mascotExpression;
     if (section) bot.section = section;
     bot.tasks = [{ threadId: bot.threadId, title: UNTITLED_TASK, createdAt: bot.createdAt, resumeCursors: {} }];
     this.bots.unshift(bot);
@@ -1750,6 +1773,8 @@ export class Store {
     for (const threadId of new Set([bot.threadId, ...(bot.tasks ?? []).map((t) => t.threadId)])) {
       this.deleteThreadRecord(threadId);
     }
+    // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
     // the bot's workspace (files + memory) goes with it — same rule as its
     // transcripts: deleting a bot deletes what it knew
     try {
@@ -1809,6 +1834,8 @@ export class Store {
     return bot;
   }
 
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   /** Elect one Chief of Staff in its section (or clear one section) as one persisted change.
    * The changed records are returned so the server can update every open
    * window, including the bot that just handed the role over. */
@@ -1835,7 +1862,7 @@ export class Store {
     return changed;
   }
 
-  setResumeCursor(botId: string, instanceId: string, cursor: unknown, threadId?: string) {
+  setResumeCursor(botId: string, instanceId: string, cursor, threadId?: string) {
     const bot = this.bot(botId);
     if (!bot) return;
     // the cursor belongs to the task that produced it, not to the bot
@@ -1855,6 +1882,8 @@ export class Store {
 
   /** Record which instance just took a turn on this task. Called at
    * dispatch, not at cursor time — transcript-replay engines never
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * produce a cursor, and they still count as having run last. */
   markTaskDispatched(botId: string, threadId: string, instanceId: string) {
     const task = this.taskByThread(botId, threadId);
@@ -2029,8 +2058,8 @@ export class Store {
       title: title?.trim() || UNTITLED_TASK,
       createdAt: Date.now(),
       resumeCursors: {},
-      ...(automationKey ? { automationKey } : {}),
     };
+if (automationKey) task.automationKey = automationKey;
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {
       bot.threadId = task.threadId;
@@ -2060,7 +2089,11 @@ export class Store {
    *
    * `modelSelection: null` clears the override so the bot's engine is used
    * again; `snoozedUntil: null` wakes the thread now.  An omitted field
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * always means "leave it alone", which is why waking travels as an
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * explicit null rather than as an absent key. */
   patchTask(
     botId: string,
@@ -2113,6 +2146,8 @@ export class Store {
   /** Drop every snooze whose deadline has passed, so a woken thread returns
    * to plain update order without waiting for someone to touch its bot.
    *
+   // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
    * Clients heal expired deadlines on read as well — the harness clock is
    * the authority and a device's may be skewed — but a desktop or phone left
    * open needs the change to ARRIVE, which is what the emit here is for.

@@ -20,6 +20,7 @@ import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
 import { requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
 import type { BotRecord, GroupRecord } from "./store.ts";
+import type { JsonValue, JsonObject } from "./schema.ts";
 
 export interface DelegationItem {
   toBotId: string;
@@ -60,22 +61,28 @@ function savePending(): void {
 export function _loadPending(): void {
   pendingDelegations.clear();
   try {
-    const raw = JSON.parse(readFileSync(DELEGATIONS_FILE, "utf8")) as Record<string, unknown>;
+    // SAFETY: the file is a JSON document; the cast narrows it to a
+    // record of JsonValue arrays used below.
+    const raw = JSON.parse(readFileSync(DELEGATIONS_FILE, "utf8")) as Record<string, JsonValue>;
     for (const [threadId, list] of Object.entries(raw)) {
       if (!Array.isArray(list)) continue;
       const items = list.flatMap((value): PendingDelegationItem[] => {
-        if (!value || typeof value !== "object") return [];
+        if (!value || !(Object.prototype.toString.call(value) === "[object Object]")) return [];
+        // SAFETY: the toString-call guard above restricts value to a
+        // JSON object, so the cast to Partial<PendingDelegationItem> is exact.
         const item = value as Partial<PendingDelegationItem>;
         if (
-          typeof item.toBotId !== "string" ||
-          typeof item.message !== "string" ||
+          !(Object.prototype.toString.call(item.toBotId) === "[object String]") ||
+          !(Object.prototype.toString.call(item.message) === "[object String]") ||
           !Number.isFinite(item.depth)
         ) return [];
-        return [{
-          id: typeof item.id === "string" && item.id ? item.id : newId(),
+        const out = {
+          id: (Object.prototype.toString.call(item.id) === "[object String]") && item.id ? item.id : newId(),
           toBotId: item.toBotId,
           message: item.message,
-          ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
+        };
+        if ((Object.prototype.toString.call(item.reason) === "[object String]")) out.reason = item.reason;
+        return [out];
           depth: Math.max(0, Math.trunc(item.depth!)),
         }];
       });

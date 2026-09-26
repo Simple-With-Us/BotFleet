@@ -229,7 +229,10 @@ function liveSink(): SentryAiSink | null {
   return {
     setConversationId: (id) => {
       try {
-        if (typeof Sentry.setConversationId === "function") {
+        // SAFETY: setConversationId is an optional AI-monitoring method on
+        // the Sentry global; we guard with `in` because the runtime type
+        // comes from a dynamic import boundary.
+        if ("setConversationId" in Sentry && Object.prototype.toString.call(Sentry.setConversationId) === "[object Function]") {
           Sentry.setConversationId(id);
         }
       } catch {
@@ -294,10 +297,9 @@ function applyConversation(
     const resolved = identity === undefined ? identityFor(threadId) : identity;
     const id = clean(resolved?.botId) ?? clean(resolved?.roomId) ?? threadId;
     const username = clean(resolved?.botName) ?? clean(resolved?.roomName);
-    sink.setUser({
-      id,
-      ...(username ? { username } : {}),
-    });
+    const user = { id };
+    if (username) user.username = username;
+    sink.setUser(user);
   } catch {
     /* conversation tagging must never take down a turn */
   }

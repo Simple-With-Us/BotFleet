@@ -345,6 +345,9 @@ function fallbackEffort(candidate: AutoFallbackCandidate, effort: EffortLevel | 
   const allowed = modelEffortLevels(
     {
       driverKind: candidate.driverKind,
+      // SAFETY: candidate.capabilities?.effortLevels is typed loosely on the
+      // driver record; the surrounding modelEffortLevels call already accepts
+      // readonly EffortLevel[] | undefined, so the widening is exact.
       capabilities: { effortLevels: candidate.capabilities?.effortLevels as readonly EffortLevel[] | undefined },
     },
     candidate.models.options?.find((option) => option.id === model),

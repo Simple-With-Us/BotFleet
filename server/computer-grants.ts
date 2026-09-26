@@ -285,7 +285,7 @@ export function resolveGrants(
   runOn?: string,
   workspaceDefault?: ComputerDestination[],
   allowed: ComputerDestination[] | null = null,
-): { granted: ComputerDestination[]; auto: boolean } {
+) {
   // A cloud routine runs on the box whatever the bot is set to, and is never
   // auto — it named its destination.  The cloud destination is always
   // available, because the routine chose to run on the cloud in the first

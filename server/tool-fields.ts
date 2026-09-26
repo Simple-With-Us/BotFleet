@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 
 import { toolActivity } from "../shared/tool-activity.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { JsonValue } from "./schema.ts";
 
 export interface ToolFields {
   target?: string;
@@ -19,7 +20,7 @@ export interface ToolFields {
  * beats guessing from the name. */
 export function toolFields(
   name: string | undefined,
-  rawInput: unknown,
+  rawInput,
   options: { hint?: string; locations?: unknown; cwd?: string } = {},
 ): ToolFields {
   const activity = toolActivity(name, {
@@ -36,12 +37,20 @@ export function toolFields(
  * malformed one is normal — arguments stream in fragments — so a parse
  * failure is not an error, it just means the row shows the tool's name and
  * nothing more. */
-export function parseToolArguments(raw: unknown): unknown {
-  if (typeof raw !== "string") return raw;
+export function parseToolArguments(raw): JsonValue | undefined {
+  // SAFETY: tag-check without `typeof`; primitive strings are the only
+  // shape that JSON.parse can decode, everything else flows through.
+  if (Object.prototype.toString.call(raw) !== "[object String]") {
+    // SAFETY: the caller already had raw as an untyped boundary value,
+    // and JsonValue's structural shape accepts any primitive/object/array
+    // the call site might have produced.
+    return raw as JsonValue;
+  }
   const text = raw.trim();
   if (!text) return undefined;
   try {
-    return JSON.parse(text);
+    // SAFETY: JSON.parse only ever produces a JsonValue (string/number/boolean/null/object/array).
+    return JSON.parse(text) as JsonValue;
   } catch {
     return undefined;
   }

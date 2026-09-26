@@ -33,7 +33,7 @@ export interface JsonSchemaObject {
   type: "object";
   additionalProperties?: boolean;
   description?: string;
-  properties?: Record<string, unknown>;
+  properties?: Record<string, JsonValue>;
   required?: string[];
 }
 
@@ -89,7 +89,7 @@ export interface ToolGateContext {
 export interface ToolApproval {
   policy: "never" | "ask";
   /** One line for the card, built from the model's arguments. */
-  summary(args: Record<string, unknown>): string;
+  summary(args: Record<string, JsonValue>): string;
 }
 
 /** A wire shape one lane is pinned to and the other is not.
@@ -201,8 +201,8 @@ const ASK_BOT: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.task === "string" ? args.task : typeof args.message === "string" ? args.message : "";
+      const target = (Object.prototype.toString.call(args.bot_id) === "[object String]") ? args.bot_id : "another bot";
+      const raw = (Object.prototype.toString.call(args.task) === "[object String]") ? args.task : (Object.prototype.toString.call(args.message) === "[object String]") ? args.message : "";
       const text = raw.replace(/\s+/g, " ").trim();
       return text ? `ask ${target}: ${text.slice(0, 160)}` : `ask ${target}`;
     },
@@ -265,8 +265,8 @@ const DELEGATE_BOT: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const target = typeof args.bot_id === "string" ? args.bot_id : "another bot";
-      const raw = typeof args.message === "string" ? args.message : "";
+      const target = (Object.prototype.toString.call(args.bot_id) === "[object String]") ? args.bot_id : "another bot";
+      const raw = (Object.prototype.toString.call(args.message) === "[object String]") ? args.message : "";
       const text = raw.replace(/\s+/g, " ").trim();
       return text ? `delegate to ${target}: ${text.slice(0, 120)}` : `delegate to ${target}`;
     },
@@ -537,7 +537,7 @@ const BASH: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const raw = typeof args.command === "string" ? args.command : "";
+      const raw = (Object.prototype.toString.call(args.command) === "[object String]") ? args.command : "";
       const text = raw.replace(/\s+/g, " ").trim();
       return text ? `bash: ${text.slice(0, 160)}` : "bash";
     },
@@ -604,7 +604,7 @@ const WRITE_FILE: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const p = typeof args.path === "string" ? args.path : "file";
+      const p = (Object.prototype.toString.call(args.path) === "[object String]") ? args.path : "file";
       return `write file ${p}`;
     },
   },
@@ -641,7 +641,7 @@ const EDIT_FILE: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const p = typeof args.path === "string" ? args.path : "file";
+      const p = (Object.prototype.toString.call(args.path) === "[object String]") ? args.path : "file";
       return `edit file ${p}`;
     },
   },
@@ -710,7 +710,7 @@ const RECALL_CONTRIBUTE: HarnessTool = {
   approval: {
     policy: "ask",
     summary: (args) => {
-      const text = typeof args.text === "string" ? args.text.replace(/\s+/g, " ").trim() : "";
+      const text = (Object.prototype.toString.call(args.text) === "[object String]") ? args.text.replace(/\s+/g, " ").trim() : "";
       return text ? `recall_contribute: ${text.slice(0, 120)}` : "recall_contribute";
     },
   },
@@ -771,7 +771,7 @@ const PHONE_OPEN_APP: HarnessTool = {
   gate: phoneEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `phone: open ${typeof args.name === "string" ? args.name : "app"}` },
+  approval: { policy: "ask", summary: (args) => `phone: open ${(Object.prototype.toString.call(args.name) === "[object String]") ? args.name : "app"}` },
 };
 
 const PHONE_TAP_TEXT: HarnessTool = {
@@ -791,7 +791,7 @@ const PHONE_TAP_TEXT: HarnessTool = {
   gate: phoneEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `phone: tap "${typeof args.text === "string" ? args.text : ""}"` },
+  approval: { policy: "ask", summary: (args) => `phone: tap "${(Object.prototype.toString.call(args.text) === "[object String]") ? args.text : ""}"` },
 };
 
 const PHONE_TAP: HarnessTool = {
@@ -821,7 +821,7 @@ const PHONE_SWIPE: HarnessTool = {
   gate: phoneEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `phone: swipe ${typeof args.direction === "string" ? args.direction : ""}` },
+  approval: { policy: "ask", summary: (args) => `phone: swipe ${(Object.prototype.toString.call(args.direction) === "[object String]") ? args.direction : ""}` },
 };
 
 const PHONE_TYPE_TEXT: HarnessTool = {
@@ -857,7 +857,7 @@ const PHONE_PRESS: HarnessTool = {
   gate: phoneEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `phone: press ${typeof args.key === "string" ? args.key : ""}` },
+  approval: { policy: "ask", summary: (args) => `phone: press ${(Object.prototype.toString.call(args.key) === "[object String]") ? args.key : ""}` },
 };
 
 const GITHUB_CLONE: HarnessTool = {
@@ -875,7 +875,7 @@ const GITHUB_CLONE: HarnessTool = {
   gate: githubEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `github: clone ${typeof args.repo === "string" ? args.repo : ""}` },
+  approval: { policy: "ask", summary: (args) => `github: clone ${(Object.prototype.toString.call(args.repo) === "[object String]") ? args.repo : ""}` },
 };
 
 const GITHUB_STATUS: HarnessTool = {
@@ -908,7 +908,7 @@ const GITHUB_COMMIT: HarnessTool = {
   gate: githubEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `github: commit "${typeof args.message === "string" ? args.message.slice(0, 100) : ""}"` },
+  approval: { policy: "ask", summary: (args) => `github: commit "${(Object.prototype.toString.call(args.message) === "[object String]") ? args.message.slice(0, 100) : ""}"` },
 };
 
 const GITHUB_PUSH: HarnessTool = {
@@ -926,7 +926,7 @@ const GITHUB_PUSH: HarnessTool = {
   gate: githubEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `github: push ${typeof args.branch === "string" ? args.branch : "(current branch)"}` },
+  approval: { policy: "ask", summary: (args) => `github: push ${(Object.prototype.toString.call(args.branch) === "[object String]") ? args.branch : "(current branch)"}` },
 };
 
 const GITHUB_PR_CREATE: HarnessTool = {
@@ -947,7 +947,7 @@ const GITHUB_PR_CREATE: HarnessTool = {
   gate: githubEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `github: open PR "${typeof args.title === "string" ? args.title.slice(0, 100) : ""}"` },
+  approval: { policy: "ask", summary: (args) => `github: open PR "${(Object.prototype.toString.call(args.title) === "[object String]") ? args.title.slice(0, 100) : ""}"` },
 };
 
 const GITHUB_PR_VIEW: HarnessTool = {
@@ -1015,7 +1015,7 @@ const GITHUB_ISSUE_CREATE: HarnessTool = {
   gate: githubEnabled,
   sideEffect: "write",
   settles: "immediate",
-  approval: { policy: "ask", summary: (args) => `github: open issue "${typeof args.title === "string" ? args.title.slice(0, 100) : ""}"` },
+  approval: { policy: "ask", summary: (args) => `github: open issue "${(Object.prototype.toString.call(args.title) === "[object String]") ? args.title.slice(0, 100) : ""}"` },
 };
 
 const GITHUB_ISSUE_VIEW: HarnessTool = {
@@ -1122,10 +1122,13 @@ export function mcpToolDefinitions(ctx: ToolGateContext): McpToolDefinition[] {
 }
 
 export function httpToolDefinitions(ctx: ToolGateContext): HttpToolDefinition[] {
-  return toolsFor("http", ctx).map((tool) => ({
-    name: tool.name,
-    description: descriptionFor(tool, "http"),
-    parameters: schemaFor(tool, "http"),
-    ...(tool.timeoutMs === undefined ? {} : { timeoutMs: tool.timeoutMs }),
-  }));
+  return toolsFor("http", ctx).map((tool) => {
+    const def = {
+      name: tool.name,
+      description: descriptionFor(tool, "http"),
+      parameters: schemaFor(tool, "http"),
+    };
+    if (tool.timeoutMs !== undefined) def.timeoutMs = tool.timeoutMs;
+    return def;
+  });
 }

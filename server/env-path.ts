@@ -277,7 +277,10 @@ function nodeExe(near: string): string | null {
   // make a stray node.cmd hide the real node.exe beside it.
   const onPath = whichWin("node.exe");
   if (onPath && extname(onPath).toLowerCase() === ".exe") return onPath;
-  return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
+  // SAFETY: process.versions is a node-blessed Record<string, string>; the
+// .electron key is undefined when running under plain Node and a string
+// path under Electron, which is the only branch we care about here.
+return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
 }
 
 /** npm/pnpm .cmd shims all spell their target as "%dp0%\..." (or

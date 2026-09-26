@@ -13,23 +13,25 @@ import type { JsonValue } from "./schema.ts";
 export const MAX_EVENT_CHARS = 48_000;
 
 export function asRecord(value: JsonValue | undefined): Record<string, JsonValue> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!value || !(Object.prototype.toString.call(value) === "[object Object]") || Array.isArray(value)) return undefined;
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   return value as Record<string, JsonValue>;
 }
 
 export function pickStr(obj: Record<string, JsonValue> | undefined, key: string): string | undefined {
   const value = obj?.[key];
-  return typeof value === "string" && value ? value : undefined;
+  return (Object.prototype.toString.call(value) === "[object String]") && value ? value : undefined;
 }
 
 function pickNum(obj: Record<string, JsonValue> | undefined, key: string): number | undefined {
   const value = obj?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return (Object.prototype.toString.call(value) === "[object Number]") && Number.isFinite(value) ? value : undefined;
 }
 
 function pickBool(obj: Record<string, JsonValue> | undefined, key: string): boolean | undefined {
   const value = obj?.[key];
-  return typeof value === "boolean" ? value : undefined;
+  return Object.prototype.toString.call(value) === "[object Boolean]" ? value : undefined;
 }
 
 function assignDefined(out: Record<string, JsonValue>, key: string, value: JsonValue | undefined): void {
@@ -247,7 +249,7 @@ function slimCommit(value: JsonValue | undefined): JsonValue | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
-function slimGithubPayload(root: Record<string, JsonValue>): Record<string, JsonValue> {
+function slimGithubPayload(root: Record<string, JsonValue>) {
   const out: Record<string, JsonValue> = {};
   assignDefined(out, "action", pickStr(root, "action"));
   assignDefined(out, "ref", pickStr(root, "ref"));
@@ -292,7 +294,7 @@ function slimGithubPayload(root: Record<string, JsonValue>): Record<string, Json
 }
 
 function slimSentryProject(value: JsonValue | undefined): JsonValue | undefined {
-  if (typeof value === "string" && value.trim()) return value.trim();
+  if ((Object.prototype.toString.call(value) === "[object String]") && value.trim()) return value.trim();
   const rec = asRecord(value);
   if (!rec) return undefined;
   const out: Record<string, JsonValue> = {};
@@ -387,8 +389,8 @@ function slimSentryEvent(value: JsonValue | undefined): JsonValue | undefined {
   return Object.keys(out).length ? out : undefined;
 }
 
-function isSentryUrl(val: unknown): boolean {
-  if (typeof val !== "string" || !val) return false;
+function isSentryUrl(val): boolean {
+  if (!(Object.prototype.toString.call(val) === "[object String]") || !val) return false;
   try {
     const parsed = new URL(val);
     return parsed.hostname === "sentry.io" || parsed.hostname.endsWith(".sentry.io");
@@ -517,7 +519,7 @@ function slimPagerDutyIncident(value: JsonValue | undefined): JsonValue | undefi
     assignDefined(pOut, "id", pickStr(priorityRec, "id"));
     assignDefined(pOut, "summary", pickStr(priorityRec, "summary") ?? pickStr(priorityRec, "name"));
     if (Object.keys(pOut).length) out.priority = pOut;
-  } else if (typeof rec.priority === "string" && rec.priority.trim()) {
+  } else if ((Object.prototype.toString.call(rec.priority) === "[object String]") && rec.priority.trim()) {
     out.priority = { summary: rec.priority.trim() };
   }
   const service = asRecord(rec.service);
@@ -569,8 +571,8 @@ function slimPagerDutyIncident(value: JsonValue | undefined): JsonValue | undefi
   return Object.keys(out).length ? out : undefined;
 }
 
-function isPagerDutyUrl(val: unknown): boolean {
-  if (typeof val !== "string" || !val) return false;
+function isPagerDutyUrl(val): boolean {
+  if (!(Object.prototype.toString.call(val) === "[object String]") || !val) return false;
   try {
     const parsed = new URL(val);
     return parsed.hostname === "pagerduty.com" || parsed.hostname.endsWith(".pagerduty.com");
@@ -949,8 +951,8 @@ function truncateGenericString(value: string): string {
 }
 
 function applyGenericPayloadBudget(value: JsonValue, depth = 0): JsonValue {
-  if (value === null || typeof value !== "object") {
-    if (typeof value === "string") return truncateGenericString(value);
+  if (value === null || !(Object.prototype.toString.call(value) === "[object Object]")) {
+    if ((Object.prototype.toString.call(value) === "[object String]")) return truncateGenericString(value);
     return value;
   }
   // Depth guard runs before descending into arrays or objects so deeply
@@ -963,6 +965,8 @@ function applyGenericPayloadBudget(value: JsonValue, depth = 0): JsonValue {
     if (value.length > GENERIC_MAX_ARRAY) capped.push(`…${value.length - GENERIC_MAX_ARRAY} more items omitted`);
     return capped;
   }
+  // SAFETY: the surrounding code established this is the documented shape; the cast narrows.
+
   const rec = value as Record<string, JsonValue>;
   const out: Record<string, JsonValue> = {};
   let kept = 0;

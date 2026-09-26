@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { DATA_DIR } from "./config.ts";
 import type { TurnBillingMode } from "./contracts.ts";
 import { FailureLogDedup } from "./log-dedup.ts";
+import type { JsonValue } from "./schema.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import {
   UsageTelemetryOutbox,
@@ -117,8 +118,9 @@ export interface TelemetryV2Event {
   confidence: "actual" | "estimated";
   occurredAt: string;
   metadata: TelemetryMetadata;
-  // Durable outbox events are an open bag; this keeps v2 events assignable.
-  [key: string]: unknown;
+  // Durable outbox events are an open bag; the index signature is bounded
+  // by JsonValue so callers have a concrete contract for out-of-band fields.
+  [key: string]: JsonValue;
 }
 
 /** One v2 batch exactly as it goes on the wire.  `producerId` is the fleet
@@ -746,11 +748,11 @@ export class UsageTelemetryManager {
       this.lastError = error;
       this.failureLog.report(`http-${res.status}`, error);
       const terminalStatus = terminalStatusFor(res.status);
-      const result: { ok: boolean; error: string | null; acknowledged: boolean; rejected: number; terminalStatus?: TerminalHttpStatus } = {
-        ok: false,
+      const result = {
+        ok: false as const,
         error,
-        acknowledged: false,
-        rejected: 0,
+        acknowledged: false as const,
+        rejected: 0 as const,
       };
       if (terminalStatus !== undefined) result.terminalStatus = terminalStatus;
       return result;

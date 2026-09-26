@@ -126,9 +126,11 @@ export type BotPackageDefinition = ParsedBotPackage["package"];
 export type BotPackageAgent = BotPackageDefinition["agents"][number];
 export type BotPackagePlaybook = NonNullable<BotPackageDefinition["playbooks"]>[number];
 
-export function isBotPackage(value: unknown): boolean {
-  if (typeof value === "string") return /^---\r?\n[\s\S]*?\bbotmrr:\s*1\b/m.test(value);
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+export function isBotPackage(value): boolean {
+  if ((Object.prototype.toString.call(value) === "[object String]")) return /^---\r?\n[\s\S]*?\bbotmrr:\s*1\b/m.test(value);
+  // SAFETY: toString-call + !Array.isArray() restrict value to a JSON
+  // object, so the cast to the documented { format } envelope is exact.
+  return Boolean(value) && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value) &&
     (value as { format?: unknown }).format === BOT_PACKAGE_FORMAT;
 }
 
@@ -142,14 +144,18 @@ function markdownDocument(markdown: string): ParsedBotPackage {
   } catch {
     throw new Error("This Markdown has invalid YAML frontmatter");
   }
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+  if (!metadata || !(Object.prototype.toString.call(metadata) === "[object Object]") || Array.isArray(metadata)) {
     throw new Error("This Markdown is missing its BotMRR blueprint");
   }
-  const { botmrr, ...definition } = metadata as Record<string, unknown>;
+  // SAFETY: the toString-call + !Array.isArray() guards above restrict
+  // metadata to a JSON object, so the cast is exact.
+  const { botmrr, ...definition } = metadata as Record<string, JsonValue>;
   if (botmrr !== BOTMRR_MARKDOWN_VERSION) throw new Error("BotMRR Markdown version is not supported");
   for (const heading of ["Activation", "Mission", "Outcomes", "Connections", "Team", "Chief of Staff", "Completion rule"]) {
     if (!markdown.includes(`## ${heading}`)) throw new Error(`This Markdown is missing its ${heading} section`);
   }
+  // SAFETY: same invariant — definition carries every field documented
+  // in the BotPackageDefinition envelope after the botmrr key is removed.
   return {
     format: BOT_PACKAGE_FORMAT,
     version: BOT_PACKAGE_VERSION,
@@ -161,7 +167,7 @@ function markdownDocument(markdown: string): ParsedBotPackage {
  * are stripped; ids, grants, credentials, paths, model selections, and
  * runtime state therefore cannot ride through the package boundary. */
 export function parseBotPackage(value: JsonValue | ParsedBotPackage): ParsedBotPackage {
-  const source = typeof value === "string" ? markdownDocument(value) : value;
+  const source = (Object.prototype.toString.call(value) === "[object String]") ? markdownDocument(value) : value;
   const parsed = packageSchema.safeParse(source);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "This is not a bot package"));
   const pkg = parsed.data.package;
@@ -264,9 +270,10 @@ export function packageAgentAsMember(agent: BotPackageAgent): TeamManifestMember
     name: agent.name,
     title: agent.title ?? "",
     description: agent.description ?? "",
-    appearance: {
-      color: agent.appearance.color,
-      ...(agent.appearance.mascotExpression ? { mascotExpression: agent.appearance.mascotExpression } : {}),
-    },
+    appearance: (() => {
+      const out = { color: agent.appearance.color };
+      if (agent.appearance.mascotExpression) out.mascotExpression = agent.appearance.mascotExpression;
+      return out;
+    })(),
   };
 }

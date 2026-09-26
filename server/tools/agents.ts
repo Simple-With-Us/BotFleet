@@ -16,6 +16,7 @@
 // reaches an endpoint function.
 
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
+import type { JsonValue } from "../schema.ts";
 import { sectionKey } from "../store.ts";
 import { MAX_CREATED_BOTS_PER_TURN } from "./registry.ts";
 import { routineFields } from "./schedule.ts";
@@ -47,7 +48,7 @@ export interface AgentPeerRow {
  *  response carries, so one function serves the endpoint and the host. */
 export interface AgentRequestResult {
   status: number;
-  body: Record<string, unknown>;
+  body: Record<string, JsonValue>;
 }
 
 /** THE peer filter.  Same section, not hidden, and never the caller itself,
@@ -142,9 +143,9 @@ export interface RoutineRequestInput {
   // outright, and this keeps that rule visible at the type.
   fromThreadId: string;
   action: "create" | "update" | "pause" | "resume" | "run_now" | "delete";
-  routine?: Record<string, unknown>;
+  routine?: Record<string, JsonValue>;
   routineId?: string;
-  changes?: Record<string, unknown>;
+  changes?: Record<string, JsonValue>;
 }
 
 /** Every dependency the agents tools have, named.  Each one is an
@@ -213,16 +214,16 @@ const ok = (content: string, detail?: string): TurnToolOutcome =>
 const failed = (content: string, detail?: string): TurnToolOutcome =>
   detail ? { kind: "error", content, detail } : { kind: "error", content };
 
-const errorText = (body: Record<string, unknown>, fallback: string): string =>
-  typeof body.error === "string" && body.error ? body.error : fallback;
+const errorText = (body: Record<string, JsonValue>, fallback: string): string =>
+  (Object.prototype.toString.call(body.error) === "[object String]") && body.error ? body.error : fallback;
 
-function jsonRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+function jsonRecord(value): value is Record<string, JsonValue> {
+  return value !== null && (Object.prototype.toString.call(value) === "[object Object]") && !Array.isArray(value);
 }
 
 type RoutineAction = "update" | "pause" | "resume" | "run_now" | "delete";
 
-function routineAction(value: unknown): RoutineAction | null {
+function routineAction(value): RoutineAction | null {
   return value === "update" || value === "pause" || value === "resume" || value === "run_now" || value === "delete"
     ? value
     : null;
@@ -232,8 +233,8 @@ function routineAction(value: unknown): RoutineAction | null {
  *  proposal endpoint made a card, the turn has to end here, and the model
  *  must not claim the change already happened.  One function so the two
  *  tools cannot say it differently. */
-function routineSuspendOutcome(body: Record<string, unknown>, fallback: string): TurnToolOutcome {
-  const summary = typeof body.summary === "string" && body.summary.trim() ? `\n\n${body.summary.trim()}` : "";
+function routineSuspendOutcome(body: Record<string, JsonValue>, fallback: string): TurnToolOutcome {
+  const summary = (Object.prototype.toString.call(body.summary) === "[object String]") && body.summary.trim() ? `\n\n${body.summary.trim()}` : "";
   return {
     kind: "suspend",
     content: `A confirmation card is now visible to the user for ${fallback}.${summary}\n\nThis change has not been applied yet. End this turn and wait for the user to confirm or deny the card; do not claim the routine was created or changed before confirmation.`,
@@ -263,7 +264,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     // `selectPeerBots`.  The `Array.isArray` guard above rules out the 403
     // shape.
     return {
-      section: typeof result.body.section === "string" ? result.body.section : "",
+      section: (Object.prototype.toString.call(result.body.section) === "[object String]") ? result.body.section : "",
       rows: result.body.bots as AgentPeerRow[],
     };
   }
@@ -271,7 +272,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
   return {
     async list_bots(_call, ctx): Promise<TurnToolOutcome> {
       const list = await roster(ctx);
-      if (typeof list === "string") {
+      if ((Object.prototype.toString.call(list) === "[object String]")) {
         return failed(JSON.stringify({ error: list }), list);
       }
       const { section, rows } = list;
@@ -294,7 +295,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         );
       }
       const list = await roster(ctx);
-      if (typeof list === "string") return failed(JSON.stringify({ error: list }), list);
+      if ((Object.prototype.toString.call(list) === "[object String]")) return failed(JSON.stringify({ error: list }), list);
       // Resolved against the roster the model was actually shown, so a bot
       // it cannot see is a bot it cannot reach.
       const peer = list.rows.find((row) => row.id === target || `@${row.name}` === target);
@@ -319,8 +320,8 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         const message = String(result.body.error);
         return failed(JSON.stringify({ error: message }), message);
       }
-      const reply = typeof result.body.text === "string" ? result.body.text : "";
-      const name = typeof result.body.botName === "string" ? result.body.botName : peer.name;
+      const reply = (Object.prototype.toString.call(result.body.text) === "[object String]") ? result.body.text : "";
+      const name = (Object.prototype.toString.call(result.body.botName) === "[object String]") ? result.body.botName : peer.name;
       if (!reply) return failed(JSON.stringify({ error: "no reply" }), "no reply");
       return ok(`${name} replied:\n${reply}`, `@${name} replied`);
     },
@@ -328,7 +329,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     async delegate_bot(call, ctx): Promise<TurnToolOutcome> {
       const target = String(call.arguments.bot_id ?? "").trim();
       const message = String(call.arguments.message ?? "").trim();
-      const reason = typeof call.arguments.reason === "string" ? call.arguments.reason.trim() : "";
+      const reason = (Object.prototype.toString.call(call.arguments.reason) === "[object String]") ? call.arguments.reason.trim() : "";
       if (!target || !message) {
         return failed(
           JSON.stringify({ error: "delegate_bot requires both `bot_id` and `message`" }),
@@ -344,13 +345,21 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         message,
         depth: ctx.commsDepth,
         fromThreadId: ctx.threadId,
-        ...(reason ? { reason } : {}),
       });
+      const delegateBody: any = {
+        fromBotId: ctx.botId,
+        toBotId: target,
+        message,
+        depth: ctx.commsDepth,
+        fromThreadId: ctx.threadId,
+      };
+      if (reason) delegateBody.reason = reason;
+      const result = await deps.executeDelegateBotRequest(delegateBody);
       if (result.body.error) {
         const errorMessage = String(result.body.error);
         return failed(JSON.stringify({ error: errorMessage }), errorMessage);
       }
-      const text = typeof result.body.message === "string" ? result.body.message : "Delegation queued.";
+      const text = (Object.prototype.toString.call(result.body.message) === "[object String]") ? result.body.message : "Delegation queued.";
       return ok(text);
     },
 
@@ -384,21 +393,21 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         return failed(JSON.stringify({ error: message }), message);
       }
       createdThisTurn += 1;
-      const createdName = typeof result.body.name === "string" ? result.body.name : name;
-      const section = typeof result.body.section === "string" ? result.body.section : "General";
+      const createdName = (Object.prototype.toString.call(result.body.name) === "[object String]") ? result.body.name : name;
+      const section = (Object.prototype.toString.call(result.body.section) === "[object String]") ? result.body.section : "General";
       return ok(`Created @${createdName} in ${section} [id: ${result.body.id}]. Assign work with delegate_bot.`);
     },
 
     async request_credential(call, ctx): Promise<TurnToolOutcome> {
       const credentialId = call.arguments.credential_id;
-      if (typeof credentialId !== "string" || !credentialId) {
+      if (!(Object.prototype.toString.call(credentialId) === "[object String]") || !credentialId) {
         return failed(
           JSON.stringify({ error: "request_credential needs a supported credential_id" }),
           "bad arguments",
         );
       }
       const reason =
-        typeof call.arguments.reason === "string" ? call.arguments.reason.trim().slice(0, 240) : "";
+        (Object.prototype.toString.call(call.arguments.reason) === "[object String]") ? call.arguments.reason.trim().slice(0, 240) : "";
       // The allowlist itself is enforced by executeRequestCredentialRequest
       // — the one place both lanes reach it — so this stays free of the
       // credential target list.
@@ -412,7 +421,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
         const message = errorText(result.body, "that credential is not supported");
         return failed(JSON.stringify({ error: message }), message);
       }
-      const label = typeof result.body.label === "string" ? result.body.label : "That credential";
+      const label = (Object.prototype.toString.call(result.body.label) === "[object String]") ? result.body.label : "That credential";
       if (result.body.alreadyConfigured) {
         // Nothing to show, nothing to wait for — the loop keeps going.
         return ok(`${label} is already configured. Continue the task.`);
@@ -429,7 +438,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
     },
 
     async list_routines(call, ctx): Promise<TurnToolOutcome> {
-      const routineId = typeof call.arguments.routine_id === "string"
+      const routineId = (Object.prototype.toString.call(call.arguments.routine_id) === "[object String]")
         ? call.arguments.routine_id.trim()
         : "";
       const result = await deps.executeListRoutinesRequest({
@@ -444,7 +453,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       const routines = Array.isArray(result.body.routines) ? result.body.routines : [];
       const routine = result.body.routine;
       // A budget-trimmed list must say so, or it reads as complete.
-      const omitted = typeof result.body.routinesOmitted === "number" && result.body.routinesOmitted > 0
+      const omitted = (Object.prototype.toString.call(result.body.routinesOmitted) === "[object Number]") && result.body.routinesOmitted > 0
         ? result.body.routinesOmitted
         : 0;
       const listed = routines.length === 1 ? "1 routine" : `${routines.length} routines`;
@@ -489,7 +498,7 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
           "bad arguments",
         );
       }
-      let changes: Record<string, unknown> | undefined;
+      let changes: Record<string, JsonValue> | undefined;
       if (action === "update") {
         if (!jsonRecord(call.arguments.changes)) {
           return failed(

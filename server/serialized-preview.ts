@@ -3,7 +3,7 @@
  * (3 bytes each) and control characters (a NUL serializes as the 6-byte
  * "\u0000"), so a unit-count slice can blow a response budget; walking code
  * points also never splits an emoji's surrogate pair. */
-export function serializedPreview(text: string, maxBytes: number): { preview: string; truncated: boolean } {
+export function serializedPreview(text: string, maxBytes: number) {
   let bytes = 0;
   let end = 0;
   for (const codePoint of text) {
@@ -23,13 +23,13 @@ export function serializedPreview(text: string, maxBytes: number): { preview: st
  * `routine_id` lookup away), then drop trailing rows and report how many
  * were omitted. */
 export function fitListToBudget<T extends { instructionsPreview: string; instructionsPreviewTruncated: boolean }>(
-  envelope: Record<string, unknown>,
+  envelope: Record<string, string | number | boolean | null>,
   rows: readonly T[],
   maxBytes: number,
   /** Rows the caller already cut before this call (the 100-row cap).  They
    * count toward routinesOmitted, and the budget includes that field. */
   alreadyOmitted = 0,
-): { routines: T[]; routinesOmitted?: number } {
+) {
   const kept = rows.map((row) => ({ ...row }));
   let omitted = Math.max(0, alreadyOmitted);
   const body = () => (omitted > 0 ? { routines: kept, routinesOmitted: omitted } : { routines: kept });

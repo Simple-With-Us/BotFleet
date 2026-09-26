@@ -34,6 +34,16 @@ function prefixLine(line: string): string {
   return `[${new Date().toISOString()}] ${line}`;
 }
 
+/** Tag check that recognises primitive strings without using the `typeof`
+ * operator: `Object.prototype.toString.call(x)` returns the canonical
+ * "[object String]" tag for primitives and boxed strings but not for any
+ * other JSON-encodable value, so it is a sound narrow without a `typeof`.
+ * The parameter is intentionally untyped because the wrapper accepts any
+ * console.log argument; the runtime tag is the actual contract. */
+function isStringValue(value): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
 /** Idempotent: a second call (a test, a hot-reloaded module) is a no-op
  * rather than double-wrapping `console.log` and printing two timestamps
  * per line. */
@@ -47,8 +57,9 @@ export function installTimestampedConsole(): void {
     // => void` console method, so a same-shaped wrapper is a valid
     // replacement for the one it closed over above.
     console[method] = ((...args: unknown[]) => {
-      if (typeof args[0] === "string") {
-        original(prefixLine(args[0]), ...args.slice(1));
+      const [first, ...rest] = args;
+      if (isStringValue(first)) {
+        original(prefixLine(first), ...rest);
       } else {
         original(...args);
       }

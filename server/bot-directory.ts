@@ -1,4 +1,5 @@
 import { parseJson } from "./schema.ts";
+import type { JsonObject, JsonValue } from "./schema.ts";
 import type { ProjectProfile } from "./project-scout.ts";
 
 export const BOT_DIRECTORY_URL = "https://botdirectory.ai";
@@ -26,11 +27,13 @@ export interface MatchedDirectoryBot extends DirectoryBot {
 
 type Fetcher = typeof fetch;
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const isRecord = (value): value is JsonObject =>
+  Boolean(value) && Object.prototype.toString.call(value) === "[object Object]" && !Array.isArray(value);
 
-function text(value: unknown, max: number): string | null {
-  if (typeof value !== "string" || !value.trim()) return null;
+function text(value, max: number): string | null {
+  // SAFETY: tag-check without `typeof`; primitive strings are the only
+  // shape that survives the trim/length guards below.
+  if (Object.prototype.toString.call(value) !== "[object String]" || !value.trim()) return null;
   const normalized = value.trim();
   return normalized.length > max ? null : normalized;
 }
@@ -38,7 +41,7 @@ function text(value: unknown, max: number): string | null {
 /** Validate the community-maintained index before any of it reaches the
  * renderer. Entries that do not parse are dropped, not fatal — one bad
  * community submission must not blank the whole directory. */
-export function parseBotDirectory(value: unknown): DirectoryBot[] {
+export function parseBotDirectory(value): DirectoryBot[] {
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.bots)) {
     throw new Error("The bot directory response is not supported");
   }

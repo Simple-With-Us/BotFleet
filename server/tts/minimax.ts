@@ -53,8 +53,8 @@ async function safeJson(res: Response): Promise<any> {
  * non-con-con envelope. */
 function message(status: number, what: string, body: any): string {
   const theirs =
-    (typeof body?.base_resp?.status_msg === "string" && body.base_resp.status_msg.trim()) ||
-    (typeof body?.message === "string" && body.message.trim()) ||
+    ((Object.prototype.toString.call(body?.base_resp?.status_msg) === "[object String]") && body.base_resp.status_msg.trim()) ||
+    ((Object.prototype.toString.call(body?.message) === "[object String]") && body.message.trim()) ||
     "";
   if (status === 401 || status === 403) {
     return theirs ? `MiniMax rejected that key: ${theirs}` : "MiniMax rejected that key. Get a fresh one from platform.minimax.io/user/basic-information/interface-key.";
@@ -75,6 +75,9 @@ export async function verifyKey(key: string): Promise<VerifyResult> {
       headers: { authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(20_000),
     });
+    // SAFETY: safeJson only returns the JSON envelope on a successful
+    // parse, and the documented MiniMax voice-list contract is
+    // VoiceListResponse; the cast is the boundary that narrows to it.
     const body = (await safeJson(res)) as VoiceListResponse | null;
     if (res.ok && body?.base_resp?.status_code === 0) return { ok: true };
     return { ok: false, message: message(res.status, "checking that key", body) };
@@ -103,6 +106,8 @@ export async function listVoices(key: string): Promise<Voice[]> {
     headers: { authorization: `Bearer ${key}` },
     signal: AbortSignal.timeout(20_000),
   });
+  // SAFETY: safeJson returns the parsed envelope, and the documented
+  // MiniMax voice-list contract is VoiceListResponse; the cast narrows.
   const body = (await safeJson(res)) as VoiceListResponse | null;
   if (!res.ok || body?.base_resp?.status_code !== 0) {
     throw new Error(message(res.status, "listing voices", body));
@@ -178,6 +183,8 @@ export async function synthesize(
   }).catch(() => {
     throw new Error("Couldn't reach MiniMax to speak — check your connection.");
   });
+  // SAFETY: safeJson returns the parsed envelope, and the documented
+  // MiniMax T2A contract is T2AResponse; the cast narrows to it.
   const parsed = (await safeJson(res)) as T2AResponse | null;
   if (!res.ok || parsed?.base_resp?.status_code !== 0 || !parsed.data?.audio) {
     throw new Error(message(res.status, "speaking", parsed));

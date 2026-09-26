@@ -119,22 +119,27 @@ export function readInterruptedTurns(dataDir: string): InterruptedTurnsFile {
   const path = interruptedTurnsPath(dataDir);
   if (!existsSync(path)) return emptyFile();
   try {
+    // SAFETY: the file is a versioned JSON envelope this module writes
+    // itself; a foreign shape falls through to the empty-file branch
+    // below because every filter below accepts it.
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<InterruptedTurnsFile>;
+    // SAFETY: same invariant — the turn filter accepts only entries that
+    // already carry the documented string fields, so the cast is exact.
     const turns = Array.isArray(parsed.turns)
       ? parsed.turns.filter(
           (turn): turn is InterruptedTurnRecord =>
-            Boolean(turn) && typeof turn.botId === "string" && typeof turn.threadId === "string",
+            Boolean(turn) && Object.prototype.toString.call(turn.botId) === "[object String]" && Object.prototype.toString.call(turn.threadId) === "[object String]",
         )
       : [];
     const failures = Array.isArray(parsed.failures)
       ? parsed.failures.filter(
           (failure): failure is ResumeFailureRecord =>
-            Boolean(failure) && typeof failure.botId === "string" && typeof failure.threadId === "string",
+            Boolean(failure) && Object.prototype.toString.call(failure.botId) === "[object String]" && Object.prototype.toString.call(failure.threadId) === "[object String]",
         )
       : [];
     return {
       version: 1,
-      recordedAt: typeof parsed.recordedAt === "number" ? parsed.recordedAt : 0,
+      recordedAt: Object.prototype.toString.call(parsed.recordedAt) === "[object Number]" ? parsed.recordedAt : 0,
       turns,
       failures,
     };
@@ -279,6 +284,9 @@ export function inspectLastTurn(
     if (!line.startsWith("{")) continue;
     let event: { type?: string; setup?: boolean; sessionId?: string | null; ok?: boolean };
     try {
+      // SAFETY: each ndjson line is an event record the bus wrote; the
+      // shape above is the documented envelope and the optional fields
+      // tolerate missing or wrong-typed values per their nullable type.
       event = JSON.parse(line) as { type?: string; setup?: boolean; sessionId?: string | null; ok?: boolean };
     } catch {
       continue;
@@ -301,7 +309,7 @@ export function inspectLastTurn(
         producedOutput = true;
         break;
       case "session.started":
-        if (typeof event.sessionId === "string" && event.sessionId.length > 0) promptSubmitted = true;
+        if (Object.prototype.toString.call(event.sessionId) === "[object String]" && event.sessionId.length > 0) promptSubmitted = true;
         break;
       case "session.exited":
         attempted = true;

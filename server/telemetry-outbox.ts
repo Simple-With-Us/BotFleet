@@ -4,10 +4,13 @@ import { dirname } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
+import type { JsonValue } from "./schema.ts";
 
 export interface DurableTelemetryEvent {
   eventId: string;
-  [key: string]: unknown;
+  // Durable outbox events are an open bag; bound the index signature to
+  // JsonValue so callers have a concrete contract for out-of-band fields.
+  [key: string]: JsonValue;
 }
 
 export interface DurableTelemetryBatch {
@@ -255,7 +258,7 @@ function sanitizeBatchForPersistence(batch: DurableTelemetryBatch): DurableTelem
       // durable retry file.
       sanitized.label = "BotFleet turn";
       const metadata = event.metadata;
-      if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+      if (metadata && Object.prototype.toString.call(metadata) === "[object Object]" && !Array.isArray(metadata)) {
         sanitized.metadata = Object.fromEntries(
           Object.entries(metadata).filter(([key]) => SAFE_METADATA_KEYS.has(key)),
         );
@@ -333,14 +336,18 @@ export class UsageTelemetryOutbox {
       .update(`${destinationHash}\0${batch.producerInstanceId}\0${batch.events.map((event) => event.eventId).join("\0")}`)
       .digest("hex");
     const persistedBatch = sanitizeBatchForPersistence(batch);
-    this.state.queue.push({
+    // SAFETY: sanitizeBatchForPersistence strips any field that is not in the
+    // v2 schema (see `v2TelemetryEventSchema`), so the result is byte-for-byte
+    // compatible with the StoredOutbox queue entry shape by construction.
+    const entry = {
       queueId,
       destinationHash,
       enqueuedAt,
-      attempts: 0,
-      nextAttemptAt: 0,
+      attempts: 0 as const,
+      nextAttemptAt: 0 as const,
       batch: persistedBatch as StoredOutbox["queue"][number]["batch"],
-    });
+    };
+    this.state.queue.push(entry);
     this.pendingDurability.add(queueId);
     // Stable event ids are on disk before the first network attempt begins.
     this.persist();

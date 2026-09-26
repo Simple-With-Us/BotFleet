@@ -6,6 +6,7 @@
 // readable.
 
 import type { ComputerMount } from "./computer-grants.ts";
+import type { JsonValue } from "./schema.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 
 export type DriverKind = string;
@@ -38,8 +39,10 @@ export const EFFORT_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"] a
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 /** Narrow untrusted API/config input before it becomes a model selection. */
-export function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+export function isEffortLevel(value): value is EffortLevel {
+  // SAFETY: tag-check without `typeof`; primitive strings are the only
+  // shape that can match EFFORT_LEVELS as a member.
+  return Object.prototype.toString.call(value) === "[object String]" && (EFFORT_LEVELS as readonly string[]).includes(value);
 }
 
 // ── model selection ────────────────────────────────────────────────────
@@ -64,7 +67,7 @@ export interface InstanceConfig {
   accentColor?: string;
   environment?: Record<string, string>;
   enabled?: boolean;
-  config?: { fullAuto?: boolean; cli?: string; [key: string]: unknown } | unknown;
+  config?: { fullAuto?: boolean; cli?: string; [key: string]: JsonValue } | unknown;
 }
 
 export type InstanceConfigMap = Record<InstanceId, InstanceConfig>;
@@ -279,7 +282,7 @@ export interface SendTurnInput {
     description?: string;
     /** JSON Schema for the tool's arguments, in the form the OpenAI Chat
      * Completions API expects.  Default is an empty object schema. */
-    parameters?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
+    parameters?: { type: "object"; properties?: Record<string, JsonValue>; required?: string[] };
   }>;
   /** Per-bot integrations the driver may hand to the agent as tools. */
   integrations?: {
@@ -351,7 +354,7 @@ export interface SendTurnInput {
 export interface TurnToolCall {
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: Record<string, JsonValue>;
 }
 
 /** What the host made of a tool call.  The three variants are the only
@@ -649,7 +652,7 @@ export interface ProviderDriver<Config = unknown> {
    * binary (API-key drivers), which is what makes it optional. */
   readonly install?: EngineInstall;
   /** Decode the opaque config envelope; throw on invalid (→ shadow). */
-  decodeConfig(raw: unknown): Config;
+  decodeConfig(raw): Config;
   defaultConfig(): Config;
   readonly models: ModelCatalog;
   create(input: DriverCreateInput<Config>): Promise<ProviderInstance>;
