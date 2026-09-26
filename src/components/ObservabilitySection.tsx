@@ -354,7 +354,6 @@ export function ObservabilitySection() {
                       const next = Number(e.target.value);
                       const rate = Number.isFinite(next) ? next : 0;
                       setHttpTracesSampleRate(rate);
-                      setTracesSampleRate(rate);
                       setSaveOk(false);
                     }}
                     onKeyDown={(e) => e.key === "Enter" && void save()}
