@@ -1202,7 +1202,9 @@ struct MessageRow: View {
             ForEach(Self.reactionChoices, id: \.self) { emoji in
                 Button(emoji) { Task { await session.react(to: message, in: chat.threadId, emoji: emoji) } }
             }
-            if message.role == .user, message.kind == .text,
+            if (message.role == .user ||
+                (message.role == .system && message.automationSource == "delegation")),
+               message.kind == .text,
                WebhookMessageView.parse(message.text) == nil,
                ImessageMessageView.parse(message.text) == nil,
                case let .bot(bot) = chat {
