@@ -26,7 +26,12 @@ export function automationSourceLabel(source: string | undefined, body: string):
       return "Webhook";
     case "schedule":
       return "Scheduled Run";
+    case "delegation":
+      return "Delegated Task";
     default:
+      if (body.startsWith("[Delegated by @") || body.includes("another bot in this BotFleet workspace")) {
+        return "Delegated Task";
+      }
       return body.includes("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run";
   }
 }

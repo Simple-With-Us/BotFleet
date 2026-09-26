@@ -27,7 +27,7 @@ export type RoutineSchedule =
  * configured computer tools, if any. */
 export type { RoutineRunOn } from "../shared/run-on.ts";
 
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource";
+export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "delegation";
 
 /** One shared task per bot for incoming events, one for calendar work. */
 export type AutomationLane = "trigger" | "schedule";

@@ -3106,7 +3106,7 @@ bus.subscribe((event: RuntimeEvent) => {
 /** How a drained delegation becomes a real turn on the target. Shared by
  * the settle-time drain and the boot-time drain of what a previous process
  * left queued. */
-const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel) => {
+const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel, options) => {
     // startTurn REJECTS on an ordinary condition — busy target, deleted bot,
     // unavailable provider. Unhandled, that rejection is fatal to the
     // harness (Node's default), which in the packaged app kills the server
@@ -3135,9 +3135,19 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
         tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
       });
     };
+    const sender = options?.sender;
+    const comm = channel && sender ? {
+      groupId: channel.id,
+      withBotId: sender.botId,
+      withName: sender.name,
+      withColor: sender.color,
+    } : undefined;
     return startTurn(toBotId, text, {
       commsDepth,
       unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
+      automationSource: "delegation",
+      from: sender,
+      comm,
       // startTurn schedules provider/integration setup after marking the bot
       // busy. Those asynchronous setup failures do not emit turn.completed,
       // so clear the watch and report them through this callback too.
@@ -3265,6 +3275,8 @@ async function startTurn(
     onDispatchError?: (message: string) => void;
     /** Override engine for this turn (model fallback).  Persistence is the caller's job. */
     modelSelection?: ModelSelection;
+    from?: Message["from"];
+    comm?: Message["comm"];
   },
 ) {
   if (runtimeQuiescing) {
@@ -3431,6 +3443,8 @@ async function startTurn(
           text,
           replyToId: opts?.replyTo?.id,
           automationSource: opts?.automationSource,
+          from: opts?.from,
+          comm: opts?.comm,
         });
   }
 

@@ -1234,7 +1234,15 @@ struct MessageRow: View {
     private var content: some View {
         switch message.kind {
         case .text:
-            if message.role == .system {
+            if let delegation = DelegationMessageView.parse(message.text, fromName: message.from?.name, automationSource: message.automationSource) {
+                ChannelEventCard(
+                    headline: delegation.headline,
+                    subtitle: delegation.subtitle,
+                    payload: delegation.payload,
+                    systemImage: "arrow.triangle.branch",
+                    accessibilityName: delegation.headline
+                )
+            } else if message.role == .system {
                 if let webhook = WebhookMessageView.parse(message.text) {
                     WebhookEventCard(view: webhook)
                 } else if let imessage = ImessageMessageView.parse(message.text) {
@@ -1308,7 +1316,12 @@ struct MessageRow: View {
             return "Webhook"
         case "schedule":
             return "Scheduled Run"
+        case "delegation":
+            return "Delegated Task"
         default:
+            if body.hasPrefix("[Delegated by @") || body.contains("another bot in this BotFleet workspace") {
+                return "Delegated Task"
+            }
             return body.contains("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run"
         }
     }
@@ -1408,7 +1421,7 @@ struct TextBubble: View {
     }
 
     var body: some View {
-        let mine = message.role == .user
+        let mine = message.role == .user && !DelegationMessageView.isDelegation(message.text, automationSource: message.automationSource)
         let customCard = parsedDiff != nil || parsedTable != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from

@@ -50,5 +50,15 @@ describe("automationSourceLabel", () => {
   it("prefers the persisted automationSource over sniffing", () => {
     expect(automationSourceLabel("manual", "[UNTRUSTED RESOURCE SAMPLE]")).toBe("Run Now");
     expect(automationSourceLabel("schedule", "anything")).toBe("Scheduled Run");
+    expect(automationSourceLabel("delegation", "anything")).toBe("Delegated Task");
+  });
+
+  it("sniffs delegation text marker when automationSource is missing", () => {
+    expect(
+      automationSourceLabel(
+        undefined,
+        "[Delegated by @Compiler, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nRun CI",
+      ),
+    ).toBe("Delegated Task");
   });
 });

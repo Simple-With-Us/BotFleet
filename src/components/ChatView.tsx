@@ -73,6 +73,8 @@ import { ToolLine } from "./ToolLine";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
+import { delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
+import { DelegationCard } from "./DelegationCard";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import {
@@ -273,7 +275,7 @@ function Bubble({
   // bot's `ask_bot` reply mirrored into this thread (`from.botId` set) —
   // but purple is reserved for what the human actually typed.  Auto
   // instructions are `role: "system"` and never sit on the human side.
-  const alignRight = message.role === "user";
+  const alignRight = message.role === "user" && !isDelegationMessage(message);
   const humanTyped = alignRight && !message.from?.botId;
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -888,6 +890,12 @@ const MessagesList = memo(function MessagesList({
                   </div>
                 );
               };
+              const delegationView = delegationMessageView(m.text ?? "", m.from?.name, m.automationSource);
+              if (delegationView) {
+                return withSystemChrome(
+                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
+                );
+              }
               const webhookView = autoDelivered ? webhookMessageView(m.text ?? "") : null;
               if (webhookView) return withSystemChrome(<WebhookCard view={webhookView} />);
               const imessageView = autoDelivered ? imessageMessageView(m.text ?? "") : null;
