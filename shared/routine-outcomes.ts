@@ -1,19 +1,10 @@
 export type RoutineOutcomeCode =
   | "completed" | "cancelled" | "capability_denied" | "auth_required"
   | "quota_exhausted" | "timeout" | "runtime_restart" | "runtime_reconfigured" | "bot_stopped"
-  | "bot_missing" | "thread_missing" | "dispatch_failed" | "engine_unavailable" | "resume_failed"
-  | "budget_exhausted" | "execution_failed" | "missed_offline" | "combined_unverified";
+  | "bot_missing" | "thread_missing" | "dispatch_failed" | "resume_failed"
+  | "execution_failed" | "missed_offline" | "combined_unverified";
 
 export type RoutineFailurePhase = "schedule" | "dispatch" | "execution" | "approval" | "lifecycle";
-
-/** Stop reasons that mean the ENGINE could not start, not that this run's work
- *  went wrong.  Only meaningful alongside the `setup` flag on the runtime
- *  error — a plain `spawn_error` from a mid-flight crash is a different fact
- *  and stays `dispatch_failed`. */
-const SETUP_REASONS: Record<string, RoutineOutcomeCode> = {
-  spawn_error: "engine_unavailable",
-  setup_required: "engine_unavailable",
-};
 
 const REASONS: Record<string, RoutineOutcomeCode> = {
   interrupted: "cancelled", cancelled: "cancelled", canceled: "cancelled",
@@ -22,12 +13,6 @@ const REASONS: Record<string, RoutineOutcomeCode> = {
   quota_exhausted: "quota_exhausted", rate_limit: "quota_exhausted",
   prompt_timeout: "timeout", prompt_stall: "timeout", turn_timeout: "timeout", permission_timeout: "timeout", timeout: "timeout",
   resume_failed: "resume_failed", spawn_error: "dispatch_failed",
-  // A turn that spent its tool-round ceiling did real work and stopped on a
-  // budget line, which is a different fact from a crash: the work is partial
-  // and resumable, the engine is fine, and the fix is a bigger `maxToolRounds`
-  // rather than a retry.  Filing it as `execution_failed` made a configured
-  // ceiling indistinguishable from a broken driver in receipts and digests.
-  tool_round_limit: "budget_exhausted",
   "BotFleet restarted while this routine was running": "runtime_restart",
   "The bot stopped before this run finished": "bot_stopped",
   "The assigned Bot no longer exists": "bot_missing",
@@ -36,24 +21,15 @@ const REASONS: Record<string, RoutineOutcomeCode> = {
 };
 
 /** Only fixed driver reasons and harness messages become diagnostic codes.
- * Arbitrary upstream text stays in the existing error field, never in labels.
- *
- *  `setup` is consulted FIRST, for the reasons it can explain.  The old order
- *  looked `setup` up last, so an ENOENT spawn — the single most common
- *  doomed-engine failure, and the one that kept a recurring trigger
- *  re-dispatching into a CLI that was not installed — was recorded as a plain
- *  `dispatch_failed`, indistinguishable from a transient dispatch throw.  The
- *  receipt then said the wrong thing and nothing downstream could tell a dead
- *  engine from a busy one. */
+ * Arbitrary upstream text stays in the existing error field, never in labels. */
 export function routineFailureCode(reason?: string | null, setup = false, denied = false): RoutineOutcomeCode {
-  if (setup && reason && Object.hasOwn(SETUP_REASONS, reason)) return SETUP_REASONS[reason];
   return (reason && Object.hasOwn(REASONS, reason) ? REASONS[reason] : undefined)
     ?? (denied ? "capability_denied" : setup ? "auth_required" : "execution_failed");
 }
 
 export function routineFailurePhase(code: RoutineOutcomeCode): RoutineFailurePhase {
   if (["runtime_restart", "runtime_reconfigured", "bot_stopped", "cancelled"].includes(code)) return "lifecycle";
-  if (["bot_missing", "thread_missing", "dispatch_failed", "auth_required", "engine_unavailable", "resume_failed"].includes(code)) return "dispatch";
+  if (["bot_missing", "thread_missing", "dispatch_failed", "auth_required", "resume_failed"].includes(code)) return "dispatch";
   if (code === "capability_denied") return "approval";
   if (code === "missed_offline") return "schedule";
   return "execution";
@@ -63,9 +39,7 @@ export const ROUTINE_OUTCOME_LABELS: Record<RoutineOutcomeCode, string> = {
   completed: "Completed", cancelled: "Cancelled", capability_denied: "Capability denied",
   auth_required: "Sign-in required", quota_exhausted: "Quota exhausted", timeout: "Timed out",
   runtime_restart: "Interrupted by restart", runtime_reconfigured: "Interrupted by settings change", bot_stopped: "Bot stopped", bot_missing: "Bot unavailable",
-  thread_missing: "Conversation unavailable", dispatch_failed: "Could not start", engine_unavailable: "Engine unavailable",
-  resume_failed: "Could not resume",
-  budget_exhausted: "Round budget reached",
+  thread_missing: "Conversation unavailable", dispatch_failed: "Could not start", resume_failed: "Could not resume",
   execution_failed: "Execution failed", missed_offline: "Missed while offline", combined_unverified: "Combined; outcome unavailable",
 };
 

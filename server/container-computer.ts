@@ -7,13 +7,13 @@
 // typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { augmentedPath } from "./env-path.ts";
-import { DATA_DIR } from "./config.ts";
+import { DATA_DIR, type AppConfig } from "./config.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 const run = promisify(execFile);
@@ -46,7 +46,27 @@ export const DRIVER_LABEL = "com.botfleet.cua-driver";
 export const BASE_IMAGE_LABEL = "com.botfleet.cua-base";
 export const WORKSPACE_LABEL = "com.botfleet.workspace";
 export const TARGET_LABEL = "com.botfleet.local-vm-target";
-export const VM_WORKSPACE_DIR = join(DATA_DIR, "vm-home");
+/** The Local VM workspace root, deliberately OUTSIDE `~/.botfleet`.
+ *
+ *  The desktop app opens anything under `DATA_DIR` on a single click from a
+ *  bot's Markdown link — `resolveOpenablePath` in electron/open-file.mjs
+ *  confines renderer-supplied paths to exactly that tree and then calls
+ *  `shell.openPath`, and the "Reveal Data Folder" item hands the whole
+ *  directory to the Finder.  A workspace inside that tree therefore turns a
+ *  bot's sandbox into a file the user can be talked into opening, with
+ *  whatever the bot had saved in it inside.
+ *
+ *  A sibling directory is outside every openable root, and it keeps the
+ *  migration below a single rename because it is the same volume as
+ *  `DATA_DIR`.  Deriving the name from `DATA_DIR` rather than hard-coding
+ *  `~/.botfleet-vm` also keeps a test rig that sets `OMB_DATA_DIR` isolated. */
+export const VM_WORKSPACE_ROOT = join(dirname(DATA_DIR), `${basename(DATA_DIR)}-vm`);
+export const VM_WORKSPACE_DIR = join(VM_WORKSPACE_ROOT, "workspace");
+/** Where the workspace lived before it moved out of the openable tree.  Read
+ *  only so a pre-move workspace can be found and migrated in place; nothing
+ *  creates a workspace here again. */
+export const LEGACY_VM_WORKSPACE_DIR = join(DATA_DIR, "vm-home");
+const LEGACY_VM_HOMES_DIR = join(DATA_DIR, "vm-homes");
 export const VM_WORKSPACE_GUEST = "/home/cua/workspace";
 export const DISPLAY = ":1";
 export const CUA_SOCKET = "/run/user/1000/botfleet-cua.sock";
@@ -113,10 +133,30 @@ export function perBotLocalVmTarget(botId: string): LocalVmTarget {
   return {
     key: `bot:${digest}`,
     containerName: `${CONTAINER}-${short}`,
-    workspaceDir: join(DATA_DIR, "vm-homes", short),
+    workspaceDir: join(VM_WORKSPACE_ROOT, "homes", short),
     viewerPort: null,
     label: digest,
   };
+}
+
+/** Where this target's workspace lived before the move out of the openable
+ *  tree.  `shared` predates per-bot VMs and is the one that exists on disk for
+ *  an install that has been running; a per-bot target's short hash is the last
+ *  path segment, so its pre-move directory is recoverable from the target
+ *  itself rather than from any caller. */
+export function legacyVmWorkspaceDir(target: LocalVmTarget): string {
+  return target.key === SHARED_LOCAL_VM_TARGET.key
+    ? LEGACY_VM_WORKSPACE_DIR
+    : join(LEGACY_VM_HOMES_DIR, basename(target.workspaceDir));
+}
+
+/** Both paths a target's workspace may legitimately be at: the current one and
+ *  its pre-move location.  The mount check has to accept the second, or a
+ *  Local VM that is still running from before the move reads as "unsafe
+ *  workspace" in the panel until the user removes and recreates it. */
+export function workspaceSources(target: LocalVmTarget): string[] {
+  const sources = [target.workspaceDir, legacyVmWorkspaceDir(target)];
+  return sources.filter((value, i) => sources.indexOf(value) === i);
 }
 
 const LINUX_WHEELS = {
@@ -531,7 +571,7 @@ export async function containerComputerStatus(
       status.imageMatches =
         appleImage === IMAGE && status.image_id !== null && appleImageId === status.image_id;
       status.managed = containerLabelsMatch(detail?.configuration?.labels, target);
-      status.persistence = appleWorkspaceMountIsSafe(detail?.configuration?.mounts, platform, target.workspaceDir)
+      status.persistence = appleWorkspaceMountIsSafe(detail?.configuration?.mounts, platform, workspaceSources(target))
         ? "durable"
         : "unsafe";
       const resources = detail?.configuration?.resources;
@@ -571,7 +611,7 @@ export async function containerComputerStatus(
       status.persistence = dockerWorkspaceMountIsSafe(
         detail?.Mounts,
         platform,
-        target.workspaceDir,
+        workspaceSources(target),
         status.runtime,
       ) ? "durable" : "unsafe";
       status.security = (
@@ -727,13 +767,17 @@ function dockerWorkspaceMountIsSafe(
     | Array<{ Type?: string; Source?: string; Destination?: string; RW?: boolean }>
     | undefined,
   platform: NodeJS.Platform,
-  expectedWorkspace: string,
+  expectedWorkspace: string | readonly string[],
   runtime: Runtime = "docker",
 ): boolean {
-  const sourceMatches = sameWorkspaceSource(mounts?.[0]?.Source, platform, expectedWorkspace) ||
-    (runtime === "podman" &&
-      platform === "win32" &&
-      samePodmanWindowsWorkspaceSource(mounts?.[0]?.Source, expectedWorkspace));
+  // Both the current path and the pre-move one count: a Local VM started
+  // before the workspace moved out of the openable tree is still correctly
+  // bound, it is just bound to where it was created.
+  const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
+  const source = mounts?.[0]?.Source;
+  const sourceMatches =
+    expected.some((candidate) => sameWorkspaceSource(source, platform, candidate)) ||
+    (runtime === "podman" && platform === "win32" && expected.some((candidate) => samePodmanWindowsWorkspaceSource(source, candidate)));
   return Boolean(
     mounts?.length === 1 &&
       mounts[0]?.Type === "bind" &&
@@ -746,12 +790,13 @@ function dockerWorkspaceMountIsSafe(
 function appleWorkspaceMountIsSafe(
   mounts: Array<{ source?: string; destination?: string; options?: string[] }> | undefined,
   platform: NodeJS.Platform,
-  expectedWorkspace: string,
+  expectedWorkspace: string | readonly string[],
 ): boolean {
   const options = mounts?.[0]?.options ?? [];
+  const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
   return Boolean(
     mounts?.length === 1 &&
-      sameWorkspaceSource(mounts[0]?.source, platform, expectedWorkspace) &&
+      expected.some((candidate) => sameWorkspaceSource(mounts[0]?.source, platform, candidate)) &&
       mounts[0]?.destination === VM_WORKSPACE_GUEST &&
       !options.some((option) => option === "ro" || option === "readonly"),
   );
@@ -867,10 +912,54 @@ export function podmanSecurityIsHardened(
   });
 }
 
+/** Where the well-known host names point inside a managed container.
+ *
+ *  A documentation-only address (TEST-NET-3, RFC 5737) that no daemon routes
+ *  anywhere, so resolving a host name yields nothing to connect to. */
+export const HOST_GATEWAY_BLACKHOLE = "203.0.113.1";
+const HOST_GATEWAY_NAMES = ["host.docker.internal", "host.containers.internal"] as const;
+
+/** The host-gateway flags for one runtime, and what each one actually buys.
+ *
+ *  The container needs outbound internet — it browses, installs, and fetches
+ *  pages — so `--network none` is never the answer here.  What the runtimes
+ *  offer instead is a partial one, and the differences between them are real:
+ *
+ *  - podman: rootless Podman puts the container behind slirp4netns, whose
+ *    `allow_host_loopback` already defaults to false, so a service bound to
+ *    the host's 127.0.0.1 is unreachable from inside.  On macOS and Windows
+ *    that is the only supported Podman setup (`podman machine`), so the mode
+ *    is stated rather than inherited from a default a future runtime version
+ *    is free to change.  On Linux the mode is left alone, because rootful
+ *    Podman has no slirp4netns and forcing it would stop the VM starting.
+ *  - docker / colima: the bridge gateway cannot be removed by a run flag at
+ *    all, and Colima runs Docker's engine, so both get the same treatment.
+ *    Naming the bridge stops a daemon default from quietly choosing something
+ *    else, and the two host names are pinned at a blackhole so the first
+ *    thing a container tries does not work.  Reaching the host by its gateway
+ *    IP still works on these runtimes; that needs a host firewall rule, which
+ *    is a machine-level change outside this repository.
+ *  - container: Apple's `container` CLI cannot be verified from this tree, so
+ *    it gets no flag it might reject.  It is also the runtime that places
+ *    every container in its own lightweight VM, which is the strongest of the
+ *    three boundaries already. */
+export function containerNetworkArgs(runtime: Runtime, platform: NodeJS.Platform = process.platform): string[] {
+  if (runtime === "container") return [];
+  const args: string[] = [];
+  if (runtime === "podman") {
+    if (platform !== "linux") args.push("--network", "slirp4netns:allow_host_loopback=false");
+  } else {
+    args.push("--network", "bridge");
+  }
+  for (const host of HOST_GATEWAY_NAMES) args.push("--add-host", `${host}:${HOST_GATEWAY_BLACKHOLE}`);
+  return args;
+}
+
 export function containerRunArgs(
   runtime: Runtime,
   password = "CHANGE_ME",
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  platform: NodeJS.Platform = process.platform,
 ): string[] {
   if (runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key) {
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
@@ -936,6 +1025,7 @@ export function containerRunArgs(
       "512m",
     );
   }
+  common.push(...containerNetworkArgs(runtime, platform));
   common.push(
     "--mount",
     runtime === "podman"
@@ -952,7 +1042,43 @@ export function containerRunArgs(
   return common;
 }
 
+/** Move a pre-move workspace to the new root, once, in place.
+ *
+ *  `rename` is the whole migration: the files and their inodes move, so a
+ *  workspace a container is already bound to keeps its contents, and the run
+ *  path that calls this only fires when no container exists for the target —
+ *  `containerComputerAction` refuses `run` unless that container is missing.
+ *  Nothing is copied and nothing is deleted, so there is no window in which a
+ *  workspace exists in two places or in neither.
+ *
+ *  A rename that cannot happen is reported rather than swallowed: binding the
+ *  new empty directory over a workspace that is still at the old path would
+ *  present the user with an empty VM and hide their files.  Both directories
+ *  are siblings under the same parent, so the realistic failures are a
+ *  permissions problem and a bind mount the platform refuses to rename. */
+export async function migrateVmWorkspace(
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  paths: { from?: string; to?: string } = {},
+): Promise<string | null> {
+  const from = paths.from ?? legacyVmWorkspaceDir(target);
+  const to = paths.to ?? target.workspaceDir;
+  if (from === to) return null;
+  if (!(await stat(from).catch(() => null))?.isDirectory()) return null;
+  if (await stat(to).catch(() => null)) return null;
+  await mkdir(dirname(to), { recursive: true, mode: 0o700 });
+  try {
+    await rename(from, to);
+  } catch (error) {
+    throw new Error(
+      `the Local VM workspace at ${from} could not be moved to ${to} — ` +
+        `move it by hand, or remove the Local VM and create it again: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return from;
+}
+
 async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
+  await migrateVmWorkspace(target);
   await mkdir(target.workspaceDir, { recursive: true, mode: 0o700 });
   if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
 }
@@ -1005,7 +1131,7 @@ export async function containerComputerAction(
     if (action === "run") await ensureVmWorkspace(platform, target);
     const args =
       action === "run"
-        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target)
+        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform)
         : action === "remove"
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
@@ -1177,7 +1303,7 @@ export function setupCommands(
     run:
       runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key
         ? null
-        : command(containerRunArgs(runtime, "CHANGE_ME", target)),
+        : command(containerRunArgs(runtime, "CHANGE_ME", target, platform)),
     start: null,
     stop: command(["stop", target.containerName]),
     remove: command(["rm", runtime === "container" ? "--force" : "-f", target.containerName]),
@@ -1185,17 +1311,221 @@ export function setupCommands(
   };
 }
 
+/* ── Box gateway ───────────────────────────────────────────────────────────
+ *
+ * The account-wide Box API key used to be handed to the bot's own computer
+ * proxy, through that process's environment and the 0600 `mcp.json` the CLI
+ * reads.  A bot holding it could list every box in the account, run commands
+ * on any of them, and delete any of them — not just the one box its turn had
+ * mounted — and it only had to read a file another bot could also read.
+ *
+ * The key now stays in the harness.  Each mount gets a *grant*: a random
+ * bearer that names one box id, and the proxy is pointed at the harness's own
+ * loopback gateway instead of ascii.dev.  The gateway re-checks the box id in
+ * the path against the grant before it calls the provider, so a proxy that
+ * names a box it was not granted is refused here rather than by the provider
+ * that would have honoured it.
+ */
+
+/** The loopback path the harness serves the gateway on.  Deliberately NOT
+ *  under `/api/internal/`, whose routes are gated by the fleet-wide comms
+ *  token: a per-mount grant has to be checked here, by this code, and not by
+ *  a gate that every bot's proxy already passes. */
+export const BOX_GATEWAY_PATH = "/api/local/box-gateway";
+/** The provider the gateway calls.  Read the harness-side override so a test
+ *  rig and a self-hosted deployment address the same base as box.ts does. */
+const BOX_GATEWAY_API = process.env.OMB_BOX_API || "https://ascii.dev/api/box/v1";
+/** How long a grant stays usable.  A turn is minutes, not hours; the ceiling
+ *  is what stops a grant read out of one turn's `mcp.json` from being a
+ *  permanent account handle. */
+const BOX_GATEWAY_TTL_MS = 4 * 60 * 60 * 1000;
+const MAX_BOX_GATEWAY_GRANTS = 512;
+
+export interface BoxGatewayGrant {
+  botId: string;
+  boxId: string;
+  expiresAt: number;
+}
+
+const boxGatewayGrants = new Map<string, BoxGatewayGrant>();
+
+/** The loopback base the child proxy sends its Box calls to, derived from the
+ *  turn's existing control endpoint so the proxy needs no second port. */
+export function boxGatewayUrl(control: { url: string } | undefined): string {
+  if (!control?.url) return "";
+  try {
+    return `${new URL(control.url).origin}${BOX_GATEWAY_PATH}`;
+  } catch {
+    return "";
+  }
+}
+
+/** Issue one mount's grant.  The value returned is what reaches the bot's
+ *  process: it authenticates nothing at ascii.dev, only here. */
+export function mintBoxGatewayGrant(
+  botId: string,
+  boxId: string,
+  gatewayUrl: string,
+  now = Date.now(),
+) {
+  const token = randomBytes(24).toString("hex");
+  boxGatewayGrants.set(token, { botId, boxId, expiresAt: now + BOX_GATEWAY_TTL_MS });
+  // Map iterates in insertion order, so this drops the oldest first — a
+  // long-lived harness with many turns cannot grow the table without bound.
+  while (boxGatewayGrants.size > MAX_BOX_GATEWAY_GRANTS) {
+    const oldest = boxGatewayGrants.keys().next();
+    if (oldest.done) break;
+    boxGatewayGrants.delete(oldest.value);
+  }
+  return { url: gatewayUrl, token };
+}
+
+export function revokeBoxGatewayGrant(token: string): void {
+  boxGatewayGrants.delete(token);
+}
+
+/** Test seam: forget every grant, so one test's mint cannot satisfy another. */
+export function resetBoxGatewayGrants(): void {
+  boxGatewayGrants.clear();
+}
+
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+/** Does this grant authenticate this box?  The box id in the path is checked
+ *  here and nowhere else, so a proxy cannot widen its own reach by rewriting
+ *  the URL it was configured with. */
+export function authorizeBoxGateway(
+  authorization: string | string[] | undefined,
+  boxId: string,
+  now = Date.now(),
+): { ok: true; grant: BoxGatewayGrant } | { ok: false; status: 401 | 403; error: string } {
+  const presented = Array.isArray(authorization) ? "" : String(authorization ?? "").replace(/^Bearer /, "");
+  const grant = presented ? boxGatewayGrants.get(presented) : undefined;
+  if (!grant) return { ok: false, status: 401, error: "no live Box grant for this computer" };
+  if (grant.expiresAt <= now) {
+    boxGatewayGrants.delete(presented);
+    return { ok: false, status: 401, error: "this Box grant has expired" };
+  }
+  if (grant.boxId !== boxId) {
+    return { ok: false, status: 403, error: "this Box grant does not cover that computer" };
+  }
+  return { ok: true, grant };
+}
+
+/** The Box operations a computer proxy is allowed to make, and the methods
+ *  each one takes.  Anything not in this table is not proxied at all: the
+ *  account key must never become a general-purpose pass-through.
+ *
+ *  `action` below is read out of the request path and is a general `string`, so
+ *  this table genuinely needs an index signature rather than the narrow
+ *  literal-keyed type `satisfies` would infer.  An unmapped action reads back
+ *  `undefined`, which is exactly the refusal the handler returns.
+ */
+// oxlint-disable-next-line anti-slop/no-known-value-widening
+const BOX_GATEWAY_ACTIONS: Record<string, "GET" | "POST"> = {
+  "": "GET",
+  commands: "POST",
+  resume: "POST",
+  files: "GET",
+  artifacts: "GET",
+};
+
+export interface BoxGatewayRequest {
+  method: string;
+  /** Path and query, exactly as it arrived. */
+  url: string;
+  authorization?: string | string[];
+  remoteAddress?: string;
+  body?: string;
+}
+
+export interface BoxGatewayResponse {
+  status: number;
+  body: string;
+}
+
+const json = (status: number, error: string): BoxGatewayResponse => ({ status, body: JSON.stringify({ error }) });
+
+/** Serve one Box call on behalf of a mount's proxy.
+ *
+ *  The account key is read from the harness config here and nowhere else, and
+ *  it is never taken from the request: the child's `authorization` header is
+ *  checked against the grant and then dropped. */
+export async function handleBoxGatewayRequest(
+  request: BoxGatewayRequest,
+  // SAFETY: the default is the caller's "no harness config" case, and the
+  // gateway reads `cfg.box.token` off it and nothing else — an empty AppConfig
+  // yields the same "no account key configured" refusal a partial one would.
+  deps: { cfg: AppConfig; fetchImpl?: typeof fetch; now?: number } = { cfg: {} as AppConfig },
+): Promise<BoxGatewayResponse> {
+  if (!LOOPBACK.has(request.remoteAddress ?? "")) {
+    return json(403, "the Box gateway is loopback-only");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(request.url, "http://127.0.0.1");
+  } catch {
+    return json(400, "malformed gateway URL");
+  }
+  if (!parsed.pathname.startsWith(`${BOX_GATEWAY_PATH}/boxes/`)) {
+    return json(404, "unknown gateway route");
+  }
+  const rest = parsed.pathname.slice(`${BOX_GATEWAY_PATH}/boxes/`.length);
+  if (rest.includes("/") && rest.split("/").length > 2) return json(404, "unknown gateway route");
+  const [boxId = "", action = ""] = rest.split("/");
+  // A box id is a provider identifier, never a path fragment.
+  if (!/^[\w-]{1,64}$/.test(boxId)) return json(404, "unknown gateway route");
+  const allowedMethod = BOX_GATEWAY_ACTIONS[action];
+  if (!allowedMethod || request.method.toUpperCase() !== allowedMethod) {
+    return json(405, "that Box operation is not proxied");
+  }
+  const auth = authorizeBoxGateway(request.authorization, boxId, deps.now ?? Date.now());
+  if (!auth.ok) return json(auth.status, auth.error);
+
+  const init: RequestInit = {
+    method: allowedMethod,
+    headers: {
+      authorization: `Bearer ${deps.cfg.box?.token ?? ""}`,
+      "content-type": "application/json",
+    },
+  };
+  // A GET carries no body at all, and `body: undefined` would send one anyway.
+  if (request.body !== undefined) init.body = request.body;
+  const upstream = await (deps.fetchImpl ?? fetch)(
+    `${BOX_GATEWAY_API}/boxes/${encodeURIComponent(boxId)}/${action}${parsed.search}`,
+    init,
+  );
+  return { status: upstream.status, body: await upstream.text() };
+}
+
 /** Cloud boxes still use BotFleet's high-latency REST adapter. Local VMs
  * bypass it and mount Cua Driver's official MCP server through
- * containerComputerMcp(). */
+ * containerComputerMcp().
+ *
+ * `OGB_BOX_TOKEN` is the mount's gateway grant, never the account-wide Box
+ * API key, and `OGB_BOX_API` is the harness's loopback gateway — so a proxy
+ * that reads its own environment finds a bearer that authenticates only here,
+ * and only for the one box this turn mounted. */
 export function computerProxyEnv(
-  computer: { boxId?: string; token?: string; control?: { url: string; token: string } },
+  computer: { boxId?: string; token?: string; gatewayUrl?: string; control?: { url: string; token: string } },
 ): NodeJS.ProcessEnv {
-  return {
+  // A token with no gateway is the finding all over again: the child would
+  // fall back to ascii.dev and present a credential that authorises every box
+  // in the account.  Refuse to build the env instead, so a caller that forgets
+  // `gatewayUrl` fails here rather than quietly handing over the account key.
+  if (computer.token && !computer.gatewayUrl) {
+    throw new Error(
+      "computerProxyEnv: a Box grant needs a gatewayUrl; refusing to hand a child an ungated Box token",
+    );
+  }
+  const env: NodeJS.ProcessEnv = {
+    OGB_BOX_API: computer.gatewayUrl ?? "",
     OGB_BOX_ID: computer.boxId ?? "",
     OGB_BOX_TOKEN: computer.token ?? "",
-    ...(computer.control
-      ? { OMB_CONTROL_URL: computer.control.url, OMB_CONTROL_TOKEN: computer.control.token }
-      : {}),
   };
+  if (computer.control) {
+    env.OMB_CONTROL_URL = computer.control.url;
+    env.OMB_CONTROL_TOKEN = computer.control.token;
+  }
+  return env;
 }

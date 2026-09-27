@@ -43,10 +43,6 @@
 //                        no configOptions, so nothing to confirm against
 //   FAKE_ACP_USAGE_ROOT  put the prompt result's usage at the root instead of
 //                        under _meta (what opencode 1.18.18 actually does)
-//   FAKE_ACP_CACHE_READ  a cache-read token count, reported alongside
-//                        FAKE_ACP_USAGE_ROOT as `cachedInputTokens`
-//   FAKE_ACP_COST  a dollar figure, reported alongside FAKE_ACP_USAGE_ROOT
-//                        as `cost` — the field ACP core used to discard
 //   FAKE_ACP_INIT_DELAY_MS  answer initialize only after this many ms — a
 //                        slow cold boot, or (with a large value) one that
 //                        never finishes inside the driver's deadline
@@ -516,21 +512,7 @@ function handle(msg: any) {
           process.env.FAKE_ACP_USAGE_UPDATE
             ? { stopReason: "end_turn" }
             : process.env.FAKE_ACP_USAGE_ROOT
-              ? {
-                  stopReason: "end_turn",
-                  usage: {
-                    inputTokens: 10,
-                    outputTokens: 5,
-                    // FAKE_ACP_CACHE_READ / _COST let a test script the fields
-                    // an agent may or may not report.  Absent by default, which
-                    // is the shape most ACP agents actually send.
-                    ...(process.env.FAKE_ACP_CACHE_READ
-                      ? { cachedInputTokens: Number(process.env.FAKE_ACP_CACHE_READ) }
-                      : {}),
-                    ...(process.env.FAKE_ACP_COST ? { cost: Number(process.env.FAKE_ACP_COST) } : {}),
-                  },
-                  _meta: {},
-                }
+              ? { stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 5 }, _meta: {} }
               : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
         );
       };

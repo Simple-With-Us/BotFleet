@@ -262,11 +262,6 @@ describe("the Add Engine form's driver choice", () => {
     // The default fleet's own ids, for drivers whose id is not their kind.
     expect(isCustomEngineInstance({ driverKind: "claudeAgent", instanceId: "claude" })).toBe(false);
     expect(isCustomEngineInstance({ driverKind: "boxAgent", instanceId: "computer" })).toBe(false);
-    // MiniMax Code's reserved id is "mcode", not its driver kind — without
-    // the row above it would read as operator-added and offer a delete button
-    // on a default-fleet engine.
-    expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode" })).toBe(false);
-    expect(isCustomEngineInstance({ driverKind: "mcodeAgent", instanceId: "mcode-china" })).toBe(true);
     // …and a driver nobody listed fails SAFE: its reserved id is its own
     // kind, so anything else reads as operator-added and offers a delete
     // button, rather than hiding one for an engine that really was added.
@@ -294,9 +289,6 @@ describe("the Add Engine form's driver choice", () => {
     expect(driverDisplayName("minimax")).toBe("MiniMax");
     expect(driverDisplayName("dshAgent")).toBe("DeepSeek");
     expect(driverDisplayName("piAgent")).toBe("pi");
-    // mcode's own product name, not the humanized "Mcode" the fallback
-    // would hand back from the driver kind alone.
-    expect(driverDisplayName("mcodeAgent")).toBe("MiniMax Code");
     expect(driverDisplayName("widgetAgent")).toBe("Widget");
     expect(driverDisplayName("widget")).toBe("Widget");
     // Never returns an empty label, whatever it is handed.

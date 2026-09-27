@@ -202,7 +202,6 @@ const PROVIDER_BY_ENGINE = new Map<string, string>(Object.entries({
   moonshot: "moonshot",
   cursor: "cursor",
   minimax: "minimax",
-  mcode: "minimax",
   box: "box",
   // `computer` is the default instance id that rides the boxAgent driver.
   computer: "box",

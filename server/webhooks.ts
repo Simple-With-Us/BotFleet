@@ -166,6 +166,10 @@ const RATE_LIMIT = 10;
 const MAX_PENDING_RUNS = 3;
 const MAX_IGNORED_ATTEMPTS_PER_WINDOW = 3;
 const IGNORED_ATTEMPTS_WINDOW_MS = 10_000;
+// An unauthenticated caller can reject forever, so rejected rows are capped
+// per window too.  See recordRejectedForTrigger.
+const MAX_REJECTED_ATTEMPTS_PER_WINDOW = 10;
+const REJECTED_ATTEMPTS_WINDOW_MS = 60_000;
 
 const runOnSchema = z
   .enum(["bot", "cloud", "maus"])
@@ -881,6 +885,7 @@ export class WebhookManager {
   private attempts: WebhookAttempt[] = [];
   private rate = new Map<string, number[]>();
   private recentIgnored = new Map<string, number[]>();
+  private recentRejected = new Map<string, number[]>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
 
@@ -976,6 +981,7 @@ export class WebhookManager {
     this.attempts = this.attempts.filter((attempt) => attempt.webhookId !== trigger.id);
     this.rate.delete(trigger.endpointId);
     this.recentIgnored.delete(trigger.id);
+    this.recentRejected.delete(trigger.id);
     this.options.cancelQueued?.(trigger.id, "The webhook was deleted before this delivery started");
     this.save();
     this.options.emit?.({ kind: "webhook.deleted", webhookId: id });
@@ -1183,7 +1189,23 @@ export class WebhookManager {
     return { deliveryId, duplicate: false, captured: true };
   }
 
-  private recordRejectedForTrigger(trigger: StoredWebhookTrigger, statusCode: number, reason: string, event: Partial<WebhookEvent>): WebhookAttempt {
+  private recordRejectedForTrigger(trigger: StoredWebhookTrigger, statusCode: number, reason: string, event: Partial<WebhookEvent>): WebhookAttempt | null {
+    // A rejection is an UNAUTHENTICATED caller writing to this trigger's log.
+    // Without a window, anyone who can reach the receiver can flush the
+    // 500-row cap with bad secrets and erase the delivery history the owner
+    // is trying to read.  Throttle the row exactly as ignored attempts are
+    // throttled, and say so in the reason so the operator can tell a
+    // suppressed row from a missing one.
+    const now = this.now();
+    const recent = (this.recentRejected.get(trigger.id) ?? []).filter(
+      (at) => now - at < REJECTED_ATTEMPTS_WINDOW_MS,
+    );
+    if (recent.length >= MAX_REJECTED_ATTEMPTS_PER_WINDOW) {
+      this.recentRejected.set(trigger.id, recent);
+      return null;
+    }
+    recent.push(now);
+    this.recentRejected.set(trigger.id, recent);
     const attempt = this.appendAttempt(trigger, event, {
       outcome: "rejected",
       statusCode,

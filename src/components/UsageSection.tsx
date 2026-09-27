@@ -105,35 +105,6 @@ function formatUsdBalance(balance: number | null): string {
   return `$${balance.toFixed(2)} remaining`;
 }
 
-/** One engine's rolling spend as the tracker reports it. */
-export interface EngineSpend {
-  spend5hUsd: number;
-  spend7dUsd: number;
-  /** Settled turns the engine could not price.  A non-zero count means the
-   *  dollar figures beside it are a floor, not a total. */
-  unpricedTurns5h?: number;
-  unpricedTurns7d?: number;
-}
-
-/** Whether an engine row has enough to be worth showing.
- *
- *  Dollars OR unpriced turns.  An engine that settled work but reported no
- *  cost has spent money the panel cannot price, and the row used to be hidden
- *  entirely — which is how `dsh`, carrying six of twelve bots, came to read as
- *  free.  A blank row is not the same as no activity. */
-export function hasEngineSpendActivity(spend: EngineSpend | undefined): boolean {
-  if (!spend) return false;
-  return spend.spend5hUsd > 0
-    || spend.spend7dUsd > 0
-    || (spend.unpricedTurns5h ?? 0) > 0
-    || (spend.unpricedTurns7d ?? 0) > 0;
-}
-
-/** Total turns in the window the panel could not put a price on. */
-export function unpricedTurnCount(spend: EngineSpend | undefined): number {
-  return (spend?.unpricedTurns5h ?? 0) + (spend?.unpricedTurns7d ?? 0);
-}
-
 function formatSpendUsd(amount: number): string {
   if (!amount || amount === 0) return "$0.00";
   if (amount < 0.01) return `<$0.01 ($${amount.toFixed(4)})`;
@@ -176,7 +147,7 @@ export function UsageSection() {
   const [antigravityQuota, setAntigravityQuota] = React.useState<AntigravityUsageSnapshot | null>(null);
   const [grokQuota, setGrokQuota] = React.useState<GrokUsageSnapshot | null>(null);
   const [deepseekBalance, setDeepSeekBalance] = React.useState<DeepSeekBalanceView | null>(null);
-  const [engineSpend, setEngineSpend] = React.useState<Record<string, EngineSpend>>({});
+  const [engineSpend, setEngineSpend] = React.useState<Record<string, { spend5hUsd: number; spend7dUsd: number }>>({});
   const [quotaWindows, setQuotaWindows] = React.useState<Array<{
     id: string;
     provider: string;
@@ -698,7 +669,7 @@ export function UsageSection() {
               // MiniMax row, which is what let a second connection show the
               // reserved instance's numbers.
               (isMiniMax && Boolean(instance.snapshot.quota?.minimax?.capExists)) ||
-              hasEngineSpendActivity(spend);
+              Boolean(spend && (spend.spend5hUsd > 0 || spend.spend7dUsd > 0));
             // A configured engine that has gone unavailable — a Box token set
             // but the API unreachable, a login that expired, a CLI that stops
             // launching — must still show its row with the real failure
@@ -849,8 +820,7 @@ export function UsageSection() {
                 });
               }
             }
-            const unpriced = unpricedTurnCount(spend);
-            if (spend && (hasEngineSpendActivity(spend) || isDeepSeek)) {
+            if (spend && (spend.spend5hUsd > 0 || spend.spend7dUsd > 0 || isDeepSeek)) {
               detailLines.push({
                 label: "Spend (Past 5 Hours)",
                 value: formatSpendUsd(spend.spend5hUsd),
@@ -863,17 +833,6 @@ export function UsageSection() {
                 exhausted: false,
                 group: "window" as const,
               });
-              if (unpriced > 0) {
-                // Say it in words rather than rendering a confident dollar
-                // total that quietly excludes this engine. The count is a
-                // floor on how much is unaccounted for, not the missing cash.
-                detailLines.push({
-                  label: "Unpriced turns",
-                  value: `${unpriced} could not be costed — the totals above exclude them`,
-                  exhausted: false,
-                  group: "window" as const,
-                });
-              }
             }
             const fullSummary = detailLines.length > 0
               ? quotaLinesSummary(detailLines)

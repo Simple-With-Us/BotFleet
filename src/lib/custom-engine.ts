@@ -243,7 +243,6 @@ const RESERVED_INSTANCE_ID = new Map<string, string>([
   ["qwenAgent", "qwen"],
   ["hermesAgent", "hermes"],
   ["piAgent", "pi"],
-  ["mcodeAgent", "mcode"],
 ]);
 
 export function isCustomEngineInstance(instance: {
@@ -275,7 +274,6 @@ const DRIVER_DISPLAY_NAME = new Map<string, string>([
   ["qwenAgent", "Qwen"],
   ["hermesAgent", "Hermes"],
   ["piAgent", "pi"],
-  ["mcodeAgent", "MiniMax Code"],
 ]);
 
 export function driverDisplayName(driverKind: string): string {

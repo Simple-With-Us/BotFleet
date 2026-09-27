@@ -43,6 +43,11 @@ type HarnessRequestBody = {
   prompt?: string;
   botId?: string;
   runOn?: string;
+  /** A relay-sourced inbound message names its transport. */
+  source?: string;
+  chatId?: string;
+  botDefaults?: { imessagePerBot?: Record<string, string> };
+  text?: string;
   schedule?: { type: string; at: number };
 };
 
@@ -69,6 +74,23 @@ async function waitForCard(threadId: string, ms = 30_000) {
   while (Date.now() < deadline) {
     const { body } = await api("GET", `/api/threads/${threadId}/messages`);
     const card = (body.messages ?? []).find(
+      (m: { kind: string; card?: { requestId?: string } }) => m.kind === "options" && m.card?.requestId,
+    );
+    if (card) return card;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+}
+
+/** Poll a BOT's own conversation for a live permission card.  A relayed
+ *  message dispatches on the bot's thread, so unlike the webhook case the
+ *  card does land on the open conversation. */
+async function waitForBotCard(botId: string, ms = 30_000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const { body } = await api("GET", "/api/bots");
+    const messages = (body.bots ?? []).find((b: { id: string }) => b.id === botId)?.messages ?? [];
+    const card = messages.find(
       (m: { kind: string; card?: { requestId?: string } }) => m.kind === "options" && m.card?.requestId,
     );
     if (card) return card;
@@ -159,7 +181,13 @@ posixOnly("unattended turns keep asking", () => {
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
-    const deadline = Date.now() + 20_000;
+    // Four ACP instances means four CLI probes before the fleet is ready.
+    // 20s was tuned on an idle machine; a loaded one (other seats working in
+    // their own worktrees) spends it in the probes and reports "the server
+    // never came up" for a child that is booting perfectly well.  All the
+    // boot log goes to stdout, which this loop does not read, so the failure
+    // message had nothing to show for it either.
+    const deadline = Date.now() + 90_000;
     for (;;) {
       try {
         if (await harnessReady(BASE)) break;
@@ -169,7 +197,7 @@ posixOnly("unattended turns keep asking", () => {
       if (Date.now() > deadline) throw new Error(`server never came up. stderr:\n${stderr}`);
       await new Promise((r) => setTimeout(r, 150));
     }
-  }, 40_000);
+  }, 100_000);
 
   afterAll(async () => {
     await waitForExit(child, { signal: "SIGTERM" });
@@ -218,6 +246,120 @@ posixOnly("unattended turns keep asking", () => {
       expect(card.card.requestId).toBeTruthy();
       // and it must not already be answered
       expect(card.card.answered).toBeUndefined();
+    },
+    60_000,
+  );
+
+  it(
+    "still asks a human when a stranger's iMessage text starts the turn, even with auto mode on",
+    async () => {
+      // A message that arrived over the Mac relay is somebody else's phone,
+      // not the owner's keyboard.  It must dispatch unattended, so Auto mode
+      // cannot answer for a person who is not watching.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Relay",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+
+      const delivered = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: "run the deploy",
+        source: "imessage",
+      });
+      expect(delivered.status).toBe(202);
+
+      const card = await waitForBotCard(bot.id);
+      expect(card, "relayed iMessage text auto-approved instead of asking").not.toBeNull();
+      expect(card.card.requestId).toBeTruthy();
+      expect(card.card.answered).toBeUndefined();
+    },
+    60_000,
+  );
+
+  it(
+    "still asks a human when a Linq chat starts the turn, even with auto mode on",
+    async () => {
+      // The other relay.  It has to be armed per bot (`imessagePerBot`), the
+      // same gate the real Linq webhook posts through.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Linq relay",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+      const armed = await api("PUT", "/api/config", {
+        botDefaults: { imessagePerBot: { [bot.id]: "linq" } },
+      });
+      expect(armed.status, JSON.stringify(armed.body)).toBe(200);
+
+      const delivered = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: "ship it",
+        source: "linq",
+        chatId: "chat_test_1",
+      });
+      expect(delivered.status).toBe(202);
+
+      expect(
+        await waitForBotCard(bot.id),
+        "Linq-sourced text auto-approved instead of asking",
+      ).not.toBeNull();
+    },
+    60_000,
+  );
+
+  it(
+    "lets Auto mode answer an owner-typed message, which is the attended case",
+    async () => {
+      // The other half of the relay rule: a person typing into the bot is
+      // exactly what Auto mode is for, and S8 must not have taken it away.
+      const bot = (await api("POST", "/api/bots")).body.bot;
+      expect(
+        (
+          await api("PATCH", `/api/bots/${bot.id}`, {
+            name: "Owner",
+            autoApprove: true,
+            computers: [],
+            modelSelection: { instanceId: "grok", model: "fake-model" },
+          })
+        ).status,
+      ).toBe(200);
+
+      const sent = await api("POST", `/api/bots/${bot.id}/messages`, { text: "run the deploy" });
+      expect(sent.status).toBe(202);
+
+      const deadline = Date.now() + 30_000;
+      /** What the poll found on this pass: the auto-approval activity, and the
+       *  approval card that is still unanswered. */
+      type PollResult = { auto?: unknown; card?: unknown };
+      const seen: PollResult = {};
+      while (Date.now() < deadline) {
+        const { body } = await api("GET", "/api/bots");
+        const messages = (body.bots ?? []).find((b: { id: string }) => b.id === bot.id)?.messages ?? [];
+        const auto = messages.find(
+          (m: { kind: string; tool?: { name?: string } }) =>
+            m.kind === "activity" && String(m.tool?.name ?? "").startsWith("auto-approved"),
+        );
+        const card = messages.find(
+          (m: { kind: string; card?: { requestId?: string; answered?: string } }) =>
+            m.kind === "options" && m.card?.requestId && m.card.answered === undefined,
+        );
+        Object.assign(seen, { auto, card });
+        if (auto) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(seen.auto, "Auto mode never answered the owner's own message").toBeTruthy();
+      expect(seen.card, "an owner-typed message stopped carding").toBeUndefined();
     },
     60_000,
   );

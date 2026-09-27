@@ -35,15 +35,6 @@ export interface TurnSpendEntry {
   instanceId?: string;
   costUsd: number;
   billingMode?: TurnBillingMode;
-  /** Whether `costUsd` is a real charge figure.  False for a turn whose engine
-   *  reported no cost at all — an unpriced turn is NOT a free turn, and
-   *  counting it as one is what made this map a silent fraction of the truth
-   *  (see `unpriced`).  Costs carry `costUsd: 0` so the dollar arithmetic
-   *  downstream is unchanged.
-   *
-   *  Optional because a cursor persisted by an older build has no flag at all;
-   *  read it through `isPriced`, never directly. */
-  priced?: boolean;
   /** The `eventId` of the `turn.completed` this came from, when there was one.
    * The merge key: it is what stops one turn being counted twice when the same
    * bytes are seen again under a different inode. */
@@ -53,12 +44,6 @@ export interface TurnSpendEntry {
 export interface EngineSpendSummary {
   spend5hUsd: number;
   spend7dUsd: number;
-  /** Settled turns in the window this engine could not price.  A non-zero
-   *  count means the dollar figure beside it is a floor, not a total — the
-   *  settings panel says so in words rather than showing a confident number
-   *  that silently excludes an engine. */
-  unpricedTurns5h: number;
-  unpricedTurns7d: number;
 }
 
 export type EngineSpendMap = Record<string, EngineSpendSummary>;
@@ -87,10 +72,7 @@ const turnCompletedSchema = z.object({
   provider: z.string().default("unknown"),
   providerInstanceId: z.string().optional(),
   createdAt: z.string().optional(),
-  // Nullable, not required-and-positive: an engine that reports no cost is
-  // UNPRICED, and the old `z.number().positive()` made those lines fail the
-  // whole parse, so they vanished from the map with nothing to show for it.
-  cost: z.number().positive().nullable().optional(),
+  cost: z.number().positive(),
   billingMode: z.enum(["actual", "estimated"]).optional(),
 });
 
@@ -100,7 +82,6 @@ const spendEntrySchema = z.object({
   instanceId: z.string().optional(),
   costUsd: z.number(),
   billingMode: z.enum(["actual", "estimated"]).optional(),
-  priced: z.boolean().optional(),
   eventId: z.string().optional(),
 });
 
@@ -120,32 +101,24 @@ const spendCursorSchema = z.object({
 
 export type SpendCursor = z.infer<typeof spendCursorSchema>;
 
-/** One NDJSON line, or null when it is not a settled turn.  The `includes` is
- * the cheap gate that keeps `JSON.parse` off the 99% of lines that cannot
- * match.
- *
- * A turn with no usable cost is returned as an UNPRICED entry rather than
- * dropped.  It carries `costUsd: 0` so nothing downstream has to special-case
- * it, plus `priced: false` so the coverage gap stays countable. */
+/** One NDJSON line, or null when it is not a billable settled turn.  The two
+ * `includes` are the cheap gate that keeps `JSON.parse` off the 99% of lines
+ * that cannot match. */
 export function parseTurnSpendLine(line: string, cutoffMs: number): TurnSpendEntry | null {
-  if (!line.includes('"turn.completed"')) return null;
+  if (!line.includes('"turn.completed"') || !line.includes('"cost"')) return null;
   try {
     const parsed = turnCompletedSchema.safeParse(JSON.parse(line));
     if (!parsed.success) return null;
     const ev = parsed.data;
+    if (ev.billingMode === "estimated") return null;
     const at = ev.createdAt ? Date.parse(ev.createdAt) : NaN;
     if (!Number.isFinite(at) || at < cutoffMs) return null;
-    // An estimate is a real number about the wrong thing — these engines are
-    // subscription logins — so it neither inflates the dollar total nor
-    // counts as priced.  It is visible as unpriced work.
-    const priced = ev.billingMode !== "estimated" && typeof ev.cost === "number" && ev.cost > 0;
     return {
       at,
       provider: ev.provider,
       instanceId: ev.providerInstanceId,
-      costUsd: priced ? (ev.cost as number) : 0,
+      costUsd: ev.cost,
       billingMode: ev.billingMode,
-      priced,
       eventId: ev.eventId,
     };
   } catch {
@@ -320,18 +293,6 @@ export function saveSpendCursor(path: string, cursor: SpendCursor): void {
   writeFileAtomic(path, JSON.stringify({ ...cursor, entries }), { mode: 0o600 });
 }
 
-/** Whether a record carries a charge we can stand behind.
- *
- *  Entries persisted by a build from before unpriced tracking existed have no
- *  `priced` flag, so fall back to the only thing they do carry: a positive
- *  cost that is not an estimate.  Without this a boot onto an old cursor would
- *  report every previously-priced turn as unpriced and make a healthy engine
- *  look blind. */
-function isPriced(entry: TurnSpendEntry): boolean {
-  if (typeof entry.priced === "boolean") return entry.priced;
-  return entry.billingMode !== "estimated" && entry.costUsd > 0;
-}
-
 export class RollingSpendTracker {
   private records: TurnSpendEntry[] = [];
   private initialized = false;
@@ -368,41 +329,20 @@ export class RollingSpendTracker {
     billingMode?: TurnBillingMode;
     eventId?: string;
   }): void {
-    // An estimate, a null, a zero, and a non-finite figure are all the same
-    // thing here: no charge we can stand behind.  The turn is still recorded,
-    // marked unpriced, so the spend map can say how much of the window it
-    // could not account for instead of quietly under-reporting.
-    const priced =
-      entry.billingMode !== "estimated" &&
-      typeof entry.costUsd === "number" &&
-      Number.isFinite(entry.costUsd) &&
-      entry.costUsd > 0;
+    if (!entry.costUsd || !Number.isFinite(entry.costUsd) || entry.costUsd <= 0) {
+      return;
+    }
+    if (entry.billingMode === "estimated") {
+      return;
+    }
     this.records.push({
       at: entry.at ?? Date.now(),
       provider: entry.provider,
       instanceId: entry.instanceId,
-      costUsd: priced ? (entry.costUsd as number) : 0,
+      costUsd: entry.costUsd,
       billingMode: entry.billingMode,
-      priced,
       eventId: entry.eventId,
     });
-  }
-
-  /** Turn counts and accountable dollars for the 5-hour window, so the spend
-   *  ceiling can judge how much of the window it can actually see before
-   *  acting on the total.  `spend5hUsd` sums each record ONCE: the per-engine
-   *  map from `getSpend` deliberately books a turn under both its provider
-   *  and its instance id (and DeepSeek under both aliases) so a Settings
-   *  lookup by either name finds it - which makes that map useless for a
-   *  fleet total, because summing its values counts every dollar twice. */
-  getWindow(now = Date.now()): { totalTurns: number; unpricedTurns: number; spend5hUsd: number } {
-    const t5h = now - FIVE_HOURS_MS;
-    const inWindow = this.records.filter((r) => r.at >= t5h);
-    return {
-      totalTurns: inWindow.length,
-      unpricedTurns: inWindow.filter((r) => !isPriced(r)).length,
-      spend5hUsd: Math.round(inWindow.reduce((sum, r) => sum + (isPriced(r) ? r.costUsd : 0), 0) * 10_000) / 10_000,
-    };
   }
 
   getSpend(now = Date.now()): EngineSpendMap {
@@ -415,23 +355,11 @@ export class RollingSpendTracker {
 
     const addCost = (key: string, cost: number, at: number) => {
       if (!spend[key]) {
-        spend[key] = { spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 0, unpricedTurns7d: 0 };
+        spend[key] = { spend5hUsd: 0, spend7dUsd: 0 };
       }
       spend[key].spend7dUsd += cost;
       if (at >= t5h) {
         spend[key].spend5hUsd += cost;
-      }
-    };
-
-    /** Count a turn this engine could not price, on both the provider key and
-     *  the instance key, so a caller looking either up sees the gap. */
-    const addUnpriced = (key: string, at: number) => {
-      if (!spend[key]) {
-        spend[key] = { spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 0, unpricedTurns7d: 0 };
-      }
-      spend[key].unpricedTurns7d += 1;
-      if (at >= t5h) {
-        spend[key].unpricedTurns5h += 1;
       }
     };
 
@@ -451,11 +379,9 @@ export class RollingSpendTracker {
       }
     }
     if (hasDsEntry) {
-      const dsSummary: EngineSpendSummary = {
+      const dsSummary = {
         spend5hUsd: Math.round(dsSpend5h * 10_000) / 10_000,
         spend7dUsd: Math.round(dsSpend7d * 10_000) / 10_000,
-        unpricedTurns5h: this.records.filter((r) => !isPriced(r) && dsKeys.includes(r.provider) && r.at >= t5h).length,
-        unpricedTurns7d: this.records.filter((r) => !isPriced(r) && dsKeys.includes(r.provider)).length,
       };
       for (const k of dsKeys) {
         spend[k] = { ...dsSummary };
@@ -465,16 +391,9 @@ export class RollingSpendTracker {
     for (const r of this.records) {
       const isDs = dsKeys.includes(r.provider) || (r.instanceId && dsKeys.includes(r.instanceId));
       if (!isDs) {
-        if (isPriced(r)) {
-          addCost(r.provider, r.costUsd, r.at);
-          if (r.instanceId && r.instanceId !== r.provider) {
-            addCost(r.instanceId, r.costUsd, r.at);
-          }
-        } else {
-          addUnpriced(r.provider, r.at);
-          if (r.instanceId && r.instanceId !== r.provider) {
-            addUnpriced(r.instanceId, r.at);
-          }
+        addCost(r.provider, r.costUsd, r.at);
+        if (r.instanceId && r.instanceId !== r.provider) {
+          addCost(r.instanceId, r.costUsd, r.at);
         }
       }
     }
@@ -495,90 +414,3 @@ export class RollingSpendTracker {
 }
 
 export const rollingSpendTracker = new RollingSpendTracker();
-
-/** The result of asking "may the fleet keep spending right now?". */
-export interface SpendCeilingDecision {
-  blocked: boolean;
-  /** Why, in words fit for a log line or a receipt.  Set even when not
-   *  blocked, because "the cap did not fire because it could not see enough"
-   *  is the most useful thing this function ever has to say. */
-  reason: string;
-  /** Dollars the tracker can actually account for in the 5-hour window. */
-  visibleUsd: number;
-  /** Fraction of settled turns in that window carrying a real price. */
-  pricedShare: number;
-  unpricedTurns: number;
-}
-
-/** Fraction of the window that must be priced before the ceiling may act. */
-export const DEFAULT_MIN_PRICED_SHARE = 0.5;
-
-/** Should the dispatcher stop starting turns because the fleet is over budget?
- *
- *  A spend cap on an unattended fleet is a dangerous thing to build blind, and
- *  the blind spot is the whole problem: an engine that reports no cost adds
- *  nothing to the total while spending very much more than nothing.  Measured
- *  over three days, `dsh` — the engine behind six of twelve bots — reported
- *  `cost: null` on every turn, so a cap measured against that total would have
- *  been reading roughly a third of real spend and would have declared the fleet
- *  nearly free.
- *
- *  The total compared against the ceiling comes from the tracker's window,
- *  never from the per-engine spend map: that map books each turn under both
- *  its provider and its instance id (and DeepSeek under both aliases) so a
- *  display can look a bot up by either name, and summing its values counts
- *  every dollar twice - enough to trip the cap at half the real spend.
- *
- *  So the gate refuses to fire unless it can see enough of the window to be
- *  worth believing.  `minPricedShare` is the operator's own statement of how
- *  much visibility they require; below it the honest answer is "I cannot tell",
- *  which returns `blocked: false` with a reason naming the gap.  That is a
- *  deliberate refusal to enforce rather than a failure of the check: blocking
- *  the fleet on a number known to be a floor stops the work, and the owner
- *  finds out that their automation died before they find out why.
- */
-export function spendCeilingDecision(
-  window: { totalTurns: number; unpricedTurns: number; spend5hUsd: number },
-  options: { ceilingUsd?: number; minPricedShare?: number } = {},
-): SpendCeilingDecision {
-  const ceiling = options.ceilingUsd;
-  const visibleUsd = window.spend5hUsd;
-  const { totalTurns, unpricedTurns } = window;
-  // No settled turns in the window means nothing has been spent yet, which is
-  // full visibility rather than none.
-  const pricedShare = totalTurns > 0 ? Math.max(0, Math.min(1, (totalTurns - unpricedTurns) / totalTurns)) : 1;
-
-  if (typeof ceiling !== "number" || !Number.isFinite(ceiling) || ceiling <= 0) {
-    return { blocked: false, reason: "no spend ceiling configured", visibleUsd, pricedShare, unpricedTurns };
-  }
-
-  const minShare = options.minPricedShare ?? DEFAULT_MIN_PRICED_SHARE;
-  if (pricedShare < minShare) {
-    return {
-      blocked: false,
-      reason:
-        `spend ceiling of $${ceiling} not enforced: only ${(pricedShare * 100).toFixed(0)}% of the last 5h of turns ` +
-        `carry a price (${unpricedTurns} unpriced), below the ${(minShare * 100).toFixed(0)}% needed to trust the total`,
-      visibleUsd,
-      pricedShare,
-      unpricedTurns,
-    };
-  }
-
-  if (visibleUsd < ceiling) {
-    return {
-      blocked: false,
-      reason: `within ceiling: $${visibleUsd.toFixed(2)} of $${ceiling}`,
-      visibleUsd,
-      pricedShare,
-      unpricedTurns,
-    };
-  }
-  return {
-    blocked: true,
-    reason: `over ceiling: $${visibleUsd.toFixed(2)} against a $${ceiling} cap`,
-    visibleUsd,
-    pricedShare,
-    unpricedTurns,
-  };
-}

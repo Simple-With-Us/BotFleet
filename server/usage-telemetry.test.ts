@@ -256,7 +256,6 @@ describe("provider naming", () => {
       ["kimiAgent", "moonshot"],
       ["cursorAgent", "cursor"],
       ["minimax", "minimax"],
-      ["mcodeAgent", "minimax"],
       ["boxAgent", "box"],
       ["openrouter", "openrouter"],
     ];

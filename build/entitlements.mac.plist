@@ -6,8 +6,16 @@
     <true/>
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
-    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-    <true/>
+    <!--
+      disable-library-validation stays on the MAIN app only, and only here:
+      electron/cua.mjs loads Resources/cua-sdk/native/libcua_driver_sdk.dylib
+      and cua_driver_node_runtime.node into this process, and
+      scripts/prepare-cua.mjs copies both out of the npm package without
+      re-signing them (Resources are data, not nested code, so the signing
+      pass never reaches them).  Library validation would block that load.
+      Every other nested helper gets build/entitlements.mac.inherit.plist,
+      which has neither this nor the DYLD escape hatch.
+    -->
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
     <key>com.apple.security.device.audio-input</key>

@@ -16,12 +16,6 @@ export const ENGINE_PLAN_OPTIONS: Record<string, EnginePlanOption[]> = {
     { label: "Token Plan Starter ($15/mo)", planName: "MiniMax Token Plan Starter", costPerMonth: 15 },
     { label: "API Pay-as-you-go", planName: "MiniMax API Pay-as-you-go", costPerMonth: null },
   ],
-  mcode: [
-    { label: "Token Plan Max ($132/mo)", planName: "MiniMax Token Plan Max", costPerMonth: 132 },
-    { label: "Token Plan Pro ($55/mo)", planName: "MiniMax Token Plan Pro", costPerMonth: 55 },
-    { label: "Token Plan Starter ($15/mo)", planName: "MiniMax Token Plan Starter", costPerMonth: 15 },
-    { label: "API Pay-as-you-go", planName: "MiniMax API Pay-as-you-go", costPerMonth: null },
-  ],
   claude: [
     { label: "Claude Max 20× ($213.20/mo)", planName: "Claude Max 20×", costPerMonth: 213.2 },
     { label: "Claude Max 5× ($100/mo)", planName: "Claude Max 5×", costPerMonth: 100 },

@@ -363,6 +363,7 @@ export function antigravityMcpServers(
           env: {
             ELECTRON_RUN_AS_NODE: "1",
             OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+            OGB_BOX_API: proxyEnv.OGB_BOX_API ?? "",
             OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
             OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
             OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",

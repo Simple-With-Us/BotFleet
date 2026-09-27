@@ -175,12 +175,6 @@ const playTurn = (prompt: JsonValue) => {
       if (process.env.FAKE_CLAUDE_PARTIAL_FAILS) {
         out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "half an answer" } } });
       }
-      // FAKE_CLAUDE_TOOL_FAILS makes the failing launch emit a tool_use frame
-      // first — the produced-output guard must forbid retrying it (E2): the
-      // relaunch would replay the user message and re-run the tool.
-      if (process.env.FAKE_CLAUDE_TOOL_FAILS) {
-        out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_fake_fail", name: "Bash", input: { command: "echo ran" } }] } });
-      }
       process.stderr.write("claude: API error (503): service temporarily unavailable\n");
       process.exit(5);
     }

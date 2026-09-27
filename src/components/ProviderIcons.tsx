@@ -279,10 +279,6 @@ export function ProviderMark({
       return <QwenMark size={size} className={className} />;
     case "minimax":
     case "minimaxAgent":
-    // MiniMax Code is MiniMax's own CLI and carries the same brand, so it
-    // renders the same mark rather than a monogram.
-    case "mcode":
-    case "mcodeAgent":
       return <MiniMaxMark size={size} className={className} />;
     case "hermesAgent":
       return <HermesMark size={size} className={className} />;

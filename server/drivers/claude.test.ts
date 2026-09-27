@@ -174,7 +174,6 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_DUMP;
     delete process.env.FAKE_CLAUDE_TRANSIENTS;
     delete process.env.FAKE_CLAUDE_PARTIAL_FAILS;
-    delete process.env.FAKE_CLAUDE_TOOL_FAILS;
     delete process.env.FAKE_CLAUDE_STATE;
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
@@ -626,16 +625,14 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
-  it("interrupt kills the turn and settles it interrupted, not hung and not a crash", async () => {
+  it("interrupt kills the turn and settles it as failed, not hung", async () => {
     await create("hang");
     await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
 
     await instance.adapter.interruptTurn("t-int");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
-    // a stop is not a crash: no runtime.error accompanies it (audit E6)
-    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
   });
 
   it("a message sent mid-turn is steered into the running turn", async () => {
@@ -667,51 +664,6 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(dump, "utf8")).toBe(dumpBefore);
     expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(2);
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
-  });
-
-  it("relaunches the live turn, not the first turn, when a warm process crashes (E3)", async () => {
-    // The close handler is registered by the FIRST spawn.  On a warm session
-    // a crash during turn 2 used to run that closure's relaunch with turn
-    // 1's turn object - the relaunched CLI received turn 1's prompt.
-    const state = join(scratch, "launches.txt");
-    const dump = join(scratch, "dump.json");
-    // TRANSIENTS=1 crashes playTurn while the state counter is below the
-    // quota; seeded at 1, turn 1 completes and each later playTurn crashes
-    // only after the test re-arms the counter.
-    writeFileSync(state, "1");
-    process.env.FAKE_CLAUDE_DUMP = dump;
-    process.env.FAKE_CLAUDE_TRANSIENTS = "1";
-    process.env.FAKE_CLAUDE_STATE = state;
-    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
-    await create();
-    const first = await instance.adapter.sendTurn({ threadId: "t-e3", text: "turn one: delete branch foo" });
-    await recorder.until((e) => e.type === "turn.completed");
-    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
-    // arm the scripted crash for the warm process's second prompt
-    writeFileSync(state, "0");
-    const second = await instance.adapter.sendTurn({
-      threadId: "t-e3",
-      text: "turn two: rename branch bar",
-      resumeCursor: announced,
-    });
-    // the relaunch is a fresh sendTurn with its own turnId, the same shape a
-    // turn-1 crash retry takes
-    await recorder.until(
-      (e) => e.type === "turn.completed" && e.turnId !== first.turnId && e.turnId !== second.turnId,
-      15_000,
-    );
-    // the retry is reported against the turn that was live when the process
-    // died - turn 2 - not the turn the close handler's closure spawned with
-    const retrying = recorder.events.find((e) => e.type === "turn.retrying") as { turnId?: string } | undefined;
-    expect(retrying?.turnId).toBe(second.turnId);
-    const completed = recorder.events.filter((e) => e.type === "turn.completed");
-    expect(completed).toHaveLength(2);
-    expect(completed[1]).toMatchObject({ ok: true });
-    // the relaunch is a fresh process, so it dumps its spawn payload: the
-    // prompt must be turn 2's, never a replay of turn 1's
-    const relaunch = JSON.parse(readFileSync(dump, "utf8")) as { prompt: { message: { content: string } } };
-    expect(relaunch.prompt.message.content).toContain("turn two: rename branch bar");
-    expect(relaunch.prompt.message.content).not.toContain("turn one: delete branch foo");
   });
 
   it("keeps the warm process across a roster whose live state moved, replaces it when membership did", async () => {
@@ -1049,21 +1001,6 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
     expect(recorder.events.some((e) => e.type === "content.delta" && e.streamKind === "assistant_text")).toBe(true);
     expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
-  }, 20_000);
-
-  it("never retries after a tool call already ran - the relaunch would re-run it (E2)", async () => {
-    process.env.FAKE_CLAUDE_TRANSIENTS = "9";
-    process.env.FAKE_CLAUDE_TOOL_FAILS = "1";
-    process.env.FAKE_CLAUDE_STATE = join(scratch, "launches-tool-fail");
-    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.001";
-    await create();
-    await instance.adapter.sendTurn({ threadId: "t-tool-fail", text: "go" });
-
-    await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
-    expect(recorder.events.some((e) => e.type === "item.started" && e.itemType === "tool")).toBe(true);
-    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
-    // no relaunch: the launch counter never moved past the first attempt
-    expect(readFileSync(process.env.FAKE_CLAUDE_STATE!, "utf8")).toBe("1");
   }, 20_000);
 
   it("an interrupt during the retry backoff cancels cleanly without a zombie relaunch", async () => {

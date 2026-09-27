@@ -121,13 +121,6 @@ export interface RoutineRun {
   coalescedInto?: string;
   outcomeCode?: RoutineOutcomeCode;
   failurePhase?: RoutineFailurePhase;
-  /** Set when the failure that ended this run was a SETUP failure — the engine
-   *  could not start (CLI absent, not executable, needs an interactive login).
-   *  That is a fact about the ENGINE, not about this run's work, and it is what
-   *  tells the doomed-dispatch breaker that the next tick will fail the same
-   *  way.  Carried on the run so it survives from the `runtime.error` to the
-   *  `turn.completed` that closes it. */
-  setupFailed?: boolean;
   engineId?: string;
   driver?: string;
   model?: string;
@@ -1151,7 +1144,7 @@ export class RoutineManager {
     }
   }
 
-  handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
+  handleRuntimeEvent(event: RuntimeEvent): RoutineRun | null {
     const run = this.runs.find((r) => !r.coalescedInto && r.threadId === event.threadId && ["running", "waiting"].includes(r.status));
     if (!run) return null;
     run.engineId = event.providerInstanceId ?? event.provider;
@@ -1166,28 +1159,16 @@ export class RoutineManager {
       run.output = event.text.trim().slice(0, 2_000);
     } else if (event.type === "runtime.error") {
       run.error = event.message.slice(0, 500);
-      // Remember setup-ness on the run rather than smuggling it through
-      // `outcomeCode`.  It used to be written as `auth_required` and then read
-      // back at the `turn.completed` arm as `run.outcomeCode === "auth_required"`
-      // — which was both lossy (it stood for every setup failure) and
-      // destroyed by the failure-code lookup that followed it.
-      run.setupFailed = event.setup === true;
+      run.outcomeCode = event.setup ? "auth_required" : undefined;
     } else if (event.type === "turn.retrying") {
       // the driver will relaunch this same run; a transient blip is not a
       // receipt-worthy failure, so keep the run running and stay quiet
       return null;
     } else if (event.type === "turn.completed") {
-      if (opts?.fallingOver) {
-        // A fallback dispatch is already launching for this turn: receipt
-        // waits for the fallback's own completion, the same way a driver
-        // retry keeps the run open.  The caller still gets the run so the
-        // fallback can inherit what it needs from it.
-        return { ...run };
-      }
       run.cost = event.cost;
       run.denials = event.denials;
       const reason = event.stopReason ?? run.error;
-      const code = routineFailureCode(reason, run.setupFailed === true, Boolean(event.denials?.length));
+      const code = routineFailureCode(reason, run.outcomeCode === "auth_required", Boolean(event.denials?.length));
       if (code === "cancelled") {
         run.status = "cancelled";
         run.outcomeCode = "cancelled";
@@ -1205,7 +1186,6 @@ export class RoutineManager {
         run.status = "completed";
         run.outcomeCode = "completed";
         run.failurePhase = undefined;
-        run.setupFailed = false;
         run.finishedAt = this.now();
         run.error = undefined;
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);

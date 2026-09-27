@@ -126,10 +126,6 @@ const DRIVER_KIND_PROVIDERS: Readonly<Record<string, string>> = {
   antigravityAgent: "google-antigravity",
   minimax: "minimax",
   minimaxAgent: "minimax",
-  // MiniMax Code spends the same Token Plan as the direct MiniMax engine, so
-  // its driver kind answers to that provider rather than claiming a window
-  // nothing publishes for the CLI.
-  mcodeAgent: "minimax",
   deepseek: "deepseek",
   deepseekAgent: "deepseek",
   dshAgent: "dsh",
@@ -196,7 +192,7 @@ export function driverKindsForWindow(window: QuotaWindowMatch): string[] {
   if (hay.includes("codex") || hay.includes("chatgpt")) return ["codex", "codexAgent"];
   if (hay.includes("anthropic") || hay.includes("claude")) return ["claudeAgent"];
   if (hay.includes("grok") || hay.includes("xai")) return ["grokAgent", "grok"];
-  if (hay.includes("minimax")) return ["minimaxAgent", "minimax", "mcodeAgent"];
+  if (hay.includes("minimax")) return ["minimaxAgent", "minimax"];
   // inferProviderAndService (server/telemetry.ts) reports Kimi/Moonshot
   // windows under provider "moonshot"; the shipped fleet's Kimi instance
   // rides driver kind "kimiAgent" (instanceConfigs()'s DEFAULT_FLEET). The

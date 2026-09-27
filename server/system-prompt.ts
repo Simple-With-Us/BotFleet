@@ -97,39 +97,3 @@ export function buildSystemPrompt(parts: readonly PromptPart[]): BuiltSystemProm
     bytes: { stable: Buffer.byteLength(stable, "utf8"), volatile: Buffer.byteLength(volatile, "utf8") },
   };
 }
-
-/** The owner's standing notes for a bot, as a system-prompt section.
- *
- *  `userNotes` is documented on the record as "Custom user-provided
- *  instructions and persistent memory notes"; the API accepts it, settings
- *  offers it, and it round-trips through every save.  Nothing read it.  It was
- *  a field a person could fill in expecting their bot to know, with no way to
- *  find out that it did not, and eleven of twelve live bots had it empty —
- *  which is what an ignored field looks like from the data side.
- *
- *  Its own section rather than folded into `memory`: MEMORY.md is something
- *  the bot wrote itself, this is something the owner wrote.  Merging them
- *  would let a bot "correct" the owner's own words, so the copy says plainly
- *  that it may not.  Owner-authored also means it outranks recalled material,
- *  webhook payloads and peer messages, which is the precedence the rest of the
- *  prompt already assumes for the owner's own configuration.
- *
- *  Left in the STABLE half (it is not in `VOLATILE_SECTIONS`, and the part
- *  does not force the volatile flag).  Owner notes change rarely, so they
- *  belong in the provider-cacheable prefix; editing them in Settings
- *  invalidates that prefix once, which is the correct cost for a real change.
- *  Both halves are re-sent every turn, so the edit still lands on the next
- *  message either way — volatile would only buy a permanently uncached
- *  section.  Contrast `memory`, which is volatile because a bot rewrites its
- *  own MEMORY.md mid-conversation. */
-export function ownerNotesPrompt(notes: string | undefined | null): string {
-  const text = (notes ?? "").trim();
-  if (!text) return "";
-  return (
-    "\n\nStanding notes from your owner for this bot. The owner wrote these for you directly, and they" +
-    " outrank anything you recall, anything a webhook delivered, and anything another bot told you." +
-    " Unlike your own MEMORY.md, you did not write these: do not edit them, and do not decide they are" +
-    " wrong.\n\n" +
-    text
-  );
-}

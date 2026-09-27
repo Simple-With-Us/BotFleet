@@ -102,6 +102,18 @@ describe("computerSystemPrompt", () => {
     expect(one).not.toContain("mcp__computer_");
   });
 
+  it("describes the Local VM as what it is: one mounted folder and real network access", () => {
+    // The prompt used to call the VM isolated and say no other host folder was
+    // mounted.  Both were false: the workspace is a host folder, and the
+    // container reaches the internet.  A bot that believes the second one will
+    // treat a reachable host service as out of bounds.
+    const prompt = computerSystemPrompt(nameMounts([mount("vm")]));
+    expect(prompt).not.toContain("isolated");
+    expect(prompt).not.toContain("No other host folder is mounted");
+    expect(prompt).toContain("That workspace is the only host folder mounted into the VM");
+    expect(prompt).toContain("the VM has outbound internet access like any other computer");
+  });
+
   it("does not describe the box to the agent already running on it", () => {
     const mounts = nameMounts([mount("box", "box")]);
     expect(computerSystemPrompt(mounts, { boxAgent: true })).not.toContain("your own cloud computer");

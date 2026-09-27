@@ -24,8 +24,12 @@
 // with a string the MODEL reads, so a broken tool is one more thing the
 // agent can reason about rather than a dead turn.
 
+import { isAbsolute, resolve } from "node:path";
+
+import { looksSensitive } from "../auto-approve.ts";
 import type {
   RequestOutcome,
+  ToolArguments,
   TurnToolCall,
   TurnToolHost,
   TurnToolOutcome,
@@ -43,7 +47,7 @@ import { createPhoneTools } from "./phone.ts";
 import { createRecallTools } from "./recall.ts";
 import { createLinqTools, type LinqToolDeps } from "./linq.ts";
 import type { RecallSettings } from "../recall-transport.ts";
-import { harnessTool, toolsFor, type ToolGateContext } from "./registry.ts";
+import { harnessTool, toolsFor, type ToolApproval, type ToolGateContext } from "./registry.ts";
 
 export type { AgentBot as TurnToolBot } from "./agents.ts";
 
@@ -104,6 +108,58 @@ export interface TurnToolHostContext {
 
 const failed = (content: string, detail?: string): TurnToolOutcome =>
   detail ? { kind: "error", content, detail } : { kind: "error", content };
+
+/** The `condition` values `server/tools/registry.ts` can name.  The registry
+ *  cannot hold these predicates itself — it imports nothing, so anything that
+ *  needs a path resolved against this turn's working directory belongs here,
+ *  beside the only code that knows `cwd`. */
+const APPROVAL_CONDITIONS = {
+  // Same resolution `server/tools/computer.ts` applies before it opens the
+  // file, so the card names the path the executor will really read and the
+  // pattern list sees the resolved absolute path rather than the model's
+  // own spelling of it.
+  "sensitive-file-path": (args, ctx) => {
+    // SAFETY: a `path` that is not a string cannot name a sensitive file, and
+    // a string path is the only thing this gate has to judge.  Coercing here
+    // rather than narrowing on `typeof` keeps one rule at the boundary: the
+    // executor is what decides what a non-string argument means, and by the
+    // time it opens anything the path has been through `String()` once.
+    const path = stringArg(args.path);
+    if (!path) return false;
+    return looksSensitive(isAbsolute(path) ? path : resolve(ctx.cwd ?? process.cwd(), path));
+  },
+} satisfies Record<
+  NonNullable<ToolApproval["condition"]>,
+  (args: ToolArguments, ctx: { cwd?: string }) => boolean
+>;
+
+/** One model-authored argument, as text.  Empty and absent are both "no
+ *  value", which is the only distinction either caller needs. */
+// A tool argument is `unknown` by contract, and this is the one place that
+// contract meets the executor.  Naming a narrower type here would be a claim
+// about the model's output that nothing has checked.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function stringArg(argument: unknown): string {
+  if (argument === null || argument === undefined) return "";
+  return String(argument);
+}
+
+/** The arguments a card is built from.  A record that names a path condition
+ *  gets the resolved absolute path substituted first, so the summary the
+ *  person reads is the file the executor opens — a `read_file ../../.ssh/
+ *  id_rsa` card that said `read_file ../../.ssh/id_rsa` would be a card
+ *  about a path nobody is going to look at. */
+function approvalArgs(
+  args: ToolArguments,
+  condition: ToolApproval["condition"],
+  cwd: string | undefined,
+): ToolArguments {
+  // SAFETY: see `stringArg` — a value that is not a string names no path, so
+  // it is passed through untouched and the executor decides what it means.
+  const path = stringArg(args.path);
+  if (condition !== "sensitive-file-path" || !path) return args;
+  return { ...args, path: isAbsolute(path) ? path : resolve(cwd ?? process.cwd(), path) };
+}
 
 /** Production voice synthesizer.  Resolved lazily inside `tools/linq.ts`
  *  so the host module does not import `server/tts/index.ts` directly —
@@ -198,25 +254,21 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
         // Ask BEFORE the executor runs, never after: an approval that
         // arrives once the side effect has happened is a receipt, not a
         // decision.  A tool with no `approval` record never asks at all —
-        // which is every read tool, and the reason `list_bots` does not
-        // put a card in front of anyone.
+        // which is every read tool that cannot reach something sensitive,
+        // and the reason `list_bots` does not put a card in front of anyone.
+        // A record that names a `condition` asks only when that condition
+        // holds, so a read stays free until the path is a credential store.
         const approval = harnessTool(call.name)?.approval;
-        // A `when` gate narrows the ask to the arguments that need it (a
-        // read_file of a credential path, not of a source file).  A gate
-        // that cannot decide asks: failing open is how a guard becomes a
-        // receipt printer.
-        let gated = true;
-        if (approval?.when) {
-          try {
-            gated = approval.when(call.arguments);
-          } catch {
-            gated = true;
-          }
-        }
-        if (approval?.policy === "ask" && gated) {
+        const asked = approval !== undefined && approval.policy === "ask"
+          ? (approval.condition
+            ? APPROVAL_CONDITIONS[approval.condition](call.arguments, { cwd: ctx.cwd })
+            : true)
+          : false;
+        if (asked && approval) {
+          const cardArgs = approvalArgs(call.arguments, approval.condition, ctx.cwd);
           let summary: string;
           try {
-            summary = approval.summary(call.arguments);
+            summary = approval.summary(cardArgs);
           } catch {
             // A summary a person cannot read is not a card worth showing,
             // but running the tool unasked is worse.  Name the tool and ask.

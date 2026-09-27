@@ -178,16 +178,6 @@ describe("default fleet", () => {
     expect(existing.minimax?.driver).toBe("minimax");
   });
 
-  it("ships MiniMax Code as its own default-fleet engine", () => {
-    const map = instanceConfigs({});
-    expect(map.mcode).toEqual({ driver: "mcodeAgent", environment: {} });
-    // The reserved instance id is the engine's own name, so the row is not
-    // mistaken for one the operator added.
-    expect(map.minimax?.driver).toBe("minimax");
-    const existing = instanceConfigs({ instances: { claude: { driver: "claudeAgent" } } });
-    expect(existing.mcode?.driver).toBe("mcodeAgent");
-  });
-
   it("carries the saved OpenAI-compatible URL into the live default instance", () => {
     const map = instanceConfigs({
       openaiCompat: { key: "secret", url: "https://models.example.test/v1" },

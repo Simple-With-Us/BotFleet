@@ -72,7 +72,7 @@ import { spendCeilingDecision } from "./rolling-spend.ts";
 import { effectiveToolRounds, toolBudgetPrompt } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
-import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
+import { buildSystemPrompt } from "./system-prompt.ts";
 import { telemetry } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -118,13 +118,12 @@ import {
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
 import { botFleetStatusSystemPrompt } from "./botfleet-status-capsule.ts";
 import {
+  BOX_GATEWAY_PATH,
   containerComputerAction,
-  
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
-  
-  
+  handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
   perBotLocalVmTarget,
@@ -644,132 +643,99 @@ bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
 const COMMS_TOKEN = randomBytes(24).toString("hex");
 
-/** Feed the doomed-dispatch breaker from the live event bus.
+/** Comms grants minted per turn, bound to the bot they were issued for.
  *
- *  Deliberately keyed on `runtime.error` with `setup: true` and nothing else.
- *  That flag is the driver telling us the process never came up — CLI absent,
- *  not executable, or needing an interactive login — and it is a fact about
- *  the ENGINE rather than about the work.  A model that answered badly, a
- *  provider that timed out, and a driver that threw mid-flight all arrive as
- *  failures and all deserve a retry; only this one means the next tick will
- *  fail identically, which is the only thing a breaker can usefully act on.
+ *  The boot token above is a front door, and it was the only door: every bot
+ *  in the fleet is handed that same value in a 0600 `mcp.json` it can read,
+ *  so holding it proved no more than "some bot on this Mac is talking" — and
+ *  the `/api/internal/*` routes then believed whatever `fromBotId` and
+ *  `depth` the body claimed.  A bot holding nothing but its own proxy could
+ *  relay as any peer and could claim a nesting depth its turn was never
+ *  issued.
  *
- *  Fed from the bus rather than from the routine tracker on purpose: the
- *  tracker only sees threads that have a run attached, and it resolves
- *  `engineId` from the event it is handed rather than from the live instance,
- *  so a breaker fed from there would miss turns and key on a stale engine. */
-function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): void {
-  if (!bot) return;
-  const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
-  if (!instanceId) return;
-  if (event.type === "runtime.error") {
-    if (event.setup) doomedDispatches.recordFailure(bot.id, instanceId, event.message);
-    return;
+ *  Each turn's agents-proxy now gets a token of its own, bound to that bot
+ *  and thread and to the depth it was issued, and every route that takes a
+ *  bot identity checks the claim against the binding.  The depth bound is
+ *  the escalation stop: a turn issued at depth 0 cannot hand out a depth-1
+ *  peer hop, so a chain cannot grow past `MAX_COMMS_DEPTH` from the inside.
+ *
+ *  The boot token still works for the two callers that never claim to be a
+ *  peer — the computer-control proxy and Composio's MCP bridge, which
+ *  re-derive their own identity (see the `connectors/mcp` route).  A boot
+ *  token may not name a bot.
+ *
+ *  Scope, stated plainly: a bot with a shell can still read another bot's
+ *  mcp.json, and this does not stop that.  It narrows the lane to a proxy
+ *  that has no shell, which is the path this was reachable on. */
+interface CommsGrant {
+  botId: string;
+  threadId: string;
+  maxDepth: number;
+}
+const commsGrants = new Map<string, CommsGrant>();
+/** Turns are short and bots are few, so a generous cap that no real fleet
+ *  reaches still keeps a long-lived harness from growing this forever. */
+const MAX_COMMS_GRANTS = 512;
+
+function mintCommsGrant(botId: string, threadId: string, depth: number): string {
+  const token = randomBytes(24).toString("hex");
+  commsGrants.set(token, { botId, threadId, maxDepth: depth });
+  // Map iterates in insertion order, so this drops the oldest grants first.
+  while (commsGrants.size > MAX_COMMS_GRANTS) {
+    const oldest = commsGrants.keys().next();
+    if (oldest.done) break;
+    commsGrants.delete(oldest.value);
   }
-  // Any turn that reached a result proves the pair is alive, so a breaker left
-  // over from an earlier bad patch does not outlive the fix.
-  if (event.type === "turn.completed" && event.ok) doomedDispatches.recordSuccess(bot.id, instanceId);
+  return token;
 }
 
-/** Count a dispatch the doomed breaker refused, so `doomed_skipped` is a number
- *  an operator can read instead of an intention in a plan.
- *
- *  The audit that motivated the breaker counted 146 dispatches onto an engine
- *  that could not spawn and had no way to see that the refusal was working: the
- *  run stayed `queued`, `botState` still said `ready`, and nothing recorded the
- *  decision.  A breaker nobody can measure is indistinguishable from a breaker
- *  that silently stopped the fleet, which is the failure mode worth spending
- *  lines here to avoid.
- *
- *  A Sentry custom metric, not a log line and not a breadcrumb, and not a new
- *  subsystem: `usage_telemetry.outbox` already counts through
- *  `getSentry()?.metrics.count`, and this is that same call with a different
- *  name.  A breadcrumb was the other candidate and is the wrong instrument —
- *  breadcrumbs ride along on the NEXT event rather than accumulating, so they
- *  cannot answer "how many dispatches did this save over the week" at all.
- *
- *  Cheap and total on the hot path, which is the part that needed care:
- *  `canStart` runs on every tick for every due run, so one dead engine with five
- *  due routines would otherwise emit 300 calls an hour forever.  Counting
- *  locally and shipping a DELTA per pair per interval means the per-call work is
- *  a map lookup and an increment, and the counter arrives as a number that reads
- *  as a rate rather than as a function of how fast the scheduler ticks.
- *
- *  A pair that recovers keeps its pending count until the next drain, so the
- *  tail of a declining series is still reported — losing a few counts to an
- *  engine coming back is the right trade against counting a hot loop.
- *
- *  Sentry off is not a reason to throw the counts away: a local-only install
- *  has no reporter, so the tally keeps accumulating and a later window that
- *  does have one reports the whole run rather than starting from zero.  The map
- *  is bounded by the number of (bot, engine) pairs that ever declined, which is
- *  the same bound as the breaker it mirrors. */
-const doomedSkipTotals = new Map<string, { botId: string; instanceId: string; count: number }>();
-
-/** How long doomed-skip counts accumulate before they are shipped.  A minute is
- *  short enough that a live dashboard moves, and long enough that a fleet of
- *  bots ticking every second still produces a handful of increments per pair
- *  rather than one per tick. */
-const DOOMED_SKIP_DRAIN_MS = 60_000;
-
-function drainDoomedSkips(): void {
-  if (!doomedSkipTotals.size || !isSentryActive()) return;
-  const sentry = getSentry();
-  if (!sentry) return;
-  for (const [key, tally] of doomedSkipTotals) {
-    try {
-      sentry.metrics.count("botfleet.dispatcher.doomed_skipped", tally.count, {
-        attributes: {
-          "botfleet.bot.id": tally.botId,
-          "botfleet.instance.id": tally.instanceId,
-        },
-      });
-      doomedSkipTotals.delete(key);
-    } catch {
-      // A refused count must not take the drain down for the other pairs, and
-      // the tally is left in place so the next drain retries the same number
-      // rather than losing it.
-    }
-  }
-}
-
-// Unref'd so a harness that never dispatches anything still exits promptly.
-setInterval(drainDoomedSkips, DOOMED_SKIP_DRAIN_MS).unref?.();
-
-/** The hot path: a map hit and an increment, nothing that can block a tick and
- *  nothing that reaches the network.  Everything that talks to Sentry lives in
- *  the drain above. */
-function noteDoomedSkip(botId: string, instanceId: string): void {
-  try {
-    const key = `${botId}:${instanceId}`;
-    const tally = doomedSkipTotals.get(key);
-    if (tally) tally.count += 1;
-    else doomedSkipTotals.set(key, { botId, instanceId, count: 1 });
-  } catch {
-    // A counter must never be the reason a dispatch does not happen.
-  }
-}
-
-/** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
- *  consulted for work nobody is watching, so a cap can stop background
- *  automation without silently refusing a message the owner is waiting on. */
-function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
-  if (runOn !== "bot") return false;
-  const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
-    ceilingUsd: cfg.usage?.spendCeilingUsd,
-    minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
-  });
-  if (decision.blocked) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
-  return decision.blocked;
+/** The bearer value, or "" — a missing or repeated header is not a grant. */
+function bearerToken(header: string | string[] | undefined): string {
+  if (Array.isArray(header) || !header) return "";
+  const match = /^Bearer (.+)$/.exec(header);
+  return match ? match[1]! : "";
 }
 
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
- * but the compare costs nothing to make safe. */
+ * but the compare costs nothing to make safe.  A live per-turn grant counts
+ * as authorized here: the identity routes below are what decide what that
+ * grant may claim. */
 function authorizedComms(header: string | string[] | undefined): boolean {
+  if (commsGrants.has(bearerToken(header))) return true;
   const expected = Buffer.from(`Bearer ${COMMS_TOKEN}`);
   const got = Buffer.from(Array.isArray(header) ? "" : (header ?? ""));
   return got.length === expected.length && timingSafeEqual(got, expected);
+}
+
+/** Check an `/api/internal` identity claim against the token that presented
+ *  it: the bot must be the one the grant was minted for, and the depth must
+ *  not exceed the one it was issued.  Returns the refusal to send, or null
+ *  when the claim stands. */
+function authorizeCommsIdentity(
+  header: string | string[] | undefined,
+  claim: { botId?: string | null; depth?: number },
+): { status: number; body: { error: string } } | null {
+  const token = bearerToken(header);
+  const grant = token ? commsGrants.get(token) : undefined;
+  // `botId` is a string or null by this function's own signature, and every
+  // call site hands it one: a `String(...)` coercion or a zod-validated field.
+  // An absent claim and a blank one are the same "no identity claimed".
+  const claimedBotId = claim.botId?.trim() ?? "";
+  if (!grant) {
+    // A boot-token caller has no binding to check a claim against, so it may
+    // not make one.  It has no peer identity to speak with in the first place.
+    if (claimedBotId) return { status: 403, body: { error: "forbidden: claiming a bot identity needs a session-bound token" } };
+    if (claim.depth !== undefined) return { status: 403, body: { error: "forbidden: comms depth needs a session-bound token" } };
+    return null;
+  }
+  if (claimedBotId && claimedBotId !== grant.botId) {
+    return { status: 403, body: { error: "forbidden: this token belongs to another bot" } };
+  }
+  if (claim.depth !== undefined && claim.depth > grant.maxDepth) {
+    return { status: 403, body: { error: "forbidden: comms depth beyond the issued bound" } };
+  }
+  return null;
 }
 // Cap message chains: depth 0 = a user-initiated turn (may ask a peer);
 // a peer invoked via ask_bot runs at depth 1 and gets NO agents tool, so
@@ -793,7 +759,9 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
       OMB_HARNESS_URL: `http://127.0.0.1:${PORT}`,
       OMB_BOT_ID: botId,
       OMB_THREAD_ID: threadId,
-      OMB_COMMS_TOKEN: COMMS_TOKEN,
+      // Bound to THIS bot and THIS depth, not the boot-wide token: a proxy
+      // can speak for the bot it was spawned for and no further.
+      OMB_COMMS_TOKEN: mintCommsGrant(botId, threadId, depth),
       OMB_TURN_DEPTH: String(depth),
     },
   };
@@ -1589,81 +1557,6 @@ function cursorSeq(raw: string | string[] | undefined): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-
-// ── runtime-event redaction for the wire ─────────────────────────────────
-// Runtime events went to every SSE client and into the replay buffer whole,
-// while the transcript they fold into is scrubbed at append
-// (store.redactBotAuthored). Scrub the text-bearing fields on the broadcast
-// copy only: the server-side fold below and the HTTP tool executor still
-// read the raw event (the executor replays `arguments` verbatim).
-//
-// Deltas are provisional — the settled assistant_text item is what persists
-// — so a pattern that fires only ACROSS a delta boundary holds that
-// fragment back instead of shipping half a secret: the completed item still
-// delivers the full redacted text. The tail is raw context from the same
-// thread's recent deltas so such a split secret still matches a pattern.
-const DELTA_REDACT_TAIL_CHARS = 256;
-const deltaRedactTail = new Map<string, string>();
-
-function redactStreamDelta(threadId: string, delta: string): string {
-  const tail = deltaRedactTail.get(threadId) ?? "";
-  deltaRedactTail.set(threadId, (tail + delta).slice(-DELTA_REDACT_TAIL_CHARS));
-  const redactedTail = redactSecretsInText(tail);
-  const joined = redactSecretsInText(tail + delta);
-  // When redaction is prefix-stable (the common case: nothing secret-shaped
-  // near the boundary), the joined redaction is the redacted tail plus this
-  // delta's redacted text. When a pattern fired across the boundary the
-  // prefixes disagree — emit nothing and let the settled item carry the text.
-  return joined.startsWith(redactedTail) ? joined.slice(redactedTail.length) : "";
-}
-
-function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
-  switch (event.type) {
-    case "content.delta": {
-      const delta = redactStreamDelta(event.threadId, event.delta);
-      return delta === event.delta ? event : { ...event, delta };
-    }
-    case "item.started": {
-      const title = typeof event.title === "string" ? redactSecretsInText(event.title) : event.title;
-      const target = typeof event.target === "string" ? redactSecretsInText(event.target) : event.target;
-      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
-      if (title === event.title && target === event.target && args === event.arguments) return event;
-      return { ...event, title, target, arguments: args };
-    }
-    case "item.completed": {
-      if (event.itemType === "assistant_text") {
-        const text = redactSecretsInText(event.text);
-        return text === event.text ? event : { ...event, text };
-      }
-      const detail = typeof event.detail === "string" ? redactSecretsInText(event.detail) : event.detail;
-      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
-      if (detail === event.detail && args === event.arguments) return event;
-      return { ...event, detail, arguments: args };
-    }
-    case "request.opened": {
-      const summary = redactSecretsInText(event.summary);
-      const choices = event.choices?.map((choice) => redactSecretsInText(choice));
-      if (summary === event.summary && (!choices || choices.every((choice, i) => choice === event.choices?.[i]))) return event;
-      return { ...event, summary, choices };
-    }
-    case "turn.retrying": {
-      const reason = redactSecretsInText(event.reason);
-      return reason === event.reason ? event : { ...event, reason };
-    }
-    case "turn.completed": {
-      deltaRedactTail.delete(event.threadId);
-      const stopReason = typeof event.stopReason === "string" ? redactSecretsInText(event.stopReason) : event.stopReason;
-      return stopReason === event.stopReason ? event : { ...event, stopReason };
-    }
-    case "runtime.error": {
-      const message = redactSecretsInText(event.message);
-      return message === event.message ? event : { ...event, message };
-    }
-    default:
-      return event;
-  }
-}
-
 function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
@@ -1917,13 +1810,7 @@ async function interruptThreadEverywhere(threadId: string): Promise<InterruptOut
 }
 /** Room turns re-enter the member engine after turn.completed so failover
  * does not race the sequential roster walk. */
-const pendingMemberFallback = new Map<
-  string,
-  // instanceId keys the waiter to the turn that armed it: on a thread two
-  // engines touched (audit G16), one engine's settle must not consume the
-  // fallback another engine's failure armed.
-  { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
->();
+const pendingMemberFallback = new Map<string, { groupId: string; botId: string; selection: ModelSelection }>();
 const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
@@ -2485,17 +2372,10 @@ bus.subscribe((event: RuntimeEvent) => {
       // thread keeps its own chat id so the first reply cannot retarget.
       releaseLinqChat(event.threadId, event.turnId);
   }
-  broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
+  broadcast({ kind: "runtime", event });
+  const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
-  noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
-  // A turn.completed receipts only after the failover pick below: a turn a
-  // fallback is about to save must not fail (or falsely complete) its
-  // routine run first (E5).  Threads with no failover path receipt here.
-  let routineRun: RoutineRun | null = null;
-  if (event.type !== "turn.completed" || (!bot && !group)) {
-    routineRun = routines?.handleRuntimeEvent(event) ?? null;
-  }
   if (!bot && !group) return;
   const speaker = group ? groupSpeakers.get(event.threadId) : undefined;
 
@@ -2600,18 +2480,7 @@ bus.subscribe((event: RuntimeEvent) => {
       // bot so it keeps working. A QUESTION always reaches the human — the
       // whole point of asking is that a person decides — and anything that
       // looks destructive stops even in auto mode.
-      // The asker is the bot whose engine raised the request — resolved by
-      // the request's own provider instance, not the thread's speaker
-      // entry: a crossed room can leave the speaker naming the other
-      // member, and an auto verdict against the wrong bot applies the
-      // wrong auto-approve policy (audit G16).
-      const requestOwner = group
-        ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId)
-        : undefined;
-      const asker =
-        bot ??
-        (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
-        (speaker ? store.bot(speaker.botId) : undefined);
+      const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
@@ -2895,14 +2764,7 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
-      // The turn that ended owns its failover: resolve the member from the
-      // settled owner (this thread, this provider instance) before the
-      // thread's speaker entry, which a crossed room can leave naming the
-      // other member (audit G16).
-      const fallbackBot =
-        bot ??
-        (settledOwner ? store.bot(settledOwner.botId) : undefined) ??
-        (speaker ? store.bot(speaker.botId) : undefined);
+      const fallbackBot = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const storedFallbackPolicy = fallbackBot
         ? (bot ? store.taskByThread(fallbackBot.id, event.threadId)?.modelSelection : undefined) ?? fallbackBot.modelSelection
         : undefined;
@@ -2939,10 +2801,6 @@ bus.subscribe((event: RuntimeEvent) => {
           dispatchId: settledOwner?.dispatchId,
           token: completionToken,
         });
-      }
-      if (!fallbackBot) {
-        // No failover can launch on this thread, so the run receipts now.
-        routineRun = routines?.handleRuntimeEvent(event) ?? null;
       }
       let fallbackUserMessage: Message | undefined;
       let fallbackSelection: ModelSelection | undefined;
@@ -3007,7 +2865,7 @@ bus.subscribe((event: RuntimeEvent) => {
         let chain = configuredChain && configuredChain.length > 0 ? configuredChain : undefined;
         if (!chain && quotaOrCap) {
           deferredAutoFallback = true;
-          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
+          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
         }
         // A provider reload fences every dispatch, including a fallback to an
         // unrelated instance.  Keep this completion fold and its busy owner
@@ -3028,7 +2886,7 @@ bus.subscribe((event: RuntimeEvent) => {
               await waitForProviderReloads();
             }
             const refreshedAt = providerReloadGeneration;
-            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
+            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
             if (!providerReloadInProgress && providerReloadGeneration === refreshedAt) break;
           }
         }
@@ -3053,12 +2911,6 @@ bus.subscribe((event: RuntimeEvent) => {
           // fail-over can hand the turn to a second dead engine.
           botId: fallbackBot.id,
         });
-        // Receipt now that the failover decision exists: while a fallback is
-        // launching the run stays open and receipts on the fallback's own
-        // completion; otherwise it receipts exactly as it always has (E5).
-        routineRun = routines?.handleRuntimeEvent(event, {
-          fallingOver: Boolean(next && fallbackUserMessage && typeof fallbackUserMessage.text === "string"),
-        }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
           const { nextUsed, instanceId, model, effort } = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
@@ -3078,19 +2930,11 @@ bus.subscribe((event: RuntimeEvent) => {
             // does not spin forever waiting for a completion that never comes
             tool: { name: `Fell over to ${next.model}${resetNote}`, ok: true, kind: "notice" },
           });
-          // Arm the waiter for the member whose turn actually ended on
-          // this provider instance (audit G16): the thread's speaker entry
-          // can still name another member when turns have crossed, and a
-          // waiter armed from it re-dispatches the wrong member.
-          const endedRoomTurn = settledOwner
-            ? settledOwner.botId === fallbackBot.id
-            : speaker?.botId === fallbackBot.id;
-          if (group && endedRoomTurn) {
+          if (group && speaker?.botId === fallbackBot.id) {
             pendingMemberFallback.set(event.threadId, {
               groupId: group.id,
               botId: fallbackBot.id,
               selection: fallbackSelection,
-              instanceId: event.providerInstanceId,
             });
           }
         } else {
@@ -3172,10 +3016,6 @@ bus.subscribe((event: RuntimeEvent) => {
             modelSelection: fallbackSelection,
             automationSource: userMsg.automationSource,
             unattended: isUnattended(fallbackBotId),
-            // the destination travels with the turn: a cloud routine or
-            // webhook falls over to another engine in the same cloud, never
-            // silently back to the local bot (E5)
-            runOn: settledOwner?.computerInputs?.runOn,
           }).catch((error) => {
             if (isExternalCredentialPendingError(error)) {
               pendingCredentialFallback.set(`${fallbackBotId}:${event.threadId}`, {
@@ -3303,40 +3143,13 @@ bus.subscribe((event: RuntimeEvent) => {
  * instance (by fleet priority) is offered as a one-step chain. The caller
  * still runs it through selectTurnFallback, so the produced / quota /
  * stop-reason rules apply exactly as they do for a configured chain. */
-/** The computer destinations a fallback engine must reach to take over the
- *  failing turn: what the turn actually mounted wins over its grant, and a
- *  cloud runOn needs the matching cloud destination whatever was granted. */
-function fallbackComputerReach(inputs: TurnComputerInputs | undefined): Partial<Record<"box" | "vps" | "vm" | "local", boolean>> {
-  const requires: Partial<Record<"box" | "vps" | "vm" | "local", boolean>> = {};
-  if (!inputs) return requires;
-  const need = (kind: "box" | "vps" | "vm" | "local") => { requires[kind] = true; };
-  if (inputs.mounted) {
-    if (inputs.mounted.includes("asciiBox")) need("box");
-    if (inputs.mounted.includes("selfHostedVps")) need("vps");
-    if (inputs.mounted.includes("localVm")) need("vm");
-    if (inputs.mounted.includes("localMac")) need("local");
-  } else {
-    if (inputs.computers?.includes("cloud")) need(inputs.cloudBackend === "vps" ? "vps" : "box");
-    if (inputs.computers?.includes("vm")) need("vm");
-    if (inputs.computers?.includes("local")) need("local");
-  }
-  if (inputs.runOn === "cloud") need(inputs.cloudBackend === "vps" ? "vps" : "box");
-  return requires;
-}
-
-async function autoFallbackChain(
-  botId: string,
-  currentInstanceId: string,
-  effort?: EffortLevel,
-  requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>,
-): Promise<ModelSelection[]> {
+async function autoFallbackChain(botId: string, currentInstanceId: string, effort?: EffortLevel): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
     return eligibleAutoFallbackChain(described, {
       botId,
       currentInstanceId,
       effort,
-      requires,
       // The fleet ladder itself lives in model-fallback.ts so the ordering
       // is unit-testable without booting the server — minimax sits after
       // codex and ahead of openaiCompat, per the PR 10 owner decision.
@@ -3502,55 +3315,57 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
-    // The drained round runs on the room's operation queue, behind any
-    // message dispatch still in flight (audit G16).  Firing it directly
-    // let it start beside the live speaker: on a shared provider instance
-    // the turn claim then failed after the busy flags had already moved,
-    // and on separate instances two members spoke at once — either way the
-    // room's speaker, busy slot and fallback waiter crossed.
-    const prev = groupQueues.get(round.groupId) ?? Promise.resolve();
-    const next = prev.then(() =>
-      runGroupMemberTurn(
-        round.groupId,
-        round.threadId,
-        round.botId,
-        round.hop,
-        new Set(),
-        round.cardContinuation,
-        undefined,
-        undefined,
-        round.turnSelection,
-      ).catch((error) => {
-        store.appendMessage(round.threadId, {
-          role: "bot",
-          kind: "activity",
-          tool: {
-            name: `error: queued round could not start — ${
-              (error instanceof Error ? error.message : String(error)).slice(0, 120)
-            }`,
-            ok: false,
-          },
-        });
-      }).then(() => {}),
-    );
-    groupQueues.set(round.groupId, next.catch(() => {}));
+    void runGroupMemberTurn(
+      round.groupId,
+      round.threadId,
+      round.botId,
+      round.hop,
+      new Set(),
+      round.cardContinuation,
+      undefined,
+      undefined,
+      round.turnSelection,
+    ).catch((error) => {
+      store.appendMessage(round.threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: {
+          name: `error: queued round could not start — ${
+            (error instanceof Error ? error.message : String(error)).slice(0, 120)
+          }`,
+          ok: false,
+        },
+      });
+    });
   });
 }
 
+/** Queued messages that arrived over a relay, by queue id.
+ *
+ *  A message that waited for a busy bot must not gain an owner's attention by
+ *  sitting in the queue: `steer-queue.ts` drains it through the same
+ *  `startTurn` an owner's keystroke would, and an unattended dispatch is how
+ *  S8 stops a stranger's text running under Auto mode.  Keyed on the queue id
+ *  rather than the thread so a cancel removes exactly its own mark, and read
+ *  back off the drained batch's `queueId`s so a batch that mixes relayed and
+ *  typed text runs unattended — the conservative reading. */
+const relayQueuedMessageIds = new Set<string>();
+
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) => {
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
     // Drain just appended the held lines; userMessage keeps startTurn
     // from duplicating the last one, and excludeIds drops every drained
     // line from the transcript-replay so they are not also in `prompt`.
-    startTurn(botId, prompt, {
+    const drained = store.messagesFor(threadId).filter((m) => m.queueId && relayQueuedMessageIds.delete(m.queueId));
+    const relayed = excludeIds.some((messageId) => drained.some((m) => m.id === messageId));
+    return startTurn(botId, prompt, {
       threadId,
       userMessage,
       excludeMessageIds: excludeIds,
-      // A drained iMessage-relayed send keeps its provenance: unattended,
-      // no task re-title, no attended door-opening (S8).
-      ...(userMessage.automationSource ? { automationSource: userMessage.automationSource } : {}),
+      linqChatId,
+      unattended: relayed || undefined,
     }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
@@ -3560,8 +3375,8 @@ function drainQueuedSends() {
           ok: false,
         },
       });
-    }),
-  );
+    });
+  });
 }
 
 // ── live screen: capture only while a viewer watches ───────────────────
@@ -3840,11 +3655,11 @@ async function startTurn(
 
   const isImessageTask = store.tasks(bot.id)?.find((t) => t.threadId === threadId)?.title?.toLowerCase() === "imessage";
   const persona = [
-    `You are BF-${bot.name} (display: ${bot.name}), a bot in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
+    `You are ${bot.name} (display: ${bot.name}), a bot in BotFleet.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
-    `Slack communication rules: Use Slack channel #agent-sync sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
-    IMESSAGE_PERSONA_RULE,
+    `Posting rules: post only what another person needs in order to act, and never post unprompted status updates or routine commentary.`,
+    isImessageTask && IMESSAGE_PERSONA_RULE,
     isImessageTask && `iMessage communication rule: When replying in this iMessage thread, be concise, direct, and action-oriented. Do not leave out key details, but avoid verbose fluff, unnecessary conversational padding, or multi-paragraph meta commentary. Provide clear, direct summaries.`,
   ]
     .filter(Boolean)
@@ -4188,18 +4003,6 @@ async function startTurn(
         // recall lane mounted by PR #465 (MiniMax, OpenAI-compat, Grok
         // HTTP) without those engines setting `integrations.qdrant`.
         { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRecall }) },
-        // Only an HTTP tool-loop engine has a round ceiling at all — a CLI or
-        // ACP engine runs one process per turn and is not bounded this way, so
-        // telling those models about rounds would be a lie.
-        //
-        // Stable, not volatile: the budget is a setting, so it changes exactly
-        // when the cache SHOULD miss (the owner edited it), and never on a
-        // per-message basis the way memory or skill selection do.
-        {
-          id: "tool-budget",
-          label: "Tool budget",
-          text: usesDriverToolLoop ? toolBudgetPrompt(effectiveToolRounds(resolveMaxToolRounds(bot.maxToolRounds))) : "",
-        },
         // The Chief roster and the status capsule are byte-stable across a
         // teammate's busy flip (PR #617), which is what lets them stay on
         // the stable half.
@@ -4208,7 +4011,6 @@ async function startTurn(
         { id: "routine", label: "Routines", text: routinePrompt },
         { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
         { id: "memory", label: "Memory", text: promptFileTools ? memorySystemPrompt(bot.id) : "" },
-        { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },
         { id: "skills", label: "Skills index", text: promptFileTools ? skillsSystemPrompt(bot.id) : "" },
         { id: "skill-instructions", label: "Skill instructions", text: skillInstructions },
         { id: "playbooks", label: "Playbooks", text: packagePlaybooks },
@@ -4419,24 +4221,11 @@ routines = new RoutineManager({
     const task = bot && threadId ? store.taskByThread(bot.id, threadId) : undefined;
     if (!bot) return true;
     const policy = task?.modelSelection ?? bot.modelSelection;
-    const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
-    // A (bot, engine) pair that has failed to START repeatedly is not going to
-    // start on the next tick either — the CLI is missing, not executable, or
-    // waiting on an interactive login, and none of those change on a timer.
-    // Declining here leaves the run QUEUED rather than failed, so it still
-    // lands once the breaker half-opens after the TTL.  Same shape as the
-    // credential gate below it: both answer "should this go out right now".
-    if (doomedDispatches.isOpen(bot.id, instanceId)) {
-      noteDoomedSkip(bot.id, instanceId);
-      return false;
-    }
-    // Last, and off unless a ceiling is configured: an unattended fleet that
-    // silently stops working is a worse outcome than one that overspends, so
-    // this also refuses to fire when too little of the window is priced to
-    // trust the total.  The reason is logged rather than swallowed, because
-    // "the cap did not hold" needs to be explainable.
-    if (spendBlockedForUnattendedWork(runOn)) return false;
-    return !turnExternalCredentialPending(bot, instanceId, runOn);
+    return !turnExternalCredentialPending(
+      bot,
+      quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId,
+      runOn,
+    );
   },
   botState: (botId) => {
     const bot = store.bot(botId);
@@ -5843,42 +5632,16 @@ async function runGroupMemberTurn(
     // arrived with.
     clearUnattended(bot.id);
   }
-  // Claim the turn BEFORE any busy flag or speaker entry moves (audit
-  // G16).  A claim can lose: a round that reaches dispatch beside the
-  // live speaker finds this provider instance already owned on the
-  // thread and throws.  When the flags moved first, that throw left them
-  // behind — the real speaker's release then no-opped against a busy slot
-  // it no longer owned, and the room showed a speaker that was gone until
-  // restart.  The claim is the gate; the flags follow it, and a lost
-  // claim waits like the busy paths above instead of corrupting the room.
-  let roomDispatch: ReturnType<typeof activeTurnOwners.claim>;
-  try {
-    roomDispatch = activeTurnOwners.claim(threadId, {
-      botId: bot.id,
-      selection,
-      fallbackPolicy: bot.modelSelection,
-      computerInputs: turnComputerInputs(bot),
-    });
-  } catch {
-    const queued = queueRoomRound(
-      { groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection },
-      Date.now(),
-    );
-    const message = queued
-      ? `${bot.name}'s engine is mid-turn in this room — queued for when it frees up`
-      : `${bot.name}'s engine is mid-turn in this room — already queued`;
-    store.appendMessage(threadId, {
-      role: "bot",
-      kind: "activity",
-      from: { botId: bot.id, name: bot.name, color: bot.color },
-      tool: { name: message, ok: true, kind: "notice" },
-    });
-    return true;
-  }
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { inflightThreadId: threadId });
   store.patchGroup(group.id, { busyBotId: bot.id }); // the store's change stream carries the frame
   groupSpeakers.set(threadId, { botId: bot.id, name: bot.name, color: bot.color });
+  const roomDispatch = activeTurnOwners.claim(threadId, {
+    botId: bot.id,
+    selection,
+    fallbackPolicy: bot.modelSelection,
+    computerInputs: turnComputerInputs(bot),
+  });
   /** Hand the room back when no turn.completed will do it.  Only use it while
    * this invocation still owns the room; otherwise it would emit a duplicate
    * group frame or clear a newer speaker's state. */
@@ -5899,10 +5662,10 @@ async function runGroupMemberTurn(
     .map((b) => `@${b.name}${b.title ? ` (${b.title})` : ""}`)
     .join(", ");
   const system = [
-    `You are BF-${bot.name} (display: ${bot.name}), a bot in the room "${group.name}" in BotFleet. Always identify yourself as BF-${bot.name} in fleet communications and logs.`,
+    `You are ${bot.name} (display: ${bot.name}), a bot in the room "${group.name}" in BotFleet.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
-    `Slack communication rules: Use Slack channel #agent-sync sparingly — ONLY to claim/unclaim tasks on the shared board or for strictly necessary coordination with external agents outside BotFleet. Never post unprompted status spam or routine commentary to Slack.`,
+    `Posting rules: post only what another person needs in order to act, and never post unprompted status updates or routine commentary.`,
     `Room members: ${roster}, and ${userName} (the human).`,
     group.bulletin.trim() && `Room bulletin (shared instructions for everyone):\n${group.bulletin.trim()}`,
     group.extraCwds?.length &&
@@ -6105,7 +5868,6 @@ async function runGroupMemberTurn(
     { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRoomRecall }) },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: roomFileTools ? `\n${memorySystemPrompt(bot.id).trim()}` : "" },
-    { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },
     { id: "skills", label: "Skills index", text: roomFileTools ? skillsSystemPrompt(bot.id) : "" },
     { id: "skill-instructions", label: "Skill instructions", text: renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) },
     { id: "playbooks", label: "Playbooks", text: installedPlaybookInstructions(text, bot.playbooks) },
@@ -6292,14 +6054,7 @@ async function runGroupMemberTurn(
   }
 
   const pendingFallback = pendingMemberFallback.get(threadId);
-  if (
-    pendingFallback &&
-    pendingFallback.botId === bot.id &&
-    pendingFallback.groupId === groupId &&
-    // The waiter belongs to the turn that armed it (audit G16): only this
-    // invocation's own engine may consume it.
-    (!pendingFallback.instanceId || pendingFallback.instanceId === selection.instanceId)
-  ) {
+  if (pendingFallback && pendingFallback.botId === bot.id && pendingFallback.groupId === groupId) {
     pendingMemberFallback.delete(threadId);
     if (!isCancelled?.() && outcome === "settled") {
       spoken.delete(bot.id);
@@ -7645,6 +7400,44 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
+const TTS_PROVIDERS = ["minimax", "elevenlabs", "system"] as const;
+// The same list as a domain value, so a save is judged against the names the
+// harness actually has rather than against a string comparison in the handler.
+const ttsProviderName = z.enum(TTS_PROVIDERS);
+const ttsProviderFold = z.string().trim().toLowerCase();
+
+/** The voice provider a config save is asking for, or the error to name back.
+ *
+ *  Only the SAVE route needs this, because it is the only place a provider
+ *  name turns into a network call: `tts.verifyKey` posts the key to the
+ *  selected provider's endpoint.  `parseConfigPatch` has already checked the
+ *  value against the schema by the time most of this runs, but a name the
+ *  schema refuses comes back as a generic 400 — and a client that guessed
+ *  wrong deserves to be told which word it guessed. */
+
+/** The `tts` section as a save payload carries it: one provider claim, read
+ *  as `unknown` and judged only by `ttsProviderClaim` below. */
+const ttsClaimSchema = z.object({ tts: z.object({ provider: z.unknown() }).optional() });
+
+/** Named so each `{}` return keeps the shape it states; an inline object type
+ *  here reads as evidence the inference had already thrown away. */
+interface TtsProviderClaim {
+  error?: string;
+}
+
+function ttsProviderClaim(body: Record<string, unknown>): TtsProviderClaim {
+  // The save payload is decoded once, here, rather than field by field: a
+  // missing, null, or non-object `tts` section simply fails to parse and
+  // reads as "no provider claimed", which is the answer it already got.
+  const parsed = ttsClaimSchema.safeParse(body);
+  const provider = parsed.success ? parsed.data.tts?.provider : undefined;
+  // Absent and null are the same "not chosen" — the save route defaults
+  // those.  Anything else has to name a provider the harness knows.
+  if (provider === undefined || provider === null) return {};
+  const known = ttsProviderName.safeParse(ttsProviderFold.safeParse(provider).data).success;
+  return known ? {} : { error: "tts.provider must be minimax, elevenlabs, or system" };
+}
+
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
     // Buffer chunks and decode once: concatenating per-chunk strings
@@ -7685,6 +7478,39 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   });
 }
 
+// Mutating routes take `application/json`, and the one central check here is
+// the reason the per-route checks that already existed are not the whole
+// answer.  A `text/plain` POST is a CORS-SIMPLE request: the browser sends
+// it with NO preflight, so it reaches a mutating route no matter what the
+// origin gate says, and a cross-origin simple POST cannot be stopped at the
+// origin either (fetch with a JSON content type would be preflighted and
+// would fail).  `/api/update/run`, `POST /api/bots` and `/:id/respond` all
+// parsed any content type, so a page anywhere could drive them.
+//
+// Bodyless mutating requests (a stop, a cancel) are exempt — there is no
+// content type to check.  The binary upload is exempt by name, because it is
+// the one route whose body is not JSON, and the phone sends its own type
+// through `companion/src/proxy.ts`, which forwards it verbatim.
+const NON_JSON_BODY_ROUTES = new Set(["/api/attachments"]);
+
+/** The 415 a mutating request gets when it carries a body the harness will
+ *  not parse.  One string for one condition: the shared gate and the per-route
+ *  checks below are the same rule written twice for defence in depth, and a
+ *  caller that hits one of them should not be told something different from a
+ *  caller that hits the other. */
+const UNSUPPORTED_JSON_BODY = "unsupported media type: mutating requests take application/json";
+
+function hasRequestBody(req: IncomingMessage): boolean {
+  if (req.headers["transfer-encoding"]) return true;
+  const length = req.headers["content-length"];
+  return length !== undefined && /^\d+$/.test(String(length)) && Number(length) > 0;
+}
+
+function isJsonContentType(req: IncomingMessage): boolean {
+  const type = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+  return type === "application/json" || type.endsWith("+json");
+}
+
 // Loopback-only enforcement: the harness runs on 127.0.0.1 but accepts
 // requests from any loopback connection and any web page that DNS-rebinds
 // onto it. Reject non-loopback Hosts outright (defeats rebinding) and
@@ -7713,12 +7539,29 @@ function isLoopbackHost(host: string | undefined): boolean {
   return hostname === "::1" || hostname === "0:0:0:0:0:0:0:1";
 }
 
+/** Ports a browser on this Mac may drive a mutating route FROM.
+ *
+ *  The packaged renderer is served BY the harness, so its own origin is
+ *  `http://127.0.0.1:${PORT}`; the dev renderer is vite's
+ *  `http://127.0.0.1:${OMB_UI_PORT || 5199}` and proxies `/api` here, so it
+ *  is same-origin with itself and has to be named explicitly.  Vite takes the
+ *  next free port when 5199 is taken, so `pnpm dev` against a busy port
+ *  needs `OMB_UI_PORT` set to the one it actually bound.
+ *
+ *  This used to be "any loopback hostname", which made every dev server,
+ *  every preview and every page a malicious npm package serves on this Mac
+ *  a first-class caller of `PUT /api/config` and `POST /api/bots`. */
+const ALLOWED_ORIGIN_PORTS = new Set([String(PORT), String(WEBHOOK_PORT), String(process.env.OMB_UI_PORT || 5199)]);
+
 function isAllowedOrigin(origin: string | undefined | null): boolean {
   if (!origin) return true; // non-browser clients (CLIs, curl, tests) send none
   try {
     const o = new URL(origin);
-    return isLoopbackHost(o.hostname) && (o.protocol === "http:" || o.protocol === "https:")
-      && Number(o.port) === PORT;
+    if (!isLoopbackHost(o.hostname)) return false;
+    if (o.protocol !== "http:" && o.protocol !== "https:") return false;
+    // An origin with no port is `http://host/` on port 80, which is not a
+    // port the harness listens on — a rebinding page lands here, not there.
+    return ALLOWED_ORIGIN_PORTS.has(o.port);
   } catch {
     return false;
   }
@@ -8058,20 +7901,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     const mutatingApiRequest = path.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method) &&
       path !== "/api/runtime/quiesce";
-    // Require application/json content-type for mutating API requests that carry a body.
-    // /api/attachments is the one raw-upload route; it sniffs and rejects
-    // unsupported content-types itself, and the sec-fetch-site check above
-    // still covers it against cross-site browser posts.
-    if (mutatingApiRequest && path !== "/api/attachments") {
-      const contentLength = req.headers["content-length"];
-      const transferEncoding = req.headers["transfer-encoding"];
-      const hasBody = (contentLength !== undefined && Number(contentLength) > 0) || transferEncoding !== undefined;
-      if (hasBody) {
-        const contentType = req.headers["content-type"] ?? "";
-        if (!contentType.toLowerCase().startsWith("application/json")) {
-          return json(res, 415, { error: "unsupported media type" });
-        }
-      }
+    if (mutatingApiRequest && !NON_JSON_BODY_ROUTES.has(path) && hasRequestBody(req) && !isJsonContentType(req)) {
+      return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
     }
     let ownAdmissionActive = false;
     if (mutatingApiRequest) {
@@ -8093,23 +7924,33 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 401, { error: "unauthorized" });
       }
       if (method === "GET" && path === "/api/internal/agents") {
-        const result = executeListAgentsRequest({ selfId: url.searchParams.get("self") ?? "" });
+        const selfId = url.searchParams.get("self") ?? "";
+        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: selfId });
+        if (refused) return json(res, refused.status, refused.body);
+        const result = executeListAgentsRequest({ selfId });
         return json(res, result.status, result.body);
       }
       if (method === "GET" && path === "/api/internal/routines") {
         const fromThreadId = url.searchParams.get("fromThreadId");
         const routineId = url.searchParams.get("routineId");
-        const result = executeListRoutinesRequest({
-          fromBotId: String(url.searchParams.get("fromBotId") ?? ""),
-          ...(fromThreadId ? { fromThreadId } : {}),
-          ...(routineId ? { routineId } : {}),
+        const refused = authorizeCommsIdentity(req.headers.authorization, {
+          botId: String(url.searchParams.get("fromBotId") ?? ""),
         });
+        if (refused) return json(res, refused.status, refused.body);
+        const listRequest: Parameters<typeof executeListRoutinesRequest>[0] = {
+          fromBotId: String(url.searchParams.get("fromBotId") ?? ""),
+        };
+        if (fromThreadId) listRequest.fromThreadId = fromThreadId;
+        if (routineId) listRequest.routineId = routineId;
+        const result = executeListRoutinesRequest(listRequest);
         return json(res, result.status, result.body);
       }
       if (method === "POST" && path === "/api/internal/routine-requests") {
         const parsed = routineRequestEnvelopeSchema.safeParse(await readBody(req));
         if (!parsed.success) return json(res, 400, { error: "invalid routine proposal" });
         const body = parsed.data;
+        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: body.fromBotId });
+        if (refused) return json(res, refused.status, refused.body);
         const result = await executeRoutineRequestRequest(
           body.action === "create"
             ? { fromBotId: body.fromBotId, fromThreadId: body.fromThreadId, action: body.action, routine: body.routine }
@@ -8132,11 +7973,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (method === "POST" && path === "/api/internal/ask-bot") {
         const body = await readBody(req);
+        const fromBotId = String(body.fromBotId ?? "");
+        const depth = Number(body.depth ?? 0) || 0;
+        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
+        if (refused) return json(res, refused.status, refused.body);
         const result = await executeAskBotRequest({
-          fromBotId: String(body.fromBotId ?? ""),
+          fromBotId,
           toBotId: String(body.toBotId ?? ""),
           message: String(body.message ?? "").trim(),
-          depth: Number(body.depth ?? 0) || 0,
+          depth,
           fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
         });
         return json(res, result.status, result.body);
@@ -8144,20 +7989,46 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Async handoff: the source bot queues a task for a peer and goes
       // back to the user; the peer turn runs after the source's
       // turn.completed. Returns immediately (the caller does not wait).
+      // The Box gateway is NOT a comms route.  It authenticates a per-mount,
+      // per-box grant minted for one turn, and it holds the account-wide Box
+      // key on this side of the socket so no bot process ever holds it.  It
+      // therefore sits ahead of the `authorizeCommsIdentity` gate below, which
+      // is the fleet-wide token, and before it is reachable at all.
+      if (path === BOX_GATEWAY_PATH || path.startsWith(`${BOX_GATEWAY_PATH}/`)) {
+        const gateway = await handleBoxGatewayRequest(
+          {
+            method,
+            url: path + url.search,
+            authorization: req.headers.authorization,
+            remoteAddress: req.socket.remoteAddress,
+            body: method === "GET" || method === "HEAD" ? undefined : await readBody(req),
+          },
+          { cfg },
+        );
+        return json(res, gateway.status, gateway.body);
+      }
       if (method === "POST" && path === "/api/internal/delegate-bot") {
         const body = await readBody(req);
+        const fromBotId = String(body.fromBotId ?? "");
+        const depth = Number(body.depth ?? 0) || 0;
+        const refused = authorizeCommsIdentity(req.headers.authorization, { botId: fromBotId, depth });
+        if (refused) return json(res, refused.status, refused.body);
         const result = executeDelegateBotRequest({
-          fromBotId: String(body.fromBotId ?? ""),
+          fromBotId,
           toBotId: String(body.toBotId ?? ""),
           message: String(body.message ?? "").trim(),
           reason: typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined,
-          depth: Number(body.depth ?? 0) || 0,
+          depth,
           fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
         });
         return json(res, result.status, result.body);
       }
       if (method === "POST" && path === "/api/internal/create-bot") {
         const body = await readBody(req);
+        const refused = authorizeCommsIdentity(req.headers.authorization, {
+          botId: String(body.fromBotId ?? ""),
+        });
+        if (refused) return json(res, refused.status, refused.body);
         const result = executeCreateBotRequest({
           fromBotId: String(body.fromBotId ?? ""),
           fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
@@ -8169,6 +8040,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (method === "POST" && path === "/api/internal/request-credential") {
         const body = await readBody(req);
+        const refused = authorizeCommsIdentity(req.headers.authorization, {
+          botId: String(body.fromBotId ?? ""),
+        });
+        if (refused) return json(res, refused.status, refused.body);
         const result = executeRequestCredentialRequest({
           fromBotId: String(body.fromBotId ?? ""),
           fromThreadId: typeof body.fromThreadId === "string" ? body.fromThreadId : undefined,
@@ -10107,7 +9982,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
     if (method === "POST" && path === "/api/local-computer/interrupt") {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       await Promise.allSettled(
         store.bots
@@ -10473,6 +10348,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
 
       const replyTo = resolveReplyTarget(bot.threadId, body.replyToId);
+      // Text that arrived over iMessage or Linq came from somewhere the
+      // harness did not choose: a stranger's phone, not the owner's
+      // keyboard.  Running it as an ATTENDED turn let Auto mode and
+      // always-allow answer for a person who is not watching, so a relayed
+      // text could spend the fleet's keys with nobody asked.  A relay
+      // message dispatches unattended and the approval layer still asks.
+      // An owner-typed message is untouched: it stays attended.
+      const relaySourced = fromImessage || fromLinq;
       const deliver = async (): Promise<RouteReply> => {
         // Steering/queueing does not preserve message metadata. A recorded
         // turn waits for idle rather than pretending its audio was retained.
@@ -10490,9 +10373,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               .steer(bot.threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
               .catch(() => false);
             if (steered) {
-              // An outside iMessage sender is not a person at the keyboard:
-              // the unattended mark stays.
-              if (!fromImessage) clearUnattended(bot.id);
+              // A steer from a relay joins a turn the owner may be watching,
+              // so it must not clear the unattended mark: the card is the
+              // only thing standing between a stranger's text and Auto mode.
+              if (relaySourced) markUnattended(bot.id);
+              else clearUnattended(bot.id);
               store.appendMessage(bot.threadId, {
                 role: "user",
                 kind: "text",
@@ -10510,12 +10395,23 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             linqChatId,
             ...(fromImessage ? { automationSource: "imessage" as const } : {}),
           });
+          if (relaySourced) relayQueuedMessageIds.add(queued.id);
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId } };
         }
-        // S8: iMessage-relayed text comes from an outside sender, not the
-        // owner — it must run unattended, or Auto mode and Always-allow
-        // would apply to words the owner never typed.
-        await startTurn(bot.id, text, { replyTo, ...(fromImessage ? { automationSource: "imessage" as const } : {}) });
+        // `automationSource` is the richer half and is what the transcript
+        // and the prompt boundary read: it stores the message as `system`
+        // rather than `user`, tells the model the text is untrusted data
+        // rather than the owner speaking, and names the task.  It also lands
+        // in the unattended set above, so it carries the approval semantics
+        // on its own.  `unattended` is passed as well because a Linq-sourced
+        // turn has no `automationSource` value and still must not be attended.
+        await startTurn(bot.id, text, {
+          replyTo,
+          linqChatId,
+          recording,
+          ...(fromImessage ? { automationSource: "imessage" as const } : {}),
+          unattended: relaySourced || undefined,
+        });
         return { status: 202, body: { ok: true } };
       };
       // A retried send must not run the instruction twice: the key is scoped
@@ -10532,6 +10428,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!cancelSteeredMessage(bot.threadId, queueId)) {
         return json(res, 404, { error: "no such queued message" });
       }
+      // A cancelled relayed message must not leave a mark behind: the next
+      // drain of this thread would then run an owner's words unattended.
+      relayQueuedMessageIds.delete(queueId);
       return json(res, 200, { ok: true });
     }
 
@@ -10919,7 +10818,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // and its cross-origin JSON request is stopped by the browser preflight
       // because this server deliberately emits no CORS permission.
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const action = z.enum(["pull", "run", "start", "stop", "remove"]).parse(m[1]);
       // A Local VM turned off in Computer settings must not be started from
@@ -10973,7 +10872,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // Lane A exists to prevent.
     if (method === "POST" && path === "/api/local-computer/mode") {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
       if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -11039,7 +10938,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/bots\/([\w-]+)\/local-computer\/(run|stop|remove)$/);
     if (m && method === "POST") {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
@@ -11293,7 +11192,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Local-only probe — same gate as the lifecycle routes so a hostile
       // page cannot trigger outbound TCP from a simple text/plain request.
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
       const raw = typeof body?.publicUrl === "string" ? body.publicUrl.trim() : "";
@@ -11324,15 +11223,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, {
         ok: true,
         cooldowns: quotaCooldowns.list(),
-        // A sibling of cooldowns because it is the same question about a
-        // different failure: cooldowns is "this engine is out of quota", doomed
-        // is "this engine cannot start" — a CLI that is absent, not
-        // executable, or waiting on an interactive login.  Both make the
-        // dispatcher decline and leave the run QUEUED, so a queue that has
-        // stopped draining cannot be told apart without both lists.  `list()`
-        // is the live registry including half-open entries, so the half-open
-        // "we let one probe through" state is visible here too.
-        doomed: doomedDispatches.list(),
         antigravity: lastAntigravityQuotaSnapshot(),
         grok: lastGrokQuotaSnapshot(),
         windows: usageQuotaPoller.getWindows(),
@@ -11446,7 +11336,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // binary, so a hostile page must not be able to submit it as a simple
       // text/plain cross-origin request
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
       const cli = typeof body?.cli === "string" ? body.cli.trim() : "";
@@ -11466,7 +11356,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "PATCH" && instancePatch) {
       // same non-simple-request gate as the local-VM lifecycle routes
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
       const patchOptions: { cli?: string; fullAuto?: boolean; enabled?: boolean; key?: string; externalCredential?: boolean } = {};
@@ -11594,7 +11484,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // per instance.  openai-compat and minimax today.
     if (method === "POST" && path === "/api/instances") {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       const body = await readBody(req);
       const name = typeof body?.name === "string" ? body.name.trim() : "";
@@ -12463,9 +12353,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const check = await box.verifyToken(newBoxToken.trim());
         if (!check.ok) return json(res, 400, { error: check.message });
       }
-      // Check the new key against the effective selected provider, including
-      // the existing choice when the patch changes only the key.
-      const newTts = patch.tts;
+      // A voice card names the provider its key belongs to, and that name is
+      // honoured as sent: the key is verified against THAT provider's
+      // endpoint and stored under it.  A provider is defaulted only when the
+      // field is genuinely absent, and then to the one already saved (so a
+      // re-save cannot move an ElevenLabs key to MiniMax) or the documented
+      // default.  An unknown name is the client's mistake and is named back,
+      // never quietly replaced — a silent fallback here is what sent an
+      // ElevenLabs key to MiniMax's verification endpoint in the first place.
+      const ttsProvider = ttsProviderClaim(body);
+      if (ttsProvider.error) return json(res, 400, { error: ttsProvider.error });
+      // SAFETY: `patch.tts` was produced by `parseConfigPatch` above, so its
+      // `provider` is already the union member the config save expects; the
+      // default only fills in a section the client genuinely left out.
+      const newTts = patch.tts?.key?.trim() && !Object.hasOwn(patch.tts, "provider")
+        ? { provider: cfg.tts?.provider ?? "minimax", ...patch.tts } as typeof patch.tts
+        : patch.tts;
       if (newTts?.key?.trim()) {
         const check = await tts.verifyKey(newTts.key.trim(), { tts: { ...cfg.tts, ...newTts } });
         if (!check.ok) return json(res, 400, { error: check.message });
@@ -13038,7 +12941,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // JSON-only for the same anti-form-POST reason as every other
         // computer mutation below.
         if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-          return json(res, 415, { error: "content-type must be application/json" });
+          return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
         }
         const body = await readBody(req);
         const action = String(body.action ?? "");
@@ -13074,7 +12977,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       return json(res, 200, resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend) === "vps"
         ? vps.closeVpsDesktopTunnel(cfg, bot.id)
@@ -13095,7 +12998,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // request dies in the preflight this server never answers. Applied to
       // both backends — the Box branch runs commands too.
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
-        return json(res, 415, { error: "content-type must be application/json" });
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
       }
       // A cloud provider turned off in Computer settings keeps every bot off
       // it here too, not just in turns: opening the Computer panel must not
@@ -13211,7 +13114,6 @@ routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
   enableQuotaCooldownPersist(join(DATA_DIR, "quota-cooldowns.json"));
-  enableDoomedDispatchPersist(join(DATA_DIR, "doomed-dispatches.json"));
   // OP3 / HS13: only spawn the CLI while at least one Antigravity instance
   // is actually in the fleet.  `instanceConfigs(cfg)` reads the SAME live,
   // mutated-in-place `cfg` every settings-reload path already uses, so a

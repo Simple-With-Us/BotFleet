@@ -322,30 +322,6 @@ describe("RoutineManager", () => {
     expect(new RoutineManager(h.options).listRuns()).toEqual(finished);
   });
 
-  it("keeps a run open across a failover and receipts it on the fallback's completion (E5)", async () => {
-    const h = harness();
-    h.setBot("busy");
-    h.manager.enqueueWebhook({ webhookId: "failover-fixture", webhookName: "Failover fixture",
-      prompt: "Synthetic delivery", botId: "maus-1", runOn: "bot", deliveryId: "delivery-fo", receivedAt: 1000 });
-    await h.manager.tick();
-    h.setBot("ready");
-    await h.manager.tick();
-    const run = h.manager.listRuns().find((r) => r.status === "running")!;
-    const base = { eventId: "event", provider: "claude" as const, providerInstanceId: "claude-fixture", threadId: run.threadId!, createdAt: new Date().toISOString() };
-    // the first engine's turn failed, but the failover pick already launched
-    // a fallback: the run must not receipt failed yet
-    const open = h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: false, stopReason: "quota_exceeded" }, { fallingOver: true });
-    expect(open?.status).toBe("running");
-    expect(h.manager.listRuns().find((r) => r.id === run.id)!.status).toBe("running");
-    expect(h.failed).toHaveLength(0);
-    // the fallback's own completion on the same thread receipts the run
-    h.manager.handleRuntimeEvent({ ...base, providerInstanceId: "codex-fixture", type: "turn.completed", ok: true, stopReason: "end_turn", cost: 0.01 });
-    const settled = h.manager.listRuns().find((r) => r.id === run.id)!;
-    expect(settled.status).toBe("completed");
-    expect(settled.engineId).toBe("codex-fixture");
-    expect(settled.cost).toBe(0.01);
-  });
-
   it("cancels the owning execution and all combined deliveries when any combined receipt is cancelled", async () => {
     const h = harness();
     h.setBot("busy");
@@ -1547,71 +1523,5 @@ describe("Sentry Crons check-ins", () => {
     expect(h.started).toHaveLength(1);
     expect(h.checkInStarts).toHaveLength(1);
     expect(h.checkInStarts[0].routine.schedule).toEqual({ type: "once", at: routine.nextRunAt });
-  });
-});
-
-describe("setup-class failures", () => {
-  async function dispatchOnce() {
-    const h = harness();
-    const routine = h.manager.create({
-      name: "Compile gates",
-      prompt: "Run the gate",
-      botId: "maus-1",
-      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
-    });
-    h.setNow(routine.nextRunAt!);
-    await h.manager.tick();
-    return { h, run: h.manager.listRuns()[0] };
-  }
-
-  const base = (threadId: string) => ({
-    eventId: "event",
-    provider: "dshAgent" as const,
-    providerInstanceId: "dsh-fixture",
-    threadId,
-    createdAt: new Date().toISOString(),
-  });
-
-  it("files a setup spawn failure as engine_unavailable, not a generic dispatch failure", async () => {
-    // The signal used to be written as `outcomeCode: "auth_required"` and then
-    // looked up through the failure-code table, where `spawn_error` won — so
-    // the most common doomed-engine failure was receipted as a transient
-    // dispatch error, which is exactly the thing a timer keeps retrying.
-    const { h, run } = await dispatchOnce();
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "runtime.error", message: "spawn dsh-agent ENOENT", setup: true } as any);
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "turn.completed", ok: false, stopReason: "spawn_error", cost: null } as any);
-    const [finished] = h.manager.listRuns();
-    expect(finished.status).toBe("failed");
-    expect(finished.outcomeCode).toBe("engine_unavailable");
-    expect(finished.failurePhase).toBe("dispatch");
-    expect(finished.setupFailed).toBe(true);
-  });
-
-  it("leaves a non-setup spawn failure as dispatch_failed", async () => {
-    // Same stop reason, different fact: nothing here says the engine cannot
-    // start, so it must not be read as a dead engine.
-    const { h, run } = await dispatchOnce();
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "runtime.error", message: "spawn dsh-agent" } as any);
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "turn.completed", ok: false, stopReason: "spawn_error", cost: null } as any);
-    const [finished] = h.manager.listRuns();
-    expect(finished.outcomeCode).toBe("dispatch_failed");
-    expect(finished.setupFailed).toBe(false);
-  });
-
-  it("files a spent round budget as budget_exhausted rather than a crash", async () => {
-    const { h, run } = await dispatchOnce();
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "turn.completed", ok: false, stopReason: "tool_round_limit", cost: 0.01 } as any);
-    const [finished] = h.manager.listRuns();
-    expect(finished.outcomeCode).toBe("budget_exhausted");
-    expect(finished.failurePhase).toBe("execution");
-  });
-
-  it("clears the setup mark on a successful turn so it cannot leak to the next run", async () => {
-    const { h, run } = await dispatchOnce();
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "runtime.error", message: "flaky", setup: true } as any);
-    h.manager.handleRuntimeEvent({ ...base(run.threadId!), type: "turn.completed", ok: true, stopReason: "end_turn", cost: 0.01 } as any);
-    const [finished] = h.manager.listRuns();
-    expect(finished.status).toBe("completed");
-    expect(finished.setupFailed).toBe(false);
   });
 });

@@ -715,7 +715,8 @@ describe("Antigravity computer MCP config", () => {
     computer: {
       kind: "box" as const,
       boxId: "bx_1",
-      token: "box-tok",
+      token: "box-grant",
+      gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
       control: { url: "http://127.0.0.1:9/control", token: "ctl-tok" },
     },
   };

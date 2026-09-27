@@ -73,7 +73,7 @@ struct ProviderMarkView: View {
             return .asset("ProviderMarkGemini")
         case "cursor", "cursorAgent":
             return .templateAsset("ProviderMarkCursor")
-        case "minimax", "minimaxAgent", "mcodeAgent":
+        case "minimax", "minimaxAgent":
             return .asset("ProviderMarkMiniMax")
         case "boxAgent":
             return .symbol("desktopcomputer")
@@ -107,9 +107,6 @@ struct ProviderMarkView: View {
         case "antigravity", "antigravityAgent": return "Antigravity"
         case "cursor", "cursorAgent": return "Cursor"
         case "minimax", "minimaxAgent": return "MiniMax"
-        // mcode is the same subscription read as a coding CLI, so it keeps the
-        // MiniMax mark but announces as its own product name.
-        case "mcodeAgent": return "MiniMax Code"
         case "boxAgent": return "Computer"
         case "kimi", "kimiAgent": return "Kimi"
         case "droid", "droidAgent": return "Droid"

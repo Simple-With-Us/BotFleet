@@ -69,26 +69,56 @@ describe("every record is complete", () => {
     }
   });
 
-  it("keeps read tools free of an approval ask — only a write tool needs a card", () => {
+  it("keeps read tools free of a blanket approval ask — only a write tool needs a card", () => {
+    // A read tool may still ask, but only through a DECLARED condition the
+    // host evaluates — never as an unconditional card, which would put
+    // read_file's own `src/index.ts` reads in front of a person. The
+    // condition below is the whole of that latitude: one named condition,
+    // on the one read tool that can reach a credential store.
+    const conditioned = new Set<string>();
     for (const tool of HARNESS_TOOLS) {
       // read_file is the one exception: its approval is `when`-gated, so
       // ordinary reads still never see a card and only credential-store
       // paths ask (S10).  The gate is what makes the exception safe.
       if (tool.name === "read_file") continue;
       if (tool.sideEffect === "read") {
-        expect(tool.approval?.policy ?? "never", `${tool.name}`).toBe("never");
+        if (tool.approval?.policy === "ask") {
+          expect(tool.approval.condition, `${tool.name} asks unconditionally`).toBeTruthy();
+          conditioned.add(tool.name);
+        } else {
+          expect(tool.approval?.policy ?? "never", `${tool.name}`).toBe("never");
+        }
         expect(tool.settles, `${tool.name}`).toBe("immediate");
       }
+    }
+    expect([...conditioned]).toEqual(["read_file"]);
+  });
+
+  it("asks for read_file only through the sensitive-path condition", () => {
+    const readFile = harnessTool("read_file")!;
+    expect(readFile.approval).toMatchObject({ policy: "ask", condition: "sensitive-file-path" });
+    expect(readFile.approval!.summary({ path: "/Users/jay/.botfleet/config.json" })).toBe(
+      "read file /Users/jay/.botfleet/config.json",
+    );
+    // the two write tools on the same paths already asked unconditionally,
+    // so a card there is not a new behaviour — pinned so it cannot go quiet
+    for (const name of ["write_file", "edit_file"]) {
+      expect(harnessTool(name)!.approval, name).toMatchObject({ policy: "ask" });
+      expect(harnessTool(name)!.approval!.condition, name).toBeUndefined();
     }
   });
 
   it("gates read_file's ask on sensitive paths only, in parity with auto-approve's SENSITIVE", () => {
-    // registry.ts is import-free by test, so its path shapes restate
-    // auto-approve.ts's SENSITIVE list; this table is what keeps the two
-    // from drifting apart (the parity mechanism, same as the diagnostics
-    // credential-env test).
-    const when = harnessTool("read_file")!.approval!.when!;
-    expect(harnessTool("read_file")!.approval!.policy).toBe("ask");
+    // The catalog names the condition rather than restating the path rules:
+    // `host.ts` resolves the argument and calls `looksSensitive`, so the two
+    // lists cannot drift the way a hand-copied regex table did.  The parity is
+    // therefore structural, and what is worth pinning here is that read_file
+    // IS gated and that the gate is the named condition.
+    const approval = harnessTool("read_file")!.approval!;
+    expect(approval.policy).toBe("ask");
+    expect(approval.condition).toBe("sensitive-file-path");
+    // Every shape the list knows must be a shape this gate catches, and
+    // nothing ordinary may be caught by accident.
     const sensitivePaths = [
       ".env", "/home/u/app/.env.production", "~/.ssh/id_ed25519",
       "~/.aws/credentials", ".npmrc", "creds/credentials.json",
@@ -98,12 +128,10 @@ describe("every record is complete", () => {
       "package.json", "src/index.ts", "README.md", "/tmp/notes.txt",
     ];
     for (const path of sensitivePaths) {
-      expect(when({ path }), path).toBe(true);
-      expect(looksSensitive(`cat ${path}`), `SENSITIVE parity: ${path}`).toBe(true);
+      expect(looksSensitive(path), `SENSITIVE: ${path}`).toBe(true);
     }
     for (const path of ordinaryPaths) {
-      expect(when({ path }), path).toBe(false);
-      expect(looksSensitive(`cat ${path}`), `SENSITIVE parity: ${path}`).toBe(false);
+      expect(looksSensitive(path), `SENSITIVE: ${path}`).toBe(false);
     }
   });
 

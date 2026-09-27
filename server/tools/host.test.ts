@@ -461,3 +461,52 @@ describe("host computer tools on HTTP lane", () => {
     expect(bashOutcome).toMatchObject({ kind: "error", detail: "unknown tool" });
   });
 });
+
+describe("read_file asks only when the path is a credential store", () => {
+  // The repo root, wherever it is checked out — the reads below have to
+  // resolve to files that really exist.
+  const CWD = process.cwd();
+
+  it("reads a project file without a card, even against a denying broker", async () => {
+    const asking = askingRuntime("rejected");
+    for (const path of ["package.json", "vite.config.ts", "README.md", "./server/index.ts"]) {
+      const outcome = await hostFor({}, { localComputer: true, cwd: CWD }).execute(
+        { id: "1", name: "read_file", arguments: { path, limit: 1 } },
+        asking.runtime,
+      );
+      expect(outcome.kind, path).not.toBe("error");
+    }
+    expect(asking.asks).toEqual([]);
+  });
+
+  it("asks for BotFleet's own config, an ssh key, and the desktop credential store", async () => {
+    for (const path of [
+      "/Users/jay/.botfleet/config.json",
+      "/Users/jay/.ssh/id_ed25519",
+      "/Users/jay/Library/Application Support/BotFleet/credentials.bin",
+    ]) {
+      const asking = askingRuntime("rejected");
+      const outcome = await hostFor({}, { localComputer: true, cwd: CWD }).execute(
+        { id: "1", name: "read_file", arguments: { path } },
+        asking.runtime,
+      );
+      expect(asking.asks, path).toHaveLength(1);
+      expect(asking.asks[0]).toMatchObject({ tool: "read_file", summary: `read file ${path}` });
+      // a denied ask never reaches the executor
+      expect(outcome).toMatchObject({ kind: "error", detail: "denied" });
+    }
+  });
+
+  it("resolves a relative path against the turn's working directory first", async () => {
+    // The card has to name the file the executor opens, and the pattern list
+    // has to see the resolved path: a workspace bot asking for
+    // `../../.ssh/id_rsa` is asking for a key.
+    const asking = askingRuntime("allowed-once");
+    await hostFor({}, { localComputer: true, cwd: "/tmp/project" }).execute(
+      { id: "1", name: "read_file", arguments: { path: "../.ssh/config" } },
+      asking.runtime,
+    );
+    expect(asking.asks).toHaveLength(1);
+    expect(asking.asks[0]!.summary).toBe("read file /tmp/.ssh/config");
+  });
+});

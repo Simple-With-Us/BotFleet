@@ -37,7 +37,6 @@ const CALLOUT_DRIVER_KINDS = new Set([
   "antigravityAgent",
   "grokAgent",
   "claudeAgent",
-  "mcodeAgent",
 ]);
 
 function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNode {

@@ -327,20 +327,7 @@ export interface AutoFallbackCandidate {
     };
   };
   driverKind?: string;
-  capabilities?: {
-    effortLevels?: readonly string[];
-    computerMcp?: boolean;
-    localComputerMcp?: boolean;
-    composioMcp?: boolean;
-    agentsMcp?: boolean;
-    phoneMcp?: boolean;
-    images?: boolean;
-    queueing?: boolean;
-    toolLoop?: boolean;
-  };
-  /** Which computer destinations this engine can be given at all, shipped by
-   *  the registry's describe() so failover filters instead of restating it. */
-  computerReach?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
+  capabilities?: { effortLevels?: readonly string[] };
   models: {
     default: string;
     options?: ReadonlyArray<{ id: string; effortLevels?: readonly EffortLevel[]; supportsEffort?: boolean }>;
@@ -378,16 +365,10 @@ export function eligibleAutoFallbackChain(
     botId: string;
     currentInstanceId: string;
     effort?: EffortLevel;
-    /** Computer destinations the failing turn holds; a fallback that cannot
-     *  reach every one of them would lose the turn's computer tools, so it
-     *  is not a fallback at all (E5).  A candidate without a shipped reach
-     *  predates the field and stays eligible, matching the old behavior. */
-    requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>;
     isCooling: (botId: string, instanceId: string, model: string) => boolean;
     priority: readonly string[];
   },
 ): ModelSelection[] {
-  const needed = (["box", "vps", "vm", "local"] as const).filter((kind) => input.requires?.[kind] === true);
   const viable = candidates
     .map((candidate, order) => ({ candidate, order }))
     .filter(({ candidate }) => {
@@ -400,8 +381,7 @@ export function eligibleAutoFallbackChain(
         candidate.snapshot.quota?.capped !== true &&
         candidate.snapshot.quota?.models?.[model]?.capped !== true &&
         Boolean(model) &&
-        !input.isCooling(input.botId, candidate.instanceId, model) &&
-        needed.every((kind) => candidate.computerReach?.[kind] !== false)
+        !input.isCooling(input.botId, candidate.instanceId, model)
       );
     })
     .sort((a, b) => {

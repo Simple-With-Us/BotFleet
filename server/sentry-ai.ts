@@ -19,7 +19,7 @@
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
 import { classifyError } from "./drivers/retry.ts";
-import { redactSecretsInText } from "./redact.ts";
+import { redactSecrets, redactSecretsInText } from "./redact.ts";
 import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
 
 export type SpanLike = {
@@ -144,6 +144,107 @@ function clean(value: string | null | undefined): string | undefined {
   return trimmed || undefined;
 }
 
+// ── redaction at the Sentry boundary ──────────────────────────────────
+// Every string that leaves this module as TEXT goes through `sentryText`, and
+// every Error goes through `redactErrorForSentry`.  The two call sites that
+// O2 named (`captureException(new Error(event.message…))` and the
+// `isExpectedNonCrash` breadcrumb) were the visible half of it: the same text
+// was redacted for `errors.log` and redacted again inside `classifyMessage`,
+// which is why the Issue fingerprint came out clean while the Issue body did
+// not — the leak was visible only on installs carrying a Sentry DSN, and
+// only for whatever a driver happened to echo, raw CLI stderr included.
+//
+// The ORDER is redact, THEN clip, and it is not a detail.  A secret cut in
+// half upstream has lost the closing marker the patterns anchor on, so a clip
+// first hands back the whole credential.  Redacting first is also why the
+// fingerprint and the message can disagree in length and still be the same
+// event: they are the same text, taken at two different widths.
+
+/** Runtime text, bounded for Sentry, with credentials removed.
+ *
+ * `undefined` and `null` collapse to the empty string rather than to the
+ * words "undefined"/"null": a caller that had nothing to say should produce
+ * an empty message, and `String(null)` would be a fact about the code, not
+ * about the run. */
+function sentryText(value: string | null | undefined, maxChars: number): string {
+  const text = value ?? "";
+  if (!text) return "";
+  return redactSecretsInText(text).slice(0, maxChars);
+}
+
+/** Every string value in a flat map, redacted, with the value types kept.
+ *
+ * This is `redactSecrets` rather than a hand-rolled second pass: it is the same
+ * function the native log tee and `redactSecretsInText` already share, so a
+ * pattern added there is redacted in a breadcrumb's `data` map for free instead
+ * of by whoever remembers to come back here.
+ *
+ * `undefined` passes through as `undefined` rather than becoming an empty
+ * object, because these maps are optional and an absent `data` means the
+ * breadcrumb carried none — Sentry renders the two differently. */
+function redactStringValues(
+  values: Record<string, string | number | boolean> | undefined,
+): Record<string, string | number | boolean> | undefined {
+  if (!values) return undefined;
+  // SAFETY: `redactSecrets` walks a value and returns the same structure with
+  // its strings replaced, so a flat string map comes back as a flat string
+  // map — the declared type is preserved, not widened.
+  return redactSecrets(values) as Record<string, string | number | boolean>;
+}
+
+/** The same pass for the tag map, which is strings only.
+ *
+ * Separate from the breadcrumb pass rather than one function over a union, so
+ * each keeps the exact type its caller declares: a tag map that could come
+ * back holding numbers would no longer be a tag map. */
+function redactTagValues(
+  values: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!values) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) out[key] = redactSecretsInText(value);
+  return out;
+}
+
+/** Rewrite a captured error's own text in place, keeping its frames.
+ *
+ * The MESSAGE is the obvious half.  The STACK HEADER is the half that is easy
+ * to miss: V8 formats `<name>: <message>` when the stack is first read and
+ * caches that string, so redacting only `error.message` leaves the original
+ * text sitting in `error.stack` — which is the field Sentry's Issue view
+ * actually shows.  The frames below the header are what an Issue is grouped
+ * and read by, so they are left byte-for-byte alone and only the header is
+ * rebuilt around the redacted message.
+ *
+ * In place rather than by constructing a new Error, because a new Error
+ * starts a new stack and would replace the frames with this function's.
+ * Never throws: a redaction that takes down the turn it was protecting is
+ * worse than the capture it was protecting — the same reasoning as
+ * `safeScrubHook` on the other side of the SDK. */
+function redactErrorForSentry(error: Error): Error {
+  try {
+    const message = redactSecretsInText(error.message);
+    if (message === error.message) return error;
+    error.message = message;
+    // `Error.stack` is `string | undefined` on V8, and a falsy check narrows
+    // it to the string without a runtime type test.
+    if (error.stack) {
+      const newline = error.stack.indexOf("\n");
+      const header = newline < 0 ? error.stack : error.stack.slice(0, newline);
+      const frames = newline < 0 ? "" : error.stack.slice(newline);
+      // A named Error's header is `Name: message`; an anonymous one is the
+      // message alone, and an error carrying a custom name that its header
+      // does not start with must not have the message spliced into the wrong
+      // place.  Anything unrecognised keeps the redacted message on its own.
+      const named = Boolean(error.name) && header.startsWith(`${error.name}:`);
+      error.stack = `${named ? `${error.name}: ` : ""}${message}${frames}`;
+    }
+    return error;
+  } catch {
+    return error;
+  }
+}
+
 /** The botfleet.* attributes one turn contributes to a span or a capture.
  * Every field is optional because a blank one is skipped outright: an
  * empty-string tag is worse than an absent one, since Sentry then groups
@@ -217,15 +318,58 @@ type SentryStartSpanOptions = Parameters<
 function captureScope(context: SentryCaptureContext | undefined): SentryCaptureContext | undefined {
   if (!context?.tags && !context?.fingerprint) return undefined;
   const scope: SentryCaptureContext = {};
-  if (context.tags) scope.tags = context.tags;
-  if (context.fingerprint) scope.fingerprint = context.fingerprint;
+  // Tags and fingerprints are built from bounded identity and stop-reason
+  // values today, but a tag is a flat string map on a payload an operator
+  // reads, and the whole point of doing this at the sink rather than only at
+  // the two sites O2 named is that a future caller inherits the redaction
+  // instead of having to remember it.
+  if (context.tags) scope.tags = redactTagValues(context.tags);
+  if (context.fingerprint) {
+    scope.fingerprint = context.fingerprint.map((part) => sentryText(part, 200));
+  }
   return scope;
 }
 
-function liveSink(): SentryAiSink | null {
-  if (!isSentryActive()) return null;
-  const Sentry = getSentry();
-  if (!Sentry) return null;
+/** Build the sink that talks to a Sentry client.
+ *
+ *  Exported and parameterised so the redaction below can be exercised against
+ *  a recording double instead of the whole `./sentry.ts` module: a whole-module
+ *  substitute is hoisted over every other test in a file that imports this
+ *  one, and it would put a stub redactor under the real grouping logic.  The
+ *  client is the only thing that varies, so it is the only thing injected. */
+/** The client surface this sink uses, and no more.
+ *
+ *  Declared as the minimum this module actually calls rather than derived from
+ *  the SDK's own type.  A `Pick<SentryNode, …>` demands a recording double
+ *  implement every overload and every return contract of the real client, which
+ *  is what makes people reach for a whole-module mock instead — and a
+ *  whole-module mock is hoisted over every other test in a file that imports
+ *  this one.  Method syntax, so the real client stays assignable to it.
+ */
+export interface SentryClientLike {
+  setConversationId?: (id: string) => void;
+  setUser(user: { id?: string; username?: string; email?: string } | null): void;
+  startInactiveSpan(options: SentryStartSpanOptions): SpanLike;
+  // `captureException` and `captureMessage` keep the SDK's own `unknown`
+  // parameters: the exception really can be any value (a driver may hand the
+  // sink a string or a plain object), and the capture context is a type this
+  // file deliberately does not import, because @sentry/node is loaded lazily
+  // through a createRequire in sentry.ts and a type import would undo that.
+  // The redactors below are the boundary that turns either into something
+  // safe to send, so a named type here would be narrower than the contract.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns
+  captureException(error: unknown, hint?: unknown): unknown;
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns
+  captureMessage(message: string, context?: unknown): unknown;
+  addBreadcrumb(crumb: {
+    message?: string;
+    category?: string;
+    level?: string;
+    data?: Record<string, string | number | boolean>;
+  }): void;
+}
+
+export function createSentryAiSink(Sentry: SentryClientLike): SentryAiSink {
   return {
     setConversationId: (id) => {
       try {
@@ -257,22 +401,38 @@ function liveSink(): SentryAiSink | null {
       return span as SpanLike;
     },
     captureException: (error, context) => {
-      Sentry.captureException(error, captureScope(context));
+      Sentry.captureException(redactErrorForSentry(error), captureScope(context));
       observability.noteCapture();
     },
     captureMessage: (message, context) => {
-      Sentry.captureMessage(message, { ...captureScope(context), level: context?.level ?? "warning" });
+      Sentry.captureMessage(sentryText(message, 500), {
+        ...captureScope(context),
+        level: context?.level ?? "warning",
+      });
       observability.noteCapture();
     },
     addBreadcrumb: (crumb) => {
+      // Breadcrumbs are the weakest link in this file, and the reason is in
+      // server/sentry.ts: the client registers `beforeSend`,
+      // `beforeSendTransaction` and `beforeSendLog`, and NO `beforeBreadcrumb`
+      // — so a breadcrumb attached to the scope reaches Sentry with whatever
+      // text it was given, and the payload scrub never sees it.  Redacting
+      // here, where the breadcrumb is built, is the only place left to do it.
       Sentry.addBreadcrumb({
         category: crumb.category,
-        message: crumb.message,
+        message: sentryText(crumb.message, 500),
         level: crumb.level ?? "info",
-        data: crumb.data,
+        data: redactStringValues(crumb.data),
       });
     },
   };
+}
+
+function liveSink(): SentryAiSink | null {
+  if (!isSentryActive()) return null;
+  const Sentry = getSentry();
+  if (!Sentry) return null;
+  return createSentryAiSink(Sentry);
 }
 
 /** `conversationId` is the per-TASK id (one invocation chain — see
@@ -361,7 +521,6 @@ const GEN_AI_PROVIDERS = new Map<string, string>([
   ["cursor", "cursor"],
   ["cursoragent", "cursor"],
   ["minimax", "minimax"],
-  ["mcodeagent", "minimax"],
   ["boxagent", "box"],
 ]);
 
@@ -382,21 +541,8 @@ function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?
 /** Stop reasons that are never a crash on their own.  `host_control_policy`
  * is Antigravity refusing, fail-closed, to run a host-control turn under an
  * always-proceed tool policy — a verdict the person is shown, not a fault.
- * `tool_round_limit` is the turn spending a ceiling the owner configured
- * (`maxToolRounds`), which is the budget working as designed rather than a
- * defect: paging on it buries real failures under a number the owner can
- * change in Settings.  It still reaches the transcript, the routine receipt
- * (`budget_exhausted`) and the Sentry breadcrumb trail below, so the signal
- * is not lost — it just stops arriving as a crash.
  * "timeout" is deliberately absent: see `modelTimeoutTurns`. */
-const EXPECTED_TURN_STOPS = new Set([
-  "auth_required",
-  "cancelled",
-  "interrupted",
-  "host_control_policy",
-  "tool_round_limit",
-]);
-
+const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted", "host_control_policy"]);
 
 /** Stop reasons a request-timeout turn can end with: the chat-completions
  * loop maps its `request_timeout` exit to "timeout", and "request_timeout"
@@ -608,7 +754,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
     case "turn.retrying": {
       sink.addBreadcrumb?.({
         category: "botfleet.turn",
-        message: `turn retrying: ${clean(event.reason)?.slice(0, 200) ?? "unknown"}`,
+        message: `turn retrying: ${sentryText(event.reason, 200) || "unknown"}`,
         level: "warning",
         data: {
           attempt: event.attempt,
@@ -649,12 +795,12 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (isExpectedNonCrash) {
         sink.addBreadcrumb?.({
           category: "botfleet.turn",
-          message: event.message.slice(0, 500),
+          message: sentryText(event.message, 500),
           level: "warning",
         });
         if (event.message.includes("initialize timed out")) initTimeoutTurns.add(key);
         if (event.message.includes("the model did not answer within")) modelTimeoutTurns.add(key);
-        if (event.setup) setupErrorTurns.set(key, redactSecretsInText(event.message).slice(0, 500));
+        if (event.setup) setupErrorTurns.set(key, sentryText(event.message, 500));
         break;
       }
       const turn = turns.get(key);
@@ -664,7 +810,7 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       const providerTurnFailure = event.raw?.source !== "botfleet.event-log";
       if (!providerTurnFailure || !reportedProviderErrors.has(key)) {
         sink.captureException(
-          new Error(event.message.slice(0, 500)),
+          new Error(sentryText(event.message, 500)),
           {
             tags: failureTags(event, provider, turn),
             fingerprint: ["bot-runtime-error", event.provider, classifyMessage(event.message)],
@@ -676,7 +822,13 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
     }
     case "turn.completed": {
       const runtimeErrorReported = reportedProviderErrors.has(key);
-      const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
+      // Redacted here, at the one definition, because this value reaches
+      // Sentry twice — a breadcrumb and a captured Error — and a stop reason
+      // is driver-reported free text, so it is a credential-shaped string
+      // exactly as often as a runtime error message is.  `?? "unknown"`
+      // survives: an empty stop reason is still "no reason", and the
+      // membership tests below run against the same value either way.
+      const stopReason = sentryText(event.stopReason, 200) || "unknown";
       const afterInitTimeout = initTimeoutTurns.delete(key);
       const afterModelTimeout = modelTimeoutTurns.delete(key);
       const setupMessage = setupErrorTurns.get(key);

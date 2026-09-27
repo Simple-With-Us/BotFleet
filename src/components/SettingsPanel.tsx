@@ -20,7 +20,6 @@ import { VoiceSettings } from "./VoiceSettings";
 import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS } from "../../shared/bot-profile";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { modelEffortLevels } from "@/lib/model-effort";
-import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
 
 function Field({
   label,
@@ -589,28 +588,30 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">
             <div>
-              <div className="text-[15px] font-medium text-ink">{CONNECTED_APPS_HEADING}</div>
+              <div className="text-[15px] font-medium text-ink">Connected Apps</div>
               <div className="mt-0.5 text-[13px] text-ink-secondary">
-                {connectedAppsBlurb({
-                  configured: connectedAppsConfigured,
-                  canUse: canUseConnectedApps,
-                  enabled: connectedAppsEnabled,
-                })}
+                {!connectedAppsConfigured
+                  ? "Connect apps in App Settings before giving this bot access."
+                  : !canUseConnectedApps
+                    ? "This bot's current engine cannot use connected apps."
+                    : connectedAppsEnabled
+                      ? "Let this bot use your connected Gmail, Calendar, Slack, and other apps."
+                      : "Keep your connected apps unavailable to this bot."}
               </div>
             </div>
             <button
               role="switch"
               aria-checked={connectedAppsEnabled}
-              aria-label="Let this bot use connected Composio apps"
+              aria-label="Allow this bot to use connected apps"
               disabled={
                 !connectedAppsEnabled && (!connectedAppsConfigured || !canUseConnectedApps)
               }
               onClick={() => patch({ composio: !connectedAppsEnabled })}
               title={
                 !connectedAppsEnabled && !connectedAppsConfigured
-                  ? "Composio is not set up for this workspace"
+                  ? "Connect apps in App Settings first"
                   : !connectedAppsEnabled && !canUseConnectedApps
-                    ? "This engine cannot call Composio tools"
+                    ? "This engine cannot use connected apps"
                     : undefined
               }
               className={cn(

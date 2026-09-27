@@ -50,6 +50,27 @@ files:
 
 asar: true
 
+# Electron fuses, applied to the packaged binary before signing (all platforms).
+# Each one closes a way to turn the app into a general Node runtime or to read
+# the bundle some other way:
+#   enableCookieEncryption  Chromium stores cookies through the OS keychain
+#   enableNodeOptionsEnvironmentVariable / enableNodeCliInspectArguments
+#                           no NODE_OPTIONS, no --inspect
+#   onlyLoadAppFromAsar     the app runs from its asar, never from a loose
+#                           directory someone can edit
+#
+# runAsNode stays ON deliberately.  The harness launches the Electron binary
+# with ELECTRON_RUN_AS_NODE=1 — server/index.ts's AGENTS_NODE_FLAG, every
+# engine driver, and the packaged server child the desktop forks — so turning
+# it off would break the app at first boot.  It flips only once those sites
+# stop depending on the env var.
+electronFuses:
+  runAsNode: true
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  onlyLoadAppFromAsar: true
+
 extraResources:
   # Ship the app's own license terms in every desktop distribution.
   - from: LICENSE

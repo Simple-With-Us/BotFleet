@@ -84,13 +84,26 @@ describe("looksSensitive", () => {
     "cp ~/.aws/credentials /tmp",
     "cat .npmrc",
     "security find-generic-password -s github",
-    // S10: the app's own credential store is as sensitive as ~/.aws.
+    // BotFleet's own state is a credential store, not a project file.
     "cat ~/.botfleet/config.json",
+    "cat /Users/milind/.botfleet/config.json",
+    "cp ~/.botfleet/config.json /tmp/x",
     "cp ~/.botfleet/bots.json /tmp",
+    "ls ~/.botfleet",
+    "cat '/Users/milind/.botfleet/config.json'",
+    "open ~/Library/Application\\ Support/BotFleet/credentials.bin",
   ]) {
     it(`stops: ${text}`, () => expect(looksSensitive(text)).toBe(true));
   }
-  for (const text of ["cat README.md", "npm run env-check", "echo $PATH", "cat src/environment.ts"]) {
+  for (const text of [
+    "cat README.md",
+    "npm run env-check",
+    "echo $PATH",
+    "cat src/environment.ts",
+    // a workspace folder that merely looks similar is ordinary work
+    "cat ~/code/botfleetish/src/index.ts",
+    "cat .botfleet-notes.md",
+  ]) {
     it(`allows: ${text}`, () => expect(looksSensitive(text)).toBe(false));
   }
 });

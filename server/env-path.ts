@@ -34,7 +34,6 @@ function knownDirs(): string[] {
     join(home, ".local", "bin"), // claude installer default
     join(home, ".npm-global", "bin"), // npm prefix ~/.npm-global (claude, opencode)
     join(home, ".kimi-code", "bin"), // kimi-code installer
-    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
     join(home, ".grok", "bin"), // x.ai installer
     join(home, ".opencode", "bin"), // opencode installer
     join(home, ".claude", "local"), // claude "local install"

@@ -49,7 +49,6 @@ const RESERVED_INSTANCE_ID = new Map<string, InstanceId>([
   ["qwenAgent", "qwen"],
   ["hermesAgent", "hermes"],
   ["piAgent", "pi"],
-  ["mcodeAgent", "mcode"],
 ]);
 
 export function isCustomInstance(driverKind: string, instanceId: InstanceId): boolean {

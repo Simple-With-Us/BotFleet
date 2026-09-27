@@ -180,7 +180,27 @@ export function createWebhookIngressHandler(
 
     let releaseAdmission: (() => void) | null = null;
     try {
-      const pathSecret = match[2] ? decodeURIComponent(match[2]) : "";
+      // A malformed percent-encoding is a caller error, never a receiver
+      // failure: decoding it unguarded threw a URIError that the catch below
+      // reported as a 500 and captured to Sentry, so an unauthenticated
+      // `POST /hooks/wh_x/%E0%A4%A` could both pollute the error pipeline and
+      // fill the rejected-delivery log.  Fail closed with the same answer an
+      // invalid secret gets, before any body is read and before Sentry sees
+      // anything, and keep the throttled rejection row so the attempt is
+      // still visible.
+      let pathSecret = "";
+      if (match[2]) {
+        try {
+          pathSecret = decodeURIComponent(match[2]);
+        } catch {
+          manager.recordRejected(match[1], 400, "Malformed webhook URL encoding", {
+            contentType: header(req, "content-type"),
+            eventName: eventName(req),
+            deliveryId: deliveryId(req),
+          });
+          return json(res, 400, { error: "Malformed webhook URL encoding" });
+        }
+      }
       const secret = pathSecret || bearerSecret(req);
       // Reject bad capability URLs before buffering or parsing attacker input.
       if (!manager.authorize(match[1], secret)) {
@@ -249,18 +269,7 @@ export async function listenWebhookIngress(
   },
 ): Promise<WebhookIngress> {
   const host = options.host ?? "127.0.0.1";
-  const handler = createWebhookIngressHandler(manager, options.beginAdmission, options.routes);
-  // Same boundary guard as the API port's createServer callback (audit
-  // C1): an async route that throws must not escape as an unhandled
-  // rejection — there is deliberately no process-level handler, so one
-  // would take the receiver down.  Log, answer 500, stay up.
-  const server = createServer((req, res) => {
-    void Promise.resolve(handler(req, res)).catch((error: unknown) => {
-      console.error("[webhook-ingress] unhandled route failure:", error);
-      if (!res.headersSent) json(res, 500, { error: "internal error" });
-      else res.destroy();
-    });
-  });
+  const server = createServer(createWebhookIngressHandler(manager, options.beginAdmission, options.routes));
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
     server.once("error", onError);

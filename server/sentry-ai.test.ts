@@ -497,16 +497,9 @@ describe("failed turns become Issues", () => {
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "auth_required" }), sink);
     observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled", turnId: "turn-2" }), sink);
-    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-3" }), sink);
-    // A turn that spent the tool-round ceiling the owner configured is the
-    // budget working as designed, not a defect. Paging on it buried real
-    // failures under a number that is fixed in Settings. The signal is not
-    // lost: it still reaches the breadcrumb trail and the routine receipt.
-    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "tool_round_limit", turnId: "turn-3" }), sink);
     expect(exceptions).toHaveLength(0);
-    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(3);
-    expect(breadcrumbs.some((b) => b.message === "bot turn failed: tool_round_limit")).toBe(true);
-    expect(spans.map((span) => span.status)).toEqual([undefined, undefined, undefined]);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(2);
+    expect(spans.map((span) => span.status)).toEqual([undefined, undefined]);
     expect(spans.every((span) => span.ended)).toBe(true);
   });
 
@@ -970,7 +963,6 @@ describe("Sentry provider vocabulary", () => {
     expect(genAiProvider("kimiAgent")).toBe("moonshot");
     expect(genAiProvider("cursorAgent")).toBe("cursor");
     expect(genAiProvider("minimax")).toBe("minimax");
-    expect(genAiProvider("mcodeAgent")).toBe("minimax");
     expect(genAiProvider("boxAgent")).toBe("box");
   });
 
@@ -1149,5 +1141,104 @@ describe("honest failure classification", () => {
       expect(breadcrumbs.some((b) => b.message === "bot turn failed: host_control_policy")).toBe(true);
       resetSentryAiForTests();
     }
+  });
+});
+
+// O2: runtime error text reaches Sentry unredacted.
+//
+// The finding was specific about why this hid so well: the same message is
+// redacted for `errors.log` a few lines away and redacted again inside
+// `classifyMessage`, so the Issue's fingerprint came out clean while the
+// Issue's body did not.  Only installs carrying a Sentry DSN were ever
+// exposed, and only when a driver happened to echo a credential — raw CLI
+// stderr being the ordinary way that happens.
+//
+// Both credentials below are fake and are assembled at runtime, so no
+// token-shaped literal sits in the source (GitHub's push protection flags
+// those).  Neither is a real key in any form.
+describe("runtime error text is redacted before it reaches the sink", () => {
+  const SYNTHETIC_KEY = ["sk", "-ant-api03-", "A".repeat(24)].join("");
+  const SYNTHETIC_BEARER = ["Bearer", " ", "bearer", ".token", ".value", ".9f2c"].join("");
+
+  it("keeps a synthetic key out of the captured exception and its stack", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: `grok auth failed: sent ${SYNTHETIC_KEY} and gave up` }),
+      sink,
+    );
+    expect(exceptions).toHaveLength(1);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    const [error] = exceptions as Error[];
+    expect(error.message).not.toContain(SYNTHETIC_KEY);
+    expect(error.message).toMatch(/«redacted \d+ chars»/);
+    // The stack header is the field the Issue view shows, and V8 caches it
+    // from the message — redacting the message alone would leave the original
+    // text sitting right there in the frames' header line.
+    expect(error.stack ?? "").not.toContain(SYNTHETIC_KEY);
+  });
+
+  it("keeps a synthetic Bearer token out of the expected-non-crash breadcrumb", () => {
+    const { sink, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "runtime.error",
+        message: `The saved ACP session could not be resumed: sent ${SYNTHETIC_BEARER}`,
+      }),
+      sink,
+    );
+    const crumb = breadcrumbs.find((b) => b.message.includes("could not be resumed"));
+    expect(crumb, "the expected-non-crash breadcrumb was not recorded").toBeDefined();
+    expect(crumb?.message).not.toContain("bearer.token.value.9f2c");
+    expect(crumb?.message).toMatch(/«redacted \d+ chars»/);
+  });
+
+  it("keeps both out of the turn-retrying breadcrumb and a driver stop reason", () => {
+    const { sink, breadcrumbs, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({
+        type: "turn.retrying",
+        attempt: 2,
+        reason: `rate limited, header was ${SYNTHETIC_BEARER}`,
+      }),
+      sink,
+    );
+    observeRuntimeEvent(
+      base({ type: "turn.completed", ok: false, stopReason: `crashed holding ${SYNTHETIC_KEY}` }),
+      sink,
+    );
+    const retry = breadcrumbs.find((b) => b.message.startsWith("turn retrying"));
+    expect(retry?.message).not.toContain("bearer.token.value.9f2c");
+    // The retry breadcrumb's `data` is a free-form map a driver controls, so
+    // the sink redacts its string values too.
+    expect(JSON.stringify(retry?.data ?? {})).not.toContain("bearer.token.value.9f2c");
+    // An unrecognised stop reason is not an expected stop and there is no
+    // setup message, so the turn-failure text is captured as an Error rather
+    // than breadcrumbled — and that Error's message carries the stop reason.
+    expect(exceptions.length).toBeGreaterThan(0);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    for (const error of exceptions as Error[]) {
+      expect(error.message).not.toContain(SYNTHETIC_KEY);
+      expect(error.stack ?? "").not.toContain(SYNTHETIC_KEY);
+    }
+  });
+
+  it("redacts before the clip, so a long message still masks a secret at the cut", () => {
+    // Redacting after `.slice()` is the failure this ordering exists to
+    // prevent: a credential cut at 500 characters has lost the closing marker
+    // the patterns anchor on, and the head of it ships in the clear.
+    const padded = `${"filler ".repeat(60)}${SYNTHETIC_KEY}`;
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: padded }), sink);
+    // SAFETY: `SentryAiSink.captureException` takes its first argument as an
+    // `Error`, so the recording sink only ever holds Errors.
+    const [error] = exceptions as Error[];
+    expect(error.message).not.toContain(SYNTHETIC_KEY);
+    expect(error.message).toMatch(/«redacted \d+ chars»/);
   });
 });
