@@ -174,3 +174,34 @@ describe("webhook-only ingress", () => {
     expect(manager.listAttempts().filter((attempt) => attempt.webhookId === manager.list().find((webhook) => webhook.endpointId === endpointId)?.id && attempt.outcome === "rejected").length).toBeGreaterThanOrEqual(3);
   });
 });
+
+describe("webhook-only ingress fixed routes", () => {
+  it("serves a mounted partner route (Linq) on the ingress listener, POST only, behind admission", async () => {
+    const seen: string[] = [];
+    let admit = true;
+    const routed = await listenWebhookIngress(manager, {
+      port: 0,
+      beginAdmission: () => (admit ? () => {} : null),
+      routes: {
+        "/api/webhooks/linq": async (req, res) => {
+          seen.push(req.method ?? "");
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        },
+      },
+    });
+    try {
+      const ok = await fetch(`${routed.baseUrl}/api/webhooks/linq`, { method: "POST", body: "{}" });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toEqual({ ok: true });
+      expect((await fetch(`${routed.baseUrl}/api/webhooks/linq`)).status).toBe(405);
+      admit = false;
+      expect((await fetch(`${routed.baseUrl}/api/webhooks/linq`, { method: "POST", body: "{}" })).status).toBe(503);
+      expect(seen).toEqual(["POST"]);
+      // Mounting a route does not open the rest of the app API.
+      expect((await fetch(`${routed.baseUrl}/api/bots`)).status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => routed.server.close(() => resolve()));
+    }
+  });
+});

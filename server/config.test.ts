@@ -1487,6 +1487,91 @@ describe("the secret-store section", () => {
   });
 });
 
+describe("imessageLinq config section", () => {
+  beforeEach(() => {
+    mkdirSync(DATA_DIR, { recursive: true });
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+  afterEach(() => {
+    rmSync(join(DATA_DIR, "config.json"), { force: true });
+  });
+
+  it("defaults to absent and lets bots opt in via per-bot imessagePerBot", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq).toBeUndefined();
+    expect(cfg.botDefaults?.imessagePerBot).toBeUndefined();
+  });
+
+  it("parses an imessageLinq block with botNumber and voice toggle, and a separate perBot map under botDefaults", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        imessageLinq: {
+          botNumber: "+14158707772",
+          ignoredSenders: ["+15555550100"],
+          allowedSenders: [],
+          allowVoiceByDefault: true,
+        },
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq", other: "off" },
+        },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.imessageLinq?.allowVoiceByDefault).toBe(true);
+    expect(cfg.botDefaults?.imessagePerBot?.director).toBe("linq");
+    expect(cfg.imessageLinq?.ignoredSenders).toEqual(["+15555550100"]);
+  });
+
+  it("rejects an unknown transport choice", () => {
+    const stored = {
+      botDefaults: { imessagePerBot: { director: "sms" } },
+    };
+    expect(() => parseStoredConfig(stored)).toThrow();
+  });
+
+  it("`PUT /api/config { imessageLinq }` persists per-bot transport choices", () => {
+    writeFileSync(join(DATA_DIR, "config.json"), JSON.stringify({}));
+    saveConfig({
+      imessageLinq: {
+        botNumber: "+14158707772",
+        allowVoiceByDefault: true,
+      },
+      botDefaults: {
+        imessagePerBot: { director: "linq", sidekick: "off" },
+      },
+    });
+    const cfg = loadConfig();
+    expect(cfg.imessageLinq?.botNumber).toBe("+14158707772");
+    expect(cfg.botDefaults?.imessagePerBot).toEqual({ director: "linq", sidekick: "off" });
+  });
+
+  it("migrates without overwriting an existing perBot map", () => {
+    writeFileSync(
+      join(DATA_DIR, "config.json"),
+      JSON.stringify({
+        botDefaults: {
+          computers: [],
+          cloudBackend: "box",
+          allowedComputers: null,
+          imessagePerBot: { director: "linq" },
+        },
+      }),
+    );
+    saveConfig({
+      imessageLinq: { botNumber: "+14158707772" },
+    });
+    const next = loadConfig();
+    expect(next.botDefaults?.imessagePerBot).toEqual({ director: "linq" });
+    expect(next.imessageLinq?.botNumber).toBe("+14158707772");
+  });
+});
+
 describe("migrateComputerProvidersConfig", () => {
   // The next provider save back-fills `allowedComputers` from whatever this
   // migration writes, so a wrong mapping here becomes a real grant change.
@@ -1544,6 +1629,7 @@ describe("migrateComputerProvidersConfig", () => {
     const cfg: AppConfig = { botDefaults: { allowedComputers: [], computerProviders: { ...providers }, vpsMode: null } };
     expect(migrateComputerProvidersConfig(cfg)).toBe(false);
     expect(cfg.botDefaults?.computerProviders).toEqual(providers);
+
   });
 });
 

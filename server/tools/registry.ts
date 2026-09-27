@@ -81,6 +81,12 @@ export interface ToolGateContext {
    *  "act on a git repo" only has to change what callers pass in, not this
    *  interface or the registry records. */
   github?: boolean;
+  /** The Linq partner-API is bound to this bot's phone number for this turn.
+   *  When true, `send_voice_message` is offered; false/undefined removes it
+   *  from the catalog entirely.  Set only when the operator opted this bot
+   *  into Linq, has a workspace bot number configured, AND enabled voice
+   *  (`imessageLinq.allowVoiceByDefault`). */
+  linq?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -1049,6 +1055,56 @@ const GITHUB_ISSUE_LIST: HarnessTool = {
   settles: "immediate",
 };
 
+/** The Linq voice-message tool is offered only when the dispatch bound the
+ *  current bot to a Linq phone number — turning a hosted TTS transcription
+ *  into an iMessage audio attachment is too billing-sensitive to be on by
+ *  default.  The first-party hosted TTS driver (`server/tts/index.ts`)
+ *  reads the workspace's voice config; the synthesized bytes cross the
+ *  partner API as an mp3 attachment because that is the smallest universal
+ *  audio container Linq accepts. */
+const linqEnabled = (ctx: ToolGateContext) => Boolean(ctx.linq);
+
+const LINQ_VOICE_MESSAGE: HarnessTool = {
+  name: "send_voice_message",
+  description:
+    "Synthesize a spoken reply with the workspace's hosted TTS and ship it as an iMessage audio attachment to a Linq-bound bot's caller. Use this when text would land poorly — quick voice notes, hands-busy replies, or persona-driven announcements — and only when the operator opted the bot into voice. Refuses silently when the bot has no Linq binding; check the bot's transport setting before invoking.",
+  schema: {
+    type: "object",
+    properties: {
+      chat_id: {
+        type: "string",
+        description:
+          "The Linq chat id the inbound arrived on. Pass it back unchanged so the audio lands in the same thread that triggered the reply. Omit it when the server already bound this turn to the inbound chat — the runtime fills it in from the turn's binding.",
+      },
+      text: {
+        type: "string",
+        description:
+          "What the voice note should say. Keep it under 30 seconds of speech (~600 characters) unless the operator asked for longer; longer is fine but consumes TTS quota.",
+      },
+      voice: {
+        type: "string",
+        description:
+          "Optional voice id override; defaults to the workspace's configured voice. Use the operator's chosen voice rather than picking freely — they curate this choice.",
+      },
+    },
+    required: ["text"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: linqEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment:
+    "Use send_voice_message to ship a spoken reply as an iMessage audio attachment; only when the operator opted the bot into Linq voice.",
+  approval: {
+    policy: "ask",
+    summary: (args) => {
+      const chat = typeof args.chat_id === "string" ? args.chat_id : "linq chat";
+      const text = typeof args.text === "string" ? args.text.replace(/\s+/g, " ").trim() : "";
+      return text ? `voice note to ${chat}: ${text.slice(0, 140)}` : `voice note to ${chat}`;
+    },
+  },
+};
+
 /** Every tool the registry owns, in the order the MCP lane publishes them —
  *  spelled out here, not derived, so reordering this array is a deliberate
  *  edit rather than something that silently reorders the MCP wire list. */
@@ -1088,6 +1144,7 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   GITHUB_ISSUE_CREATE,
   GITHUB_ISSUE_VIEW,
   GITHUB_ISSUE_LIST,
+  LINQ_VOICE_MESSAGE,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

@@ -545,6 +545,19 @@ export interface ConfigStatus {
     hasError: boolean;
     pendingProviderReload: boolean;
   };
+  /** Linq partner-API transport configuration.  The token never crosses the
+   *  /api/config wire — `configured` is the only signal of token presence;
+   *  `botNumber` and the per-bot transport map are operator-curated values
+   *  saved through `PUT /api/config`. */
+  imessageLinq?: {
+    configured: boolean;
+    botNumber: string;
+    perBot: Record<string, "off" | "mac-relay" | "linq">;
+    ignoredSenders: string[];
+    allowedSenders: string[];
+    allowVoiceByDefault: boolean;
+    webhookReady: boolean;
+  };
 }
 
 export type { RoomTerminology };
@@ -569,7 +582,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -600,6 +613,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     features: frame.features,
     observability: frame.observability,
     infisical: frame.infisical,
+    // Without this every SSE `config` frame wipes Linq status and resets
+    // LinqSettings back to its empty defaults.
+    imessageLinq: frame.imessageLinq,
   };
 }
 

@@ -23,6 +23,7 @@ import {
 import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { showToolCallsEnabled, skillRecorderEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, EngineKeyRow, VpsConnection } from "./ApiKeys";
+import { LinqSettings } from "./LinqSettings";
 import { useUpdaterState } from "@/lib/updater";
 import {
   availableLabel,
@@ -984,6 +985,7 @@ function DiagnosticsRow() {
 
 export function SettingsModal() {
   const { state, dispatch } = useStore();
+  const bots = state.bots ?? [];
   const section = state.appSettingsSection;
   const dialogRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
@@ -1170,6 +1172,13 @@ export function SettingsModal() {
                       <ApiKeyRow section="composio" />
                     </div>
                   </details>
+                  <LinqSettings
+                    bots={bots}
+                    config={state.config ?? undefined}
+                    onPatch={async (patch) => {
+                      await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+                    }}
+                  />
                 </div>
               </Card>
             )}

@@ -278,6 +278,28 @@ describe("config status frames", () => {
     });
   });
 
+  it("round-trips imessageLinq, so a config broadcast does not wipe Linq status", () => {
+    const imessageLinq = {
+      configured: true,
+      botNumber: "+15555550100",
+      perBot: { "maus-1": "linq" as const },
+      ignoredSenders: ["+15555550101"],
+      allowedSenders: [],
+      allowVoiceByDefault: true,
+      webhookReady: true,
+    };
+    const frame = {
+      xai: { configured: true },
+      composio: { configured: true, mode: "managed" as const },
+      box: { configured: false },
+      vps: { configured: true, sshAlias: "homelab" },
+      rooms: { turnTimeoutMinutes: 20 },
+      localVm: { mode: "per-bot" as const, maxInstances: 3 },
+      imessageLinq,
+    };
+    expect(configStatusFromFrame(frame).imessageLinq).toEqual(imessageLinq);
+  });
+
   it("round-trips botDefaults, so an inheriting bot's resolved backend survives a broadcast", () => {
     // botDefaults was missing from the ConfigStatusFrame Pick, so every SSE
     // `config` frame silently dropped it via the reducer's full `config:

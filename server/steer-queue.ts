@@ -32,7 +32,7 @@ interface QueueEntry {
    * happen on a DIFFERENT thread (a room turn) — drain matches on "this
    * queue's bot is idle now", which needs the bot, not the settling thread. */
   botId: string;
-  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string }>;
+  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string; linqChatId?: string }>;
 }
 
 const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
@@ -41,12 +41,18 @@ const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
 export function queueSteeredMessage(
   bot: BotRecord,
   text: string,
-  options: { prompt?: string; replyToId?: string } = {},
+  options: { prompt?: string; replyToId?: string; linqChatId?: string } = {},
 ): { id: string } {
   const threadId = bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
-  entry.items.push({ messageId: id, text, prompt: options.prompt ?? text, replyToId: options.replyToId });
+  entry.items.push({
+    messageId: id,
+    text,
+    prompt: options.prompt ?? text,
+    replyToId: options.replyToId,
+    linqChatId: options.linqChatId,
+  });
   queues.set(threadId, entry);
   return { id };
 }
@@ -66,8 +72,10 @@ export function drainSteeredMessages(
     prompt: string,
     userMessage: Message,
     excludeIds: string[],
+    linqChatId?: string,
   ) => void | Promise<void>,
 ): void {
+  const leftovers: Array<[string, QueueEntry]> = [];
   // deleting only the entry being visited is safe under Map iteration
   for (const [threadId, entry] of queues) {
     const bot = store.bot(entry.botId);
@@ -80,8 +88,22 @@ export function drainSteeredMessages(
     // committed to draining: the entry leaves the map before anything runs,
     // so a settle racing another settle can never fire the same queue twice
     queues.delete(threadId);
+    const firstLinq = entry.items.findIndex((item) => item.linqChatId);
+    const batch = firstLinq === 0
+      ? entry.items.slice(0, 1)
+      : firstLinq > 0
+        ? entry.items.slice(0, firstLinq)
+        : entry.items;
+    const rest = firstLinq === 0
+      ? entry.items.slice(1)
+      : firstLinq > 0
+        ? entry.items.slice(firstLinq)
+        : [];
+    // Requeue after this pass so a same-loop Map insert cannot start the
+    // next Linq chat before the current startTurn marks the bot busy.
+    if (rest.length) leftovers.push([threadId, { botId: entry.botId, items: rest }]);
     const appended: Message[] = [];
-    for (const item of entry.items) {
+    for (const item of batch) {
       // queueId is the pending-chip identity from the 202; append still
       // assigns a fresh transcript id so replay/exclude keep using message.id.
       appended.push(
@@ -96,14 +118,21 @@ export function drainSteeredMessages(
     }
     const last = appended.at(-1);
     if (!last) continue;
-    const prompt = entry.items.map((item) => item.prompt).join("\n");
+    const prompt = batch.map((item) => item.prompt).join("\n");
     void run(
       entry.botId,
       threadId,
       prompt,
       last,
       appended.map((message) => message.id),
+      batch.length === 1 ? batch[0]?.linqChatId : undefined,
     );
+  }
+  for (const [threadId, leftover] of leftovers) {
+    const existing = queues.get(threadId);
+    queues.set(threadId, existing
+      ? { botId: leftover.botId, items: [...leftover.items, ...existing.items] }
+      : leftover);
   }
 }
 
