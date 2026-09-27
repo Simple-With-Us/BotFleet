@@ -172,13 +172,14 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
             // but running the tool unasked is worse.  Name the tool and ask.
             summary = call.name;
           }
-          const verdict: RequestOutcome = await runtime.requestApproval({
+          const request: Parameters<typeof runtime.requestApproval>[0] = {
             tool: call.name,
             summary,
-            // This executor invokes bash on the host, never in a VM. Scope
-            // host-computer approvals independently of the model's arguments.
-            ...(call.name === "bash" && ctx.localComputer ? { approvalScope: "local-computer" as const } : {}),
-          });
+          };
+          // This executor invokes bash on the host, never in a VM. Scope
+          // host-computer approvals independently of the model's arguments.
+          if (call.name === "bash" && ctx.localComputer) request.approvalScope = "local-computer";
+          const verdict: RequestOutcome = await runtime.requestApproval(request);
           if (verdict !== "allowed-once") {
             // A refusal the MODEL reads, so the turn continues and the
             // agent can say what it was stopped from doing.  `unavailable`
