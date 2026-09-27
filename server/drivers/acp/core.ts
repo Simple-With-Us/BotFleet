@@ -650,6 +650,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           text: "",
         };
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
+        // Tool calls that started but have not reported completed/failed yet.
+        // A long quiet build is work, not a wedge — the idle guard consults
+        // this the same way it consults `asks`.
+        const openToolCalls = new Set<string>();
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -711,7 +715,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 // A permission ask blocks on a PERSON, not the agent —
                 // waiting on one is not the silence this guard exists to
                 // catch, so keep re-checking instead of tripping.
-                if (asks.size) {
+                if (asks.size || openToolCalls.size) {
+                  // An ask waits on a PERSON; an open tool call is the agent
+                  // working quietly (a build, a test run). Neither is the
+                  // silence this guard exists to catch — keep re-checking.
+                  // The hard ceiling still bounds a truly wedged call.
                   armIdle();
                   return;
                 }
@@ -1013,6 +1021,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
+              if (typeof u.toolCallId === "string") openToolCalls.add(u.toolCallId);
               flushAssistantText();
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
@@ -1034,6 +1043,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call_update": {
               if (u.status === "completed" || u.status === "failed") {
+                openToolCalls.delete(u.toolCallId);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",

@@ -437,6 +437,20 @@ describe("ACP turns (fake CLI)", () => {
     expect(instance.adapter.hasSession("t-idle-stall")).toBe(false);
   });
 
+  it("keeps a turn alive through a silently running tool call past the idle window", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "600";
+    // the tool call is quiet for 600 ms — four times the idle window (150
+    // ms) — so only open-tool-call tracking can explain the turn surviving
+    await create(GrokAgentDriver, "quiet-tool-call", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-tool", text: "build it" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")).toBe(true);
+    expect(recorder.events.some((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1" && "ok" in event && event.ok === true)).toBe(true);
+  });
+
   it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
     process.env.FAKE_ACP_DRIP_MS = "20";
     // no FAKE_ACP_DRIP_COUNT: drips forever, so the idle guard (5 s, never
