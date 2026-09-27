@@ -21,6 +21,7 @@ import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
 import { DroidAgentDriver } from "./droid.ts";
 import { CursorAgentDriver } from "./cursor.ts";
+import { McodeAgentDriver } from "./mcode.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
@@ -1111,6 +1112,51 @@ describe("ACP turns (fake CLI)", () => {
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
     expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+  });
+
+  // mcode rides the same hook, but its wire values embed the user's login
+  // provider (m:<providerId>:<modelId>[:v:<variant>]): the driver matches the
+  // picker id against the advertised options and sends the advertised value
+  // back verbatim rather than constructing one.
+  it("mcode switches to a picker model via the advertised option value", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u,m:minimax:MiniMax-M2.7:v:highspeed";
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-model", text: "go", model: "MiniMax-M2.7-highspeed" });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ model: "MiniMax-M2.7-highspeed" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).toContain("session/set_config_option");
+  });
+
+  // An older mcode advertises no model option: the switch must be skipped,
+  // not attempted - the session keeps its login default, exactly the behavior
+  // the picker had before this hook existed.
+  it("mcode keeps the session default when no model option is advertised", async () => {
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-default", text: "go", model: "MiniMax-M3" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).not.toContain("session/set_config_option");
+  });
+
+  it("mcode fails the turn clearly when the model is not advertised", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u";
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-bad", text: "go", model: "MiniMax-M9" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false });
+    const err = recorder.events.find((e) => e.type === "runtime.error")!;
+    expect(err.message).toMatch(/does not offer MiniMax-M9/);
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
   });
 
   it("selects the model on a resumed session too, not just a new one", async () => {
