@@ -3,26 +3,26 @@
 
 # BotFleet
 
-**Pick Any Platform For Each Bot.**<br>
-**Use Your Subscriptions + APIs.**
+**Choose an Engine for Each Bot.**<br>
+**Bring the Accounts and Tools You Configure.**
 
 <sub>A friendly fork of <a href="https://github.com/milind-soni/OpenMausBot">OpenMausBot</a> — run a coordinated team of bots on your own computer, with an iPhone companion.  Every BotFleet-layer add-on is in testing.</sub>
 
 <br>
 <br>
 
-<a href="https://botfleet.app"><b>botfleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://github.com/jaywedgeworth22/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
+<a href="https://botfleet.app"><b>botfleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://simplewithus.com/">From Simple With Us</a> &nbsp;·&nbsp; <a href="https://github.com/jaywedgeworth22/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
 
 </div>
 
 ## What BotFleet Adds
 
-These are features this fork layered on after OpenMausBot.  **All of them are in testing** — they run in daily use on this fleet, they are not a finished product surface, and they can still change.  Card-by-card provenance lives at **[botfleet.app](https://botfleet.app)**.
+These are features this fork layered on after OpenMausBot.  **All of them are in testing** — some are used regularly on this fleet, and their behavior and setup may change.  Card-by-card provenance lives at **[botfleet.app](https://botfleet.app)**.
 
 ### Messaging, companion, and desktop
 
-- **Always-on iMessage relay** — a host daemon plus LaunchAgents keep bot group chats in Messages.app wired to the BotFleet backend in both directions while the relay is running.
-- **iOS companion (public TestFlight)** — pairing, universal links on `botfleet.app`, App Groups, thread tabs, unread Live Activities, and display-aware transcript windows.  Alerts are SSE plus local notifications while the companion is open.  A killed or backgrounded app wakes over APNs when the Mac sidecar is running and the phone has allowed notifications.  iPad still runs in compatibility mode.
+- **iMessage relay** — a Mac relay can connect bot group chats in Messages.app to BotFleet while its host service is running.
+- **iOS companion (public TestFlight)** — pairs with a running Mac host to show conversations and approvals.  Notification behavior depends on the Mac sidecar and iOS permissions; iPad runs in compatibility mode.
 - **Nested conversations under channels** — renameable task threads live under their channel, can be moved, searched, and collapsed, with a custom word for "room" if you want one.
 - **Chat bubble and request-ID copy** — click a bubble to copy its text; hover and right-click also copy Request ID or Message ID.
 - **macOS menu bar tray** — a menu-bar extra keeps BotFleet reachable while the window is hidden.
@@ -32,7 +32,7 @@ These are features this fork layered on after OpenMausBot.  **All of them are in
 ### Engines, failover, and telemetry
 
 - **Native DeepSeek driver** — DeepSeek models join Claude, Codex, Cursor, Grok, Gemini, and Antigravity via a native driver plus the dsh bot, with in-app rates and token pricing.
-- **Gemini and Antigravity engines** — including Gemini 3.8 Flash, full tool loading, and local computer dispatch on those harnesses after opt-in.
+- **Gemini and Antigravity engines** — engine options with tool access and local computer dispatch where configured and approved.
 - **Multi-tier model fallbacks** — first, second, and third choice models per bot.  Quota, usage-cap, and session-limit chips fail over to the saved chain automatically, including after tools already ran and in rooms.  Other streamed error paths are still in review.
 - **Elapsed turn timer** — a live timer on the in-progress turn, plus duration on completed activity runs.
 - **Usage telemetry** — live token consumption (prompt, completion, cache hits) and model costs stream to a Usage Monitor instance you configure, with project and repo classification.  Working-directory classification uses the folder **basename only**, never the full path.
