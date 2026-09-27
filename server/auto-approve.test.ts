@@ -84,6 +84,9 @@ describe("looksSensitive", () => {
     "cp ~/.aws/credentials /tmp",
     "cat .npmrc",
     "security find-generic-password -s github",
+    // S10: the app's own credential store is as sensitive as ~/.aws.
+    "cat ~/.botfleet/config.json",
+    "cp ~/.botfleet/bots.json /tmp",
   ]) {
     it(`stops: ${text}`, () => expect(looksSensitive(text)).toBe(true));
   }

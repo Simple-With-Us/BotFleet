@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { CREDENTIAL_TARGETS } from "../../shared/credential-request.ts";
+import { looksSensitive } from "../auto-approve.ts";
 import {
   CREDENTIAL_TARGET_IDS,
   HARNESS_TOOLS,
@@ -70,10 +71,39 @@ describe("every record is complete", () => {
 
   it("keeps read tools free of an approval ask — only a write tool needs a card", () => {
     for (const tool of HARNESS_TOOLS) {
+      // read_file is the one exception: its approval is `when`-gated, so
+      // ordinary reads still never see a card and only credential-store
+      // paths ask (S10).  The gate is what makes the exception safe.
+      if (tool.name === "read_file") continue;
       if (tool.sideEffect === "read") {
         expect(tool.approval?.policy ?? "never", `${tool.name}`).toBe("never");
         expect(tool.settles, `${tool.name}`).toBe("immediate");
       }
+    }
+  });
+
+  it("gates read_file's ask on sensitive paths only, in parity with auto-approve's SENSITIVE", () => {
+    // registry.ts is import-free by test, so its path shapes restate
+    // auto-approve.ts's SENSITIVE list; this table is what keeps the two
+    // from drifting apart (the parity mechanism, same as the diagnostics
+    // credential-env test).
+    const when = harnessTool("read_file")!.approval!.when!;
+    expect(harnessTool("read_file")!.approval!.policy).toBe("ask");
+    const sensitivePaths = [
+      ".env", "/home/u/app/.env.production", "~/.ssh/id_ed25519",
+      "~/.aws/credentials", ".npmrc", "creds/credentials.json",
+      "~/.botfleet/config.json", ".botfleet/bots.json",
+    ];
+    const ordinaryPaths = [
+      "package.json", "src/index.ts", "README.md", "/tmp/notes.txt",
+    ];
+    for (const path of sensitivePaths) {
+      expect(when({ path }), path).toBe(true);
+      expect(looksSensitive(`cat ${path}`), `SENSITIVE parity: ${path}`).toBe(true);
+    }
+    for (const path of ordinaryPaths) {
+      expect(when({ path }), path).toBe(false);
+      expect(looksSensitive(`cat ${path}`), `SENSITIVE parity: ${path}`).toBe(false);
     }
   });
 

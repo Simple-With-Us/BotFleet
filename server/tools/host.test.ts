@@ -401,6 +401,28 @@ describe("host computer tools on HTTP lane", () => {
     expect(asking.asks).toEqual([]);
   });
 
+  it("asks before read_file on a credential-store path, executes on allow", async () => {
+    const asking = askingRuntime("allowed-once");
+    const outcome = await hostFor({}, { localComputer: true }).execute(
+      { id: "1", name: "read_file", arguments: { path: ".botfleet/config.json", limit: 5 } },
+      asking.runtime,
+    );
+    expect(asking.asks).toHaveLength(1);
+    expect(asking.asks[0].tool).toBe("read_file");
+    expect(asking.asks[0].summary).toContain(".botfleet/config.json");
+    expect(outcome).not.toMatchObject({ kind: "error", detail: "denied" });
+  });
+
+  it("a denied read_file on a sensitive path never touches the file", async () => {
+    const asking = askingRuntime("rejected");
+    const outcome = await hostFor({}, { localComputer: true }).execute(
+      { id: "1", name: "read_file", arguments: { path: ".botfleet/config.json" } },
+      asking.runtime,
+    );
+    expect(asking.asks).toHaveLength(1);
+    expect(outcome).toMatchObject({ kind: "error", detail: "denied" });
+  });
+
   it("asks for approval before running bash, executes on allow", async () => {
     const asking = askingRuntime("allowed-once");
     const outcome = await hostFor({}, { localComputer: true }).execute(

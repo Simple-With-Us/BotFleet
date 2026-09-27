@@ -96,6 +96,11 @@ export interface ToolApproval {
   policy: "never" | "ask";
   /** One line for the card, built from the model's arguments. */
   summary(args: Record<string, unknown>): string;
+  /** Optional gate: when present, the broker asks ONLY if this returns true
+   *  for the call's arguments (a read tool that is harmless on ordinary
+   *  inputs but not on sensitive ones).  A throw is treated as "ask" — the
+   *  gate fails closed, never open. */
+  when?(args: Record<string, unknown>): boolean;
 }
 
 /** A wire shape one lane is pinned to and the other is not.
@@ -550,6 +555,18 @@ const BASH: HarnessTool = {
   },
 };
 
+// read_file's sensitive-path gate.  This module is import-free by test, so
+// the path shapes from server/auto-approve.ts's SENSITIVE list are restated
+// here in path form — registry.test.ts pins the two lists to the same
+// verdicts, which is what keeps this copy from drifting the way the
+// pre-parity-test diagnostics redactor did.
+const SENSITIVE_READ_PATHS: RegExp[] = [
+  /(^|\/)\.env(\.|$)/i,
+  /\.ssh\/|id_rsa|id_ed25519|authorized_keys/i,
+  /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
+  /\bcredentials?\.json\b|\bserviceaccount\b/i,
+  /\.botfleet\//i,
+];
 const READ_FILE: HarnessTool = {
   name: "read_file",
   description:
@@ -582,6 +599,19 @@ const READ_FILE: HarnessTool = {
   settles: "immediate",
   promptFragment:
     "Use read_file to inspect files in the workspace; it returns 400 lines at most by default, and a truncated result names the offset to pass next.",
+  approval: {
+    policy: "ask",
+    // Ordinary source files stream by with no card; a path that names a
+    // credential store stops and asks first (S10).
+    when: (args) => {
+      const path = typeof args.path === "string" ? args.path : "";
+      return SENSITIVE_READ_PATHS.some((re) => re.test(path));
+    },
+    summary: (args) => {
+      const path = typeof args.path === "string" ? args.path : "file";
+      return `read file ${path}`;
+    },
+  },
 };
 
 const WRITE_FILE: HarnessTool = {

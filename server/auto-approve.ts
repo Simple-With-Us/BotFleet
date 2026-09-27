@@ -40,6 +40,9 @@ const SENSITIVE = [
   /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
   /security\s+find-(generic|internet)-password|\bkeychain\b/i,
   /\bcredentials?\.json\b|\bserviceaccount\b/i,
+  // BotFleet's own credential store: the app's config holds engine API keys
+  // and bot tokens, so reading it is exactly as sensitive as ~/.aws.
+  /\.botfleet\//i,
 ];
 
 /** First matching pattern's source, so a verdict can NAME the rule that

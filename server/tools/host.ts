@@ -201,7 +201,19 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
         // which is every read tool, and the reason `list_bots` does not
         // put a card in front of anyone.
         const approval = harnessTool(call.name)?.approval;
-        if (approval?.policy === "ask") {
+        // A `when` gate narrows the ask to the arguments that need it (a
+        // read_file of a credential path, not of a source file).  A gate
+        // that cannot decide asks: failing open is how a guard becomes a
+        // receipt printer.
+        let gated = true;
+        if (approval?.when) {
+          try {
+            gated = approval.when(call.arguments);
+          } catch {
+            gated = true;
+          }
+        }
+        if (approval?.policy === "ask" && gated) {
           let summary: string;
           try {
             summary = approval.summary(call.arguments);
