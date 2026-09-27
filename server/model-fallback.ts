@@ -310,7 +310,7 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation";
 
 export interface BootRecoveryResumeUser {
   role?: string;

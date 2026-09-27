@@ -23,6 +23,7 @@ import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseCli
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { firstTurnTitleText } from "./task-title.ts";
 import {
   allowsMultipleBotThreads,
   parseConversationMode,
@@ -237,7 +238,8 @@ import { loadLocalMiniMaxConfig } from "./drivers/minimax.ts";
 import { flushNativeTee } from "./drivers/native.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
-import { promptWithReply, transcriptText } from "./replies.ts";
+import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
+import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
 import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
@@ -3106,7 +3108,7 @@ bus.subscribe((event: RuntimeEvent) => {
 /** How a drained delegation becomes a real turn on the target. Shared by
  * the settle-time drain and the boot-time drain of what a previous process
  * left queued. */
-const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel) => {
+const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text, commsDepth, sourceThreadId, channel, options) => {
     // startTurn REJECTS on an ordinary condition — busy target, deleted bot,
     // unavailable provider. Unhandled, that rejection is fatal to the
     // harness (Node's default), which in the packaged app kills the server
@@ -3135,9 +3137,19 @@ const runDelegatedTurn: Parameters<typeof drainDelegations>[3] = (toBotId, text,
         tool: { name: `error: delegation to @${bot?.name ?? toBotId} could not start — ${why.slice(0, 120)}`, ok: false },
       });
     };
+    const sender = options?.sender;
+    const comm = channel && sender ? {
+      groupId: channel.id,
+      withBotId: sender.botId,
+      withName: sender.name,
+      withColor: sender.color,
+    } : undefined;
     return startTurn(toBotId, text, {
       commsDepth,
       unattended: isUnattended(store.botByThread(sourceThreadId)?.id),
+      automationSource: "delegation",
+      from: sender,
+      comm,
       // startTurn schedules provider/integration setup after marking the bot
       // busy. Those asynchronous setup failures do not emit turn.completed,
       // so clear the watch and report them through this callback too.
@@ -3265,6 +3277,8 @@ async function startTurn(
     onDispatchError?: (message: string) => void;
     /** Override engine for this turn (model fallback).  Persistence is the caller's job. */
     modelSelection?: ModelSelection;
+    from?: Message["from"];
+    comm?: Message["comm"];
   },
 ) {
   if (runtimeQuiescing) {
@@ -3305,12 +3319,11 @@ async function startTurn(
   const task = store.taskByThread(bot.id, threadId);
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
   const commsDepth = opts?.commsDepth ?? 0;
-  // a task takes its name from the first thing you asked it to do.
-  // Auto-delivered instructions are not that — they already named the task
-  // from the routine or webhook.
-  if (text.trim() && !opts?.cardContinuation && !opts?.automationSource) {
-    store.titleTaskFromFirstMessage(bot.id, text, threadId);
-  }
+  // A new task takes its name from its first prompt. For delegations,
+  // use only the shared parser's payload, never the sender wrapper or reason.
+  // Routine/webhook instructions have their own task names.
+  const titleText = firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
+  if (titleText) store.titleTaskFromFirstMessage(bot.id, titleText, threadId);
 
   const fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
@@ -3431,6 +3444,8 @@ async function startTurn(
           text,
           replyToId: opts?.replyTo?.id,
           automationSource: opts?.automationSource,
+          from: opts?.from,
+          comm: opts?.comm,
         });
   }
 
@@ -5101,16 +5116,28 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
   console.log(
     `boot recovery: ${replay ? "replaying" : "continuing"} in-flight thread ${threadId} for ${bot.name}`,
   );
-  return startTurn(bot.id, prompt, {
+  const channel = resumeUser?.comm?.groupId ? store.group(resumeUser.comm.groupId) : undefined;
+  const channelId = resumedDelegationChannel(resumeUser, bot.id, channel);
+  if (channelId) delegationWatch.set(threadId, { channelId, toBotId: bot.id });
+  const resumed = startTurn(bot.id, prompt, {
     threadId,
     userMessage: replay ? resumeUser : undefined,
     ...bootRecoveryTurnOpts(resumeUser, replay),
-  }).then(() => {}, (error) => {
+    ...(channelId ? {
+      commsDepth: 1,
+      from: resumeUser?.from,
+      comm: resumeUser?.comm,
+      onDispatchError: () => finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume"),
+    } : {}),
+  });
+  return resumed.then(() => {}, (error) => {
     if (isExternalCredentialPendingError(error)) {
+      if (channelId) delegationWatch.delete(threadId);
       releaseBootResume(bot.id, threadId);
       deferredBootRecoveries.add(bot.id);
       return;
     }
+    if (channelId) finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume");
     console.error(`boot recovery failed for ${bot.name} (${threadId}):`, error);
     // Terminal, and remembered: without this the next boot finds the same
     // marker, dispatches the same doomed turn, and fails the same way — 29
@@ -7287,20 +7314,41 @@ async function resumeInterruptedChatTurns(
         );
         continue;
       }
-      const resumeMessages = store.messagesFor(resumeThreadId);
+      const resumeMessages = store.activePath(resumeThreadId);
       const resumePrompt =
-        resumeMessages.find((message) => message.id === entry.promptMessageId) ??
-        [...resumeMessages]
-          .reverse()
-          .find((message) => message.role === "user" && message.kind === "text" && message.text);
+        resumeMessages.find((message) => message.id === entry.promptMessageId &&
+          (message.role === "user" || (message.role === "system" && message.automationSource === "delegation"))) ??
+        lastInterruptedChatStarter(resumeMessages);
       if (!resumePrompt?.text) {
         console.log(`[${context}] no resumable prompt for bot ${resumeBot.id} on thread ${resumeThreadId}`);
         continue;
       }
-      await startTurn(resumeBot.id, resumePrompt.text, {
-        threadId: resumeThreadId,
-        userMessage: resumeMessages.some((message) => message.id === resumePrompt.id) ? resumePrompt : undefined,
-      });
+      // Forced quiescing consumed the old watch when it mirrored the
+      // interruption. A resumed delegated turn needs a fresh terminal
+      // watch or its reply never reaches the bot-to-bot channel.
+      if (resumePrompt.automationSource === "delegation") {
+        const channel = resumePrompt.comm?.groupId ? store.group(resumePrompt.comm.groupId) : undefined;
+        const channelId = resumedDelegationChannel(resumePrompt, resumeBot.id, channel);
+        if (channelId) delegationWatch.set(resumeThreadId, { channelId, toBotId: resumeBot.id });
+      }
+      try {
+        await startTurn(resumeBot.id, resumePrompt.text, {
+          threadId: resumeThreadId,
+          userMessage: resumePrompt,
+          automationSource: resumePrompt.automationSource,
+          ...(resumePrompt.automationSource === "delegation" ? {
+            commsDepth: 1,
+            unattended: isUnattended(resumeBot.id),
+            from: resumePrompt.from,
+            comm: resumePrompt.comm,
+          } : {}),
+        });
+      } catch (error) {
+        // The provider rejected the redispatch before it could emit a
+        // terminal event. Consume only this re-armed watch and record it.
+        finalizeDelegationWatch(resumeThreadId, false, "", "Delegated turn could not resume");
+        throw error;
+      }
       console.log(`[${context}] re-dispatched interrupted turn for bot ${resumeBot.id}`);
     } catch (err) {
       console.warn(`[${context}] could not resume interrupted turn:`, err);
@@ -7396,9 +7444,7 @@ async function beginRuntimeQuiesce(force = false) {
           botId: bot.id,
           threadId: liveThreadId,
         };
-        const promptMessage = [...store.messagesFor(liveThreadId)]
-          .reverse()
-          .find((message) => message.role === "user" && message.kind === "text" && message.text);
+        const promptMessage = lastInterruptedChatStarter(store.activePath(liveThreadId));
         if (promptMessage?.text) {
           entry.promptMessageId = promptMessage.id;
           entry.promptText = promptMessage.text;
@@ -8219,8 +8265,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const userName = cfg.profile?.name?.trim() || "User";
       const lines: string[] = [`# ${title}`, ""];
       for (const msg of messages) {
-        const who =
-          msg.role === "user" ? userName : msg.role === "system" ? "Scheduled Run" : (msg.from?.name ?? bot?.name ?? "Bot");
+        const who = exportMessageSpeaker(msg, userName, bot?.name);
         if (msg.kind === "text" && msg.text) lines.push(`**${who}:**`, "", msg.text, "");
         else if (msg.kind === "activity" && msg.tool) lines.push(`> ${msg.tool.name}`, "");
         else if (msg.kind === "screen") lines.push("> [screen capture]", "");

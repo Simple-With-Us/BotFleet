@@ -73,6 +73,8 @@ import { ToolLine } from "./ToolLine";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
+import { delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
+import { DelegationCard } from "./DelegationCard";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import {
@@ -273,7 +275,7 @@ function Bubble({
   // bot's `ask_bot` reply mirrored into this thread (`from.botId` set) —
   // but purple is reserved for what the human actually typed.  Auto
   // instructions are `role: "system"` and never sit on the human side.
-  const alignRight = message.role === "user";
+  const alignRight = message.role === "user" && !isDelegationMessage(message);
   const humanTyped = alignRight && !message.from?.botId;
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -827,8 +829,12 @@ const MessagesList = memo(function MessagesList({
               // system message the same way it forks a user one
               // (store.branchMessage), so its siblings must stay selectable
               // and its edit state must actually render, not just be armed.
-              const systemEditing = m.role === "system" && editingId === m.id;
-              const systemVersions = m.role === "system" ? messageVersions(bot, m) : [m];
+              const delegationView = delegationMessageView(m.role, m.text ?? "", m.from?.name, m.automationSource);
+              // Legacy delegation starters were stored as user messages but
+              // now render as cards. Keep their editor and branches reachable.
+              const cardStarter = m.role === "system" || Boolean(delegationView);
+              const systemEditing = cardStarter && editingId === m.id;
+              const systemVersions = cardStarter ? messageVersions(bot, m) : [m];
               const systemVersionIndex = systemVersions.findIndex((v) => v.id === m.id);
               const withSystemChrome = (card: ReactNode) => {
                 if (systemEditing) {
@@ -888,6 +894,11 @@ const MessagesList = memo(function MessagesList({
                   </div>
                 );
               };
+              if (delegationView) {
+                return withSystemChrome(
+                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
+                );
+              }
               const webhookView = autoDelivered ? webhookMessageView(m.text ?? "") : null;
               if (webhookView) return withSystemChrome(<WebhookCard view={webhookView} />);
               const imessageView = autoDelivered ? imessageMessageView(m.text ?? "") : null;

@@ -368,10 +368,10 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(note.comm?.groupId).toBeTruthy();
       expect(note.comm?.withName).toBe("Helper");
 
-      // B ran a depth-1 turn: the inbound user text carries the delegation
-      // prefix, B's reply is the happy-mode line (no agents integration).
+      // B ran a depth-1 turn: the system-attributed starter carries the
+      // delegation prefix, B's reply is the happy-mode line.
       const helperInbound = helperBot.messages.find(
-        (m: any) => m.role === "user" && m.kind === "text",
+        (m: any) => m.role === "system" && m.automationSource === "delegation" && m.kind === "text",
       );
       expect(helperInbound.text).toContain("[Delegated by @Asker");
       expect(helperInbound.text).toContain("delegated task");

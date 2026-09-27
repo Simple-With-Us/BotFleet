@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
@@ -104,7 +105,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   card?: OptionCardData;
@@ -1624,9 +1625,9 @@ export class Store {
 
   /** Fork the conversation: a new message that replaces `sourceId`
    * (same parent, new text) and becomes the active leaf.  Preserves the
-   * source's role and automationSource — regenerating or editing an
-   * auto-delivered instruction (role="system") must produce another
-   * system-attributed prompt, not a fabricated human user bubble. */
+   * source's role, automationSource, and sender. A branched delegation is
+   * rerun directly, not mirrored into its former bot-to-bot channel, so it
+   * must not claim a peer-thread link to an exchange that never happened. */
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
@@ -1640,6 +1641,10 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      from: source.from ? { ...source.from } : undefined,
+      comm: source.comm && source.automationSource !== "delegation" &&
+        !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
+        ? { ...source.comm } : undefined,
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);

@@ -1113,9 +1113,15 @@ struct MessageRow: View {
             content
 
             if let comm = message.comm {
-                Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.secondary)
+                if message.automationSource == "delegation" {
+                    Label("From @\(comm.withName)", systemImage: "arrow.down.left.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                } else {
+                    Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                }
             }
 
             // Stay up while `message.queued` is true, even after `bot.busy`
@@ -1196,7 +1202,9 @@ struct MessageRow: View {
             ForEach(Self.reactionChoices, id: \.self) { emoji in
                 Button(emoji) { Task { await session.react(to: message, in: chat.threadId, emoji: emoji) } }
             }
-            if message.role == .user, message.kind == .text,
+            if (message.role == .user ||
+                (message.role == .system && message.automationSource == "delegation")),
+               message.kind == .text,
                WebhookMessageView.parse(message.text) == nil,
                ImessageMessageView.parse(message.text) == nil,
                case let .bot(bot) = chat {
@@ -1234,7 +1242,15 @@ struct MessageRow: View {
     private var content: some View {
         switch message.kind {
         case .text:
-            if message.role == .system {
+            if let delegation = DelegationMessageView.parse(message.text, role: message.role, fromName: message.from?.name, automationSource: message.automationSource) {
+                ChannelEventCard(
+                    headline: delegation.headline,
+                    subtitle: delegation.subtitle,
+                    payload: delegation.payload,
+                    systemImage: "arrow.triangle.branch",
+                    accessibilityName: delegation.headline
+                )
+            } else if message.role == .system {
                 if let webhook = WebhookMessageView.parse(message.text) {
                     WebhookEventCard(view: webhook)
                 } else if let imessage = ImessageMessageView.parse(message.text) {
@@ -1308,7 +1324,12 @@ struct MessageRow: View {
             return "Webhook"
         case "schedule":
             return "Scheduled Run"
+        case "delegation":
+            return "Delegated Task"
         default:
+            if DelegationMessageView.isDelegation(body, role: .system) {
+                return "Delegated Task"
+            }
             return body.contains("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run"
         }
     }
@@ -1408,7 +1429,7 @@ struct TextBubble: View {
     }
 
     var body: some View {
-        let mine = message.role == .user
+        let mine = message.role == .user && !DelegationMessageView.isDelegation(message.text, role: message.role, automationSource: message.automationSource)
         let customCard = parsedDiff != nil || parsedTable != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from
