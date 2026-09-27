@@ -666,6 +666,51 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
   });
 
+  it("relaunches the live turn, not the first turn, when a warm process crashes (E3)", async () => {
+    // The close handler is registered by the FIRST spawn.  On a warm session
+    // a crash during turn 2 used to run that closure's relaunch with turn
+    // 1's turn object - the relaunched CLI received turn 1's prompt.
+    const state = join(scratch, "launches.txt");
+    const dump = join(scratch, "dump.json");
+    // TRANSIENTS=1 crashes playTurn while the state counter is below the
+    // quota; seeded at 1, turn 1 completes and each later playTurn crashes
+    // only after the test re-arms the counter.
+    writeFileSync(state, "1");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.FAKE_CLAUDE_TRANSIENTS = "1";
+    process.env.FAKE_CLAUDE_STATE = state;
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.01";
+    await create();
+    const first = await instance.adapter.sendTurn({ threadId: "t-e3", text: "turn one: delete branch foo" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+    // arm the scripted crash for the warm process's second prompt
+    writeFileSync(state, "0");
+    const second = await instance.adapter.sendTurn({
+      threadId: "t-e3",
+      text: "turn two: rename branch bar",
+      resumeCursor: announced,
+    });
+    // the relaunch is a fresh sendTurn with its own turnId, the same shape a
+    // turn-1 crash retry takes
+    await recorder.until(
+      (e) => e.type === "turn.completed" && e.turnId !== first.turnId && e.turnId !== second.turnId,
+      15_000,
+    );
+    // the retry is reported against the turn that was live when the process
+    // died - turn 2 - not the turn the close handler's closure spawned with
+    const retrying = recorder.events.find((e) => e.type === "turn.retrying") as { turnId?: string } | undefined;
+    expect(retrying?.turnId).toBe(second.turnId);
+    const completed = recorder.events.filter((e) => e.type === "turn.completed");
+    expect(completed).toHaveLength(2);
+    expect(completed[1]).toMatchObject({ ok: true });
+    // the relaunch is a fresh process, so it dumps its spawn payload: the
+    // prompt must be turn 2's, never a replay of turn 1's
+    const relaunch = JSON.parse(readFileSync(dump, "utf8")) as { prompt: { message: { content: string } } };
+    expect(relaunch.prompt.message.content).toContain("turn two: rename branch bar");
+    expect(relaunch.prompt.message.content).not.toContain("turn one: delete branch foo");
+  });
+
   it("keeps the warm process across a roster whose live state moved, replaces it when membership did", async () => {
     // DR1.  `turn.system` is passed as --append-system-prompt and hashed into
     // `argsKey`, the spawn contract that decides whether the live process may
