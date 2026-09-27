@@ -3,7 +3,8 @@ import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
@@ -213,6 +214,12 @@ export function Composer({
     [text, setText, setAttachments],
   );
   const [recording, setRecording] = useState(false);
+  const onCall = useOnCall();
+  // Stop the independent composer microphone before the call overlay starts
+  // its own session. Keep the draft, but never resume capture implicitly.
+  useLayoutEffect(() => {
+    if (onCall && recording) setRecording(false);
+  }, [onCall, recording]);
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [caret, setCaret] = useState(0);
   const [highlight, setHighlight] = useState(0);
@@ -384,7 +391,7 @@ export function Composer({
   // native dictation: partials stream into the input while the Swift
   // helper runs; the final transcript stays in the box, ready to edit/send
   useEffect(() => {
-    if (!recording) return;
+    if (!recording || onCall) return;
     let detached = false;
     let offTranscript: () => void = () => {};
     let offEnd: () => void = () => {};
@@ -397,7 +404,7 @@ export function Composer({
     let session: STTSession | null = sttSessionRef.current;
 
     const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
-      if (typeof line.text === "string") {
+      if (!detached && !currentCall() && typeof line.text === "string") {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
@@ -454,7 +461,7 @@ export function Composer({
           return;
         }
       }
-      if (detached) return;
+      if (detached || currentCall()) return;
       offTranscript = session.onTranscript(handleTranscript);
       offEnd = session.onEnd(handleEnd);
       session.start({ keyterms: sessionKeyterms([...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])], state.config?.callStt?.keyterms ?? []) }).catch(() => {
@@ -470,11 +477,17 @@ export function Composer({
 
     return () => {
       detached = true;
-      // AssemblyAI may deliver its final formatted turn while Terminate
-      // drains. Keep callbacks attached until finalization settles.
+      // A call takes the microphone, so drop the composer listener at once
+      // and close its cloud socket without a final hidden draft update.
+      const callStarted = Boolean(currentCall());
+      if (callStarted) {
+        offTranscript();
+        offEnd();
+      }
+      // An ordinary mic-off still drains the last formatted cloud turn.
       void (async () => {
         try {
-          if (session?.provider === "assemblyai") await session.finish();
+          if (session?.provider === "assemblyai" && !callStarted) await session.finish();
           else await session?.stop();
         } catch {
           // A provider can close during navigation; still detach listeners.
@@ -486,10 +499,10 @@ export function Composer({
         }
       })();
     };
-  }, [recording]);
+  }, [recording, onCall]);
 
   const toggleMic = () => {
-    if (!dictationAvailable || !window.ogb) {
+    if (onCall || !dictationAvailable || !window.ogb) {
       setSpeechError("Dictation isn't available in this build.");
       return;
     }
@@ -841,7 +854,7 @@ export function Composer({
             <Square size={14} className="fill-current" />
           </button>
         )}
-        {!locked && !busy && !hasContent && dictationAvailable && (
+        {!locked && !busy && !hasContent && !onCall && dictationAvailable && (
           <button
             onClick={toggleMic}
             aria-label={recording ? "Stop Dictation" : "Start Dictation"}
