@@ -23,6 +23,7 @@ import { execCli } from "../procs.ts";
 import { redactSecretsInText } from "../redact.ts";
 import { workspaceDir } from "../workspace.ts";
 import type { ComputerToolExecutor } from "./computer.ts";
+import { modelShellEnv } from "./shell-env.ts";
 
 const SAFE_DIR_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const SAFE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9/._-]{0,199}$/;
@@ -52,7 +53,7 @@ interface ExecResult {
  *  error containing a token into its own stdout/stderr. */
 function run(command: string, args: string[], cwd: string, timeoutMs = 60_000): Promise<ExecResult> {
   return new Promise((resolvePromise) => {
-    execCli(command, args, { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env }, (error, stdout, stderr) => {
+    execCli(command, args, { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: modelShellEnv() }, (error, stdout, stderr) => {
       const timedOut = Boolean(
         error && ((error as unknown as { killed?: boolean }).killed || HARD_TIMEOUT_MESSAGE.test(error.message)),
       );

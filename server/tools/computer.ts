@@ -23,6 +23,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { isInside, realOrResolved } from "../bot-cwd.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import type { AgentToolCallContext } from "./agents.ts";
+import { modelShellEnv } from "./shell-env.ts";
 
 // DR5 — `read_file` results are embedded verbatim in the transcript, and the
 // HTTP-lane chat-completions engines (MiniMax, OpenAI-compatible, Grok API)
@@ -123,7 +124,7 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
           cwd: workingDir,
           timeout: 60_000,
           maxBuffer: 4 * 1024 * 1024,
-          env: process.env,
+          env: modelShellEnv(),
         },
         (error, stdout, stderr) => {
           if (error && (error as unknown as { killed?: boolean }).killed) {
