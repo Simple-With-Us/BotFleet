@@ -7432,3 +7432,144 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     expect(await inside.text()).toContain("color: white");
   });
 });
+
+describe("CSRF security hardening", () => {
+  /** Makes a raw HTTP request with full header control, returns { status, body } */
+  const rawRequest = (options: {
+    method?: string;
+    path?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }): Promise<{ status: number; body: string }> => new Promise((resolve, reject) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port: PORT,
+      path: options.path ?? "/api/bots",
+      method: options.method ?? "POST",
+      headers: options.headers ?? {},
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: data }));
+    });
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+
+  it("rejects cross-site sec-fetch-site POST with 403 even with no Origin header", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "sec-fetch-site": "cross-site",
+        "content-type": "application/json",
+        "content-length": "2",
+        // no origin header
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-site request");
+  });
+
+  it("rejects mutating API request with text/plain body and 415", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "text/plain",
+        "content-length": "5",
+      },
+      body: "hello",
+    });
+    expect(result.status).toBe(415);
+    expect(result.body).toContain("unsupported media type");
+  });
+
+  it("accepts mutating API request with application/json body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("accepts mutating API request with application/json; charset=utf-8 body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("rejects Origin from a different loopback port with 403", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": "http://127.0.0.1:9999",
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-origin request");
+  });
+
+  it("accepts Origin from the server's own port", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("allows bodiless mutating POST (e.g. /api/runtime/quiesce)", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/runtime/quiesce",
+      headers: {
+        "authorization": `Bearer ${owner.nonce}`,
+        "origin": `http://127.0.0.1:${PORT}`,
+        // no content-type, no content-length
+      },
+      // no body
+    });
+    // 200 means accepted; 409 means active work (acceptable here); either way not 403/415
+    expect([200, 409]).toContain(result.status);
+    // clean up if quiesced
+    if (result.status === 200) {
+      await new Promise<void>((resolve) => {
+        const req = request({
+          hostname: "127.0.0.1",
+          port: PORT,
+          path: "/api/runtime/quiesce",
+          method: "DELETE",
+          headers: { "authorization": `Bearer ${owner.nonce}` },
+        }, () => resolve());
+        req.end();
+      });
+    }
+  });
+});

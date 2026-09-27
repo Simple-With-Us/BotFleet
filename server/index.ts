@@ -7361,7 +7361,8 @@ function isAllowedOrigin(origin: string | undefined | null): boolean {
   if (!origin) return true; // non-browser clients (CLIs, curl, tests) send none
   try {
     const o = new URL(origin);
-    return isLoopbackHost(o.hostname) && (o.protocol === "http:" || o.protocol === "https:");
+    return isLoopbackHost(o.hostname) && (o.protocol === "http:" || o.protocol === "https:")
+      && Number(o.port) === PORT;
   } catch {
     return false;
   }
@@ -7690,12 +7691,32 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (origin && !isAllowedOrigin(origin)) {
       return json(res, 403, { error: "forbidden: cross-origin request" });
     }
+    // Reject cross-site sec-fetch-site even when no Origin is sent (closes simple form POSTs)
+    const secFetchSite = req.headers["sec-fetch-site"];
+    if (secFetchSite === "cross-site") {
+      return json(res, 403, { error: "forbidden: cross-site request" });
+    }
     if (runtimeQuiescing && path.startsWith("/api/") && path !== "/api/runtime" && path !== "/api/runtime/quiesce" &&
         path !== "/api/health" && path !== "/api/update/status") {
       return json(res, 503, { error: "BotFleet is quiescing for an update" });
     }
     const mutatingApiRequest = path.startsWith("/api/") && !["GET", "HEAD", "OPTIONS"].includes(method) &&
       path !== "/api/runtime/quiesce";
+    // Require application/json content-type for mutating API requests that carry a body.
+    // /api/attachments is the one raw-upload route; it sniffs and rejects
+    // unsupported content-types itself, and the sec-fetch-site check above
+    // still covers it against cross-site browser posts.
+    if (mutatingApiRequest && path !== "/api/attachments") {
+      const contentLength = req.headers["content-length"];
+      const transferEncoding = req.headers["transfer-encoding"];
+      const hasBody = (contentLength !== undefined && Number(contentLength) > 0) || transferEncoding !== undefined;
+      if (hasBody) {
+        const contentType = req.headers["content-type"] ?? "";
+        if (!contentType.toLowerCase().startsWith("application/json")) {
+          return json(res, 415, { error: "unsupported media type" });
+        }
+      }
+    }
     let ownAdmissionActive = false;
     if (mutatingApiRequest) {
       const releaseAdmission = beginUpdateAdmission();
