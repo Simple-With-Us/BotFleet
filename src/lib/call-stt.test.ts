@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ start: vi.fn() }));
 vi.mock("./assemblyai-transcription", () => ({ startAssemblyAITranscription: mocks.start }));
-import { createAssemblyAISTTSession } from "./call-stt";
+import { createAppleSTTSession, createAssemblyAISTTSession, disposeAppleSTTSession } from "./call-stt";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -60,5 +60,41 @@ describe("AssemblyAI STT lifecycle", () => {
     await session.start();
     expect(mocks.start).toHaveBeenCalledTimes(2);
     await session.stop();
+  });
+});
+
+
+describe("STT teardown", () => {
+  it("delivers a final formatted turn while finish drains, then rejects late turns", async () => {
+    const { track } = setup();
+    const draining = deferred<void>();
+    mocks.start.mockResolvedValue({ stop: vi.fn(() => draining.promise) });
+    const session = createAssemblyAISTTSession();
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start();
+    const turn = mocks.start.mock.calls[0]![0].onTurn as (value: { text: string; final: boolean }) => void;
+    const finish = session.finish();
+    expect(track.stop).toHaveBeenCalledOnce();
+    turn({ text: "last words", final: true });
+    expect(transcript).toHaveBeenCalledWith({ text: "last words", partial: false });
+    draining.resolve();
+    await finish;
+    turn({ text: "too late", final: true });
+    expect(transcript).toHaveBeenCalledTimes(1);
+  });
+
+  it("detaches raw Apple IPC listeners when a session is disposed", () => {
+    const offTranscript = vi.fn();
+    const offEnd = vi.fn();
+    vi.stubGlobal("window", { ogb: {
+      speechStart: vi.fn(), speechStop: vi.fn(), speechFinish: vi.fn(),
+      onSpeechTranscript: vi.fn(() => offTranscript),
+      onSpeechEnd: vi.fn(() => offEnd),
+    } });
+    const session = createAppleSTTSession();
+    disposeAppleSTTSession(session);
+    expect(offTranscript).toHaveBeenCalledOnce();
+    expect(offEnd).toHaveBeenCalledOnce();
   });
 });

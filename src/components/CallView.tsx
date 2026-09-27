@@ -26,7 +26,7 @@ import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
-import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
@@ -273,7 +273,9 @@ function Call({ bot }: { bot: Bot }) {
     const session = sttSessionRef.current;
     session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms([bot.name], state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
-        setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+        setNote(session?.provider === "assemblyai"
+          ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
+          : "The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
     });
   }, [bot.id, bot.name, move, state.config?.callStt?.keyterms]);
@@ -328,7 +330,9 @@ function Call({ bot }: { bot: Bot }) {
       if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
       if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
-        setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+        setNote(sttSessionRef.current?.provider === "assemblyai"
+          ? "Cloud dictation stopped unexpectedly. Check the AssemblyAI key, connection, and microphone access."
+          : "Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
         return;
       }
       if (typeof line.text !== "string") return;
@@ -421,9 +425,11 @@ function Call({ bot }: { bot: Bot }) {
       }
       if (code === 1) {
         setNote(
-          reason === "helper-build-failed"
-            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
-            : "Dictation needs Microphone + Speech Recognition access in System Settings.",
+          session?.provider === "assemblyai"
+            ? `Cloud dictation stopped: ${reason ?? "connection or microphone error"}. Check the AssemblyAI key, connection, and microphone access.`
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access in System Settings.",
         );
         return;
       }
@@ -472,7 +478,8 @@ function Call({ bot }: { bot: Bot }) {
       detached = true;
       offTranscript();
       offEnd();
-      void session?.stop();
+      if (session?.provider === "apple") disposeAppleSTTSession(session);
+      void session?.stop().catch(() => {});
       if (sttSessionRef.current === session) sttSessionRef.current = null;
     };
     // busy/approval are intentionally initial snapshots. Their live changes

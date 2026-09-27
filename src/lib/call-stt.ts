@@ -101,8 +101,8 @@ export function createAppleSTTSession(): STTSession {
       return () => endListeners.delete(cb);
     },
   };
-  // The IPC subscriptions live for the lifetime of the page. Tests own the
-  // raw listeners so they can detach; production code does not need this.
+  // The raw IPC subscriptions must be detached when the owning component
+  // releases the session, including after a stop failure.
   (session as STTSession & { __off?: () => void }).__off = () => {
     offTranscript();
     offEnd();
@@ -110,9 +110,7 @@ export function createAppleSTTSession(): STTSession {
   return session;
 }
 
-/** Detach the IPC subscriptions created by `createAppleSTTSession`. Test-only;
- * the renderer never tears these down in production because a single
- * Electron window owns one Swift helper session for its lifetime. */
+/** Detach the IPC subscriptions created by `createAppleSTTSession`. */
 export function disposeAppleSTTSession(session: STTSession): void {
   const off = (session as STTSession & { __off?: () => void }).__off;
   off?.();
@@ -135,6 +133,7 @@ export function createAssemblyAISTTSession(): STTSession {
   let session: AssemblyAITranscriptionSession | null = null;
   let running = false;
   let generation = 0;
+  let finalizingGeneration: number | null = null;
 
   const releaseMedia = () => {
     if (!stream) return;
@@ -149,7 +148,10 @@ export function createAssemblyAISTTSession(): STTSession {
   const stopCloud = async (reason: string, notify = true) => {
     if (!running) return;
     running = false;
+    const finishing = reason === "finished" && session !== null;
     generation += 1; // invalidate pending microphone/token/socket startup
+    const drainGeneration = generation;
+    finalizingGeneration = finishing ? drainGeneration - 1 : null;
     const live = session;
     session = null;
     releaseMedia(); // before awaiting socket drain; a new start may begin meanwhile
@@ -157,8 +159,10 @@ export function createAssemblyAISTTSession(): STTSession {
       await live?.stop();
     } catch {
       // best-effort; the socket may already have closed
+    } finally {
+      if (finishing && generation === drainGeneration) finalizingGeneration = null;
     }
-    if (notify) emitEnd({ code: 0, reason });
+    if (notify && generation === drainGeneration) emitEnd({ code: 0, reason });
   };
 
   return {
@@ -197,7 +201,10 @@ export function createAssemblyAISTTSession(): STTSession {
           stream,
           getToken: () => tokenMint(),
           onTurn: (turn) => {
-            if (generation !== attempt || !running) return;
+            // Terminate drains the final formatted Turn after finish() has
+            // stopped capture. Keep that one generation alive until stop ends.
+            if (!(generation === attempt && running) &&
+                !(finalizingGeneration === attempt && generation === attempt + 1)) return;
             const line: STTTranscriptLine = {
               text: turn.text,
               partial: !turn.final,

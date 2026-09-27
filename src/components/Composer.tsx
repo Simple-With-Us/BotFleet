@@ -1,4 +1,4 @@
-import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { track } from "@/lib/analytics";
@@ -404,9 +404,11 @@ export function Composer({
         );
       } else if (code === 1) {
         setSpeechError(
-          reason === "helper-build-failed"
-            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
-            : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
+          session?.provider === "assemblyai"
+            ? `Cloud dictation stopped: ${reason ?? "connection or microphone error"}. Check the AssemblyAI key, connection, and microphone access.`
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
         );
       }
     };
@@ -450,7 +452,9 @@ export function Composer({
       session.start({ keyterms: sessionKeyterms([...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])], state.config?.callStt?.keyterms ?? []) }).catch(() => {
         if (!detached) {
           setRecording(false);
-          setSpeechError("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+          setSpeechError(session?.provider === "assemblyai"
+            ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
+            : "The microphone couldn't start. Check Microphone and Speech Recognition access.");
         }
       });
     };
@@ -469,6 +473,7 @@ export function Composer({
         } finally {
           offTranscript();
           offEnd();
+          if (session?.provider === "apple") disposeAppleSTTSession(session);
           if (sttSessionRef.current === session) sttSessionRef.current = null;
         }
       })();
