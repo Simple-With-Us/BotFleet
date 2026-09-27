@@ -1217,12 +1217,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             return;
           }
           retryState.delete(threadId);
-          emit({
-            ...base(threadId, currentTurnId()),
-            type: "runtime.error",
-            message,
-          });
-          settle(false, "exit_before_result");
+          // A user stop cancels the retry and kills the process (audit E6):
+          // the close that follows is the interrupt landing, not a crash —
+          // no runtime.error, and the turn settles interrupted under the
+          // same convention #647 set for Antigravity.
+          if (liveTurn.retry.cancelled) {
+            settle(false, "interrupted");
+          } else {
+            emit({
+              ...base(threadId, currentTurnId()),
+              type: "runtime.error",
+              message,
+            });
+            settle(false, "exit_before_result");
+          }
         }
         if (session.idleTimer) clearTimeout(session.idleTimer);
         session.broker?.close();

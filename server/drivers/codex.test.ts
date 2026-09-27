@@ -597,6 +597,18 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("interrupt settles a running turn interrupted, not as a crash", async () => {
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-stop", text: "clean up" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await instance.adapter.interruptTurn("t-stop");
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    // a stop is not a crash: no runtime.error, no exit_before_result (audit E6)
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  });
+
   it("answers Codex 0.149 MCP elicitation with the MCP result shape", async () => {
     await create({ mode: "mcp-elicitation" });
     const dump = join(scratch, "mcp-elicitation.json");

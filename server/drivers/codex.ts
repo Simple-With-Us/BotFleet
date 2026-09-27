@@ -622,6 +622,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       child.on("close", (code) => {
         if (abandoned) return;
         if (!state.settled) {
+          // A user stop kills the app-server (audit E6): that close is the
+          // interrupt landing, not a crash — no runtime.error, settle
+          // interrupted under the #647 convention.
+          if (stopRequested) {
+            settle(false, "interrupted");
+            return;
+          }
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",

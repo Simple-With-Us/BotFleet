@@ -626,14 +626,16 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
-  it("interrupt kills the turn and settles it as failed, not hung", async () => {
+  it("interrupt kills the turn and settles it interrupted, not hung and not a crash", async () => {
     await create("hang");
     await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
 
     await instance.adapter.interruptTurn("t-int");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    // a stop is not a crash: no runtime.error accompanies it (audit E6)
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it("a message sent mid-turn is steered into the running turn", async () => {
