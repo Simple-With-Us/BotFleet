@@ -1656,6 +1656,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     codex: { driver: "codex" },
     antigravity: { driver: "antigravityAgent" },
     minimax: { driver: "minimax" },
+    mcode: { driver: "mcodeAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -1677,6 +1678,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     openaiCompat: { driver: "openai-compat" },
     dsh: { driver: "dshAgent" },
     minimax: { driver: "minimax" },
+    mcode: { driver: "mcodeAgent" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;

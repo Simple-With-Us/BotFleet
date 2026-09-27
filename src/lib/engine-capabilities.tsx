@@ -113,6 +113,9 @@ const CODEX_PRO_LITE_NOTE =
 const MINIMAX_TOKEN_PLAN_NOTE =
   "MiniMax Token Plan Max subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
+const MCODE_TOKEN_PLAN_NOTE =
+  "MiniMax Code authenticates with the MiniMax Code CLI login and shares the MiniMax Token Plan with the MiniMax engine.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
+
 const GROK_SUPER_NOTE =
   "xAI SuperGrok Heavy subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
 
@@ -457,6 +460,63 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       { id: "MiniMax-H3", display: "MiniMax H3", ctxTokens: 256_000 },
     ],
   },
+
+  mcode: {
+    id: "mcode",
+    displayName: "MiniMax Code",
+    // One shade off MiniMax's violet on purpose.  The two engines sit next to
+    // each other in the matrix, run the same account, and offer the same
+    // flagship model, so identical chips would read as one row.
+    capabilityBadgeColor: "bg-violet-500 text-white",
+    group: "Cloud",
+    pricing: {
+      kind: "subscription+api",
+      subscription: {
+        tierLabel: "MiniMax Token Plan Max",
+        costPerMonth: 132,
+        includedQuota: "MiniMax Token Plan Max quota",
+        notes: MCODE_TOKEN_PLAN_NOTE,
+      },
+      api: {
+        inputPer1k: 0.001,
+        outputPer1k: 0.004,
+        cachedInputPer1k: 0.0002,
+        notes:
+          "MiniMax M3 public API rates.  Prompts over 512,000 input tokens use 2x these rates.  " +
+          "Catalog reference for the what-if projection, not an invoice.",
+      },
+      notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
+    },
+    capabilities: {
+      files: "yes",
+      terminal: "yes",
+      thisComputer: "yes",
+      webAccess: "yes",
+      // The driver declares `images: true`, so the composer accepts image
+      // input on this engine the way it does on the other coding CLIs.
+      imageAttachments: "yes",
+      // The ACP core mounts MCP servers for this driver, and composioMcp
+      // answers from that one question — so the Connected Apps channel is
+      // present here even though the direct MiniMax engine does not have it.
+      connectedApps: "yes",
+      crossBotCoordination: "yes",
+      longContext: "yes",
+    },
+    whyThisEngine: {
+      headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
+      prose: [
+        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, and long context are available.",
+        "It signs in with the CLI's own login and draws on the same Token Plan as the MiniMax engine, so the two rows report one subscription.",
+        "BotFleet does not support rooms, voice chat, computer use, or live research on MiniMax Code yet.",
+      ],
+    },
+    defaultModels: [
+      { id: "MiniMax-M3", display: "MiniMax M3", ctxTokens: 1_000_000 },
+      // Context length for the M2.7 speed tier is not published in the CLI's
+      // own catalog, so no figure is claimed here.
+      { id: "MiniMax-M2.7-highspeed", display: "MiniMax M2.7 Highspeed" },
+    ],
+  },
 };
 
 /** Every capability key the matrix exposes, in display order. */
@@ -500,6 +560,7 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
   "antigravity",
   "deepseek-harness",
   "minimax",
+  "mcode",
 ];
 
 /** Resolve the engine id from a driver-kind string when the registry and

@@ -24,6 +24,7 @@ const KNOWN_ENGINE_IDS = [
   "antigravity",
   "deepseek-harness",
   "minimax",
+  "mcode",
 ];
 
 describe("ENGINE_CAPABILITIES registry", () => {
@@ -115,6 +116,10 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(engineIdFromDriverKind("deepseek")).toBe("deepseek-harness");
     expect(engineIdFromDriverKind("antigravityAgent")).toBe("antigravity");
     expect(engineIdFromDriverKind("minimax")).toBe("minimax");
+    // The MiniMax Code CLI driver carries the Agent suffix like every other
+    // ACP coding CLI, so the suffix strip has to reach the mcode row.
+    expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
+    expect(engineIdFromDriverKind("mcode")).toBe("mcode");
     expect(engineIdFromDriverKind("unknown-engine")).toBeNull();
     expect(engineIdFromDriverKind(undefined)).toBeNull();
   });
@@ -139,6 +144,42 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // (localComputerMcp), a different thing.  Pin 'no' so a future edit
     // cannot silently regress the matrix to overclaim.
     expect(ENGINE_CAPABILITIES.minimax.capabilities.connectedApps).toBe("no");
+  });
+
+  it("keeps MiniMax Code a distinct engine row on the same Token Plan", () => {
+    // MiniMax Code is its own engine, not an alias of the direct MiniMax one:
+    // a separate driver kind, its own row in the matrix, its own display
+    // name.  The subscription is shared, so the plan block matches.
+    const mcode = ENGINE_CAPABILITIES.mcode;
+    const minimaxEntry = ENGINE_CAPABILITIES.minimax;
+    expect(mcode.displayName).toBe("MiniMax Code");
+    expect(mcode.id).toBe("mcode");
+    // Distinct chips: the two rows sit next to each other in the matrix.
+    expect(mcode.capabilityBadgeColor).not.toBe(minimaxEntry.capabilityBadgeColor);
+    expect(mcode.pricing.kind).toBe("subscription+api");
+    if (mcode.pricing.kind !== "subscription+api" || minimaxEntry.pricing.kind !== "subscription+api") {
+      throw new Error("both MiniMax engines must retain separate subscription and API pricing");
+    }
+    expect(mcode.pricing.subscription.tierLabel).toBe(minimaxEntry.pricing.subscription.tierLabel);
+    expect(mcode.pricing.subscription.costPerMonth).toBe(minimaxEntry.pricing.subscription.costPerMonth);
+    expect(mcode.pricing.api).toEqual(minimaxEntry.pricing.api);
+    // The ACP core mounts MCP servers for this driver, so Connected Apps and
+    // images are genuinely available here even though the direct MiniMax
+    // engine declares neither.
+    expect(mcode.capabilities.connectedApps).toBe("yes");
+    expect(mcode.capabilities.imageAttachments).toBe("yes");
+    expect(minimaxEntry.capabilities.connectedApps).toBe("no");
+    expect(mcode.defaultModels.map((m) => m.id)).toEqual(["MiniMax-M3", "MiniMax-M2.7-highspeed"]);
+  });
+
+  it("leaves MiniMax-M3 unmapped rather than crediting one of its two engines", () => {
+    // The shared flagship model id belongs to both MiniMax engines, so the
+    // unique-model map must not first-win it onto either one.  Engine-tagged
+    // usage still attributes correctly through engineIdFromDriverKind.
+    const map = uniqueModelToEngineId();
+    expect(map.get("MiniMax-M3")).toBeUndefined();
+    expect(engineIdFromDriverKind("minimax")).toBe("minimax");
+    expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
   });
 
   it("pricingModeLabel reads consistently with the pricing block", () => {
