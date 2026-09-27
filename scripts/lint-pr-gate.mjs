@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const baseRef = process.env.LINT_BASE_REF ?? "origin/main";
+const baseBranch = baseRef.replace(/^origin\//, "");
 
 function sh(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: "utf8" });
@@ -19,7 +20,7 @@ function sh(cmd, args) {
 }
 
 function changedFiles() {
-  sh("git", ["fetch", "origin", baseRef.replace(/^origin\//, "")]);
+  sh("git", ["fetch", "origin", baseBranch, "--depth=1"]);
   const raw = sh("git", ["diff", "--name-only", "--diff-filter=ACMRT", `${baseRef}...HEAD`]);
   return raw
     .split("\n")
