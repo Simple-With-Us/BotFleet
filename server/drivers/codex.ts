@@ -337,7 +337,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const mcpTool = isMcpElicitation
           ? String(params.message ?? "").match(/tool \"([^\"]+)\"/)?.[1]
           : undefined;
-        const tool =
+        let tool =
           isMcpElicitation
             ? (mcpTool ?? "mcp")
             : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
@@ -359,10 +359,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           mount.kind !== "local" && params.serverName === mount.name &&
           typeof mcpTool === "string" && mcpTool.length > 0,
         );
+        if (remoteComputerAsk) tool = `mcp__${params.serverName}__${mcpTool}`;
         const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
         const summary =
-          isMcpElicitation && typeof params.message === "string"
-            ? params.message
+          remoteComputerAsk && typeof params._meta?.tool_params?.command === "string"
+            ? params._meta.tool_params.command
+            : remoteComputerAsk
+              ? mcpTool!
+              : isMcpElicitation && typeof params.message === "string"
+                ? params.message
             : typeof params.command === "string"
             ? params.command
             : Array.isArray(params.questions)

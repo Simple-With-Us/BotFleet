@@ -213,7 +213,7 @@ process.stdin.on("data", (chunk) => {
             params: {
               serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : "agents",
               mode: "form",
-              _meta: { codex_approval_kind: "mcp_tool_call", tool_params: {} },
+              _meta: { codex_approval_kind: "mcp_tool_call", tool_params: mode === "remote-computer-elicitation" ? { command: "bash -c echo hi" } : {} },
               message: mode === "remote-computer-elicitation"
                 ? 'Allow the computer_shared_vm MCP server to run tool "bash"?'
                 : 'Allow the agents MCP server to run tool "list_bots"?',

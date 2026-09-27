@@ -930,7 +930,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             });
           }
           const kind = String(toolCall.kind ?? "");
-          const tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
+          let tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
           const summary = String(toolCall.rawInput?.command ?? toolCall.title ?? tool).slice(0, 200);
           const requestId = newId();
           // ACP toolCall metadata can name an MCP server in rawInput. Trust
@@ -941,6 +941,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             toolCall.rawInput?.serverName === mount.name &&
             typeof toolCall.rawInput?.toolName === "string" && toolCall.rawInput.toolName.length > 0,
           );
+          if (remoteComputerAsk) tool = `mcp__${toolCall.rawInput.serverName}__${toolCall.rawInput.toolName}`;
           const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
           const finish = (behavior: string, source: "user" | "timeout" | "system" = "user") => {
             if (!asks.delete(requestId)) return;

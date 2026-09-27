@@ -71,7 +71,7 @@ export function looksDestructive(text: string): boolean {
 const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
 
 export function approvalKey(tool: string, summary: string, scope?: "local-computer"): string {
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
   if (!COMMAND_TOOLS.has(bare)) return scope ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
@@ -103,15 +103,15 @@ export function isCoarseApprovalKey(key: string): boolean {
   const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
   const colon = unscoped.indexOf(":");
   const tool = colon === -1 ? unscoped : unscoped.slice(0, colon);
-  if (!COMMAND_TOOLS.has(tool.replace(/^mcp__[^_]+__/, "").toLowerCase())) return false;
+  if (!COMMAND_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase())) return false;
   if (colon === -1) return true;
   const program = unscoped.slice(colon + 1).toLowerCase();
   return program === "" || COARSE_PROGRAMS.has(program);
 }
 
-/** Whether Always-allow must refuse to remember or honor this coarse key.
- * Non-local / virtual computers may remember `Bash:bash` and friends; the
- * host may not. */
+/** Whether Always-allow must refuse this coarse key. Native shell asks
+ * are host-capable even when no computer is mounted; only explicitly named
+ * remote-computer MCP calls can keep a coarse grant. */
 export function coarseAlwaysAllowRefused(
   key: string,
   context?: { scope?: "local-computer" },
@@ -119,7 +119,12 @@ export function coarseAlwaysAllowRefused(
   if (!isCoarseApprovalKey(key)) return false;
   if (key.startsWith("local-computer:")) return true;
   if (context?.scope === "local-computer") return true;
-  return false;
+  // A native Bash/shell ask runs in the provider process on the host even
+  // when no computer MCP server is mounted. An absent scope is not proof
+  // of disposable execution. Only a named remote MCP computer can carry a
+  // coarse key without becoming a remembered host-shell grant.
+  const tool = key.split(":", 1)[0]!;
+  return !/^mcp__computer_(?:shared_vm|local_vm|box)__/.test(tool);
 }
 
 export interface AutoApprover {

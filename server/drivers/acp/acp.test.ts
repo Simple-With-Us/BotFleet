@@ -715,7 +715,7 @@ describe("ACP turns (fake CLI)", () => {
       ] },
     });
     const opened = await recorder.until((e) => e.type === "request.opened");
-    expect(opened).toMatchObject({ tool: "mcp", summary: "bash -c echo hi" });
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
     expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
     await instance.adapter.respondToRequest("t-mixed-computer", opened.requestId!, { behavior: "allow" });
     await recorder.until((e) => e.type === "turn.completed");
