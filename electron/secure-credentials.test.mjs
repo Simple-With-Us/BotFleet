@@ -3,7 +3,13 @@
 // keychain hiccup look like the user had never connected anything.
 import { describe, expect, it, vi } from "vitest";
 
-import { readSecureCredentials } from "./secure-credentials.mjs";
+import {
+  applySafeStorageMigration,
+  parseSafeStorageMigrationText,
+  readSecureCredentials,
+  SAFE_STORAGE_EXPORT_FLAG,
+  wantsSafeStorageExport,
+} from "./secure-credentials.mjs";
 
 const transient = () =>
   new Error("safeStorage.decryptStringAsync is temporarily unavailable. Please try again.");
@@ -70,5 +76,50 @@ describe("readSecureCredentials", () => {
     const result = await readSecureCredentials(deps({ decrypt }));
     expect(result.status).toBe("unavailable");
     expect(decrypt).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("safeStorage bundle-rename migration", () => {
+  it("recognizes the one-shot export flag", () => {
+    expect(wantsSafeStorageExport(["node", "main.mjs", SAFE_STORAGE_EXPORT_FLAG])).toBe(true);
+    expect(wantsSafeStorageExport(["node", "main.mjs"])).toBe(false);
+  });
+
+  it("imports a predecessor migration when the renamed store cannot decrypt", () => {
+    const result = applySafeStorageMigration(
+      { status: "unavailable", credentials: {}, error: "keychain" },
+      {
+        migrationExists: () => true,
+        readMigration: () => JSON.stringify({ xaiApiKey: "xai-keep" }),
+        removeMigration: () => {
+          throw new Error("must not delete until the new store re-encrypts");
+        },
+      },
+    );
+    expect(result).toEqual({
+      status: "ok",
+      credentials: { xaiApiKey: "xai-keep" },
+      fromMigration: true,
+    });
+  });
+
+  it("drops a leftover migration file once the current store already reads", () => {
+    let removed = false;
+    const result = applySafeStorageMigration(
+      { status: "ok", credentials: { xaiApiKey: "current" } },
+      {
+        migrationExists: () => true,
+        readMigration: () => JSON.stringify({ xaiApiKey: "stale" }),
+        removeMigration: () => {
+          removed = true;
+        },
+      },
+    );
+    expect(result).toEqual({ status: "ok", credentials: { xaiApiKey: "current" } });
+    expect(removed).toBe(true);
+  });
+
+  it("rejects a non-object migration payload", () => {
+    expect(() => parseSafeStorageMigrationText("[]")).toThrow(/not readable/);
   });
 });

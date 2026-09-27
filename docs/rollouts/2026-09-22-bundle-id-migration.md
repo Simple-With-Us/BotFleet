@@ -75,6 +75,12 @@ The same LaunchAgent rename is replicated outside the repo so the live harness m
 - `scripts/update-botfleet-mac.mjs` defaults moved to `app.botfleet.server` for both the LaunchAgent plist path and the `BOTFLEET_LAUNCH_AGENT_LABEL` env, so an un-overridden invocation picks up the new label.
 - `botfleet-imessage-relay.py` was searched for `com.botfleet.app`, `com.jay.botfleet-server`, `app.botfleet.widgets`; no matches, no edits required.
 
+## Credential and pairing handoff
+
+- **macOS safeStorage.** Changing `appId` changes the designated requirement, so the renamed executable cannot decrypt `credentials.bin`. Before the updater swaps bundles, the still-authorized `com.botfleet.app` binary is launched with `--export-safe-storage-migration` and writes `credentials.migration.json` (mode 0600) next to `credentials.bin`. The renamed app imports that file on first read, re-encrypts with its own `safeStorage` key, and deletes the handoff file.
+- **iOS pairing.** `CompanionConnectionStore.exportLegacyPairingToSharedStorage()` copies `UserDefaults.standard` into `group.app.botfleet` at launch without overwriting a suite that already has data. The renamed `app.botfleet.ios` install reads the suite first, then standard. Keychain writes use `CC8UTF7ATG.group.app.botfleet` with a private-group fallback on read.
+- **URL scheme.** Pairing QR codes use `botfleet-ios://pair`. The iOS app also still registers legacy `botfleet://` so older links and Live Activities can land here.
+
 ## Out of scope
 
 - Apple Developer Portal App ID registration (owner).

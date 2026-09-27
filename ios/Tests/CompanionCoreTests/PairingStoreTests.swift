@@ -79,4 +79,28 @@ final class PairingStoreTests: XCTestCase {
         XCTAssertNil(shared.data(forKey: CompanionConnectionStore.connectionKey))
         XCTAssertNil(standard.data(forKey: CompanionConnectionStore.connectionKey))
     }
+
+    func testExportCopiesStandardIntoEmptySharedAndDoesNotOverwrite() throws {
+        let suiteName = "PairingStoreTests.export.\(UUID().uuidString)"
+        let standardName = "PairingStoreTests.exportStd.\(UUID().uuidString)"
+        defer {
+            UserDefaults().removePersistentDomain(forName: suiteName)
+            UserDefaults().removePersistentDomain(forName: standardName)
+        }
+        let shared = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let standard = try XCTUnwrap(UserDefaults(suiteName: standardName))
+        let legacy = Data("legacy-pairing".utf8)
+        standard.set(legacy, forKey: CompanionConnectionStore.connectionKey)
+
+        XCTAssertTrue(
+            CompanionConnectionStore.exportLegacyPairingToSharedStorage(shared: shared, standard: standard)
+        )
+        XCTAssertEqual(shared.data(forKey: CompanionConnectionStore.connectionKey), legacy)
+
+        standard.set(Data("newer-private".utf8), forKey: CompanionConnectionStore.connectionKey)
+        XCTAssertFalse(
+            CompanionConnectionStore.exportLegacyPairingToSharedStorage(shared: shared, standard: standard)
+        )
+        XCTAssertEqual(shared.data(forKey: CompanionConnectionStore.connectionKey), legacy)
+    }
 }

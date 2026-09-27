@@ -3,10 +3,10 @@ import Foundation
 /// Shared container used to hand pairing state from the legacy
 /// `app.botfleet` install to the renamed `app.botfleet.ios` install.
 ///
-/// Both apps must entitle `group.app.botfleet`. The legacy app still has to
-/// *export* (write) into this suite before the rename can finish the
-/// handoff; this module is the import + dual-compat read path the renamed
-/// app needs so that export can complete the transition once it lands.
+/// Both apps must entitle `group.app.botfleet`. `exportLegacyPairingToSharedStorage`
+/// copies a private-container blob into this suite at launch so a separately
+/// installed `app.botfleet.ios` can import it. The renamed app also reads
+/// the suite first, then `UserDefaults.standard` for same-container upgrades.
 public enum CompanionAppGroup {
     public static let suiteName = "group.app.botfleet"
 
@@ -62,6 +62,24 @@ public enum CompanionConnectionStore {
     ) {
         guard source == .standard else { return }
         shared?.set(data, forKey: connectionKey)
+    }
+
+    /// Legacy-app export: copy a private-container pairing blob into the
+    /// app group so a separately installed `app.botfleet.ios` can import it.
+    /// Idempotent — does not overwrite a suite that already has data.
+    @discardableResult
+    public static func exportLegacyPairingToSharedStorage(
+        shared: UserDefaults? = UserDefaults(suiteName: CompanionAppGroup.suiteName),
+        standard: UserDefaults = .standard
+    ) -> Bool {
+        if let existing = shared?.data(forKey: connectionKey), !existing.isEmpty {
+            return false
+        }
+        guard let data = standard.data(forKey: connectionKey), !data.isEmpty else {
+            return false
+        }
+        shared?.set(data, forKey: connectionKey)
+        return shared?.data(forKey: connectionKey) == data
     }
 
     public enum Source: Equatable, Sendable {

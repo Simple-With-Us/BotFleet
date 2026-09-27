@@ -274,6 +274,10 @@ final class Session: ObservableObject {
             return
         }
 #endif
+        // Write the private-container blob into the app group before restore
+        // so a sibling `app.botfleet.ios` install can import it. No-op when
+        // the suite already holds data or this container was never paired.
+        CompanionConnectionStore.exportLegacyPairingToSharedStorage()
         restore()
         Task { await refreshNotificationAuthorization() }
     }
