@@ -12352,11 +12352,26 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (m[2] === "provision" && !bot.computers?.includes("cloud") && !bot.autoStartVps) {
           return json(res, 409, { error: "Auto may start this VPS only after Start VPS automatically is enabled" });
         }
-        if (m[2] === "sleep" || m[2] === "remove") {
+        if (m[2] === "sleep" || m[2] === "remove" || m[2] === "stop") {
           const occupancyKey = vps.vpsOccupancyKey(cfg, botId);
-          if (bot.busy || activeVpsThreads.hasBot(botId) || activeVpsThreads.hasTarget(occupancyKey)) {
+          const selfHasLease =
+            activeVpsThreads.hasBot(botId) || activeVpsThreads.hasTarget(occupancyKey);
+          if (bot.busy || selfHasLease) {
             return json(res, 409, {
               error: "the VPS computer is being used by this bot — interrupt the turn first",
+            });
+          }
+          if (
+            vps.sharedVpsContainerLifecycleBlocked(
+              cfg,
+              botId,
+              activeVpsThreads.size,
+              false,
+              false,
+            )
+          ) {
+            return json(res, 409, {
+              error: "the shared VPS is in use by another bot — wait for that turn to finish",
             });
           }
         }

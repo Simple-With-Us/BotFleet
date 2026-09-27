@@ -27,6 +27,7 @@ import {
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
+  perBotOccupancyKey,
   vpsDriverDisplay,
   vpsDriverSocket,
   vpsOccupancyKey,
@@ -150,6 +151,8 @@ const PIDS_LIMIT = 512;
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
+/** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
+const botSessionLocks = new Map<string, Promise<void>>();
 // A held lock means a lifecycle mutation (worst case: a 10-minute image
 // build) is running. Waiting it out would wedge Sleep and the screenshot
 // poll behind it, so acquisition fails fast instead.
@@ -521,6 +524,12 @@ function statusProblem(status: VpsComputerStatus): string | null {
  * image inspect right below already proves the daemon answers — even its
  * "No such image" failure is a daemon reply. Anything that is neither JSON
  * nor a "no such object" reply is attributed to the transport instead. */
+function vpsBotSessionLockKey(cfg: AppConfig, botId: string): string | null {
+  const alias = vpsSshAlias(cfg);
+  if (!alias || !isSharedVpsMode(cfg)) return null;
+  return `${alias}:session:${perBotOccupancyKey(botId)}`;
+}
+
 async function ensureSharedVpsBotSession(
   cfg: AppConfig,
   botId: string,
@@ -531,10 +540,14 @@ async function ensureSharedVpsBotSession(
   const alias = vpsSshAlias(cfg);
   if (!alias) return;
   const session = vpsSharedBotSession(botId);
-  await runner(
-    vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)),
-    { timeoutMs: 90_000 },
-  );
+  const sessionKey = vpsBotSessionLockKey(cfg, botId);
+  const runEnsure = async () => {
+    await runner(vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)), {
+      timeoutMs: 90_000,
+    });
+  };
+  if (sessionKey) return withVpsLock(botSessionLocks, sessionKey, runEnsure);
+  return runEnsure();
 }
 
 async function computeVpsComputerStatus(
@@ -884,30 +897,32 @@ async function waitForVpsReady(
   return status;
 }
 
-async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const previous = lifecycleLocks.get(key);
+async function withVpsLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  operation: () => Promise<T>,
+  acquireTimeoutMs = LOCK_ACQUIRE_TIMEOUT_MS,
+): Promise<T> {
+  const previous = locks.get(key);
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  lifecycleLocks.set(key, current);
+  locks.set(key, current);
   if (previous) {
     let acquireTimer: ReturnType<typeof setTimeout> | undefined;
     const acquired = await Promise.race([
       previous.then(() => true),
       new Promise<boolean>((resolve) => {
-        acquireTimer = setTimeout(() => resolve(false), LOCK_ACQUIRE_TIMEOUT_MS);
+        acquireTimer = setTimeout(() => resolve(false), acquireTimeoutMs);
         acquireTimer.unref?.();
       }),
     ]);
     if (acquireTimer) clearTimeout(acquireTimer);
     if (!acquired) {
-      // Keep the queue serialized: this slot opens only when the holder's
-      // does, so a later caller can never run beside the long operation the
-      // timed-out one refused to wait for.
       void previous.then(() => {
         release();
-        if (lifecycleLocks.get(key) === current) lifecycleLocks.delete(key);
+        if (locks.get(key) === current) locks.delete(key);
       });
       throw Object.assign(new Error("the VPS is being prepared — try again shortly"), { status: 409 });
     }
@@ -916,8 +931,12 @@ async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>)
     return await operation();
   } finally {
     release();
-    if (lifecycleLocks.get(key) === current) lifecycleLocks.delete(key);
+    if (locks.get(key) === current) locks.delete(key);
   }
+}
+
+async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  return withVpsLock(lifecycleLocks, key, operation);
 }
 
 function vpsLockKey(cfg: AppConfig, botId: string): string | null {
@@ -991,17 +1010,18 @@ export async function vpsComputerAction(
         assertUsableContainer(before);
         await run(["stop", containerRef]);
       }
-      const after =
-        action === "stop" ? await computeVpsComputerStatus(cfg, botId, runner) : await waitForVpsReady(cfg, botId, runner);
-      if (after.ready && after.container_id) {
-        await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
-      }
-      return after;
+      return action === "stop"
+        ? await computeVpsComputerStatus(cfg, botId, runner)
+        : await waitForVpsReady(cfg, botId, runner);
     } finally {
       statusCache.delete(key);
     }
   };
-  return withVpsLifecycleLock(key, operation);
+  const after = await withVpsLifecycleLock(key, operation);
+  if (isSharedVpsMode(cfg) && after.ready && (after.container_id ?? after.container_name)) {
+    await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
+  }
+  return after;
 }
 
 /** Auto is intentionally read-only: it can attach only to an existing ready
@@ -1025,14 +1045,13 @@ export async function inspectVpsForAuto(
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
   const key = vpsLockKey(cfg, botId);
-  const inspect = async () => {
-    const status = await computeVpsComputerStatus(cfg, botId, runner);
-    if (status.ready && status.container_id) {
-      await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
-    }
-    return status;
-  };
-  return key ? withVpsLifecycleLock(key, inspect) : inspect();
+  const status = key
+    ? await withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
+    : await computeVpsComputerStatus(cfg, botId, runner);
+  if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
+    await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
+  }
+  return status;
 }
 
 /** Open a temporary noVNC connection through the configured SSH alias. The
@@ -1154,7 +1173,11 @@ export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: str
   };
 }
 
-export { vpsOccupancyKey } from "./vps-shared-session.ts";
+export {
+  isSharedVpsMode,
+  sharedVpsContainerLifecycleBlocked,
+  vpsOccupancyKey,
+} from "./vps-shared-session.ts";
 
 /** Why this engine cannot take a self-hosted VPS, in the words a person
  *  reads.  The RULE lives in `computer-capability.ts` — this function owns
@@ -1177,65 +1200,58 @@ export async function vpsComputerScreenshot(
   const target = vpsTargetFor(cfg, botId);
   const key = `${alias}:${target.containerName}`;
   const cacheable = runner === defaultRunner;
-  return withVpsLifecycleLock(key, async () => {
-    // Same shape as containerComputerScreenshot's screenshotStatusCache: the
-    // poller runs every few seconds, and re-verifying the whole container
-    // between frames multiplied every frame's SSH cost.
+  const loadStatus = async () => {
     const cached = cacheable ? statusCache.get(key) : undefined;
-    const status =
-      cached && cached.expiresAt > Date.now()
-        ? cached.status
-        : await computeVpsComputerStatus(cfg, botId, runner);
-    if (!status.ready) {
-      if (cacheable) statusCache.delete(key);
-      throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
-    }
-    if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
-    const containerRef = status.container_id ?? status.container_name;
-    // The ref goes straight into docker argv, and a cached status is one
-    // more step removed from the inspect that produced it — revalidate the
-    // exact shapes before spending an exec on it.
-    if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
-      throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
-    }
-    await ensureSharedVpsBotSession(cfg, botId, containerRef, runner);
-    const socket = vpsDriverSocket(cfg, botId);
-    const screenshotPath = vpsScreenshotPath(cfg, botId);
-    const display = vpsDriverDisplay(cfg, botId);
-    try {
-      await runner(
-        vpsDockerArgs(
-          alias,
-          cuaExecArgs(
-            ["call", "get_desktop_state", "{}", "--socket", socket, "--screenshot-out-file", screenshotPath],
-            { container: containerRef, display },
-          ),
+    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    return computeVpsComputerStatus(cfg, botId, runner);
+  };
+  const status = cacheable
+    ? await withVpsLifecycleLock(key, loadStatus)
+    : await loadStatus();
+  if (!status.ready) {
+    if (cacheable) statusCache.delete(key);
+    throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
+  }
+  if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  const containerRef = status.container_id ?? status.container_name;
+  if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
+    throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
+  }
+  await ensureSharedVpsBotSession(cfg, botId, containerRef, runner);
+  const socket = vpsDriverSocket(cfg, botId);
+  const screenshotPath = vpsScreenshotPath(cfg, botId);
+  const display = vpsDriverDisplay(cfg, botId);
+  try {
+    await runner(
+      vpsDockerArgs(
+        alias,
+        cuaExecArgs(
+          ["call", "get_desktop_state", "{}", "--socket", socket, "--screenshot-out-file", screenshotPath],
+          { container: containerRef, display },
         ),
-        { timeoutMs: 30_000 },
-      );
-      const encoded = (await runner(vpsDockerArgs(alias, [
-        "exec",
-        "-u",
-        "cua",
-        "-e",
-        "HOME=/home/cua",
-        containerRef,
-        "base64",
-        "-w0",
-        screenshotPath,
-      ]), { timeoutMs: 30_000 })).stdout.trim();
-      const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
-      if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
-      return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
-    } catch (error) {
-      // The failure may mean the world changed (container stopped, link
-      // dropped); a cached "ready" would keep the poller failing for a TTL.
-      if (cacheable) statusCache.delete(key);
-      throw error;
-    } finally {
-      await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", screenshotPath]), {
-        timeoutMs: 10_000,
-      }).catch(() => {});
-    }
-  });
+      ),
+      { timeoutMs: 30_000 },
+    );
+    const encoded = (await runner(vpsDockerArgs(alias, [
+      "exec",
+      "-u",
+      "cua",
+      "-e",
+      "HOME=/home/cua",
+      containerRef,
+      "base64",
+      "-w0",
+      screenshotPath,
+    ]), { timeoutMs: 30_000 })).stdout.trim();
+    const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
+    if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
+    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
+  } catch (error) {
+    if (cacheable) statusCache.delete(key);
+    throw error;
+  } finally {
+    await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", screenshotPath]), {
+      timeoutMs: 10_000,
+    }).catch(() => {});
+  }
 }

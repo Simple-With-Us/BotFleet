@@ -28,15 +28,22 @@ export function vpsOccupancyKey(_cfg: AppConfig, botId: string): string {
   return perBotOccupancyKey(botId);
 }
 
+/** Map each bot id to a distinct X display number.  The prior `% 50` slice
+ * collided (e.g. bot-11 and bot-16 both landed on `:52`); the full digest
+ * is injective for distinct bot ids. */
+export function vpsSharedDisplayForBot(botId: string): string {
+  const digest = createHash("sha256").update(botId).digest("hex");
+  const displayNum = 10 + Number.parseInt(digest.slice(0, 8), 16);
+  return `:${displayNum}`;
+}
+
 /** Deterministic display + Cua socket for one bot on the shared container. */
 export function vpsSharedBotSession(botId: string): VpsSharedBotSession {
   const digest = createHash("sha256").update(botId).digest("hex");
   const short = digest.slice(0, 12);
-  // Keep off :0/:1 — the image's supervisor owns :1 for the container shell.
-  const displayNum = 10 + (Number.parseInt(digest.slice(12, 16), 16) % 50);
   return {
     occupancyKey: perBotOccupancyKey(botId),
-    display: `:${displayNum}`,
+    display: vpsSharedDisplayForBot(botId),
     socket: `/run/user/1000/botfleet-cua-${short}.sock`,
     session: `bf-${short}`,
     screenshotPath: `/tmp/botfleet-vps-${short}.png`,
@@ -53,6 +60,19 @@ export function vpsDriverDisplay(cfg: AppConfig, botId: string): string {
 
 export function vpsScreenshotPath(cfg: AppConfig, botId: string): string {
   return isSharedVpsMode(cfg) ? vpsSharedBotSession(botId).screenshotPath : "/tmp/botfleet-vps-preview.png";
+}
+
+/** Shared container sleep/remove/stop must not run while any bot holds a VPS
+ * turn lease on the one shared host. */
+export function sharedVpsContainerLifecycleBlocked(
+  cfg: AppConfig,
+  _botId: string,
+  activeLeaseCount: number,
+  selfBusy: boolean,
+  selfHasLease: boolean,
+): boolean {
+  if (selfBusy || selfHasLease) return true;
+  return isSharedVpsMode(cfg) && activeLeaseCount > 0;
 }
 
 /** argv tail for `docker exec` that starts or revives one bot's isolated

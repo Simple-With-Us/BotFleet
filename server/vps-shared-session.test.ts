@@ -4,10 +4,12 @@ import { CUA_SOCKET, DISPLAY } from "./container-computer.ts";
 import {
   ensureSharedVpsSessionExecArgs,
   isSharedVpsMode,
+  sharedVpsContainerLifecycleBlocked,
   vpsDriverDisplay,
   vpsDriverSocket,
   vpsOccupancyKey,
   vpsSharedBotSession,
+  vpsSharedDisplayForBot,
 } from "./vps-shared-session.ts";
 import { SHARED_VPS_TARGET, perBotVpsTarget, vpsTargetFor } from "./vps-computer.ts";
 import type { AppConfig } from "./config.ts";
@@ -36,6 +38,13 @@ describe("vps shared session identity", () => {
     expect(a.display).toMatch(/^:\d+$/);
     expect(a.display).not.toBe(":1");
     expect(a.socket).toMatch(/^\/run\/user\/1000\/botfleet-cua-[a-f0-9]+\.sock$/);
+  });
+
+  it("never maps distinct bot ids to the same X display (regression: bot-11 vs bot-16)", () => {
+    expect(vpsSharedDisplayForBot("bot-11")).not.toBe(vpsSharedDisplayForBot("bot-16"));
+    expect(vpsSharedBotSession("bot-11").display).not.toBe(vpsSharedBotSession("bot-16").display);
+    const displays = new Set(["bot-11", "bot-16", "bot-a", "bot-b", "bot-ensure"].map((id) => vpsSharedDisplayForBot(id)));
+    expect(displays.size).toBe(5);
   });
 
   it("falls back to the container default socket and display in per-bot mode", () => {
@@ -78,5 +87,28 @@ describe("shared VPS concurrent leases", () => {
     const leases = new ExactTurnLeases();
     expect(leases.claim("bot-a", "thread-a", 1, "shared")).not.toBeNull();
     expect(leases.claim("bot-b", "thread-b", 2, "shared")).toBeNull();
+  });
+});
+
+describe("shared VPS container lifecycle guard", () => {
+  it("blocks sleep/remove/stop when any bot holds a lease but this bot does not", () => {
+    const sharedCfg = cfgWithVpsMode("shared");
+    expect(
+      sharedVpsContainerLifecycleBlocked(sharedCfg, "bot-b", 2, false, false),
+    ).toBe(true);
+    expect(
+      sharedVpsContainerLifecycleBlocked(sharedCfg, "bot-b", 0, false, false),
+    ).toBe(false);
+    expect(
+      sharedVpsContainerLifecycleBlocked(sharedCfg, "bot-b", 1, true, false),
+    ).toBe(true);
+    expect(
+      sharedVpsContainerLifecycleBlocked(sharedCfg, "bot-b", 1, false, true),
+    ).toBe(true);
+  });
+
+  it("does not block per-bot mode based on foreign lease count alone", () => {
+    const perBotCfg = cfgWithVpsMode("per-bot");
+    expect(sharedVpsContainerLifecycleBlocked(perBotCfg, "bot-b", 3, false, false)).toBe(false);
   });
 });
