@@ -35,7 +35,6 @@
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
     "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:server-start",
     "test:ci-scope": "node --test scripts/ci-change-scope.node-test.mjs",
-    "test:e2e": "playwright test",
     "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs",
     "test:infisical-fetch": "node --test scripts/infisical-fetch.node-test.mjs",
     "test:release-workflow": "node --test scripts/release-workflow.node-test.mjs",
@@ -88,6 +87,7 @@
     "postinstall": "node scripts/compile-harness-dep.mjs"
   },
   "dependencies": {
+    "@openfeature/server-sdk": "^1.23.0",
     "@sentry/node": "^10.73.0",
     "@sentry/react": "^10.73.0",
     "@trycua/cua-driver": "0.20.0",
