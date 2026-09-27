@@ -7431,6 +7431,43 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     const inside = await fetch(`${BASE}/assets/smoke.css`);
     expect(await inside.text()).toContain("color: white");
   });
+
+  it("keeps multi-byte UTF-8 intact when a JSON body splits across TCP chunks", async () => {
+    // A raw socket is the only way to control TCP chunk boundaries; fetch
+    // and http.request both coalesce small writes.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const title = "héllo 🙂 wörld";
+      const payload = Buffer.from(JSON.stringify({ title }), "utf8");
+      const emojiAt = payload.indexOf(0xf0); // first byte of the 4-byte emoji
+      expect(emojiAt).toBeGreaterThan(0);
+      const first = payload.subarray(0, emojiAt + 2);
+      const second = payload.subarray(emojiAt + 2);
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = connect(PORT, "127.0.0.1");
+        let response = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => (response += chunk));
+        socket.on("end", () => resolve(response));
+        socket.on("error", reject);
+        socket.on("connect", () => {
+          socket.write(
+            `POST /api/bots/${bot.id}/tasks HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n`,
+          );
+          socket.write(first);
+          setTimeout(() => {
+            socket.write(second);
+            socket.end();
+          }, 25);
+        });
+      });
+      expect(raw.startsWith("HTTP/1.1 201")).toBe(true);
+      expect(raw).toContain(title);
+      expect(raw).not.toContain("\uFFFD");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
 });
 
 describe("CSRF security hardening", () => {

@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -178,6 +179,43 @@ describe("webhook-only ingress", () => {
     });
     expect(oversized.status).toBe(413);
     expect(manager.listAttempts().filter((attempt) => attempt.webhookId === manager.list().find((webhook) => webhook.endpointId === endpointId)?.id && attempt.outcome === "rejected").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("keeps multi-byte UTF-8 intact when the body splits across TCP chunks", async () => {
+    // A raw socket is the only way to control TCP chunk boundaries; fetch
+    // and http.request both coalesce small writes. A fresh endpoint keeps a
+    // fresh rate bucket: the shared one is spent by the earlier tests.
+    const own = manager.create({ name: "UTF-8 probe", prompt: "Report the note", botId: "maus-1" });
+    const credential = webhookCredential(ingress.baseUrl, own.webhook.endpointId, own.secret);
+    const url = new URL(credential.url);
+    const text = "héllo 🙂 wörld";
+    const payload = Buffer.from(JSON.stringify({ note: text }), "utf8");
+    const emojiAt = payload.indexOf(0xf0); // first byte of the 4-byte emoji
+    expect(emojiAt).toBeGreaterThan(0);
+    const first = payload.subarray(0, emojiAt + 2);
+    const second = payload.subarray(emojiAt + 2);
+    const raw = await new Promise<string>((resolve, reject) => {
+      const socket = connect(Number(url.port), url.hostname);
+      let response = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk) => (response += chunk));
+      socket.on("end", () => resolve(response));
+      socket.on("error", reject);
+      socket.on("connect", () => {
+        socket.write(
+          `POST ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n`,
+        );
+        socket.write(first);
+        setTimeout(() => {
+          socket.write(second);
+          socket.end();
+        }, 25);
+      });
+    });
+    expect(raw.startsWith("HTTP/1.1 202")).toBe(true);
+    const prompt = queued.at(-1)?.prompt as string;
+    expect(prompt).toContain(text);
+    expect(prompt).not.toContain("\uFFFD");
   });
 });
 

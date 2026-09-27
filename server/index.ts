@@ -7294,7 +7294,9 @@ function json(res: ServerResponse, status: number, body: unknown) {
 
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
-    let data = "";
+    // Buffer chunks and decode once: concatenating per-chunk strings
+    // corrupts multi-byte UTF-8 sequences that split across TCP chunks.
+    const chunks: Buffer[] = [];
     let bytes = 0;
     let done = false;
     const fail = (status: number, msg: string) => {
@@ -7312,12 +7314,13 @@ function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
         // receiving the useful 413 response.
         return fail(413, "body too large");
       }
-      data += c;
+      chunks.push(typeof c === "string" ? Buffer.from(c) : c);
     });
     req.on("end", () => {
       if (done) return;
       let body: any;
       try {
+        const data = Buffer.concat(chunks).toString("utf8");
         body = data ? JSON.parse(data) : {};
       } catch {
         return fail(400, "invalid JSON body");
