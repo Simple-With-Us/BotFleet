@@ -60,7 +60,7 @@ export interface OptionCardData {
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
   /** Local actions never share remembered grants with cloud/tool approvals. */
-  approvalScope?: "local-computer";
+  approvalScope?: "local-computer" | "disposable-computer";
   /** A durable chat-created routine proposal. The scheduler only applies it
    * after this card is explicitly confirmed by the user. */
   routineRequest?: RoutineRequestCardData;

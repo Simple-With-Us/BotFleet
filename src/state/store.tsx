@@ -58,7 +58,7 @@ export interface OptionCardData {
   held?: string;
   /** the narrow grant "always allow" remembers, e.g. "Bash:git" */
   allowKey?: string;
-  approvalScope?: "local-computer";
+  approvalScope?: "local-computer" | "disposable-computer";
   /** Persisted proposal used by the server when the user confirms it. */
   routineRequest?: RoutineRequestCardData;
 }
@@ -2270,16 +2270,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               action.onError?.(error instanceof Error ? error.message : String(error));
             });
           if (action.alwaysAllow) {
-            const bot = stateRef.current.bots.find((b) => b.id === action.alwaysAllow!.botId);
-            const next = [...new Set([...(bot?.alwaysAllow ?? []), action.alwaysAllow.key])];
+            // The card-bound endpoint validates its pending request and
+            // disposable-computer scope. A generic bot PATCH has neither
+            // provenance and must continue rejecting ambiguous coarse keys.
             // save the grant BEFORE releasing the bot: it may ask again
             // within milliseconds, and a grant that hasn't landed yet
             // would make "always allow" ask a second time. A failed save
             // still lets this one through — losing a preference must not
             // strand the turn — but it says so.
-            void api(`/api/bots/${action.alwaysAllow.botId}`, {
-              method: "PATCH",
-              body: JSON.stringify({ alwaysAllow: next }),
+            void api(`/api/bots/${action.alwaysAllow.botId}/always-allow`, {
+              method: "POST",
+              body: JSON.stringify({ allowKey: action.alwaysAllow.key, threadId: action.threadId, requestId: action.requestId }),
             })
               .catch(showError)
               .finally(respond);

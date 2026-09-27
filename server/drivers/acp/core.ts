@@ -15,6 +15,8 @@
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
 import { homedir } from "node:os";
 
+import { z } from "zod";
+
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
@@ -63,6 +65,8 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+
+const acpNonemptyString = z.string().min(1);
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -510,7 +514,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // harness, where the bot's Auto policy, the destructive and sensitive
         // guards, and the unattended block decide. That is what lets a
         // full-auto bot mount the local computer at all.
-        const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
+        const computerMounts = turnComputerMounts(turn.integrations);
+        const controlsHost = hostToolPrefix(computerMounts) !== null;
         const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
@@ -929,9 +934,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             });
           }
           const kind = String(toolCall.kind ?? "");
-          const tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
+          let tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
           const summary = String(toolCall.rawInput?.command ?? toolCall.title ?? tool).slice(0, 200);
           const requestId = newId();
+          // ACP toolCall metadata can name an MCP server in rawInput. Trust
+          // only an exact granted remote mount; unknown/native calls stay
+          // host-scoped so missing metadata cannot expose host shell grants.
+          const remoteComputerAsk = computerMounts.some((mount) =>
+            kind !== "edit" && mount.kind !== "local" &&
+            toolCall.rawInput?.serverName === mount.name &&
+            acpNonemptyString.safeParse(toolCall.rawInput?.toolName).success,
+          );
+          if (remoteComputerAsk) tool = `mcp__${toolCall.rawInput.serverName}__${toolCall.rawInput.toolName}`;
+          const approvalScope = remoteComputerAsk && toolCall.rawInput?.serverName === "computer" ? "disposable-computer"
+            : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
           const finish = (behavior: string, source: "user" | "timeout" | "system" = "user") => {
             if (!asks.delete(requestId)) return;
             clearTimeout(timer);
@@ -949,7 +965,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               requestId,
               behavior: optionId && behavior === "allow" ? "allow" : "deny",
               source: optionId ? source : "system",
-              approvalScope: controlsHost ? "local-computer" : undefined,
+              approvalScope,
             });
           };
           const timer = setTimeout(() => {
@@ -964,7 +980,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             requestType: "permission",
             tool,
             summary,
-            approvalScope: controlsHost ? "local-computer" : undefined,
+            approvalScope,
           });
         };
 

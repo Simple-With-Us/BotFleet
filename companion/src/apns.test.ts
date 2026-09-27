@@ -43,6 +43,31 @@ function testP8(): string {
   return privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 }
 
+function asApnsSession(raw: EventEmitter): Http2ApnsSession {
+  // SAFETY: HTTP/2 unit tests only touch `raw` fields production reads
+  // (request, close, destroyed, ping, events) — never real TLS or framing.
+  return { raw: raw as ClientHttp2Session };
+}
+
+function asClientHttp2Session(raw: EventEmitter): ClientHttp2Session {
+  // SAFETY: lifecycle wiring only registers event listeners on the stand-in.
+  return raw as ClientHttp2Session;
+}
+
+type PingCallback = (err: Error | null, duration?: number, payload?: Buffer) => void;
+type ApnsPingHolder = { session: ClientHttp2Session; pings: PingCallback[] };
+
+function attachPingHolder(raw: EventEmitter): ApnsPingHolder {
+  const pings: PingCallback[] = [];
+  // SAFETY: keepalive only calls `.ping()` on the stand-in session.
+  const session = raw as EventEmitter & { ping: (cb: PingCallback) => boolean };
+  session.ping = (cb) => {
+    pings.push(cb);
+    return true;
+  };
+  return { session: asClientHttp2Session(session), pings };
+}
+
 function testConfig(overrides: Partial<ApnsConfig> = {}): ApnsConfig {
   return {
     keyId: "ABC123",
@@ -1282,8 +1307,10 @@ describe("watchHarnessNotifications", () => {
     // read-only disk it used to become an unhandled rejection — and Node's
     // default `--unhandled-rejections=throw` turns that into an exit of the
     // proxy every paired phone depends on.
-    const rejections: unknown[] = [];
-    const onRejection = (reason: unknown) => rejections.push(reason);
+    const rejections: Error[] = [];
+    const onRejection: NodeJS.UnhandledRejectionListener = (reason) => {
+      rejections.push(reason instanceof Error ? reason : new Error(String(reason)));
+    };
     process.on("unhandledRejection", onRejection);
     const delivered: string[] = [];
     const frames = notifyFrameWithBody("approval", "one") + notifyFrameWithBody("approval", "two");
@@ -1550,15 +1577,14 @@ describe("HTTP/2 session cache", () => {
     dropHttp2Sessions();
   });
 
-  /** A fake session stand-in: the cache test only cares about identity and
-   * `closed` / `destroyed` flags, never about a real socket.  A bare object
-   * with those two boolean fields is enough — `getOrOpenSession` reads them
-   * and `dropHttp2Sessions` checks them before calling `.close()`.  The
-   * `as unknown as ClientHttp2Session` cast is the same shape `apns.ts` uses
-   * to define `Http2ApnsSession.raw`: tests do not exercise the wire, so
-   * the wider interface contract does not apply. */
   const fakeSession = (): Http2ApnsSession =>
-    ({ raw: { closed: false, destroyed: false, close() {} } }) as unknown as Http2ApnsSession;
+    asApnsSession(
+      Object.assign(new EventEmitter(), {
+        closed: false,
+        destroyed: false,
+        close() {},
+      }),
+    );
   const fakeFactory = (): Http2SessionFactory => () => fakeSession();
 
   it("reuses a session while the keyId is unchanged", () => {
@@ -1587,6 +1613,8 @@ describe("createApnsHttp2Fetch", () => {
    * calls.  It emits nothing unless the test drives it, which is exactly
    * the stalled-stream shape the request deadline exists for. */
   const fakeStream = () => {
+    // SAFETY: sendOver only calls setEncoding, end, close, and listens on
+    // response/data/end/close — all wired on this EventEmitter stand-in.
     const stream = new EventEmitter() as EventEmitter & {
       setEncoding: (enc: string) => void;
       end: (body?: string) => void;
@@ -1603,14 +1631,14 @@ describe("createApnsHttp2Fetch", () => {
   };
 
   const fakeSessionFor = (stream: ReturnType<typeof fakeStream>): Http2ApnsSession =>
-    ({
-      raw: {
+    asApnsSession(
+      Object.assign(new EventEmitter(), {
         closed: false,
         destroyed: false,
         close() {},
         request: () => stream,
-      },
-    }) as unknown as Http2ApnsSession;
+      }),
+    );
 
   const respond200 = (stream: ReturnType<typeof fakeStream>) => {
     stream.emit("response", { ":status": 200 });
@@ -1672,6 +1700,7 @@ describe("createApnsHttp2Fetch", () => {
    * runs the production lifecycle wiring, so the per-session pending sweep
    * is exercised end to end. */
   const lifecycleSession = (host: string, stream: ReturnType<typeof fakeStream>) => {
+    // SAFETY: lifecycle tests only wire request/close/destroy and events.
     const raw = new EventEmitter() as EventEmitter & {
       closed: boolean;
       destroyed: boolean;
@@ -1686,7 +1715,7 @@ describe("createApnsHttp2Fetch", () => {
       raw.destroyed = true;
     };
     raw.request = () => stream;
-    watchHttp2SessionLifecycle(host, raw as unknown as ClientHttp2Session);
+    watchHttp2SessionLifecycle(host, asClientHttp2Session(raw));
     return raw;
   };
 
@@ -1699,7 +1728,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const raw = lifecycleSession(host, sessions.length === 0 ? streamA : streamB);
       sessions.push(raw);
-      return { raw } as unknown as Http2ApnsSession;
+      return asApnsSession(raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const onA = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -1730,7 +1759,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const raw = lifecycleSession(host, sessions.length === 0 ? streamA : streamB);
       sessions.push(raw);
-      return { raw } as unknown as Http2ApnsSession;
+      return asApnsSession(raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const onA = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -1750,6 +1779,7 @@ describe("createApnsHttp2Fetch", () => {
    * several sends can be in flight on one session at once. */
   const multiStreamSession = (host: string) => {
     const streams: ReturnType<typeof fakeStream>[] = [];
+    // SAFETY: multi-stream tests only wire request/close/destroy and events.
     const raw = new EventEmitter() as EventEmitter & {
       closed: boolean;
       destroyed: boolean;
@@ -1771,7 +1801,7 @@ describe("createApnsHttp2Fetch", () => {
       streams.push(stream);
       return stream;
     };
-    watchHttp2SessionLifecycle(host, raw as unknown as ClientHttp2Session);
+    watchHttp2SessionLifecycle(host, asClientHttp2Session(raw));
     return { raw, streams };
   };
 
@@ -1780,7 +1810,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = multiStreamSession(host);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 20 });
     // Half-open connection: the stream never answers.
@@ -1803,7 +1833,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = multiStreamSession(host);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     // Same key and factory, so both transports share the cached session;
     // only the deadlines differ.
@@ -1845,7 +1875,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = multiStreamSession(host);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const started = Date.now();
@@ -1873,7 +1903,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = multiStreamSession(host);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -1891,7 +1921,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = multiStreamSession(host);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const started = Date.now();
     const pending = sendApnsAlert(testConfig(), "aa".repeat(32), { title: "t", body: "b" }, {
@@ -1918,12 +1948,8 @@ describe("createApnsHttp2Fetch", () => {
    * held so the test decides whether it succeeds, fails, or never returns. */
   const pingingSession = (host: string, deadlineMs: number) => {
     const s = multiStreamSession(host);
-    const pings: Array<(err: Error | null, duration?: number, payload?: Buffer) => void> = [];
-    (s.raw as unknown as { ping: (cb: (err: Error | null) => void) => boolean }).ping = (cb) => {
-      pings.push(cb);
-      return true;
-    };
-    const stop = startHttp2PingKeepalive(host, s.raw as unknown as ClientHttp2Session, {
+    const { session, pings } = attachPingHolder(s.raw);
+    const stop = startHttp2PingKeepalive(host, session, {
       intervalMs: 10,
       deadlineMs,
     });
@@ -1940,7 +1966,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = pingingSession(host, 5_000);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const started = Date.now();
@@ -1965,7 +1991,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = pingingSession(host, 20);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -1993,7 +2019,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = pingingSession(host, 20);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const pending = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -2024,7 +2050,7 @@ describe("createApnsHttp2Fetch", () => {
     const factory: Http2SessionFactory = (host) => {
       const s = pingingSession(host, 50);
       sessions.push(s);
-      return { raw: s.raw } as unknown as Http2ApnsSession;
+      return asApnsSession(s.raw);
     };
     const fetchImpl = createApnsHttp2Fetch({ keyId: "K1", factory, requestDeadlineMs: 5_000 });
     const first = fetchImpl(DEVICE_URL, { method: "POST", body: "{}" });
@@ -2669,7 +2695,14 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     const planted = getOrOpenSession(
       "api.push.apple.com",
       "ROTATE1",
-      () => ({ raw: { closed: false, destroyed: false, close() {} } }) as unknown as Http2ApnsSession,
+      () =>
+        asApnsSession(
+          Object.assign(new EventEmitter(), {
+            closed: false,
+            destroyed: false,
+            close() {},
+          }),
+        ),
     );
     const store = memoryKeyFaultStore();
     const watch = watchHarnessNotifications({
@@ -2698,7 +2731,14 @@ describe("watchHarnessNotifications — a refused key survives a restart", () =>
     const rebuilt = getOrOpenSession(
       "api.push.apple.com",
       "ROTATE1",
-      () => ({ raw: { closed: false, destroyed: false, close() {} } }) as unknown as Http2ApnsSession,
+      () =>
+        asApnsSession(
+          Object.assign(new EventEmitter(), {
+            closed: false,
+            destroyed: false,
+            close() {},
+          }),
+        ),
     );
     expect(rebuilt).not.toBe(planted);
     dropHttp2Sessions();

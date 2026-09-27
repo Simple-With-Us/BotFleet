@@ -73,11 +73,14 @@ const connectorToolsSchema = z
   });
 
 
+const maxToolRoundsValueSchema = z.number().int().min(1).max(MAX_TOOL_ROUNDS);
+
 /** Integer 1..MAX_TOOL_ROUNDS, else absent. Empty/null/invalid all mean unset. */
-export function resolveMaxToolRounds(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isInteger(value)) return undefined;
-  if (value < 1 || value > MAX_TOOL_ROUNDS) return undefined;
-  return value;
+export function resolveMaxToolRounds(
+  value: string | number | boolean | null | undefined,
+): number | undefined {
+  const parsed = maxToolRoundsValueSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 const profilePatchSchema = z.object({

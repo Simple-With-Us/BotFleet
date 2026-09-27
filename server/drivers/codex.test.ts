@@ -615,6 +615,23 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept", content: {} });
   });
 
+  it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
+    await create({ mode: "remote-computer-elicitation" });
+    await instance.adapter.sendTurn({
+      threadId: "t-mixed-computer",
+      text: "work remotely",
+      integrations: { computers: [
+        { name: "computer_shared_vm", label: "My VPS", kind: "vps", stdio: { command: "/vps-driver", args: ["mcp"], env: {} } },
+        { name: "computer_host", label: "This Mac", kind: "local", stdio: { command: "/cua-driver", args: ["mcp"], env: {}, scope: "local-computer" } },
+      ] },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-mixed-computer", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("stamps approvalScope on cards only when the turn controls this Mac", async () => {
     await create({ mode: "approval" });
 

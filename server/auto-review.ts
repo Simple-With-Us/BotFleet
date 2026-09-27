@@ -23,7 +23,7 @@ export interface ReviewContext {
   source: AutoVerdictSource | undefined;
   mode: AutoReviewMode;
   unattended: boolean;
-  approvalScope: "local-computer" | undefined;
+  approvalScope: "local-computer" | "disposable-computer" | undefined;
 }
 
 export function resolveAutoReviewMode(stored: string | undefined): AutoReviewMode {
@@ -38,7 +38,7 @@ export function shouldReview(context: ReviewContext): boolean {
     context.mode !== "off" &&
     context.source === "no-grant" &&
     !context.unattended &&
-    context.approvalScope === undefined
+    context.approvalScope !== "local-computer"
   );
 }
 

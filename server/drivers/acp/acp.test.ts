@@ -704,6 +704,40 @@ describe("ACP turns (fake CLI)", () => {
     expect(done).toMatchObject({ ok: true });
   });
 
+  it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
+    await create(GrokAgentDriver, "remote-computer-permission");
+    await instance.adapter.sendTurn({
+      threadId: "t-mixed-computer",
+      text: "work remotely",
+      integrations: { computers: [
+        { name: "computer_shared_vm", label: "My VPS", kind: "vps", stdio: { command: "/vps-driver", args: ["mcp"], env: {} } },
+        { name: "computer_host", label: "This Computer", kind: "local", stdio: { command: "/cua-driver", args: ["mcp"], env: {}, scope: "local-computer" } },
+      ] },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-mixed-computer", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("recognizes an execute-classified remote shell only with exact mounted MCP identity", async () => {
+    await create(GrokAgentDriver, "remote-execute-permission");
+    await instance.adapter.sendTurn({
+      threadId: "t-remote-execute",
+      text: "work remotely",
+      integrations: { computers: [
+        { name: "computer_shared_vm", label: "My VPS", kind: "vps", stdio: { command: "/vps-driver", args: ["mcp"], env: {} } },
+        { name: "computer_host", label: "This Computer", kind: "local", stdio: { command: "/cua-driver", args: ["mcp"], env: {}, scope: "local-computer" } },
+      ] },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
+    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    await instance.adapter.respondToRequest("t-remote-execute", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("brokers host control on a full-auto instance instead of auto-allowing it", async () => {
     process.env.FAKE_ACP_MODE = "permission";
     instance = await GrokAgentDriver.create({

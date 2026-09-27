@@ -43,7 +43,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, isCoarseApprovalKey } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -2447,7 +2447,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 options: ["Allow", "Deny"],
                 requestId,
                 tool,
-                allowKey: event.approvalScope
+                allowKey: event.approvalScope === "local-computer"
                   ? undefined
                   : approvalKey(tool, summary, event.approvalScope),
                 held: "Auto mode couldn't answer this one.",
@@ -2487,7 +2487,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // the exact grant "always allow" would remember, decided here so
           // client and server can never derive it differently
           allowKey:
-            permission && !event.approvalScope
+            permission && event.approvalScope !== "local-computer"
               ? approvalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
           // in auto mode a card can only mean the guard stopped it — say so
@@ -3988,6 +3988,7 @@ async function startTurn(
                   providerInstanceId: instance.instanceId,
                   tool: ask.tool,
                   summary: ask.summary,
+                  approvalScope: ask.approvalScope,
                   signal: ask.signal,
                 }),
               deps: {
@@ -5801,6 +5802,7 @@ async function runGroupMemberTurn(
               providerInstanceId: instance.instanceId,
               tool: ask.tool,
               summary: ask.summary,
+              approvalScope: ask.approvalScope,
               signal: ask.signal,
             }),
           deps: {
@@ -9434,15 +9436,25 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!allowKey) return json(res, 400, { error: "allowKey required" });
-      if (isCoarseApprovalKey(allowKey)) {
-        return json(res, 400, { error: `${allowKey} would cover every shell command — approve this one instead` });
-      }
-      const pending = store.messagesFor(bot.threadId).some((message) =>
+      const threadId = typeof body.threadId === "string" ? body.threadId : bot.threadId;
+      const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+      const room = store.groupByThread(threadId);
+      // Room cards live on the room thread, not the responder's private DM.
+      // Bind the request to that room's actual speaker and the exact pending
+      // card, so another member cannot grant a key from a different ask.
+      const pendingCard = (store.threadBelongsToBot(bot.id, threadId) && (!room || requestId)
+        ? store.messagesFor(threadId) : []).find((message) =>
         message.card?.requestId &&
+        (!requestId || message.card.requestId === requestId) &&
         !message.card.answered &&
         message.card.dismissed !== true &&
-        message.card.allowKey === allowKey
-      );
+        message.card.allowKey === allowKey &&
+        (!room || message.from?.botId === bot.id)
+      )?.card;
+      if (coarseAlwaysAllowRefused(allowKey, { scope: pendingCard?.approvalScope })) {
+        return json(res, 400, { error: `${allowKey} would cover every shell command — approve this one instead` });
+      }
+      const pending = Boolean(pendingCard);
       if (!pending) {
         return json(res, 409, { error: "that grant is not on a pending approval for this bot" });
       }
@@ -9621,13 +9633,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // A shell in disguise (Bash:bash, Bash:env, a bare Bash) is refused
         // when it is new; one stored before this rule existed is dropped
         // rather than failing every later save that carries it along.
+        // A single disposable mount is named exactly "computer"
+        // (server/computer-grants.ts), so an mcp__computer__ key can only
+        // ever run on that disposable machine — this context-free route
+        // treats those keys with their one possible scope instead of
+        // 400-ing a grant the approval card saved through here.
+        const patchScope = (key: string) =>
+          key.startsWith("mcp__computer__")
+            ? ({ scope: "disposable-computer" as const })
+            : undefined;
         const introduced = requested.find(
-          (key) => isCoarseApprovalKey(key) && !existingBot?.alwaysAllow?.includes(key),
+          (key) => coarseAlwaysAllowRefused(key, patchScope(key)) && !existingBot?.alwaysAllow?.includes(key),
         );
         if (introduced) {
           return json(res, 400, { error: `${introduced} would cover every shell command — approve it once instead` });
         }
-        patch.alwaysAllow = requested.filter((key) => !isCoarseApprovalKey(key)).slice(0, 200);
+        patch.alwaysAllow = requested.filter((key) => !coarseAlwaysAllowRefused(key, patchScope(key))).slice(0, 200);
       }
       if (existingBot && body.computers !== undefined) {
         await interruptIfHostRevoked(existingBot, body.computers);

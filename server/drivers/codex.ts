@@ -11,6 +11,8 @@
 // fails visibly when the native session cannot be restored.
 import { homedir } from "node:os";
 
+import { z } from "zod";
+
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
@@ -39,6 +41,7 @@ import { appendNative } from "./native.ts";
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+const codexNonemptyString = z.string().min(1);
 
 // A resumed thread keeps the model it was started with, so changing the bot's
 // model cannot fix a retired one there — only a fresh thread or a rewind can.
@@ -209,7 +212,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // Reached from a room as well as a 1:1 chat since the room lane started
       // resolving computers, so a full-auto Codex bot with This Computer now
       // asks in BOTH lanes.
-      const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
+      const computerMounts = turnComputerMounts(turn.integrations);
+      const hostPrefix = hostToolPrefix(computerMounts);
+      const controlsHost = hostPrefix !== null;
       const brokered = controlsHost && config.fullAuto;
       const turnFullAuto = config.fullAuto && !brokered;
       // a retry relaunches the whole app-server; the backoff is scaled down in
@@ -339,6 +344,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       // server→client approval request → canonical request.opened
+      // Native shell/file asks can run on the host, even with a remote
+      // computer mounted. Only an MCP elicitation explicitly naming a
+      // different granted computer may use that computer's coarse grants.
       // Host-scope tagging mirrors claude.ts: when this turn mounts the real
       // Mac (not a VM), every card carries approvalScope so the harness's
       // local-computer-block backstop applies to remembered always-allows.
@@ -359,7 +367,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const mcpTool = isMcpElicitation
           ? String(params.message ?? "").match(/tool \"([^\"]+)\"/)?.[1]
           : undefined;
-        const tool =
+        let tool =
           isMcpElicitation
             ? (mcpTool ?? "mcp")
             : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
@@ -377,9 +385,23 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           });
         }
         const requestId = newId();
+        const remoteComputerAsk = isMcpElicitation && computerMounts.some((mount) =>
+          mount.kind !== "local" && params.serverName === mount.name &&
+          codexNonemptyString.safeParse(mcpTool).success,
+        );
+        if (remoteComputerAsk) tool = `mcp__${params.serverName}__${mcpTool}`;
+        const approvalScope = remoteComputerAsk && params.serverName === "computer" ? "disposable-computer"
+          : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
+        const remoteShellCommand = codexNonemptyString.safeParse(
+          remoteComputerAsk ? params._meta?.tool_params?.command : undefined,
+        );
         const summary =
-          isMcpElicitation && typeof params.message === "string"
-            ? params.message
+          remoteShellCommand.success
+            ? remoteShellCommand.data
+            : remoteComputerAsk
+              ? mcpTool!
+              : isMcpElicitation && typeof params.message === "string"
+                ? params.message
             : typeof params.command === "string"
             ? params.command
             : Array.isArray(params.questions)
@@ -426,7 +448,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           tool,
           summary,
           choices,
-          approvalScope: controlsHost ? "local-computer" : undefined,
+          approvalScope,
         });
       };
 

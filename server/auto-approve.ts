@@ -70,23 +70,24 @@ export function looksDestructive(text: string): boolean {
  * client so the two sides can never disagree about what was granted. */
 const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
 
-export function approvalKey(tool: string, summary: string, scope?: "local-computer"): string {
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
-  if (!COMMAND_TOOLS.has(bare)) return scope ? `${scope}:${tool}` : tool;
+export function approvalKey(tool: string, summary: string, scope?: "local-computer" | "disposable-computer"): string {
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
+  if (!COMMAND_TOOLS.has(bare)) return scope === "local-computer" ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
   let i = 0;
   while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
   const program = (words[i] ?? "").split("/").pop()?.replace(/[^\w.-]/g, "") ?? "";
   const key = program ? `${tool}:${program}` : tool;
-  return scope ? `${scope}:${key}` : key;
+  return scope === "local-computer" ? `${scope}:${key}` : key;
 }
 
-/** Program names that run whatever follows them.  An Always-allow keyed on
- * one of these is the bare "Bash" grant in disguise — `Bash:bash` covers
+/** Program names that run whatever follows them.  On the person's own
+ * desktop (`local-computer` scope) an Always-allow keyed on one of these
+ * is the bare "Bash" grant in disguise — `Bash:bash` covers
  * `bash -c <anything>`, `Bash:env` covers `env sh -c …` — so it is never
- * remembered, and a stored one is ignored.  The only way through is the
- * card, every time. */
+ * remembered there, and a stored local-scoped one is ignored.  On a
+ * disposable remote computer the same key is the right width. */
 const COARSE_PROGRAMS = new Set([
   "sh", "bash", "zsh", "fish", "ksh", "dash", "csh", "tcsh",
   "eval", "exec", "source", ".", "env", "xargs", "nohup", "command", "builtin", "time", "timeout", "nice", "su",
@@ -102,10 +103,29 @@ export function isCoarseApprovalKey(key: string): boolean {
   const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
   const colon = unscoped.indexOf(":");
   const tool = colon === -1 ? unscoped : unscoped.slice(0, colon);
-  if (!COMMAND_TOOLS.has(tool.replace(/^mcp__[^_]+__/, "").toLowerCase())) return false;
+  if (!COMMAND_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase())) return false;
   if (colon === -1) return true;
   const program = unscoped.slice(colon + 1).toLowerCase();
   return program === "" || COARSE_PROGRAMS.has(program);
+}
+
+/** Whether Always-allow must refuse this coarse key. Native shell asks
+ * are host-capable even when no computer is mounted; only explicitly named
+ * remote-computer MCP calls can keep a coarse grant. */
+export function coarseAlwaysAllowRefused(
+  key: string,
+  context?: { scope?: "local-computer" | "disposable-computer" },
+): boolean {
+  if (!isCoarseApprovalKey(key)) return false;
+  if (key.startsWith("local-computer:")) return true;
+  if (context?.scope === "local-computer") return true;
+  // A native Bash/shell ask runs in the provider process on the host even
+  // when no computer MCP server is mounted. An absent scope is not proof
+  // of disposable execution. Only a named remote MCP computer can carry a
+  // coarse key without becoming a remembered host-shell grant.
+  const tool = key.split(":", 1)[0]!;
+  return !/^mcp__computer_(?:shared_vm|local_vm|box)__/.test(tool) &&
+    !(context?.scope === "disposable-computer" && /^mcp__computer__/.test(tool));
 }
 
 export interface AutoApprover {
@@ -149,7 +169,7 @@ export function autoVerdict(
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
     /** the request controls the user's active desktop */
-    scope?: "local-computer";
+    scope?: "local-computer" | "disposable-computer";
   },
 ): AutoVerdict {
   // the guards outrank the grants, so an "always allow" can never widen
@@ -164,7 +184,7 @@ export function autoVerdict(
   const grant =
     destructive || sensitive
       ? null
-      : bot.alwaysAllow?.includes(key) && !isCoarseApprovalKey(key)
+      : bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
         : bot.autoApprove
           ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
@@ -206,7 +226,7 @@ export function autoDecision(
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
     /** the request controls the user's active desktop */
-    scope?: "local-computer";
+    scope?: "local-computer" | "disposable-computer";
   },
 ): string | null {
   return autoVerdict(bot, tool, summary, context).approve;

@@ -2327,6 +2327,15 @@ describe("harness HTTP API", () => {
         );
       }, { timeout: 5_000 }).toBe(true);
 
+      const roomGrant = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "fallback-room-approval",
+      });
+      expect(roomGrant.status).toBe(200);
+      expect(roomGrant.body.bot.alwaysAllow).toContain("Bash:echo");
+      const wrongRequest = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "other-request",
+      });
+      expect(wrongRequest.status).toBe(409);
       const answered = await api("POST", `/api/threads/${room.threadId}/respond`, {
         requestId: "fallback-room-approval",
         behavior: "allow",
@@ -7246,16 +7255,26 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 
 describe("trust boundaries: phone-originated room folders, coarse always-allow, and the packaged UI folder", () => {
   const phone = { "x-botfleet-companion": "1" };
+  type PhoneApiBody = {
+    cwd?: string | null;
+    extraCwds?: string[];
+    alwaysAllow?: string[];
+  };
+
+  // SAFETY: the harness answers JSON on every route this test calls, and the
+  // body shapes are asserted at the point of use.
   const apiAs = async (
     headers: Record<string, string>,
     method: string,
     path: string,
-    body?: unknown,
+    payload?: PhoneApiBody,
   ): Promise<{ status: number; body: any }> => {
+    const requestHeaders: Record<string, string> = { ...headers };
+    if (payload) requestHeaders["content-type"] = "application/json";
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: { ...headers, ...(body ? { "content-type": "application/json" } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      headers: requestHeaders,
+      body: payload ? JSON.stringify(payload) : undefined,
     });
     return { status: res.status, body: await res.json() };
   };
@@ -7307,18 +7326,59 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     }
   });
 
-  it("refuses to remember an always-allow that is a shell in disguise", async () => {
+  it("refuses unscoped native shell grants and accepts a named disposable-computer grant", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
-      const coarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
-      expect(coarse.status).toBe(400);
-      expect(coarse.body.error).toMatch(/every shell command/);
+      const hostCoarse = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: ["Bash:git", "local-computer:Bash:bash"],
+      });
+      expect(hostCoarse.status).toBe(400);
+      expect(hostCoarse.body.error).toMatch(/every shell command/);
+
+      const nativeCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
+      expect(nativeCoarse.status).toBe(400);
+      expect(nativeCoarse.body.error).toMatch(/every shell command/);
+
+      const remoteKey = "mcp__computer_shared_vm__bash:bash";
+      const virtualCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", remoteKey] });
+      expect(virtualCoarse.status).toBe(200);
+      expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", remoteKey]);
+
       const direct = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:sh" });
       expect(direct.status).toBe(400);
       expect(direct.body.error).toMatch(/every shell command/);
+
+      const narrowWithoutCard = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:git" });
+      expect(narrowWithoutCard.status).toBe(409);
+      expect(narrowWithoutCard.body.error).toMatch(/not on a pending approval/);
+
       const narrow = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git"] });
       expect(narrow.status).toBe(200);
       expect(narrow.body.bot.alwaysAllow).toEqual(["Bash:git"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("keeps single-mount disposable-computer grants through the generic PATCH route", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const disposableKey = "mcp__computer__bash:bash";
+      const saved = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: [disposableKey] });
+      expect(saved.status).toBe(200);
+      expect(saved.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // a later unrelated save carrying the same list must not filter it out
+      const carried = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: [disposableKey],
+        hidden: true,
+      });
+      expect(carried.status).toBe(200);
+      expect(carried.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // native and local-computer coarse keys stay refused
+      const refused = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:bash"] });
+      expect(refused.status).toBe(400);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
