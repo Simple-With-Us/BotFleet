@@ -716,7 +716,7 @@ describe("ACP turns (fake CLI)", () => {
     });
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
-    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    expect(opened).not.toHaveProperty("approvalScope");
     await instance.adapter.respondToRequest("t-mixed-computer", opened.requestId!, { behavior: "allow" });
     await recorder.until((e) => e.type === "turn.completed");
   });
@@ -733,7 +733,7 @@ describe("ACP turns (fake CLI)", () => {
     });
     const opened = await recorder.until((e) => e.type === "request.opened");
     expect(opened).toMatchObject({ tool: "mcp__computer_shared_vm__bash", summary: "bash -c echo hi" });
-    expect((opened as { approvalScope?: string }).approvalScope).toBeUndefined();
+    expect(opened).not.toHaveProperty("approvalScope");
     await instance.adapter.respondToRequest("t-remote-execute", opened.requestId!, { behavior: "allow" });
     await recorder.until((e) => e.type === "turn.completed");
   });

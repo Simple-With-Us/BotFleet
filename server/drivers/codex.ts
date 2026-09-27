@@ -11,6 +11,8 @@
 // fails visibly when the native session cannot be restored.
 import { homedir } from "node:os";
 
+import { z } from "zod";
+
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
@@ -39,6 +41,7 @@ import { appendNative } from "./native.ts";
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
+const codexNonemptyString = z.string().min(1);
 
 class CodexResumeError extends Error {
   constructor(options?: { cause?: unknown }) {
@@ -357,14 +360,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const requestId = newId();
         const remoteComputerAsk = isMcpElicitation && computerMounts.some((mount) =>
           mount.kind !== "local" && params.serverName === mount.name &&
-          typeof mcpTool === "string" && mcpTool.length > 0,
+          codexNonemptyString.safeParse(mcpTool).success,
         );
         if (remoteComputerAsk) tool = `mcp__${params.serverName}__${mcpTool}`;
         const approvalScope = remoteComputerAsk && params.serverName === "computer" ? "disposable-computer"
           : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
+        const remoteShellCommand = codexNonemptyString.safeParse(
+          remoteComputerAsk ? params._meta?.tool_params?.command : undefined,
+        );
         const summary =
-          remoteComputerAsk && typeof params._meta?.tool_params?.command === "string"
-            ? params._meta.tool_params.command
+          remoteShellCommand.success
+            ? remoteShellCommand.data
             : remoteComputerAsk
               ? mcpTool!
               : isMcpElicitation && typeof params.message === "string"

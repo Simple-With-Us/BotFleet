@@ -15,6 +15,8 @@
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
 import { homedir } from "node:os";
 
+import { z } from "zod";
+
 import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
 import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
@@ -63,6 +65,8 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+
+const acpNonemptyString = z.string().min(1);
 
 /** Stdio MCP server as ACP session/new sends it. */
 export type AcpStdioMcpServer = {
@@ -939,7 +943,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           const remoteComputerAsk = computerMounts.some((mount) =>
             kind !== "edit" && mount.kind !== "local" &&
             toolCall.rawInput?.serverName === mount.name &&
-            typeof toolCall.rawInput?.toolName === "string" && toolCall.rawInput.toolName.length > 0,
+            acpNonemptyString.safeParse(toolCall.rawInput?.toolName).success,
           );
           if (remoteComputerAsk) tool = `mcp__${toolCall.rawInput.serverName}__${toolCall.rawInput.toolName}`;
           const approvalScope = remoteComputerAsk && toolCall.rawInput?.serverName === "computer" ? "disposable-computer"

@@ -7251,16 +7251,26 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 
 describe("trust boundaries: phone-originated room folders, coarse always-allow, and the packaged UI folder", () => {
   const phone = { "x-botfleet-companion": "1" };
+  type PhoneApiBody = {
+    cwd?: string | null;
+    extraCwds?: string[];
+    alwaysAllow?: string[];
+  };
+
+  // SAFETY: the harness answers JSON on every route this test calls, and the
+  // body shapes are asserted at the point of use.
   const apiAs = async (
     headers: Record<string, string>,
     method: string,
     path: string,
-    body?: unknown,
+    payload?: PhoneApiBody,
   ): Promise<{ status: number; body: any }> => {
+    const requestHeaders: Record<string, string> = { ...headers };
+    if (payload) requestHeaders["content-type"] = "application/json";
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: { ...headers, ...(body ? { "content-type": "application/json" } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      headers: requestHeaders,
+      body: payload ? JSON.stringify(payload) : undefined,
     });
     return { status: res.status, body: await res.json() };
   };

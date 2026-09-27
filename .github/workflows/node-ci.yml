@@ -20,4 +20,9 @@ jobs:
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@10.33.0 --activate
       - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
+      - name: Lint (no new anti-slop errors in changed files)
+        if: github.event_name == 'pull_request'
+        run: node scripts/lint-pr-gate.mjs
+      - name: Lint (full repo)
+        if: github.event_name != 'pull_request'
+        run: pnpm lint
