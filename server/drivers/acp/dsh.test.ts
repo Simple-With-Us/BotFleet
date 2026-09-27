@@ -116,6 +116,37 @@ describe("DshAgentDriver config", () => {
     expect(dshModelIdFromOptionValue("deepseek-v4-pro")).toBeNull();
   });
 
+  it("round-trips every catalog row through the ACP model option encoding", () => {
+    // A row that appears in the picker but cannot be encoded is a dead choice:
+    // the id is sent to the CLI, and if dshProviderForModel cannot place it
+    // under a provider the session rejects the model.  Asserting over the whole
+    // catalog rather than two hand-picked ids means a future model added to
+    // STATIC_DSH_MODELS is covered the day it lands.
+    //
+    // Checked directly because the risk was live: dshProviderForModel is prefix
+    // based (`MiniMax-` -> minimax), so the newer M3.1 Flash Preview and M2.7
+    // highspeed ids do encode, but nothing in the suite proved it.
+    for (const option of STATIC_DSH_MODELS.options) {
+      const encoded = dshModelOptionValue(option.id);
+      expect(encoded, `${option.id} must encode to an ACP model option`).toBeTruthy();
+      expect(
+        dshModelIdFromOptionValue(encoded!),
+        `${option.id} must survive the encode/decode round trip`,
+      ).toBe(option.id);
+    }
+  });
+
+  it("places the two newer MiniMax ids under the minimax provider", () => {
+    // Spelled out so a change from prefix matching to a hardcoded allowlist
+    // fails here with a readable message rather than at turn time.
+    expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe(
+      '["minimax","MiniMax-M3.1-Flash-Preview"]',
+    );
+    expect(dshModelOptionValue("MiniMax-M2.7-highspeed")).toBe(
+      '["minimax","MiniMax-M2.7-highspeed"]',
+    );
+  });
+
   it("rejects stock DSH versions older than the native ACP profile", () => {
     expect(DSH_MINIMUM_ACP_VERSION).toBe("0.1.5-rc.1");
     expect(dshVersionCompatibilityReason("dsh 0.1.5-rc.1")).toBeNull();
