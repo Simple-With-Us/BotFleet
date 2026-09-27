@@ -4,7 +4,7 @@ This file is the **authoritative coordination manifest for AI agent fleets** wor
 
 GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
-Hosting and routing (apexes, hostnames, hosts, deploy paths): see [`Fleet-OPS/docs/DOMAINS-AND-ROUTING.md`](https://github.com/jaywedgeworth22/Fleet-OPS/blob/main/docs/DOMAINS-AND-ROUTING.md). Built from live Cloudflare, Vercel, Coolify, Namecheap/RDAP, and GitHub APIs by CLAUDE on 2026-09-25; refresh via `Fleet-OPS/scripts/domain-inventory/run-all.sh`.
+Consult the private operations inventory for hosting and routing details.
 
 > **2026-09-22 [INSTINCT]:** Updater transition release — must ship and be applied to every Mac BEFORE the bundle rename (PR #524).  It ports the target-bootstrapping wrapper and the updater's legacy-identity acceptance with no bundle ID change, so the old updater can apply it and the rename update is then judged by transition-capable code.  See `docs/rollouts/2026-09-22-updater-transition-bootstrap.md` for the rollout order.
 
