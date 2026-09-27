@@ -15,6 +15,7 @@ import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
@@ -129,7 +130,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     setNote(null);
     const session = sttSessionRef.current;
     if (!session) return;
-    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: [...(state.config?.callStt?.keyterms ?? []), ...membersRef.current.map((member) => member.name)] }).catch(() => {
+    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms(membersRef.current.map((member) => member.name), state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === group.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }

@@ -134,6 +134,7 @@ export function createAssemblyAISTTSession(): STTSession {
   let stream: MediaStream | null = null;
   let session: AssemblyAITranscriptionSession | null = null;
   let running = false;
+  let generation = 0;
 
   const releaseMedia = () => {
     if (!stream) return;
@@ -145,11 +146,27 @@ export function createAssemblyAISTTSession(): STTSession {
     for (const cb of endListeners) cb(info);
   };
 
+  const stopCloud = async (reason: string, notify = true) => {
+    if (!running) return;
+    running = false;
+    generation += 1; // invalidate pending microphone/token/socket startup
+    const live = session;
+    session = null;
+    releaseMedia(); // before awaiting socket drain; a new start may begin meanwhile
+    try {
+      await live?.stop();
+    } catch {
+      // best-effort; the socket may already have closed
+    }
+    if (notify) emitEnd({ code: 0, reason });
+  };
+
   return {
     provider: "assemblyai",
     async start(opts) {
       if (running) return;
       running = true;
+      const attempt = ++generation;
       let media: MediaStream;
       try {
         media = await navigator.mediaDevices.getUserMedia({
@@ -164,21 +181,23 @@ export function createAssemblyAISTTSession(): STTSession {
           },
         });
       } catch (error) {
+        if (generation !== attempt) return;
         running = false;
         const reason = (error as Error)?.message ?? String(error);
         emitEnd({ code: 1, reason: `Microphone unavailable: ${reason}` });
         return;
       }
-      if (!running) {
+      if (!running || generation !== attempt) {
         for (const track of media.getTracks()) track.stop();
         return;
       }
       stream = media;
       try {
-        session = await startAssemblyAITranscription({
+        const opened = await startAssemblyAITranscription({
           stream,
           getToken: () => tokenMint(),
           onTurn: (turn) => {
+            if (generation !== attempt || !running) return;
             const line: STTTranscriptLine = {
               text: turn.text,
               partial: !turn.final,
@@ -186,13 +205,25 @@ export function createAssemblyAISTTSession(): STTSession {
             for (const cb of transcriptListeners) cb(line);
           },
           onError: (message) => {
-            emitEnd({ code: 1, reason: message });
+            if (generation !== attempt || !running) return;
+            // The socket closed unexpectedly. Release the microphone before
+            // reporting the error so a retry can start a fresh session.
+            void (async () => {
+              await stopCloud("error", false);
+              if (generation === attempt + 1) emitEnd({ code: 1, reason: message });
+            })();
           },
           keyterms: opts?.keyterms,
           minTurnSilenceMs: opts?.endpointMs,
           speechModel: opts?.speechModel,
         });
+        if (!running || generation !== attempt) {
+          await opened.stop().catch(() => {});
+          return;
+        }
+        session = opened;
       } catch (error) {
+        if (generation !== attempt) return;
         running = false;
         releaseMedia();
         const reason = (error as Error)?.message ?? String(error);
@@ -200,30 +231,10 @@ export function createAssemblyAISTTSession(): STTSession {
       }
     },
     async stop() {
-      if (!running) return;
-      running = false;
-      const live = session;
-      session = null;
-      try {
-        await live?.stop();
-      } catch {
-        // best-effort; the WebSocket may already be closed
-      }
-      releaseMedia();
-      emitEnd({ code: 0, reason: "stopped" });
+      await stopCloud("stopped");
     },
     async finish() {
-      if (!running) return;
-      running = false;
-      const live = session;
-      session = null;
-      try {
-        await live?.stop();
-      } catch {
-        // best-effort
-      }
-      releaseMedia();
-      emitEnd({ code: 0, reason: "finished" });
+      await stopCloud("finished");
     },
     onTranscript(cb) {
       transcriptListeners.add(cb);

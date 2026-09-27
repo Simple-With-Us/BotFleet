@@ -1,4 +1,5 @@
 import { createSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -446,7 +447,7 @@ export function Composer({
       if (detached) return;
       offTranscript = session.onTranscript(handleTranscript);
       offEnd = session.onEnd(handleEnd);
-      session.start({ keyterms: [...(state.config?.callStt?.keyterms ?? []), ...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])] }).catch(() => {
+      session.start({ keyterms: sessionKeyterms([...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])], state.config?.callStt?.keyterms ?? []) }).catch(() => {
         if (!detached) {
           setRecording(false);
           setSpeechError("The microphone couldn't start. Check Microphone and Speech Recognition access.");

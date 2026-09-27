@@ -3,30 +3,11 @@ import { useEffect, useMemo, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { announceTranscriptionStatus } from "@/lib/transcription-status";
+import { KEYTERMS_MAX, formatKeyterms, keytermsDirty, parseKeyterms, persistKeyterms } from "@/lib/stt-keyterms";
 
 type Provider = "auto" | "apple" | "assemblyai";
 
-const KEYTERMS_MAX = 100;
 const MAX_INPUT_HEIGHT_PX = 220;
-
-function parseKeyterms(raw: string): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const piece of raw.split(",")) {
-    const trimmed = piece.trim();
-    if (!trimmed) continue;
-    const key = trimmed.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(trimmed);
-    if (out.length >= KEYTERMS_MAX) break;
-  }
-  return out;
-}
-
-function formatKeyterms(list: readonly string[]): string {
-  return list.join(", ");
-}
 
 export function TranscriptionSettings() {
   const bridge = window.ogb?.transcription;
@@ -38,6 +19,7 @@ export function TranscriptionSettings() {
 
   const [provider, setProvider] = useState<Provider>("auto");
   const [globalKeyterms, setGlobalKeyterms] = useState<string>("");
+  const [lastSavedKeyterms, setLastSavedKeyterms] = useState<string[]>([]);
   const [callSttLoaded, setCallSttLoaded] = useState(false);
   const [savingProvider, setSavingProvider] = useState(false);
   const [savingKeyterms, setSavingKeyterms] = useState(false);
@@ -60,7 +42,9 @@ export function TranscriptionSettings() {
         if (!alive) return;
         const explicit = cfg?.callStt?.provider;
         setProvider(explicit === "apple" || explicit === "assemblyai" ? explicit : "auto");
-        setGlobalKeyterms(formatKeyterms(Array.isArray(cfg?.callStt?.keyterms) ? cfg.callStt.keyterms : []));
+        const saved = parseKeyterms(formatKeyterms(Array.isArray(cfg?.callStt?.keyterms) ? cfg.callStt.keyterms : []));
+        setGlobalKeyterms(formatKeyterms(saved));
+        setLastSavedKeyterms(saved);
         setCallSttLoaded(true);
       })
       .catch(() => alive && setCallSttLoaded(true));
@@ -69,12 +53,7 @@ export function TranscriptionSettings() {
 
   const parsedKeyterms = useMemo(() => parseKeyterms(globalKeyterms), [globalKeyterms]);
   const keytermsOverLimit = parsedKeyterms.length >= KEYTERMS_MAX;
-  const keytermsDirty = useMemo(() => {
-    if (!callSttLoaded) return false;
-    // Empty list is the saved-or-not-saved ambiguity; rely on a stable
-    // string compare so an empty box doesn't trigger an auto-save loop.
-    return globalKeyterms.trim().length > 0 && formatKeyterms(parsedKeyterms) !== globalKeyterms.trim();
-  }, [callSttLoaded, globalKeyterms, parsedKeyterms]);
+  const vocabularyDirty = callSttLoaded && keytermsDirty(parsedKeyterms, lastSavedKeyterms);
 
   const save = async () => {
     if (!bridge || saving || (!value.trim() && !configured)) return;
@@ -114,14 +93,10 @@ export function TranscriptionSettings() {
     setSavingKeyterms(true);
     setError(null);
     try {
-      const res = await fetch("/api/config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ callStt: { keyterms: parsedKeyterms } }),
-      });
-      if (!res.ok) throw new Error(`PUT /api/config → ${res.status}`);
-      // Reflect canonical form (trimmed + de-duplicated + capped).
-      setGlobalKeyterms(formatKeyterms(parsedKeyterms));
+      const saved = await persistKeyterms(parsedKeyterms);
+      // Only a successful PUT advances the baseline, including a cleared list.
+      setGlobalKeyterms(formatKeyterms(saved));
+      setLastSavedKeyterms(saved);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -271,7 +246,7 @@ export function TranscriptionSettings() {
           <button
             type="button"
             onClick={() => void saveKeyterms()}
-            disabled={!callSttLoaded || savingKeyterms || !keytermsDirty}
+            disabled={!callSttLoaded || savingKeyterms || !vocabularyDirty}
             className="flex items-center gap-1.5 rounded-lg bg-control px-3 py-1 text-[12px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             {savingKeyterms ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
