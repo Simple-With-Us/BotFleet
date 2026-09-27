@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
@@ -1624,9 +1625,9 @@ export class Store {
 
   /** Fork the conversation: a new message that replaces `sourceId`
    * (same parent, new text) and becomes the active leaf.  Preserves the
-   * source's role, automationSource, sender, and peer-thread link —
-   * regenerating or editing an auto-delivered delegation must remain a
-   * system-attributed, navigable bot-to-bot prompt. */
+   * source's role, automationSource, and sender. A branched delegation is
+   * rerun directly, not mirrored into its former bot-to-bot channel, so it
+   * must not claim a peer-thread link to an exchange that never happened. */
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
@@ -1641,7 +1642,9 @@ export class Store {
       replyToId: source.replyToId,
       automationSource: source.automationSource,
       from: source.from ? { ...source.from } : undefined,
-      comm: source.comm ? { ...source.comm } : undefined,
+      comm: source.comm && source.automationSource !== "delegation" &&
+        !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
+        ? { ...source.comm } : undefined,
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);

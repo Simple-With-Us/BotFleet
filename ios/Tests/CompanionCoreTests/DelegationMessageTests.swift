@@ -36,6 +36,7 @@ final class DelegationMessageTests: XCTestCase {
     func testIgnoresOrdinaryChat() {
         XCTAssertNil(DelegationMessageView.parse("Hello world", role: .user))
         XCTAssertFalse(DelegationMessageView.isDelegation("Hello world", role: .user))
+        XCTAssertFalse(DelegationMessageView.isDelegation("Consult another bot in this BotFleet workspace tomorrow", role: .system))
         let quote = "[Delegated by @Compiler, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nQuoted reply"
         XCTAssertNil(DelegationMessageView.parse(quote, role: .bot))
         XCTAssertFalse(DelegationMessageView.isDelegation(quote, role: .bot))

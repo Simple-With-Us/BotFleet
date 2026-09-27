@@ -60,5 +60,7 @@ describe("automationSourceLabel", () => {
         "[Delegated by @Compiler, another bot in this BotFleet workspace. Do the work and reply directly.]\n\nRun CI",
       ),
     ).toBe("Delegated Task");
+    expect(automationSourceLabel(undefined, "Consult another bot in this BotFleet workspace tomorrow")).toBe("Scheduled Run");
+    expect(automationSourceLabel(undefined, "[Delegated by @Compiler] not the full marker")).toBe("Scheduled Run");
   });
 });

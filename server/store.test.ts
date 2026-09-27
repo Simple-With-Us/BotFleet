@@ -454,7 +454,7 @@ describe("Store", () => {
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
   });
 
-  it("branchMessage preserves delegated sender and channel metadata", () => {
+  it("branchMessage retains delegated attribution but drops the stale peer-thread link", () => {
     const store = new Store(selection);
     const bot = store.createBot();
     const from = { botId: "sender", name: "Compiler", color: "blue" };
@@ -465,15 +465,16 @@ describe("Store", () => {
     });
 
     const edited = store.branchMessage(bot.threadId, original.id, "Run tests")!;
-    expect(edited).toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+    expect(edited).toMatchObject({ role: "system", automationSource: "delegation", from });
     expect(edited.from).not.toBe(original.from);
-    expect(edited.comm).not.toBe(original.comm);
+    expect(edited.comm).toBeUndefined();
     const regenerated = store.branchMessage(bot.threadId, edited.id, "Run tests")!;
-    expect(regenerated).toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+    expect(regenerated).toMatchObject({ role: "system", automationSource: "delegation", from });
+    expect(regenerated.comm).toBeUndefined();
     store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.messagesFor(bot.threadId).find((message) => message.id === regenerated.id))
-      .toMatchObject({ role: "system", automationSource: "delegation", from, comm });
+      .toMatchObject({ role: "system", automationSource: "delegation", from });
   });
 
   it("setActiveLeaf switches branches and descends to the newest leaf", () => {

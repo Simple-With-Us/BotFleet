@@ -1,4 +1,5 @@
 import type { Message } from "@/state/store";
+import { isDelegationMessage } from "../../shared/delegation-message";
 
 export function replySnippet(text: string, limit = 160): string {
   const clean = text
@@ -29,7 +30,7 @@ export function automationSourceLabel(source: string | undefined, body: string):
     case "delegation":
       return "Delegated Task";
     default:
-      if (body.startsWith("[Delegated by @") || body.includes("another bot in this BotFleet workspace")) {
+      if (isDelegationMessage({ role: "system", text: body })) {
         return "Delegated Task";
       }
       return body.includes("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run";

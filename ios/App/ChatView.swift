@@ -1327,7 +1327,7 @@ struct MessageRow: View {
         case "delegation":
             return "Delegated Task"
         default:
-            if body.hasPrefix("[Delegated by @") || body.contains("another bot in this BotFleet workspace") {
+            if DelegationMessageView.isDelegation(body, role: .system) {
                 return "Delegated Task"
             }
             return body.contains("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run"
