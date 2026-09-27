@@ -5,10 +5,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CAPABILITY_CATEGORIES,
   CAPABILITY_KEYS,
+  CAPABILITY_NOTES,
+  CAPABILITY_STATES,
   ENGINE_CAPABILITIES,
   ENGINE_DISPLAY_ORDER,
+  capabilityCellGlyph,
   capabilityCellLabel,
+  capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
   uniqueModelToEngineId,
@@ -105,6 +110,86 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(new Set(ENGINE_DISPLAY_ORDER)).toEqual(new Set(KNOWN_ENGINE_IDS));
   });
 
+  it("resolves every display-ordered id to a real registry entry", () => {
+    // The matrix builds its rows by mapping ENGINE_DISPLAY_ORDER through
+    // ENGINE_CAPABILITIES and filtering out whatever is missing.  An id
+    // with no entry therefore vanishes from the table with no error at
+    // all — a new engine that someone added to the display order but not
+    // to the registry would just be absent.  That is the bug this pins.
+    for (const id of ENGINE_DISPLAY_ORDER) {
+      const entry = ENGINE_CAPABILITIES[id];
+      expect(entry, `ENGINE_DISPLAY_ORDER lists "${id}" with no registry entry`).toBeDefined();
+      expect(entry.id, `registry key "${id}" must match its own id field`).toBe(id);
+    }
+  });
+
+  it("has every registered engine declare every capability key explicitly", () => {
+    // This is the test that ends the "the registry omitted it" regression
+    // class, which had bitten four times before.  A missing key used to
+    // render as a dash wearing the "not available" tone, which reads as
+    // "audited: this engine cannot do it" — an underclaim that is
+    // indistinguishable, to a reader, from the truth.  Now a key must be
+    // declared, and "I have not checked" is spelled "unknown".
+    const states = new Set<string>(CAPABILITY_STATES);
+    for (const id of ENGINE_DISPLAY_ORDER) {
+      const entry = ENGINE_CAPABILITIES[id];
+      for (const key of CAPABILITY_KEYS) {
+        const state = entry.capabilities[key];
+        expect(
+          state,
+          `${id}.capabilities.${key} is missing — declare a real state or "unknown"`,
+        ).toBeDefined();
+        expect(
+          states.has(state as string),
+          `${id}.capabilities.${key} is "${state}", which is not a CapabilityState`,
+        ).toBe(true);
+      }
+      // And no stray keys outside the vocabulary.
+      for (const key of Object.keys(entry.capabilities)) {
+        expect(
+          (CAPABILITY_KEYS as string[]).includes(key),
+          `${id}.capabilities.${key} is not a declared CapabilityKey`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("groups every capability under exactly one named category", () => {
+    // CAPABILITY_KEYS is derived from the categories, so a column can
+    // never drift out of its group — but a duplicated or dropped key
+    // would still render a malformed spanning header.
+    const grouped = CAPABILITY_CATEGORIES.flatMap((category) => category.keys);
+    expect(new Set(grouped).size).toBe(grouped.length);
+    expect(new Set(grouped)).toEqual(new Set(CAPABILITY_KEYS));
+    for (const category of CAPABILITY_CATEGORIES) {
+      expect(category.label.length, `${category.id} needs a label`).toBeGreaterThan(0);
+    }
+  });
+
+  it("explains what every capability means, and prefers the engine's own note", () => {
+    for (const key of CAPABILITY_KEYS) {
+      const note = CAPABILITY_NOTES[key];
+      expect(note, `${key} has no capability note`).toBeTruthy();
+      expect(
+        (note ?? "").length,
+        `${key} note is too short to explain the capability`,
+      ).toBeGreaterThan(40);
+    }
+    // Resolution order: engine-specific note, then the shared capability
+    // note, then the engine headline — never an empty strip.
+    expect(ENGINE_CAPABILITIES.grok.capabilityNotes?.longContext).toBeTruthy();
+    expect(capabilityNoteFor(ENGINE_CAPABILITIES.grok, "longContext")).toBe(
+      ENGINE_CAPABILITIES.grok.capabilityNotes!.longContext,
+    );
+    // A pair with no engine override falls back to the shared note.
+    const fallback = capabilityNoteFor(ENGINE_CAPABILITIES.grok, "files");
+    expect(fallback).toBe(CAPABILITY_NOTES.files);
+    // And an engine with neither still gets its headline rather than blank.
+    expect(
+      capabilityNoteFor({ ...ENGINE_CAPABILITIES.grok, capabilityNotes: {} }, "files"),
+    ).toBe(CAPABILITY_NOTES.files);
+  });
+
   it("engineIdFromDriverKind maps known driver kinds to registry ids", () => {
     expect(engineIdFromDriverKind("grok")).toBe("grok");
     expect(engineIdFromDriverKind("grokAgent")).toBe("grok");
@@ -197,12 +282,32 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(pricingModeLabel(api)).toContain("API");
   });
 
-  it("capabilityCellLabel returns the legacy vocabulary", () => {
-    expect(capabilityCellLabel("yes")).toBe("✓");
-    expect(capabilityCellLabel("no")).toBe("✗");
-    expect(capabilityCellLabel("limited")).toBe("limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("pro only");
-    expect(capabilityCellLabel(undefined)).toBe("—");
+  it("capabilityCellLabel states the verdict in words", () => {
+    // The glyph and the word are separate functions now.  The word is what
+    // the cell's `title`, its accessible name, and the detail strip read;
+    // conflating the two is what let a dash wear the "not available" tone.
+    expect(capabilityCellLabel("yes")).toBe("Available");
+    expect(capabilityCellLabel("no")).toBe("Not available");
+    expect(capabilityCellLabel("limited")).toBe("Limited");
+    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    // A missing key and an explicit "unknown" say the same thing, and
+    // neither of them says "not available".
+    expect(capabilityCellLabel("unknown")).toBe("Not audited");
+    expect(capabilityCellLabel(undefined)).toBe("Not audited");
+  });
+
+  it("capabilityCellGlyph is one compact character per state", () => {
+    for (const state of CAPABILITY_STATES) {
+      expect(capabilityCellGlyph(state).length, `${state} glyph`).toBe(1);
+    }
+    expect(capabilityCellGlyph("yes")).toBe("✓");
+    expect(capabilityCellGlyph("no")).toBe("✗");
+    // Unaudited and missing share the glyph, so "nobody checked" can
+    // never be mistaken for a measured "no".
+    expect(capabilityCellGlyph("unknown")).toBe("?");
+    expect(capabilityCellGlyph(undefined)).toBe("?");
+    // Every glyph is visually distinct from every other.
+    expect(new Set(CAPABILITY_STATES.map(capabilityCellGlyph)).size).toBe(CAPABILITY_STATES.length);
   });
 });
 
@@ -277,6 +382,17 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
         assertTwoAsciiSpaces(entry.pricing.subscription.includedQuota ?? "", `${id} includedQuota`);
       }
       if ("api" in entry.pricing) assertTwoAsciiSpaces(entry.pricing.api.notes ?? "", `${id} api.notes`);
+      // Per-engine capability notes are shown verbatim in the matrix detail
+      // strip, so they carry the same sentence-gap rule as the prose above.
+      for (const [key, note] of Object.entries(entry.capabilityNotes ?? {})) {
+        assertTwoAsciiSpaces(note ?? "", `${id} capabilityNotes.${key}`);
+      }
+    }
+  });
+
+  it("uses two ASCII spaces after periods and colons in the shared capability notes", () => {
+    for (const [key, note] of Object.entries(CAPABILITY_NOTES)) {
+      assertTwoAsciiSpaces(note ?? "", `CAPABILITY_NOTES.${key}`);
     }
   });
 

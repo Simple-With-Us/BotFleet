@@ -30,7 +30,24 @@ export type CapabilityKey =
   | "longContext"
   | "liveResearch";
 
-export type CapabilityState = "yes" | "no" | "limited" | "yes-pro-only";
+/** Every verdict a cell can carry.  `unknown` is a real verdict, not the
+ *  absence of one: nobody has audited this (engine, capability) pair, and
+ *  the matrix must say so in its own voice instead of borrowing the "no"
+ *  tone.  A registry key that is missing entirely resolves to the same
+ *  word, so the old failure mode — an unaudited pair wearing the
+ *  "not available" colour while printing a dash — cannot come back.
+ *  `engine-capabilities.test.ts` fails the build when a registered engine
+ *  omits a key, so the honest answer becomes explicit `"unknown"`. */
+export type CapabilityState = "yes" | "no" | "limited" | "yes-pro-only" | "unknown";
+
+/** The full state vocabulary, in the order the matrix legend lists it. */
+export const CAPABILITY_STATES: readonly CapabilityState[] = [
+  "yes",
+  "limited",
+  "yes-pro-only",
+  "no",
+  "unknown",
+] as const;
 
 export interface ApiRates {
   /** USD per 1k input tokens. */
@@ -92,6 +109,12 @@ export interface EngineCapabilityEntry {
   group: "Cloud" | "Local Computer";
   pricing: PricingMode;
   capabilities: Partial<Record<CapabilityKey, CapabilityState>>;
+  /** Per-engine explanation of one capability, used by the matrix detail
+   *  strip.  Wins over the capability-level `CAPABILITY_NOTES` entry, which
+   *  in turn wins over `whyThisEngine.headline`.  Write it about the
+   *  *build*, never about the model: "BotFleet does not wire this here" is a
+   *  gap in the wiring, not a claim that the model cannot do it. */
+  capabilityNotes?: Partial<Record<CapabilityKey, string>>;
   whyThisEngine: WhyThisEngine;
   /** Default model ids surfaced by the Usage section when no per-session
    *  override exists.  Always at least one entry — registry invariants
@@ -170,6 +193,20 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       longContext: "yes",
       liveResearch: "yes",
       crossBotCoordination: "limited",
+      // The Grok driver mounts no Connected Apps channel and no computer-use
+      // channel, and the prose below already recorded the rooms and voice
+      // gaps.  All four are BotFleet gaps on this build, not limits on what
+      // the model can do — hence "no" rather than "unknown" here.
+      connectedApps: "no",
+      roomCoordination: "no",
+      voiceChat: "no",
+      computerUse: "no",
+    },
+    capabilityNotes: {
+      longContext:
+        "Grok 4.7 holds half a million tokens in one turn.  Prompts at or above 200,000 tokens bill at the higher long-context rate.",
+      crossBotCoordination:
+        "Team tools are mounted, so a Grok bot can ask another bot for work.  The channel is partially built, so treat a long hand-off as less reliable than a direct ask.",
     },
     whyThisEngine: {
       headline: "Grok 4.7 with long context and live research.",
@@ -215,6 +252,15 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       imageAttachments: "yes",
       longContext: "yes",
       crossBotCoordination: "yes",
+      // Recorded gaps, from the prose below: the registry deliberately
+      // treats these as BotFleet work still to do on the Cursor CLI.
+      connectedApps: "no",
+      roomCoordination: "no",
+      voiceChat: "no",
+      computerUse: "no",
+      // No verdict was ever recorded for a research pass on Cursor, so the
+      // matrix says so rather than guessing in either direction.
+      liveResearch: "unknown",
     },
     whyThisEngine: {
       headline: "Cursor's coding agent, driven over ACP.",
@@ -258,6 +304,16 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       roomCoordination: "yes",
       voiceChat: "yes",
       computerUse: "yes",
+      // The widest surface in the registry, and still one cell nobody
+      // recorded a verdict for.  Claude is the engine most likely to grow
+      // this, so it must not quietly read as unsupported.
+      liveResearch: "unknown",
+    },
+    capabilityNotes: {
+      computerUse:
+        "The Claude driver drives another computer's screen itself, so the actions arrive as tool calls rather than as a remote session someone has to babysit.",
+      voiceChat:
+        "Claude is the one engine where a voice turn is a first-class turn, not a text turn with a voice skin on it.",
     },
     whyThisEngine: {
       headline: "Files, terminal, web, images, rooms, voice, and computer use.",
@@ -299,6 +355,17 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       connectedApps: "yes",
       longContext: "yes",
       computerUse: "yes",
+      // Recorded gaps, from the prose below.
+      crossBotCoordination: "no",
+      roomCoordination: "no",
+      voiceChat: "no",
+      liveResearch: "no",
+    },
+    capabilityNotes: {
+      longContext:
+        "GPT-5 Codex holds 400,000 tokens in one turn, enough to keep a large repository and its history in the same prompt.",
+      computerUse:
+        "The Codex driver drives another computer's screen, so clicks and typing arrive as tool calls under the same approval cards as everything else.",
     },
     whyThisEngine: {
       headline: "OpenAI coding models with files, terminal, and computer use.",
@@ -347,6 +414,20 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       // the matrix used to render "-" here because the registry omitted it.
       connectedApps: "yes",
       liveResearch: "yes",
+      // Recorded gaps, from the prose below.
+      crossBotCoordination: "no",
+      roomCoordination: "no",
+      voiceChat: "no",
+      computerUse: "no",
+      // The driver mounts a computer-use channel, but no verdict was ever
+      // recorded for holding a million tokens on a Gemini turn.  Flagged
+      // rather than guessed: the model window and the wiring are different
+      // questions, and only the first one is answered.
+      longContext: "unknown",
+    },
+    capabilityNotes: {
+      liveResearch:
+        "Gemini runs the research pass itself, so a bot can sweep several sources inside one turn and come back with the answer rather than a list of links.",
     },
     whyThisEngine: {
       headline: "Gemini models with files, web, images, and live research.",
@@ -392,6 +473,21 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       // "-" here because the registry omitted it.
       connectedApps: "yes",
       crossBotCoordination: "yes",
+      // The ACP bridge mounts the channels, but four of these pairs have
+      // never been audited against a real DeepSeek turn.  "unknown" is the
+      // honest cell: the bridge being generic says nothing about whether a
+      // DeepSeek model uses the channel well once it is mounted.
+      longContext: "unknown",
+      roomCoordination: "unknown",
+      voiceChat: "unknown",
+      computerUse: "unknown",
+      liveResearch: "unknown",
+    },
+    capabilityNotes: {
+      imageAttachments:
+        "The bridge pins image input to false, so the composer rejects an image on this engine.  That is a limit on the bridge BotFleet ships, not on what the model can read.",
+      crossBotCoordination:
+        "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
       headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
@@ -446,6 +542,19 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       // stops claiming a channel the driver does not wire.
       connectedApps: "no",
       longContext: "yes",
+      // The direct driver exposes neither a web tool nor image input, and
+      // neither has been audited on a real turn.  Marked "unknown" so the
+      // matrix does not claim a gap nobody measured.
+      webAccess: "unknown",
+      imageAttachments: "unknown",
+      computerUse: "unknown",
+      liveResearch: "unknown",
+    },
+    capabilityNotes: {
+      connectedApps:
+        "Connected Apps is the Composio bridge, and the direct MiniMax driver declares no such channel.  This engine reaches the outside world through its own tools and through this Mac instead.",
+      roomCoordination:
+        "Rooms and peers are both mounted here, which makes MiniMax the engine that holds a channel conversation best across the fleet.",
     },
     whyThisEngine: {
       headline: "Files, terminal, rooms, voice, and long context.",
@@ -501,6 +610,17 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       connectedApps: "yes",
       crossBotCoordination: "yes",
       longContext: "yes",
+      // Recorded gaps, from the prose below.
+      roomCoordination: "no",
+      voiceChat: "no",
+      computerUse: "no",
+      liveResearch: "no",
+    },
+    capabilityNotes: {
+      connectedApps:
+        "The ACP core mounts the Connected Apps bridge for this driver, so the channel is present even though the direct MiniMax engine does not have it.",
+      thisComputer:
+        "MiniMax Code runs its own CLI on this Mac, so the bot reads and writes the same working folder the rest of the fleet does.",
     },
     whyThisEngine: {
       headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
@@ -519,23 +639,39 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
   },
 };
 
-/** Every capability key the matrix exposes, in display order. */
-export const CAPABILITY_KEYS: CapabilityKey[] = [
-  "files",
-  "terminal",
-  "thisComputer",
-  "webAccess",
-  "imageAttachments",
-  "connectedApps",
-  "crossBotCoordination",
-  "roomCoordination",
-  "voiceChat",
-  "computerUse",
-  "longContext",
-  "liveResearch",
+/** A named block of related capabilities.  The matrix renders one spanning
+ *  header per category so twelve columns read as four groups rather than a
+ *  flat wall of glyphs.  Order here is the column order. */
+export interface CapabilityCategory {
+  id: "local" | "thisComputer" | "web" | "fleet";
+  label: string;
+  keys: CapabilityKey[];
+}
+
+export const CAPABILITY_CATEGORIES: CapabilityCategory[] = [
+  { id: "local", label: "Files & Shell", keys: ["files", "terminal"] },
+  { id: "thisComputer", label: "This Computer", keys: ["thisComputer", "computerUse"] },
+  {
+    id: "web",
+    label: "Web & Media",
+    keys: ["webAccess", "imageAttachments", "liveResearch", "longContext"],
+  },
+  {
+    id: "fleet",
+    label: "Fleet & Voice",
+    keys: ["connectedApps", "crossBotCoordination", "roomCoordination", "voiceChat"],
+  },
 ];
 
-/** Display labels for the matrix header cells. */
+/** Every capability key, in matrix column order.  Derived from the
+ *  categories rather than listed beside them, so a column can never drift
+ *  out of its group. */
+export const CAPABILITY_KEYS: CapabilityKey[] = CAPABILITY_CATEGORIES.flatMap(
+  (category) => category.keys,
+);
+
+/** Full display labels — the detail strip, the cell tooltip, and the
+ *  accessible name all read these. */
 export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   files: "Files",
   terminal: "Terminal",
@@ -550,6 +686,66 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   longContext: "Long Context",
   liveResearch: "Live Research",
 };
+
+/** Column labels for the matrix header.  One or two words, sized to fit a
+ *  single 54px column (they wrap onto a second line where they must).  The
+ *  full label stays in `CAPABILITY_LABELS` for the tooltip and the detail
+ *  strip, so shortening here costs the reader nothing. */
+export const CAPABILITY_SHORT_LABELS: Record<CapabilityKey, string> = {
+  files: "Files",
+  terminal: "Terminal",
+  thisComputer: "This Computer",
+  webAccess: "Web Access",
+  imageAttachments: "Images",
+  connectedApps: "Apps",
+  crossBotCoordination: "Peers",
+  roomCoordination: "Rooms",
+  voiceChat: "Voice",
+  computerUse: "Screen Use",
+  longContext: "Long Context",
+  liveResearch: "Research",
+};
+
+/** What each capability actually means in BotFleet — which wiring stands
+ *  behind it.  This is the copy the detail strip shows, so a reader learns
+ *  what Connected Apps *is* instead of re-reading the engine's pitch. */
+export const CAPABILITY_NOTES: Partial<Record<CapabilityKey, string>> = {
+  files:
+    "Reading and writing files in the working folder.  Backed by the driver's own file tools, so the bot follows the same approval and permission rules as the rest of its turn.",
+  terminal:
+    "Running shell commands on the machine the turn runs on.  Backed by the driver's shell tool, which is where the approval cards and the permission guards come from.",
+  thisComputer:
+    "Driving the computer BotFleet itself is running on.  This is a different channel from Connected Apps, and a different one again from driving another computer's screen.",
+  computerUse:
+    "Clicking and typing on another computer's screen the way a person drives a desktop.  Every action still runs through the same approval cards.",
+  webAccess:
+    "Fetching pages from the web during a turn.  Backed by the driver's web or search tool.",
+  imageAttachments:
+    "Reading an image the bot was sent.  A driver that does not declare image input has the attachment rejected before the model ever sees it.",
+  liveResearch:
+    "Running a multi-step research pass across the web inside the turn, rather than answering from what the model already knows.",
+  longContext:
+    "Holding a very long prompt in a single turn without the conversation being cut off.",
+  connectedApps:
+    "Reaching third-party services through the Connected Apps bridge.  Only a driver that mounts that channel has it; it is not the same as driving this computer.",
+  crossBotCoordination:
+    "Asking another bot on the fleet for work, and answering when one asks back.  Backed by the team tools every driver can mount.",
+  roomCoordination:
+    "Posting into a shared room and reading the conversation around it, so a bot holds its place in a channel.",
+  voiceChat:
+    "Speaking to the user and hearing them back inside one turn.",
+};
+
+/** Resolve the sentence the detail strip shows for one (engine, capability)
+ *  pair: the engine's own note wins, then the shared capability note, then
+ *  the engine's headline so the strip is never blank. */
+export function capabilityNoteFor(entry: EngineCapabilityEntry, key: CapabilityKey): string {
+  return (
+    entry.capabilityNotes?.[key] ??
+    CAPABILITY_NOTES[key] ??
+    entry.whyThisEngine.headline
+  );
+}
 
 /** Engine ids in display order (Cloud group first, then Local Computer). */
 export const ENGINE_DISPLAY_ORDER: string[] = [
@@ -640,21 +836,43 @@ export function pricingModeLabel(pricing: PricingMode): string {
   }
 }
 
-/** Cell text for the matrix — keeps the wording identical to what the
- *  legacy `<MiniMaxCallout>` used (yes / no / limited / pro only) so the
- *  visual vocabulary of the panel stays familiar. */
-export function capabilityCellLabel(state: CapabilityState | undefined): string {
+/** The compact glyph that goes in a matrix cell.  One character, so twelve
+ *  columns of them stay inside one 54px column.  Kept separate from
+ *  `capabilityCellLabel` because the glyph and the word answer different
+ *  questions — one is a scan target, the other is what a screen reader, a
+ *  `title` tooltip, and the detail strip need. */
+export function capabilityCellGlyph(state: CapabilityState | undefined): string {
   switch (state) {
     case "yes":
       return "✓";
     case "no":
       return "✗";
     case "limited":
-      return "limited";
+      return "~";
     case "yes-pro-only":
-      return "pro only";
+      return "★";
     default:
-      return "—";
+      // "unknown" and a missing key share this glyph on purpose: both mean
+      // nobody has looked, and neither is a claim that the engine can't.
+      return "?";
+  }
+}
+
+/** The state in words — the cell's `title`, its accessible name, and the
+ *  detail strip's verdict line.  Sentence case, because it is a value
+ *  rather than a heading. */
+export function capabilityCellLabel(state: CapabilityState | undefined): string {
+  switch (state) {
+    case "yes":
+      return "Available";
+    case "no":
+      return "Not available";
+    case "limited":
+      return "Limited";
+    case "yes-pro-only":
+      return "Pro plan only";
+    default:
+      return "Not audited";
   }
 }
 
