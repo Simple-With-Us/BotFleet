@@ -22,6 +22,7 @@ import type {
   RoutineRequestSchedule,
 } from "../shared/routine-request.ts";
 import { validTimeZone } from "../shared/time-zone.ts";
+import { normalizeRunOn } from "../shared/run-on.ts";
 
 const WEEKDAY_NUMBER = {
   sunday: 0,
@@ -63,7 +64,10 @@ const routineToolDefinitionSchema = z.object({
   name: z.string().max(80),
   instructions: z.string().max(20_000),
   schedule: routineToolScheduleSchema,
-  runOn: z.enum(["maus", "cloud"]).optional(),
+  runOn: z
+    .enum(["bot", "cloud", "maus"])
+    .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value))
+    .optional(),
   durationMinutes: z.number().optional(),
 }).strict();
 
@@ -98,7 +102,9 @@ const storedDefinitionSchema = z.object({
   name: z.string().trim().min(1).max(80),
   instructions: z.string().trim().min(1).max(20_000),
   schedule: storedScheduleSchema,
-  runOn: z.enum(["maus", "cloud"]),
+  runOn: z
+    .enum(["bot", "cloud", "maus"])
+    .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value)),
   durationMinutes: z.number().int().min(15).max(240),
 }).strict();
 const storedChangesSchema = storedDefinitionSchema.partial().refine(
@@ -251,8 +257,8 @@ function text(value: string, field: string, max: number): string {
   return redacted;
 }
 
-function runOn(value: RoutineRequestRunOn | undefined): RoutineRequestRunOn {
-  return value ?? "maus";
+function runOn(value: RoutineRequestRunOn | "maus" | undefined): RoutineRequestRunOn {
+  return normalizeRunOn(value);
 }
 
 function duration(value: number | undefined): number {

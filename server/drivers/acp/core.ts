@@ -21,6 +21,15 @@ import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
+import {
+  decodeInitTimeoutMs,
+  describeInitDeadline,
+  describeSlowInit,
+  readHostLoad,
+  resolveInitDeadline,
+  SLOW_INIT_LOG_MS,
+} from "./init-deadline.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -136,9 +145,20 @@ export interface AcpConfig {
   fullAuto: boolean;
   /** Optional home for this instance's sessions. */
   workspace?: string;
-  /** Whole `session/prompt` deadline.  The default remains below the harness
-   * watchdog so the driver can cancel and settle its own process first. */
+  /** Exact `initialize` deadline for this instance, overriding the engine's
+   * load-scaled default (see `init-deadline.ts`). */
+  initTimeoutMs?: number;
+  /** Hard `session/prompt` backstop, regardless of streaming activity.  The
+   * default remains below the harness watchdog so the driver can cancel and
+   * settle its own process first. */
   promptTimeoutMs?: number;
+  /** Renewable `session/prompt` idle deadline.  Fires only after this many
+   * ms with NO inbound traffic at all — no `session/update` (message chunk,
+   * thought chunk, tool call, or tool result) and no permission request.
+   * Any of those resets the clock, so a legitimately long-running turn is
+   * never cut off; only a fully wedged one is.  `promptTimeoutMs` still
+   * applies underneath this as the absolute backstop. */
+  promptIdleMs?: number;
 }
 
 /** Per-harness specifics — everything that differs between Grok, Gemini, … */
@@ -156,6 +176,10 @@ export interface AcpSupport {
   effortLevels?: readonly EffortLevel[];
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
+  /** Base `initialize` deadline for a CLI whose cold boot is heavier than
+   *  the 60 s default assumes.  Host load still stretches it; an instance's
+   *  `initTimeoutMs` still overrides it. */
+  initTimeoutMs?: number;
   /** Optional live model catalog. A failed lookup keeps the last usable catalog.
    *  `config` is the instance decode so a support can ask the same binary it
    *  will spawn (custom `cli` paths), not whatever happens to be named on PATH. */
@@ -261,7 +285,11 @@ export interface AcpSupport {
   }): Promise<void>;
 }
 
+// authenticate and set_config_option run on a child that already booted;
+// the cold-start `initialize` deadline lives in init-deadline.ts.
 const INIT_TIMEOUT = 60_000;
+/** Relaunches an initialize timeout may spend from the retry budget. */
+const MAX_INIT_TIMEOUT_RELAUNCHES = 1;
 const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
 /** Upper bound on per-driver model discovery during registry load. */
 const BOOT_MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
@@ -271,18 +299,49 @@ const BOOT_MODEL_DISCOVERY_TIMEOUT_MS = 10_000;
 // cold starts with many servers configured.
 const NEW_SESSION_TIMEOUT = 120_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
-const DEFAULT_PROMPT_TIMEOUT_MS = 18 * 60_000;
+// Hard backstop: fires regardless of streaming activity.  Kept as a floor
+// under the renewable idle deadline below — an agent that streams filler
+// forever without ever finishing must still die eventually.
+const DEFAULT_PROMPT_MAX_MS = 18 * 60_000;
 const MIN_PROMPT_TIMEOUT_MS = 1_000;
 const MAX_PROMPT_TIMEOUT_MS = 20 * 60_000;
+// Renewable: restarts on every inbound line (session/update or a permission
+// request), so this only trips on TOTAL silence — see `request`'s `armIdle`.
+const DEFAULT_PROMPT_IDLE_MS = 180_000;
+const MIN_PROMPT_IDLE_MS = 1_000;
+const MAX_PROMPT_IDLE_MS = 20 * 60_000;
 const CANCEL_FLUSH_GRACE_MS = 50;
 const FORCE_EXIT_AFTER_MS = 2_000;
+
+/** "3 minutes" at the real default, "N s" for anything not a whole number
+ *  of minutes (short test windows included) — used only in the idle-stall
+ *  message below. */
+function describeIdleWindow(ms: number): string {
+  const minutes = ms / 60_000;
+  if (Number.isInteger(minutes) && minutes >= 1) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  return `${Math.max(1, Math.round(ms / 1000))} s`;
+}
 
 class AcpRpcTimeoutError extends Error {
   readonly method: string;
 
-  constructor(method: string) {
-    super(`${method} timed out`);
+  /** `detail` extends the message ("… timed out after 180 s (…)") and must
+   *  stay free of turn content: it reaches logs and Sentry breadcrumbs. */
+  constructor(method: string, detail?: string) {
+    super(detail ? `${method} timed out ${detail}` : `${method} timed out`);
     this.name = "AcpRpcTimeoutError";
+    this.method = method;
+  }
+}
+
+/** Distinct from `AcpRpcTimeoutError`: this is the renewable idle guard
+ *  tripping on total silence, not the hard wall-clock ceiling elapsing. */
+class AcpPromptIdleError extends Error {
+  readonly method: string;
+
+  constructor(method: string, idleMs: number) {
+    super(`${method} produced no output for ${describeIdleWindow(idleMs)} and was stopped as a stall.`);
+    this.name = "AcpPromptIdleError";
     this.method = method;
   }
 }
@@ -326,11 +385,22 @@ function decodeAcpConfig(defaultCli: string) {
       o.promptTimeoutMs <= MAX_PROMPT_TIMEOUT_MS
         ? o.promptTimeoutMs
         : undefined;
+    const initTimeoutMs = decodeInitTimeoutMs(o.initTimeoutMs);
+    const promptIdleMs =
+      typeof o.promptIdleMs === "number" &&
+      Number.isFinite(o.promptIdleMs) &&
+      Number.isInteger(o.promptIdleMs) &&
+      o.promptIdleMs >= MIN_PROMPT_IDLE_MS &&
+      o.promptIdleMs <= MAX_PROMPT_IDLE_MS
+        ? o.promptIdleMs
+        : undefined;
     return {
       cli: typeof o.cli === "string" ? o.cli : defaultCli,
       fullAuto: o.fullAuto === true,
       workspace: typeof o.workspace === "string" ? o.workspace : undefined,
+      ...(initTimeoutMs === undefined ? {} : { initTimeoutMs }),
       ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
+      ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
     };
   };
 }
@@ -402,6 +472,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       }
       const active = new Map<string, Turn>();
       let disposed = false;
+      // Retry bookkeeping lives PER THREAD, not per sendTurn call: a relaunch
+      // re-enters sendTurn, and the budget has to survive that hop or every
+      // attempt would look like the first one.  Mirrors claude.ts, which owns
+      // the same shape for the same reason.
+      const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+      // A relaunch waits real seconds; the fakes in acp.test.ts scale that
+      // down so a scripted transient failure does not cost the suite its
+      // backoff.  The `turn.retrying` event still reports the REAL delay.
+      const retryScale = Number(process.env.FAKE_ACP_RETRY_SCALE ?? "1");
 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
@@ -435,12 +514,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
+        // Carried across a relaunch (see maybeRetry): `attempt` is how many
+        // transient failures this logical turn has already absorbed, and
+        // `cancelled` is how a user stop during the backoff reaches the
+        // pending relaunch instead of letting it spawn a process nobody wants.
+        const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
+        retry.cancelled = false;
+        retryState.set(threadId, retry);
+        const retryAbort = new AbortController();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv(turnConfig);
         let preflightCancelled = false;
         const preflightAsks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
         const cancelPreflight = () => {
           preflightCancelled = true;
+          retry.cancelled = true;
+          retryAbort.abort();
         };
         active.set(threadId, {
           stop: cancelPreflight,
@@ -456,6 +545,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           error?: { message: string; setup?: boolean },
         ) => {
           if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
+          retryState.delete(threadId);
           if (error) emit({ ...base(threadId, turnId), type: "runtime.error", ...error });
           emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
           return { turnId, dispatched: false as const };
@@ -536,17 +626,52 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           });
         }
 
-        const state = { settled: false, deadlineTerminating: false, promptSent: false, text: "" };
+        // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
+        // a reading of the error text: it flips the moment this child put
+        // something on the bus that a relaunch would duplicate or contradict —
+        // an assistant or reasoning delta, a tool call, or a permission card.
+        // A transient failure before any of that is a failure to start, and
+        // starting over is free.  After it, the CLI may already have edited a
+        // file or run a command, and only the CLI's own resume can be trusted
+        // to continue safely — so the turn fails honestly instead.
+        // `retrying` means a relaunch is already scheduled; every settle path
+        // checks it so the dying child cannot also terminate the turn.
+        const state = {
+          settled: false,
+          deadlineTerminating: false,
+          promptSent: false,
+          sawOutput: false,
+          retrying: false,
+          text: "",
+        };
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
         const rpcPending = new Map<
           number,
-          { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> | null }
+          {
+            resolve: (v: any) => void;
+            reject: (e: Error) => void;
+            timer: ReturnType<typeof setTimeout> | null;
+            /** No-op unless this request armed an idle deadline (only
+             *  session/prompt does). Re-arming after every inbound line
+             *  (and after we answer a permission ask) is what makes the
+             *  guard trip on total silence only. */
+            armIdle: () => void;
+            clearIdle: () => void;
+          }
         >();
 
         const send = (obj: unknown) => {
+          // A reply to a server->client request (permission, most likely)
+          // resumes an agent that was waiting on US — give it a fresh idle
+          // window from the moment it can act again, rather than whatever
+          // was left over from before the ask (which could be ~0).
+          const message = obj as { id?: unknown; result?: unknown; error?: unknown };
+          if (message.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
+            for (const pending of rpcPending.values()) pending.armIdle();
+          }
           try {
             child.stdin.write(JSON.stringify(obj) + "\n");
           } catch {}
@@ -561,18 +686,47 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             appendNative(threadId, { dir: "out", source: SOURCE, msg: obj });
           });
-        const request = (method: string, params: unknown, timeoutMs?: number) =>
+        const request = (method: string, params: unknown, timeoutMs?: number, idleMs?: number) =>
           new Promise<any>((resolve, reject) => {
             const id = nextId++;
+            // Idle watchdog — unlike `timer` below, this restarts on every
+            // inbound line (see the stdout handler), so a long-lived
+            // streaming turn is never cut off; only one that has gone
+            // completely silent trips it.  Only armed when the caller
+            // passes idleMs (currently just session/prompt).
+            let idleTimer: ReturnType<typeof setTimeout> | null = null;
+            const clearIdle = () => {
+              if (idleTimer) clearTimeout(idleTimer);
+              idleTimer = null;
+            };
+            const armIdle = () => {
+              if (!(idleMs && idleMs > 0)) return;
+              clearIdle();
+              idleTimer = setTimeout(() => {
+                // A permission ask blocks on a PERSON, not the agent —
+                // waiting on one is not the silence this guard exists to
+                // catch, so keep re-checking instead of tripping.
+                if (asks.size) {
+                  armIdle();
+                  return;
+                }
+                rpcPending.delete(id);
+                if (timer) clearTimeout(timer);
+                reject(new AcpPromptIdleError(method, idleMs));
+              }, idleMs);
+              idleTimer.unref?.();
+            };
             let timer: ReturnType<typeof setTimeout> | null = null;
             if (timeoutMs) {
               timer = setTimeout(() => {
                 rpcPending.delete(id);
+                clearIdle();
                 reject(new AcpRpcTimeoutError(method));
               }, timeoutMs);
               timer.unref?.();
             }
-            rpcPending.set(id, { resolve, reject, timer });
+            armIdle();
+            rpcPending.set(id, { resolve, reject, timer, armIdle, clearIdle });
             send({ jsonrpc: "2.0", id, method, params });
           });
 
@@ -626,12 +780,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         let turnUsage: { input: number; output?: number } | undefined;
 
         const settle = (ok: boolean, stopReason: string | null) => {
-          if (state.settled) return;
+          if (state.settled || state.retrying) return;
           state.settled = true;
+          retryState.delete(threadId);
           if (interruptTimer) clearTimeout(interruptTimer);
           for (const finish of [...asks.values()]) finish("cancel", "system");
           for (const p of rpcPending.values()) {
             if (p.timer) clearTimeout(p.timer);
+            p.clearIdle();
             p.reject(new Error("turn settled"));
           }
           rpcPending.clear();
@@ -648,6 +804,98 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           stop(); // the agent process does not exit on its own
         };
 
+        /** Absorb a transient provider or transport failure by relaunching
+         *  this turn, or report `false` and let the caller settle it.
+         *
+         *  Every ACP engine — Cursor, Droid, Grok CLI, Hermes, Kimi,
+         *  DeepSeek, Qwen, OpenCode, DSH — used to fail the whole turn on a
+         *  single 429 or connection reset, which then pushed the bot's
+         *  fallback chain into a cooldown that one retry would have avoided.
+         *  The conditions are exactly claude.ts's, and for the same reasons:
+         *  the failure must be transient by the shared classifier, the user
+         *  must not have stopped the turn, the budget must not be spent, and
+         *  — the replay-safety one — this child must not have produced any
+         *  output yet.  Nothing that already reached the person or the disk
+         *  is ever re-run here. */
+        const maybeRetry = (failure: Parameters<typeof classifyError>[0]): boolean => {
+          if (state.settled || state.retrying || state.deadlineTerminating) return false;
+          if (retry.cancelled || preflightCancelled || disposed) return false;
+          if (state.sawOutput) return false;
+          if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
+          const verdict = classifyError(failure);
+          if (!verdict.transient) return false;
+
+          state.retrying = true;
+          retry.attempt++;
+          const delayMs = computeBackoff(retry.attempt - 1);
+          emit({
+            ...base(threadId, turnId),
+            type: "turn.retrying",
+            attempt: retry.attempt,
+            delayMs,
+            reason: verdict.reason,
+          });
+          // Retire the failed attempt: no card, no pending RPC, and no child
+          // may outlive it into the relaunch.
+          if (interruptTimer) clearTimeout(interruptTimer);
+          for (const finish of [...asks.values()]) finish("cancel", "system");
+          asks.clear();
+          for (const p of rpcPending.values()) {
+            if (p.timer) clearTimeout(p.timer);
+            p.clearIdle();
+            p.reject(new Error("turn retrying"));
+          }
+          rpcPending.clear();
+          stop();
+          // The thread STAYS claimed through the backoff — that entry is what
+          // makes a stop during the wait reach this turn instead of racing a
+          // relaunch nobody can see yet.
+          const cancelRetry = () => {
+            retry.cancelled = true;
+            retryAbort.abort();
+          };
+          active.set(threadId, { stop: cancelRetry, interrupt: cancelRetry, turnId, asks: new Map() });
+          void (async () => {
+            const wait = interruptibleDelay(delayMs * retryScale, retryAbort.signal);
+            await wait.promise;
+            active.delete(threadId);
+            if (retry.cancelled || disposed) {
+              retryState.delete(threadId);
+              emit({
+                ...base(threadId, turnId),
+                type: "turn.completed",
+                ok: false,
+                stopReason: retry.cancelled ? "interrupted" : "disposed",
+                cost: null,
+              });
+              return;
+            }
+            try {
+              // The SAME turn, cursor included: a turn that never got a
+              // prompt result has nothing to resume past, and re-loading the
+              // cursor it arrived with is what keeps the relaunch on the
+              // thread's real history rather than a session this attempt
+              // happened to create and abandon.
+              await sendTurn(turn);
+            } catch (error) {
+              retryState.delete(threadId);
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: error instanceof Error ? error.message : String(error),
+              });
+              emit({
+                ...base(threadId, turnId),
+                type: "turn.completed",
+                ok: false,
+                stopReason: "exit_before_result",
+                cost: null,
+              });
+            }
+          })();
+          return true;
+        };
+
         // server→client permission request → canonical request.opened
         const handleServerRequest = (msg: any) => {
           if (msg.method !== "session/request_permission") {
@@ -655,6 +903,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });
           }
           const params = msg.params ?? {};
+          // A card in front of a person, or a full-auto approval about to let
+          // a tool run, is a side effect this turn can no longer take back.
+          state.sawOutput = true;
           flushAssistantText();
           const options: Array<{ optionId?: string; kind?: string }> = Array.isArray(params.options) ? params.options : [];
           const optionFor = (want: "allow" | "reject") =>
@@ -729,6 +980,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const delta = u.content?.text;
               if (typeof delta === "string" && delta) {
                 state.text += delta;
+                // past this point a relaunch would repeat words the person
+                // already read — see maybeRetry
+                state.sawOutput = true;
                 emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
               }
               break;
@@ -736,11 +990,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             case "agent_thought_chunk": {
               const delta = u.content?.text;
               if (typeof delta === "string" && delta) {
+                state.sawOutput = true;
                 emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "reasoning_text", delta });
               }
               break;
             }
             case "tool_call": {
+              state.sawOutput = true;
               flushAssistantText();
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
@@ -830,12 +1086,23 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             } catch {
               continue;
             }
-            appendNative(threadId, { dir: "in", source: SOURCE, msg });
+            // A resumed session replays its whole history as session/update
+            // before the prompt goes out; handleNotification drops those, so
+            // teeing them only re-wrote the same transcript on every turn.
+            if (msg.method !== "session/update" || (state.promptSent && msg.params?._meta?.isReplay !== true)) {
+              appendNative(threadId, { dir: "in", source: SOURCE, msg });
+            }
+            // Inbound traffic proves the child is alive and making progress
+            // — a message chunk, a thought chunk, a tool call or result, a
+            // permission request, this response itself, anything — so every
+            // idle deadline restarts here; only total silence trips one.
+            for (const pend of rpcPending.values()) pend.armIdle();
             if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
               const pend = rpcPending.get(msg.id);
               if (pend) {
                 rpcPending.delete(msg.id);
                 if (pend.timer) clearTimeout(pend.timer);
+                pend.clearIdle();
                 if (msg.error) {
                   const error = new Error(msg.error.message ?? JSON.stringify(msg.error));
                   Object.assign(error, { code: msg.error.code, data: msg.error.data });
@@ -862,12 +1129,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           settle(false, "spawn_error");
         });
         child.on("close", (code) => {
-          if (!state.settled && !state.deadlineTerminating) {
-            emit({
-              ...base(threadId, turnId),
-              type: "runtime.error",
-              message: `${DRIVER_KIND} exited ${code} before the prompt result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
-            });
+          if (!state.settled && !state.deadlineTerminating && !state.retrying) {
+            const message = `${DRIVER_KIND} exited ${code} before the prompt result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`;
+            // A CLI that died on a provider hiccup before saying anything is
+            // worth one more launch; a CLI that died for its own reasons is
+            // not, and classifyError treats a bare nonzero exit as terminal.
+            if (maybeRetry({ exitCode: code, stderr: message })) return;
+            emit({ ...base(threadId, turnId), type: "runtime.error", message });
             settle(false, "exit_before_result");
           }
         });
@@ -879,15 +1147,51 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           interruptTimer = setTimeout(() => settle(true, "cancelled"), 5_000);
           interruptTimer.unref?.();
         };
-        active.set(threadId, { stop, interrupt, turnId, asks });
+        // Wrapped, not bare: a person who stops this turn has stopped the
+        // WHOLE turn, and the child's close event must not read as a transient
+        // failure worth relaunching.  `stop` and `interrupt` themselves stay
+        // unwrapped for the driver's own internal use (settle, deadlines).
+        const cancelAndStop = () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+          stop();
+        };
+        const cancelAndInterrupt = () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+          interrupt();
+        };
+        active.set(threadId, { stop: cancelAndStop, interrupt: cancelAndInterrupt, turnId, asks });
+
+        // Read the host load once per spawn: the deadline this boot gets is
+        // fixed when it starts, not re-judged while it runs.
+        const initDeadline = resolveInitDeadline({
+          configured: turnConfig.initTimeoutMs,
+          engineBaseMs: support.initTimeoutMs,
+          load: readHostLoad(),
+        });
 
         (async () => {
           try {
-            const init = await request(
-              "initialize",
-              { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
-              INIT_TIMEOUT,
-            );
+            const initStartedAt = Date.now();
+            let init: any;
+            try {
+              init = await request(
+                "initialize",
+                { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } },
+                initDeadline.timeoutMs,
+              );
+            } catch (error) {
+              // Name the budget in the failure so a log line says whether
+              // the deadline or the boot was the outlier.
+              throw error instanceof AcpRpcTimeoutError
+                ? new AcpRpcTimeoutError("initialize", describeInitDeadline(initDeadline))
+                : error;
+            }
+            const initElapsedMs = Date.now() - initStartedAt;
+            if (initElapsedMs >= SLOW_INIT_LOG_MS) {
+              console.warn(`[acp] ${DRIVER_KIND} ${describeSlowInit(initElapsedMs, initDeadline)}`);
+            }
             const methods: Array<{ id?: string }> = Array.isArray(init?.authMethods) ? init.authMethods : [];
             const methodId = support.pickAuthMethod(methods);
             if (!skipSubscriptionAuthForLocalInject(turn.model)) {
@@ -1024,7 +1328,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 sessionId,
                 prompt: [{ type: "text", text }],
               },
-              turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS,
+              turnConfig.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS,
+              turnConfig.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS,
             );
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
@@ -1042,7 +1347,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             else if (reason === "cancelled") settle(true, "cancelled");
             else settle(false, reason ?? "failed");
           } catch (e) {
-            if (!state.settled) {
+            if (!state.settled && !state.retrying) {
               const resumeFailure = e instanceof AcpResumeError;
               const classifiedFailure = resumeFailure && e.cause !== undefined ? e.cause : e;
               const classifiedMessage = classifiedFailure instanceof Error
@@ -1050,7 +1355,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 : String(classifiedFailure);
               const code = support.classifyError?.(classifiedFailure);
               const promptTimedOut = e instanceof AcpRpcTimeoutError && e.method === "session/prompt";
-              if (promptTimedOut && sessionId) {
+              const initTimedOut = e instanceof AcpRpcTimeoutError && e.method === "initialize";
+              // Same shape as a hard timeout — an unresponsive child on the
+              // other end of a wedged RPC — just detected by total silence
+              // instead of elapsed wall clock, so the cleanup is identical.
+              const promptWentIdle = e instanceof AcpPromptIdleError && e.method === "session/prompt";
+              if ((promptTimedOut || promptWentIdle) && sessionId) {
                 state.deadlineTerminating = true;
                 // ACP cancellation is a notification.  Flush it to the child
                 // and give its event loop one bounded chance to handle it
@@ -1079,6 +1389,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const message = resumeFailure && needsAuth && classifiedMessage !== baseMessage
                 ? `${baseMessage}  ${classifiedMessage}`
                 : baseMessage;
+              // A 429 or a reset during initialize / session setup / prompt is
+              // a failure to start, and `sawOutput` inside maybeRetry is what
+              // proves nothing has happened yet.  An auth problem is the
+              // person's to fix and is never retried; a prompt timeout or an
+              // idle stall already set `deadlineTerminating`, which
+              // maybeRetry refuses — a wedged child must not be relaunched
+              // into the same hang.
+              //
+              // An initialize deadline earns ONE relaunch, not the whole
+              // transient budget: the relaunch repeats the entire cold boot
+              // under the same host load, and a second one mostly adds load.
+              const initRelaunchSpent = initTimedOut && retry.attempt >= MAX_INIT_TIMEOUT_RELAUNCHES;
+              if (
+                !needsAuth &&
+                !initRelaunchSpent &&
+                maybeRetry(classifiedFailure instanceof Error ? classifiedFailure : { text: classifiedMessage })
+              ) {
+                return;
+              }
               emit({
                 ...base(threadId, turnId),
                 type: "runtime.error",
@@ -1093,7 +1422,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     ? "resume_failed"
                     : promptTimedOut
                       ? "prompt_timeout"
-                      : "rpc_error",
+                      : promptWentIdle
+                        ? "prompt_stall"
+                        : "rpc_error",
               );
             }
           }

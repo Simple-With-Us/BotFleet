@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
@@ -14,10 +15,12 @@ import { newId, type CloudBackend, type ModelSelection, type ThreadId, type Turn
 import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
+import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 
-export type MausColor =
+export type BotColor =
   | "green"
   | "blue"
   | "red"
@@ -34,7 +37,12 @@ export type MausColor =
  * string rather than a union: bots saved under the app's earlier ten-face
  * vocabulary still carry those names, and the client resolves both on read.
  */
-export type MausExpression = string;
+export type BotExpression = string;
+
+/** @deprecated Prefer BotColor. */
+export type MausColor = BotColor;
+/** @deprecated Prefer BotExpression. */
+export type MausExpression = BotExpression;
 
 export interface OptionCardData {
   title: string;
@@ -97,7 +105,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** Persisted audio clips for this exact reply, in playback order. */
@@ -275,6 +283,11 @@ export interface TaskRecord {
    * falling through to the run-history fallback (which fails once the
    * source task is gone) and minting a duplicate. */
   automationKeyAliases?: string[];
+  /** This thread is asleep: 0 sleeps until the thread does anything again,
+   * a timestamp sleeps until that moment, and absent means awake.  Narrower
+   * than the bot-wide snooze in `server/routines.ts` — the bot keeps working
+   * its other threads.  See `shared/thread-snooze.ts`. */
+  snoozedUntil?: number;
 }
 
 export interface TaskUsage {
@@ -492,8 +505,8 @@ export interface BotRecord {
   title: string;
   description: string;
   notifications: boolean;
-  color: MausColor;
-  mascotExpression?: MausExpression | null;
+  color: BotColor;
+  mascotExpression?: BotExpression | null;
   /** App-owned attachment served as this bot's custom profile image. */
   avatarUrl?: string;
   /** Mascot, or the crop applied to avatarUrl. */
@@ -525,6 +538,10 @@ export interface BotRecord {
   /** Tools this bot may always use without asking, even outside auto mode
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
+  /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
+   * HTTP / openai-compat). Unset = DEFAULT_TURN_LOOP_BUDGET.maxRounds (12).
+   * Integer 1..200; invalid values are treated as absent at dispatch. */
+  maxToolRounds?: number;
   /** Speak this bot's replies aloud as they settle, without being asked.
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
@@ -558,6 +575,13 @@ export interface BotRecord {
    * start false — a shared persona must not reach the user's Gmail on
    * turn one. */
   composio?: boolean;
+  /** Per-bot Composio tool grants. Unset = legacy all-tools (every
+   * connected service, every tool) — added after bots already existed, so
+   * an untouched bot must keep working exactly as before. An explicit
+   * record — including the empty one — restricts to exactly what it names;
+   * enforced in the /api/internal/connectors/mcp relay (connector-verdict.ts),
+   * never here. See shared/connector-tools.ts for the grant shape. */
+  connectorTools?: Record<string, ConnectorToolGrant>;
   /** Additional repo paths for context. */
   extraCwds?: string[];
   /** Custom user-provided instructions and persistent memory notes. */
@@ -599,9 +623,11 @@ export interface InstalledPackageMetadata {
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
+/** How long a burst of saveBots() calls coalesces into one atomic write. */
+const BOTS_SAVE_DEBOUNCE_MS = 250;
 const messagesFile = (threadId: string) => join(DATA_DIR, `messages-${threadId}.json`);
 
-const COLORS: MausColor[] = [
+const COLORS: BotColor[] = [
   "green",
   "blue",
   "red",
@@ -723,10 +749,62 @@ interface ThreadState {
   activeLeafId: string | null;
 }
 
+/** How many threads' full message arrays `Store` keeps warm in memory at
+ * once. `GET /api/bots` used to hydrate every bot and group's thread
+ * through this cache with no eviction — one request against a large
+ * database pulled every thread into the heap for the life of the process
+ * (HS12/HS21). A thread's existence lives on its bot/group record, never
+ * here, so evicting a thread's cached messages loses nothing durable:
+ * the next read just re-hydrates from sqlite. */
+const DEFAULT_THREAD_CACHE_LIMIT = 64;
+
+/** A bounded LRU over per-thread message caches. `get` touches (moves the
+ * entry to the most-recently-used end); `set` evicts the least-recently-
+ * used entries past `limit`. Backed by a plain Map: insertion order is
+ * Map's own iteration order, so "delete then re-set" is enough to move a
+ * key to the MRU end, and `.keys().next()` is always the LRU key. */
+class ThreadCache {
+  private map = new Map<string, ThreadState>();
+  private limit: number;
+
+  constructor(limit: number) {
+    this.limit = limit;
+  }
+
+  get(threadId: string): ThreadState | undefined {
+    const state = this.map.get(threadId);
+    if (state) {
+      this.map.delete(threadId);
+      this.map.set(threadId, state);
+    }
+    return state;
+  }
+
+  set(threadId: string, state: ThreadState): void {
+    this.map.delete(threadId);
+    this.map.set(threadId, state);
+    while (this.map.size > this.limit) {
+      const oldest = this.map.keys().next().value;
+      if (oldest === undefined) break;
+      this.map.delete(oldest);
+    }
+  }
+
+  delete(threadId: string): void {
+    this.map.delete(threadId);
+  }
+
+  /** Membership only — deliberately does not touch LRU order, so a test
+   * can inspect the cache without perturbing the eviction it's testing. */
+  has(threadId: string): boolean {
+    return this.map.has(threadId);
+  }
+}
+
 export class Store {
   bots: BotRecord[] = [];
   groups: GroupRecord[] = [];
-  private threads = new Map<string, ThreadState>();
+  private threads: ThreadCache;
   private defaultSelection: () => ModelSelection;
   private listeners = new Set<(change: StoreChange) => void>();
   /** true when no bots.json existed at load — the one time the roster is seeded */
@@ -734,9 +812,24 @@ export class Store {
   /** true when bots.json existed but did not parse — do not treat an empty
    * in-memory roster as "every room member was deleted". */
   private botsLoadFailed = false;
+  /** Coalesces bursts of saveBots() calls — a single startTurn used to fire
+   * at least three full-roster fsynced rewrites — into one atomic write.
+   * Fires a fixed delay after the first dirty call in a burst rather than
+   * resetting per call, so sustained activity still flushes on a bounded
+   * cadence instead of being starved. */
+  private saveBotsTimer: ReturnType<typeof setTimeout> | null = null;
+  private botsDirty = false;
+  /** Thread ids sleeping on the until-activity sentinel.  `appendMessage`
+   * is the hot path every turn runs through, so it asks this rather than
+   * walking the roster for a snooze that is almost never there. */
+  private readonly threadsAwaitingActivity = new Set<string>();
 
-  constructor(defaultSelection: () => ModelSelection) {
+  /** `opts.threadCacheLimit` only exists so tests can force evictions
+   * without creating dozens of real threads; production always takes the
+   * default. */
+  constructor(defaultSelection: () => ModelSelection, opts: { threadCacheLimit?: number } = {}) {
     this.defaultSelection = defaultSelection;
+    this.threads = new ThreadCache(opts.threadCacheLimit ?? DEFAULT_THREAD_CACHE_LIMIT);
     mkdirSync(DATA_DIR, { recursive: true });
     try {
       this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
@@ -780,6 +873,13 @@ export class Store {
       if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
         delete b.avatarCrop;
         botsMigrated = true;
+      }
+      // A snooze IS durable — unlike busy, it is a decision the person made,
+      // and a relaunch must not wake every thread they put to sleep.  Only
+      // the until-activity index is rebuilt here; expired deadlines heal on
+      // read and are swept by `wakeExpiredThreadSnoozes`.
+      for (const task of b.tasks ?? []) {
+        if (task.snoozedUntil === SNOOZE_UNTIL_ACTIVITY) this.threadsAwaitingActivity.add(task.threadId);
       }
     }
     for (const b of this.bots) {
@@ -887,7 +987,44 @@ export class Store {
   }
 
   private saveBots() {
-    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots, null, 2));
+    this.botsDirty = true;
+    if (this.saveBotsTimer) return;
+    this.saveBotsTimer = setTimeout(() => this.flushBotsFromTimer(), BOTS_SAVE_DEBOUNCE_MS);
+    this.saveBotsTimer.unref?.();
+  }
+
+  /** The debounce timer's flush.  A throw here would be an uncaught exception
+   * in a timer callback, so a failed write is logged instead; `botsDirty`
+   * stays set, and the next saveBots() or the shutdown flush retries it. */
+  private flushBotsFromTimer(): void {
+    this.saveBotsTimer = null;
+    try {
+      this.flushBotsNow();
+    } catch (error) {
+      console.error("store: debounced bots.json save failed; the next save or shutdown retries it", error);
+    }
+  }
+
+  /** Synchronous, immediate write-through — used by patchBot() for the
+   * inflightThreadId crash marker (unlike busy/activity, it survives a
+   * restart and must be durable before a turn dispatches), by tests
+   * asserting on-disk state right after a mutation (including a fresh
+   * `new Store` against the same files, which reads whatever is on disk
+   * right now), and by the shutdown path so a pending coalesced save is
+   * never lost when the process exits. A no-op when nothing is dirty.
+   * `botsDirty` is cleared only after the write succeeds, so a failed write
+   * throws with the pending change still marked for the next try. */
+  flushBotsNow(): void {
+    if (this.saveBotsTimer) {
+      clearTimeout(this.saveBotsTimer);
+      this.saveBotsTimer = null;
+    }
+    if (!this.botsDirty) return;
+    // busy/activity never survive a restart (reset on load above) and
+    // change on every turn transition, so they are excluded here rather
+    // than debounced — nothing to coalesce for state nobody reads back.
+    writeFileAtomic(BOTS_FILE, JSON.stringify(this.bots.map(({ busy, activity, ...bot }) => bot), null, 2));
+    this.botsDirty = false;
   }
 
   private saveGroups() {
@@ -1347,11 +1484,21 @@ export class Store {
   }
 
   private thread(threadId: string): ThreadState {
-    let t = this.threads.get(threadId);
+    const t = this.threads.get(threadId);
     if (t) return t;
     // SQLite is the source of truth; a thread with no rows imports its
     // legacy messages-<threadId>.json once, inside readThread
-    const { messages, activeLeafId: storedLeaf } = mdb.readThread(threadId, messagesFile(threadId));
+    return this.cacheThread(threadId, mdb.readThread(threadId, messagesFile(threadId)));
+  }
+
+  /** Finish hydrating a full set of thread rows into the cache: chain any
+   * legacy (pre-branching) rows' parentId in array order, default the
+   * active leaf to the newest message, and store it (evicting the LRU
+   * entry if the cache is now over its bound). Shared by a full load and
+   * by messagesTail() when its bounded read turns out to be the whole
+   * thread anyway. */
+  private cacheThread(threadId: string, rows: mdb.ThreadRows): ThreadState {
+    const { messages, activeLeafId: storedLeaf } = rows;
     let activeLeafId = storedLeaf;
     // legacy rows carry no parentId — chain them in array order
     let prev: string | null = null;
@@ -1360,13 +1507,53 @@ export class Store {
       prev = m.id;
     }
     if (!activeLeafId) activeLeafId = messages.at(-1)?.id ?? null;
-    t = { messages, activeLeafId };
+    const t = { messages, activeLeafId };
     this.threads.set(threadId, t);
     return t;
   }
 
   messagesFor(threadId: string): Message[] {
     return this.thread(threadId).messages;
+  }
+
+  /** A bounded page of a thread's newest messages, for callers that only
+   * need a display page — the GET /api/bots hydrate and a fresh
+   * scrollback view. Reads just `limit` rows at the SQL boundary instead
+   * of the whole transcript (HS12/HS21), unless the thread is already
+   * cached from other work (then it's a plain in-memory slice, no extra
+   * SQL) or the bounded read comes back as the complete thread anyway
+   * (short thread, or a one-time legacy import) — that gets cached like
+   * any other full load so a later messagesFor() doesn't re-read it.
+   * Legacy rows that predate per-message parentId are only chained
+   * correctly on a full load, so a bounded page missing that context
+   * falls back to one rather than returning messages with a broken
+   * parent chain. */
+  messagesTail(threadId: string, limit: number): { messages: Message[]; hasMore: boolean; activeLeafId: string | null } {
+    let state = this.threads.get(threadId);
+    if (!state) {
+      const tail = mdb.readThreadTail(threadId, messagesFile(threadId), limit);
+      const legacyRows = tail.hasMore !== undefined && tail.messages.some((m) => m.parentId === undefined);
+      if (tail.hasMore !== true || legacyRows) {
+        state = this.cacheThread(threadId, legacyRows ? mdb.readThread(threadId, messagesFile(threadId)) : tail);
+      } else {
+        return {
+          messages: tail.messages,
+          hasMore: tail.hasMore,
+          activeLeafId: tail.activeLeafId ?? tail.messages.at(-1)?.id ?? null,
+        };
+      }
+    }
+    const { messages, activeLeafId } = state;
+    const start = Math.max(0, messages.length - limit);
+    return { messages: messages.slice(start), hasMore: start > 0, activeLeafId };
+  }
+
+  /** Test-only: whether a thread's messages are currently warm in the LRU,
+   * so a test can prove a bounded read stayed bounded (or that eviction
+   * actually happened) without depending on internal call counts. Reads
+   * membership only — does not touch LRU order. */
+  threadIsCachedForTests(threadId: string): boolean {
+    return this.threads.has(threadId);
   }
 
   activeLeaf(threadId: string): string | null {
@@ -1399,6 +1586,11 @@ export class Store {
       }
     }
     this.emit({ type: "message", threadId, message: full });
+    // A message landing here IS the "new activity" an until-activity snooze
+    // waits for — whoever caused it, a person, a routine or the bot itself.
+    // Every path that adds to a transcript funnels through here, so this one
+    // hook is the whole alarm.  A timed snooze is left to its clock.
+    if (this.threadsAwaitingActivity.has(threadId)) this.wakeThreadOnActivity(threadId);
     // The first-run quiz is not a live ask. Talking past it hides it so the
     // transcript is just the greeting plus what they said. Cards with a
     // requestId are permission/question prompts and stay until answered.
@@ -1443,9 +1635,9 @@ export class Store {
 
   /** Fork the conversation: a new message that replaces `sourceId`
    * (same parent, new text) and becomes the active leaf.  Preserves the
-   * source's role and automationSource — regenerating or editing an
-   * auto-delivered instruction (role="system") must produce another
-   * system-attributed prompt, not a fabricated human user bubble. */
+   * source's role, automationSource, and sender. A branched delegation is
+   * rerun directly, not mirrored into its former bot-to-bot channel, so it
+   * must not claim a peer-thread link to an exchange that never happened. */
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
@@ -1461,6 +1653,10 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      from: source.from ? { ...source.from } : undefined,
+      comm: source.comm && source.automationSource !== "delegation" &&
+        !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
+        ? { ...source.comm } : undefined,
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
@@ -1602,12 +1798,22 @@ export class Store {
     }
     Object.assign(bot, patch);
     this.saveBots();
+    if ("inflightThreadId" in patch) {
+      // Durable crash marker (see the field's own doc comment): unlike
+      // busy/activity it survives a restart, and boot recovery depends on it
+      // being on disk before a turn actually dispatches — a debounced write
+      // could lose it to a crash in the gap. Flush immediately rather than
+      // let it coalesce with the general roster debounce.
+      this.flushBotsNow();
+    }
     this.emit({ type: "bot", botId: id });
     return bot;
   }
 
   /** The one way runtime state changes. Sets `activity` and derives `busy`
-   * from it, so a reader that only knows busy sees the same truth. */
+   * from it, so a reader that only knows busy sees the same truth. Neither
+   * field is persisted (both reset to idle on load — see the constructor),
+   * so an activity blink never touches disk. */
   setActivity(botId: string, activity: BotActivity): BotRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
@@ -1616,7 +1822,6 @@ export class Store {
     bot.activity = activity;
     bot.busy = busy;
     bot.activityStartedAt = Date.now();
-    this.saveBots();
     this.emit({ type: "bot", botId });
     return bot;
   }
@@ -1868,8 +2073,12 @@ export class Store {
     return this.patchTask(botId, threadId, { title });
   }
 
-  /** Rename and/or set a per-thread model.  `modelSelection: null` clears
-   * the override so the bot's engine is used again. */
+  /** Rename, set a per-thread model, or put the thread to sleep.
+   *
+   * `modelSelection: null` clears the override so the bot's engine is used
+   * again; `snoozedUntil: null` wakes the thread now.  An omitted field
+   * always means "leave it alone", which is why waking travels as an
+   * explicit null rather than as an absent key. */
   patchTask(
     botId: string,
     threadId: string,
@@ -1877,6 +2086,7 @@ export class Store {
       title?: string;
       modelSelection?: ModelSelection | null;
       activeModelSelection?: ModelSelection | null;
+      snoozedUntil?: number | null;
     },
   ): TaskRecord | null {
     const task = this.bot(botId)?.tasks?.find((t) => t.threadId === threadId);
@@ -1892,9 +2102,53 @@ export class Store {
       if (patch.activeModelSelection === null) delete task.activeModelSelection;
       else task.activeModelSelection = patch.activeModelSelection;
     }
+    if (patch.snoozedUntil !== undefined) {
+      if (patch.snoozedUntil === null) delete task.snoozedUntil;
+      else task.snoozedUntil = patch.snoozedUntil;
+      if (task.snoozedUntil === SNOOZE_UNTIL_ACTIVITY) this.threadsAwaitingActivity.add(threadId);
+      else this.threadsAwaitingActivity.delete(threadId);
+    }
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** End an until-activity snooze because the thread just did something.
+   *
+   * Self-healing: a thread that has since been deleted or merged away leaves
+   * the index, so a stale id costs one lookup once and never again. */
+  private wakeThreadOnActivity(threadId: string): void {
+    this.threadsAwaitingActivity.delete(threadId);
+    const bot = this.bots.find((b) => b.tasks?.some((t) => t.threadId === threadId));
+    const task = bot?.tasks?.find((t) => t.threadId === threadId);
+    if (!bot || !task || task.snoozedUntil !== SNOOZE_UNTIL_ACTIVITY) return;
+    delete task.snoozedUntil;
+    this.saveBots();
+    this.emit({ type: "bot", botId: bot.id });
+  }
+
+  /** Drop every snooze whose deadline has passed, so a woken thread returns
+   * to plain update order without waiting for someone to touch its bot.
+   *
+   * Clients heal expired deadlines on read as well — the harness clock is
+   * the authority and a device's may be skewed — but a desktop or phone left
+   * open needs the change to ARRIVE, which is what the emit here is for.
+   * Returns the bots that changed so a caller can log or assert on it. */
+  wakeExpiredThreadSnoozes(now = Date.now()): string[] {
+    const woken: string[] = [];
+    for (const bot of this.bots) {
+      let changed = false;
+      for (const task of bot.tasks ?? []) {
+        if (!isSnoozeExpired(task.snoozedUntil, now)) continue;
+        delete task.snoozedUntil;
+        changed = true;
+      }
+      if (changed) woken.push(bot.id);
+    }
+    if (!woken.length) return woken;
+    this.saveBots();
+    for (const botId of woken) this.emit({ type: "bot", botId });
+    return woken;
   }
 
   /** Name a task after its first message, once. */

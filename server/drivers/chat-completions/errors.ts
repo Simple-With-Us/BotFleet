@@ -66,8 +66,8 @@ export function httpErrorFor(status: number, body: string, headers?: HeaderReade
 /** Ceiling on a provider's own `Retry-After`.  Honouring the header is the
  *  point — a provider knows its own cool-down better than a fixed schedule
  *  does — but a 429 asking for five minutes is a wait no chat turn should
- *  serve: the person is watching a spinner, and the round's own 180s
- *  ceiling would kill it anyway.  Past this cap the loop's budget guard
+ *  serve: the person is watching a spinner, and a provider that has
+ *  asked for silence would trip the round's 120s idle clock anyway.  Past this cap the loop's budget guard
  *  declines the retry outright rather than sleeping toward a deadline it
  *  cannot beat. */
 export const RETRY_AFTER_CAP_MS = 30_000;

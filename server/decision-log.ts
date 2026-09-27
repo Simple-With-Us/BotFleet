@@ -46,7 +46,9 @@ export type DecisionSource =
   | "routine"
   | "user"
   | "auto-review"
-  | "auto-review-shadow";
+  | "auto-review-shadow"
+  // the per-bot connectorTools grant check at the connected-apps relay
+  | "connector-scope";
 
 export interface DecisionRow {
   at: string;

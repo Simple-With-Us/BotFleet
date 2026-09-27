@@ -169,7 +169,7 @@ export function providersForBot(
  * can fire. */
 export type CloudAutomationSource = {
   botId: string;
-  runOn: "maus" | "cloud";
+  runOn: "bot" | "cloud";
   enabled: boolean;
 };
 

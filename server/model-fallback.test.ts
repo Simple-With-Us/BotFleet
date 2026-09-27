@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
 import {
@@ -639,6 +639,42 @@ describe("parseQuotaResetTime", () => {
     expect(res.isQuotaOrCap).toBe(true);
     expect(typeof res.resetsAt).toBe("number");
     expect(res.resetsAt).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  // Behaviour pin for the hoisted Intl.DateTimeFormat in computeNextOccurrence:
+  // the zoned search must land on the same instant it always did, and it must
+  // build its formatter once per parse rather than once per candidate minute.
+  it("resolves a zoned time-of-day reset to the exact next instant in that zone", () => {
+    // 12:00 UTC on Fri, Sep 25, 2026 is 7:00 AM CDT (UTC-5).
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+    // The next 12:10 AM in Chicago is 05:10 UTC the following day.
+    expect(res.resetsAt).toBe(Date.UTC(2026, 8, 26, 5, 10, 0));
+
+    // Same wall time in winter, when Chicago is UTC-6.
+    const winter = Date.UTC(2026, 0, 15, 12, 0, 0);
+    const winterRes = parseQuotaResetTime("You've hit your session limit · resets 3:30pm (America/Chicago)", winter);
+    expect(winterRes.resetsAt).toBe(Date.UTC(2026, 0, 15, 21, 30, 0));
+  });
+
+  it("builds the zone formatter once per parse, not once per candidate minute", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const spy = vi.spyOn(Intl, "DateTimeFormat");
+    try {
+      parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("falls back to local time for a zone Intl does not recognize", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (Not/AZone)", now);
+    const local = new Date(now);
+    local.setHours(0, 10, 0, 0);
+    if (local.getTime() <= now) local.setDate(local.getDate() + 1);
+    expect(res.resetsAt).toBe(local.getTime());
   });
 
   it("parses midnight reset", () => {

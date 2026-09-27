@@ -310,7 +310,7 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation";
 
 export interface BootRecoveryResumeUser {
   role?: string;
@@ -454,15 +454,20 @@ export interface BotQuotaCooldown {
 function computeNextOccurrence(targetHour: number, targetMinute: number, tz: string | undefined, now: number): number {
   if (tz) {
     try {
+      // Built once per call, not once per candidate minute.  Constructing an
+      // Intl.DateTimeFormat loads ICU zone data and is by far the costliest
+      // step here; inside the loop it ran up to 2,160 times on the main
+      // thread for every zoned reset chip.  An unrecognized zone still
+      // throws from this constructor and still falls through to local time.
+      const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hour: "numeric",
+        minute: "numeric",
+        hour12: false,
+      });
       // Find candidate timestamp within the next 36 hours matching the hour:minute in that tz
       for (let offsetMinutes = 1; offsetMinutes <= 36 * 60; offsetMinutes++) {
         const candidate = new Date(now + offsetMinutes * 60 * 1000);
-        const formatter = new Intl.DateTimeFormat("en-US", {
-          timeZone: tz,
-          hour: "numeric",
-          minute: "numeric",
-          hour12: false,
-        });
         const parts = formatter.formatToParts(candidate);
         const h = parseInt(parts.find((p) => p.type === "hour")?.value ?? "-1", 10);
         const m = parseInt(parts.find((p) => p.type === "minute")?.value ?? "-1", 10);

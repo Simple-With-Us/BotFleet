@@ -156,6 +156,14 @@ interface IntegrationContext {
   threadId: string;
 }
 
+/** Headers the connector-proxy stdio bridge sends on every relay to
+ * /api/internal/connectors/mcp, naming the bot on whose behalf it is
+ * calling. The route handler (server/index.ts) reads these to enforce that
+ * bot's connectorTools grants — see the OMB_CONNECTOR_UPSTREAM_HEADERS
+ * comment in mcpIntegration below for why headers rather than the body. */
+export const CONNECTOR_BOT_ID_HEADER = "x-botfleet-bot-id";
+export const CONNECTOR_THREAD_ID_HEADER = "x-botfleet-thread-id";
+
 let managedBrokerAccess: { url: string; token: string } | null | undefined;
 let managedBrokerGeneration = 0;
 
@@ -571,7 +579,18 @@ export async function mcpIntegration(
       // Project/broker credentials stay in the harness process, so a coding
       // agent that prints its environment cannot export a durable secret.
       OMB_CONNECTOR_UPSTREAM_URL: `${context.harnessUrl}/api/internal/connectors/mcp`,
-      OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({ authorization: `Bearer ${context.commsToken}` }),
+      // COMMS_TOKEN is one shared secret for every internal caller, so it
+      // alone does not say which bot is relaying — the connectorTools
+      // verdict (connector-verdict.ts) needs that to pick the right grants
+      // and to write an attributable decision-log row. Carried as headers
+      // (merged into every relay request by connector-proxy.ts's existing
+      // upstreamHeaders mechanism) rather than folded into the JSON-RPC
+      // body, so the payload Composio itself sees never changes shape.
+      OMB_CONNECTOR_UPSTREAM_HEADERS: JSON.stringify({
+        authorization: `Bearer ${context.commsToken}`,
+        [CONNECTOR_BOT_ID_HEADER]: context.botId,
+        [CONNECTOR_THREAD_ID_HEADER]: context.threadId,
+      }),
       OMB_HARNESS_URL: context.harnessUrl,
       OMB_COMMS_TOKEN: context.commsToken,
       OMB_BOT_ID: context.botId,

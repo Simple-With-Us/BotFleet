@@ -68,8 +68,11 @@ const DAILY_SWEEP_MS = 24 * 60 * 60 * 1000;
  * over the original.  A SIGKILL or a power loss between those two steps
  * leaves the temp file behind with nothing to reclaim it, so the sweep does:
  * a temp file whose writer is gone, or that is older than an hour, is not a
- * trim in flight. */
-const TEMP_NAME = /^(?:.+)\.ndjson(?:\.1)?\.(\d{1,10})\.[0-9a-f-]{36}\.tmp$/;
+ * trim in flight.  Group 1 is the thread id prefix (`<threadId>.ndjson[.1]`
+ * minus the `.ndjson`/`.ndjson.1` suffix), group 2 the pid — the orphan sweep
+ * below reads group 1 to fold a stray temp file into the thread it belongs
+ * to; `sweepTranscriptLogs` reads group 2 for `reapStaleTemp`. */
+const TEMP_NAME = /^(.+)\.ndjson(?:\.1)?\.(\d{1,10})\.[0-9a-f-]{36}\.tmp$/;
 const STALE_TEMP_MS = 60 * 60 * 1000;
 
 /** Live byte counts, so the cap costs an arithmetic compare per append rather
@@ -373,7 +376,7 @@ export function sweepTranscriptLogs(dir: string, maxBytes: number, now: number =
   for (const name of names) {
     const temp = TEMP_NAME.exec(name);
     if (temp) {
-      const reaped = reapStaleTemp(join(dir, name), Number(temp[1]), now);
+      const reaped = reapStaleTemp(join(dir, name), Number(temp[2]), now);
       if (reaped.removed) {
         result.tempRemoved += 1;
         result.bytesReclaimed += reaped.bytes;
@@ -474,4 +477,180 @@ export function startTranscriptRetentionSweeps(
   }, DAILY_SWEEP_MS);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+// ── Orphan and age sweep ───────────────────────────────────────────────────
+//
+// Everything above bounds a LIVE thread's log to a byte cap. Nothing above
+// ever asks whether the thread is still live at all, which is the actual gap
+// behind HS1: a thread that stops being used keeps its two 64 MB native
+// generations and two 16 MB events generations forever — 160 MB per thread
+// ever created, observed as 1.2 GB across 209 native files (188 idle 7+
+// days) and 143 MB across 202 events files (179 idle 14+ days) on the
+// owner's Mac.
+//
+// The rule is an AND, not an OR: a thread id absent from the store AND whose
+// newest file (across both directories, both generations) has not been
+// touched in ORPHAN_MAX_AGE_MS. Age alone would delete a long-idle thread the
+// user might reopen tomorrow; orphan alone would delete a thread mid-turn if
+// the store read raced a save. Together, a false positive needs the store to
+// have forgotten the thread AND a week of silence — the same conservatism
+// `removeTranscriptLogs`'s callers already rely on for explicit deletes.
+//
+// A sibling project (server/thread-retention.ts, PR #1280) sweeps by a
+// different axis: threads still IN the store but closed or archived, guarded
+// by skipping anything busy, unread, or with an open direct handoff. That
+// does not apply here — this codebase's TaskRecord/BotRecord/GroupRecord
+// have no closedAt/archivedAt/openDirectHandoff, and there is no close- or
+// archive-thread feature to hang that guard on. It would not be redundant
+// even if ported: this sweep already only ever considers ids `liveThreadIds`
+// does NOT contain, and busy/unread/handoff-open are properties of a record
+// that is, by construction, still in that set — so a thread this sweep could
+// ever touch has no such state to check in the first place. Porting the
+// field-based guard here would be a no-op at best and a schema change this
+// finding never asked for at worst.
+
+/** How long an orphaned thread's logs survive before this sweep removes
+ * them.  A week, not a day: the daily cap sweep already bounds live disk use,
+ * so this only needs to be shorter than "forever". */
+export const ORPHAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The thread id a transcript log's file name encodes.  Only ever called
+ * after `isTranscriptLogName`, so the `.ndjson` / `.ndjson.1` suffix is
+ * already known to be there. */
+function threadIdFromLogName(name: string): string {
+  const base = name.endsWith(ROTATED_SUFFIX) ? name.slice(0, -ROTATED_SUFFIX.length) : name;
+  return base.slice(0, -".ndjson".length);
+}
+
+/** The thread id a trim's leftover temp file name encodes
+ * (`<threadId>.ndjson[.1].<pid>.<uuid>.tmp`), or null when `name` does not
+ * match that shape.  `removeTranscriptLogs` already deletes a thread's stray
+ * temp files alongside its logs; this is what lets the orphan sweep's own
+ * byte/file count agree with what that deletion actually does, rather than
+ * silently under-reporting whenever an interrupted trim left one behind. */
+function threadIdFromTempName(name: string): string | null {
+  const match = TEMP_NAME.exec(name);
+  return match ? match[1]! : null;
+}
+
+export interface OrphanSweepResult {
+  /** distinct orphaned thread ids old enough to act on */
+  ids: number;
+  /** files removed — or that would be removed under dry run — normally up
+   *  to 4 per id (native live/rotated, events live/rotated), plus any stray
+   *  `.tmp` file left by an interrupted trim for that id */
+  files: number;
+  bytesReclaimed: number;
+  dryRun: boolean;
+}
+
+/** Delete both generations of `native/<id>.ndjson` and `events/<id>.ndjson`,
+ * and any leftover trim temp file beside them, for every thread id that is
+ * neither in `liveThreadIds` nor touched within `maxAgeMs`.  `liveThreadIds`
+ * is the caller's job to build — every bot's
+ * active thread and every task thread, every group's active thread and every
+ * group task thread (see the call site in index.ts, which builds this the
+ * same way `Store`'s own legacy-import pass does).
+ *
+ * `dryRun` reports exactly what a real run would do — same ids, same file
+ * count, same bytes — without touching disk, so `OMB_RETENTION_DRY_RUN=1`
+ * gives an honest preview rather than a guess. */
+export function sweepOrphanedTranscripts(
+  dirs: TranscriptDirs,
+  liveThreadIds: ReadonlySet<string>,
+  opts: { now?: number; maxAgeMs?: number; dryRun?: boolean } = {},
+): OrphanSweepResult {
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? ORPHAN_MAX_AGE_MS;
+  const dryRun = opts.dryRun ?? false;
+
+  // thread id -> what it holds across BOTH directories, so a write to either
+  // one is enough to keep the thread out of the "untouched" bucket.
+  const candidates = new Map<string, { files: number; bytes: number; newestMtime: number }>();
+  for (const dir of [dirs.eventsDir, dirs.nativeDir]) {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      let threadId: string;
+      if (isTranscriptLogName(name)) {
+        threadId = threadIdFromLogName(name);
+      } else {
+        const tempThreadId = threadIdFromTempName(name);
+        if (tempThreadId === null) continue;
+        threadId = tempThreadId;
+      }
+      // Never delete a file for a live id — checked before anything else
+      // here touches the file.
+      if (liveThreadIds.has(threadId)) continue;
+      let stat: { mtimeMs: number; size: number };
+      try {
+        stat = statSync(join(dir, name));
+      } catch {
+        continue;
+      }
+      const entry = candidates.get(threadId) ?? { files: 0, bytes: 0, newestMtime: 0 };
+      entry.files += 1;
+      entry.bytes += stat.size;
+      entry.newestMtime = Math.max(entry.newestMtime, stat.mtimeMs);
+      candidates.set(threadId, entry);
+    }
+  }
+
+  const orphaned: string[] = [];
+  let files = 0;
+  let bytesReclaimed = 0;
+  for (const [threadId, candidate] of candidates) {
+    if (now - candidate.newestMtime < maxAgeMs) continue;
+    orphaned.push(threadId);
+    files += candidate.files;
+    bytesReclaimed += candidate.bytes;
+  }
+  if (!dryRun && orphaned.length) {
+    // One listing per directory for every orphan together, the same
+    // batching `removeTranscriptLogs` already does for a room's tasks.
+    for (const dir of [dirs.eventsDir, dirs.nativeDir]) removeTranscriptLogs(dir, orphaned);
+  }
+  return { ids: orphaned.length, files, bytesReclaimed, dryRun };
+}
+
+/** One line for the boot or daily log, or null when there was nothing to
+ * report. */
+export function describeOrphanSweep(result: OrphanSweepResult): string | null {
+  if (result.files === 0) return null;
+  const verb = result.dryRun ? "would remove" : "removed";
+  const logs = result.files === 1 ? "log" : "logs";
+  return `[retention] ${verb} ${result.files} transcript ${logs}, ${result.bytesReclaimed} bytes`;
+}
+
+/** Runs the orphan-and-age sweep once shortly after boot (default 60 s, off
+ * the request path so a large `native/`/`events/` directory never delays
+ * `server.listen`) and then on the same daily cadence as the cap sweep.
+ * `getLiveThreadIds` is called fresh on every run, not just once at
+ * registration, so a thread created or deleted after boot is still read
+ * correctly a day later.  Both timers are unref'd.  Returns the stopper. */
+export function startOrphanTranscriptSweeps(
+  dirs: TranscriptDirs,
+  getLiveThreadIds: () => Iterable<string>,
+  log: (line: string) => void = console.log,
+  opts: { dryRun?: boolean; initialDelayMs?: number } = {},
+): () => void {
+  const dryRun = opts.dryRun ?? false;
+  const run = () => {
+    const result = sweepOrphanedTranscripts(dirs, new Set(getLiveThreadIds()), { dryRun });
+    const line = describeOrphanSweep(result);
+    if (line) log(line);
+  };
+  const initial = setTimeout(run, opts.initialDelayMs ?? 60_000);
+  initial.unref?.();
+  const timer = setInterval(run, DAILY_SWEEP_MS);
+  timer.unref?.();
+  return () => {
+    clearTimeout(initial);
+    clearInterval(timer);
+  };
 }

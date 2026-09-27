@@ -1,3 +1,4 @@
+import { normalizeRunOn } from "../../shared/run-on.ts";
 // Routine-schedule normalisation, shared by both lanes.
 //
 // Before this file, this logic lived once, inside `agents-proxy.ts`'s
@@ -141,7 +142,7 @@ export function routineFields(args: Json): { fields: Json; error?: string } {
     if (normalized.error) return { fields, error: normalized.error };
     fields.schedule = normalized.schedule;
   }
-  if (typeof args.run_on === "string") fields.runOn = args.run_on;
+  if (typeof args.run_on === "string") fields.runOn = normalizeRunOn(args.run_on);
   if (typeof args.duration_minutes === "number") fields.durationMinutes = args.duration_minutes;
   return { fields };
 }

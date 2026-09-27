@@ -66,6 +66,22 @@ final class ProfileClientTests: XCTestCase {
         super.tearDown()
     }
 
+    func testProfilePatchEncodesMaxToolRoundsSetAndClear() throws {
+        let setData = try JSONEncoder().encode(BotProfilePatch(maxToolRounds: .set(40)))
+        let setBody = try XCTUnwrap(JSONSerialization.jsonObject(with: setData) as? [String: Any])
+        XCTAssertEqual(setBody.keys.sorted(), ["maxToolRounds"])
+        XCTAssertEqual((setBody["maxToolRounds"] as? NSNumber)?.intValue, 40)
+
+        let clearData = try JSONEncoder().encode(BotProfilePatch(maxToolRounds: .clear))
+        let clearBody = try XCTUnwrap(JSONSerialization.jsonObject(with: clearData) as? [String: Any])
+        XCTAssertEqual(clearBody.keys.sorted(), ["maxToolRounds"])
+        XCTAssertTrue(clearBody["maxToolRounds"] is NSNull)
+
+        let omitted = try JSONEncoder().encode(BotProfilePatch())
+        let omittedBody = try XCTUnwrap(JSONSerialization.jsonObject(with: omitted) as? [String: Any])
+        XCTAssertNil(omittedBody["maxToolRounds"])
+    }
+
     func testProfilePatchPreservesServerLimitsWithoutClientTruncation() throws {
         let name = String(repeating: "n", count: 100)
         let title = String(repeating: "t", count: 200)

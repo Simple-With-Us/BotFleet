@@ -170,8 +170,13 @@ export function createWebhookIngressHandler(
       }
       // A 500-class failure is the receiver breaking, not a caller sending
       // rubbish, so it is the one branch worth an Issue.  The body is
-      // untrusted and can carry credentials, and the endpoint id is half of
-      // a capability URL — neither goes to Sentry.
+      // untrusted and can carry credentials, so these explicit tags carry
+      // neither the body nor the endpoint id.  That promise covers only the
+      // tags below: the SDK also attaches the request itself (URL, culprit,
+      // transaction name), and the path's secret segment is kept out of
+      // those by `scrubSentryPayload` in server/sentry.ts, not by anything
+      // in this file.  The `/hooks/*` filter there drops only the incoming
+      // server span; a span started under the request still carries it.
       if (status >= 500 && isSentryActive()) {
         getSentry()?.captureException(error instanceof Error ? error : new Error(message), {
           tags: { component: "webhook-ingress", "http.status_code": String(status) },

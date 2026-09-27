@@ -15,7 +15,16 @@ export const STATIC_GROK_MODELS: ModelCatalog = {
   default: "grok-4.7",
   options: [
     { id: "grok-4.7", label: "Grok 4.7" },
-    { id: "grok-4.7-build-fast", label: "Grok 4.7 Build Fast" },
+    // Same underlying Grok 4.7 served on high-performance infrastructure:
+    // ~2x output speed, 2x the per-token cost of the standard tier.
+    // Surface that tradeoff in the picker so the operator does not pick it
+    // by accident — the chip is short on purpose (fits a narrow chat head).
+    {
+      id: "grok-4.7-build-fast",
+      label: "Grok 4.7 Build Fast",
+      badge: "2× $",
+      badgeTitle: "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+    },
     { id: "grok-4.6", label: "Grok 4.6" },
     { id: "grok-4.5", label: "Grok 4.5" },
   ],

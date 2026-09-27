@@ -165,24 +165,133 @@ describe("ENGINE_CAPABILITIES registry", () => {
   });
 });
 
+function registryStrings(): string[] {
+  const strings: string[] = [];
+  const walk = (value: unknown) => {
+    if (typeof value === "string") strings.push(value);
+    else if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  };
+  walk(ENGINE_CAPABILITIES);
+  return strings;
+}
+
+/** Two ASCII spaces after a sentence period or colon.  Decimals, URLs, and
+ *  abbreviations do not match because they are not ". " / ": " before a letter. */
+function assertTwoAsciiSpaces(text: string, where: string) {
+  expect(text.match(/\. [A-Za-z]/g), `${where} needs two spaces after a period: ${text}`).toBeNull();
+  expect(text.match(/: [A-Za-z]/g), `${where} needs two spaces after a colon: ${text}`).toBeNull();
+}
+
 describe("ENGINE_CAPABILITIES user-facing copy", () => {
+  const BANNED: RegExp[] = [
+    /on this seat/i,
+    /\bthis seat\b/i,
+    /fleet-recall/i,
+    /fleet recall/i,
+    /\bJay\b/,
+    /\bstrongest\b/i,
+    /\bsafest\b/i,
+    /right tool/i,
+    /budget tier/i,
+    /pairs well/i,
+    /pairs with/i,
+    /\bJWT\b/,
+    /prolite/i,
+    /renewing/i,
+    /2026-10-05/,
+    /mid-October/,
+    /Grok Bot/,
+    /bundled into/i,
+    /Bundled with/,
+    /\bMavis\b/,
+    /\$213\.20/,
+    /\$105\.79/,
+    /\$99/,
+    /\$55/,
+    /\$50\b/,
+    /PR #/,
+    /EFFORT-LOG/,
+    /server\//,
+  ];
+
   it("never names the account holder in any displayed string", () => {
-    // Every string in the registry reaches the UI (pricing notes, quota
-    // labels, callout prose), so a name in any of them is visible copy.
-    const strings: string[] = [];
-    const walk = (value: unknown) => {
-      if (typeof value === "string") strings.push(value);
-      else if (Array.isArray(value)) value.forEach(walk);
-      else if (value && typeof value === "object") Object.values(value).forEach(walk);
-    };
-    walk(ENGINE_CAPABILITIES);
-    expect(strings.filter((text) => /\bJay\b/.test(text))).toEqual([]);
+    expect(registryStrings().filter((text) => /\bJay\b/.test(text))).toEqual([]);
   });
 
-  it("shows the neutral Cursor Ultra note in the pricing table", () => {
-    // UsageSection renders `pricing.notes ?? subscription.notes`.
+  it("strips seat diary and ranking voice from every engine", () => {
+    const hits = registryStrings().flatMap((text) =>
+      BANNED.filter((pattern) => pattern.test(text)).map((pattern) => `${pattern}: ${text}`),
+    );
+    expect(hits).toEqual([]);
+  });
+
+  it("uses two ASCII spaces after periods and colons in engine info prose", () => {
+    for (const [id, entry] of Object.entries(ENGINE_CAPABILITIES)) {
+      assertTwoAsciiSpaces(entry.whyThisEngine.headline, `${id} headline`);
+      for (const line of entry.whyThisEngine.prose) assertTwoAsciiSpaces(line, `${id} prose`);
+      assertTwoAsciiSpaces(entry.pricing.notes ?? "", `${id} pricing.notes`);
+      if ("subscription" in entry.pricing) {
+        assertTwoAsciiSpaces(entry.pricing.subscription.notes ?? "", `${id} subscription.notes`);
+        assertTwoAsciiSpaces(entry.pricing.subscription.includedQuota ?? "", `${id} includedQuota`);
+      }
+      if ("api" in entry.pricing) assertTwoAsciiSpaces(entry.pricing.api.notes ?? "", `${id} api.notes`);
+    }
+  });
+
+  it("shows a Cursor Ultra plan note without a seat bundle story", () => {
     const pricing = ENGINE_CAPABILITIES.cursor.pricing;
-    const shown = pricing.notes ?? ("subscription" in pricing ? pricing.subscription.notes : undefined);
-    expect(shown).toContain("this seat's xAI SuperGrok Heavy subscription");
+    expect(pricing.kind).toBe("subscription");
+    if (pricing.kind !== "subscription") return;
+    expect(pricing.subscription.tierLabel).toBe("Cursor Ultra");
+    const shown = pricing.notes ?? pricing.subscription.notes;
+    expect(shown).toBe(
+      "Cursor Ultra subscription.  BotFleet does not register a separate Cursor API rate.",
+    );
+    expect(pricingModeLabel(pricing)).toBe("Subscription");
+    expect(pricingModeLabel(pricing).toLowerCase()).not.toContain("bundled");
+  });
+
+  it("bills DeepSeek Harness as DeepSeek PAYG, not a Claude Max bundle", () => {
+    const entry = ENGINE_CAPABILITIES["deepseek-harness"];
+    expect(entry.pricing.kind).toBe("api");
+    if (entry.pricing.kind !== "api") return;
+    expect(entry.pricing.api).toMatchObject({
+      inputPer1k: 0.00027,
+      outputPer1k: 0.0011,
+      cachedInputPer1k: 0.00007,
+    });
+    expect(entry.pricing.notes).toBe(
+      "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
+    );
+    expect(entry.whyThisEngine).toEqual({
+      headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
+      prose: [
+        "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
+        "BotFleet does not support image attachments on DeepSeek Harness yet.",
+      ],
+    });
+    expect(entry.capabilities.imageAttachments).toBe("no");
+    const copy = [
+      entry.pricing.notes ?? "",
+      entry.pricing.api.notes ?? "",
+      entry.whyThisEngine.headline,
+      ...entry.whyThisEngine.prose,
+    ].join("\n");
+    expect(copy).toContain("BotFleet does not support image attachments");
+    expect(copy).not.toContain("Bundled with Claude Max");
+    expect(copy).not.toContain("Claude Max");
+    expect(copy).not.toContain("same Claude Max seat");
+    expect(copy).not.toContain("bundled Claude Max seat");
+    expect(copy).not.toContain("pairs with Claude");
+    expect(copy).not.toContain("pairs well with Claude");
+    expect(copy).not.toContain("Subscription is bundled");
+    expect(copy).not.toContain("composer rejects");
+    expect(copy).not.toMatch(/this model cannot/i);
+    expect(copy).not.toMatch(/\bOpus\b/);
+    expect(copy).not.toMatch(/on this seat/i);
+    expect(pricingModeLabel(entry.pricing)).toBe("API · $0.00027/1k in");
+    expect(pricingModeLabel(entry.pricing).toLowerCase()).not.toContain("bundled");
   });
 });

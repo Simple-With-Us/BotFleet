@@ -34,9 +34,11 @@ iOS never sends a push itself.  Live Activities stay local (`pushType: nil`).
 The optional hosted transport connects to the user's own computer; it is not a
 cloud transcript store.
 
-The first launch is light.  `CompanionApp` pins `.preferredColorScheme(.light)`
-until an in-app picker exists; the phone does not boot dark from system
-appearance.
+The app follows the system color scheme.  Fleet UI ruling 2026-09-19 removed
+`CompanionApp`'s explicit `.preferredColorScheme(.light)` pin, so the phone
+now boots light or dark with the OS appearance setting rather than always
+light; the owner can still override it per device via iOS Settings → Display
+& Brightness.
 
 Chat attachments from the phone match desktop compose.  Photos, Files, paste,
 and drag-drop upload raw bytes to `POST /api/attachments` and embed the

@@ -18,6 +18,7 @@ export type BotUpdatePatch = Partial<
     | "autoApprove"
     | "speakReplies"
     | "speechDevices"
+    | "maxToolRounds"
     | "voice"
     | "pinned"
     | "hidden"

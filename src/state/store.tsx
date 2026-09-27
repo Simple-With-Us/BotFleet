@@ -17,8 +17,9 @@ import {
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
-import type { MausColor, MausMotion } from "@/lib/mascot";
+import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import type { ToolKind } from "../../shared/tool-activity";
 import {
@@ -41,7 +42,7 @@ import { spokenReply } from "../../shared/voice-summary";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
-export type { MausColor } from "@/lib/mascot";
+export type { BotColor, MausColor } from "@/lib/mascot";
 
 export interface OptionCardData {
   title: string;
@@ -94,7 +95,7 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   audio?: Array<{ path: string; mime: string }>;
@@ -142,11 +143,11 @@ export interface Message {
   /** Flat reply reference for an inline quote; unrelated to branch ancestry. */
   replyToId?: string;
   /** rooms: which member said this (sender attribution). */
-  from?: { botId: string; name: string; color: MausColor };
+  from?: { botId: string; name: string; color: BotColor };
   /** emoji reactions; by = "user" or a member botId. */
   reactions?: Array<{ emoji: string; by: string }>;
   /** comm chips: "Messaged @X" linking to the bot⇄bot channel. */
-  comm?: { groupId: string; withBotId: string; withName: string; withColor: MausColor };
+  comm?: { groupId: string; withBotId: string; withName: string; withColor: BotColor };
   /** sent while the bot was mid-turn; auto-sends when the turn settles.
    * Rendered only while the bot is busy, so a flag stranded by a server
    * restart never shows a promise nothing will keep. */
@@ -246,6 +247,12 @@ export interface Task {
   activeModelSelection?: ModelSelection;
   /** Stable webhook/routine identity so a re-fire appends here. */
   automationKey?: string;
+  /** This thread is asleep: 0 until it does anything again, a timestamp
+   * until that moment, absent means awake.  The harness drops deadlines it
+   * has already passed, so an arriving snapshot is authoritative — but a
+   * window left open across one is not, which is why the sidebar checks the
+   * clock too.  See `shared/thread-snooze.ts`. */
+  snoozedUntil?: number;
 }
 
 export interface TaskUsage {
@@ -276,7 +283,7 @@ export interface Bot {
   title: string;
   description: string;
   notifications: boolean;
-  color: MausColor;
+  color: BotColor;
   mascotExpression?: string | null;
   /** App-owned image attachment used for this bot's profile. */
   avatarUrl?: string | null;
@@ -304,6 +311,8 @@ export interface Bot {
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
+  /** Ceiling on HTTP toolLoop rounds (MiniMax / Grok HTTP / openai-compat). Unset or null uses 12. */
+  maxToolRounds?: number | null;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
   speechDevices?: Array<"mac" | "iphone">;
@@ -323,6 +332,11 @@ export interface Bot {
   /** Whether this bot may use the workspace's connected apps. Unset means
    * allowed for existing bots; imported bots start with this disabled. */
   composio?: boolean;
+  /** Per-bot Composio tool grants. Unset = every connected service, every
+   * tool (legacy). An explicit record — including the empty one — allows
+   * only what it names. A PATCH may send `null` to clear back to legacy,
+   * mirroring avatarUrl. */
+  connectorTools?: Record<string, ConnectorToolGrant> | null;
   messages: Message[];
   /** The hydrate said the server holds messages older than the first one it
    * sent.  Read once into `hasMore` and not kept on the conversation, so
@@ -490,6 +504,7 @@ export interface ConfigStatus {
     /** Whether a locally-observed subscription cap diverts auto-fallback. */
     localQuotaRouting?: boolean;
     projects: Array<{ slug: string; match: string[] }>;
+    enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
   /** Opt-in flags. Absent means off. */
   features?: { skillRecorder: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
@@ -509,6 +524,9 @@ export interface ConfigStatus {
     source: "env" | "config" | "none" | "infisical";
     environment: string;
     tracesSampleRate: number;
+    aiTracesSampleRate?: number;
+    httpTracesSampleRate?: number;
+    uiTracesSampleRate?: number;
     logsEnabled: boolean;
   };
   /** Infisical secret-store status.  Booleans and counts only — the project
@@ -645,6 +663,15 @@ export interface InstanceInfo {
       label: string;
       custom?: boolean;
       loaded?: boolean;
+      /** Short tag rendered next to the label in the model picker (e.g. a
+       * price/speed tradeoff the user should see before picking).  Drivers
+       * set it on static catalog rows; the picker renders it as a chip with
+       * `badgeTitle` (full sentence) on hover.  Keep the chip under ~10 chars
+       * so it does not push the label to a second line on narrow chat heads. */
+      badge?: string;
+      /** Hover explanation for `badge`.  Without this the chip renders
+       * without a tooltip and a screen-reader hint. */
+      badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
       supportsEffort?: boolean;
     }>;
@@ -661,6 +688,8 @@ export interface InstanceInfo {
     /** This engine can answer a bounded review prompt without changing the
      * bot's active conversation. */
     approvalReview?: boolean;
+    /** The harness runs this engine's tool loop, so Maximum Tool Rounds applies. */
+    toolLoop?: boolean;
   };
   /** Which computer destinations this engine can be given at all, derived
    *  server-side in `server/computer-capability.ts` and shipped whole.  The
@@ -741,7 +770,7 @@ export interface AppState {
   mascotMotion: {
     botId: string;
     nonce: number;
-    kind: Exclude<MausMotion, "none">;
+    kind: Exclude<BotMotion, "none">;
   } | null;
   /** 1:1 queue-fallback lines waiting for drain; keyed by threadId.
    * Each entry is identified by the server queueId, not by text. */
@@ -884,6 +913,10 @@ export type Action =
   | { type: "switchTask"; botId: string; threadId: string }
   | { type: "taskSwitched"; bot: Bot }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
+  /** Put one thread to sleep, or wake it.  `null` is the wake — an omitted
+   * field means "leave it alone" on the harness route, and `0` is the real
+   * until-activity sentinel rather than an empty value. */
+  | { type: "snoozeTask"; botId: string; threadId: string; snoozedUntil: number | null }
   | { type: "deleteTask"; botId: string; threadId: string }
   | { type: "newBot" }
   | { type: "botAdded"; bot: Bot }
@@ -994,7 +1027,7 @@ export function mergeHydrateGroups(
 function withMascotMotion(
   state: AppState,
   botId: string,
-  kind: Exclude<MausMotion, "none">,
+  kind: Exclude<BotMotion, "none">,
 ): AppState {
   return {
     ...state,
@@ -1646,6 +1679,18 @@ export function reducer(state: AppState, action: Action): AppState {
         tasks: (bot.tasks ?? []).map((task) =>
           task.threadId === action.threadId ? { ...task, title: action.title } : task,
         ),
+      }));
+    // Paint the snooze at once.  The harness answers with the same state and
+    // an SSE frame overwrites this, but a row that only dims a round trip
+    // later reads as a menu that did nothing.
+    case "snoozeTask":
+      return updateBot(state, action.botId, (bot) => ({
+        ...bot,
+        tasks: (bot.tasks ?? []).map((task) => {
+          if (task.threadId !== action.threadId) return task;
+          const { snoozedUntil: _asleep, ...awake } = task;
+          return action.snoozedUntil === null ? awake : { ...task, snoozedUntil: action.snoozedUntil };
+        }),
       }));
     case "renameGroupTask":
       return {
@@ -2400,6 +2445,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ title: action.title }),
+          }).catch(showError);
+          break;
+        case "snoozeTask":
+          // The key has to be present for a wake: the harness reads an
+          // absent field as "leave the snooze alone", and JSON.stringify
+          // would drop an undefined.
+          api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
+            method: "PATCH",
+            body: JSON.stringify({ snoozedUntil: action.snoozedUntil }),
           }).catch(showError);
           break;
         case "deleteTask":

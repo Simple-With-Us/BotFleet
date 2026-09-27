@@ -38,6 +38,9 @@ export interface ObservabilityStatusView {
   projectId: string | null;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate: number;
+  httpTracesSampleRate: number;
+  uiTracesSampleRate: number;
   logsEnabled: boolean;
   profilingAvailable: boolean;
   totalCaptured: number;
@@ -94,6 +97,9 @@ class ObservabilityManager {
       enabled: settings.enabled,
       environment: settings.environment,
       tracesSampleRate: settings.tracesSampleRate,
+      aiTracesSampleRate: settings.aiTracesSampleRate,
+      httpTracesSampleRate: settings.httpTracesSampleRate,
+      uiTracesSampleRate: settings.uiTracesSampleRate,
       logsEnabled: settings.logsEnabled,
       source,
     };
@@ -125,6 +131,9 @@ class ObservabilityManager {
       projectId: parsed?.projectId ?? null,
       environment: input.environment,
       tracesSampleRate: input.tracesSampleRate,
+      aiTracesSampleRate: input.aiTracesSampleRate ?? 1.0,
+      httpTracesSampleRate: input.httpTracesSampleRate ?? 0.1,
+      uiTracesSampleRate: input.uiTracesSampleRate ?? 0.1,
       logsEnabled: input.logsEnabled,
       profilingAvailable: runtime.profilingAvailable,
       totalCaptured: this.totalCaptured,

@@ -68,7 +68,7 @@ describe("impactedBotsForProvider", () => {
       bots: [makeBot("a", [])],
       workspaceProviders: ALL_ON,
       automations: {
-        routines: [cloudRoutine("a", false), { botId: "a", runOn: "maus", enabled: true }, cloudRoutine("other")],
+        routines: [cloudRoutine("a", false), { botId: "a", runOn: "bot", enabled: true }, cloudRoutine("other")],
       },
     });
     expect(impacted).toEqual([]);
@@ -187,7 +187,7 @@ describe("BotComputerMatrix and the impact list agree", () => {
 
   it("keeps an Off bot with no cloud automation dark", async () => {
     const { effectiveProvidersForBot } = await import("../components/BotComputerMatrix");
-    const automations = { routines: [cloudRoutine("off", false), { botId: "off", runOn: "maus" as const, enabled: true }] };
+    const automations = { routines: [cloudRoutine("off", false), { botId: "off", runOn: "bot" as const, enabled: true }] };
     expect(effectiveProvidersForBot(makeBot("off", []), { workspaceProviders: ALL_ON, automations })).toEqual({
       asciiBox: false, selfHostedVps: false, localVm: false, localMac: false,
     });

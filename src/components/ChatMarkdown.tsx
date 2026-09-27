@@ -13,6 +13,8 @@ import remarkGfm from "remark-gfm";
 import { Check, Copy } from "lucide-react";
 import { isDarkSkin, useResolvedSkin } from "@/lib/skins";
 import { remarkMentions } from "@/lib/mentions";
+import { MermaidBlock } from "./MermaidBlock";
+import { hash, STREAM_SETTLE_MS } from "@/lib/stream-settle";
 
 // tiny highlight cache so revisiting a thread doesn't re-tokenize settled
 // blocks; keys are content-hashed and capped. Streamed partials may land here
@@ -21,18 +23,6 @@ import { remarkMentions } from "@/lib/mentions";
 // makes the settled bubble render highlighted on mount.
 const highlightCache = new Map<string, string>();
 const CACHE_MAX = 200;
-// how long a streaming block's content must be unchanged before we spend a
-// tokenize on it — long enough to skip per-token churn mid-fence, short
-// enough that the highlight lands before the stream settles
-const STREAM_SETTLE_MS = 250;
-const hash = (s: string) => {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(36);
-};
 
 // A markdown link whose target is a file on this machine: bots hand over
 // bot-created documents as absolute paths or file:// URLs. Web links stay
@@ -320,6 +310,11 @@ function ChatMarkdownComponent({ text, streaming = false }: { text: string; stre
             const flat = (n: any): string =>
               typeof n === "string" ? n : Array.isArray(n) ? n.map(flat).join("") : (n?.props?.children ? flat(n.props.children) : "");
             const code = flat(child?.props?.children).replace(/\n$/, "");
+            // a mermaid fence is a picture, not a program: hand it to the
+            // diagram renderer instead of the highlighter
+            if (lang.toLowerCase() === "mermaid") {
+              return <MermaidBlock code={code} streaming={streaming} />;
+            }
             return <CodeBlock code={code} lang={lang} streaming={streaming} />;
           },
           img({ src, alt }: { src?: string; alt?: string }) {

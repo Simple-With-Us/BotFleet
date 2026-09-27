@@ -47,7 +47,7 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   if (voiceProvider(cfg) === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(cfg.tts?.voice);
   }
-  return Boolean(cfg.tts?.key && (cfg.tts?.voice || voiceProvider(cfg) === "minimax"));
+  return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
 /** A per-bot voice is a complete choice too; it should not be blocked just
@@ -56,7 +56,7 @@ export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
   if (voiceProvider(cfg) === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
   }
-  return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice || voiceProvider(cfg) === "minimax"));
+  return Boolean(cfg.tts?.key && (voiceId || cfg.tts?.voice));
 }
 
 /** What the settings panel needs. Never includes the key — same write-only
@@ -65,7 +65,7 @@ export function describeVoice(cfg: AppConfig) {
   return {
     configured: providerConfigured(cfg),
     ready: voiceConfigured(cfg),
-    voice: cfg.tts?.voice || (voiceProvider(cfg) === "minimax" ? "Jay-Wedgeworth-001" : ""),
+    voice: cfg.tts?.voice || "",
     provider: voiceProvider(cfg),
     optimizedSummary: cfg.tts?.optimizedSummary === true,
   };
@@ -97,7 +97,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
   }
   const key = cfg.tts?.key;
   if (!key) throw new NoVoiceConfigured("key");
-  const voice = voiceId || cfg.tts?.voice || (voiceProvider(cfg) === "minimax" ? "Jay-Wedgeworth-001" : "");
+  const voice = voiceId || cfg.tts?.voice;
   if (!voice) throw new NoVoiceConfigured("voice");
   return voiceProvider(cfg) === "elevenlabs" ? elevenlabs.synthesize(text, voice, key) : minimax.synthesize(text, voice, key);
 }

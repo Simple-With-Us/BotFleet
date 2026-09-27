@@ -38,6 +38,123 @@ final class StoreTests: XCTestCase {
         }
     }
 
+    // MARK: - Hydration merges scrollback instead of wiping it (IO12)
+
+    func testRehydratingMergesTheFreshPageInsteadOfDiscardingPagedInScrollback() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let beforeCount = state.transcript(forThread: threadId).count
+
+        // Simulate "Load earlier": an older page the fresh 50-message
+        // hydrate below will not repeat.
+        state.prepend(
+            ThreadPage(messages: [message("older-page-1", at: 0)], hasMore: true),
+            toThread: threadId
+        )
+        XCTAssertEqual(state.transcript(forThread: threadId).count, beforeCount + 1)
+
+        state.hydrate(try fleet())
+
+        XCTAssertTrue(
+            state.transcript(forThread: threadId).contains { $0.id == "older-page-1" },
+            "a foreground re-hydrate must not discard scrollback paged in earlier"
+        )
+        XCTAssertEqual(state.transcript(forThread: threadId).count, beforeCount + 1)
+    }
+
+    func testRehydratingReplacesOverlappingMessageIdsWithTheFreshCopy() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let existingId = try XCTUnwrap(state.transcript(forThread: threadId).first?.id)
+
+        var edited = try fleet()
+        if let index = edited.bots.firstIndex(where: { $0.threadId == threadId }) {
+            edited.bots[index].messages = edited.bots[index].messages?.map { original in
+                guard original.id == existingId else { return original }
+                var patched = original
+                patched.text = "edited server-side"
+                return patched
+            }
+        }
+
+        state.hydrate(edited)
+
+        let merged = state.transcript(forThread: threadId).first { $0.id == existingId }
+        XCTAssertEqual(merged?.text, "edited server-side")
+    }
+
+    func testRehydratingDoesNotUnlearnHasMoreOnceScrollbackAlreadyExtendsPastTheFreshPage() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        // The fixture's bot already reports `hasMore: false` — establish
+        // "there is more above" the way paging earlier actually would.
+        state.prepend(
+            ThreadPage(messages: [message("older-page-1", at: 0)], hasMore: true),
+            toThread: threadId
+        )
+        XCTAssertEqual(state.hasMore[threadId], true)
+
+        // A plain foreground re-hydrate re-fetches only the newest 50 and
+        // reports `hasMore: false` for that narrow window — it must not
+        // un-learn the boundary already resolved by paging further back.
+        state.hydrate(try fleet())
+
+        XCTAssertEqual(
+            state.hasMore[threadId], true,
+            "a 50-message re-hydrate must not overwrite a boundary already resolved by paging earlier"
+        )
+    }
+
+    func testRehydrateWithNoMessagesFieldLeavesExistingScrollbackUntouched() throws {
+        var state = try hydrated()
+        let threadId = try XCTUnwrap(state.bots.first?.threadId)
+        let before = state.transcript(forThread: threadId)
+        XCTAssertFalse(before.isEmpty)
+
+        // A response shape that omits `messages` entirely for a bot that
+        // still exists — decodes to `nil`, not `[]` — must never be read as
+        // "this thread now has zero messages".
+        let json = #"""
+        {
+          "bots": [
+            {
+              "id": "4f254cf4-98c5-45ca-907e-967e2bbcb8ac",
+              "threadId": "\#(threadId)",
+              "name": "Pesto",
+              "title": "",
+              "description": "",
+              "notifications": true,
+              "color": "green",
+              "unread": true,
+              "modelSelection": { "instanceId": "", "model": "" },
+              "createdAt": 1786742441013
+            }
+          ],
+          "groups": []
+        }
+        """#
+        let noMessagesField = try JSONDecoder().decode(Fleet.self, from: Data(json.utf8))
+
+        state.hydrate(noMessagesField)
+
+        XCTAssertEqual(state.transcript(forThread: threadId), before)
+    }
+
+    func testRehydrateDropsScrollbackOnlyForAThreadNoLongerInTheFleet() throws {
+        var state = try hydrated()
+        let deletedThreadId = "thread-deleted-elsewhere"
+        state.apply(.message(threadId: deletedThreadId, message: message("orphan-1")))
+        XCTAssertFalse(state.transcript(forThread: deletedThreadId).isEmpty)
+
+        state.hydrate(try fleet())
+
+        XCTAssertTrue(
+            state.transcript(forThread: deletedThreadId).isEmpty,
+            "a thread absent from the fresh roster is the one real reset signal a hydrate carries today"
+        )
+        XCTAssertNil(state.hasMore[deletedThreadId])
+    }
+
     func testConflictRefreshSnapshotCannotOverwriteAConcurrentStreamFrame() throws {
         var state = try hydrated()
         let staleSnapshot = try fleet()

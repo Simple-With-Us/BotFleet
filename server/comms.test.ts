@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { mentionedBots, normalizeGroupDefaultResponder, roomResponders } from "./store.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -166,8 +167,7 @@ describe("comms e2e (fake ACP fleet)", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        const res = await fetch(`${BASE}/api/health`);
-        if (res.ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -368,10 +368,10 @@ describe("comms e2e (fake ACP fleet)", () => {
       expect(note.comm?.groupId).toBeTruthy();
       expect(note.comm?.withName).toBe("Helper");
 
-      // B ran a depth-1 turn: the inbound user text carries the delegation
-      // prefix, B's reply is the happy-mode line (no agents integration).
+      // B ran a depth-1 turn: the system-attributed starter carries the
+      // delegation prefix, B's reply is the happy-mode line.
       const helperInbound = helperBot.messages.find(
-        (m: any) => m.role === "user" && m.kind === "text",
+        (m: any) => m.role === "system" && m.automationSource === "delegation" && m.kind === "text",
       );
       expect(helperInbound.text).toContain("[Delegated by @Asker");
       expect(helperInbound.text).toContain("delegated task");

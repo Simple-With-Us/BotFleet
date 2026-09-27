@@ -33,6 +33,7 @@ import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { classifyResumeFailure, mayReplay, recoveryPromptFor } from "../resume-recovery.ts";
 import { appendNative } from "./native.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
@@ -48,6 +49,24 @@ class CodexResumeError extends Error {
     this.name = "CodexResumeError";
   }
 }
+
+class CodexRpcError extends Error {
+  code: unknown;
+
+  constructor(error: { code?: unknown; message?: string }) {
+    super(error.message ?? JSON.stringify(error));
+    this.code = error.code;
+  }
+}
+
+function missingNativeCodexThread(error: unknown, cursor: string): boolean {
+  // Codex's local thread/resume rejection, verified with an empty native home.
+  // A generic 404, auth error, timeout or prose mentioning a missing thread is
+  // not evidence that the native history was lost. Unknown versions fail closed.
+  return error instanceof CodexRpcError && error.code === -32600 &&
+    error.message === `no rollout found for thread id ${cursor}`;
+}
+
 
 export interface CodexConfig {
   cli: string;
@@ -182,6 +201,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // a retry relaunches the whole app-server; the backoff is scaled down in
       // tests so a fake's transient failures don't stall real seconds
       const retryScale = Number(process.env.FAKE_CODEX_RETRY_SCALE ?? "1");
+      // A missing native session is established before any prompt is sent.
+      // Keep its rebuilt prompt across app-server relaunches: a fresh process
+      // has no native history, and recomputing from turn.text loses it.
+      let recoveredMissingSession = false;
+      let rebuiltFromReplay = false;
+      let promptText = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
 
       const launchAttempt = async (attempt: number): Promise<void> => {
         const env = childEnv();
@@ -521,7 +546,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             const pend = rpcPending.get(msg.id);
             if (pend) {
               rpcPending.delete(msg.id);
-              msg.error ? pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error))) : pend.resolve(msg.result);
+              msg.error ? pend.reject(new CodexRpcError(msg.error)) : pend.resolve(msg.result);
             }
           } else if (msg.id !== undefined && msg.method) {
             handleServerRequest(msg);
@@ -558,6 +583,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // active process current on every attempt, but announce the turn once.
       if (attempt === 0) emit({ ...base(threadId, turnId), type: "turn.started" });
 
+      let promptSubmitted = false;
+      let promptAccepted = false;
       // handshake + kickoff; a transient failure (5xx/overloaded/reset) gets
       // one relaunch of the whole app-server after backoff — but only when
       // nothing streamed yet, and never for auth/shape errors or interrupts
@@ -577,12 +604,37 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const cursor = brokered && !(resumeCursor && brokeredThreads.has(resumeCursor)) ? null : resumeCursor;
         let codexThreadId: string | null = null;
         let startedModel: string | null = null;
-        if (cursor) {
+        if (cursor && !recoveredMissingSession) {
           try {
             const resumed = await request("thread/resume", { threadId: cursor });
             codexThreadId = resumed?.thread?.id ?? cursor;
           } catch (error) {
-            throw new CodexResumeError({ cause: error });
+            const failure = classifyResumeFailure({
+              attempted: true,
+              rejected: error instanceof CodexRpcError,
+              promptSubmitted,
+              producedOutput: state.sawStreamDelta,
+            });
+            // Protocol-state gate (mayReplay) — never an error-text regex — decides
+            // whether this turn may be sent again on a fresh native thread.
+            if (
+              recoveredMissingSession ||
+              stopRequested ||
+              state.settled ||
+              !turn.recoveryText?.trim() ||
+              !missingNativeCodexThread(error, cursor) ||
+              !mayReplay(failure)
+            ) {
+              throw new CodexResumeError({ cause: error });
+            }
+            recoveredMissingSession = true;
+            const rebuild = recoveryPromptFor({
+              recoveryText: turn.recoveryText,
+              currentText: turn.text,
+              failure,
+            });
+            rebuiltFromReplay = rebuild.replayed;
+            promptText = turn.system ? `${turn.system}\n\n${rebuild.text}` : rebuild.text;
           }
         }
         if (!codexThreadId) {
@@ -603,10 +655,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // full-auto and replaced rather than trusted.
           if (brokered && codexThreadId) brokeredThreads.add(codexThreadId);
         }
-        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
+        emit({
+          ...base(threadId, turnId),
+          type: "session.started",
+          sessionId: codexThreadId,
+          model: startedModel ?? turn.model ?? null,
+          ...(rebuiltFromReplay ? { rebuilt: true } : {}),
+        });
+        promptSubmitted = true;
         await request("turn/start", {
           threadId: codexThreadId,
-          input: [{ type: "text", text: turn.system ? `${turn.system}\n\n${turn.text}` : turn.text }],
+          input: [{ type: "text", text: promptText }],
           // Spread, not `effort: turn.effort ?? null`. Probed against
           // codex-cli 0.146.0: null is indistinguishable from an absent key
           // — both leave the thread's current effort alone, emitting no
@@ -618,6 +677,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // thread rather than the current one.
           ...(turn.effort ? { effort: turn.effort } : {}),
         });
+        promptAccepted = true;
       } catch (e) {
         const resumeFailure = e instanceof CodexResumeError;
         const failure = resumeFailure && e.cause !== undefined
@@ -637,7 +697,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           : failureMessage;
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(failureMessage);
         const verdict = classifyError(failure);
-        if (!state.settled && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+        // A rejected RPC proves turn/start did not accept the prompt. A
+        // timeout, connection loss or error after acceptance cannot prove
+        // that; never replay a possibly acted-on turn in those cases.
+        const safeToRelaunch = !promptAccepted && (!promptSubmitted || e instanceof CodexRpcError);
+        if (!state.settled && !needsAuth && verdict.transient && safeToRelaunch && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           const delayMs = computeBackoff(attempt);
           attempt++;
           emit({

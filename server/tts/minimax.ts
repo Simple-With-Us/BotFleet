@@ -116,8 +116,9 @@ export async function cloneVoice(
 
   // Step 1 — upload the audio clip.
   const form = new FormData();
+  const lowerName = filename.toLowerCase();
   const file = new File([new Uint8Array(audioBuffer)], filename, {
-    type: filename.endsWith(".wav") ? "audio/wav" : filename.endsWith(".m4a") ? "audio/mp4" : "audio/mpeg",
+    type: lowerName.endsWith(".wav") ? "audio/wav" : lowerName.endsWith(".m4a") ? "audio/mp4" : "audio/mpeg",
   });
   form.append("file", file);
   form.append("purpose", "voice_clone");

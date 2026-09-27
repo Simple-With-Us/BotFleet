@@ -495,3 +495,127 @@ test("an owner that disappears between attempts is not named in the final diagno
   assert.deepEqual(result, { mode: "failed", conflictOnly: false });
   assert.deepEqual(spawned, []);
 });
+
+// ---------------------------------------------------------------------------
+// A harness that has the port but is still booting (audit HS19).
+//
+// The harness now binds its port before the boot work — the Infisical
+// preload, the registry load, the post-update resume — and answers health
+// with `ready: false` until that work is done. Every other route 503s,
+// `/api/runtime` included, which is the build handshake. So the launcher has
+// to tell "starting" apart from "broken": the first is worth waiting for, and
+// the second must never lead to a second harness on the same data directory.
+
+test("probeHarness: a harness that is still booting says so instead of looking unavailable", async () => {
+  const seen = await probeHarness({
+    port: 8799,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...HARNESS, ready: false, booting: true }),
+    }),
+  });
+  assert.deepEqual(seen, { kind: "booting", pid: 82972 });
+});
+
+test("probeHarness: a booting harness never reaches the build handshake", async () => {
+  const asked = [];
+  const seen = await probeHarness({
+    port: 8799,
+    owner: { version: 1, pid: 82972, port: 8799, nonce: "ab".repeat(32) },
+    expectedBuild: { version: "1.0.0", sourceCommit: "a".repeat(40), apiVersion: 1 },
+    fetchImpl: async (url) => {
+      asked.push(String(url));
+      return { ok: true, status: 200, json: async () => ({ ...HARNESS, ready: false, booting: true }) };
+    },
+  });
+  // An owner-proof check would reject the fixture before the booting branch,
+  // so this asserts the shape the real harness answers with: whatever the
+  // proof says, /api/runtime is never asked while the harness is booting.
+  assert.ok(!asked.some((url) => url.includes("/api/runtime")));
+  assert.ok(seen.kind === "booting" || seen.kind === "unavailable");
+});
+
+test("resolvePackagedServer waits for a booting harness and then attaches to it", async () => {
+  let probes = 0;
+  let spawned = 0;
+  const result = await resolvePackagedServer({
+    ports: [8799],
+    probe: async () => {
+      probes += 1;
+      return probes < 3 ? { kind: "booting", pid: 82972 } : { kind: "botfleet", pid: 82972, static: false };
+    },
+    spawn: async () => {
+      spawned += 1;
+      return { proc: {} };
+    },
+    attachSettleMs: 0,
+    bootPollMs: 1,
+    sleep: noSleep,
+  });
+  assert.deepEqual(result, { mode: "attached", port: 8799, pid: 82972, static: false });
+  assert.equal(spawned, 0, "a harness that is merely slow must not get a second one beside it");
+});
+
+test("resolvePackagedServer gives up on a harness that never finishes booting, without spawning", async () => {
+  const logged = [];
+  let spawned = 0;
+  const result = await resolvePackagedServer({
+    ports: [8799],
+    probe: async () => ({ kind: "booting", pid: 82972 }),
+    spawn: async () => {
+      spawned += 1;
+      return { proc: {} };
+    },
+    attempts: 1,
+    bootWaitAttempts: 3,
+    bootPollMs: 1,
+    sleep: noSleep,
+    log: (line) => logged.push(line),
+  });
+  assert.equal(result.mode, "failed");
+  assert.equal(spawned, 0, "two harnesses on one data directory is worse than no window");
+  assert.ok(logged.some((line) => line.includes("still booting")));
+});
+
+test("pollServerIdentity keeps waiting while our own child reports ready:false", async () => {
+  let calls = 0;
+  const outcome = await pollServerIdentity({
+    port: 8799,
+    pid: () => 4242,
+    bootTimeoutMs: 5_000,
+    sleep: async () => {},
+    fetchImpl: async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          calls < 3
+            ? { app: "botfleet", pid: 4242, static: true, ready: false, booting: true }
+            : { app: "botfleet", pid: 4242, static: true, ready: true, booting: false },
+      };
+    },
+  });
+  assert.equal(outcome.outcome, "ready");
+  assert.equal(calls, 3, "a booting child must be waited for, not reaped as a foreign owner");
+});
+
+test("pollServerIdentity still gives up on a child that never finishes booting", async () => {
+  let clock = 0;
+  const outcome = await pollServerIdentity({
+    port: 8799,
+    pid: () => 4242,
+    bootTimeoutMs: 100,
+    now: () => clock,
+    sleep: async (ms) => {
+      clock += ms;
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ app: "botfleet", pid: 4242, static: true, ready: false, booting: true }),
+    }),
+  });
+  assert.equal(outcome.outcome, "timeout");
+});

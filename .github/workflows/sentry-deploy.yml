@@ -1,11 +1,26 @@
 name: Sentry Deploy
 
 # Additive only: after a green CI run on main, attach a production *deploy*
-# record for the botfleet Sentry project using the full git SHA. Vercel hosts
+# record for the botfleet Sentry project using the full git SHA.  Vercel hosts
 # apps/site (and related web surfaces); org Vercel integration 494377 does not
-# currently mark production deploys. Does NOT call `releases new`.
+# currently mark production deploys.  Does NOT call `releases new`.
+#
+# The deploy record also carries a "seat:<seat> pr:#<number>" tag in its
+# --name field, so the Sentry deploy UI shows which PR shipped this deploy
+# and the prefix of the branch it came from.  That prefix is often a fleet
+# seat (claude/, grok/, minimax/, ...) but not always -- some BotFleet
+# branches use a bot-persona or fix-type prefix instead (instinct/, fixer/,
+# fix/, ...), so read it as "branch prefix," not a guaranteed seat name.
+# Derived by looking up the PR that produced the merge commit (this workflow
+# runs on `workflow_run` after CI on `main`, so
+# `github.event.workflow_run.head_branch` is just "main" -- the originating
+# branch has to be recovered via the GitHub API).  Pattern and rationale:
+# jaywedgeworth22/Usage-Monitor docs/rollouts/2026-09-24-deploy-seat-tagging.md
+# (also implemented there in .github/workflows/sentry-deploy.yml, PR #1536).
 #
 # Soft-fail: sentry-cli errors warn and exit 0 so this never blocks merges.
+# The seat/PR lookup is best-effort too -- a lookup failure just omits the
+# --name tag, it never fails the build.
 #
 # SENTRY_AUTH_TOKEN comes from Infisical prod through the shared composite
 # action (.github/actions/infisical-secrets), with the synced GitHub secret
@@ -19,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: sentry-deploy-${{ github.event.workflow_run.head_sha }}
@@ -39,6 +55,51 @@ jobs:
       # merged copy of the composite action and its script.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Derive deploying seat and PR number
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set +e
+          PR_JSON="$(gh api "repos/${{ github.repository }}/commits/${SHA}/pulls" --jq '.[0] // empty' 2>/dev/null)"
+          if [ -z "$PR_JSON" ]; then
+            echo "::notice::No merged PR found for ${SHA} (e.g. a direct push to main); skipping seat/PR deploy tag"
+            {
+              echo "pr_number="
+              echo "seat="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PR_NUMBER="$(echo "$PR_JSON" | jq -r '.number // empty')"
+          HEAD_REF="$(echo "$PR_JSON" | jq -r '.head.ref // empty')"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::notice::PR lookup for ${SHA} returned no PR number; skipping seat/PR deploy tag"
+            {
+              echo "pr_number="
+              echo "seat="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fleet convention: branch prefixes are lowercase "<seat>/<slug>"
+          # (Slack/board tags are ALL CAPS, e.g. [CLAUDE] -- that casing is
+          # not used here, since this value comes straight off the branch).
+          SEAT="unknown"
+          case "$HEAD_REF" in
+            */*) SEAT="${HEAD_REF%%/*}" ;;
+          esac
+          # Sentry's deploy `name` field caps at 64 chars (DeploySerializer
+          # max_length=64); SEAT is an unbounded branch prefix, so cap it well
+          # short of that to guarantee "seat:<seat> pr:#<number>" always fits
+          # and never turns a working untagged deploy record into a 400.
+          SEAT="${SEAT:0:24}"
+          echo "Deploying PR #${PR_NUMBER} from branch '${HEAD_REF}' (seat=${SEAT})"
+          {
+            echo "pr_number=${PR_NUMBER}"
+            echo "seat=${SEAT}"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
       # SENTRY_AUTH_TOKEN is a non-identity name behind Infisical, with the
       # synced GitHub secret as a GH_FALLBACK_ during the cutover.  Not
       # `required` -- this workflow is soft-fail by design (see header).
@@ -58,6 +119,8 @@ jobs:
           SENTRY_ORG: jays-services
           SENTRY_PROJECT: botfleet
           VERSION: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}
+          SEAT: ${{ steps.pr-info.outputs.seat }}
         run: |
           set +e
           if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
@@ -68,10 +131,14 @@ jobs:
             echo "::warning::empty VERSION; skipping sentry deploy record"
             exit 0
           fi
-          echo "Recording production deploy for release=${VERSION} project=${SENTRY_PROJECT}"
+          DEPLOY_NAME_ARGS=()
+          if [ -n "${PR_NUMBER:-}" ]; then
+            DEPLOY_NAME_ARGS=(-n "seat:${SEAT} pr:#${PR_NUMBER}")
+          fi
+          echo "Recording production deploy for release=${VERSION} project=${SENTRY_PROJECT} ${DEPLOY_NAME_ARGS[*]:-(no seat/PR tag)}"
           ok=0
           for i in 1 2 3 4 5; do
-            npx --yes @sentry/cli@2.58.6 releases deploys "$VERSION" new -e production
+            npx --yes @sentry/cli@2.58.6 releases deploys "$VERSION" new -e production "${DEPLOY_NAME_ARGS[@]}"
             if [ $? -eq 0 ]; then
               ok=1
               break

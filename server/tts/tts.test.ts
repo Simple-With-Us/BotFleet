@@ -90,10 +90,10 @@ const voice = () => import("./index.ts");
 const cfg = (tts: AppConfig["tts"]): AppConfig => ({ tts });
 
 describe("configuration", () => {
-  it("needs a key and supplies the preferred MiniMax default voice", async () => {
+  it("needs a key and an explicit voice; MiniMax has no product-default id", async () => {
     const { voiceConfigured, voiceReady } = await voice();
     expect(voiceConfigured({})).toBe(false);
-    expect(voiceConfigured(cfg({ key: "k" }))).toBe(true); // preferred MiniMax voice is the workspace default
+    expect(voiceConfigured(cfg({ key: "k" }))).toBe(false);
     expect(voiceConfigured(cfg({ voice: "v-1" }))).toBe(false);
     expect(voiceConfigured(cfg({ key: "k", voice: "v-1" }))).toBe(true);
     expect(voiceReady(cfg({ key: "k" }), "v-per-bot")).toBe(true);

@@ -325,6 +325,12 @@ describe("provider naming", () => {
     expect(inferProviderAndService("computer-2", undefined, "boxAgent").provider).toBe("box");
     expect(inferProviderAndService("whatever-the-operator-typed", "gpt-5", "boxAgent").provider).toBe("box");
   });
+
+  it("attributes MiniMax models to minimax even under DSH or other drivers", () => {
+    expect(inferProviderAndService("dsh-instance", "MiniMax-M3", "dshAgent").provider).toBe("minimax");
+    expect(inferProviderAndService("deepseek", "MiniMax-M3", "deepseekAgent").provider).toBe("minimax");
+    expect(inferProviderAndService("dsh-instance", "deepseek-chat", "dshAgent").provider).toBe("dsh");
+  });
 });
 
 describe("ingest acknowledgement accounting", () => {
@@ -516,6 +522,83 @@ describe("ingest acknowledgement accounting", () => {
     expect(result.error).toBe("Usage Monitor dispatch failed (TypeError)");
     expect(rendered).not.toContain("private network detail");
     warn.mockRestore();
+  });
+
+  // HS23: a downed receiver or a broken destination used to write one
+  // `[telemetry]` line per attempt forever.  These pin the collapsed shape.
+  function telemetryWarnLines(warn: { mock: { calls: unknown[][] } }): string[] {
+    return warn.mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith("[telemetry]"));
+  }
+
+  it("collapses repeated identical failures into one warn call", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    withSettings({ ingestUrl: "https://usage.example.com", ingestToken: "tok_abc" });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 503 })));
+
+    await telemetry.probe();
+    await telemetry.probe();
+    await telemetry.probe();
+
+    const lines = telemetryWarnLines(warn);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("HTTP 503");
+    warn.mockRestore();
+  });
+
+  it("logs again immediately when the failure kind changes, without waiting for a summary", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    withSettings({ ingestUrl: "https://usage.example.com", ingestToken: "tok_abc" });
+    let status = 503;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status })));
+
+    await telemetry.probe();
+    status = 500;
+    await telemetry.probe();
+
+    const lines = telemetryWarnLines(warn);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("503");
+    expect(lines[1]).toContain("500");
+    warn.mockRestore();
+  });
+
+  // OP2d: root cause of the field's 25 "dispatch failed (TypeError)" lines.
+  // A malformed URL or a control character in the token makes fetch() throw
+  // TypeError on every attempt; validating once here means it is rejected
+  // and logged once instead of thrown per batch.
+  it("rejects a malformed ingest URL instead of letting fetch() throw on every attempt", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    withSettings({ ingestUrl: "not a url", ingestToken: "tok_abc" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await telemetry.probe();
+    const second = await telemetry.probe();
+
+    expect(first.ok).toBe(false);
+    expect(second.ok).toBe(false);
+    expect(telemetry.getStatus().enabled).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const lines = telemetryWarnLines(warn);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("ingest URL");
+    warn.mockRestore();
+  });
+
+  it("rejects a token containing a control character instead of letting fetch() throw", async () => {
+    // A trailing newline (the common copy-paste accident) is already
+    // stripped by `.trim()` above this check; an INTERNAL control
+    // character — a multi-line paste into a secret field, for instance —
+    // is what actually reaches `fetch()`'s header construction unvalidated.
+    withSettings({ ingestUrl: "https://usage.example.com", ingestToken: "tok_ab\ncd" });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await telemetry.probe();
+
+    expect(result.ok).toBe(false);
+    expect(telemetry.getStatus().enabled).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

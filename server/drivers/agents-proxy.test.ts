@@ -367,7 +367,7 @@ describe("agents-proxy MCP surface", () => {
         name: "Morning brief",
         instructions: "Summarize today's priorities.",
         schedule: { type: "weekly", time: "09:00", weekdays: ["monday", "friday"], timeZone: "America/Chicago" },
-        runOn: "maus",
+        runOn: "bot",
         durationMinutes: 45,
       },
     });

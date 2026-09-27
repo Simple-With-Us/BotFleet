@@ -200,20 +200,31 @@ public struct CompanionState: Sendable {
 
     // MARK: - Hydrating
 
-    /// Replace everything from a `GET /api/bots` response.
+    /// Refresh the roster from a `GET /api/bots` response, merging its
+    /// message page into whatever scrollback each thread already holds
+    /// rather than discarding it.
+    ///
+    /// The harness has no wire concept yet of "this thread's history was
+    /// reset", so the one hard signal a hydrate carries today is a thread
+    /// disappearing from the roster entirely — a deleted bot or room really
+    /// is gone, and its scrollback goes with it.  Every thread that is
+    /// still present merges: wiping ten pages of scrollback a person
+    /// already paged in, just because a foreground refresh re-fetched the
+    /// newest 50 messages, was the bug (IO12).
     public mutating func hydrate(_ fleet: Fleet) {
         hydrationRevision &+= 1
         bots = fleet.bots
         rooms = fleet.groups
-        messages.removeAll()
-        hasMore.removeAll()
+        let liveThreadIds = Set(fleet.bots.map(\.threadId) + fleet.groups.map(\.threadId))
+        for staleThreadId in Array(messages.keys) where !liveThreadIds.contains(staleThreadId) {
+            messages.removeValue(forKey: staleThreadId)
+            hasMore.removeValue(forKey: staleThreadId)
+        }
         for bot in fleet.bots {
-            messages[bot.threadId] = bot.messages ?? []
-            hasMore[bot.threadId] = bot.hasMore ?? false
+            mergeHydratedPage(bot.messages, hasMore: bot.hasMore, threadId: bot.threadId)
         }
         for room in fleet.groups {
-            messages[room.threadId] = room.messages ?? []
-            hasMore[room.threadId] = room.hasMore ?? false
+            mergeHydratedPage(room.messages, hasMore: room.hasMore, threadId: room.threadId)
         }
         // Drain or an idle send may have landed while we were disconnected.
         // Retire chips whose queueId is now a real transcript row; only idle
@@ -226,6 +237,40 @@ public struct CompanionState: Sendable {
             for entry in entries where landedIds.contains(entry.queueId) || (!entry.queued && landedTexts.contains(entry.text)) {
                 consumePendingQueued(threadId: threadId, queueId: entry.queueId)
             }
+        }
+    }
+
+    /// Merge one hydrated page into a thread's held scrollback instead of
+    /// discarding pages already paged in.  Overlapping ids take the fresh
+    /// copy — the harness may have patched a message since the last
+    /// hydrate — and everything else the phone already held survives,
+    /// oldest pages included.
+    ///
+    /// `nil` means the response carried no messages for this thread at all
+    /// (a bot/room with nothing loaded yet); never treat that as "empty",
+    /// or a payload shape that omits the field would erase scrollback for
+    /// no reason.
+    private mutating func mergeHydratedPage(_ page: [Message]?, hasMore newHasMore: Bool?, threadId: String) {
+        guard let page else { return }
+        let existing = messages[threadId] ?? []
+        guard !existing.isEmpty else {
+            messages[threadId] = page
+            hasMore[threadId] = newHasMore ?? false
+            return
+        }
+        var byId = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        for message in page { byId[message.id] = message }
+        messages[threadId] = byId.values.sorted {
+            $0.at == $1.at ? $0.id < $1.id : $0.at < $1.at
+        }
+        // Only let the fresh page's `hasMore` win when it actually describes
+        // the whole held scrollback.  A person who already paged further
+        // back than this window resolved that boundary themselves; a
+        // 50-message re-hydrate must not un-learn it.
+        let existingOldest = existing.map(\.at).min() ?? .greatestFiniteMagnitude
+        let freshOldest = page.map(\.at).min() ?? .greatestFiniteMagnitude
+        if existingOldest >= freshOldest {
+            hasMore[threadId] = newHasMore ?? false
         }
     }
 

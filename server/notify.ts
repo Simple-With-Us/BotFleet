@@ -38,10 +38,22 @@ export function isBlockingKind(kind: NotifyKind): boolean {
   return kind === "approval" || kind === "question";
 }
 
-/** One line, short enough for a lock screen, with the newlines and code
- * fences of a model's answer flattened out of it. */
+/** One line, short enough for a lock screen, with the newlines, code
+ * fences, and HTML entities (like &nbsp;) of a model's answer flattened out of it. */
 export function summarize(text: string, max = 140): string {
-  const line = text.replace(/```[\s\S]*?```/g, " ").replace(/\s+/g, " ").trim();
+  const line = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#160;/g, " ")
+    .replace(/&#xA0;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
 
@@ -61,12 +73,20 @@ export function buildNotification(
   bot: NotifyBot,
   threadId: string,
   detail: string,
-  extra?: { avatarUrl?: string; requestId?: string; tool?: string },
+  extra?: { avatarUrl?: string; requestId?: string; tool?: string; snoozed?: boolean },
 ): Notification | null {
   // The toggle means what it says: off is off, including for approvals.
   // A bot whose notifications you turned off can still block waiting for
   // you — that is the choice you made, and the chat still shows the card.
   if (bot.notifications === false) return null;
+  // A snoozed thread is an alert the person asked not to get yet — either
+  // this thread's own snooze or the bot-wide one it sits under.  Only the
+  // banner is suppressed: nothing here owns unread, so the sidebar badge,
+  // the transcript and any waiting approval card all still arrive, and the
+  // moment the snooze ends the thread is loud again with no backlog to
+  // replay.  Callers resolve the state (`shared/thread-snooze.ts`) so this
+  // stays a pure policy function with no clock of its own.
+  if (extra?.snoozed === true) return null;
 
   const body = summarize(detail);
   const title =

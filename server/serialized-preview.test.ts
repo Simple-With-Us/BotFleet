@@ -40,7 +40,7 @@ describe("fitListToBudget", () => {
     instructionsPreview: preview,
     instructionsPreviewTruncated: true,
     enabled: false,
-    runOn: "maus",
+    runOn: "bot",
     durationMinutes: 30,
     schedule: {
       type: "weekly",

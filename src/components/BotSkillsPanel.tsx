@@ -58,6 +58,20 @@ export function skillsEngineNote(driverKind: string | undefined): string | null 
   return `This bot runs on the Computer engine, so it has no workspace on this computer.${GAP}Imported skills never reach it.`;
 }
 
+/** GET /api/bots/:id/skills also reports `notIndexed`: enabled skills the
+ * prompt's index budget left out (still enabled, still usable if the bot is
+ * told about them directly — just not self-discoverable). null/empty means
+ * everything enabled made the index. */
+export function skillsNotIndexedNotice(notIndexed: string[] | undefined): string | null {
+  if (!notIndexed || !notIndexed.length) return null;
+  const count = notIndexed.length;
+  return (
+    `${count} enabled skill${count === 1 ? "" : "s"} not indexed — ${notIndexed.join(", ")}.${GAP}` +
+    `Still enabled, but there are too many (or they are too long) for this bot to discover on its own.${GAP}` +
+    "Disable one you don't need, or ask the bot to read it directly."
+  );
+}
+
 function importedAtLabel(importedAt: string): string {
   const at = Date.parse(importedAt);
   if (Number.isNaN(at)) return "an unknown date";
@@ -241,17 +255,20 @@ export function BotSkillsPanel({ bot, driverKind }: { bot: Bot; driverKind?: str
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [skills, setSkills] = useState<SkillListingRow[]>([]);
+  const [notIndexed, setNotIndexed] = useState<string[]>([]);
   const [importing, setImporting] = useState(false);
   const canPick = Boolean(window.ogb?.pickFolder);
   const engineNote = skillsEngineNote(driverKind);
   const placeholder = skillsPanelPlaceholder(skills, loading, error);
+  const notIndexedNotice = skillsNotIndexedNotice(notIndexed);
 
   const load = async () => {
     setLoading(true);
     setError(null);
     try {
-      const result: { skills: SkillListingRow[] } = await api(`/api/bots/${bot.id}/skills`);
+      const result: { skills: SkillListingRow[]; notIndexed?: string[] } = await api(`/api/bots/${bot.id}/skills`);
       setSkills(result.skills);
+      setNotIndexed(result.notIndexed ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -295,6 +312,13 @@ export function BotSkillsPanel({ bot, driverKind }: { bot: Bot; driverKind?: str
       {open && (
         <div className="mt-3">
           {engineNote && <div className="mb-2 text-[12px] text-ink-secondary">{engineNote}</div>}
+
+          {notIndexedNotice && (
+            <div className="mb-2 flex items-start gap-1.5 rounded bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-warning-dark border border-warning/20">
+              <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+              <span>{notIndexedNotice}</span>
+            </div>
+          )}
 
           {placeholder && <div className="text-[13px] text-ink-secondary">{placeholder}</div>}
 

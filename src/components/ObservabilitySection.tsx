@@ -39,6 +39,9 @@ export function ObservabilitySection() {
   const [dsn, setDsn] = React.useState("");
   const [environment, setEnvironment] = React.useState(observabilityConfig?.environment ?? "");
   const [tracesSampleRate, setTracesSampleRate] = React.useState(observabilityConfig?.tracesSampleRate ?? 0.2);
+  const [aiTracesSampleRate, setAiTracesSampleRate] = React.useState(observabilityConfig?.aiTracesSampleRate ?? 1.0);
+  const [httpTracesSampleRate, setHttpTracesSampleRate] = React.useState(observabilityConfig?.httpTracesSampleRate ?? 0.1);
+  const [uiTracesSampleRate, setUiTracesSampleRate] = React.useState(observabilityConfig?.uiTracesSampleRate ?? 0.1);
   const [enabled, setEnabled] = React.useState(initialSendDiagnostics(observabilityConfig));
   const [logsEnabled, setLogsEnabled] = React.useState(observabilityConfig?.logsEnabled ?? true);
 
@@ -57,6 +60,15 @@ export function ObservabilitySection() {
   React.useEffect(() => {
     if (observabilityConfig?.tracesSampleRate !== undefined) setTracesSampleRate(observabilityConfig.tracesSampleRate);
   }, [observabilityConfig?.tracesSampleRate]);
+  React.useEffect(() => {
+    if (observabilityConfig?.aiTracesSampleRate !== undefined) setAiTracesSampleRate(observabilityConfig.aiTracesSampleRate);
+  }, [observabilityConfig?.aiTracesSampleRate]);
+  React.useEffect(() => {
+    if (observabilityConfig?.httpTracesSampleRate !== undefined) setHttpTracesSampleRate(observabilityConfig.httpTracesSampleRate);
+  }, [observabilityConfig?.httpTracesSampleRate]);
+  React.useEffect(() => {
+    if (observabilityConfig?.uiTracesSampleRate !== undefined) setUiTracesSampleRate(observabilityConfig.uiTracesSampleRate);
+  }, [observabilityConfig?.uiTracesSampleRate]);
   React.useEffect(() => {
     setEnabled(initialSendDiagnostics(observabilityConfig));
   }, [observabilityConfig?.configured, observabilityConfig?.enabled, observabilityConfig?.requestedEnabled]);
@@ -96,10 +108,22 @@ export function ObservabilitySection() {
   const dsnLocked = source === "env";
   const viewEnvironment = status?.environment ?? observabilityConfig?.environment ?? "production";
   const viewTraces = status?.tracesSampleRate ?? observabilityConfig?.tracesSampleRate ?? 0.2;
+  const viewAiTraces = status?.aiTracesSampleRate ?? observabilityConfig?.aiTracesSampleRate ?? 1.0;
+  const viewHttpTraces = status?.httpTracesSampleRate ?? observabilityConfig?.httpTracesSampleRate ?? 0.1;
+  const viewUiTraces = status?.uiTracesSampleRate ?? observabilityConfig?.uiTracesSampleRate ?? 0.1;
   const viewLogsEnabled = status?.logsEnabled ?? observabilityConfig?.logsEnabled ?? true;
 
   const save = async (): Promise<boolean> => {
-    const built = buildObservabilityConfigPatch({ sentryDsn: dsn, enabled, environment, tracesSampleRate, logsEnabled });
+    const built = buildObservabilityConfigPatch({
+      sentryDsn: dsn,
+      enabled,
+      environment,
+      tracesSampleRate,
+      aiTracesSampleRate,
+      httpTracesSampleRate,
+      uiTracesSampleRate,
+      logsEnabled,
+    });
     if (!built.ok) {
       setSaveError(built.error);
       setSaveOk(false);
@@ -226,7 +250,16 @@ export function ObservabilitySection() {
             </div>
             <div className="flex flex-col rounded-lg border border-hairline/20 bg-inset/20 p-2">
               <span className="text-ink-secondary">Traces</span>
-              <span className="font-medium text-ink">{viewTraces > 0 ? `${Math.round(viewTraces * 100)}%` : "Off"}</span>
+              <span
+                className="font-medium text-ink"
+                title={`AI: ${Math.round(viewAiTraces * 100)}%  ·  HTTP: ${Math.round(viewHttpTraces * 100)}%  ·  UI: ${Math.round(viewUiTraces * 100)}%`}
+              >
+                {viewAiTraces > 0 || viewHttpTraces > 0 || viewUiTraces > 0
+                  ? `AI ${Math.round(viewAiTraces * 100)}%  ·  HTTP ${Math.round(viewHttpTraces * 100)}%  ·  UI ${Math.round(viewUiTraces * 100)}%`
+                  : viewTraces > 0
+                    ? `${Math.round(viewTraces * 100)}%`
+                    : "Off"}
+              </span>
             </div>
             <div className="flex flex-col rounded-lg border border-hairline/20 bg-inset/20 p-2">
               <span className="text-ink-secondary">Logs</span>
@@ -275,25 +308,85 @@ export function ObservabilitySection() {
                 className={observabilityInputClass}
               />
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-[12px] font-medium text-ink-secondary" htmlFor="observability-traces">
-                Traces Sample Rate
-              </label>
-              <input
-                id="observability-traces"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={tracesSampleRate}
-                onChange={(e) => {
-                  const next = Number(e.target.value);
-                  setTracesSampleRate(Number.isFinite(next) ? next : 0);
-                  setSaveOk(false);
-                }}
-                onKeyDown={(e) => e.key === "Enter" && void save()}
-                className={observabilityInputClass}
-              />
+            <div className="flex flex-col gap-2 border-t border-hairline/30 pt-3">
+              <div>
+                <div className="text-[13px] font-medium text-ink">Trace Sampling Rates</div>
+                <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Capture performance traces across AI reasoning, network calls, and user interactions to diagnose latency and bottlenecks.
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[12px] font-medium text-ink-secondary" htmlFor="observability-ai-traces">
+                    AI Operations &amp; Tools
+                  </label>
+                  <input
+                    id="observability-ai-traces"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={aiTracesSampleRate}
+                    onChange={(e) => {
+                      const next = Number(e.target.value);
+                      setAiTracesSampleRate(Number.isFinite(next) ? next : 0);
+                      setSaveOk(false);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && void save()}
+                    className={observabilityInputClass}
+                  />
+                  <span className="text-[11px] text-ink-secondary">
+                    Chat turns, bot handoffs, and tool runs.
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[12px] font-medium text-ink-secondary" htmlFor="observability-http-traces">
+                    Server HTTP Requests
+                  </label>
+                  <input
+                    id="observability-http-traces"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={httpTracesSampleRate}
+                    onChange={(e) => {
+                      const next = Number(e.target.value);
+                      const rate = Number.isFinite(next) ? next : 0;
+                      setHttpTracesSampleRate(rate);
+                      setSaveOk(false);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && void save()}
+                    className={observabilityInputClass}
+                  />
+                  <span className="text-[11px] text-ink-secondary">
+                    API calls, status checks, and background polls.
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[12px] font-medium text-ink-secondary" htmlFor="observability-ui-traces">
+                    Desktop &amp; Web UI
+                  </label>
+                  <input
+                    id="observability-ui-traces"
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={uiTracesSampleRate}
+                    onChange={(e) => {
+                      const next = Number(e.target.value);
+                      setUiTracesSampleRate(Number.isFinite(next) ? next : 0);
+                      setSaveOk(false);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && void save()}
+                    className={observabilityInputClass}
+                  />
+                  <span className="text-[11px] text-ink-secondary">
+                    Page views and screen loads.
+                  </span>
+                </div>
+              </div>
             </div>
 
             <div className="flex items-center justify-between gap-4 border-t border-hairline/30 pt-3">

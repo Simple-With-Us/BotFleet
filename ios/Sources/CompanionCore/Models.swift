@@ -275,6 +275,25 @@ public struct BotTask: Codable, Hashable, Sendable {
     public var usage: TaskUsage?
     public var modelSelection: ModelSelection?
     public var activeModelSelection: ModelSelection?
+    /// Asleep until: `0` is the until-activity sentinel and sleeps until the
+    /// thread does anything again, a timestamp sleeps until that moment, and
+    /// nil means awake.  Expired deadlines heal against the harness clock,
+    /// so a snapshot is authoritative; a live frame is never refreshed
+    /// afterwards, which is why `isSnoozed` reads a clock too.  See
+    /// `shared/thread-snooze.ts`.
+    public var snoozedUntil: Double?
+
+    /// Asleep right now.  Narrower than the bot-wide snooze: the bot keeps
+    /// working its other threads while this one is quiet.
+    public func isSnoozed(now: Date = Date()) -> Bool {
+        ThreadSnooze.isSnoozed(snoozedUntil, now: now)
+    }
+
+    /// "Until activity" or the resolved deadline, for the badge under a
+    /// thread's title.  Nil while the thread is awake.
+    public func snoozeLabel(now: Date = Date()) -> String? {
+        ThreadSnooze.label(snoozedUntil, now: now)
+    }
 }
 
 public struct Bot: Codable, Hashable, Identifiable, Sendable {
@@ -293,6 +312,8 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var unread: Bool
     public var modelSelection: ModelSelection
     public var activeModelSelection: ModelSelection?
+    /// HTTP tool-loop ceiling. Nil uses 12. Only a toolLoop engine honors it.
+    public var maxToolRounds: Int? = nil
     public var createdAt: Double
     public var busy: Bool?
     public var pinned: Bool?
@@ -618,6 +639,8 @@ public struct ModelCatalog: Codable, Hashable, Sendable {
 
 public struct InstanceCapabilities: Codable, Hashable, Sendable {
     public var effortLevels: [String]?
+    /// True when this engine runs the harness HTTP tool loop.
+    public var toolLoop: Bool? = nil
 }
 
 public struct Instance: Codable, Hashable, Identifiable, Sendable {
@@ -826,6 +849,14 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var speechDevices: [String]?
     public var modelSelection: ModelSelection?
     public var section: SectionString?
+    /// `nil` leaves the stored ceiling alone. `.clear` sends JSON null so the
+    /// harness drops it and the turn uses 12.
+    public var maxToolRounds: MaxToolRounds?
+
+    public enum MaxToolRounds: Equatable, Sendable {
+        case set(Int)
+        case clear
+    }
 
     public enum SectionString: Equatable, Sendable {
         case set(String)
@@ -851,7 +882,8 @@ public struct BotProfilePatch: Encodable, Sendable {
         speakReplies: Bool? = nil,
         speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
-        section: SectionString? = nil
+        section: SectionString? = nil,
+        maxToolRounds: MaxToolRounds? = nil
     ) {
         self.name = name
         self.title = title
@@ -864,10 +896,11 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.speechDevices = speechDevices
         self.modelSelection = modelSelection
         self.section = section
+        self.maxToolRounds = maxToolRounds
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -891,6 +924,12 @@ public struct BotProfilePatch: Encodable, Sendable {
             switch section {
             case let .set(val): try values.encode(val, forKey: .section)
             case .clear: try values.encodeNil(forKey: .section)
+            }
+        }
+        if let maxToolRounds {
+            switch maxToolRounds {
+            case let .set(rounds): try values.encode(rounds, forKey: .maxToolRounds)
+            case .clear: try values.encodeNil(forKey: .maxToolRounds)
             }
         }
     }
@@ -1029,7 +1068,7 @@ public struct RoutineInput: Encodable, Sendable {
     public var durationMinutes: Int
 
     public init(
-        name: String, prompt: String, botId: String, runOn: String = "maus",
+        name: String, prompt: String, botId: String, runOn: String = "bot",
         enabled: Bool? = nil, schedule: RoutineSchedule, durationMinutes: Int = 30
     ) {
         self.name = name
@@ -1043,8 +1082,26 @@ public struct RoutineInput: Encodable, Sendable {
 }
 
 public enum RoutineRunLocation: String, CaseIterable, Codable, Hashable, Sendable {
-    case maus
+    case bot
     case cloud
+
+    public init?(rawValue: String) {
+        switch rawValue {
+        case "bot", "maus": self = .bot
+        case "cloud": self = .cloud
+        default: return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = RoutineRunLocation(rawValue: raw) ?? .bot
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// Desktop-equivalent run-location availability, derived only from paired-safe
@@ -1065,13 +1122,13 @@ public struct RoutineRunAvailability: Equatable, Sendable {
     public var cloudReady: Bool { cloudConfigured && cloudInstanceAvailable }
 
     public func canSelect(_ location: RoutineRunLocation, preserving current: RoutineRunLocation) -> Bool {
-        location == .maus || cloudReady || current == .cloud
+        location == .bot || cloudReady || current == .cloud
     }
 }
 
 public extension Routine {
     var runLocation: RoutineRunLocation {
-        RoutineRunLocation(rawValue: runOn) ?? .maus
+        RoutineRunLocation(rawValue: runOn) ?? .bot
     }
 
     /// Mirrors the desktop `canToggleRoutine` policy. A one-time routine has

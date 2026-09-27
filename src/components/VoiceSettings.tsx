@@ -4,16 +4,20 @@
 // The voice list comes from the harness, which holds the key — the
 // renderer never talks to MiniMax itself.
 import { useEffect, useRef, useState } from "react";
-import { Check, Loader2, Mic, Plus, Volume2, X } from "lucide-react";
+import { Check, ExternalLink, Loader2, Mic, Plus, Volume2, X } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { useDesktopCapabilities } from "@/components/DesktopCapabilities";
 import { speaker } from "@/lib/tts";
 import { cn } from "@/lib/cn";
 
-const DEFAULT_MINIMAX_VOICE = "Jay-Wedgeworth-001";
-
-const SAMPLE = "Morning. Overnight the tests went green, and I left two notes for you in the thread.";
+const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
+const MINIMAX_KEY_URL = "https://platform.minimax.io/user/basic-information/interface-key";
+const ELEVENLABS_KEY_URL = "https://elevenlabs.io/app/settings/api-keys";
+const cnSwitch = (on: boolean) =>
+  `relative h-6 w-11 shrink-0 rounded-full transition-colors ${on ? "bg-accent" : "bg-control"}`;
+const cnKnob = (on: boolean) =>
+  `absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white transition-all ${on ? "left-[21px]" : "left-[3px]"}`;
 
 export function VoiceSettings({
   bot,
@@ -132,7 +136,7 @@ export function VoiceSettings({
       if (result.error) {
         setCloneError(result.error);
       } else {
-        setCloneSuccess(`Voice "${label}" cloned and ready. Pick it from the list below.`);
+        setCloneSuccess(`Voice "${label}" cloned and ready.  Pick it from the list below.`);
         setCloneLabel("");
         setCloneFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
@@ -156,11 +160,11 @@ export function VoiceSettings({
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Give this bot a voice for calls and spoken replies. The voice choice belongs to this bot;
+        Give this bot a voice for calls and spoken replies.  The voice choice belongs to this bot;
         {provider === "system"
           ? systemVoicesAvailable
             ? " the voices are the ones already installed on this Mac."
-            : " built-in Mac voices are unavailable here. Switch to MiniMax to keep using voice."
+            : " built-in Mac voices are unavailable here.  Switch to MiniMax to keep using voice."
           : provider === "elevenlabs" ? " the ElevenLabs key is shared by the workspace." : " the MiniMax key is shared by the workspace."}
       </div>
 
@@ -199,7 +203,7 @@ export function VoiceSettings({
               <span>{provider === "elevenlabs" ? "ElevenLabs Key" : "MiniMax Key"}</span>
               {configured && <span className="text-[11px] text-success">Connected</span>}
             </div>
-            <p className="mb-2 text-[11.5px] text-ink-secondary">Switching engines keeps the saved key. Replace it here if the new engine uses a different account.</p>
+            <p className="mb-2 text-[11.5px] text-ink-secondary">Switching engines keeps the saved key.  Replace it here if the new engine uses a different account.</p>
             <div className="flex gap-2">
               <input
                 type="password"
@@ -219,6 +223,17 @@ export function VoiceSettings({
                 {saving ? <Loader2 size={13} className="animate-spin" /> : <><Check size={13} />Save</>}
               </button>
             </div>
+            {!configured && (
+              <a
+                href={provider === "elevenlabs" ? ELEVENLABS_KEY_URL : MINIMAX_KEY_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-1.5 inline-flex items-center gap-1 text-[12px] font-medium text-accent hover:underline"
+              >
+                Get a Key
+                <ExternalLink size={11} aria-hidden="true" />
+              </a>
+            )}
           </div>
 
           {configured && provider === "minimax" && (
@@ -233,7 +248,7 @@ export function VoiceSettings({
                     className="flex items-center gap-1 text-accent hover:underline"
                   >
                     {cloneOpen ? <X size={12} /> : <Plus size={12} />}
-                    {cloneOpen ? "Close" : "Add from audio"}
+                    {cloneOpen ? "Close" : "Add From Audio"}
                   </button>
                 </div>
 
@@ -241,7 +256,7 @@ export function VoiceSettings({
                   <div className="mt-2 rounded-lg border border-hairline/40 bg-inset p-3">
                     <p className="mb-2 text-[12px] text-ink-secondary">
                       Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice
-                      clone. The clone appears in the voice list below.
+                      clone.  The clone appears in the voice list below.
                     </p>
                     <div className="mb-2 flex gap-2">
                       <input
@@ -259,7 +274,7 @@ export function VoiceSettings({
                         value={cloneLabel}
                         onChange={(e) => setCloneLabel(e.target.value)}
                         maxLength={64}
-                        placeholder='Voice ID (e.g. Jay-Wedgeworth-001)'
+                        placeholder="Voice ID (e.g. My-Voice-01)"
                         aria-label="Clone voice ID"
                         className="w-full rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
                       />
@@ -304,10 +319,7 @@ export function VoiceSettings({
                     ? "Workspace default"
                     : "Pick a voice"}
               </option>
-              {provider === "minimax" && !voices.some((voice) => voice.id === DEFAULT_MINIMAX_VOICE) && (
-                <option value={DEFAULT_MINIMAX_VOICE}>Jay-Wedgeworth-001 (default, if available on your MiniMax account)</option>
-              )}
-              {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && selectedVoice !== DEFAULT_MINIMAX_VOICE && (
+              {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
                 <option value={selectedVoice}>Current bot voice</option>
               )}
               {voices.map((v) => (
@@ -327,23 +339,20 @@ export function VoiceSettings({
               <Volume2 size={14} /> Try
             </button>
           </div>
-          {provider === "minimax" && !voices.some((voice) => voice.id === DEFAULT_MINIMAX_VOICE) && !loadingVoices && (
-            <p className="mt-1 text-[11px] text-warning">Jay-Wedgeworth-001 is the requested default, but it is not in this account's current voice list. Clone or add that voice before speaking.</p>
-          )}
         </div>
       )}
 
       <div className="mt-4 border-t border-hairline/40 pt-4">
-        <div className="text-[13px] font-medium text-ink">Speech to text</div>
-        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it. Recordings sent from iPhone keep the original audio and transcript on their message.</p>
-        <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured. Siri and iOS 27 speech features still need device testing.</p>
+        <div className="text-[13px] font-medium text-ink">Speech to Text</div>
+        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.  Recordings sent from iPhone keep the original audio and transcript on their message.</p>
+        <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured.  Siri and iOS 27 speech features still need device testing.</p>
       </div>
 
       <div className="mt-4 border-t border-hairline/40 pt-4">
-        <div className="text-[13px] font-medium text-ink">Play replies on</div>
-        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive. Voice clips stay on their messages for replay.</p>
+        <div className="text-[13px] font-medium text-ink">Play Replies On</div>
+        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.  Voice clips stay on their messages for replay.</p>
         <div className="mt-3 flex gap-4">
-          {([['mac', 'Mac'], ['iphone', 'iPhone (app open)']] as const).map(([device, label]) => {
+          {([['mac', 'Mac'], ['iphone', 'Play on iPhone (while app is open)']] as const).map(([device, label]) => {
             const selected = bot.speechDevices ? bot.speechDevices.includes(device) : device === 'mac' && Boolean(bot.speakReplies);
             return <label key={device} className="flex items-center gap-2 text-[13px] text-ink">
               <input type="checkbox" checked={selected} onChange={() => {
@@ -357,14 +366,23 @@ export function VoiceSettings({
 
       <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
         <div>
-          <div className="text-[13px] font-medium text-ink">Speech-friendly summaries</div>
-          <p className="text-[11.5px] text-ink-secondary">Ask every bot to write a short spoken summary and a full written answer. The summary appears when a message is expanded and is used for speech.</p>
+          <div className="text-[13px] font-medium text-ink">Speech-Friendly Summaries</div>
+          <p className="text-[11.5px] text-ink-secondary">Ask every bot to write a short spoken summary and a full written answer.  The summary appears when a message is expanded and is used for speech.</p>
         </div>
-        <input type="checkbox" checked={Boolean(tts.optimizedSummary)} aria-label="Speech-friendly summaries" onChange={(e) => {
-          api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { optimizedSummary: e.target.checked } }) })
-            .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
-            .catch((cause: Error) => setError(cause.message));
-        }} />
+        <button
+          type="button"
+          role="switch"
+          aria-checked={Boolean(tts.optimizedSummary)}
+          aria-label="Speech-Friendly Summaries"
+          onClick={() => {
+            api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { optimizedSummary: !tts.optimizedSummary } }) })
+              .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
+              .catch((cause: Error) => setError(cause.message));
+          }}
+          className={cnSwitch(Boolean(tts.optimizedSummary))}
+        >
+          <span className={cnKnob(Boolean(tts.optimizedSummary))} />
+        </button>
       </div>
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>
