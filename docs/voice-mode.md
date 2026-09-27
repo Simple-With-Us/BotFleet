@@ -41,7 +41,7 @@ without either throws `NoVoiceConfigured`, which the route turns into a 409 —
 
 ## The spoken register
 
-The half that decides whether this is pleasant. Agents write for a screen:
+The half that decides whether this is pleasant. Bots write for a screen:
 fenced code, file paths, tables, link soup. Read aloud verbatim, a diff is four
 minutes of punctuation and `server/drivers/acp/core.ts` is "server slash drivers
 slash a c p slash core dot t s".
@@ -79,7 +79,7 @@ streaming model does the same job server-side via `min_turn_silence`, configured
 to the same 850ms. Composer dictation omits the timeout and keeps its
 press-to-stop behavior.
 
-**Narration is what makes it bearable.** An agent turn is 5–60 seconds of tool
+**Narration is what makes it bearable.** A bot turn is 5–60 seconds of tool
 calls, and silence that long reads as a dropped call. Every activity chip the
 harness narrates is read aloud as it happens. The phrase is computed once,
 server-side, into `tool.spoken` at fold time — so the chip you see and the phrase
@@ -89,11 +89,11 @@ you hear cannot drift apart.
 "yes"/"no". Anything that is not clearly a decision is refused and re-asked:
 consent must never be inferred from a sentence that merely contained the word
 "sure". Non-permission questions are read too, and the next complete spoken
-turn is returned as the answer, so an agent asking for input does not strand the
+turn is returned as the answer, so a bot asking for input does not strand the
 call behind an invisible card.
 
 **Latency, honestly.** Endpointing is 300–700ms and time-to-first-byte is
-~100–250ms, against an agent turn of 5–60s. The agent dominates by 50–100x, so
+~100–250ms, against a bot turn of 5–60s. The bot dominates by 50–100x, so
 voice choice is a quality decision, not a latency one. The way to make a call
 feel conversational is to put the bot you call on a fast model and let it
 delegate real work to specialists over `ask_bot` — no new machinery required.
@@ -106,7 +106,7 @@ delegate real work to specialists over `ask_bot` — no new machinery required.
 | Piper | Same complaint, one tier up |
 | Kokoro-82M in the renderer | Genuinely good and free, but it is a second provider, a 2.2MB chunk, an ONNX runtime and a first-run model download. Simplicity won. |
 | Cartesia | Cheaper and faster to first byte, but a second provider earns its keep only once one is not enough |
-| ElevenLabs Agents | Its custom-LLM `cascade_timeout_seconds` maxes at 15s and agent turns exceed that; it also wants to own turn-taking and tool calls, which is what the harness owns |
+| ElevenLabs Agents | Its custom-LLM `cascade_timeout_seconds` maxes at 15s and bot turns exceed that; it also wants to own turn-taking and tool calls, which is what the harness owns |
 | OpenAI Realtime / Gemini Live (speech-to-speech) | They replace the brain, and the brain being Claude Code on your own machine *is* the product |
 
 ## Known gaps
@@ -120,7 +120,7 @@ delegate real work to specialists over `ask_bot` — no new machinery required.
 - **No transcript polish** — Lane 1+2 ships raw AssemblyAI transcripts (already
   formatted via `format_turns: true`). Lane 3 ("Optimize responses for spoken
   word format") will pipe final transcripts through the bot's MiniMax-M3 model
-  for punctuation cleanup and acronym normalization before sending to the agent.
+  for punctuation cleanup and acronym normalization before sending to the bot.
 
 ## Failure boundaries
 

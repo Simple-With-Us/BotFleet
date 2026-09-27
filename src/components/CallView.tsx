@@ -683,7 +683,7 @@ function Call({ bot }: { bot: Bot }) {
       </div>
 
       <div className="text-[11.5px] text-ink-secondary/70">
-        Hold Control + Option to talk · Space interrupts · Esc hangs up
+        {sttSessionRef.current?.provider === "apple" ? "Hold Control + Option to talk · " : ""}Space interrupts · Esc hangs up
       </div>
     </div>
   );
