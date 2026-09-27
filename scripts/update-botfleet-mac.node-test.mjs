@@ -7,6 +7,8 @@ import test from "node:test";
 import {
   applicationAttachmentError,
   applicationIdentitiesCanTransition,
+  SAFE_STORAGE_EXPORT_FLAG,
+  shouldExportSafeStorageBeforeRename,
   authenticatedRuntimeError,
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
@@ -234,6 +236,13 @@ test("transition release still accepts main's legacy-ID candidate over a legacy 
   assert.equal(applicationIdentitiesCanTransition(current, legacy), false);
   // Any other bundle ID is rejected as a candidate.
   assert.equal(applicationIdentitiesCanTransition(legacy, { ...legacy, bundleIdentifier: "com.example.other" }), false);
+});
+
+test("safeStorage export runs only when the installed app is the legacy identity", () => {
+  assert.equal(shouldExportSafeStorageBeforeRename("com.botfleet.app", "app.botfleet.macos"), true);
+  assert.equal(shouldExportSafeStorageBeforeRename("app.botfleet.macos", "app.botfleet.macos"), false);
+  assert.equal(shouldExportSafeStorageBeforeRename("com.botfleet.app", "com.botfleet.app"), false);
+  assert.equal(SAFE_STORAGE_EXPORT_FLAG, "--export-safe-storage-migration");
 });
 
 test("the stable wrapper bootstraps updater policy from the fetched target", async () => {

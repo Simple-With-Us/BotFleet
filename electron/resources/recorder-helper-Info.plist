@@ -7,7 +7,7 @@
   <key>CFBundleExecutable</key>
   <string>recorder-helper</string>
   <key>CFBundleIdentifier</key>
-  <string>com.botfleet.app.recorder</string>
+  <string>app.botfleet.recorder.macos</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

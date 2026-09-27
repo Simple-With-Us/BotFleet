@@ -108,7 +108,7 @@ export async function pollServerIdentity({
 // ---------------------------------------------------------------------------
 // Attach-or-spawn (harness-ops, 2026-09-02).
 //
-// A Mac that runs the always-on launchd harness (`com.jay.botfleet-server`)
+// A Mac that runs the always-on launchd harness (`app.botfleet.server`)
 // already has a BotFleet server on 8799 when the desktop app starts. The old
 // boot loop treated that as a "foreign owner" (pid mismatch), fell through to
 // 18799 and forked a SECOND harness against the same ~/.botfleet data dir —

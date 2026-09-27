@@ -41,7 +41,7 @@ const STANDALONE_SOCKET = path.join(
   app.getPath("home"),
   "Library/Caches/cua-driver/cua-driver.sock",
 );
-const HOST_BUNDLE_ID = "com.botfleet.app";
+const HOST_BUNDLE_ID = "app.botfleet.macos";
 const CUA_ENV = { CUA_DRIVER_RS_TELEMETRY_ENABLED: "0" };
 process.env.CUA_DRIVER_RS_TELEMETRY_ENABLED ??= "0";
 

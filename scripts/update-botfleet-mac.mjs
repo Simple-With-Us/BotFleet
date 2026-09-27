@@ -37,6 +37,7 @@ const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // rename PR drops legacy candidates and keeps legacy only as a predecessor.
 const EXPECTED_BUNDLE_ID = "app.botfleet.macos";
 const LEGACY_BUNDLE_ID = "com.botfleet.app";
+export const SAFE_STORAGE_EXPORT_FLAG = "--export-safe-storage-migration";
 const LEGACY_LAUNCH_AGENT_LABEL = "com.jay.botfleet-server";
 const PREPARED_SCHEMA_VERSION = 2;
 const EXPECTED_SIGN_IDENTITY = "Developer ID Application: Jay Wedgeworth, LLC (CC8UTF7ATG)";
@@ -832,6 +833,10 @@ async function signatureIdentity(bundlePath, { allowLegacyBundleId = false } = {
     throw new Error("BotFleet designated signing requirement is missing its stable bundle or team identity");
   }
   return { teamIdentifier, bundleIdentifier: identifier, designatedRequirement: sha256(designatedRequirement) };
+}
+
+export function shouldExportSafeStorageBeforeRename(installedBundleId, candidateBundleId) {
+  return installedBundleId === LEGACY_BUNDLE_ID && candidateBundleId === EXPECTED_BUNDLE_ID;
 }
 
 export function applicationIdentitiesCanTransition(installed, candidate) {
@@ -1758,6 +1763,16 @@ function createOperations(config) {
     },
 
     installCandidate: async (prepared, previous) => {
+      // The renamed executable cannot decrypt the Keychain item Electron
+      // safeStorage created under com.botfleet.app.  The still-authorized
+      // predecessor writes credentials.migration.json before the swap.
+      if (shouldExportSafeStorageBeforeRename(
+        previous.installedIdentity.bundleIdentifier,
+        prepared.bundleIdentifier,
+      )) {
+        const executable = join(config.appPath, "Contents/MacOS/BotFleet");
+        await run(executable, [SAFE_STORAGE_EXPORT_FLAG]);
+      }
       // capturePrevious already refused a pre-existing rollback path before the
       // boundary; this repeats the check because the window between them is
       // where a concurrent run would have to have raced the updater lock.

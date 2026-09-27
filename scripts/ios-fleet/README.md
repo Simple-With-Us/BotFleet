@@ -3,7 +3,7 @@
 Vendored from `/Users/jay/apps/ios-fleet` (same family as Congress.Trade
 `scripts/ios-fleet`) so a GitHub-hosted `macos-latest` runner can ship
 without that Mac path.  `apps.json` here is BotFleet-only: bundle
-`app.botfleet`, team `CC8UTF7ATG`, SKU `botfleet`, marketing `1.0.N`,
+`app.botfleet.ios`, team `CC8UTF7ATG`, SKU `botfleet`, marketing `1.0.N`,
 build UTC `YYYYMMDDHHMM`.
 
 `scripts/ios-ship-testflight.sh` prefers this directory, then falls back

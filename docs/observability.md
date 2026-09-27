@@ -132,7 +132,7 @@ the field leaves the stored value untouched).
 
 ## How each surface gets its DSN
 
-1. **Mac harness** (`com.jay.botfleet-server`).  Resolution order above.
+1. **Mac harness** (`app.botfleet.server`).  Resolution order above.
    Boot line on success:
    `[sentry] enabled (config) env=production traces=0.2 logs=on host=o123.ingest.sentry.io project=456`.
    The DSN's key and the full DSN string never reach a log line, an error

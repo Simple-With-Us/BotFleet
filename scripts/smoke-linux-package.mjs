@@ -117,7 +117,7 @@ const metadata = {
   mcp_protocol_version: "2025-06-18",
   pid: process.pid,
   embedded: true,
-  host_bundle_id: "com.botfleet.app",
+  host_bundle_id: "app.botfleet.macos",
 };
 const tools = ["click", "get_window_state", "list_apps", "type_text"].map((name) => ({ name }));
 const toolManifest = { schema_version: "1", capability_version: "1", tools };

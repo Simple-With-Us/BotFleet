@@ -2,7 +2,7 @@
 # Thin wrapper: ship BotFleet companion to TestFlight (no Xcode UI).
 # Prefer the in-repo copy so a GitHub-hosted macos-latest runner without
 # /Users/jay/apps/ios-fleet still resolves the 1.0.N train and bundle
-# app.botfleet.  Fall back to the Mac runtime when that directory exists.
+# app.botfleet.ios.  Fall back to the Mac runtime when that directory exists.
 #
 # Hosted path: .github/workflows/ios-ship.yml (push path filter on ios/**,
 # schedule, workflow_dispatch). CI invokes this wrapper with no extra flags.

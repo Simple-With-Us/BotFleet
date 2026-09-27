@@ -15,5 +15,9 @@
 	<array>
 		<string>group.app.botfleet</string>
 	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)group.app.botfleet</string>
+	</array>
 </dict>
 </plist>

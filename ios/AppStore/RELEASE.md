@@ -5,7 +5,7 @@ The app is native Swift and uses XcodeGen; EAS commands do not apply.
 ## One-time Apple setup
 
 1. Enrol in the Apple Developer Program.
-2. Register the bundle IDs `app.botfleet` and `app.botfleet.widgets` (already in `project.yml`).
+2. Register the bundle IDs `app.botfleet.ios` and `app.botfleet.ios.widgets` (already in `project.yml`).
 3. Create the matching app in App Store Connect with the name **BotFleet**, primary category **Productivity**, and a unique SKU.
 4. Use the existing Apple Distribution identity (team `CC8UTF7ATG`).  Hosted ships use automatic signing and do not install a new provisioning profile.
 5. Add the review contact details in App Store Connect; do not commit private contact data or App Store Connect keys.
