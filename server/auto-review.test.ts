@@ -38,6 +38,7 @@ describe("shouldReview", () => {
   it("never reviews unattended or local-computer requests", () => {
     expect(shouldReview(context({ unattended: true }))).toBe(false);
     expect(shouldReview(context({ approvalScope: "local-computer" }))).toBe(false);
+    expect(shouldReview(context({ approvalScope: "disposable-computer" }))).toBe(true);
   });
 
   it("supports watch mode but stays off by default", () => {

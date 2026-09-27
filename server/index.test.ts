@@ -2323,6 +2323,15 @@ describe("harness HTTP API", () => {
         );
       }, { timeout: 5_000 }).toBe(true);
 
+      const roomGrant = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "fallback-room-approval",
+      });
+      expect(roomGrant.status).toBe(200);
+      expect(roomGrant.body.bot.alwaysAllow).toContain("Bash:echo");
+      const wrongRequest = await api("POST", `/api/bots/${bot.id}/always-allow`, {
+        allowKey: "Bash:echo", threadId: room.threadId, requestId: "other-request",
+      });
+      expect(wrongRequest.status).toBe(409);
       const answered = await api("POST", `/api/threads/${room.threadId}/respond`, {
         requestId: "fallback-room-approval",
         behavior: "allow",

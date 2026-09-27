@@ -9212,11 +9212,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!allowKey) return json(res, 400, { error: "allowKey required" });
-      const pendingCard = store.messagesFor(bot.threadId).find((message) =>
+      const threadId = typeof body.threadId === "string" ? body.threadId : bot.threadId;
+      const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+      const room = store.groupByThread(threadId);
+      // Room cards live on the room thread, not the responder's private DM.
+      // Bind the request to that room's actual speaker and the exact pending
+      // card, so another member cannot grant a key from a different ask.
+      const pendingCard = (store.threadBelongsToBot(bot.id, threadId) && (!room || requestId)
+        ? store.messagesFor(threadId) : []).find((message) =>
         message.card?.requestId &&
+        (!requestId || message.card.requestId === requestId) &&
         !message.card.answered &&
         message.card.dismissed !== true &&
-        message.card.allowKey === allowKey
+        message.card.allowKey === allowKey &&
+        (!room || message.from?.botId === bot.id)
       )?.card;
       if (coarseAlwaysAllowRefused(allowKey, { scope: pendingCard?.approvalScope })) {
         return json(res, 400, { error: `${allowKey} would cover every shell command — approve this one instead` });

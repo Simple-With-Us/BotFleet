@@ -38,7 +38,7 @@ export function shouldReview(context: ReviewContext): boolean {
     context.mode !== "off" &&
     context.source === "no-grant" &&
     !context.unattended &&
-    context.approvalScope === undefined
+    context.approvalScope !== "local-computer"
   );
 }
 

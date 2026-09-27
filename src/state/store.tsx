@@ -2258,7 +2258,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // strand the turn — but it says so.
             void api(`/api/bots/${action.alwaysAllow.botId}/always-allow`, {
               method: "POST",
-              body: JSON.stringify({ allowKey: action.alwaysAllow.key }),
+              body: JSON.stringify({ allowKey: action.alwaysAllow.key, threadId: action.threadId, requestId: action.requestId }),
             })
               .catch(showError)
               .finally(respond);
