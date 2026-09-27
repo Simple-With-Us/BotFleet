@@ -178,6 +178,13 @@ export interface AcpSupport {
    * describe() runs before any session exists, so there is no _meta to read
    * — eventually both should come from initialize's _meta.modelState. */
   effortLevels?: readonly EffortLevel[];
+  /** Per-model reasoning-effort budgets, keyed by model id.  A model listed
+   * here gets its entry as the catalog option's `effortLevels`, which the
+   * client prefers over the driver-wide list; models absent from the map
+   * fall back to `effortLevels`.  Mirrors the Harness
+   * `AcpSupport.perModelEffortLevels` shape so a Harness-published map can
+   * be passed straight through. */
+  perModelEffortLevels?: Readonly<Record<string, readonly EffortLevel[]>>;
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
   /** Base `initialize` deadline for a CLI whose cold boot is heavier than
@@ -413,6 +420,27 @@ function decodeAcpConfig(defaultCli: string) {
  * ACP JSON-RPC-over-stdio driver. Harness differences (argv, auth, catalog)
  * live in `support`; this is the shared handshake and turn runtime.
  */
+/** Overlay `perModelEffortLevels` onto a model catalog.  A model listed in
+ * the map gets its entry as the option's `effortLevels`, which the client
+ * prefers over the engine-wide list; a model absent from the map, or an
+ * option that already declares its own levels, is left alone.  Returns the
+ * catalog untouched (same reference) when no map is declared, so drivers
+ * that do not opt in see zero behavior change. */
+function withPerModelEffortLevels(
+  catalog: ModelCatalog,
+  perModel: AcpSupport["perModelEffortLevels"],
+): ModelCatalog {
+  if (!perModel) return catalog;
+  let changed = false;
+  const options = catalog.options.map((option) => {
+    const levels = perModel[option.id];
+    if (!levels || option.effortLevels !== undefined) return option;
+    changed = true;
+    return { ...option, effortLevels: levels };
+  });
+  return changed ? { ...catalog, options } : catalog;
+}
+
 export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> {
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
@@ -426,7 +454,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       access: support.access ?? "subscription",
     },
     install: support.install,
-    models: support.models,
+    models: withPerModelEffortLevels(support.models, support.perModelEffortLevels),
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
 
@@ -450,12 +478,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         support.transformEnv?.(env, effective);
         return env;
       };
-      let models = support.models;
+      let models = withPerModelEffortLevels(support.models, support.perModelEffortLevels);
       const refreshModels = async () => {
         if (!support.resolveModels) return;
         try {
           const resolved = await support.resolveModels(childEnv(), config);
-          if (resolved.options.length) models = resolved;
+          if (resolved.options.length) {
+            models = withPerModelEffortLevels(resolved, support.perModelEffortLevels);
+          }
         } catch {
           // Keep the last usable catalog when an optional discovery source is down.
         }
