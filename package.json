@@ -21,7 +21,7 @@
   "packageManager": "pnpm@10.33.0",
   "scripts": {
     "clean": "node scripts/clean.mjs",
-    "lint": "oxlint .",
+    "lint": "node scripts/check-lint-baseline.mjs",
     "check:contrast": "node scripts/check-contrast.mjs",
     "dev": "vite",
     "docs:dev": "pnpm --filter @botfleet/docs dev",
