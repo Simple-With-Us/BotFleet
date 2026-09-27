@@ -58,6 +58,13 @@ const KEY_PREFIXES: RegExp[] = [
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, // github classic
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g, // github fine-grained
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g, // slack
+  // Stripe's live/test keys use underscores, which the sk- pattern above
+  // (hyphenated ant-/proj-/live-/test- variants) does not reach.
+  /\bsk_(?:live|test)_[A-Za-z0-9]{16,}/g, // stripe underscore form
+  /\bak_[A-Za-z0-9_-]{16,}/g, // generic issued api keys (botfleet-owned shape)
+  /\bwhsec_[A-Za-z0-9]{16,}/g, // stripe webhook signing secrets
+  /\bya29\.[A-Za-z0-9_-]{20,}/g, // google oauth access tokens
+  /\bglpat-[A-Za-z0-9_-]{15,}/g, // gitlab personal access tokens
   /\bAKIA[0-9A-Z]{16}\b/g, // aws access key id
   /\bAIza[0-9A-Za-z_-]{30,}/g, // google api key
   /\bnpm_[A-Za-z0-9]{20,}/g, // npm
