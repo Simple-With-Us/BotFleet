@@ -1,9 +1,15 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { McodeAgentDriver, mcodeAuthenticated, mcodeDataDir, STATIC_MCODE_MODELS } from "./mcode.ts";
+import {
+  McodeAgentDriver,
+  mcodeAuthenticated,
+  mcodeDataDir,
+  readMcodeModelCatalog,
+  STATIC_MCODE_MODELS,
+} from "./mcode.ts";
 
 const scratchDirs: string[] = [];
 
@@ -22,14 +28,79 @@ function scratchHome(withConfig: boolean): string {
 }
 
 describe("STATIC_MCODE_MODELS", () => {
-  it("defaults to MiniMax-M3 with the M2.7 speed tier alongside", () => {
-    expect(STATIC_MCODE_MODELS).toEqual({
-      default: "MiniMax-M3",
-      options: [
-        { id: "MiniMax-M3", label: "MiniMax M3" },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed" },
-      ],
-    });
+  it("keeps a preview tier reachable without making it the shipped default", () => {
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3");
+    expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
+      "MiniMax-M3",
+      "MiniMax-M3.1-Flash-Preview",
+      "MiniMax-M2.7-highspeed",
+      "MiniMax-M2.7",
+    ]);
+  });
+});
+
+describe("readMcodeModelCatalog", () => {
+  const write = (dir: string, body: string): void => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.yaml"), body, "utf8");
+  };
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcode-catalog-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("lands on the model the user's own config defaults to", () => {
+    // The whole point: a current install defaults to the flash preview tier,
+    // and a frozen static list made it unreachable in the picker.
+    write(
+      dir,
+      [
+        "defaultModel: minimax/MiniMax-M3.1-Flash-Preview",
+        "defaultModelContextWindow: 1000000",
+        "provider:",
+        "  minimax:",
+        "    model_order:",
+        "      - minimax/MiniMax-M3.1-Flash-Preview",
+        "      - minimax/MiniMax-M3",
+        "      - minimax/MiniMax-M2.7-highspeed",
+        "      - minimax/MiniMax-M2.7",
+      ].join("\n"),
+    );
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dir });
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(catalog.options.map((o) => o.id)).toContain("MiniMax-M2.7");
+    // The configured window fills a gap; it never overwrites a declared one.
+    expect(catalog.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.contextWindow).toBe(1_000_000);
+  });
+
+  it("unions rather than replaces, so a thin config cannot blank the picker", () => {
+    write(dir, ["defaultModel: MiniMax-M3", "provider:", "  minimax:", "    model_order:", "      - MiniMax-M3"].join("\n"));
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dir });
+    // The config names one model; the shipped rows are still all there.
+    expect(catalog.options.map((o) => o.id)).toEqual(STATIC_MCODE_MODELS.options.map((o) => o.id));
+    expect(catalog.default).toBe("MiniMax-M3");
+  });
+
+  it("keeps the static catalog when there is no config at all", () => {
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dir, "missing") });
+    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
+  });
+
+  it("survives a config that is unparseable or the wrong shape", () => {
+    write(dir, "defaultModel: [not, a, string]\n\tbad: : :\n");
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dir });
+    expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
+    expect(catalog.default).toBe("MiniMax-M3");
+  });
+
+  it("never defaults to a model the config did not actually offer", () => {
+    write(dir, ["defaultModel: minimax/MiniMax-M9-Imaginary", "provider:", "  minimax:", "    model_order:", "      - MiniMax-M3"].join("\n"));
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dir });
+    // A default that is not on offer would send every turn to a model the
+    // picker never offered, so it falls back to the shipped default.
+    expect(catalog.default).toBe("MiniMax-M3");
   });
 });
 

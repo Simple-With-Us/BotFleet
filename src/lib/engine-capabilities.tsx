@@ -512,9 +512,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
     },
     defaultModels: [
       { id: "MiniMax-M3", display: "MiniMax M3", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash-Preview", display: "MiniMax M3.1 Flash Preview", ctxTokens: 1_000_000 },
       // Context length for the M2.7 speed tier is not published in the CLI's
       // own catalog, so no figure is claimed here.
       { id: "MiniMax-M2.7-highspeed", display: "MiniMax M2.7 Highspeed" },
+      { id: "MiniMax-M2.7", display: "MiniMax M2.7" },
     ],
   },
 };
