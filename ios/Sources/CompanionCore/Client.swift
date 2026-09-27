@@ -602,6 +602,9 @@ public struct CompanionClient: Sendable {
 
     private struct HealthIdentity: Decodable {
         let app: String
+        // Older sidecars did not include readiness; their 2xx identity was
+        // already the complete health signal.
+        let ready: Bool?
     }
 
     private static func healthy(_ connection: Connection, session: URLSession) async -> Bool {
@@ -616,7 +619,7 @@ public struct CompanionClient: Sendable {
             else { return false }
             let identity = try JSONDecoder().decode(HealthIdentity.self, from: data)
             let app = identity.app.lowercased()
-            guard app == "botfleet" || app == "botfleet" else { return false }
+            guard app == "botfleet", identity.ready != false else { return false }
             return true
         } catch {
             return false
@@ -1192,6 +1195,22 @@ public struct CompanionClient: Sendable {
 
     public func renameTask(botId: String, threadId: String, title: String) async throws {
         try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: ["title": title]))
+    }
+
+    /// Put one thread to sleep, or wake it: `0` sleeps until the thread's
+    /// next activity, a timestamp in epoch milliseconds until that moment,
+    /// and nil wakes it now.
+    ///
+    /// Waking travels as JSON `null`, not as an omitted field — the harness
+    /// reads an absent key as "leave the snooze alone", which is what lets a
+    /// rename on the same route not disturb one.  `NSNull()` is how that
+    /// null survives `JSONSerialization`.
+    public func snoozeTask(botId: String, threadId: String, snoozedUntil: Double?) async throws {
+        try await send(try makeRequest(
+            "PATCH",
+            "/api/bots/\(botId)/tasks/\(threadId)",
+            body: ["snoozedUntil": snoozedUntil ?? NSNull()]
+        ))
     }
 
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {

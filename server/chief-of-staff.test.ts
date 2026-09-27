@@ -58,17 +58,69 @@ describe("chiefOfStaffSystemPrompt", () => {
     { id: "personal", name: "Scout", title: "Travel planner", section: "Personal" },
   ];
 
-  it("describes visible teammates, roles, and availability", () => {
+  it("describes visible teammates and roles, and defers availability to list_bots", () => {
     const prompt = chiefOfStaffSystemPrompt("chief", bots, CLI_AGENT_TOOLS);
 
     expect(prompt).toContain("Chief of Staff for the Work section");
-    expect(prompt).toContain("Quill — Writer: Drafts concise copy (available)");
-    expect(prompt).toContain("Patch — Engineer (working right now)");
+    expect(prompt).toContain("Quill — Writer: Drafts concise copy");
+    expect(prompt).toContain("Patch — Engineer");
+    // who is FREE is a live fact and belongs to list_bots, not to a string
+    // that is part of the Claude driver's spawn fingerprint
+    expect(prompt).not.toContain("working right now");
+    expect(prompt).not.toContain("(available)");
+    expect(prompt).toContain("Use list_bots to confirm the live roster, IDs, and who is busy right now");
     expect(prompt).not.toContain("Secret");
     expect(prompt).not.toContain("Scout");
     expect(prompt).not.toContain("Atlas —");
     expect(prompt).toContain("Use ask_bot");
     expect(prompt).toContain("use create_bot");
+  });
+
+  // DR1: `turn.system` is passed to the Claude CLI as --append-system-prompt
+  // and hashed into `argsKey`, the spawn fingerprint that decides whether the
+  // Chief's warm process survives to take the next turn.  A teammate merely
+  // becoming busy must not move it; a teammate joining, leaving, or being
+  // re-roled must.
+  describe("spawn-fingerprint stability", () => {
+    const withBusy = (busy: Record<string, boolean>) =>
+      bots.map((bot) => ({ ...bot, busy: busy[bot.id] ?? false }));
+
+    it("is byte-identical across a teammate's busy flip", () => {
+      const idle = chiefOfStaffSystemPrompt("chief", withBusy({}), CLI_AGENT_TOOLS);
+      const working = chiefOfStaffSystemPrompt("chief", withBusy({ coder: true }), CLI_AGENT_TOOLS);
+      const allWorking = chiefOfStaffSystemPrompt(
+        "chief",
+        withBusy({ coder: true, writer: true }),
+        CLI_AGENT_TOOLS,
+      );
+
+      expect(working).toBe(idle);
+      expect(allWorking).toBe(idle);
+    });
+
+    it("changes when the team's membership or roles change", () => {
+      const baseline = chiefOfStaffSystemPrompt("chief", bots, CLI_AGENT_TOOLS);
+
+      const joined = chiefOfStaffSystemPrompt(
+        "chief",
+        [...bots, { id: "new", name: "Ledger", title: "Analyst", section: "Work" }],
+        CLI_AGENT_TOOLS,
+      );
+      const left = chiefOfStaffSystemPrompt(
+        "chief",
+        bots.filter((bot) => bot.id !== "coder"),
+        CLI_AGENT_TOOLS,
+      );
+      const rerolled = chiefOfStaffSystemPrompt(
+        "chief",
+        bots.map((bot) => (bot.id === "coder" ? { ...bot, title: "Principal Engineer" } : bot)),
+        CLI_AGENT_TOOLS,
+      );
+
+      expect(joined).not.toBe(baseline);
+      expect(left).not.toBe(baseline);
+      expect(rerolled).not.toBe(baseline);
+    });
   });
 
   it("does not promise delegation when the engine cannot mount agent tools", () => {

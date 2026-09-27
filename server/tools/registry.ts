@@ -119,6 +119,16 @@ export interface HarnessTool {
   /** The sentence the system prompt may use to introduce this tool.  It is a
    *  FIELD ON THE TOOL so prompt copy cannot outlive the tool it describes. */
   promptFragment?: string;
+  /** How long the driver tool loop may let THIS tool run, overriding the
+   *  loop's uniform per-tool ceiling.
+   *
+   *  The uniform clock exists to catch a call that has hung, and 90s is right
+   *  for a file read or a shell command.  It is wrong for a tool whose whole
+   *  job is to wait on something slower — `ask_bot` runs a peer's entire turn
+   *  and was being cut off well under the three minutes the fleet already
+   *  documents for a peer reply.  Declared here, next to the tool it bounds,
+   *  so the number cannot drift away from the behaviour that needs it. */
+  timeoutMs?: number;
   approval?: ToolApproval;
   wire?: Partial<Record<ToolSurface, ToolWireDeviation>>;
 }
@@ -136,6 +146,11 @@ export interface HttpToolDefinition {
   name: string;
   description: string;
   parameters: JsonSchemaObject;
+  /** Per-tool run ceiling, honoured by the chat-completions loop.  Absent
+   *  means the loop's uniform `toolTimeoutMs`.  Drivers pick `name`,
+   *  `description`, and `parameters` explicitly when they build the provider
+   *  payload, so this never reaches the wire. */
+  timeoutMs?: number;
 }
 
 const peerComms = (ctx: ToolGateContext) => ctx.agents && ctx.commsDepth < ctx.maxCommsDepth;
@@ -172,8 +187,12 @@ const ASK_BOT: HarnessTool = {
   gate: peerComms,
   sideEffect: "write",
   settles: "immediate",
+  // A peer's whole turn happens inside this call, and the fleet documents a
+  // three-minute ceiling for a peer reply.  The loop's uniform 90s clock cut
+  // that in half and reported a timeout for a peer that was still working.
+  timeoutMs: 240_000,
   promptFragment:
-    "Use ask_bot to send a peer a task and wait for its reply; pass the bot's id or @name from list_bots.",
+    "Use ask_bot to send a peer a task and wait for its reply; pass the bot's id or @name from list_bots.  It blocks until that bot's whole turn finishes, so prefer delegate_bot for anything that might run long — research, a build, a multi-step job — and keep ask_bot for a question you need answered before you can continue.",
   // Starting a peer's turn spends that bot's tokens under its own model and
   // permissions, so it is the one registry tool a person may want to see
   // first.  The verdict itself is NOT decided here: the ask goes through
@@ -385,8 +404,8 @@ const ROUTINE_FIELDS_SCHEMA = {
   schedule: ROUTINE_SCHEDULE_SCHEMA,
   run_on: {
     type: "string",
-    enum: ["maus", "cloud"],
-    description: "Where the routine runs. Defaults to maus (this BotFleet setup).",
+    enum: ["bot", "cloud", "maus"],
+    description: "Where the routine runs. Defaults to bot (this BotFleet setup). Legacy value maus is accepted and stored as bot.",
   },
   duration_minutes: {
     type: "integer",
@@ -528,7 +547,7 @@ const BASH: HarnessTool = {
 const READ_FILE: HarnessTool = {
   name: "read_file",
   description:
-    "Read the text content of a file on the host computer. Optionally specify offset (1-based line number) and limit (number of lines to read) for large files.",
+    "Read the text content of a file on the host computer, returned with 1-based line numbers.  limit defaults to 400 lines when omitted, and the result is capped at 64 KB even for a larger explicit limit, so one call can never return an unbounded amount of text.  When the result is truncated it ends with a notice naming the exact offset to pass next — call read_file again with that offset to page through the rest of the file.",
   schema: {
     type: "object",
     properties: {
@@ -539,12 +558,14 @@ const READ_FILE: HarnessTool = {
       offset: {
         type: "integer",
         minimum: 1,
-        description: "Optional 1-based line number to start reading from.",
+        description:
+          "Optional 1-based line number to start reading from.  Use this to page through a file: when a read_file result is truncated (by the 400-line default limit or the 64 KB cap), pass offset=<next line> from the truncation notice to continue.",
       },
       limit: {
         type: "integer",
         minimum: 1,
-        description: "Optional maximum number of lines to read.",
+        description:
+          "Optional maximum number of lines to read.  Defaults to 400 when omitted.  The result is also capped at 64 KB regardless of limit, so a very large explicit limit can still be cut short by the byte cap.  If the response is truncated it says so and names the offset to pass next.",
       },
     },
     required: ["path"],
@@ -553,7 +574,8 @@ const READ_FILE: HarnessTool = {
   gate: workspaceOrHostComputer,
   sideEffect: "read",
   settles: "immediate",
-  promptFragment: "Use read_file to inspect files in the workspace.",
+  promptFragment:
+    "Use read_file to inspect files in the workspace; it returns 400 lines at most by default, and a truncated result names the offset to pass next.",
 };
 
 const WRITE_FILE: HarnessTool = {
@@ -1104,5 +1126,6 @@ export function httpToolDefinitions(ctx: ToolGateContext): HttpToolDefinition[] 
     name: tool.name,
     description: descriptionFor(tool, "http"),
     parameters: schemaFor(tool, "http"),
+    ...(tool.timeoutMs === undefined ? {} : { timeoutMs: tool.timeoutMs }),
   }));
 }

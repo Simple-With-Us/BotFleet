@@ -1,8 +1,9 @@
 import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-retention.ts";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 import type { RoutineRequestOperation } from "../shared/routine-request.ts";
@@ -15,17 +16,18 @@ import {
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
+import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
 
-/** `cloud` runs the agent itself inside the bot's Box VM. `maus` keeps
- * using the provider selected on the MAUS and only borrows its configured
- * computer tools, if any. */
-export type RoutineRunOn = "maus" | "cloud";
+/** `cloud` runs the agent itself inside the bot's Box VM. `bot` keeps
+ * using the provider selected on this BotFleet setup and only borrows its
+ * configured computer tools, if any. */
+export type { RoutineRunOn } from "../shared/run-on.ts";
 
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource";
+export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "delegation";
 
 /** One shared task per bot for incoming events, one for calendar work. */
 export type AutomationLane = "trigger" | "schedule";
@@ -258,6 +260,11 @@ const MAX_RUNS = 2_000;
  * pressure).  Older settled runs keep a bounded snapshot — see
  * boundStalePromptSnapshots for exactly what survives. */
 const PROMPT_SNAPSHOT_LIMIT = 100;
+/** How long a burst of save() calls (every run-state transition can fire
+ * several) coalesces into one atomic write. Trailing-edge: the timer is set
+ * once per burst, not reset per call, so sustained activity still flushes on
+ * a bounded cadence instead of being starved. */
+const SAVE_DEBOUNCE_MS = 250;
 /** A run is marked running just before its turn is dispatched; give the
  * dispatch this long to mark the bot busy before the sweep may call it an
  * orphan. */
@@ -318,10 +325,12 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
   const prompt = String(input.prompt ?? "").trim().slice(0, 20_000);
   const botId = String(input.botId ?? "").trim();
   if (!name) throw new Error("Give the routine a name");
-  if (!prompt) throw new Error("Tell the bot what to do");
-  if (!botId) throw new Error("Choose a bot");
-  const runOn = input.runOn ?? "maus";
-  if (runOn !== "maus" && runOn !== "cloud") throw new Error("Choose where this routine runs");
+  if (!prompt) throw new Error("Tell the Bot what to do");
+  if (!botId) throw new Error("Choose a Bot");
+  const runOn = normalizeRunOn(input.runOn);
+  if (input.runOn != null && input.runOn !== "bot" && input.runOn !== "cloud" && input.runOn !== "maus") {
+    throw new Error("Choose where this routine runs");
+  }
   const schedule = input.schedule.type === "daily" && input.scheduleTimeZoneSource === "host"
     ? { type: "daily" as const, time: input.schedule.time, weekdays: input.schedule.weekdays }
     : input.schedule;
@@ -345,6 +354,13 @@ export class RoutineManager {
   private routineRequestReceipts: RoutineRequestReceipt[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
+  /** Coalesces bursts of save() calls (every run-state transition, every
+   * markRunSeen) into one atomic write instead of one per call — a save at
+   * today's size costs about 45 ms of blocked loop. Fires a fixed delay
+   * after the first dirty call in a burst rather than resetting per call,
+   * so sustained activity still flushes on a bounded cadence. */
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
   /** When each trigger last STARTED, keyed by `automationThreadKey`.
    *
    * In memory only: a gap is a rate limit on waking a bot, and after a
@@ -363,14 +379,21 @@ export class RoutineManager {
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "routines.json");
     this.now = options.now ?? Date.now;
+    let runOnMigrated = false;
     try {
       const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
-      this.routines = Array.isArray(disk.routines)
-        ? disk.routines.map((routine) => ({ ...routine, runOn: routine.runOn ?? "maus" }))
-        : [];
-      this.runs = Array.isArray(disk.runs)
-        ? disk.runs.map((run) => ({ ...run, runOn: run.runOn ?? "maus" }))
-        : [];
+      const rawRoutines = Array.isArray(disk.routines) ? disk.routines : [];
+      const rawRuns = Array.isArray(disk.runs) ? disk.runs : [];
+      this.routines = rawRoutines.map((routine) => {
+        const runOn = normalizeRunOn(routine.runOn);
+        if ((routine as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+        return { ...routine, runOn };
+      });
+      this.runs = rawRuns.map((run) => {
+        const runOn = normalizeRunOn(run.runOn);
+        if ((run as { runOn?: unknown }).runOn !== runOn) runOnMigrated = true;
+        return { ...run, runOn };
+      });
       this.routineRequestReceipts = Array.isArray(disk.routineRequestReceipts)
         ? disk.routineRequestReceipts.filter((receipt): receipt is RoutineRequestReceipt =>
             typeof receipt?.requestId === "string" &&
@@ -401,6 +424,7 @@ export class RoutineManager {
       this.runs = [];
       this.routineRequestReceipts = [];
     }
+    if (runOnMigrated) this.save();
     // A local process cannot still own these turns after a full restart.
     const recovered: RoutineRun[] = [];
     for (const run of this.runs) {
@@ -415,6 +439,10 @@ export class RoutineManager {
     }
     if (recovered.length > 0) {
       this.save();
+      // Boot recovery is rare and not a hot path — flush immediately rather
+      // than debounce, since onRunFailed (Sentry, etc.) assumes the failure
+      // it is being told about is already durable.
+      this.flushNow();
       for (const run of recovered) if (!run.coalescedInto) this.options.onRunFailed?.(run);
       // The check-in was opened by the process that died; close it here too,
       // or Sentry only learns of the failure when the monitor times out.
@@ -504,7 +532,7 @@ export class RoutineManager {
         run.finishedAt = this.now();
         this.emitRun(run);
         if (run.threadId) {
-          await this.options.interruptTurn?.(run.botId, run.threadId, run.runOn ?? "maus").catch(() => {});
+          await this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
         }
         cancelled.push({ ...run });
       }
@@ -585,7 +613,7 @@ export class RoutineManager {
       }
     }
     const clean = sanitizeInput(input);
-    if (this.options.botState(clean.botId) === "missing") throw new Error("That bot no longer exists");
+    if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const at = this.now();
     const routine: Routine = {
       id: randomUUID(),
@@ -639,7 +667,7 @@ export class RoutineManager {
       schedule: nextSchedule,
       durationMinutes: patch.durationMinutes ?? routine.durationMinutes,
     });
-    if (this.options.botState(clean.botId) === "missing") throw new Error("That bot no longer exists");
+    if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
     this.commitMutation(() => {
       Object.assign(routine, clean, {
@@ -703,9 +731,9 @@ export class RoutineManager {
       if (run.botId !== botId || !["queued", "running", "waiting"].includes(run.status)) continue;
       run.status = "cancelled";
       run.finishedAt = this.now();
-      run.error = "The assigned bot was deleted";
+      run.error = "The assigned Bot was deleted";
       this.emitRun(run);
-      if (run.threadId) void this.options.interruptTurn?.(run.botId, run.threadId, run.runOn ?? "maus").catch(() => {});
+      if (run.threadId) void this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
       changed = true;
     }
     if (changed) this.save();
@@ -746,7 +774,7 @@ export class RoutineManager {
     receivedAt: number;
   }): RoutineRun {
     if (this.options.botState(input.botId) === "missing") {
-      throw Object.assign(new Error("The assigned MAUS no longer exists"), { status: 410 });
+      throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
     const run: RoutineRun = {
@@ -788,7 +816,7 @@ export class RoutineManager {
     receivedAt: number;
   }): RoutineRun {
     if (this.options.botState(input.botId) === "missing") {
-      throw Object.assign(new Error("The assigned MAUS no longer exists"), { status: 410 });
+      throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
     const run: RoutineRun = {
@@ -850,7 +878,7 @@ export class RoutineManager {
     // The later turn.completed cannot close the check-in: handleRuntimeEvent
     // only matches running/waiting runs, and this one is now cancelled.
     if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
-    if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, run.runOn ?? "maus").catch(() => {});
+    if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, normalizeRunOn(run.runOn)).catch(() => {});
     queueMicrotask(() => void this.tick());
     return { ...run };
   }
@@ -879,6 +907,9 @@ export class RoutineManager {
     if (this.gapWake) clearTimeout(this.gapWake);
     this.gapWake = null;
     this.gapWakeAt = 0;
+    // A pending debounced save must land before the process exits, or the
+    // last run-state transition before shutdown is silently lost.
+    this.flushNow();
   }
 
   /** Come back when a gap closes.
@@ -939,7 +970,7 @@ export class RoutineManager {
         const state = this.options.botState(run.botId);
         if (state === "busy") continue;
         if (state === "missing") {
-          this.failRun(run, "The assigned bot no longer exists");
+          this.failRun(run, "The assigned Bot no longer exists");
           continue;
         }
         // A trigger with a minimum gap stays quiet after it runs.  The
@@ -1100,7 +1131,7 @@ export class RoutineManager {
             run.botId,
             threadId,
             prompt,
-            run.runOn ?? "maus",
+            normalizeRunOn(run.runOn),
             scheduledTriggerSource,
             (message) => this.failThread(threadId, message, "dispatch_failed"),
           );
@@ -1231,7 +1262,7 @@ export class RoutineManager {
       prompt: routine.prompt,
       durationMinutes: routine.durationMinutes,
       botId: routine.botId,
-      runOn: routine.runOn ?? "maus",
+      runOn: normalizeRunOn(routine.runOn),
       scheduledFor,
       status: "queued",
       manual,
@@ -1317,6 +1348,12 @@ export class RoutineManager {
    * receipt reached the same atomic file. Restore the complete in-memory
    * state if writing or renaming that file fails so a retry cannot mistake an
    * uncommitted action for a durable one.
+   *
+   * This flushes immediately rather than letting the general debounce apply:
+   * confirmation receipts are low-frequency and the whole contract above
+   * depends on a failed write throwing HERE, synchronously, so it can be
+   * rolled back — a debounced save would report success and fail later, with
+   * nothing left to catch it.
    */
   private commitMutation(mutate: () => void): void {
     const before = {
@@ -1327,6 +1364,7 @@ export class RoutineManager {
     try {
       mutate();
       this.save();
+      this.flushNow();
     } catch (error) {
       this.routines = before.routines;
       this.runs = before.runs;
@@ -1346,8 +1384,41 @@ export class RoutineManager {
       .map((receipt) => receipt.resultId);
     this.runs = retainRoutineRuns(this.runs, MAX_RUNS, receiptResultIds);
     boundStalePromptSnapshots(this.runs, PROMPT_SNAPSHOT_LIMIT, receiptResultIds);
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    this.dirty = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.flushFromTimer(), SAVE_DEBOUNCE_MS);
+    this.saveTimer.unref?.();
+  }
+
+  /** The debounce timer's flush.  A throw here would be an uncaught exception
+   * in a timer callback, so a failed write is logged instead; `dirty` stays
+   * set, and the next save() or the shutdown flush retries the whole file. */
+  private flushFromTimer(): void {
+    this.saveTimer = null;
+    try {
+      this.flushNow();
+    } catch (error) {
+      console.error("routines: debounced save failed; the next save or shutdown retries it", error);
+    }
+  }
+
+  /** Synchronous, immediate write-through — bypasses the debounce for
+   * tests that assert on-disk state right after a mutation (including a
+   * fresh `new RoutineManager` against the same file, which reads whatever
+   * is on disk right now) and for the shutdown path, so a pending
+   * coalesced save is never lost when the process exits. A no-op when
+   * nothing is dirty. */
+  flushNow(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (!this.dirty) return;
     mkdirSync(dirname(this.file), { recursive: true });
-    const temp = `${this.file}.tmp`;
     const now = this.now();
     const botSnoozes: Record<string, number | null> = {};
     for (const [botId, until] of this.botSnoozeUntil) {
@@ -1359,13 +1430,15 @@ export class RoutineManager {
         this.botSnoozeUntil.delete(botId);
       }
     }
-    writeFileSync(temp, JSON.stringify({
+    writeFileAtomic(this.file, JSON.stringify({
       version: 1,
       routines: this.routines,
       runs: this.runs,
       routineRequestReceipts: this.routineRequestReceipts,
       ...(Object.keys(botSnoozes).length > 0 ? { botSnoozes } : {}),
-    } satisfies RoutineFile, null, 2));
-    renameSync(temp, this.file);
+    } satisfies RoutineFile));
+    // Cleared only after the write lands: a failed write throws (so
+    // commitMutation can roll back) with the pending state still marked.
+    this.dirty = false;
   }
 }

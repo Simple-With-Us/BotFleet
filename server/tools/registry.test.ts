@@ -103,6 +103,37 @@ describe("both lanes derive from the same records", () => {
     }
   });
 
+  it("carry ask_bot's longer per-tool ceiling onto the HTTP lane (DR9)", () => {
+    // The loop's uniform 90s clock cut ask_bot off mid-peer-turn, under the
+    // three minutes the fleet documents for a peer reply.  The number lives
+    // on the tool so it travels with the behaviour that needs it.
+    const askBot = harnessTool("ask_bot")!;
+    expect(askBot.timeoutMs).toBe(240_000);
+    expect(askBot.promptFragment).toContain("prefer delegate_bot");
+
+    const http = new Map(
+      httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]),
+    );
+    expect(http.get("ask_bot")!.timeoutMs).toBe(240_000);
+    // and a tool with no declared ceiling carries none, so the loop keeps
+    // its own default for it
+    expect(http.get("bash")!.timeoutMs).toBeUndefined();
+    expect("timeoutMs" in http.get("bash")!).toBe(false);
+  });
+
+  it("tell the model read_file is bounded and how to page past the cut (DR5)", () => {
+    const http = new Map(
+      httpToolDefinitions(gate({ localComputer: true })).map((t) => [t.name, t]),
+    );
+    const readFile = http.get("read_file")!;
+    expect(readFile.description).toContain("400 lines");
+    expect(readFile.description).toContain("64 KB");
+    expect(readFile.description).toContain("offset");
+    const properties = readFile.parameters.properties as Record<string, { description?: string }>;
+    expect(properties.limit.description).toContain("Defaults to 400");
+    expect(properties.offset.description).toContain("truncat");
+  });
+
   it("cover the same name set for the same gate", () => {
     // THE drift test.  A tool added to one renderer and not the other fails
     // here rather than in a user's transcript six weeks later.

@@ -17,6 +17,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -138,7 +139,7 @@ posixOnly("unattended turns keep asking", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${BASE}/api/health`)).ok) break;
+        if (await harnessReady(BASE)) break;
       } catch {
         /* not up yet */
       }
@@ -172,7 +173,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Nightly build",
         prompt: "Handle the incoming build event",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
 
@@ -217,7 +218,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Nightly sweep",
         prompt: "Tidy the workspace",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
         schedule: { type: "once", at: Date.now() - 1_000 },
       });
       expect(created.status).toBe(201);
@@ -275,7 +276,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Disk sweep",
         prompt: "Free some disk space",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
         schedule: { type: "once", at: Date.now() - 1_000 },
       });
       expect(created.status).toBe(201);
@@ -319,7 +320,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Handoff",
         prompt: "Ask the Teammate to handle this",
         botId: delegator.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
 
@@ -379,7 +380,7 @@ posixOnly("unattended turns keep asking", () => {
         name: "Ask a teammate",
         prompt: "Ask the Answerer what to do about this",
         botId: asker.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
       const delivered = await fetch(hook.body.credential.url, {

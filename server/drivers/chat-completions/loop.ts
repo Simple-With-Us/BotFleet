@@ -41,7 +41,7 @@
 //      anything (a text delta, a reasoning delta, a tool call announced
 //      off the stream) — replaying that round would duplicate output a
 //      person already read, which is worse than the failure.  And it never
-//      starts an attempt it cannot finish: the round's own 180s ceiling
+//      starts an attempt it cannot finish: the round's own ceiling
 //      and the turn's 900s wall clock both have to have real headroom
 //      left, and the sleep between attempts aborts with the turn, so Stop
 //      during a backoff settles immediately instead of after the wait.
@@ -71,7 +71,8 @@ export type TurnLoopExit =
   | "tool_round_limit"
   /** The whole-turn budget ran out. */
   | "wall_clock"
-  /** One model request exceeded `requestTimeoutMs`. */
+  /** One model request exceeded `requestTimeoutMs`, or went silent for
+   *  `requestIdleMs`. */
   | "request_timeout"
   /** An HTTP or stream failure from the provider. */
   | "provider_error"
@@ -108,10 +109,19 @@ export interface TurnLoopBudget {
    *  — running side effects nobody reads is worse than stopping one round
    *  earlier. */
   maxRounds: number;
-  /** Ceiling on one model request, enforced by an abort the request itself
-   *  carries.  A harness-side timer that fires while the request keeps
-   *  streaming is what manufactured orphaned late completions before. */
+  /** HARD ceiling on one model round, however live its stream is, enforced
+   *  by an abort the request itself carries.  A harness-side timer that
+   *  fires while the request keeps streaming is what manufactured orphaned
+   *  late completions before.  Shared by every attempt at the round. */
   requestTimeoutMs: number;
+  /** IDLE ceiling on one model request: how long it may go without the
+   *  driver reporting progress (`onChunk` for any raw bytes off the socket,
+   *  `onPublished` for anything put on the bus) before it is aborted as a
+   *  `request_timeout`.  Re-armed at the start of every attempt and on
+   *  every progress report, so a slow reasoning round that keeps streaming
+   *  runs until the hard ceiling while a dead connection is caught in this
+   *  long.  `0` turns it off, for a driver that owns its own stall guard. */
+  requestIdleMs: number;
   /** Ceiling on one tool call. */
   toolTimeoutMs: number;
   /** Ceiling on the whole turn, rounds and tools together. */
@@ -128,7 +138,8 @@ export interface TurnLoopBudget {
 
 export const DEFAULT_TURN_LOOP_BUDGET: TurnLoopBudget = {
   maxRounds: 12,
-  requestTimeoutMs: 180_000,
+  requestTimeoutMs: 600_000,
+  requestIdleMs: 120_000,
   toolTimeoutMs: 90_000,
   wallClockMs: 900_000,
   toolConcurrency: 4,
@@ -204,6 +215,15 @@ export interface TurnLoopDeps {
        *  started streaming — the safe direction; one that calls it too
        *  eagerly loses a retry, never duplicates output. */
       onPublished?: () => void;
+      /** Called by the driver for every raw chunk its response body
+       *  yields (and once when the response headers arrive), parsed into
+       *  anything or not.  It is the liveness signal `requestIdleMs` is
+       *  measured against: "is the socket still moving", not "did the
+       *  model say something new" — keep-alives and reasoning frames a
+       *  driver does not surface still count.  A driver that never calls
+       *  it is judged on `onPublished` alone, and one that calls neither
+       *  gets `requestIdleMs` of total budget per attempt. */
+      onChunk?: () => void;
       onUsage?: (usage: TurnUsage) => void;
     },
   ) => Promise<TurnRoundResult>;
@@ -255,6 +275,11 @@ export interface TurnLoopDeps {
    *  asserts the policy without paying its seconds.  Production leaves it
    *  at 1. */
   retryDelayScale?: number;
+  /** This turn's catalog, as the driver already has it.  The loop reads one
+   *  thing from it: a tool's own `timeoutMs`, when the registry declared that
+   *  this tool needs longer than the uniform per-tool ceiling.  Absent, or a
+   *  tool with no override, keeps `budget.toolTimeoutMs`. */
+  tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
 }
 
 /** A tool's arguments are declared as a JSON object schema; anything else on
@@ -273,6 +298,17 @@ function decodeArguments(raw: unknown): Record<string, unknown> {
 function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   const handle: { unref?: () => void } = timer;
   handle.unref?.();
+}
+
+/** Push a pending timer's deadline out by its full delay, in place.  Node's
+ *  `Timeout.refresh()` does that without allocating, which matters on a
+ *  path that runs once per streamed chunk; where it is missing the caller
+ *  re-arms instead. */
+function refreshTimer(timer: ReturnType<typeof setTimeout>): boolean {
+  const handle: { refresh?: () => unknown } = timer;
+  if (typeof handle.refresh !== "function") return false;
+  handle.refresh();
+  return true;
 }
 
 /** Rejects when `signal` aborts, and detaches its listener either way so a
@@ -443,6 +479,14 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     }
     const toolAbort = new AbortController();
     let toolTimedOut = false;
+    // One ceiling per TOOL, not one per loop.  90s catches a hung shell
+    // command; it also used to cut `ask_bot` off mid-peer-turn, well under
+    // the three minutes the fleet documents for a peer reply, and report a
+    // timeout for a bot that was still working.  The number lives on the
+    // tool definition (registry.ts) so it travels with the behaviour that
+    // needs it instead of being a special case here.
+    const toolTimeoutMs =
+      deps.tools?.find((tool) => tool.name === decoded.name)?.timeoutMs ?? budget.toolTimeoutMs;
     // The per-tool clock, and it PAUSES.  The 90s ceiling is there to catch
     // a call that has hung; a card sitting in front of a person is neither
     // hung nor the model's fault, and killing the tool out from under a
@@ -453,7 +497,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     // keeps running: something has to bound a turn nobody ever answers, and
     // the watchdog's stall detector is separately exempted for an open card
     // (`setWaitingOnHuman`), which is what makes this pause safe.
-    let remainingMs = budget.toolTimeoutMs;
+    let remainingMs = toolTimeoutMs;
     let clockStartedAt = now();
     let toolTimer: ReturnType<typeof setTimeout> | null = null;
     const startClock = () => {
@@ -507,7 +551,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
       if (toolTimedOut) {
         return {
           kind: "error",
-          content: `Tool ${decoded.name} did not finish within ${Math.round(budget.toolTimeoutMs / 1000)}s and was stopped.`,
+          content: `Tool ${decoded.name} did not finish within ${Math.round(toolTimeoutMs / 1000)}s and was stopped.`,
           detail: "timed out",
         };
       }
@@ -588,16 +632,50 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
 
       const request = new AbortController();
       let requestTimedOut = false;
+      // Which of the round's two clocks fired, for the message only: both
+      // are the same `request_timeout` exit.
+      let idleTimedOut = false;
       const requestTimer = setTimeout(() => {
         requestTimedOut = true;
         request.abort();
       }, budget.requestTimeoutMs);
       unrefTimer(requestTimer);
-      // The round's deadline, shared by EVERY attempt at it rather than
-      // re-armed per try: `requestTimeoutMs` is what a person is willing
-      // to wait for this round's answer, and a fresh 180s per retry would
-      // silently turn that into nine minutes.  It is also the ceiling the
-      // retry budget guard measures headroom against.
+      // The idle clock.  Split out of the hard ceiling because one number
+      // cannot be both: 180s total cut a slow-but-live reasoning round off
+      // mid-answer (grok's 120s fetch timer made it worse, racing this one
+      // and ending the round as a provider_error that paged), while a
+      // ceiling long enough for that round let a dead socket hold the bot
+      // for just as long.  Armed per ATTEMPT (a retry is a new request with
+      // a new socket) and disarmed across the backoff between attempts.
+      const idleEnabled = Number.isFinite(budget.requestIdleMs) && budget.requestIdleMs > 0;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const disarmIdle = () => {
+        if (idleTimer !== null) clearTimeout(idleTimer);
+        idleTimer = null;
+      };
+      const armIdle = () => {
+        disarmIdle();
+        if (!idleEnabled || request.signal.aborted) return;
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          requestTimedOut = true;
+          idleTimedOut = true;
+          request.abort();
+        }, budget.requestIdleMs);
+        unrefTimer(idleTimer);
+      };
+      // Progress from the driver.  A no-op once the attempt is over or the
+      // clock has fired, so a straggling chunk can never re-arm a timer for
+      // a request that already ended.
+      const noteProgress = () => {
+        if (idleTimer === null || request.signal.aborted) return;
+        if (!refreshTimer(idleTimer)) armIdle();
+      };
+      // The round's hard deadline, shared by EVERY attempt at it rather
+      // than re-armed per try: `requestTimeoutMs` is the most a person will
+      // wait for this round's answer, and a fresh ceiling per retry would
+      // silently triple it.  It is also the ceiling the retry budget guard
+      // measures headroom against.
       const roundDeadline = now() + budget.requestTimeoutMs;
       const roundSignal = AbortSignal.any([turnSignal, wall.signal, request.signal]);
       // Set by the driver through `onPublished` the moment this round puts
@@ -616,6 +694,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
           // analysis does not follow the reassignment happening inside the
           // callback closure.
           const roundState: { usage: TurnUsage | null } = { usage: null };
+          armIdle();
           try {
             result = await deps.runRound(messages, {
               signal: roundSignal,
@@ -623,13 +702,17 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               attempt,
               onPublished: () => {
                 published = true;
+                noteProgress();
               },
+              onChunk: noteProgress,
               onUsage: (usage) => {
                 roundState.usage = usage;
               },
             });
             break;
           } catch (e) {
+            // this attempt is over; the backoff below is not model silence
+            disarmIdle();
             const error = e instanceof Error ? e : new Error(String(e));
             // A retry has to be invisible to be correct.  It is only
             // considered when the turn is still live (an interrupt, the
@@ -694,7 +777,12 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
               errorMessage = `the turn ran past its ${Math.round(budget.wallClockMs / 1000)}s budget and was stopped`;
             } else if (requestTimedOut) {
               exit = "request_timeout";
-              errorMessage = `the model did not answer within ${Math.round(budget.requestTimeoutMs / 1000)}s`;
+              // Both wordings keep the "the model did not answer within"
+              // prefix sentry-ai.ts files as an expected timeout rather
+              // than a crash.
+              errorMessage = idleTimedOut
+                ? `the model did not answer within ${Math.round(budget.requestIdleMs / 1000)}s — the stream went silent`
+                : `the model did not answer within ${Math.round(budget.requestTimeoutMs / 1000)}s`;
             } else {
               exit = "provider_error";
               errorMessage = error.message;
@@ -708,6 +796,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         }
       } finally {
         clearTimeout(requestTimer);
+        disarmIdle();
       }
 
       if (result.usage) {

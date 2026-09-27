@@ -18,9 +18,19 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+/** One slow download beats three fast failures.  Mirrors the timeout,
+ * attempt count, and delay `prepare-android-tools.mjs` picked up in PR #446
+ * for the same class of incident (the Sep 17 update outage traced to this
+ * script's single 120s attempt with no retry). */
+export const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+export const DOWNLOAD_ATTEMPTS = 3;
+export const DOWNLOAD_RETRY_DELAY_MS = 5_000;
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 export const CLOUDFLARED_VERSION = "2026.8.2";
 
@@ -197,15 +207,91 @@ function extractionFailure(result) {
   return result.error?.message ?? String(result.stderr || result.stdout || `exit status ${result.status}`).trim();
 }
 
+/** A network failure a person can act on: "timed out" and "getaddrinfo
+ * ENOTFOUND" are different problems with different fixes. */
+export function describeDownloadFailure(error, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
+  const name = error && typeof error === "object" && "name" in error ? String(error.name) : "";
+  if (name === "TimeoutError" || name === "AbortError") {
+    return `the download timed out after ${Math.round(timeoutMs / 1000)}s`;
+  }
+  const message = error && typeof error === "object" && "message" in error ? String(error.message) : String(error);
+  return message || "the download failed";
+}
+
+/**
+ * Fetch a release asset, with retries.  A slow link drops one transfer and
+ * completes the next, so a single attempt (the prior behaviour: one 120s
+ * fetch, no retry) reports a permanent failure for something that is merely
+ * intermittent -- the Sep 17 update outage traced to exactly this.
+ */
+export async function downloadRelease(url, label, options = {}) {
+  const {
+    fetchImpl = fetch,
+    attempts = DOWNLOAD_ATTEMPTS,
+    timeoutMs = DOWNLOAD_TIMEOUT_MS,
+    retryDelayMs = DOWNLOAD_RETRY_DELAY_MS,
+    wait = sleep,
+    log = console.error,
+  } = options;
+  let failure = "the download failed";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetchImpl(url, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      failure = describeDownloadFailure(error, timeoutMs);
+      if (attempt < attempts) {
+        log(`${label} download attempt ${attempt} failed: ${failure} — retrying`);
+        await wait(retryDelayMs);
+      }
+    }
+  }
+  throw new Error(`could not download ${label}: ${failure}`);
+}
+
+/** Where a successfully downloaded release archive is kept for the next
+ * `stageTarget` call to reuse, across dev runs and packaging jobs alike.
+ * `OMB_CLOUDFLARED_ARCHIVE_DIR` (documented in third_party/cloudflared/README.md)
+ * still wins when set; nothing set it by default before this, so the cache
+ * was always empty and every run re-downloaded. */
+export function cloudflaredArchiveCacheDirectory({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+} = {}) {
+  if (env.OMB_CLOUDFLARED_ARCHIVE_DIR) return env.OMB_CLOUDFLARED_ARCHIVE_DIR;
+  if (platform === "darwin") return join(home, "Library", "Caches", "BotFleet", "cloudflared-archives");
+  if (platform === "win32") {
+    const local = env.LOCALAPPDATA || join(home, "AppData", "Local");
+    return join(local, "BotFleet", "Cache", "cloudflared-archives");
+  }
+  return join(env.XDG_CACHE_HOME || join(home, ".cache"), "botfleet", "cloudflared-archives");
+}
+
 async function releaseBytes(asset) {
-  const cacheDirectory = process.env.OMB_CLOUDFLARED_ARCHIVE_DIR;
-  const cached = cacheDirectory ? join(cacheDirectory, asset.name) : "";
-  if (cached && existsSync(cached)) return readFileSync(cached);
+  const cacheDirectory = cloudflaredArchiveCacheDirectory();
+  const cached = join(cacheDirectory, asset.name);
+  if (existsSync(cached)) {
+    const bytes = readFileSync(cached);
+    if (sha256(bytes) === asset.sha256) return bytes;
+    console.error(`cached ${asset.name} failed checksum verification — re-downloading`);
+  }
 
   const url = `https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset.name}`;
-  const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
-  if (!response.ok) throw new Error(`could not download ${asset.name}: HTTP ${response.status}`);
-  return Buffer.from(await response.arrayBuffer());
+  const bytes = await downloadRelease(url, asset.name);
+
+  try {
+    mkdirSync(cacheDirectory, { recursive: true });
+    const staged = join(cacheDirectory, `.${asset.name}-${process.pid}-${Date.now()}`);
+    writeFileSync(staged, bytes, { mode: 0o600 });
+    renameSync(staged, cached);
+  } catch (error) {
+    // A cache write is an optimization, not a requirement -- the download
+    // already succeeded and its checksum is verified by the caller.
+    console.error(`could not cache ${asset.name} at ${cacheDirectory}: ${error?.message ?? error}`);
+  }
+  return bytes;
 }
 
 async function stageTarget(root, target) {
@@ -281,6 +367,18 @@ export async function prepareCloudflared({
   }
 }
 
+/** The Mac self-updater always packages `--arm64 --dir` for the machine
+ * running the update (`update-botfleet-mac.mjs` -> `pnpm package:mac:local`),
+ * so staging both darwin targets there downloads darwin-x64 only to throw it
+ * away every run.  `package:mac:local` has no CLI surface to add `--current`
+ * to (`build:cloudflared` is shared with `package:mac:release`, which must
+ * keep building both architectures for the actual release), so the updater
+ * sets this environment variable instead. */
+export function currentOnlyFromEnv(env = process.env) {
+  return env.OMB_CLOUDFLARED_CURRENT === "1";
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  await prepareCloudflared(parsePrepareCloudflaredArgs(process.argv.slice(2)));
+  const args = parsePrepareCloudflaredArgs(process.argv.slice(2));
+  await prepareCloudflared({ current: args.current || currentOnlyFromEnv() });
 }

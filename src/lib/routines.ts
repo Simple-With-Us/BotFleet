@@ -1,10 +1,10 @@
 import type { RoutineOutcomeCode, RoutineFailurePhase } from "../../shared/routine-outcomes";
+import type { RoutineRunOn } from "../../shared/run-on";
+export type { RoutineRunOn } from "../../shared/run-on";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
-
-export type RoutineRunOn = "maus" | "cloud";
 
 export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource";
 

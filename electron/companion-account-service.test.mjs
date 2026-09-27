@@ -27,7 +27,7 @@ const DUPLICATE_INSTALLATION_ID = "33333333-3333-4333-8333-333333333333";
 const ACCOUNT_TOKEN = `signed.${"a".repeat(80)}`;
 const INSTALLATION_CREDENTIAL = `omb_install_${"b".repeat(22)}.${"c".repeat(43)}`;
 const CONNECTOR_TOKEN = `eyJ${"d".repeat(100)}`;
-const ENDPOINT = "https://c-opaque.botfleet.com";
+const ENDPOINT = "https://c-opaque.botfleet.app";
 
 function credentialStore(initial = {}) {
   let document = structuredClone(initial);

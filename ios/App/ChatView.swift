@@ -98,6 +98,8 @@ struct ChatView: View {
 
     private var currentDriverKind: String? {
         guard let selection = currentModelSelection else { return nil }
+        // Instance IDs are caller-chosen labels, not provider kinds. If the
+        // registry is cold, omit the mark rather than guessing a provider.
         return session.instanceDriverKinds[selection.instanceId]
     }
 
@@ -299,7 +301,7 @@ struct ChatView: View {
                             StreamingBubble(text: nil, reasoning: thinking, color: current.color)
                                 .id(Self.liveBubbleId)
                         } else if current.busy {
-                            TypingIndicatorView(tintColor: MausPalette.color(current.color))
+                            TypingIndicatorView(tintColor: BotPalette.color(current.color))
                                 .id(Self.liveBubbleId)
                                 .accessibilityLabel("\(current.name) is working")
                         }
@@ -387,13 +389,13 @@ struct ChatView: View {
                         ChatAvatarView(
                             chat: current,
                             size: 36,
-                            state: MausState.forChat(current, in: session.state),
-                            animated: MausState.forChat(current, in: session.state).showsActivity
+                            state: BotState.forChat(current, in: session.state),
+                            animated: BotState.forChat(current, in: session.state).showsActivity
                         )
                         .overlay(alignment: .bottomTrailing) {
                             if let currentDriverKind {
-                                ProviderMarkView(driverKind: currentDriverKind, model: currentModelSelection?.model, size: 15)
-                                    .offset(x: 2, y: 2)
+                                ProviderMarkView(driverKind: currentDriverKind, model: currentModelSelection?.model, size: 21)
+                                    .offset(x: 3, y: 3)
                             }
                         }
                         VStack(alignment: .leading, spacing: 1) {
@@ -459,39 +461,43 @@ struct ChatView: View {
                     .ignoresSafeArea()
                     .onTapGesture { withAnimation(.snappy(duration: 0.28)) { showingPlus = false } }
 
-                VStack(spacing: 0) {
-                    ForEach(plusActions) { action in
-                        Button {
-                            withAnimation(.snappy(duration: 0.28)) { showingPlus = false }
-                            action.run()
-                        } label: {
-                            HStack(spacing: 16) {
-                                Image(systemName: action.systemImage)
-                                    .font(.system(size: 20, weight: .medium))
-                                    .foregroundStyle(action.destructive ? Color.red : Color.primary)
-                                    .frame(width: 44, height: 44)
-                                    .background(Circle().fill(Color.primary.opacity(0.10)))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(action.title)
-                                        .font(.system(size: 19, weight: .medium))
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 0) {
+                        ForEach(plusActions) { action in
+                            Button {
+                                withAnimation(.snappy(duration: 0.28)) { showingPlus = false }
+                                action.run()
+                            } label: {
+                                HStack(spacing: 16) {
+                                    Image(systemName: action.systemImage)
+                                        .font(.system(size: 20, weight: .medium))
                                         .foregroundStyle(action.destructive ? Color.red : Color.primary)
-                                    Text(action.subtitle)
-                                        .font(.system(size: 13))
-                                        .foregroundStyle(Color.secondary)
+                                        .frame(width: 44, height: 44)
+                                        .background(Circle().fill(Color.primary.opacity(0.10)))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(action.title)
+                                            .font(.system(size: 19, weight: .medium))
+                                            .foregroundStyle(action.destructive ? Color.red : Color.primary)
+                                        Text(action.subtitle)
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(Color.secondary)
+                                    }
+                                    Spacer(minLength: 0)
                                 }
-                                Spacer(minLength: 0)
+                                .padding(.horizontal, 18)
+                                .frame(height: 64)
+                                .contentShape(Rectangle())
                             }
-                            .padding(.horizontal, 18)
-                            .frame(height: 64)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .disabled(action.disabled)
+                            .opacity(action.disabled ? 0.45 : 1)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(action.disabled)
-                        .opacity(action.disabled ? 0.45 : 1)
                     }
+                    .padding(.vertical, 10)
                 }
-                .padding(.vertical, 10)
+                .scrollBounceBehavior(.basedOnSize)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxHeight: 480)
                 .glassSheet(cornerRadius: 30)
                 .padding(.leading, 12)
                 .padding(.trailing, 44)
@@ -701,7 +707,7 @@ struct ChatView: View {
                     commands: current.isBot
                         ? CommandSkillHUDView.defaultCommands
                         : CommandSkillHUDView.defaultCommands.filter { $0.id != "computer" && $0.id != "tasks" },
-                    accentColor: MausPalette.color(current.color)
+                    accentColor: BotPalette.color(current.color)
                 ) { command in
                     switch command.id {
                     case "computer":
@@ -734,7 +740,7 @@ struct ChatView: View {
                 .padding(.horizontal, 4)
                 .transition(.opacity)
             } else if draft.isEmpty && !hasPendingApproval {
-                PredictiveActionChipsView(accentColor: MausPalette.color(current.color)) { chip in
+                PredictiveActionChipsView(accentColor: BotPalette.color(current.color)) { chip in
                     draft = chip.prompt
                     composerFocused = true
                 }
@@ -1052,6 +1058,24 @@ struct MessageRow: View {
         return nil
     }
 
+    private var senderModelSelection: ModelSelection? {
+        guard let bot = senderBot else { return nil }
+        if let currentTask = bot.tasks?.first(where: { $0.threadId == chat.threadId }) {
+            if let taskSelection = currentTask.modelSelection {
+                return currentTask.activeModelSelection ?? taskSelection
+            }
+            return currentTask.activeModelSelection ?? bot.activeModelSelection ?? bot.modelSelection
+        }
+        return bot.activeModelSelection ?? bot.modelSelection
+    }
+
+    private var senderDriverKind: String? {
+        guard let selection = senderModelSelection else { return nil }
+        // A cold registry cannot tell whether a named instance runs this model's
+        // native driver or a different one. Do not mislabel the sender's mark.
+        return session.instanceDriverKinds[selection.instanceId]
+    }
+
     @ViewBuilder
     private var avatarBadge: some View {
         // A `.system` row is an auto-delivered routine/webhook/resource
@@ -1064,6 +1088,12 @@ struct MessageRow: View {
             if let bot = senderBot {
                 if endsRun {
                     BotAvatarView(bot: bot, size: 28, state: .idle, animated: false)
+                        .overlay(alignment: .bottomTrailing) {
+                            if let senderDriverKind {
+                                ProviderMarkView(driverKind: senderDriverKind, model: senderModelSelection?.model, size: 16)
+                                    .offset(x: 3, y: 3)
+                            }
+                        }
                 } else {
                     Color.clear.frame(width: 28, height: 28)
                 }
@@ -1083,9 +1113,15 @@ struct MessageRow: View {
             content
 
             if let comm = message.comm {
-                Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.secondary)
+                if message.automationSource == "delegation" {
+                    Label("From @\(comm.withName)", systemImage: "arrow.down.left.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                } else {
+                    Label("Messaged \(comm.withName)", systemImage: "arrow.up.right.bubble")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.secondary)
+                }
             }
 
             // Stay up while `message.queued` is true, even after `bot.busy`
@@ -1166,7 +1202,9 @@ struct MessageRow: View {
             ForEach(Self.reactionChoices, id: \.self) { emoji in
                 Button(emoji) { Task { await session.react(to: message, in: chat.threadId, emoji: emoji) } }
             }
-            if message.role == .user, message.kind == .text,
+            if (message.role == .user ||
+                (message.role == .system && message.automationSource == "delegation")),
+               message.kind == .text,
                WebhookMessageView.parse(message.text) == nil,
                ImessageMessageView.parse(message.text) == nil,
                case let .bot(bot) = chat {
@@ -1204,7 +1242,15 @@ struct MessageRow: View {
     private var content: some View {
         switch message.kind {
         case .text:
-            if message.role == .system {
+            if let delegation = DelegationMessageView.parse(message.text, role: message.role, fromName: message.from?.name, automationSource: message.automationSource) {
+                ChannelEventCard(
+                    headline: delegation.headline,
+                    subtitle: delegation.subtitle,
+                    payload: delegation.payload,
+                    systemImage: "arrow.triangle.branch",
+                    accessibilityName: delegation.headline
+                )
+            } else if message.role == .system {
                 if let webhook = WebhookMessageView.parse(message.text) {
                     WebhookEventCard(view: webhook)
                 } else if let imessage = ImessageMessageView.parse(message.text) {
@@ -1278,7 +1324,12 @@ struct MessageRow: View {
             return "Webhook"
         case "schedule":
             return "Scheduled Run"
+        case "delegation":
+            return "Delegated Task"
         default:
+            if DelegationMessageView.isDelegation(body, role: .system) {
+                return "Delegated Task"
+            }
             return body.contains("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run"
         }
     }
@@ -1378,7 +1429,7 @@ struct TextBubble: View {
     }
 
     var body: some View {
-        let mine = message.role == .user
+        let mine = message.role == .user && !DelegationMessageView.isDelegation(message.text, role: message.role, automationSource: message.automationSource)
         let customCard = parsedDiff != nil || parsedTable != nil
         // rooms attribute each line to the member who said it
         let speaker = message.from
@@ -1391,7 +1442,7 @@ struct TextBubble: View {
                 if let speaker, !mine {
                     Text(speaker.name)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(MausPalette.color(speaker.color))
+                        .foregroundStyle(BotPalette.color(speaker.color))
                 }
                 // Bots get markdown, you do not — the same split the desktop
                 // makes. Markdown you did not intend is worse than markdown
@@ -1626,7 +1677,7 @@ struct ActivityRunView: View {
     }
 
     private var tint: Color {
-        MausPalette.color(chat.color)
+        BotPalette.color(chat.color)
     }
 
     var body: some View {
@@ -1750,7 +1801,7 @@ struct CardView: View {
     /// choice above so the two cannot drift apart.
     private static func isRefusal(_ option: String) -> Bool { OptionCard.isRefusal(option) }
 
-    private var tint: Color { MausPalette.color(chat.color) }
+    private var tint: Color { BotPalette.color(chat.color) }
 
     var body: some View {
         if let card = message.card {
@@ -1915,7 +1966,7 @@ struct StreamingBubble: View {
                     AgentThoughtChamberView(
                         reasoning: String(reasoning.suffix(2_000)),
                         botName: "Bot",
-                        mascotColor: MausPalette.color(color),
+                        mascotColor: BotPalette.color(color),
                         isStreaming: true
                     )
                 }

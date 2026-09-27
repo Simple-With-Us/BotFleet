@@ -23,6 +23,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
+      ios_changed: ${{ steps.scope.outputs.ios_changed }}
+      packaging_changed: ${{ steps.scope.outputs.packaging_changed }}
+      control_plane_changed: ${{ steps.scope.outputs.control_plane_changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'push' || github.event_name == 'pull_request'
@@ -36,14 +39,27 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Scheduled and manually dispatched runs keep the full gate: every
+          # area is reported changed so no job takes an area-specific fast
+          # path, the same fail-open choice docs_only already made here.
           if [[ "$EVENT_NAME" != "push" && "$EVENT_NAME" != "pull_request" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "changed_count=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "docs_only=false"
+              echo "changed_count=0"
+              echo "ios_changed=true"
+              echo "packaging_changed=true"
+              echo "control_plane_changed=true"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "changed_count=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "docs_only=false"
+              echo "changed_count=0"
+              echo "ios_changed=true"
+              echo "packaging_changed=true"
+              echo "control_plane_changed=true"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" |
@@ -99,24 +115,27 @@ jobs:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
+      - name: Control-plane-unrelated fast path
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed != 'true'
+        run: echo "No cloudflare/ paths changed; control-plane checks were skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         with:
           persist-credentials: false
       - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         with:
           node-version: 24
           cache: pnpm
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         run: pnpm install --frozen-lockfile
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         run: pnpm control-plane:check
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         run: pnpm control-plane:test
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.control_plane_changed == 'true'
         run: pnpm control-plane:dry-run
 
   package-linux:
@@ -129,38 +148,41 @@ jobs:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
+      - name: Packaging-unrelated fast path
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed != 'true'
+        run: echo "No electron/, third_party/, packaging script, or dependency paths changed; Linux packaging was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         with:
           persist-credentials: false
       - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         with:
           node-version: 24
           cache: pnpm
       - name: Install package validation and native smoke tools
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: >-
           sudo apt-get update && sudo apt-get install -y
           at-spi2-core dbus-x11 desktop-file-utils libfuse2t64 libxi6 libxkbcommon0 squashfs-tools x11-utils xdotool xvfb
         continue-on-error: false
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: pnpm install --frozen-lockfile
       - name: Stage the pinned CUA runtime
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: pnpm build:cua:linux
       - name: Prove overlay-free X11 input routing
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: dbus-run-session -- xvfb-run -a pnpm smoke:cua-x11-input
       - name: Package from the verified offline CUA stage
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: pnpm package:linux:offline
-      - if: needs.changes.outputs.docs_only != 'true'
+      - if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: node scripts/verify-linux-package.mjs
       - name: Match a normal Ubuntu package parent on the ephemeral runner
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: |
           test ! -L /opt
           test "$(stat -c '%F %U:%G' /opt)" = "directory root:root"
@@ -171,29 +193,29 @@ jobs:
           esac
           test "$(stat -c '%U:%G %a' /opt)" = "root:root 755"
       - name: Reproduce and verify an in-place DEB upgrade
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: |
           deb=(release/*.deb)
           test "${#deb[@]}" -eq 1
           sudo --preserve-env=CI,RUNNER_TEMP node scripts/smoke-deb-upgrade.mjs "${deb[0]}"
       - name: Configure Chromium sandbox for the unpacked app
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         run: |
           sudo chown root:root release/linux-unpacked/chrome-sandbox
           sudo chmod 4755 release/linux-unpacked/chrome-sandbox
           test "$(stat -c '%U:%G %a' release/linux-unpacked/chrome-sandbox)" = "root:root 4755"
       - name: Launch packaged app and verify lifecycle
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true'
         env:
           OMB_KEEP_SMOKE_DIR: "1"
           OMB_SMOKE_INSTALLED_DEB: "1"
         run: pnpm smoke:linux-package
       - name: Remove the installed upgrade fixture
-        if: needs.changes.outputs.docs_only != 'true' && always()
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && always()
         run: sudo dpkg --purge botfleet || true
       - name: Upload smoke diagnostics on failure
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true' && failure()
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.packaging_changed == 'true' && failure()
         with:
           name: botfleet-ubuntu-smoke-diagnostics
           path: |
@@ -213,19 +235,22 @@ jobs:
       - name: Documentation-only fast path
         if: needs.changes.outputs.docs_only == 'true'
         run: echo "Full application checks are unchanged and were skipped for explicitly allowlisted documentation."
+      - name: iOS-unrelated fast path
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed != 'true'
+        run: echo "No ios/, ios script, or CI workflow paths changed; the iOS build was skipped."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
       - name: Swift package tests
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: swift test --package-path ios
       - name: Generate the Xcode project
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           brew install xcodegen
           cd ios
           xcodegen generate
       - name: Build the iOS app (unsigned)
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.ios_changed == 'true'
         run: |
           cd ios
           xcodebuild \

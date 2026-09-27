@@ -7,6 +7,14 @@
 //
 //   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | resume-fails | no-auth | auth-required | permission
 //                   | interleave (message → tool → message → tool → message)
+//                   | drip (stream one agent_message_chunk every
+//                     FAKE_ACP_DRIP_MS — default 20 — for the prompt idle
+//                     guard's "still alive" side: with FAKE_ACP_DRIP_COUNT
+//                     set, complete the turn after that many chunks; left
+//                     unset, drip forever so only the driver's own cancel
+//                     — hard ceiling or a caller-forced interrupt — ends it.
+//                     Reacts to session/cancel by exiting immediately, same
+//                     as cancel-exits.)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -35,6 +43,9 @@
 //                        no configOptions, so nothing to confirm against
 //   FAKE_ACP_USAGE_ROOT  put the prompt result's usage at the root instead of
 //                        under _meta (what opencode 1.18.18 actually does)
+//   FAKE_ACP_INIT_DELAY_MS  answer initialize only after this many ms — a
+//                        slow cold boot, or (with a large value) one that
+//                        never finishes inside the driver's deadline
 //   FAKE_ACP_USAGE_UPDATE  a token count.  Sends a session/update
 //                        sessionUpdate:"usage_update" notification with that
 //                        `used` value before the (usage-free) prompt result —
@@ -42,7 +53,7 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 if (mode === "cancel-exits-with-child") {
@@ -190,6 +201,31 @@ if (argv[0] === "models" || argv.includes("--list-models")) {
   process.exit(0);
 }
 
+// Transient-failure script for the retry tests, the same shape
+// fake-claude-cli uses.  FAKE_ACP_TRANSIENTS is how many launches die with
+// 503-shaped stderr; the count of launches so far lives in a state FILE
+// because a child process cannot mutate its parent's environment.  Once the
+// quota is spent the run proceeds normally, so one test can assert "failed
+// twice, then answered once".  FAKE_ACP_PARTIAL_FAILS instead streams a chunk
+// and THEN dies, which the replay-safety guard must refuse to retry.
+let failAfterChunk = false;
+if (process.env.FAKE_ACP_TRANSIENTS && process.env.FAKE_ACP_STATE) {
+  let launched = 0;
+  try {
+    launched = Number(readFileSync(process.env.FAKE_ACP_STATE, "utf8")) || 0;
+  } catch {}
+  const quota = Number(process.env.FAKE_ACP_TRANSIENTS) || 0;
+  writeFileSync(process.env.FAKE_ACP_STATE, String(launched + 1));
+  if (launched < quota) {
+    if (process.env.FAKE_ACP_PARTIAL_FAILS) {
+      failAfterChunk = true;
+    } else {
+      process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
+      process.exit(5);
+    }
+  }
+}
+
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
 const result = (id: unknown, res: unknown) => out({ jsonrpc: "2.0", id, result: res });
 const rpcMethods: string[] = [];
@@ -321,7 +357,11 @@ function handle(msg: any) {
         process.exit(3);
       }
       const authMethods = mode === "no-auth" ? [] : [{ id: "cached_token" }];
-      result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      const reply = () =>
+        result(msg.id, { protocolVersion: 1, authMethods, _meta: { modelState: { currentModelId: "fake-acp-model" } } });
+      const initDelayMs = Number(process.env.FAKE_ACP_INIT_DELAY_MS ?? "0");
+      if (initDelayMs > 0) setTimeout(reply, initDelayMs);
+      else reply();
       break;
     }
     case "authenticate":
@@ -476,6 +516,28 @@ function handle(msg: any) {
               : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
         );
       };
+      if (mode === "drip") {
+        // Periodic output for the prompt idle guard's "still alive" side:
+        // each chunk is inbound traffic that must renew core.ts's idle
+        // deadline, so a turn that streams regularly — however long it
+        // runs in total — is never mistaken for a wedged one.
+        const intervalMs = Number(process.env.FAKE_ACP_DRIP_MS) || 20;
+        const totalDrips = process.env.FAKE_ACP_DRIP_COUNT ? Number(process.env.FAKE_ACP_DRIP_COUNT) : undefined;
+        let sent = 0;
+        const drip = setInterval(() => {
+          sent += 1;
+          out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `drip ${sent}` } } } });
+          if (totalDrips !== undefined && sent >= totalDrips) {
+            clearInterval(drip);
+            complete();
+          }
+          // totalDrips left unset: drip forever, so only the driver's own
+          // cancel (hard ceiling or an interrupt) ever ends the turn — the
+          // shape the "hard ceiling still fires despite live streaming"
+          // test needs.
+        }, intervalMs);
+        return;
+      }
       if (mode === "ask-peer" && agentsMcp) {
         // the comms e2e: reach a peer bot through the injected agents proxy
         // and reply with whatever it said (the peer's fake runs plain happy
@@ -574,6 +636,14 @@ function handle(msg: any) {
           });
         return;
       }
+      if (failAfterChunk) {
+        // A chunk the person has already seen, and only then the transport
+        // failure: the driver must NOT relaunch this one.
+        out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: "half an answer" } } } });
+        process.stderr.write("fake-acp: HTTP 503 service temporarily unavailable\n");
+        setTimeout(() => process.exit(5), 20);
+        return;
+      }
       if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
       if (mode === "permission") {
@@ -599,7 +669,7 @@ function handle(msg: any) {
     }
     case "session/cancel":
       // the interrupted prompt resolves as cancelled
-      if (mode === "cancel-exits" || mode === "cancel-exits-with-child") process.exit(0);
+      if (mode === "cancel-exits" || mode === "cancel-exits-with-child" || mode === "drip") process.exit(0);
       break;
     default:
       if (msg.id !== undefined) out({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "method not found" } });

@@ -301,6 +301,60 @@ posixOnly("readBotFleetStatus", () => {
   });
 });
 
+posixOnly("botFleetStatusSystemPrompt stability", () => {
+  const at = (offsetMs: number) => new Date(NOW.getTime() + offsetMs);
+
+  it("stays byte-identical when only the observation moves", () => {
+    // This string is spliced into a Chief of Staff's `turn.system`, which the
+    // Claude driver passes as `--append-system-prompt` and folds into the
+    // spawn fingerprint it compares before reusing the warm process
+    // (`argsKey`).  A capsule re-observed on its own five-minute clock says
+    // nothing new about what the Chief may do — it only carries a later
+    // timestamp and the receipt hash over it — so it must not cost the bot
+    // its process.
+    const first = successCapsule();
+    const refreshed = sign({
+      ...first,
+      observed_at: "2026-08-22T06:32:30Z",
+      fresh_until: "2026-08-22T06:37:30Z",
+    });
+    expect(refreshed.receipt_sha256).not.toBe(first.receipt_sha256);
+
+    const before = botFleetStatusSystemPrompt({ cachePath: cachePath(first), now: at(1_000) });
+    const after = botFleetStatusSystemPrompt({ cachePath: cachePath(refreshed), now: at(150_000) });
+
+    expect(after).toBe(before);
+    expect(before).not.toContain("observed_at");
+    expect(before).not.toContain("receipt_sha256=");
+    expect(before).not.toContain("ready_count");
+    // the verified-receipt FACT survives; only its moving value is gone
+    expect(before).toContain("receipt=verified");
+  });
+
+  it("still changes when the runtime posture itself changes", () => {
+    const before = botFleetStatusSystemPrompt({ cachePath: cachePath(successCapsule()), now: at(1_000) });
+    const readySlot = (slot: string) => ({
+      slot,
+      container: "running",
+      readiness: "ready",
+      network: "loopback",
+      security: "hardened",
+      persistence: "durable",
+    });
+    const promoted = sign({
+      ...successCapsule(),
+      runtime_state: "ready",
+      ready_count: 2,
+      slots: [readySlot("vm-1"), readySlot("vm-2")],
+    });
+
+    const after = botFleetStatusSystemPrompt({ cachePath: cachePath(promoted), now: at(1_000) });
+
+    expect(after).not.toBe(before);
+    expect(after).toContain("runtime_state=ready");
+  });
+});
+
 it.skipIf(process.getuid !== undefined)(
   "fails closed when POSIX owner and mode checks are unavailable",
   () => {

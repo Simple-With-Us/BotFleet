@@ -6,6 +6,7 @@ import {
   BASE_IMAGE_LABEL,
   CUA_DRIVER_VERSION,
   DRIVER_LABEL,
+  CUA_SOCKET,
   DISPLAY,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
@@ -467,9 +468,10 @@ describe("VPS computer", () => {
   it("mounts the official Cua MCP server through the tiny remote exec bridge", () => {
     const connection = vpsComputerMcp(CONFIG, BOT_ID);
     expect(connection.command).toBe(process.execPath);
-    expect(connection.args.slice(-2)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
+    expect(connection.args.slice(1, 3)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
+    expect(connection.args.at(-2)).toBe(CUA_SOCKET);
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
-    expect(vpsComputerMcp(CONFIG, BOT_ID, CONTAINER_ID).args.slice(-2)).toEqual(["production-vps", CONTAINER_ID]);
+    expect(vpsComputerMcp(CONFIG, BOT_ID, CONTAINER_ID).args.slice(1, 3)).toEqual(["production-vps", CONTAINER_ID]);
     expect(vpsContainerMcpArgs("production-vps", vpsContainerName(BOT_ID))).toEqual([
       "-H",
       "ssh://production-vps",

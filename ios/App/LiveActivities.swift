@@ -117,7 +117,7 @@ final class LiveActivityCoordinator {
             guard lifecycle.permitsUpdates(from: generation) else { return }
             guard case let .bot(bot) = update.chat else { continue }
             wantedIds.insert(bot.id)
-            let face = MausState.forBot(bot, last: state.visibleTranscript(forThread: bot.threadId).last)
+            let face = BotState.forBot(bot, last: state.visibleTranscript(forThread: bot.threadId).last)
             let kind = liveActivityKind(update.kind)
             if since[bot.id]?.kind != kind { since[bot.id] = (kind, Date()) }
             let content = BotActivityAttributes.ContentState(

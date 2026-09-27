@@ -3,6 +3,10 @@ export interface ChiefTeamMember {
   name: string;
   title?: string;
   description?: string;
+  /** Accepted and deliberately IGNORED by the roster: see the note on
+   *  chiefOfStaffSystemPrompt.  Callers hand this function whole bot rows,
+   *  and keeping the field declared is what makes "we chose not to print
+   *  it" readable at the call site instead of looking like an omission. */
   busy?: boolean;
   hidden?: boolean;
   section?: string;
@@ -26,6 +30,18 @@ const sectionKey = (section?: string): string => section?.trim() || "";
 /** Dynamic system context for a section's Chief of Staff.
  * It names the current team on every turn, while list_bots remains the
  * authoritative tool for IDs and live availability at delegation time.
+ *
+ * DELIBERATELY ABSENT: each teammate's live `busy` state.  This string
+ * reaches the driver as `turn.system`, and the Claude driver passes it as
+ * `--append-system-prompt`, which is part of the spawn fingerprint it
+ * compares before handing the next turn to the warm process (`argsKey` in
+ * drivers/claude.ts).  Interpolating availability here meant any teammate
+ * starting or finishing a turn changed the Chief's fingerprint and tore its
+ * CLI down for a `--resume` respawn, so the one bot BotFleet is built
+ * around got the least benefit from session reuse.  The roster is
+ * MEMBERSHIP — names, roles, about.  Availability is a live fact, and
+ * list_bots is the tool that reports it freshly at the moment the Chief is
+ * actually about to delegate.
  *
  * `availableAgentTools` is the tool-NAME set this Chief's turn actually has
  * — not a boolean — so a driver that can reach ask_bot but not create_bot /
@@ -52,19 +68,28 @@ export function chiefOfStaffSystemPrompt(
           const name = clip(bot.name, ROSTER_NAME_MAX);
           const role = clip(bot.title?.trim() || "General assistant", ROSTER_ROLE_MAX);
           const about = bot.description?.trim();
-          const availability = bot.busy ? "working right now" : "available";
-          return `- ${name} — ${role}${about ? `: ${clip(about, ROSTER_ABOUT_MAX)}` : ""} (${availability})`;
+          return `- ${name} — ${role}${about ? `: ${clip(about, ROSTER_ABOUT_MAX)}` : ""}`;
         })
         .join("\n") + (overflow > 0 ? `\n- …and ${overflow} more (use list_bots for the full roster).` : "")
     : "- No other visible bots are available yet.";
 
   const canAskBot = availableAgentTools.includes("ask_bot");
-  const canBuildTeam = canAskBot && availableAgentTools.includes("create_bot") && availableAgentTools.includes("delegate_bot");
+  const canDelegate = canAskBot && availableAgentTools.includes("delegate_bot");
+  const canBuildTeam = canDelegate && availableAgentTools.includes("create_bot");
   const delegation = canAskBot
     ? [
-        "Use list_bots to confirm the live roster and IDs. Use ask_bot when a teammate is better suited to part of the request.",
+        "Use list_bots to confirm the live roster, IDs, and who is busy right now — this prompt lists who is on the team, not who is free. Use ask_bot when a teammate is better suited to part of the request.",
         canBuildTeam
           ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use delegate_bot to assign its work. Do not create duplicate or unnecessary bots."
+          : undefined,
+        // ask_bot holds this turn open for the peer's ENTIRE turn, and the
+        // tool clock ends it eventually however patient the person is.
+        // delegate_bot returns at once and the peer answers as its own turn,
+        // which is the right shape for anything slow — so say so here, where
+        // the Chief decides, rather than leaving it to be discovered by
+        // timing out.
+        canDelegate
+          ? "ask_bot waits for the teammate's whole turn before you can continue, so prefer delegate_bot for anything that might run long — research, a build, a multi-step job — and keep ask_bot for a question you need answered before you can go on."
           : undefined,
         "Delegate with a clear, self-contained brief and wait for the teammate's actual reply before claiming its work is complete.",
         "You may consult more than one teammate when the request genuinely benefits, then combine their results into one coherent answer.",

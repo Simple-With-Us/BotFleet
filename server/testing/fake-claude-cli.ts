@@ -7,6 +7,12 @@
 //   FAKE_CLAUDE_MODE   happy (default) | exit-early | hang | malformed | quota
 //                      | stream (partial-message text deltas before the
 //                        whole-message frame, plus subagent noise to drop)
+//                      | api-error (a real Anthropic API failure shaped like
+//                        production BOTFLEET-K events: is_error true,
+//                        terminal_reason "api_error", but a stale
+//                        stop_reason "stop_sequence" left over from the CLI's
+//                        result-builder — the regression case for trusting
+//                        stop_reason over terminal_reason on a failed turn)
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -18,6 +24,10 @@
 //   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
 //                           so integration tests can queue work before settle
 //   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
+//   FAKE_CLAUDE_PROMPTS  optional path; every user message this process reads
+//                        from stdin is appended as one JSON line, so a test
+//                        can see what a REUSED process was sent (the dump
+//                        above records only the launch)
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -108,9 +118,17 @@ let turnRunning = false;
 let steered: string[] = [];
 let stdinEnded = false;
 
+// The harness delivers out-of-band context (the volatile half of the system
+// prompt — drivers/prompt-split.ts) as a leading <system-reminder> block
+// inside the user turn.  The real CLI reads that block as context, not as
+// the message, so the echo below replies to the text after it: a test that
+// asserts on the reply sees the user's words, never the harness's note.
+const stripSystemReminder = (text: string): string =>
+  text.replace(/^<system-reminder>\n[\s\S]*?\n<\/system-reminder>(?:\n\n|$)/, "");
+
 const promptText = (prompt: JsonValue): string => {
   const m = prompt && typeof prompt === "object" && !Array.isArray(prompt) ? (prompt as { message?: { content?: unknown } }).message : undefined;
-  return typeof m?.content === "string" ? m.content : "";
+  return typeof m?.content === "string" ? stripSystemReminder(m.content) : "";
 };
 
 const finishIfDone = () => {
@@ -208,6 +226,28 @@ const playTurn = (prompt: JsonValue) => {
     return;
   }
 
+  if (mode === "api-error") {
+    // No assistant/tool_use frame first: production samples show
+    // duration_api_ms: 0 — the request never got a real model response, it
+    // failed before one arrived. subtype stays "success" and stop_reason
+    // stays the stale "stop_sequence" the same way the real CLI's result
+    // builder does; only terminal_reason + api_error_status name the actual
+    // cause.
+    out({
+      type: "result",
+      is_error: true,
+      subtype: "success",
+      stop_reason: "stop_sequence",
+      terminal_reason: "api_error",
+      api_error_status: 429,
+      num_turns: 1,
+      total_cost_usd: 0,
+    });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
   if (mode === "stream") {
     const delta = (d: unknown) => out({ type: "stream_event", event: { type: "content_block_delta", delta: d } });
     delta({ type: "thinking_delta", thinking: "hmm" });
@@ -266,6 +306,7 @@ process.stdin.on("data", (c) => {
     } catch {
       continue;
     }
+    if (process.env.FAKE_CLAUDE_PROMPTS) appendFileSync(process.env.FAKE_CLAUDE_PROMPTS, JSON.stringify({ pid: process.pid, prompt }) + "\n");
     if (turnRunning) steered.push(promptText(prompt));
     else playTurn(prompt);
   }

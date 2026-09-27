@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  classifyMessage,
   configureTurnIdentity,
   genAiProvider,
   observeRuntimeEvent,
@@ -8,6 +9,7 @@ import {
   type SentryAiSink,
   type SentryBreadcrumb,
   type SentryCaptureContext,
+  type SentryMessageContext,
   type SpanLike,
   withChatSpan,
 } from "./sentry-ai.ts";
@@ -46,6 +48,7 @@ function recordingSink() {
   const exceptions: unknown[] = [];
   const contexts: Array<SentryCaptureContext | undefined> = [];
   const breadcrumbs: SentryBreadcrumb[] = [];
+  const messages: Array<{ message: string; context?: SentryMessageContext }> = [];
   const conversations: string[] = [];
   const users: Array<{ id?: string; username?: string; email?: string } | null> = [];
   const sink: SentryAiSink = {
@@ -83,9 +86,12 @@ function recordingSink() {
       exceptions.push(error);
       contexts.push(context);
     },
+    captureMessage: (message, context) => {
+      messages.push({ message, context });
+    },
     addBreadcrumb: (crumb) => breadcrumbs.push(crumb),
   };
-  return { sink, spans, exceptions, contexts, breadcrumbs, conversations, users };
+  return { sink, spans, exceptions, contexts, breadcrumbs, messages, conversations, users };
 }
 
 afterEach(() => {
@@ -602,6 +608,37 @@ describe("failed turns become Issues", () => {
     expect(String(exceptions[0])).toContain("bot turn failed: rpc_error");
   });
 
+  it("still Issues a stop_sequence completion — it is not a benign stop reason here", () => {
+    // BOTFLEET-K / board 28a249c3 / Seer PR #605: production events tagged
+    // stopReason "stop_sequence" were all real Anthropic API failures
+    // (is_error: true, terminal_reason "api_error", api_error_status 429) —
+    // "stop_sequence" was a stale value left over from the CLI's
+    // result-builder on a request that never got a real model response, not
+    // a genuine benign model-side stop. A genuinely benign stop_sequence
+    // completion has is_error: false and so never reaches this branch at
+    // all (see the "normalizes a full turn" driver test's stopReason:
+    // "end_turn" pin). Allowlisting "stop_sequence" here, as #605 proposed,
+    // would silently swallow every one of those rate-limit failures instead
+    // of surfacing them. The real fix is in the driver
+    // (server/drivers/claude.ts): prefer terminal_reason over stop_reason
+    // on a failed turn, so this case now arrives here as stopReason
+    // "api_error", asserted below — not "stop_sequence".
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "stop_sequence" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: stop_sequence");
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:"))).toHaveLength(0);
+  });
+
+  it("still Issues an api_error completion — a real Anthropic-side failure, not expected/setup", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "api_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: api_error");
+  });
+
 });
 
 describe("approval, retry, and session lifecycle", () => {
@@ -975,5 +1012,134 @@ describe("Sentry Agents conversation identity", () => {
     const { sink, conversations } = recordingSink();
     observeRuntimeEvent(base({ type: "runtime.error", message: "boom", turnId: undefined }), sink);
     expect(conversations[0]).toBe("thread-1");
+  });
+});
+
+describe("honest failure classification", () => {
+  it("reports a setup failure's own reason at warning level, not a reasonless spawn_error", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    const setup = "`dsh` isn't installed, or isn't on this app's PATH";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message: setup, setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "dshAgent", ok: false, stopReason: "spawn_error" }), sink);
+
+    expect(exceptions).toHaveLength(0);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message).toContain("isn't installed");
+    expect(messages[0].message).not.toContain("bot turn failed: spawn_error");
+    expect(messages[0].context?.level).toBe("warning");
+    expect(messages[0].context?.fingerprint).toEqual(["bot-setup", "dshAgent"]);
+    expect(messages[0].context?.tags).toMatchObject({
+      "botfleet.stop_reason": "spawn_error",
+      "botfleet.setup": "true",
+    });
+  });
+
+  it("falls back to captureException with the setup text for a sink without captureMessage", () => {
+    const { sink, exceptions, contexts } = recordingSink();
+    delete sink.captureMessage;
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`grok` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("isn't installed");
+    expect(contexts[0]?.fingerprint).toEqual(["bot-setup", "openai-compat"]);
+  });
+
+  it("does not carry a setup message into the next turn", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`dsh` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "spawn_error" }), sink);
+    expect(messages).toHaveLength(1);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: spawn_error");
+  });
+
+  it("gives two engines failing at the same throw site different fingerprints", () => {
+    const { sink, contexts } = recordingSink();
+    const message = "session/new timed out after 30000ms";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", provider: "minimax", threadId: "thread-2" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "minimax", threadId: "thread-2", message }), sink);
+    const [first, second] = contexts.map((context) => context?.fingerprint);
+    expect(first?.[0]).toBe("bot-runtime-error");
+    expect(second?.[0]).toBe("bot-runtime-error");
+    expect(first).not.toEqual(second);
+    expect(first?.[1]).toBe("dshAgent");
+    expect(second?.[1]).toBe("minimax");
+    expect(first?.[2]).toBe(second?.[2]);
+  });
+
+  it("fingerprints failed completions by engine and stop reason", () => {
+    const { sink, contexts } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "claudeAgent" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "claudeAgent", ok: false, stopReason: "api_error" }), sink);
+    expect(contexts[0]?.fingerprint).toEqual(["bot-turn-failure", "claudeAgent", "api_error"]);
+    expect(contexts[0]?.tags?.["botfleet.stop_reason"]).toBe("api_error");
+  });
+
+  it("classifies a message by shape, never by its raw variable text", () => {
+    const a = classifyMessage("session/new timed out after 30000ms (request 7f3a9c2e11)");
+    const b = classifyMessage("session/new timed out after 45000ms (request 0b1c2d3e4f)");
+    expect(a).toBe(b);
+    expect(a).not.toContain("30000");
+    expect(a).not.toContain("7f3a9c2e11");
+    expect(classifyMessage("upstream HTTP 500")).not.toBe(a);
+    const leaky = classifyMessage("POST /hooks/wh_abc/whsec_xyz0123456789 failed");
+    expect(leaky).not.toContain("whsec_xyz");
+  });
+
+  it("does not Issue a timeout completion after the model-request timeout breadcrumb", () => {
+    // chat-completions/loop.ts maps its request_timeout exit to stopReason
+    // "timeout" — the stop a real turn ends with, not "request_timeout".
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message === "bot turn failed: timeout")).toHaveLength(1);
+    expect(spans[0].status).toBeUndefined();
+  });
+
+  it("still Issues a wall-clock timeout, which ends with the same stop reason", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: timeout");
+  });
+
+  it("does not carry a model-timeout flag into the next turn", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+  });
+
+  it("does not page an Antigravity host-control policy refusal", async () => {
+    const { antigravityHostPolicyRefusal } = await import("./drivers/antigravity.ts");
+    for (const reported of ["always-proceed", null, "turbo"]) {
+      const { sink, exceptions, breadcrumbs } = recordingSink();
+      observeRuntimeEvent(base({ type: "turn.started", provider: "antigravity" }), sink);
+      observeRuntimeEvent(
+        base({ type: "runtime.error", provider: "antigravity", message: antigravityHostPolicyRefusal(reported) }),
+        sink,
+      );
+      observeRuntimeEvent(
+        base({ type: "turn.completed", provider: "antigravity", ok: false, stopReason: "host_control_policy" }),
+        sink,
+      );
+      expect(exceptions).toHaveLength(0);
+      expect(breadcrumbs.some((b) => b.level === "warning" && b.message.startsWith("Antigravity's tool execution policy"))).toBe(true);
+      expect(breadcrumbs.some((b) => b.message === "bot turn failed: host_control_policy")).toBe(true);
+      resetSentryAiForTests();
+    }
   });
 });

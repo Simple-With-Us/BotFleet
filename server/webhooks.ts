@@ -150,15 +150,26 @@ export type WebhookManagerEvent =
   | { kind: "webhook.deleted"; webhookId: string }
   | { kind: "webhook.attempt"; attempt: WebhookAttempt };
 
+/** How long a burst of save() calls coalesces into one atomic write.
+ * Trailing-edge: set once per burst, not reset per call, so sustained
+ * receipt traffic still flushes on a bounded cadence. */
+const SAVE_DEBOUNCE_MS = 250;
 const MAX_DELIVERIES = 2_000;
-const MAX_ATTEMPTS = 2_000;
+// Attempts carry a payload preview (see previewPayload below) and are UI
+// history, not idempotency state like deliveries — 2,000 of them with a
+// 2,000-character preview each made webhooks.json a 3 MB write on every
+// receipt.  500 keeps enough recent history for the delivery log without the
+// bulk.
+const MAX_ATTEMPTS = 500;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 10;
 const MAX_PENDING_RUNS = 3;
 const MAX_IGNORED_ATTEMPTS_PER_WINDOW = 3;
 const IGNORED_ATTEMPTS_WINDOW_MS = 10_000;
 
-const runOnSchema = z.enum(["maus", "cloud"]);
+const runOnSchema = z
+  .enum(["bot", "cloud", "maus"])
+  .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value));
 const eventTypesSchema = z.array(z.string()).max(20).optional();
 /** A whole number of minutes.  A day is the ceiling — past that a person
  * wants a schedule, not a trigger. */
@@ -257,10 +268,10 @@ function cleanInput(input: WebhookTriggerInput): CleanWebhookInput {
   const name = input.name.trim().slice(0, 80);
   const prompt = input.prompt.trim().slice(0, 20_000);
   const botId = input.botId.trim();
-  const runOn = input.runOn ?? "maus";
+  const runOn = input.runOn ?? "bot";
   if (!name) fail(400, "Give the webhook a name");
-  if (!botId) fail(400, "Choose a MAUS");
-  if (runOn !== "maus" && runOn !== "cloud") fail(400, "Choose where this webhook runs");
+  if (!botId) fail(400, "Choose a Bot");
+  if (runOn !== "bot" && runOn !== "cloud") fail(400, "Choose where this webhook runs");
   const eventTypes = Array.from(new Set(
     (input.eventTypes ?? [])
       .map((value) => value.trim().slice(0, 200))
@@ -304,7 +315,7 @@ function serializePayload(payload: JsonValue): string {
 }
 
 function previewPayload(payload: JsonValue): string {
-  return serializePayload(payload).replace(/\s+/g, " ").trim().slice(0, 2_000);
+  return serializePayload(payload).replace(/\s+/g, " ").trim().slice(0, 512);
 }
 
 function taskFromPayload(payload: JsonValue): string {
@@ -870,17 +881,22 @@ export class WebhookManager {
   private attempts: WebhookAttempt[] = [];
   private rate = new Map<string, number[]>();
   private recentIgnored = new Map<string, number[]>();
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private dirty = false;
 
   constructor(options: WebhookManagerOptions) {
     this.options = options;
     this.file = options.file ?? join(DATA_DIR, "webhooks.json");
     this.now = options.now ?? Date.now;
     try {
-      const parsed = webhookFileSchema.safeParse(parseJson(readFileSync(this.file, "utf8")));
+      const rawText = readFileSync(this.file, "utf8");
+      const parsed = webhookFileSchema.safeParse(parseJson(rawText));
       if (!parsed.success) throw parsed.error;
       this.webhooks = parsed.data.webhooks;
       this.deliveries = parsed.data.deliveries.slice(-MAX_DELIVERIES);
       this.attempts = (parsed.data.attempts ?? []).slice(-MAX_ATTEMPTS);
+      // One-shot: rewrite legacy runOn "maus" → "bot" on disk.
+      if (/"runOn"\s*:\s*"maus"/.test(rawText)) this.save();
     } catch {
       this.webhooks = [];
       this.deliveries = [];
@@ -898,7 +914,7 @@ export class WebhookManager {
 
   create(input: JsonValue): CreatedWebhook {
     const clean = cleanInput(parseTriggerInput(input));
-    if (this.options.botState(clean.botId) === "missing") fail(400, "That MAUS no longer exists");
+    if (this.options.botState(clean.botId) === "missing") fail(400, "That Bot no longer exists");
     const now = this.now();
     const secret = newSecret();
     const trigger: StoredWebhookTrigger = {
@@ -911,7 +927,17 @@ export class WebhookManager {
       deliveryCount: 0,
     };
     this.webhooks.unshift(trigger);
-    this.save();
+    // The caller is about to receive the only copy of this secret, so its
+    // hash must be on disk before we return — a crash inside a debounce
+    // window would otherwise hand out a secret no restarted harness accepts.
+    // If the write fails, undo the insert so memory never runs ahead of disk.
+    try {
+      this.saveNow();
+    } catch (error) {
+      const at = this.webhooks.indexOf(trigger);
+      if (at !== -1) this.webhooks.splice(at, 1);
+      throw error;
+    }
     this.emit(trigger);
     return { webhook: publicTrigger(trigger), secret };
   }
@@ -930,7 +956,7 @@ export class WebhookManager {
       eventTypes: patch.eventTypes ?? trigger.eventTypes,
       minGapMinutes: patch.minGapMinutes ?? trigger.minGapMinutes,
     });
-    if (this.options.botState(clean.botId) === "missing") fail(400, "That MAUS no longer exists");
+    if (this.options.botState(clean.botId) === "missing") fail(400, "That Bot no longer exists");
     Object.assign(trigger, clean, { updatedAt: this.now() });
     if (!clean.eventTypes?.length) delete trigger.eventTypes;
     if (!clean.minGapMinutes) delete trigger.minGapMinutes;
@@ -960,9 +986,19 @@ export class WebhookManager {
     const trigger = this.webhooks.find((candidate) => candidate.id === id);
     if (!trigger) return null;
     const secret = newSecret();
+    const previous = { secretHash: trigger.secretHash, updatedAt: trigger.updatedAt };
     trigger.secretHash = hashSecret(secret);
     trigger.updatedAt = this.now();
-    this.save();
+    // Same contract as create(): the new hash is durable before the secret is
+    // returned, so a crash cannot leave the rotated-out secret valid on disk
+    // after the caller was told it was replaced.  A failed write restores the
+    // old hash and throws instead of returning a secret that never landed.
+    try {
+      this.saveNow();
+    } catch (error) {
+      Object.assign(trigger, previous);
+      throw error;
+    }
     this.emit(trigger);
     return { webhook: publicTrigger(trigger), secret };
   }
@@ -973,7 +1009,7 @@ export class WebhookManager {
       if (trigger.botId !== botId || !trigger.enabled) continue;
       trigger.enabled = false;
       trigger.updatedAt = this.now();
-      this.options.cancelQueued?.(trigger.id, "The assigned MAUS was deleted");
+      this.options.cancelQueued?.(trigger.id, "The assigned Bot was deleted");
       this.emit(trigger);
       changed = true;
     }
@@ -1020,7 +1056,7 @@ export class WebhookManager {
 
   private dispatch(trigger: StoredWebhookTrigger, event: WebhookEvent): WebhookReceiveResult {
     if (!trigger.enabled) fail(409, "This webhook is paused");
-    if (this.options.botState(trigger.botId) === "missing") fail(410, "The assigned MAUS no longer exists");
+    if (this.options.botState(trigger.botId) === "missing") fail(410, "The assigned Bot no longer exists");
 
     const requestedDeliveryId = String(event.deliveryId ?? "").trim().slice(0, 200);
     if (requestedDeliveryId) {
@@ -1111,7 +1147,13 @@ export class WebhookManager {
       deliveryId,
       runId: run.id,
     });
-    this.save();
+    // This just added a new entry to `this.deliveries` — the record that
+    // makes a retried delivery idempotent. It must be durable before the
+    // HTTP 202 is returned, or a restart between accepting this delivery and
+    // a debounced flush would forget it, and the sender's retry would be
+    // treated as new.  create() and rotateSecret() make the same exception
+    // for newly issued secrets; every other save() here can coalesce.
+    this.saveNow();
     this.emit(trigger);
     return { runId: run.id, deliveryId, duplicate: false };
   }
@@ -1134,7 +1176,7 @@ export class WebhookManager {
       outcome: "captured",
       statusCode: 202,
       deliveryId,
-      reason: "Test event captured; enable the webhook to start MAUS tasks",
+      reason: "Test event captured; enable the webhook to start Bot tasks",
     });
     this.save();
     this.emit(trigger);
@@ -1202,12 +1244,53 @@ export class WebhookManager {
     this.options.emit?.({ kind: "webhook", webhook: publicTrigger(trigger) });
   }
 
+  /** Coalesces bursts of save() calls — a push storm was one full
+   * serialize-fsync-rename per event on the request path — into one write.
+   * See flushNow() for the durability exception on the receive path. */
   private save(): void {
+    this.dirty = true;
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.flushFromTimer(), SAVE_DEBOUNCE_MS);
+    this.saveTimer.unref?.();
+  }
+
+  /** Mark dirty and write through now.  For the few mutations that must be
+   * durable before the call returns; throws if the write fails. */
+  private saveNow(): void {
+    this.dirty = true;
+    this.flushNow();
+  }
+
+  /** The debounce timer's flush.  A throw here would be an uncaught exception
+   * in a timer callback, so a failed write is logged instead; `dirty` stays
+   * set, and the next save() or the shutdown flush retries the whole file. */
+  private flushFromTimer(): void {
+    this.saveTimer = null;
+    try {
+      this.flushNow();
+    } catch (error) {
+      console.error("webhooks: debounced save failed; the next save or shutdown retries it", error);
+    }
+  }
+
+  /** Synchronous, immediate write-through — used by the receive path for the
+   * new-delivery record (see dispatch()), by tests asserting on-disk state
+   * right after a mutation, and by the shutdown path so a pending coalesced
+   * save is never lost when the process exits. A no-op when nothing is
+   * dirty.  `dirty` is cleared only after the write succeeds, so a failed
+   * write throws with the pending mutation still marked for the next try. */
+  flushNow(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (!this.dirty) return;
     mkdirSync(dirname(this.file), { recursive: true });
     writeFileAtomic(
       this.file,
-      JSON.stringify({ version: 1, webhooks: this.webhooks, deliveries: this.deliveries, attempts: this.attempts } satisfies WebhookFile, null, 2),
+      JSON.stringify({ version: 1, webhooks: this.webhooks, deliveries: this.deliveries, attempts: this.attempts } satisfies WebhookFile),
       { mode: 0o600 },
     );
+    this.dirty = false;
   }
 }

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { TurnToolCall, TurnToolRuntime } from "../contracts.ts";
 import type { AgentToolCallContext } from "./agents.ts";
-import { createComputerTools } from "./computer.ts";
+import { createComputerTools, READ_FILE_DEFAULT_LINE_LIMIT, READ_FILE_MAX_BYTES } from "./computer.ts";
 
 const dummyIdentity: AgentToolCallContext = {
   botId: "bot-1",
@@ -82,6 +82,11 @@ describe("computer tools", () => {
       const result = await tools.read_file(call, dummyIdentity, dummyRuntime);
       expect(result.kind).toBe("result");
       expect(result.content).toBe("1: line one\n2: line two\n3: line three\n4: ");
+      // No regression: a short file (well under READ_FILE_DEFAULT_LINE_LIMIT
+      // and READ_FILE_MAX_BYTES) comes back whole, with no truncation notice
+      // and no "(truncated)" suffix on detail.
+      expect(result.content).not.toContain("truncated");
+      expect(result.detail).toBe("lines 1-4 of 4");
     });
 
     it("supports offset and limit", async () => {
@@ -96,7 +101,93 @@ describe("computer tools", () => {
       };
       const result = await tools.read_file(call, dummyIdentity, dummyRuntime);
       expect(result.kind).toBe("result");
-      expect(result.content).toBe("2: B\n3: C");
+      // Paging itself is unchanged — offset/limit still select exactly lines
+      // 2-3 of the 6 "lines" split("\n") produces for "A\nB\nC\nD\nE\n" (the
+      // trailing "\n" yields a final empty line, same as the test above).
+      // What's new under DR5 is the trailing notice: the explicit limit=2
+      // stopped short of the file's end (line 3 of 6), so the executor now
+      // says so and names where to resume, exactly as it would if limit had
+      // been left to default.
+      expect(result.content).toBe(
+        "2: B\n3: C\n\n[truncated: showed lines 2-3 of 6 (limit=2 lines).  " +
+          "Call read_file again with offset=4 to continue, and limit to control how much comes back.]",
+      );
+      expect(result.detail).toBe("lines 2-3 of 6 (truncated)");
+    });
+
+    it("defaults limit to READ_FILE_DEFAULT_LINE_LIMIT and names the next offset when a file is longer than the default", async () => {
+      const filePath = join(scratchDir, "long.txt");
+      const totalLines = READ_FILE_DEFAULT_LINE_LIMIT + 100;
+      const content = Array.from({ length: totalLines }, (_, i) => `line ${i + 1}`).join("\n");
+      writeFileSync(filePath, content, "utf8");
+
+      const tools = createComputerTools({ cwd: scratchDir });
+      const call: TurnToolCall = {
+        id: "call-default-limit",
+        name: "read_file",
+        arguments: { path: "long.txt" },
+      };
+      const result = await tools.read_file(call, dummyIdentity, dummyRuntime);
+      expect(result.kind).toBe("result");
+
+      const [body, notice] = result.content.split("\n\n[truncated:");
+      // Exactly READ_FILE_DEFAULT_LINE_LIMIT lines came back, numbered 1..limit.
+      expect(body).toBe(
+        Array.from({ length: READ_FILE_DEFAULT_LINE_LIMIT }, (_, i) => `${i + 1}: line ${i + 1}`).join("\n"),
+      );
+      expect(notice).toBeDefined();
+      expect(result.content).toContain(
+        `showed lines 1-${READ_FILE_DEFAULT_LINE_LIMIT} of ${totalLines} (limit=${READ_FILE_DEFAULT_LINE_LIMIT} lines)`,
+      );
+      expect(result.content).toContain(`offset=${READ_FILE_DEFAULT_LINE_LIMIT + 1}`);
+      expect(result.detail).toBe(`lines 1-${READ_FILE_DEFAULT_LINE_LIMIT} of ${totalLines} (truncated)`);
+    });
+
+    it("caps the rendered result at READ_FILE_MAX_BYTES when lines are huge, even under the default line limit", async () => {
+      const filePath = join(scratchDir, "huge-lines.txt");
+      // Each line is 2000 'x' characters. 50 lines is comfortably under
+      // READ_FILE_DEFAULT_LINE_LIMIT (400) but ~100KB of raw content alone —
+      // well past READ_FILE_MAX_BYTES (64KB) — so the byte cap, not the line
+      // limit, must be what stops this read.
+      const lineText = "x".repeat(2000);
+      const totalLines = 50;
+      const content = Array.from({ length: totalLines }, () => lineText).join("\n");
+      writeFileSync(filePath, content, "utf8");
+
+      const tools = createComputerTools({ cwd: scratchDir });
+      const call: TurnToolCall = {
+        id: "call-byte-cap",
+        name: "read_file",
+        arguments: { path: "huge-lines.txt" },
+      };
+      const result = await tools.read_file(call, dummyIdentity, dummyRuntime);
+      expect(result.kind).toBe("result");
+
+      const [body] = result.content.split("\n\n[truncated:");
+      // The rendered (pre-notice) file content itself must respect the cap.
+      expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(READ_FILE_MAX_BYTES);
+
+      // Every returned line must be a COMPLETE rendered line ("N: " + the
+      // full 2000-char line) — proves the cap trims on whole-line
+      // boundaries and never splits a line mid-way.  Since offset defaults
+      // to 1, the number of whole lines returned is also the last line
+      // number returned.
+      const bodyLines = body.split("\n");
+      const lastLineReturned = bodyLines.length;
+      for (const [idx, renderedLine] of bodyLines.entries()) {
+        expect(renderedLine).toBe(`${idx + 1}: ${lineText}`);
+      }
+      // It must have stopped well short of the line limit (50 < 400) and
+      // well short of the file's end, proving the byte cap — not the line
+      // limit and not EOF — is what bound this read.
+      expect(lastLineReturned).toBeLessThan(totalLines);
+
+      // The notice must name the byte cap as the reason and the real last
+      // line actually returned (not the line-limit boundary).
+      expect(result.content).toContain(`(${READ_FILE_MAX_BYTES}-byte cap)`);
+      expect(result.content).toContain(`showed lines 1-${lastLineReturned} of ${totalLines}`);
+      expect(result.content).toContain(`offset=${lastLineReturned + 1}`);
+      expect(result.detail).toBe(`lines 1-${lastLineReturned} of ${totalLines} (truncated)`);
     });
 
     it("returns error for missing file", async () => {

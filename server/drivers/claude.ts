@@ -45,7 +45,44 @@ import {
   resolveInjectId,
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
+import {
+  clearPromptSplitReceipt,
+  EMPTY_FINGERPRINT,
+  promptHalves,
+  promptSplitFingerprints,
+  readPromptSplitReceipt,
+  sweepPromptSplitReceipts,
+  volatileContextNote,
+  writePromptSplitReceipt,
+  type PromptSplitReceipt,
+} from "./prompt-split.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+
+/** How the volatile half of the system prompt (memory, mentions) reaches a
+ * model whose process was launched with only the stable half, or launched
+ * with an older copy.  The CLI's own out-of-band convention inside a user
+ * turn: one short append rather than a relaunch that re-uploads the whole
+ * prompt cache.  Bare text when there is nothing to say — no volatile text
+ * and none was ever delivered to this session. */
+export function withVolatileNote(text: string, volatile: string, hadVolatile: boolean): string {
+  const body = volatileContextNote(volatile, hadVolatile);
+  if (!body) return text;
+  const note = `<system-reminder>\n${body}\n</system-reminder>`;
+  return text ? `${note}\n\n${text}` : note;
+}
+
+/** Receipts outlive the sessions they describe (the session id is the only
+ * key the driver has), so the stale ones are swept once per process. */
+let sweptReceipts = false;
+function sweepReceiptsOnce(): void {
+  if (sweptReceipts) return;
+  sweptReceipts = true;
+  try {
+    sweepPromptSplitReceipts();
+  } catch {
+    /* a sweep that cannot run costs nothing but a few stale files */
+  }
+}
 
 /** Whether `claude` has been signed in.
  *
@@ -473,6 +510,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       argsKey: string;
       /** the CLI's session id from `init`, what --resume takes later */
       sessionId: string | null;
+      /** the halves this native session will carry once the CLI accepts the
+       * turn just written; committed to the receipt store on the first frame
+       * after submission (see drivers/prompt-split.ts) */
+      pendingReceipt: { key: string; receipt: PromptSplitReceipt } | null;
       /** the running turn, or null between turns */
       turn: { turnId: string; settled: boolean; sawStreamDelta: boolean } | null;
       idleTimer: ReturnType<typeof setTimeout> | null;
@@ -480,6 +521,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       stderr: string;
     }
     const sessions = new Map<string, Session>();
+    sweepReceiptsOnce();
     const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
     const sessionIdleMinimum = Number.isFinite(configuredIdleMinimum) && configuredIdleMinimum > 0
       ? configuredIdleMinimum
@@ -617,7 +659,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
       if (injected.model) args.push("--model", injected.model);
       if (turn.effort) args.push("--effort", turn.effort);
-      if (turn.system) args.push("--append-system-prompt", turn.system);
+      // Only the stable half rides the spawn contract, and so argsKey: the
+      // volatile half (memory, mentions) is delivered inside the user turn
+      // below, so a memory write or a mention no longer relaunches a healthy
+      // session and makes the provider re-cache the whole conversation.  A
+      // legacy unsplit turn keeps sending its whole prompt here.
+      const halves = promptHalves(turn);
+      const appendedSystem = halves.stable ?? turn.system;
+      if (appendedSystem) args.push("--append-system-prompt", appendedSystem);
 
       // integrations → MCP servers; pre-allow their tools (a headless
       // acceptEdits run silently denies anything unlisted)
@@ -721,6 +770,25 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const keyArgs = args.filter((a, i) => a !== "--mcp-config" && args[i - 1] !== "--mcp-config");
       const argsKey = JSON.stringify({ args: keyArgs, mcpServers, cwd, model: injected.model ?? null, base: env.ANTHROPIC_BASE_URL ?? null });
 
+      // What the user turn carries besides its text.  The volatile half rides
+      // as a labelled block when this native session has not carried this
+      // exact copy — a fresh session, a resumed one whose memory moved, or a
+      // receipt this harness never wrote — and on a mention turn, whose note
+      // describes this very message.  A legacy unsplit turn goes bare.  The
+      // receipt is only pending here; the CLI's first frame commits it.
+      const planTurnText = (sessionKey: string): { text: string; pending: { key: string; receipt: PromptSplitReceipt } | null } => {
+        if (halves.stable === null) return { text: turn.text, pending: null };
+        const receipt = promptSplitFingerprints(halves.stable, halves.volatile);
+        const previous = readPromptSplitReceipt(DRIVER_KIND, sessionKey);
+        const carried = previous !== null && previous.volatile === receipt.volatile && !turn.mentionTurn;
+        return {
+          text: carried
+            ? turn.text
+            : withVolatileNote(turn.text, halves.volatile, previous !== null && previous.volatile !== EMPTY_FINGERPRINT),
+          pending: { key: sessionKey, receipt },
+        };
+      };
+
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
@@ -730,8 +798,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         live.turn = { turnId, settled: false, sawStreamDelta: false };
         active.set(threadId, { stop: () => killCliTree(live.child), turnId, broker: live.broker });
         emit({ ...base(threadId, turnId), type: "turn.started" });
-        const written = await writeUser(live, threadId, turn.text);
+        const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
+        live.pendingReceipt = plan.pending;
+        const written = await writeUser(live, threadId, plan.text);
         if (!written) {
+          live.pendingReceipt = null;
           active.delete(threadId);
           live.turn = null;
           closeSession(threadId, "stdin write failed");
@@ -802,6 +873,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpConfigPath,
         argsKey,
         sessionId: sessionId ?? newSessionId,
+        pendingReceipt: null,
         turn: { turnId, settled: false, sawStreamDelta: false },
         idleTimer: null,
         closing: false,
@@ -860,6 +932,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
+        // The CLI accepted the turn just written: this native session now
+        // carries the halves that turn delivered.  Committed on the first
+        // frame after submission, never at write time — a CLI that dies
+        // before reading stdin has carried nothing, and the next turn must
+        // deliver the volatile half again.  Keyed on the id the CLI reports,
+        // which is what the harness resumes with.
+        if (session.pendingReceipt) {
+          const { key, receipt } = session.pendingReceipt;
+          session.pendingReceipt = null;
+          if (o.type === "system" && o.subtype === "init" && typeof o.session_id === "string") session.sessionId = o.session_id;
+          try {
+            writePromptSplitReceipt(DRIVER_KIND, session.sessionId ?? key, receipt);
+          } catch {
+            /* the next turn re-delivers the note; nothing else depends on it */
+          }
+        }
         switch (o.type) {
           case "system":
             if (o.subtype === "init") {
@@ -938,15 +1026,32 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               }
             }
             break;
-          case "result":
+          case "result": {
             // result.usage is this invocation's total — one process per turn,
             // so it is the turn's figure. cache reads count as input: they
             // are billed (at the cache rate) and they fill the window — but
             // they are reported separately too, so the UI can show how much
             // of the figure was context re-read rather than new text.
+            //
+            // stop_reason vs terminal_reason: on a real failure (is_error),
+            // the CLI can report BOTH a stale stop_reason left over from the
+            // last successful model turn (observed: "stop_sequence" with
+            // duration_api_ms: 0, i.e. no model turn actually ran) and a
+            // terminal_reason that names the real cause (observed:
+            // "api_error", with api_error_status 429 — an Anthropic rate
+            // limit). Blindly trusting stop_reason there mislabels a real,
+            // actionable failure as a benign model-side stop. terminal_reason
+            // is the CLI's own account of why the whole invocation ended
+            // abnormally, so it wins whenever the turn failed; stop_reason
+            // (the Messages API's own field: end_turn, tool_use, ...) is the
+            // right label for a normal completion and stays primary there.
+            const isError = o.is_error === true;
+            const stopReason = isError
+              ? (o.terminal_reason ?? o.stop_reason ?? null)
+              : (o.stop_reason ?? o.terminal_reason ?? null);
             settle(
-              o.is_error !== true,
-              o.stop_reason ?? o.terminal_reason ?? null,
+              !isError,
+              stopReason,
               o.total_cost_usd ?? null,
               o.usage
                 ? {
@@ -959,6 +1064,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 : undefined,
             );
             break;
+          }
         }
       };
 
@@ -1047,6 +1153,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               active.delete(threadId);
               try {
                 const cursor = session.sessionId ?? sessionId ?? undefined;
+                // The dead CLI may have accepted the turn without persisting
+                // the note it carried: forget the receipt so the relaunch
+                // delivers the volatile half again.  A repeated note costs a
+                // few hundred bytes; a skipped one loses the memory for the
+                // rest of the session.
+                if (cursor) clearPromptSplitReceipt(DRIVER_KIND, cursor);
                 await sendTurn({ ...turn, resumeCursor: cursor });
               } catch (e) {
                 retryState.delete(threadId);
@@ -1095,7 +1207,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // prompt over stdin as a stream-json message — never argv (ARG_MAX).
       // stdin stays OPEN: that is what keeps the session alive for a
       // mid-turn steer or the next turn; closeSession() ends it.
-      if (!(await writeUser(session, threadId, turn.text))) {
+      const plan = planTurnText(sessionId ?? newSessionId!);
+      session.pendingReceipt = plan.pending;
+      if (!(await writeUser(session, threadId, plan.text))) {
+        session.pendingReceipt = null;
         settle(false, "stdin_write_failed");
         closeSession(threadId, "stdin write failed");
       }

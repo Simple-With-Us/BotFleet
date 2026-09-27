@@ -32,6 +32,8 @@ import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
+import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
 
 import type {
   DriverCreateInput,
@@ -311,6 +313,9 @@ export async function fetchPiModels(
   env: Record<string, string | undefined>,
 ): Promise<ModelCatalog> {
   const child = spawnCli(cli, PI_ARGS, { stdio: ["pipe", "pipe", "pipe"], env });
+  // nothing reads the probe's stderr; drain it so a chatty pi cannot fill
+  // the pipe and block before it answers
+  child.stderr?.resume();
   return new Promise((resolve) => {
     let buf = "";
     let done = false;
@@ -351,6 +356,29 @@ export async function fetchPiModels(
       finish({ default: "", options: [] });
     }
   });
+}
+
+/** How much of a turn child's stderr is kept at each end.  The middle of a
+ *  long log is dropped as it arrives; only its length is counted. */
+const PI_STDERR_KEEP = 4_096;
+
+/** A readable excerpt of a child's stderr from its kept head and tail and
+ *  the total length seen, in the same head … omitted … tail shape as
+ *  `stderrExcerpt`, with the omitted count taken from the real total. */
+export function summarizeStderr(head: string, tail: string, total: number): string {
+  if (total <= head.length + tail.length) return stderrExcerpt(head + tail);
+  const start = head.trimStart().slice(0, STDERR_EXCERPT_HEAD);
+  const end = tail.trimEnd().slice(-STDERR_EXCERPT_TAIL);
+  return `${start}\n… ${Math.max(0, total - start.length - end.length)} characters omitted …\n${end}`;
+}
+
+/** pi-ai's terminal stop reason → the harness vocabulary.  `length` is a
+ *  reply cut off by the output-token limit, which reads as a finished turn
+ *  unless it is named. */
+export function piStopReason(stopReason: string | undefined): string {
+  if (stopReason === "cancelled" || stopReason === "aborted") return "cancelled";
+  if (stopReason === "length") return "max_tokens";
+  return "end_turn";
 }
 
 export interface PiConfig {
@@ -546,6 +574,27 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       })();
       let buf = "";
       let assistantText = "";
+      // Drain stderr into a bounded head + tail.  Nothing read stderr before,
+      // so a pi that logged more than a pipe buffer (64 KB) blocked on its
+      // own write and never exited: the turn hung until the harness's
+      // 20-minute stall watchdog, and a crash said nothing about why.
+      let stderrHead = "";
+      let stderrTail = "";
+      let stderrTotal = 0;
+      child.stderr?.setEncoding("utf8");
+      child.stderr?.on("data", (chunk: string) => {
+        stderrTotal += chunk.length;
+        if (stderrHead.length < PI_STDERR_KEEP) {
+          const room = PI_STDERR_KEEP - stderrHead.length;
+          stderrHead += chunk.slice(0, room);
+          chunk = chunk.slice(room);
+        }
+        if (chunk) stderrTail = (stderrTail + chunk).slice(-PI_STDERR_KEEP);
+      });
+      const stderrSummary = () => summarizeStderr(stderrHead, stderrTail, stderrTotal);
+      // true once the child is gone, so a later RPC fails at once instead of
+      // waiting out its whole response timeout on a dead pipe
+      let exited = false;
       // resolve one-shot RPC responses (new_session / switch_session / set_model)
       const responseWaiters = new Map<string, { resolve: (data: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
       const rejectWaiters = (err: Error) => {
@@ -555,8 +604,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
         responseWaiters.clear();
       };
-      const awaitResponse = (command: string, timeoutMs = 20_000) =>
-        new Promise<unknown>((resolve, reject) => {
+      const awaitResponse = (command: string, timeoutMs = 20_000) => {
+        const response = new Promise<unknown>((resolve, reject) => {
+          if (exited) {
+            reject(new Error("pi process exited before replying"));
+            return;
+          }
           const timer = setTimeout(() => {
             responseWaiters.delete(command);
             reject(new Error(`pi ${command} timed out`));
@@ -564,6 +617,13 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           timer.unref?.();
           responseWaiters.set(command, { resolve, reject, timer });
         });
+        // Each waiter is created before its request is sent.  If the send
+        // throws, the turn fails through the catch below and nothing awaits
+        // this promise; mark it handled so its later rejection cannot crash
+        // the harness as an unhandled rejection.  Awaiting it still throws.
+        response.catch(() => undefined);
+        return response;
+      };
       child.stdin.on("error", () => rejectWaiters(new Error("pi stdin closed")));
       const send = (obj: Record<string, unknown>) => {
         appendNative(threadId, { dir: "out", source: "pi.rpc", msg: obj });
@@ -609,6 +669,17 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         active.delete(threadId);
       };
 
+      /** Fail the turn with a reason the person can read.  Once the turn is
+       *  in `active`, every failure goes through here rather than a throw:
+       *  the harness's sendTurn catch never calls interruptTurn, so a throw
+       *  left the entry behind and every later turn on the thread answered
+       *  "a turn is already running". */
+      const fail = (stopReason: string, message: string) => {
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: message.slice(0, 2_000) });
+        settle(false, stopReason);
+      };
+
       const stop = () => {
         try {
           send({ type: "abort" });
@@ -633,7 +704,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               responseWaiters.delete(evt.command);
               clearTimeout(waiter.timer);
               if (evt.success) waiter.resolve(evt.data);
-              else waiter.reject(new Error(`pi ${evt.command} failed`));
+              else {
+                const detail = typeof evt.error === "string" && evt.error.trim() ? `: ${evt.error.trim().slice(0, 500)}` : "";
+                waiter.reject(new Error(`pi ${evt.command} failed${detail}`));
+              }
             }
             return;
           }
@@ -715,7 +789,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               settle(false, "failed", usage);
               return;
             }
-            settle(true, sr === "cancelled" || sr === "aborted" ? "cancelled" : "end_turn", usage);
+            settle(true, piStopReason(sr), usage);
             return;
           }
           default:
@@ -739,83 +813,108 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
       });
       child.on("error", (err) => {
-        const fail = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
-        rejectWaiters(new Error(fail.message));
-        emit({ ...base(threadId, turnId), type: "runtime.error", message: fail.message, setup: fail.setup });
+        exited = true;
+        const spawnFailure = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
+        rejectWaiters(new Error(spawnFailure.message));
+        if (settled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message: spawnFailure.message, setup: spawnFailure.setup });
         settle(false);
       });
-      child.on("close", () => {
-        // a clean close without a terminal event is a failed turn, never a hang
+      child.on("close", (code, signal) => {
+        exited = true;
+        // a close without a terminal event is a failed turn, never a hang;
+        // "close" fires after stderr has drained, so the excerpt is whole
         rejectWaiters(new Error("pi process exited before replying"));
-        settle(false);
+        const excerpt = stderrSummary();
+        fail("exit_before_result", `pi exited ${code ?? signal ?? "unexpectedly"} before agent_end${excerpt ? `: ${excerpt}` : ""}`);
       });
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
 
-      // handshake: resume the remembered session or start a fresh one. The
-      // harness persists session.started.sessionId as the resumeCursor and
-      // hands it back next turn, so that id IS the resume handle — pi's
-      // sessionFile, which switch_session expects as `sessionPath`.
-      const sessionPath = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
-      let sessionFile = sessionPath;
       try {
-        const command = sessionPath ? "switch_session" : "new_session";
-        const hsPromise = awaitResponse(command);
-        send(sessionPath ? { type: "switch_session", sessionPath } : { type: "new_session" });
-        const hs = (await hsPromise) as { sessionFile?: string; sessionId?: string } | undefined;
-        if (hs?.sessionFile) sessionFile = hs.sessionFile;
-        emit({
-          ...base(threadId, turnId),
-          type: "session.started",
-          sessionId: sessionFile ?? hs?.sessionId ?? null,
-          model: turn.model ?? null,
-        });
-      } catch {
-        // without a session we can still try a bare prompt; pi --no-session
-        // accepts a prompt without an explicit session.
-      }
-
-      // Pin the chosen model (composite id or host::model inject → provider +
-      // modelId), and FAIL the turn if the pin does not take.
-      //
-      // This used to swallow the rejection and keep going on whatever model
-      // pi had, while session.started had already told the UI and the usage
-      // ledger which model was running.  A turn billed to one model and
-      // reported as another is worse than a turn that refuses: the person
-      // reads an answer believing a model they did not get produced it.
-      // Same rule the ACP core states for session/set_model.
-      const chosen = typeof turn.model === "string" ? splitPiModel(turn.model) : null;
-      if (chosen) {
-        const modelPromise = awaitResponse("set_model");
-        send({ type: "set_model", provider: chosen.provider, modelId: chosen.modelId });
+        // handshake: resume the remembered session or start a fresh one. The
+        // harness persists session.started.sessionId as the resumeCursor and
+        // hands it back next turn, so that id IS the resume handle — pi's
+        // sessionFile, which switch_session expects as `sessionPath`.
+        const sessionPath = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
+        let sessionFile = sessionPath;
         try {
-          await modelPromise;
+          // Loading a saved session reads its whole file, which stretches
+          // with host load the way a cold boot does; scale the deadline the
+          // same way the ACP initialize deadline is scaled.
+          const hsPromise = sessionPath
+            ? awaitResponse("switch_session", resolveInitDeadline({ engineBaseMs: 20_000, load: readHostLoad() }).timeoutMs)
+            : awaitResponse("new_session");
+          send(sessionPath ? { type: "switch_session", sessionPath } : { type: "new_session" });
+          const hs = (await hsPromise) as { sessionFile?: string; sessionId?: string } | undefined;
+          if (hs?.sessionFile) sessionFile = hs.sessionFile;
+          emit({
+            ...base(threadId, turnId),
+            type: "session.started",
+            sessionId: sessionFile ?? hs?.sessionId ?? null,
+            model: turn.model ?? null,
+          });
         } catch (error) {
-          throw new Error(
-            `pi refused the model ${chosen.provider}/${chosen.modelId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
+          if (settled) return { turnId };
+          if (sessionPath) {
+            // Prompting now would run on the empty --no-session context: the
+            // bot answers with no memory of the thread while the person
+            // believes it has one.  Fail instead; resume_failed tells the
+            // harness to drop the dead cursor so the next turn starts fresh.
+            fail(
+              "resume_failed",
+              `The saved pi session could not be resumed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            return { turnId };
+          }
+          // a fresh turn without a session can still try a bare prompt; pi
+          // --no-session accepts a prompt without an explicit session.
         }
-      }
+        if (settled) return { turnId };
 
-      // pin reasoning effort after the model (the supported level set is
-      // model-dependent); a rejection keeps the engine default
-      if (turn.effort) {
-        try {
-          const levelPromise = awaitResponse("set_thinking_level");
-          send({ type: "set_thinking_level", level: piThinkingLevel(turn.effort) });
-          await levelPromise;
-        } catch {
-          /* keep going on the engine default */
+        // Pin the chosen model (composite id or host::model inject → provider +
+        // modelId), and FAIL the turn if the pin does not take.
+        //
+        // This used to swallow the rejection and keep going on whatever model
+        // pi had, while session.started had already told the UI and the usage
+        // ledger which model was running.  A turn billed to one model and
+        // reported as another is worse than a turn that refuses: the person
+        // reads an answer believing a model they did not get produced it.
+        // Same rule the ACP core states for session/set_model.
+        const chosen = typeof turn.model === "string" ? splitPiModel(turn.model) : null;
+        if (chosen) {
+          const modelPromise = awaitResponse("set_model");
+          send({ type: "set_model", provider: chosen.provider, modelId: chosen.modelId });
+          try {
+            await modelPromise;
+          } catch (error) {
+            fail(
+              "model_refused",
+              `pi refused the model ${chosen.provider}/${chosen.modelId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return { turnId };
+          }
         }
-      }
 
-      const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
-      try {
+        // pin reasoning effort after the model (the supported level set is
+        // model-dependent); a rejection keeps the engine default
+        if (turn.effort) {
+          try {
+            const levelPromise = awaitResponse("set_thinking_level");
+            send({ type: "set_thinking_level", level: piThinkingLevel(turn.effort) });
+            await levelPromise;
+          } catch {
+            /* keep going on the engine default */
+          }
+        }
+        if (settled) return { turnId };
+
+        const message = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
         send({ type: "prompt", message });
-      } catch {
-        settle(false);
+      } catch (error) {
+        fail("failed", `pi turn setup failed: ${error instanceof Error ? error.message : String(error)}`);
       }
 
       return { turnId };
@@ -830,6 +929,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         let out = "";
         child.stdout?.setEncoding("utf8");
         child.stdout?.on("data", (c: string) => (out += c));
+        child.stderr?.resume();
         const timer = setTimeout(() => {
           try {
             killCliTree(child);

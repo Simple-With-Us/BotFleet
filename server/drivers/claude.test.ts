@@ -16,7 +16,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { ClaudeDriver, permissionSocketPath, type ClaudeConfig } from "./claude.ts";
+import { ClaudeDriver, permissionSocketPath, withVolatileNote, type ClaudeConfig } from "./claude.ts";
+import { VOLATILE_CONTEXT_CLEARED_NOTE, VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-claude-cli.ts");
@@ -177,6 +178,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
+    delete process.env.FAKE_CLAUDE_PROMPTS;
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.XAI_API_KEY;
     delete process.env.COMPOSIO_API_KEY;
@@ -216,11 +218,30 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(done).toMatchObject({
       type: "turn.completed",
       ok: true,
+      // the Messages API's own stop_reason ("end_turn" here) stays the
+      // label for a normal completion — only a FAILED turn prefers
+      // terminal_reason (see "reports the CLI's terminal_reason..." below)
+      stopReason: "end_turn",
       cost: 0.01,
       billingMode: "estimated",
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("reports the CLI's terminal_reason, not a stale stop_reason, on a failed turn", async () => {
+    // Regression for BOTFLEET-K / board 28a249c3: production events showed
+    // is_error: true, terminal_reason: "api_error" (a real 429 rate limit),
+    // but stop_reason stuck at "stop_sequence" — a leftover value from the
+    // CLI's result-builder on a request that never got a real model
+    // response (duration_api_ms: 0). Reporting "stop_sequence" made a real,
+    // actionable failure look like a benign model-side stop; Seer's PR #605
+    // proposed allowlisting "stop_sequence" as benign, which would have
+    // silently swallowed every one of these rate-limit failures instead.
+    await create("api-error");
+    await instance.adapter.sendTurn({ threadId: "t-api-error", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "api_error" });
   });
 
   it("streams partial-message text deltas without re-emitting the whole message", async () => {
@@ -645,6 +666,50 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
   });
 
+  it("keeps the warm process across a roster whose live state moved, replaces it when membership did", async () => {
+    // DR1.  `turn.system` is passed as --append-system-prompt and hashed into
+    // `argsKey`, the spawn contract that decides whether the live process may
+    // take the next turn.  The Chief of Staff roster used to interpolate each
+    // teammate's `busy` flag into that string, so an unrelated peer starting a
+    // turn tore the Chief's CLI down and respawned it with --resume.  The
+    // roster is membership-only now; this pins the driver half of the deal —
+    // an identical system prompt reuses, a changed one does not.
+    await create();
+    const dump = join(scratch, "roster-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const roster = ["Current Work section team:", "- Quill — Writer", "- Patch — Engineer"].join("\n");
+
+    await instance.adapter.sendTurn({ threadId: "t-roster", text: "one", system: roster });
+    await recorder.until((e) => e.type === "turn.completed");
+    const spawnedOnce = readFileSync(dump, "utf8");
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+
+    // Patch is busy now — the roster text is byte-identical, so nothing respawns.
+    const second = await instance.adapter.sendTurn({
+      threadId: "t-roster",
+      text: "two",
+      system: roster,
+      resumeCursor: announced,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    expect(readFileSync(dump, "utf8")).toBe(spawnedOnce);
+
+    // A teammate joins: that IS a new spawn contract, and the CLI is replaced.
+    rmSync(dump);
+    const joined = `${roster}\n- Ledger — Analyst`;
+    const third = await instance.adapter.sendTurn({
+      threadId: "t-roster",
+      text: "three",
+      system: joined,
+      resumeCursor: announced,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === third.turnId);
+    const respawn = JSON.parse(readFileSync(dump, "utf8"));
+    expect(respawn.argv).toContain("--append-system-prompt");
+    expect(respawn.argv).toContain(joined);
+    expect(respawn.argv).toContain("--resume");
+  });
+
   it("denies late broker asks between retained turns without opening a zombie card", async () => {
     await create();
     await instance.adapter.sendTurn({ threadId: "t-retained-late", text: "one" });
@@ -686,6 +751,168 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const dump = JSON.parse(readFileSync(dumpPath, "utf8"));
     expect(dump.argv).toContain("--resume");
     expect(dump.argv).toContain("claude-other");
+  });
+
+  /** Every user message the fake CLI read from stdin, in order, with the pid
+   * that read it — what a REUSED process was actually sent, which the launch
+   * dump cannot show. */
+  const promptsSent = (path: string): Array<{ pid: number; content: string }> =>
+    existsSync(path)
+      ? readFileSync(path, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            const entry = JSON.parse(line) as { pid: number; prompt: { message: { content: string } } };
+            return { pid: entry.pid, content: entry.prompt.message.content };
+          })
+      : [];
+  const lastPrompt = (path: string) => promptsSent(path).at(-1)?.content;
+
+  it("keeps the warm process across a memory write and delivers the change inside the turn, exactly when it changed", async () => {
+    // Upstream PR #1758.  Only the stable half of the system prompt is the
+    // spawn contract; the volatile half (memory, mentions) is not.  A memory
+    // edit used to change --append-system-prompt, which changed argsKey,
+    // which relaunched the CLI with --resume and made the provider re-upload
+    // the whole conversation at the cache-write rate.  Now the changed half
+    // rides inside the user turn, and only when the native session has not
+    // carried that exact copy.
+    await create();
+    const dump = join(scratch, "split-dump.json");
+    const prompts = join(scratch, "split-prompts.jsonl");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.FAKE_CLAUDE_PROMPTS = prompts;
+    const stable = "You are Testy. These rules never change mid-session.";
+    const memory = " Your memory (MEMORY.md):\n- likes tea";
+    const split = (volatile: string) => ({ system: stable + volatile, systemStable: stable, systemVolatile: volatile });
+
+    // a fresh session has carried nothing, so the volatile half rides the first turn
+    await instance.adapter.sendTurn({ threadId: "t-split", text: "one", ...split(memory) });
+    await recorder.until((e) => e.type === "turn.completed");
+    const spawnedOnce = readFileSync(dump, "utf8");
+    const launch = JSON.parse(spawnedOnce);
+    expect(launch.argv).toContain("--append-system-prompt");
+    expect(launch.argv).toContain(stable);
+    expect(JSON.stringify(launch.argv)).not.toContain("likes tea");
+    expect(promptsSent(prompts).map((p) => p.content)).toEqual([withVolatileNote("one", memory, false)]);
+    expect(lastPrompt(prompts)).toContain(VOLATILE_CONTEXT_NOTE_PREFIX);
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+
+    // unchanged halves: the process is reused and the turn goes bare
+    const second = await instance.adapter.sendTurn({ threadId: "t-split", text: "two", resumeCursor: announced, ...split(memory) });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    expect(lastPrompt(prompts)).toBe("two");
+
+    // a memory write: the same process, and the new copy rides the turn
+    const moved = `${memory}\n- moved to Toronto`;
+    const third = await instance.adapter.sendTurn({ threadId: "t-split", text: "three", resumeCursor: announced, ...split(moved) });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === third.turnId);
+    expect(lastPrompt(prompts)).toBe(withVolatileNote("three", moved, true));
+
+    // a mention turn re-delivers an unchanged half: the note describes this very message
+    const fourth = await instance.adapter.sendTurn({ threadId: "t-split", text: "four", resumeCursor: announced, mentionTurn: true, ...split(moved) });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === fourth.turnId);
+    expect(lastPrompt(prompts)).toBe(withVolatileNote("four", moved, true));
+
+    // clearing the half is announced once, then later turns go bare again
+    const fifth = await instance.adapter.sendTurn({ threadId: "t-split", text: "five", resumeCursor: announced, ...split("") });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === fifth.turnId);
+    expect(lastPrompt(prompts)).toBe(`<system-reminder>\n${VOLATILE_CONTEXT_CLEARED_NOTE}\n</system-reminder>\n\nfive`);
+    const sixth = await instance.adapter.sendTurn({ threadId: "t-split", text: "six", resumeCursor: announced, ...split("") });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === sixth.turnId);
+    expect(lastPrompt(prompts)).toBe("six");
+
+    // one process the whole way through: no relaunch, no --resume
+    expect(readFileSync(dump, "utf8")).toBe(spawnedOnce);
+    expect(new Set(promptsSent(prompts).map((p) => p.pid)).size).toBe(1);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(6);
+  });
+
+  it("replaces and resumes the process when the stable half changes, without re-delivering the volatile half it already carries", async () => {
+    await create();
+    const dump = join(scratch, "stable-dump.json");
+    const prompts = join(scratch, "stable-prompts.jsonl");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.FAKE_CLAUDE_PROMPTS = prompts;
+    const roster = ["Current Work section team:", "- Quill — Writer"].join("\n");
+    const memory = " Memory: likes tea";
+    await instance.adapter.sendTurn({ threadId: "t-stable", text: "one", system: roster + memory, systemStable: roster, systemVolatile: memory });
+    await recorder.until((e) => e.type === "turn.completed");
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+    const firstPid = promptsSent(prompts)[0]!.pid;
+    rmSync(dump);
+
+    // a teammate joins: that IS a new spawn contract, and the CLI is replaced
+    const joined = `${roster}\n- Ledger — Analyst`;
+    const second = await instance.adapter.sendTurn({ threadId: "t-stable", text: "two", system: joined + memory, systemStable: joined, systemVolatile: memory, resumeCursor: announced });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    const respawn = JSON.parse(readFileSync(dump, "utf8"));
+    expect(respawn.argv).toContain("--append-system-prompt");
+    expect(respawn.argv).toContain(joined);
+    expect(respawn.argv).toContain("--resume");
+    expect(respawn.pid).not.toBe(firstPid);
+    // the resumed native session already carries the memory: bare
+    expect(lastPrompt(prompts)).toBe("two");
+  });
+
+  it("remembers what a native session carried across a harness restart", async () => {
+    await create();
+    const prompts = join(scratch, "restart-prompts.jsonl");
+    process.env.FAKE_CLAUDE_PROMPTS = prompts;
+    const stable = "You are Testy.";
+    const memory = " Memory: likes tea";
+    await instance.adapter.sendTurn({ threadId: "t-restart", text: "one", system: stable + memory, systemStable: stable, systemVolatile: memory });
+    await recorder.until((e) => e.type === "turn.completed");
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+    expect(lastPrompt(prompts)).toBe(withVolatileNote("one", memory, false));
+
+    // the harness restarts: a new driver, no live process, the same session
+    // resumed from its cursor — the receipt on disk is all that says the
+    // session already has its memory
+    recorder.stop();
+    await instance.dispose();
+    await create();
+    const dump = join(scratch, "restart-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const second = await instance.adapter.sendTurn({ threadId: "t-restart", text: "two", resumeCursor: announced, system: stable + memory, systemStable: stable, systemVolatile: memory });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    expect(JSON.parse(readFileSync(dump, "utf8")).argv).toContain("--resume");
+    expect(lastPrompt(prompts)).toBe("two");
+
+    // and a change after the restart is still noticed
+    const moved = `${memory}\n- moved to Toronto`;
+    const third = await instance.adapter.sendTurn({ threadId: "t-restart", text: "three", resumeCursor: announced, system: stable + moved, systemStable: stable, systemVolatile: moved });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === third.turnId);
+    expect(lastPrompt(prompts)).toBe(withVolatileNote("three", moved, true));
+  });
+
+  it("re-delivers the volatile half after a transient relaunch, since the dead CLI may not have persisted it", async () => {
+    process.env.FAKE_CLAUDE_TRANSIENTS = "1";
+    process.env.FAKE_CLAUDE_STATE = join(scratch, "launches-split");
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.001";
+    const prompts = join(scratch, "retry-prompts.jsonl");
+    process.env.FAKE_CLAUDE_PROMPTS = prompts;
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-split-retry", text: "one", system: "Rules. Memory.", systemStable: "Rules.", systemVolatile: " Memory." });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    // both launches carried the note: the first accepted it and died, so the
+    // receipt was forgotten and the relaunch sent it again
+    expect(promptsSent(prompts).map((p) => p.content)).toEqual([
+      withVolatileNote("one", " Memory.", false),
+      withVolatileNote("one", " Memory.", false),
+    ]);
+  }, 40_000);
+
+  it("sends a legacy unsplit turn exactly as before: the whole prompt in argv, the text bare", async () => {
+    await create();
+    const dump = join(scratch, "legacy-dump.json");
+    const prompts = join(scratch, "legacy-prompts.jsonl");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.FAKE_CLAUDE_PROMPTS = prompts;
+    await instance.adapter.sendTurn({ threadId: "t-legacy", text: "one", system: "Rules. Memory." });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).argv).toContain("Rules. Memory.");
+    expect(promptsSent(prompts).map((p) => p.content)).toEqual(["one"]);
   });
 
   it("closes an idle session after the configured window", async () => {

@@ -1,3 +1,22 @@
+// INTENTIONALLY NON-DEPLOYABLE SCAFFOLDING.
+//
+// This Worker keeps the shared Composio project API key off the desktop:
+// each install gets a hashed bearer in D1 and short-lived Connect Links.
+// Source is checked in so forks can lift the runtime wholesale, but the
+// real D1 database and rate-limit namespaces live in the OpenMausBot-era
+// Cloudflare account (`milindsoni201`) — they are not in Jay's fleet
+// accounts (Congress.Trade, SocraticTrade.com, Usage.Jays.Services, OLD).
+//
+// To deploy on your own Cloudflare account:
+//   1. `pnpm exec wrangler d1 create botfleet-composio`  → copy the new database_id below
+//   2. `pnpm exec wrangler ratelimit namespace create REGISTRATION_LIMITER`  → copy namespace_id
+//   3. `pnpm exec wrangler ratelimit namespace create SESSION_LIMITER`        → copy namespace_id
+//   4. `pnpm exec wrangler secret put COMPOSIO_API_KEY`
+//   5. `pnpm broker:deploy`
+//
+// Do NOT deploy this file as-is.  Wrangler would either fail (D1 / namespace
+// not found in your account) or accidentally land in upstream's account if
+// the CI token is mis-scoped.
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "botfleet-composio",
@@ -15,13 +34,13 @@
     {
       "binding": "DB",
       "database_name": "botfleet-composio",
-      "database_id": "435bcde1-c017-416f-b041-7ffc508e9d88",
+      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
   ],
   "ratelimits": [
-    { "name": "REGISTRATION_LIMITER", "namespace_id": "8261701", "simple": { "limit": 30, "period": 60 } },
-    { "name": "SESSION_LIMITER", "namespace_id": "8261702", "simple": { "limit": 120, "period": 60 } }
+    { "name": "REGISTRATION_LIMITER", "namespace_id": "0000000", "simple": { "limit": 30, "period": 60 } },
+    { "name": "SESSION_LIMITER", "namespace_id": "0000000", "simple": { "limit": 120, "period": 60 } }
   ],
   "observability": {
     "enabled": true,

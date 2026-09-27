@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { nextOccurrence, RoutineManager, type RoutineManagerOptions } from "./routines.ts";
@@ -96,13 +96,15 @@ afterEach(() => {
 it("persists queued receipts while pruning more than 2,000 terminal records", () => {
   const h = harness();
   h.setAdmitting(false);
-  const input = { runOn: "maus" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: 1 };
+  const input = { runOn: "bot" as const, webhookId: "retention-hook", webhookName: "Retention", prompt: "Fixture", botId: "bot", receivedAt: 1 };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
+  h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
   disk.runs = [queued, ...Array.from({ length: 2001 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   const second = reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
+  reloaded.flushNow();
   const persisted = JSON.parse(readFileSync(h.options.file!, "utf8"));
   expect(persisted.runs).toHaveLength(2002);
   expect(persisted.runs.filter((run: { status: string }) => run.status === "queued").map((run: { id: string }) => run.id)).toEqual([queued.id, second.id]);
@@ -114,13 +116,15 @@ it("bounds the prompt snapshot of settled runs older than the newest 100 when it
   h.setAdmitting(false);
   const payload = "p".repeat(20_000);
   const prompt = ["Event: deploy.finished", "[UNTRUSTED WEBHOOK EVENT DATA]", payload, "[/UNTRUSTED WEBHOOK EVENT DATA]"].join("\n");
-  const input = { runOn: "maus" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: 1 };
+  const input = { runOn: "bot" as const, webhookId: "bound-hook", webhookName: "Bound", prompt, botId: "bot", receivedAt: 1 };
   const queued = h.manager.enqueueWebhook({ ...input, deliveryId: "queued" });
+  h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
   disk.runs = [queued, ...Array.from({ length: 105 }, (_, i) => ({ ...queued, id: `history-${i}`, deliveryId: `history-${i}`, status: "completed", createdAt: i + 2, finishedAt: i + 3 }))];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.enqueueWebhook({ ...input, deliveryId: "new-queued" });
+  reloaded.flushNow();
   const persisted = JSON.parse(readFileSync(h.options.file!, "utf8"));
   const byId = new Map(persisted.runs.map((run: { id: string; prompt?: string }) => [run.id, run.prompt]));
   expect(byId.get(queued.id)).toBe(prompt);
@@ -140,19 +144,60 @@ it("retains the exact result of an unsettled run-now confirmation until its card
   const routine = h.manager.create({ name: "Fixture", prompt: "Check", botId: "bot", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
   const request = { requestId: "retained-request", messageId: "message", botId: "bot", threadId: "thread", action: "run_now" as const, fingerprintVersion: 1 as const, fingerprint: "a".repeat(64) };
   const committed = h.manager.runNow(routine.id, request)!;
+  h.manager.flushNow();
   const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
   const terminal = { ...committed, status: "completed", finishedAt: 1 };
   disk.runs = [terminal, ...Array.from({ length: 2001 }, (_, i) => ({ ...terminal, id: `later-${i}`, createdAt: i + 2, finishedAt: i + 3 }))];
   writeFileSync(h.options.file!, JSON.stringify(disk));
   const reloaded = new RoutineManager(h.options);
   reloaded.update(routine.id, { name: "Prune history" });
+  reloaded.flushNow();
   const afterPruning = new RoutineManager(h.options);
   expect(afterPruning.runNow(routine.id, request)).toMatchObject({ id: committed.id, status: "completed" });
   expect(afterPruning.listRuns()).toHaveLength(2001);
   afterPruning.forgetRoutineRequestReceipt(request);
+  afterPruning.flushNow();
   const settled = new RoutineManager(h.options);
   expect(settled.listRuns()).toHaveLength(2000);
   expect(settled.listRuns().some((run) => run.id === committed.id)).toBe(false);
+});
+
+it("coalesces a burst of saves into one write, and stop() flushes a pending save", () => {
+  const h = harness();
+  // snoozeBot/clearBotSnooze go through the plain debounced save() path, not
+  // commitMutation (create/update/etc. carry confirmation receipts and stay
+  // synchronous — see the "rolls back an uncommitted confirmation" test).
+  h.manager.snoozeBot("bot-a");
+  // The debounced save has not landed yet — proves this burst does not each
+  // write synchronously the way the pre-fix save() did.
+  expect(existsSync(h.options.file!)).toBe(false);
+  h.manager.snoozeBot("bot-b");
+  h.manager.snoozeBot("bot-c");
+  expect(existsSync(h.options.file!)).toBe(false);
+
+  h.manager.stop();
+
+  expect(existsSync(h.options.file!)).toBe(true);
+  const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
+  expect(disk.botSnoozes).toMatchObject({ "bot-a": null, "bot-b": null, "bot-c": null });
+});
+
+it("saves through the atomic writer: unindented JSON and no stray temp file left behind", () => {
+  const h = harness();
+  h.manager.create({ name: "Fixture", prompt: "Check", botId: "maus-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+  h.manager.flushNow();
+
+  const raw = readFileSync(h.options.file!, "utf8");
+  expect(raw).not.toContain("\n  ");
+  expect(JSON.parse(raw).routines).toHaveLength(1);
+
+  // atomic.test.ts covers writeFileAtomic's own fsync/unique-temp-name
+  // guarantees directly; this just confirms routines.ts actually goes
+  // through it rather than a raw writeFileSync/renameSync pair — the
+  // observable difference is that no `.tmp` file is ever left behind, even
+  // transiently, once a save lands.
+  const leftovers = readdirSync(dirname(h.options.file!)).filter((name) => name.includes(".tmp"));
+  expect(leftovers).toEqual([]);
 });
 
 describe("nextOccurrence", () => {
@@ -202,6 +247,7 @@ describe("RoutineManager", () => {
     expect(h.manager.listRoutines()[0].scheduleTimeZoneSource).toBe("host");
     expect(h.emitted.at(-1)?.routine.schedule.timeZone).toBe("Europe/Athens");
     expect(h.emitted.at(-1)?.routine.scheduleTimeZoneSource).toBe("host");
+    h.manager.flushNow();
     const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
     expect(disk.routines[0].schedule.timeZone).toBeUndefined();
 
@@ -224,6 +270,7 @@ describe("RoutineManager", () => {
       schedule: { type: "daily", time: "09:00", weekdays: [1], timeZone: "America/Chicago" },
     });
     expect(created.nextRunAt).toBe(Date.parse("2026-09-14T14:00:00.000Z"));
+    h.manager.flushNow();
     const reloaded = new RoutineManager(h.options).listRoutines()[0];
     expect(reloaded.schedule).toMatchObject({ timeZone: "America/Chicago" });
     const recased = h.manager.create({
@@ -252,7 +299,7 @@ describe("RoutineManager", () => {
     const h = harness();
     h.setBot("busy");
     for (let i = 0; i < 3; i++) h.manager.enqueueWebhook({ webhookId: "combined-fixture", webhookName: "Combined fixture",
-      prompt: `Synthetic delivery ${i}`, botId: "maus-1", runOn: "maus", deliveryId: `delivery-${i}`, receivedAt: 1000 + i });
+      prompt: `Synthetic delivery ${i}`, botId: "maus-1", runOn: "bot", deliveryId: `delivery-${i}`, receivedAt: 1000 + i });
     await h.manager.tick();
     h.setBot("ready");
     await h.manager.tick();
@@ -271,6 +318,7 @@ describe("RoutineManager", () => {
     expect(finished.every((run) => run.engineId === "claude-fixture" && run.model === "fixture-model")).toBe(true);
     expect(finished.reduce((sum, run) => sum + (run.cost ?? 0), 0)).toBe(0.02);
     expect(h.failed).toHaveLength(ok ? 0 : 1);
+    h.manager.flushNow();
     expect(new RoutineManager(h.options).listRuns()).toEqual(finished);
   });
 
@@ -278,7 +326,7 @@ describe("RoutineManager", () => {
     const h = harness();
     h.setBot("busy");
     for (let i = 0; i < 2; i++) h.manager.enqueueWebhook({ webhookId: "combined-cancel", webhookName: "Cancel fixture",
-      prompt: "Synthetic delivery", botId: "maus-1", runOn: "maus", deliveryId: `cancel-${i}`, receivedAt: i });
+      prompt: "Synthetic delivery", botId: "maus-1", runOn: "bot", deliveryId: `cancel-${i}`, receivedAt: i });
     await h.manager.tick();
     h.setBot("ready");
     await h.manager.tick();
@@ -366,8 +414,10 @@ describe("RoutineManager", () => {
     let failureWasPersistedBeforeCallback = false;
     h.options.onRunFailed = (run) => {
       h.failed.push(run);
-      failureWasPersistedBeforeCallback = readFileSync(routineFile, "utf8").includes('"status": "failed"');
+      // routines.json is no longer pretty-printed (HS4) — no space after the colon.
+      failureWasPersistedBeforeCallback = readFileSync(routineFile, "utf8").includes('"status":"failed"');
     };
+    h.manager.flushNow();
     const reloaded = new RoutineManager(h.options);
     expect(reloaded.listRoutines()).toHaveLength(1);
     expect(reloaded.listRuns()).toMatchObject([
@@ -405,6 +455,7 @@ describe("RoutineManager", () => {
       fingerprint: "a".repeat(64),
     };
     h.manager.update(routine.id, { name: "After" }, request);
+    h.manager.flushNow();
 
     const reloaded = new RoutineManager(h.options);
     expect(reloaded.routineRequestReceipt(request.requestId)).toMatchObject({
@@ -425,6 +476,7 @@ describe("RoutineManager", () => {
 
     expect(reloaded.reconcileRoutineRequestReceipts([request])).toBe(0);
     expect(reloaded.forgetRoutineRequestReceipt(request)).toBe(true);
+    reloaded.flushNow();
     expect(new RoutineManager(h.options).routineRequestReceipt(request.requestId)).toBeNull();
   });
 
@@ -449,6 +501,7 @@ describe("RoutineManager", () => {
 
     expect(h.manager.forgetRoutineRequestReceiptsForThread("another-thread")).toBe(0);
     expect(h.manager.forgetRoutineRequestReceiptsForThread("thread-deleted")).toBe(1);
+    h.manager.flushNow();
     expect(new RoutineManager(h.options).routineRequestReceipt(request.requestId)).toBeNull();
   });
 
@@ -598,14 +651,14 @@ describe("RoutineManager", () => {
     });
     h.setNow(routine.nextRunAt!);
     await h.manager.tick();
-    h.manager.update(routine.id, { runOn: "maus" });
+    h.manager.update(routine.id, { runOn: "bot" });
 
     h.setBot("ready");
     await h.manager.tick();
 
     expect(h.runOns).toEqual(["cloud"]);
     expect(h.manager.listRuns()[0]).toMatchObject({ runOn: "cloud" });
-    expect(h.manager.listRoutines()[0]).toMatchObject({ runOn: "maus" });
+    expect(h.manager.listRoutines()[0]).toMatchObject({ runOn: "bot" });
   });
 
   it("opens webhook jobs in the assigned bot's live chat", async () => {
@@ -646,7 +699,7 @@ describe("RoutineManager", () => {
         webhookName: "UptimeRobot alerts",
         prompt: `Handle ${deliveryId}`,
         botId: "maus-webhook",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId,
         receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
       });
@@ -674,7 +727,7 @@ describe("RoutineManager", () => {
       webhookName: "UptimeRobot alerts",
       prompt: "Handle ticket 42",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d1",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -691,7 +744,7 @@ describe("RoutineManager", () => {
       webhookName: "Sentry incidents",
       prompt: "Handle page",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d2",
       receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
     });
@@ -708,7 +761,7 @@ describe("RoutineManager", () => {
       webhookName: "UptimeRobot alerts",
       prompt: "Handle ticket 42",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d1",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -726,7 +779,7 @@ describe("RoutineManager", () => {
       webhookName: "New ticket",
       prompt: "Handle ticket 42",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d-simple",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -802,7 +855,7 @@ describe("RoutineManager", () => {
       webhookName: "Sentry incidents",
       prompt: "Handle page",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d-hidden",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -821,7 +874,7 @@ describe("RoutineManager", () => {
       webhookName: "Sentry",
       prompt: "Handle issue",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d-live-1",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -839,7 +892,7 @@ describe("RoutineManager", () => {
       webhookName: "Sentry",
       prompt: "Handle issue",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d-primary",
       receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
     });
@@ -859,7 +912,7 @@ describe("RoutineManager", () => {
       webhookName: "PagerDuty",
       prompt: "Handle page",
       botId: "maus-webhook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "d-primary-2",
       receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
     });
@@ -1060,7 +1113,7 @@ describe("RoutineManager", () => {
       webhookName: "Deploy",
       prompt: "Deploy the build",
       botId: "maus-hook",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "delivery-1",
       receivedAt: start,
     });
@@ -1214,7 +1267,7 @@ describe("RoutineManager", () => {
         webhookName: "Hook 1",
         prompt: "Run 1",
         botId: "compiler-bot",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId: "del-1",
         receivedAt: Date.now(),
       });
@@ -1223,7 +1276,7 @@ describe("RoutineManager", () => {
         webhookName: "Hook 2",
         prompt: "Run 2",
         botId: "compiler-bot",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId: "del-2",
         receivedAt: Date.now(),
       });
@@ -1232,7 +1285,7 @@ describe("RoutineManager", () => {
         webhookName: "Hook 3",
         prompt: "Run Other",
         botId: "other-bot",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId: "del-3",
         receivedAt: Date.now(),
       });
@@ -1256,7 +1309,7 @@ describe("RoutineManager", () => {
         webhookName: "Hook 1",
         prompt: "Run while snoozed",
         botId: "compiler-bot",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId: "del-1",
         receivedAt: Date.now(),
       });
@@ -1268,7 +1321,7 @@ describe("RoutineManager", () => {
         triggerName: "Res 1",
         prompt: "Resource alert",
         botId: "compiler-bot",
-        runOn: "maus",
+        runOn: "bot",
         deliveryId: "del-2",
         receivedAt: Date.now(),
       });
@@ -1302,6 +1355,7 @@ describe("RoutineManager", () => {
       const h = harness();
       h.manager.snoozeBot("compiler-bot");
       h.manager.snoozeBot("finite-bot", 60_000);
+      h.manager.flushNow();
       const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
       expect(disk.botSnoozes).toMatchObject({ "compiler-bot": null, "finite-bot": expect.any(Number) });
 
@@ -1320,6 +1374,7 @@ describe("RoutineManager", () => {
       const h = harness();
       h.manager.snoozeBot("compiler-bot");
       h.manager.clearBotSnooze("compiler-bot");
+      h.manager.flushNow();
       const restarted = new RoutineManager(h.options);
       expect(restarted.isBotSnoozed("compiler-bot")).toBe(false);
       const disk = JSON.parse(readFileSync(h.options.file!, "utf8"));
@@ -1421,6 +1476,7 @@ describe("Sentry Crons check-ins", () => {
     h.setNow(routine.nextRunAt!);
     await h.manager.tick();
     expect(h.manager.listRuns()[0]!.sentryCheckInId).toBe("check-in-1");
+    h.manager.flushNow();
 
     const reloaded = new RoutineManager(h.options);
 
@@ -1436,7 +1492,7 @@ describe("Sentry Crons check-ins", () => {
       webhookName: "Fixture hook",
       prompt: "handle delivery",
       botId: "maus-1",
-      runOn: "maus",
+      runOn: "bot",
       deliveryId: "delivery-1",
       receivedAt: 1,
     });

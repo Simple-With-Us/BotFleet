@@ -9,25 +9,29 @@ import {
   updateSource,
   useUpdateControl,
 } from "@/lib/update-control";
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowDownToLine,
   BellDot,
+  BellOff,
   Bot as BotIcon,
   Bug,
   CalendarDays,
   Check,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
   ClipboardCopy,
+  Clock3,
   Copy,
   Crown,
   FolderMinus,
   FolderPlus,
   Library,
   Loader2,
+  Moon,
   Network,
   Pencil,
   PanelLeftClose,
@@ -57,12 +61,24 @@ import {
 import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
+import { botStatusText, botWaitReason } from "@/lib/sidebar-activity";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
 import { classifyTool, toolVerb } from "../../shared/tool-activity";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 import { nextRename } from "@/lib/rename";
+import {
+  isThreadSnoozed,
+  orderedThreadRows,
+  resolveCustomSnooze,
+  resolveSnoozePreset,
+  SNOOZE_PRESET_LABELS,
+  SNOOZE_PRESETS,
+  snoozeLabel,
+  useSnoozeExpiry,
+} from "@/lib/thread-snooze";
+import { ThreadSnoozeBadge, ThreadWakeButton } from "./SidebarThreadRow";
 import { imageAttachmentFromFile, intakeFiles } from "@/lib/composer-attachments";
 import { pathForFile } from "./ComposerAttachments";
 import { appendDraftAttachments } from "@/lib/drafts";
@@ -269,12 +285,12 @@ function UpdateButton() {
   );
 }
 
-function preview(bot: Bot): string {
-  if (bot.activity === "waiting-on-you") return "Waiting for you…";
-  if (bot.busy) return "Working…";
-  // the visible branch's tail — bot.messages holds every fork, so its last
-  // entry can belong to a version the user switched away from
-  const last = visibleMessages(bot).at(-1);
+function preview(bot: Bot, last: Message | undefined, bots: Bot[]): string {
+  // waiting-on-you/busy get a status line more specific than a bare
+  // spinner when it's known what the bot is waiting on — see
+  // @/lib/sidebar-activity (ported from upstream's SidebarBotActivity).
+  const status = botStatusText(bot, botWaitReason(bot, last, bots));
+  if (status) return status;
   if (!last) return "";
   if (last.kind === "options" && last.card) return plainPreview(last.card.title);
   if (last.kind === "activity" && last.tool) return activityPreview(last.tool);
@@ -313,8 +329,8 @@ function groupPreview(group: Group, bots: Bot[]): string {
   return last.from ? `${last.from.name}: ${text}` : text;
 }
 
-/** Room avatar: 2–3 overlapping mauses in the same 56px slot a bot gets. */
-function StackedMauses({ group, members, density }: { group: Group; members: Bot[]; density: SidebarDensity }) {
+/** Room avatar: 2–3 overlapping bots in the same 56px slot a single bot gets. */
+function StackedBots({ group, members, density }: { group: Group; members: Bot[]; density: SidebarDensity }) {
   const iconOnly = density === "icons";
   const slotSize = iconOnly ? "size-12" : density === "compact" ? "size-10" : "size-14";
   const singleSize = iconOnly ? 44 : density === "compact" ? 40 : 56;
@@ -376,6 +392,17 @@ interface ThreadOwner {
 
 const THREAD_DROP_CLASS = "bg-ink/15 ring-2 ring-ink/25";
 
+/** What a thread row needs to draw itself.  Bot threads and channel threads
+ * share this shape; only a bot thread can carry a snooze, because a channel
+ * conversation has no per-thread snooze route. */
+type SidebarThread = {
+  threadId: string;
+  title: string;
+  createdAt: number;
+  lastActivity?: number;
+  snoozedUntil?: number;
+};
+
 /** One conversation inside a channel.
  *
  * The server already names these from the first thing said in them and lets
@@ -390,7 +417,7 @@ function ThreadListItem({
   renameSignal,
 }: {
   owner: ThreadOwner;
-  task: { threadId: string; title: string; createdAt: number; lastActivity?: number };
+  task: SidebarThread;
   density: SidebarDensity;
   siblingCount: number;
   onMenu: (menu: { ownerId: string; threadId: string; x: number; y: number }) => void;
@@ -405,6 +432,10 @@ function ThreadListItem({
     state.activeView === "chat" &&
     state.selectedId === owner.id &&
     owner.threadId === task.threadId;
+  // Re-read on every render rather than memoised: the branch above re-renders
+  // when the nearest deadline passes, and a stale `asleep` would leave the
+  // moon on a row that has already woken.
+  const asleep = isThreadSnoozed(task.snoozedUntil);
 
   const commit = () => {
     const title = draft.trim();
@@ -448,98 +479,112 @@ function ThreadListItem({
     );
   }
 
+  // The wake button is a SIBLING of the row, never inside it: the row is a
+  // button, and a button inside a button is neither valid nor reachable —
+  // the same reason ThreadDisclosure sits outside its row.
   return (
-    <button
-      draggable={siblingCount > 1}
-      onDragStart={(event) => {
-        const payload = beginThreadDrag({
-          threadId: task.threadId,
-          fromId: owner.id,
-          fromKind: owner.kind,
-        });
-        event.dataTransfer.setData(THREAD_DRAG_TYPE, payload);
-        event.dataTransfer.setData("text/plain", payload);
-        event.dataTransfer.effectAllowed = "move";
-      }}
-      onDragEnd={() => endThreadDrag()}
-      onClick={() => {
-        dispatch({ type: "select", id: owner.id });
-        if (owner.threadId === task.threadId) return;
-        dispatch(
-          owner.kind === "group"
-            ? { type: "switchGroupTask", groupId: owner.id, threadId: task.threadId }
-            : { type: "switchTask", botId: owner.id, threadId: task.threadId },
-        );
-      }}
-      onDoubleClick={(event) => {
-        event.preventDefault();
-        setDraft(task.title);
-        setRenaming(true);
-      }}
-      onContextMenu={(event) => {
-        event.preventDefault();
-        onMenu({ ownerId: owner.id, threadId: task.threadId, x: event.clientX, y: event.clientY });
-      }}
-      onKeyDown={(event) => {
-        if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
-        event.preventDefault();
-        const rect = event.currentTarget.getBoundingClientRect();
-        onMenu({
-          ownerId: owner.id,
-          threadId: task.threadId,
-          x: rect.left + rect.width / 2,
-          y: rect.top + rect.height / 2,
-        });
-      }}
-      onDragEnter={(event) => {
-        if (!threadDragTypes(event)) return;
-        event.preventDefault();
-        setIsDragTarget(true);
-      }}
-      onDragLeave={() => setIsDragTarget(false)}
-      onDragOver={(event) => {
-        if (!threadDragTypes(event)) return;
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-      }}
-      onDrop={(event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        setIsDragTarget(false);
-        const dragged = readThreadDragEvent(event);
-        if (!dragged || dragged.threadId === task.threadId) return;
-        if (dragged.fromKind === "bot" && owner.kind === "bot" && dragged.fromId === owner.id) {
-          dispatch({
-            type: "mergeTasks",
-            botId: owner.id,
-            threadId: dragged.threadId,
-            intoThreadId: task.threadId,
+    <div className="flex items-center">
+      <button
+        draggable={siblingCount > 1}
+        onDragStart={(event) => {
+          const payload = beginThreadDrag({
+            threadId: task.threadId,
+            fromId: owner.id,
+            fromKind: owner.kind,
           });
-          return;
-        }
-        if (dragged.fromKind === "bot" && owner.kind === "bot") {
-          dispatch({
-            type: "moveTaskToBot",
-            botId: dragged.fromId,
-            threadId: dragged.threadId,
-            toBotId: owner.id,
+          event.dataTransfer.setData(THREAD_DRAG_TYPE, payload);
+          event.dataTransfer.setData("text/plain", payload);
+          event.dataTransfer.effectAllowed = "move";
+        }}
+        onDragEnd={() => endThreadDrag()}
+        onClick={() => {
+          dispatch({ type: "select", id: owner.id });
+          if (owner.threadId === task.threadId) return;
+          dispatch(
+            owner.kind === "group"
+              ? { type: "switchGroupTask", groupId: owner.id, threadId: task.threadId }
+              : { type: "switchTask", botId: owner.id, threadId: task.threadId },
+          );
+        }}
+        onDoubleClick={(event) => {
+          event.preventDefault();
+          setDraft(task.title);
+          setRenaming(true);
+        }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          onMenu({ ownerId: owner.id, threadId: task.threadId, x: event.clientX, y: event.clientY });
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+          event.preventDefault();
+          const rect = event.currentTarget.getBoundingClientRect();
+          onMenu({
+            ownerId: owner.id,
+            threadId: task.threadId,
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
           });
-        }
-      }}
-      title={`${label}\u00a0 — double-click to rename, drag onto a bot to move, onto a thread to merge`}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-lg py-1 pr-2 text-left transition-colors",
-        density === "compact" ? "pl-8" : "pl-9",
-        isDragTarget
-          ? THREAD_DROP_CLASS
-          : active
-            ? "bg-raised text-ink"
-            : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+        }}
+        onDragEnter={(event) => {
+          if (!threadDragTypes(event)) return;
+          event.preventDefault();
+          setIsDragTarget(true);
+        }}
+        onDragLeave={() => setIsDragTarget(false)}
+        onDragOver={(event) => {
+          if (!threadDragTypes(event)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          setIsDragTarget(false);
+          const dragged = readThreadDragEvent(event);
+          if (!dragged || dragged.threadId === task.threadId) return;
+          if (dragged.fromKind === "bot" && owner.kind === "bot" && dragged.fromId === owner.id) {
+            dispatch({
+              type: "mergeTasks",
+              botId: owner.id,
+              threadId: dragged.threadId,
+              intoThreadId: task.threadId,
+            });
+            return;
+          }
+          if (dragged.fromKind === "bot" && owner.kind === "bot") {
+            dispatch({
+              type: "moveTaskToBot",
+              botId: dragged.fromId,
+              threadId: dragged.threadId,
+              toBotId: owner.id,
+            });
+          }
+        }}
+        title={`${label}\u00a0 — double-click to rename, drag onto a bot to move, onto a thread to merge`}
+        className={cn(
+          "flex w-full min-w-0 items-center gap-2 rounded-lg py-1 pr-2 text-left transition-colors",
+          density === "compact" ? "pl-8" : "pl-9",
+          isDragTarget
+            ? THREAD_DROP_CLASS
+            : active
+              ? "bg-raised text-ink"
+              : "text-ink-secondary hover:bg-raised/50 hover:text-ink",
+        )}
+      >
+        <span className="size-1.5 shrink-0 rounded-full bg-current opacity-40" />
+        <span className={cn("truncate text-[13px]", asleep && "opacity-60")}>{label}</span>
+        <ThreadSnoozeBadge threadId={task.threadId} snoozedUntil={task.snoozedUntil} />
+      </button>
+      {asleep && (
+        <ThreadWakeButton
+          label={label}
+          onWake={() =>
+            dispatch({ type: "snoozeTask", botId: owner.id, threadId: task.threadId, snoozedUntil: null })
+          }
+        />
       )}
-    >
-      <span className="size-1.5 shrink-0 rounded-full bg-current opacity-40" />
-      <span className="truncate text-[13px]">{label}</span>
-    </button>
+    </div>
   );
 }
 
@@ -569,6 +614,8 @@ function ThreadContextMenu({
 }) {
   const { state, dispatch } = useStore();
   const [open, setOpen] = useState<"channels" | "bots" | null>(null);
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customAt, setCustomAt] = useState("");
   const terminology = getRoomTerminology(state.config);
 
   useEffect(() => {
@@ -596,7 +643,21 @@ function ThreadContextMenu({
     (b) => !b.hidden && !(owner.kind === "bot" && b.id === owner.id),
   );
 
-  const top = Math.min(menu.y, window.innerHeight - 220);
+  // Only a bot thread can sleep: a channel conversation has no per-thread
+  // snooze route, and the bot-wide snooze in routines.ts is a wider thing
+  // that belongs to the bot's own menu.
+  const snoozeThread =
+    owner.kind === "bot"
+      ? state.bots.find((b) => b.id === owner.id)?.tasks?.find((t) => t.threadId === menu.threadId)
+      : undefined;
+  const asleep = isThreadSnoozed(snoozeThread?.snoozedUntil);
+  const snooze = (snoozedUntil: number | null) => {
+    dispatch({ type: "snoozeTask", botId: owner.id, threadId: menu.threadId, snoozedUntil });
+    onClose();
+  };
+
+  // The snooze block makes this menu roughly twice the 220px first guess.
+  const top = Math.min(menu.y, window.innerHeight - (snoozeThread ? 420 : 220));
   const left = Math.min(menu.x, window.innerWidth - 250);
   const itemClass =
     "flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[13px] text-ink hover:bg-raised/70";
@@ -633,6 +694,68 @@ function ThreadContextMenu({
       <button type="button" className={itemClass} onClick={() => { onRename(); onClose(); }}>
         Rename
       </button>
+      {snoozeThread && (
+        <>
+          <div className="mt-1 flex items-center gap-2 border-t border-hairline/40 px-3 pb-1 pt-2 text-[11px] text-ink-secondary">
+            <Moon size={12} aria-hidden="true" />
+            Snooze
+          </div>
+          {SNOOZE_PRESETS.map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              className={itemClass}
+              // Resolved on the CLICK, never when the menu opened: a menu
+              // left open overnight must not snooze until a morning that has
+              // already been and gone.
+              onClick={() => snooze(resolveSnoozePreset(preset))}
+            >
+              {SNOOZE_PRESET_LABELS[preset]}
+            </button>
+          ))}
+          {customOpen ? (
+            <div className="flex items-center gap-1.5 px-3 py-2">
+              <input
+                autoFocus
+                type="datetime-local"
+                aria-label="Snooze until"
+                value={customAt}
+                onChange={(event) => setCustomAt(event.target.value)}
+                className="min-w-0 flex-1 rounded-md border border-hairline/50 bg-inset px-2 py-1 text-[12px] text-ink focus:outline-none"
+              />
+              <button
+                type="button"
+                // A moment already past is not a snooze.  Refuse rather than
+                // store one that is over before it starts.
+                disabled={resolveCustomSnooze(customAt) === undefined}
+                onClick={() => {
+                  const at = resolveCustomSnooze(customAt);
+                  if (at !== undefined) snooze(at);
+                }}
+                className="shrink-0 rounded-md bg-raised px-2 py-1 text-[12px] text-ink hover:bg-raised/70 disabled:opacity-40"
+              >
+                Set
+              </button>
+            </div>
+          ) : (
+            <button type="button" className={itemClass} onClick={() => setCustomOpen(true)}>
+              Custom&hellip;
+            </button>
+          )}
+          {asleep && (
+            <button type="button" className={itemClass} onClick={() => snooze(null)}>
+              <span className="flex items-center gap-2">
+                <BellOff size={13} aria-hidden="true" />
+                Stop snoozing
+              </span>
+              <span className="text-[11px] text-ink-secondary">
+                {snoozeLabel(snoozeThread.snoozedUntil)}
+              </span>
+            </button>
+          )}
+          <div className="mb-1 border-b border-hairline/40" />
+        </>
+      )}
       {movable && (
         <>
           <div className="relative" onMouseEnter={() => setOpen("channels")} onMouseLeave={() => setOpen(null)}>
@@ -832,7 +955,7 @@ function GroupListItem({
       title={density === "icons" ? group.name : undefined}
       aria-label={density === "icons" ? group.name : undefined}
     >
-      <StackedMauses group={group} members={members} density={density} />
+      <StackedBots group={group} members={members} density={density} />
       <div className={cn("min-w-0 flex-1", density === "icons" && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
           <span className="truncate text-[15px] font-semibold text-ink" title={group.name}>{group.name}</span>
@@ -858,7 +981,7 @@ function ThreadBranch({
   collapsed,
 }: {
   owner: ThreadOwner;
-  tasks: Array<{ threadId: string; title: string; createdAt: number; lastActivity?: number }>;
+  tasks: SidebarThread[];
   density: SidebarDensity;
   threadCount: number;
   collapsed: boolean;
@@ -872,11 +995,17 @@ function ThreadBranch({
   } | null>(null);
   const [renameSignals, setRenameSignals] = useState<Record<string, number>>({});
 
-  // Most recently active first, where activity is the last thing that
-  // happened in the thread whoever caused it — a person, a webhook or a
-  // schedule all land as messages.
-  const ordered = [...tasks].sort(
-    (a, b) => (b.lastActivity ?? b.createdAt) - (a.lastActivity ?? a.createdAt),
+  // A snoozed thread SINKS rather than disappearing, and the moment its
+  // deadline passes it is back in plain update order — where update order is
+  // the last thing that happened in the thread whoever caused it, a person,
+  // a webhook or a schedule, all of which land as messages.  The thread the
+  // person is reading stays put: snoozing the conversation on screen must
+  // not yank it out from under them.
+  useSnoozeExpiry(tasks);
+  const ordered = orderedThreadRows(
+    tasks,
+    Date.now(),
+    new Set(owner.threadId ? [owner.threadId] : []),
   );
   const shown = showAll ? ordered : ordered.slice(0, threadCount);
   const hidden = ordered.length - shown.length;
@@ -967,7 +1096,7 @@ function ThreadTree({
   children,
 }: {
   owner: ThreadOwner;
-  tasks: Array<{ threadId: string; title: string; createdAt: number; lastActivity?: number }>;
+  tasks: SidebarThread[];
   density: SidebarDensity;
   threadCount: number;
   collapsed: boolean;
@@ -1628,6 +1757,12 @@ function BotListItem({
   const visible = visibleMessages(bot);
   const last = visible.at(-1);
   const activityAt = latestChatActivity(bot.tasks, last?.at, bot.createdAt ?? 0);
+  const waitReason = botWaitReason(bot, last, state.bots);
+  const previewText = preview(bot, last, state.bots);
+  // Icon shape ported from upstream's SidebarBotActivity: CircleAlert for
+  // anything needing a person or naming a teammate, a spinning Loader2 as
+  // the fallback for plain busy work, nothing for idle.
+  const StatusIcon = waitReason ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert) : bot.busy ? Loader2 : null;
   const rowClass = cn(
     "flex w-full items-center rounded-xl border text-left",
     iconOnly
@@ -1696,8 +1831,15 @@ function BotListItem({
                 <Crown size={11} /> Chief of Staff
               </span>
             )}
-            {bot.chiefOfStaff && preview(bot) && <span className="shrink-0 text-ink-secondary/60">·</span>}
-            <span className="truncate" title={preview(bot)}>{preview(bot)}</span>
+            {bot.chiefOfStaff && previewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
+            {StatusIcon && (
+              <StatusIcon
+                size={11}
+                aria-hidden="true"
+                className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
+              />
+            )}
+            <span className="truncate" title={previewText}>{previewText}</span>
           </span>
           {bot.unread && (
             <span className="size-2 shrink-0 rounded-full bg-accent" />
@@ -2227,43 +2369,71 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   // instantly from local state; transcript hits are the SearchResults
   // section below the list (debounced, lands on the message).
 
-  const matchingBots = state.bots
-    .filter((b) => !b.hidden)
-    .filter(
-      (b) =>
+  // UI5: this used to filter and sort state.bots/state.groups (with a
+  // lowercase preview() per bot) directly in the render body, so every store
+  // dispatch re-ran it even when neither bots, groups, nor the query had
+  // changed. Memoized on exactly those three — state.bots/state.groups keep
+  // their identity across unrelated dispatches (the same assumption
+  // MessagesList's memoization already relies on in ChatView), so this now
+  // only redoes the work when the roster, the rooms, or the search text
+  // actually moved. Returned as one object rather than several memos: the
+  // pieces are cheap to destructure and it keeps a single dependency list
+  // instead of six near-identical ones.
+  const {
+    unsectionedChief,
+    sectionChiefs,
+    sectionedBots,
+    visibleBots,
+    visibleGroups,
+    botChats,
+    sectionedGroups,
+    unsectionedGroups,
+  } = useMemo(() => {
+    const byRecentBot = compareBotsByRecentActivity;
+    const byRecentGroup = compareGroupsByRecentActivity;
+    const matchingBots = state.bots
+      .filter((b) => !b.hidden)
+      .filter(
+        (b) =>
+          !q ||
+          b.name.toLowerCase().includes(q) ||
+          (b.title ?? "").toLowerCase().includes(q) ||
+          preview(b, visibleMessages(b).at(-1), state.bots).toLowerCase().includes(q),
+      );
+    const unsectionedChief = matchingBots.find((bot) => bot.chiefOfStaff && !bot.section);
+    const sectionChiefs = matchingBots.filter((bot) => bot.chiefOfStaff && bot.section);
+    const sectionedBots = matchingBots
+      .filter((bot) => !bot.chiefOfStaff && bot.section)
+      .sort(byRecentBot);
+    const visibleBots = matchingBots
+      .filter((bot) => !bot.chiefOfStaff && !bot.section)
+      .sort(byRecentBot);
+    const visibleGroups = state.groups.filter(
+      (g) =>
         !q ||
-        b.name.toLowerCase().includes(q) ||
-        (b.title ?? "").toLowerCase().includes(q) ||
-        preview(b).toLowerCase().includes(q),
+        g.name.toLowerCase().includes(q) ||
+        (g.tasks ?? []).some((task) => task.title.toLowerCase().includes(q)),
     );
-  const unsectionedChief = matchingBots.find((bot) => bot.chiefOfStaff && !bot.section);
-  const sectionChiefs = matchingBots.filter((bot) => bot.chiefOfStaff && bot.section);
-  const byRecentBot = compareBotsByRecentActivity;
-  const byRecentGroup = compareGroupsByRecentActivity;
-  const sectionedBots = matchingBots
-    .filter((bot) => !bot.chiefOfStaff && bot.section)
-    .sort(byRecentBot);
-  const visibleBots = matchingBots
-    .filter((bot) => !bot.chiefOfStaff && !bot.section)
-    .sort(byRecentBot);
-  const visibleGroups = state.groups.filter(
-    (g) =>
-      !q ||
-      g.name.toLowerCase().includes(q) ||
-      (g.tasks ?? []).some((task) => task.title.toLowerCase().includes(q)),
-  );
+    const {
+      botChats: botChatsRaw,
+      sectionedRooms: sectionedGroupsRaw,
+      unsectionedRooms: unsectionedGroupsRaw,
+    } = partitionSidebarGroups(visibleGroups);
+    return {
+      unsectionedChief,
+      sectionChiefs,
+      sectionedBots,
+      visibleBots,
+      visibleGroups,
+      botChats: [...botChatsRaw].sort(byRecentGroup),
+      sectionedGroups: [...sectionedGroupsRaw].sort(byRecentGroup),
+      unsectionedGroups: [...unsectionedGroupsRaw].sort(byRecentGroup),
+    };
+  }, [state.bots, state.groups, q]);
   const terminology = getRoomTerminology(state.config);
   const conversationMode = getConversationMode(state.config);
   const showExtraThreads = allowsMultipleBotThreads(conversationMode);
   const primary = rosterPrimaryLabel(conversationMode);
-  const {
-    botChats: botChatsRaw,
-    sectionedRooms: sectionedGroupsRaw,
-    unsectionedRooms: unsectionedGroupsRaw,
-  } = partitionSidebarGroups(visibleGroups);
-  const botChats = [...botChatsRaw].sort(byRecentGroup);
-  const sectionedGroups = [...sectionedGroupsRaw].sort(byRecentGroup);
-  const unsectionedGroups = [...unsectionedGroupsRaw].sort(byRecentGroup);
   // User contexts keep a stored order.  Bot ↔ Bot is not a user context and
   // always sits at the bottom, collapsed until opened.  DMs stay out of Apps
   // even when a leftover section tag remains on the record (#237).

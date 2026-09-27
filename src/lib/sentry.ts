@@ -13,7 +13,15 @@
  * Node harness (`server/sentry.ts`), not this browser bundle.
  */
 
-import * as Sentry from "@sentry/react";
+import { lazy } from "react";
+import type * as SentryTypes from "@sentry/react";
+
+/** The real SDK's shape, used only to type the dynamic loader below.
+ * `import type` and `typeof import()` are both erased at build time, so
+ * neither this alias nor `SentryTypes` puts `@sentry/react` in the chunk
+ * that ships whether or not a DSN is configured — that was UI3. Exported so
+ * a test can type a stand-in module for `setSentryModuleLoaderForTests`. */
+export type SentryModule = typeof import("@sentry/react");
 
 /** Everything that decides what a client this module starts will do.  The
  * rest of the browser SDK's configuration is fixed here, so a stand-in
@@ -45,51 +53,97 @@ export interface RuntimeObservability {
   dsn?: string | null;
   environment?: string;
   tracesSampleRate?: number;
+  uiTracesSampleRate?: number;
 }
 
 /** How the renderer asks the harness what it resolved. */
 export type ObservabilityReader = () => Promise<RuntimeObservability | null>;
 
+/** How this module reaches the real SDK — swappable so a test can control
+ * exactly when "the import resolved" happens without ever loading the real
+ * `@sentry/react` package, the same reason `setSentryPortForTests` exists. */
+type SentryModuleLoader = () => Promise<SentryModule>;
+const realSentryModuleLoader: SentryModuleLoader = () => import("@sentry/react");
+let sentryModuleLoader: SentryModuleLoader = realSentryModuleLoader;
+
+/** Memoized load — one fetch/parse no matter how many things below ask for
+ * the module (init, close, a capture made while it is still loading, and
+ * the lazy ErrorBoundary all share this promise). */
+let sentryModulePromise: Promise<SentryModule> | null = null;
+function loadSentryModule(): Promise<SentryModule> {
+  sentryModulePromise ??= sentryModuleLoader();
+  return sentryModulePromise;
+}
+
+/** The module once its dynamic import has actually resolved, or null before
+ * that and after close(). Distinct from `initialized` below, which flips
+ * true the instant init() is called so callers see "a client is coming"
+ * right away — isSentryFeedbackAvailable() and the capture functions need
+ * to know the SDK is actually running, not merely requested. */
+let loadedSentry: SentryModule | null = null;
+/** Bumped on every init() and close() so an import that resolves after a
+ * newer init() or a close() request knows not to (re)start a client nobody
+ * wants anymore — the async gap a dynamic import adds that a synchronous
+ * `Sentry.init()` call never had. */
+let pendingInitGeneration = 0;
+
 const browserPort: SentryBrowserPort = {
   init(options: SentryClientOptions): void {
-    Sentry.init({
-      dsn: options.dsn,
-      environment: options.environment,
-      tracesSampleRate: options.tracesSampleRate,
-      enableLogs: true,
-      sendDefaultPii: false,
-      dataCollection: {
-        userInfo: false,
-        cookies: false,
-        httpHeaders: { request: false, response: false },
-        urlQueryParams: false,
-        genAI: { inputs: false, outputs: false },
-      },
-      replaysSessionSampleRate: options.replaysSessionSampleRate,
-      replaysOnErrorSampleRate: options.replaysOnErrorSampleRate,
-      integrations: [
-        Sentry.browserTracingIntegration(),
-        Sentry.feedbackIntegration({
-          colorScheme: "light",
-          autoInject: false,
-          showBranding: false,
-          buttonLabel: "Report a problem",
-          submitButtonLabel: "Send",
-          formTitle: "Report a problem",
-        }),
-        ...(options.replayEnabled
-          ? [
-              Sentry.replayIntegration({
-                maskAllText: true,
-                blockAllMedia: true,
-              }),
-            ]
-          : []),
-      ],
-    });
+    const generation = ++pendingInitGeneration;
+    void loadSentryModule()
+      .then((Sentry) => {
+        if (generation !== pendingInitGeneration) return; // superseded or closed
+        Sentry.init({
+          dsn: options.dsn,
+          environment: options.environment,
+          tracesSampleRate: options.tracesSampleRate,
+          enableLogs: true,
+          sendDefaultPii: false,
+          dataCollection: {
+            userInfo: false,
+            cookies: false,
+            httpHeaders: { request: false, response: false },
+            urlQueryParams: false,
+            genAI: { inputs: false, outputs: false },
+          },
+          replaysSessionSampleRate: options.replaysSessionSampleRate,
+          replaysOnErrorSampleRate: options.replaysOnErrorSampleRate,
+          integrations: [
+            Sentry.browserTracingIntegration(),
+            Sentry.feedbackIntegration({
+              colorScheme: "light",
+              autoInject: false,
+              showBranding: false,
+              buttonLabel: "Report a problem",
+              submitButtonLabel: "Send",
+              formTitle: "Report a problem",
+            }),
+            ...(options.replayEnabled
+              ? [
+                  Sentry.replayIntegration({
+                    maskAllText: true,
+                    blockAllMedia: true,
+                  }),
+                ]
+              : []),
+          ],
+        });
+        loadedSentry = Sentry;
+      })
+      .catch(() => {
+        /* @sentry/react failed to load (offline first launch, a blocked
+         * request, …) — the renderer stays exactly as inert as it is today
+         * with no DSN configured */
+      });
   },
-  close: () => Sentry.close(),
-  getClient: () => Sentry.getClient(),
+  close: () => {
+    pendingInitGeneration++; // cancel an init() still in flight
+    if (!loadedSentry) return Promise.resolve(true);
+    const client = loadedSentry;
+    loadedSentry = null;
+    return client.close();
+  },
+  getClient: () => loadedSentry?.getClient(),
 };
 
 const harnessReader: ObservabilityReader = async () => {
@@ -162,9 +216,51 @@ export function initSentry(): void {
   buildTimeClientActive = true;
 }
 
-export const SentryErrorBoundary = Sentry.ErrorBoundary;
-export const captureException = Sentry.captureException;
-export const captureMessage = Sentry.captureMessage;
+/** Sentry's ErrorBoundary, code-split with the rest of the SDK (UI3). No
+ * call site mounts this today; wrap it in <Suspense> when one does — until
+ * the chunk resolves it renders nothing, same as any other React.lazy. */
+export const SentryErrorBoundary = lazy(() =>
+  loadSentryModule().then((Sentry) => ({ default: Sentry.ErrorBoundary })),
+);
+
+/**
+ * Send an exception to Sentry if the client has already loaded. If init()
+ * was called and the import is still resolving, queue it and flush once the
+ * client starts; if nothing is loading — init() was never called, or the
+ * pending one was superseded or closed — the capture is dropped, matching
+ * what the real SDK does with no client attached to report to.
+ */
+export function captureException(
+  exception: unknown,
+  hint?: Parameters<SentryModule["captureException"]>[1],
+): string | undefined {
+  if (loadedSentry) return loadedSentry.captureException(exception, hint);
+  if (!sentryModulePromise) return undefined;
+  // Not the resolved module itself — loadedSentry (set by init()'s own
+  // .then(), queued ahead of this one on the same promise) is what says
+  // whether the client actually started.
+  void sentryModulePromise
+    .then(() => {
+      if (loadedSentry) loadedSentry.captureException(exception, hint);
+    })
+    .catch(() => {});
+  return undefined;
+}
+
+/** Same gate-and-queue as {@link captureException}, for a plain message. */
+export function captureMessage(
+  message: string,
+  captureContext?: Parameters<SentryModule["captureMessage"]>[1],
+): string | undefined {
+  if (loadedSentry) return loadedSentry.captureMessage(message, captureContext);
+  if (!sentryModulePromise) return undefined;
+  void sentryModulePromise
+    .then(() => {
+      if (loadedSentry) loadedSentry.captureMessage(message, captureContext);
+    })
+    .catch(() => {});
+  return undefined;
+}
 
 export interface OpenFeedbackOptions {
   formTitle?: string;
@@ -185,7 +281,7 @@ let isCreatingFeedback = false;
 let activeFeedbackDetails: string | null = null;
 let feedbackProcessorInstalled = false;
 
-export function attachFeedbackEventDetails<T extends Sentry.Event>(event: T): T {
+export function attachFeedbackEventDetails<T extends SentryTypes.Event>(event: T): T {
   if (event.type === "feedback" && activeFeedbackDetails) {
     return {
       ...event,
@@ -205,9 +301,9 @@ export function setActiveFeedbackDetailsForTests(details: string | null): void {
 }
 
 function ensureFeedbackEventProcessor(): void {
-  if (feedbackProcessorInstalled) return;
+  if (feedbackProcessorInstalled || !loadedSentry) return;
   feedbackProcessorInstalled = true;
-  Sentry.addEventProcessor((event) => attachFeedbackEventDetails(event));
+  loadedSentry.addEventProcessor((event) => attachFeedbackEventDetails(event));
 }
 
 function toWellFormedString(val: string): string {
@@ -283,8 +379,8 @@ export function buildFallbackIssueUrl(
 }
 
 export function isSentryFeedbackAvailable(): boolean {
-  if (!globalThis.window || !initialized) return false;
-  return Boolean(Sentry.getFeedback());
+  if (!globalThis.window || !initialized || !loadedSentry) return false;
+  return Boolean(loadedSentry.getFeedback());
 }
 
 export async function openSentryFeedback(options?: OpenFeedbackOptions): Promise<void> {
@@ -302,7 +398,7 @@ export async function openSentryFeedback(options?: OpenFeedbackOptions): Promise
       return;
     }
 
-    const feedback = Sentry.getFeedback();
+    const feedback = loadedSentry?.getFeedback();
     if (!feedback || isCreatingFeedback) return;
     isCreatingFeedback = true;
     ensureFeedbackEventProcessor();
@@ -463,7 +559,7 @@ function applyRuntimeObservability(data: RuntimeObservability | null): void {
   buildTimeClientActive = false;
 
   const environment = data.environment?.trim() || "production";
-  const reportedRate = data.tracesSampleRate;
+  const reportedRate = data.uiTracesSampleRate ?? data.tracesSampleRate;
   const resolvedRate = reportedRate !== undefined && Number.isFinite(reportedRate) ? reportedRate : 0.2;
   const tracesSampleRate = Math.min(Math.max(resolvedRate, 0), 1);
 
@@ -527,6 +623,14 @@ export function setSentryPortForTests(port: SentryBrowserPort | null): void {
   sentryPort = port ?? browserPort;
 }
 
+/** Install a stand-in for the dynamic `import("@sentry/react")` itself, so a
+ * test can drive the real `browserPort` (init/close race, capture gate and
+ * queue) without ever loading the real SDK.  Pass null to restore the real
+ * dynamic import. */
+export function setSentryModuleLoaderForTests(loader: SentryModuleLoader | null): void {
+  sentryModuleLoader = loader ?? realSentryModuleLoader;
+}
+
 /** Script what the harness answers, so a test needs no fetch and no store. */
 export function setObservabilityReaderForTests(reader: ObservabilityReader | null): void {
   readObservability = reader ?? harnessReader;
@@ -543,4 +647,8 @@ export function resetSentryForTests(): void {
   activeFeedbackDetails = null;
   activeFeedbackDialog = null;
   isCreatingFeedback = false;
+  sentryModulePromise = null;
+  loadedSentry = null;
+  pendingInitGeneration = 0;
+  sentryModuleLoader = realSentryModuleLoader;
 }

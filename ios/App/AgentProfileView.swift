@@ -23,6 +23,7 @@ struct AgentProfileView: View {
     @State private var modelId: String
     @State private var effort: String?
     @State private var fallbacks: [ModelSelection]
+    @State private var maxToolRoundsText: String
     @State private var photo: PhotosPickerItem?
     @State private var prompt = ""
     @State private var voices: [Voice] = []
@@ -49,6 +50,7 @@ struct AgentProfileView: View {
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
+        _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -265,6 +267,19 @@ struct AgentProfileView: View {
                             }
                         }
                     }
+
+                    if instances.first(where: { $0.id == instanceId })?.capabilities?.toolLoop == true {
+                        Section {
+                            TextField("12", text: maxToolRoundsBinding)
+                                .keyboardType(.numberPad)
+                                .multilineTextAlignment(.trailing)
+                                .accessibilityLabel("Maximum Tool Rounds")
+                        } header: {
+                            Text("Maximum Tool Rounds")
+                        } footer: {
+                            Text("Per turn.  Empty uses 12.  Cap is 200.")
+                        }
+                    }
                 }
 
                 Section {
@@ -469,8 +484,42 @@ struct AgentProfileView: View {
             avatarCrop: crop == baseline.crop ? nil : crop,
             voice: voice == baseline.voice ? nil : voice,
             speakReplies: savedSpeakReplies == baseline.speakReplies ? nil : savedSpeakReplies,
-            modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection
+            modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
+            maxToolRounds: maxToolRoundsPatch
         )
+    }
+
+    /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
+    private static let maximumToolRoundsCap = 200
+
+    private static func roundsText(_ rounds: Int?) -> String {
+        guard let rounds else { return "" }
+        return String(rounds)
+    }
+
+    /// Digits only, 1...200. Empty clears. Anything else is ignored.
+    private var maxToolRoundsBinding: Binding<String> {
+        Binding(
+            get: { maxToolRoundsText },
+            set: { raw in
+                let digits = raw.filter(\.isNumber)
+                if digits.isEmpty {
+                    if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        maxToolRoundsText = ""
+                    }
+                    return
+                }
+                guard let value = Int(digits), value >= 1, value <= Self.maximumToolRoundsCap else { return }
+                maxToolRoundsText = String(value)
+            }
+        )
+    }
+
+    private var maxToolRoundsPatch: BotProfilePatch.MaxToolRounds? {
+        guard maxToolRoundsText != baseline.maxToolRoundsText else { return nil }
+        if maxToolRoundsText.isEmpty { return .clear }
+        guard let rounds = Int(maxToolRoundsText), (1...Self.maximumToolRoundsCap).contains(rounds) else { return nil }
+        return .set(rounds)
     }
 
     private func save() async -> Bool {
@@ -598,6 +647,7 @@ struct AgentProfileView: View {
         modelId = bot.modelSelection.model
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
+        maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
         baseline = ProfileFormSnapshot(bot: bot)
     }
 }
@@ -611,6 +661,7 @@ private struct ProfileFormSnapshot {
     var voice: String
     var speakReplies: Bool
     var modelSelection: ModelSelection
+    var maxToolRoundsText: String
 
     init(bot: Bot) {
         name = bot.name
@@ -621,6 +672,7 @@ private struct ProfileFormSnapshot {
         voice = bot.voice ?? ""
         speakReplies = bot.speakReplies == true
         modelSelection = bot.modelSelection
+        maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
     }
 }
 

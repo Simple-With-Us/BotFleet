@@ -1,5 +1,5 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
 import { StoreProvider, useStore, type AppSettingsSection } from "@/state/store";
 import { ERROR_RECOVERY_EVENT, type ErrorRecoveryDetail } from "@/components/ErrorRow";
@@ -9,20 +9,65 @@ import { unreadConversationCount } from "@/lib/unread";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
 import { GroupView } from "@/components/GroupView";
-import { SettingsPanel } from "@/components/SettingsPanel";
-import { GroupSettingsPanel } from "@/components/GroupSettingsPanel";
-import { PluginsPanel, preloadConnectedApps } from "@/components/PluginsPanel";
-import { ComputerPanel } from "@/components/ComputerPanel";
-import { InspectorPanel } from "@/components/InspectorPanel";
-import { SettingsModal } from "@/components/SettingsModal";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
-import { RoutinesPage } from "@/components/RoutinesPage";
 import { NoEngines } from "@/components/NoEngines";
-import { CommandPalette } from "@/components/CommandPalette";
-import { LocalVmWorkspace } from "@/components/LocalVmWorkspace";
-import { SkillRecorderPage } from "@/components/SkillRecorderPage";
-import { TeamMapPage } from "@/components/TeamMapPage";
+
+// UI2: every one of these is already conditionally rendered — near-modal
+// panels/pages that most sessions never open in a given launch — so they
+// shipped in the main chunk for nothing. React.lazy splits each into its own
+// chunk; the named export → { default } reshape is because none of them
+// default-export. See docs/audits/2026-09-24-efficiency-audit.md.
+// SettingsModal and InspectorPanel are not named in that finding but are the
+// same shape as SettingsPanel/GroupSettingsPanel right next to them, so they
+// are split too; GroupView and Onboarding are primary/first-run views, not
+// rarely-open panels, and stay static.
+const SettingsPanel = lazy(() =>
+  import("@/components/SettingsPanel").then((m) => ({ default: m.SettingsPanel })),
+);
+const GroupSettingsPanel = lazy(() =>
+  import("@/components/GroupSettingsPanel").then((m) => ({ default: m.GroupSettingsPanel })),
+);
+const PluginsPanel = lazy(() =>
+  import("@/components/PluginsPanel").then((m) => ({ default: m.PluginsPanel })),
+);
+const ComputerPanel = lazy(() =>
+  import("@/components/ComputerPanel").then((m) => ({ default: m.ComputerPanel })),
+);
+const InspectorPanel = lazy(() =>
+  import("@/components/InspectorPanel").then((m) => ({ default: m.InspectorPanel })),
+);
+const SettingsModal = lazy(() =>
+  import("@/components/SettingsModal").then((m) => ({ default: m.SettingsModal })),
+);
+const RoutinesPage = lazy(() =>
+  import("@/components/RoutinesPage").then((m) => ({ default: m.RoutinesPage })),
+);
+const CommandPalette = lazy(() =>
+  import("@/components/CommandPalette").then((m) => ({ default: m.CommandPalette })),
+);
+const LocalVmWorkspace = lazy(() =>
+  import("@/components/LocalVmWorkspace").then((m) => ({ default: m.LocalVmWorkspace })),
+);
+const SkillRecorderPage = lazy(() =>
+  import("@/components/SkillRecorderPage").then((m) => ({ default: m.SkillRecorderPage })),
+);
+const TeamMapPage = lazy(() =>
+  import("@/components/TeamMapPage").then((m) => ({ default: m.TeamMapPage })),
+);
+
+/** Small, unobtrusive placeholder while a lazy panel's chunk loads. Each
+ * loads once per install (cached after), so this is on screen for a beat at
+ * most — a corner toast rather than anything that competes with the panel's
+ * own chrome, since panels here range from a slide-over to a full page. */
+function PanelFallback() {
+  return (
+    <div className="fixed bottom-4 right-4 z-40 flex items-center gap-2 rounded-full bg-panel px-3 py-2 text-[12px] text-ink-secondary shadow-lg">
+      <Loader2 size={14} className="animate-spin" />
+      Loading…
+    </div>
+  );
+}
 
 function Shell() {
   const { state, dispatch } = useStore();
@@ -159,9 +204,14 @@ function Shell() {
   // Warm connected-account state as soon as the local server is available.
   // The modal then opens with the correct Connect/Add account buttons and
   // quietly revalidates instead of rediscovering every account from scratch.
+  // PluginsPanel is lazy now (UI2), so this reaches preloadConnectedApps
+  // through the same dynamic import rather than a static one that would
+  // pull the whole panel back into the main chunk just for this call.
   useEffect(() => {
     if (!state.connected) return;
-    void preloadConnectedApps().catch(() => {});
+    void import("@/components/PluginsPanel")
+      .then((m) => m.preloadConnectedApps())
+      .catch(() => {});
   }, [state.connected]);
 
   // Picking a conversation closes the drawer: on a phone the chat is what you
@@ -287,18 +337,26 @@ function Shell() {
         }}
       />
       {state.activeView === "team-map" ? (
-        <TeamMapPage />
+        <Suspense fallback={<PanelFallback />}>
+          <TeamMapPage />
+        </Suspense>
       ) : state.activeView === "routines" ? (
-        <RoutinesPage />
+        <Suspense fallback={<PanelFallback />}>
+          <RoutinesPage />
+        </Suspense>
       ) : state.activeView === "skill-recorder" ? (
-        <SkillRecorderPage />
+        <Suspense fallback={<PanelFallback />}>
+          <SkillRecorderPage />
+        </Suspense>
       ) : localVmWorkspaceBotId ? (
-        <LocalVmWorkspace
-          primaryBotId={localVmWorkspaceBotId}
-          overlayOpen={nativeViewOverlayOpen}
-          onClose={() => setLocalVmWorkspaceBotId(null)}
-          onOpenComputer={openComputerFromWorkspace}
-        />
+        <Suspense fallback={<PanelFallback />}>
+          <LocalVmWorkspace
+            primaryBotId={localVmWorkspaceBotId}
+            overlayOpen={nativeViewOverlayOpen}
+            onClose={() => setLocalVmWorkspaceBotId(null)}
+            onOpenComputer={openComputerFromWorkspace}
+          />
+        </Suspense>
       ) : noEngines ? (
         <NoEngines />
       ) : group ? (
@@ -330,17 +388,45 @@ function Shell() {
           className="absolute inset-0 z-10 hidden bg-black/40 max-[1099px]:block"
         />
       )}
-      {state.settingsOpen && bot && <SettingsPanel bot={bot} />}
-      {state.settingsOpen && group && <GroupSettingsPanel group={group} />}
-      {state.computerOpen && bot && (
-        <ComputerPanel bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} />
+      {state.settingsOpen && bot && (
+        <Suspense fallback={<PanelFallback />}>
+          <SettingsPanel bot={bot} />
+        </Suspense>
       )}
-      {state.inspectorOpen && bot && <InspectorPanel bot={bot} />}
-      {state.appSettingsOpen && <SettingsModal />}
-      {state.pluginsOpen && <PluginsPanel />}
+      {state.settingsOpen && group && (
+        <Suspense fallback={<PanelFallback />}>
+          <GroupSettingsPanel group={group} />
+        </Suspense>
+      )}
+      {state.computerOpen && bot && (
+        <Suspense fallback={<PanelFallback />}>
+          <ComputerPanel bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} />
+        </Suspense>
+      )}
+      {state.inspectorOpen && bot && (
+        <Suspense fallback={<PanelFallback />}>
+          <InspectorPanel bot={bot} />
+        </Suspense>
+      )}
+      {state.appSettingsOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <SettingsModal />
+        </Suspense>
+      )}
+      {state.pluginsOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <PluginsPanel />
+        </Suspense>
+      )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the
-          palette on top when one of them is open underneath */}
-      <CommandPalette onOpenChange={setPaletteOpen} />
+          palette on top when one of them is open underneath. Always
+          mounted (not gated on a boolean), so its own chunk starts loading
+          right away; fallback is null rather than PanelFallback so an
+          unopened command palette does not flash a "Loading…" toast on
+          every launch. */}
+      <Suspense fallback={null}>
+        <CommandPalette onOpenChange={setPaletteOpen} />
+      </Suspense>
       </div>
     </div>
   );

@@ -343,6 +343,308 @@ final class PushSenderHealthTests: XCTestCase {
         XCTAssertNil(health.lastSentAt)
     }
 
+    // MARK: - Off / Degraded (IO2, IO5)
+
+    /// The exact bug: a sidecar that latched sending off after Apple
+    /// refused the key must not still read "On" just because it sent
+    /// successfully before the fault.  `pushesOffReason` is one of three
+    /// known codes from the sidecar (`companion/src/apns.ts`, PR #597);
+    /// each maps to plain English rather than showing the raw code.
+    func testSummaryMapsKeyRejectedPushesOffReasonToPlainEnglish() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 5,
+            lastSentAt: now.timeIntervalSince1970 * 1000 - 60_000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            pushesOff: true,
+            pushesOffReason: "key-rejected"
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Off — Apple refused the signing key"
+        )
+    }
+
+    func testSummaryMapsNoKeyPushesOffReasonToPlainEnglish() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 0,
+            failed: 0,
+            lastSentAt: nil,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            pushesOff: true,
+            pushesOffReason: "no-key"
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Off — no signing key on your computer"
+        )
+    }
+
+    func testSummaryMapsUnreachablePushesOffReasonToPlainEnglish() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 5,
+            lastSentAt: now.timeIntervalSince1970 * 1000 - 60_000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            pushesOff: true,
+            pushesOffReason: "unreachable"
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Off — your computer cannot reach Apple"
+        )
+    }
+
+    func testSummaryReportsOffWithNoReasonWhenPushesOffReasonIsMissing() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 0,
+            lastSentAt: now.timeIntervalSince1970 * 1000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            pushesOff: true
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Off"
+        )
+    }
+
+    /// A future sidecar reason this build does not recognize yet must fall
+    /// back to the plain line rather than leak a raw machine code.
+    func testSummaryFallsBackToPlainOffForAnUnrecognizedPushesOffReason() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 0,
+            lastSentAt: now.timeIntervalSince1970 * 1000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            pushesOff: true,
+            pushesOffReason: "some-future-reason"
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Off"
+        )
+    }
+
+    /// An open circuit breaker is degraded, not dead — the sidecar is still
+    /// trying and a send may still land, unlike the latched-off states
+    /// above, so it reads "Degraded" rather than "Off".
+    func testSummaryReportsDegradedWhileTheCircuitBreakerIsOpen() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 20,
+            lastSentAt: now.timeIntervalSince1970 * 1000 - 60_000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            circuitOpenUntil: now.timeIntervalSince1970 * 1000 + 30_000
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Degraded — Apple's push service is " +
+                "temporarily unreachable from your computer; retrying automatically"
+        )
+    }
+
+    /// A `circuitOpenUntil` timestamp that has already passed is a closed
+    /// breaker, not an open one — must not still read as "Degraded".
+    func testSummaryDoesNotReportDegradedWhenCircuitOpenUntilIsInThePast() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 0,
+            lastSentAt: now.timeIntervalSince1970 * 1000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            circuitOpenUntil: now.timeIntervalSince1970 * 1000 - 30_000
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: On — last push 5 minutes ago"
+        )
+    }
+
+    func testSummaryReportsDegradedAtTheTransportFailureThreshold() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 5,
+            lastSentAt: now.timeIntervalSince1970 * 1000 - 60_000,
+            lastErrorAt: now.timeIntervalSince1970 * 1000,
+            lastError: "ECONNRESET",
+            keyRejected: nil,
+            dropped: 0,
+            consecutiveTransportFailures: PushSenderHealthView.degradedTransportFailureThreshold
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: Degraded — 5 failed attempts in a row; last error ECONNRESET"
+        )
+    }
+
+    func testSummaryStaysOnBelowTheDegradedTransportFailureThreshold() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 1,
+            lastSentAt: now.timeIntervalSince1970 * 1000 - 60_000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: nil,
+            dropped: 0,
+            consecutiveTransportFailures: PushSenderHealthView.degradedTransportFailureThreshold - 1
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "Closed-app notifications: On — last push 5 minutes ago"
+        )
+    }
+
+    /// Priority sanity: a key rejection is the most specific, most
+    /// actionable state and must keep winning over the newer fault fields.
+    func testKeyRejectedStillWinsOverPushesOffAndCircuitOpen() {
+        let health = PushSenderHealth(
+            configured: true,
+            production: true,
+            tokensRegistered: 1,
+            sent: 12,
+            failed: 5,
+            lastSentAt: now.timeIntervalSince1970 * 1000,
+            lastErrorAt: nil,
+            lastError: nil,
+            keyRejected: "InvalidProviderToken",
+            dropped: 0,
+            circuitOpenUntil: now.timeIntervalSince1970 * 1000 + 30_000,
+            pushesOff: true,
+            pushesOffReason: "should not be shown"
+        )
+        XCTAssertEqual(
+            PushSenderHealthView.summary(health, now: now, relativeDescription: Self.fixedRelative),
+            "InvalidProviderToken — the key file needs replacing."
+        )
+    }
+
+    // MARK: - Decoding the new breaker fields (IO5)
+
+    func testDecodesTheNewBreakerFieldsFromANewerSidecar() throws {
+        let json = #"""
+        {
+          "configured": true,
+          "production": true,
+          "tokensRegistered": 1,
+          "sent": 3,
+          "failed": 20,
+          "lastSentAt": null,
+          "lastErrorAt": 1699990000000,
+          "lastError": "socket hang up",
+          "keyRejected": null,
+          "dropped": 0,
+          "circuitDropped": 4,
+          "failureKind": "transport",
+          "consecutiveTransportFailures": 20,
+          "lastErrorCode": "ECONNRESET",
+          "circuitOpenUntil": 1699990060000
+        }
+        """#
+        let health = try JSONDecoder().decode(PushSenderHealth.self, from: Data(json.utf8))
+        XCTAssertEqual(health.failureKind, "transport")
+        XCTAssertEqual(health.consecutiveTransportFailures, 20)
+        XCTAssertEqual(health.lastErrorCode, "ECONNRESET")
+        XCTAssertEqual(health.circuitOpenUntil, 1_699_990_060_000)
+        XCTAssertNil(health.pushesOff)
+        XCTAssertNil(health.pushesOffReason)
+    }
+
+    func testDecodesPushesOffFieldsWhenPresent() throws {
+        let json = #"""
+        {
+          "configured": true,
+          "production": true,
+          "tokensRegistered": 1,
+          "sent": 0,
+          "failed": 0,
+          "lastSentAt": null,
+          "lastErrorAt": null,
+          "lastError": null,
+          "keyRejected": null,
+          "dropped": 0,
+          "pushesOff": true,
+          "pushesOffReason": "disabled after repeated key faults"
+        }
+        """#
+        let health = try JSONDecoder().decode(PushSenderHealth.self, from: Data(json.utf8))
+        XCTAssertEqual(health.pushesOff, true)
+        XCTAssertEqual(health.pushesOffReason, "disabled after repeated key faults")
+    }
+
+    /// An older sidecar sends none of the breaker fields; every one of them
+    /// must decode as nil rather than throwing and blanking the whole row.
+    func testOlderSidecarPayloadDecodesEveryNewFieldAsNil() throws {
+        let json = #"""
+        {
+          "configured": true,
+          "production": true,
+          "tokensRegistered": 2,
+          "sent": 14,
+          "failed": 0,
+          "lastSentAt": 1699990000000,
+          "lastErrorAt": null,
+          "lastError": null,
+          "keyRejected": null,
+          "dropped": 0
+        }
+        """#
+        let health = try JSONDecoder().decode(PushSenderHealth.self, from: Data(json.utf8))
+        XCTAssertNil(health.failureKind)
+        XCTAssertNil(health.consecutiveTransportFailures)
+        XCTAssertNil(health.lastErrorCode)
+        XCTAssertNil(health.circuitOpenUntil)
+        XCTAssertNil(health.pushesOff)
+        XCTAssertNil(health.pushesOffReason)
+    }
+
     func testDecodesAKeyRejectedSender() throws {
         let json = #"""
         {

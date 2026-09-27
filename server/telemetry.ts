@@ -4,11 +4,14 @@ import { basename, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import type { TurnBillingMode } from "./contracts.ts";
+import { FailureLogDedup } from "./log-dedup.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
 import {
   UsageTelemetryOutbox,
+  terminalStatusFor,
   usageTelemetryDestinationHash,
   type DurableTelemetryBatch,
+  type TerminalHttpStatus,
 } from "./telemetry-outbox.ts";
 
 export interface TelemetryTurnParams {
@@ -35,6 +38,13 @@ export interface TelemetryTurnParams {
    * Preferred over the instance-id heuristics when it is known, because an
    * instance id is operator-chosen and an engine id is not. */
   driverKind?: string;
+  /** UTF-8 bytes of the system prompt the driver was handed, split at the
+   * volatile boundary (server/system-prompt.ts): stable bytes ride the
+   * cacheable prefix, volatile bytes are re-delivered in the turn that
+   * changed them.  Present only when the server assembled a split prompt
+   * for the turn; read against `cachedInputTokens` to see whether the
+   * prefix is actually being cached. */
+  promptBytes?: { stable: number; volatile: number };
 }
 
 export interface TelemetryStatus {
@@ -57,8 +67,11 @@ export interface TelemetryStatus {
   corruptFilesQuarantined: number;
   terminalQuarantinedBatches: number;
   terminalQuarantineEvictedBatches: number;
-  lastTerminalStatus: 400 | 409 | null;
+  lastTerminalStatus: TerminalHttpStatus | null;
   lastTerminalAt: string | null;
+  deadLetterBatches: number;
+  deadLetterEvictedBatches: number;
+  lastDeadLetterAt: string | null;
   lastAckAt: string | null;
   lastError: string | null;
 }
@@ -229,6 +242,11 @@ export function inferProviderAndService(
   const model = (modelId || "").toLowerCase();
   const service = modelId || instanceId || "unknown";
 
+  // MiniMax running under DSH / other bridges attributes to minimax
+  if (model.includes("minimax")) {
+    return { provider: "minimax", service: modelId || "unknown" };
+  }
+
   // The engine wins when it names a provider on its own.  An instance id is
   // operator-chosen text; an engine id is ours.
   const fromEngine = providerForEngine(driverKind);
@@ -288,8 +306,10 @@ type TokenType = "input" | "cacheRead" | "output" | "unknown";
 
 /** Exactly the metadata one turn stamps on every event it emits.  Named
  * rather than the open `TelemetryMetadata` bag so the keys are a contract:
- * the nine that have always ridden along, the four this split adds, and the
- * two room fields a room turn adds on top. */
+ * the nine that have always ridden along, the four this split adds, the two
+ * room fields a room turn adds on top, and the two prompt-byte figures a
+ * split system prompt adds (flat numbers, because the v2 bag accepts only
+ * primitives). */
 type TurnMetadata = {
   botName: string;
   botId: string;
@@ -307,6 +327,8 @@ type TurnMetadata = {
   estimatedCostUsd?: number;
   roomId?: string;
   roomName?: string;
+  promptStableBytes?: number;
+  promptVolatileBytes?: number;
 };
 
 /** Turn one completed turn into the events that go on the wire.
@@ -365,6 +387,12 @@ export function buildTurnEvents(
     params.costUsd != null && Number.isFinite(params.costUsd) && params.costUsd >= 0 ? params.costUsd : null;
   const estimatedCost = params.billingMode === "estimated" ? reportedCost : null;
   const cost = params.billingMode === "estimated" ? null : reportedCost;
+  // The prompt halves' byte counts are a size, never a spend: two flat
+  // non-negative integers, or nothing when the turn's prompt was not split.
+  const promptBytes = params.promptBytes
+    && Number.isFinite(params.promptBytes.stable) && Number.isFinite(params.promptBytes.volatile)
+    ? { stable: Math.max(0, Math.round(params.promptBytes.stable)), volatile: Math.max(0, Math.round(params.promptBytes.volatile)) }
+    : null;
 
   const allSlices: Array<{ suffix: string; tokenType: TokenType; quantity: number }> = [
     { suffix: "in", tokenType: "input", quantity: inputBillable },
@@ -411,6 +439,10 @@ export function buildTurnEvents(
       if (roomName) metadata.roomName = roomName;
     }
     if (estimatedCost != null) metadata.estimatedCostUsd = index === 0 ? estimatedCost : 0;
+    if (promptBytes) {
+      metadata.promptStableBytes = promptBytes.stable;
+      metadata.promptVolatileBytes = promptBytes.volatile;
+    }
 
     const event: TelemetryV2Event = {
       eventId: `${prefix}:${slice.suffix}`,
@@ -463,12 +495,27 @@ export class UsageTelemetryManager {
       : null;
   }
 
+  /** Collapses repeats of the SAME failure (an HTTP status, a dispatch
+   * exception, an unusable destination) into one line plus a ten-minute
+   * summary instead of one line per attempt — two days of `server.log` held
+   * 279 `[telemetry]` lines, almost all repeats of the same failure (HS23). */
+  private readonly failureLog = new FailureLogDedup({
+    summaryIntervalMs: 10 * 60_000,
+    log: (message) => console.warn(`[telemetry] ${message}`),
+    formatSummary: (count, since, last) => `${count} telemetry sends failed since ${since} (last: ${last})`,
+  });
+
   /** Live view of app config, installed by the server at boot. A getter (not
    * a snapshot) so a settings change takes effect without a restart. */
   private settingsProvider: (() => UsageSettings | undefined) | null = null;
 
   configure(provider: (() => UsageSettings | undefined) | null): void {
     this.settingsProvider = provider;
+    // A new (or cleared) settings provider means whatever failure run was
+    // in progress under the OLD provider no longer applies — drop it
+    // silently rather than let a stale count resurface as a misleading
+    // summary under the new configuration.
+    this.failureLog.clear();
     this.outbox?.configure(provider
       ? () => {
           const config = this.getIngestConfig();
@@ -491,6 +538,19 @@ export class UsageTelemetryManager {
     }
   }
 
+  /** `baseUrl`/`token` are honored only once they are actually usable.
+   * `settings.ingestUrl` is already validated by `usageIngestUrl()`
+   * (`isAbsoluteHttpUrl`, same `new URL()` check as below) before it ever
+   * reaches here — but the `USAGE_MONITOR_INGEST_URL` env-var fallback on
+   * the next line is NOT, and neither token fallback strips anything but
+   * leading/trailing whitespace.  A malformed URL or a token carrying an
+   * internal control character makes `fetch()` itself throw `TypeError` on
+   * every dispatch attempt — 25 such throws over two days in the field,
+   * each classified as merely-retryable and retried forever by the outbox
+   * (OP2d).  Rejecting here means the bad input is validated once and
+   * logged once (deduped like every other failure below) instead of thrown
+   * per batch, and the outbox is told "not configured" rather than handed
+   * a batch it can never deliver. */
   private getIngestConfig(): { baseUrl: string; token: string } | null {
     const settings = this.settings();
     // Config first, env as the fallback that keeps existing installs working.
@@ -506,6 +566,24 @@ export class UsageTelemetryManager {
       process.env.USAGE_INGEST_TOKEN?.trim();
 
     if (!baseUrl || !token) return null;
+
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error(`unsupported scheme "${parsed.protocol}"`);
+      }
+    } catch {
+      this.failureLog.report("config:bad-url", `ingest URL is not usable: ${baseUrl}`);
+      return null;
+    }
+    // A bearer token becomes a raw HTTP header value; CR/LF/NUL are invalid
+    // there and are exactly what turns a `fetch()` call into a thrown
+    // TypeError rather than a rejected Response.
+    if (/[\r\n\0]/.test(token)) {
+      this.failureLog.report("config:bad-token", "ingest token contains control characters");
+      return null;
+    }
+
     return { baseUrl, token };
   }
 
@@ -527,6 +605,9 @@ export class UsageTelemetryManager {
       terminalQuarantineEvictedBatches: 0,
       lastTerminalStatus: null,
       lastTerminalAt: null,
+      deadLetterBatches: 0,
+      deadLetterEvictedBatches: 0,
+      lastDeadLetterAt: null,
     };
     return {
       enabled: config !== null,
@@ -577,6 +658,7 @@ export class UsageTelemetryManager {
       ],
     };
     const posted = await this.postBatch(endpoint, config.token, batch);
+    posted.onPersisted?.();
     return { ok: posted.ok, error: posted.error, ingestUrl: endpoint };
   }
 
@@ -599,7 +681,7 @@ export class UsageTelemetryManager {
       this.outbox.enqueue(usageTelemetryDestinationHash(endpoint), batch);
       return;
     }
-    void this.postBatch(endpoint, config.token, batch);
+    void this.postBatch(endpoint, config.token, batch).then((posted) => posted.onPersisted?.());
   }
 
   async dispose(): Promise<void> {
@@ -610,7 +692,7 @@ export class UsageTelemetryManager {
     endpoint: string,
     token: string,
     batch: DurableTelemetryBatch,
-  ): Promise<{ ok: boolean; error: string | null; acknowledged: boolean; rejected: number; terminalStatus?: 400 | 409 }> {
+  ): Promise<{ ok: boolean; error: string | null; acknowledged: boolean; rejected: number; terminalStatus?: TerminalHttpStatus; onPersisted?: () => void }> {
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -634,7 +716,7 @@ export class UsageTelemetryManager {
           const error = "Usage Monitor returned an ambiguous acknowledgement";
           this.totalFailed += 1;
           this.lastError = error;
-          console.warn(`[telemetry] ${error}`);
+          this.failureLog.report("ambiguous", error);
           return { ok: false, error, acknowledged: false, rejected: 0 };
         }
         const rejected = ackCount(ack?.rejected);
@@ -644,31 +726,40 @@ export class UsageTelemetryManager {
           const error = `Usage Monitor rejected ${rejected} of ${received || rejected} events`.slice(0, 200);
           this.totalFailed += rejected;
           this.lastError = error;
-          console.warn(`[telemetry] ingest rejected ${rejected} of ${received || rejected} events`);
+          this.failureLog.report("rejected", `ingest rejected ${rejected} of ${received || rejected} events`);
           return { ok: false, error, acknowledged: true, rejected };
         }
-        this.totalSent += 1;
         this.lastError = null;
-        return { ok: true, error: null, acknowledged: true, rejected: 0 };
+        // Healthy again: print any pending "N failed since…" summary now
+        // rather than let it wait out the full window, and start the next
+        // incident (if any) with its own fresh first line.
+        this.failureLog.reset();
+        // Counted by whoever owns durability: the outbox runs this only
+        // after it has persisted the ack, the direct path right away.
+        const onPersisted = () => {
+          this.totalSent += 1;
+        };
+        return { ok: true, error: null, acknowledged: true, rejected: 0, onPersisted };
       }
       const error = `Usage Monitor returned HTTP ${res.status}`;
       this.totalFailed += 1;
       this.lastError = error;
-      console.warn(`[telemetry] ${error}`);
-      return {
+      this.failureLog.report(`http-${res.status}`, error);
+      const terminalStatus = terminalStatusFor(res.status);
+      const result: { ok: boolean; error: string | null; acknowledged: boolean; rejected: number; terminalStatus?: TerminalHttpStatus } = {
         ok: false,
         error,
         acknowledged: false,
         rejected: 0,
-        ...(res.status === 400 ? { terminalStatus: 400 as const }
-          : res.status === 409 ? { terminalStatus: 409 as const } : {}),
       };
+      if (terminalStatus !== undefined) result.terminalStatus = terminalStatus;
+      return result;
     } catch (err) {
       const reason = err instanceof Error && err.name ? err.name : "unknown";
       const error = `Usage Monitor dispatch failed (${reason})`;
       this.totalFailed += 1;
       this.lastError = error;
-      console.warn(`[telemetry] ${error}`);
+      this.failureLog.report(`dispatch-${reason}`, error);
       return { ok: false, error, acknowledged: false, rejected: 0 };
     }
   }

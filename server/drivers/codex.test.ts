@@ -365,6 +365,64 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(methods).not.toContain("turn/start");
   });
 
+  it("rebuilds on a fresh thread when resume fails before accept and recoveryText is attached", async () => {
+    await create(); // fake rejects thread/resume outside resume mode with missing-native shape
+    const dump = join(scratch, "resume-recovered.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    const recoveryText = "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?";
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-recovered",
+      text: "what now?",
+      resumeCursor: "gone-thread",
+      recoveryText,
+    });
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ sessionId: "codex-thread-1", rebuilt: true });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+
+    const methods = JSON.parse(readFileSync(dump, "utf8")).calls.map((c: { method: string }) => c.method);
+    expect(methods).toContain("thread/resume");
+    expect(methods).toContain("thread/start");
+    expect(methods).toContain("turn/start");
+    const turnStart = JSON.parse(readFileSync(dump, "utf8")).calls.find((c: { method: string }) => c.method === "turn/start");
+    expect(JSON.stringify(turnStart.params)).toContain("my dog is Biscuit");
+  });
+
+  it("keeps the rebuilt prompt across a transient failure after missing-session recovery", async () => {
+    const dump = join(scratch, "rebuild-retry.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_STATE = join(scratch, "rebuild-launches");
+    process.env.FAKE_CODEX_TRANSIENTS = "1";
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.001";
+    await create(); // thread/resume rejects with the native missing-session error
+
+    await instance.adapter.sendTurn({
+      threadId: "t-rebuild-retry",
+      text: "what now?",
+      system: "You are Testy.",
+      resumeCursor: "gone-thread",
+      recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.ok === true);
+
+    expect(recorder.events.filter((event) => event.type === "turn.retrying")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "turn.started")).toHaveLength(1);
+    const sessions = recorder.events.filter((event) => event.type === "session.started");
+    expect(sessions).toHaveLength(2);
+    expect(sessions.every((event) => event.rebuilt === true)).toBe(true);
+    const first = JSON.parse(readFileSync(`${dump}.attempt-0`, "utf8")).calls;
+    const second = JSON.parse(readFileSync(`${dump}.attempt-1`, "utf8")).calls;
+    expect(first.map((call: { method: string }) => call.method)).toContain("thread/resume");
+    // The second process must not resume the original missing session or
+    // fall back to the current text on its new empty native thread.
+    expect(second.map((call: { method: string }) => call.method)).not.toContain("thread/resume");
+    expect(second.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(second.find((call: { method: string }) => call.method === "turn/start").params.input[0].text).toBe(
+      "You are Testy.\n\n[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+    );
+  }, 20_000);
+
   it("retries a transient resume against the same saved Codex thread", async () => {
     const dump = join(scratch, "resume-retry.json");
     process.env.FAKE_CODEX_DUMP = dump;

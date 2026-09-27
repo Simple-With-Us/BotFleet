@@ -1,4 +1,3 @@
-import cursorMark from "/cursor-mark.png";
 import { cn } from "@/lib/cn";
 
 interface IconProps {
@@ -9,7 +8,7 @@ interface IconProps {
 export function CursorMark({ size = 16, className }: IconProps) {
   return (
     <img 
-      src={cursorMark} 
+      src="/cursor-mark.png" 
       width={size} 
       height={size} 
       className={cn("object-contain dark:invert", className)}

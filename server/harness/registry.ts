@@ -4,8 +4,9 @@
 // startup failure (that behavior is what makes settings forward/backward
 // compatible — do not remove it); dispose tears an instance down without
 // touching its siblings.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { writeFileAtomic } from "../atomic.ts";
 import { usageQuotaPoller } from "../usage-quota.ts";
 import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-display.ts";
 import { lastAntigravityQuotaSnapshot, quotaModelsFromSnapshot } from "../antigravity-quota.ts";
@@ -134,6 +135,8 @@ export interface DescribedInstance {
     effortLevels?: readonly string[];
     queueing?: boolean;
     approvalReview?: boolean;
+    /** True when this engine runs the harness HTTP tool loop. */
+    toolLoop: boolean;
   };
   /** Which computer destinations this engine can be given at all — the ONE
    *  answer, derived from the adapter's own flags in `computer-capability.ts`
@@ -316,19 +319,22 @@ export class ProviderRegistry {
 
   setDiskCachePath(path: string | null): void {
     this.diskCachePath = path;
-    if (path && existsSync(path)) {
-      try {
-        const raw = readFileSync(path, "utf8");
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          this.lastDescribe = {
-            at: Date.now(),
-            result: Promise.resolve(parsed as DescribedInstance[]),
-          };
-        }
-      } catch {
-        // Corrupt or unreadable cache — ignore and start fresh
+    if (!path || !existsSync(path)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      // Legacy shape was a bare array with no captured timestamp — treat it
+      // as probed now, the best available answer. The current shape carries
+      // the time the probe actually finished, so a caller passing maxAgeMs
+      // without staleWhileRevalidate does not treat a cache written minutes
+      // or hours ago as if it just landed.
+      const legacy = Array.isArray(parsed);
+      const at = legacy ? Date.now() : typeof parsed?.at === "number" ? parsed.at : Date.now();
+      const instances = legacy ? parsed : parsed?.instances;
+      if (Array.isArray(instances) && instances.length > 0) {
+        this.lastDescribe = { at, result: Promise.resolve(instances as DescribedInstance[]) };
       }
+    } catch {
+      // Corrupt or unreadable cache — ignore and start fresh
     }
   }
 
@@ -337,7 +343,7 @@ export class ProviderRegistry {
     try {
       const dir = dirname(this.diskCachePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(this.diskCachePath, JSON.stringify(instances, null, 2), "utf8");
+      writeFileAtomic(this.diskCachePath, JSON.stringify({ at: Date.now(), instances }));
     } catch {
       // Non-fatal if saving cache fails
     }
@@ -365,13 +371,12 @@ export class ProviderRegistry {
   private refreshDescribe(at: number) {
     const result = this.describeFresh();
     this.lastDescribe = { at, result };
-    void result
-      .then((instances) => {
-        this.saveDiskCache(instances);
-      })
-      .catch(() => {
-        if (this.lastDescribe?.result === result) this.lastDescribe = null;
-      });
+    // describeFresh() already persists the disk cache once on success (see
+    // below); only guard against a failed probe here, or every probe would
+    // write the cache twice.
+    void result.catch(() => {
+      if (this.lastDescribe?.result === result) this.lastDescribe = null;
+    });
     return result;
   }
 
@@ -409,7 +414,7 @@ export class ProviderRegistry {
         enabled,
         snapshot: { state: "unavailable", reason: entry.shadow.reason } satisfies ProviderSnapshot,
         models: { default: "", options: [] },
-        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false },
         // A shadow has no adapter to ask, so the derivation is fed the same
         // all-false capabilities reported above.  That leaves the box-native
         // engine reaching its own box — which is what the client computed
@@ -657,6 +662,7 @@ export class ProviderRegistry {
         queueing: inst.adapter.capabilities.queueing === true,
         localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
         approvalReview: inst.reviewPermission !== undefined,
+        toolLoop: inst.adapter.capabilities.toolLoop === true,
       },
       // Derived here, on the one wire where adapter capabilities already
       // become an InstanceInfo, so the client never recomputes it and can

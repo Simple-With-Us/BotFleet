@@ -12,8 +12,11 @@ import {
   removeTranscriptLogs,
   EVENTS_LOG_MAX_BYTES,
   NATIVE_LOG_MAX_BYTES,
+  ORPHAN_MAX_AGE_MS,
+  describeOrphanSweep,
   describeSweep,
   rotatedPath,
+  sweepOrphanedTranscripts,
   sweepTranscriptLogs,
   transcriptLogPaths,
   trimToTail,
@@ -372,5 +375,164 @@ describe("caps and paths", () => {
     expect(NATIVE_LOG_MAX_BYTES).toBe(64 * 1024 * 1024);
     expect(EVENTS_LOG_MAX_BYTES).toBe(16 * 1024 * 1024);
     expect(EVENTS_LOG_MAX_BYTES).toBeLessThan(NATIVE_LOG_MAX_BYTES);
+  });
+});
+
+describe("sweepOrphanedTranscripts", () => {
+  const OLD = Date.now() - ORPHAN_MAX_AGE_MS - 24 * 60 * 60 * 1000; // 8 days ago
+  const RECENT = Date.now();
+
+  function age(file: string, at: number) {
+    const d = new Date(at);
+    utimesSync(file, d, d);
+  }
+
+  it("removes an orphaned thread's logs, both directories and both generations, once old enough", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const files = [
+      join(eventsDir, "orphan.ndjson"),
+      join(eventsDir, "orphan.ndjson.1"),
+      join(nativeDir, "orphan.ndjson"),
+      join(nativeDir, "orphan.ndjson.1"),
+    ];
+    for (const file of files) {
+      writeFileSync(file, "x".repeat(10));
+      age(file, OLD);
+    }
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 4, bytesReclaimed: 40, dryRun: false });
+    for (const file of files) expect(existsSync(file)).toBe(false);
+  });
+
+  it("folds a stray trim temp file into its thread's byte and file count", () => {
+    // removeTranscriptLogs already deletes a thread's leftover *.tmp files
+    // alongside its logs; this pins that the count and bytes this function
+    // reports agree with that, rather than under-reporting whenever an
+    // interrupted trim left one behind (Sentry finding on PR #599).
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const log = join(nativeDir, "orphan.ndjson");
+    const temp = join(nativeDir, `orphan.ndjson.${process.pid}.123e4567-e89b-42d3-a456-426614174000.tmp`);
+    writeFileSync(log, "x".repeat(10));
+    writeFileSync(temp, "y".repeat(7));
+    age(log, OLD);
+    age(temp, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 2, bytesReclaimed: 17, dryRun: false });
+    expect(existsSync(log)).toBe(false);
+    expect(existsSync(temp)).toBe(false);
+  });
+
+  it("dry run previews a stray temp file's bytes too, without touching disk", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const log = join(nativeDir, "preview2.ndjson");
+    const temp = join(nativeDir, `preview2.ndjson.${process.pid}.123e4567-e89b-42d3-a456-426614174000.tmp`);
+    writeFileSync(log, "a".repeat(3));
+    writeFileSync(temp, "b".repeat(4));
+    age(log, OLD);
+    age(temp, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(), { dryRun: true });
+    expect(result).toEqual({ ids: 1, files: 2, bytesReclaimed: 7, dryRun: true });
+    expect(existsSync(log)).toBe(true);
+    expect(existsSync(temp)).toBe(true);
+  });
+
+  it("never deletes a file for a live id, no matter how old", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "live.ndjson");
+    writeFileSync(file, "x");
+    age(file, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(["live"]));
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("leaves an orphaned thread alone until it is old enough", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "fresh-orphan.ndjson");
+    writeFileSync(file, "x");
+    age(file, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("a recent write in EITHER directory keeps the whole thread out of the age check", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const oldFile = join(nativeDir, "mixed.ndjson");
+    const recentFile = join(eventsDir, "mixed.ndjson");
+    writeFileSync(oldFile, "x");
+    age(oldFile, OLD);
+    writeFileSync(recentFile, "x");
+    age(recentFile, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+    expect(existsSync(oldFile)).toBe(true);
+    expect(existsSync(recentFile)).toBe(true);
+  });
+
+  it("dry run reports exactly what a real run would do, without touching disk", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const file = join(eventsDir, "preview.ndjson");
+    writeFileSync(file, "12345");
+    age(file, OLD);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(), { dryRun: true });
+    expect(result).toEqual({ ids: 1, files: 1, bytesReclaimed: 5, dryRun: true });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it("ignores threads not old enough while removing the ones that are, in the same pass", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const stale = join(eventsDir, "stale.ndjson");
+    const fresh = join(eventsDir, "fresh.ndjson");
+    writeFileSync(stale, "x");
+    age(stale, OLD);
+    writeFileSync(fresh, "x");
+    age(fresh, RECENT);
+
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set());
+    expect(result.ids).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("survives directories that do not exist", () => {
+    const result = sweepOrphanedTranscripts(
+      { eventsDir: join(tmp(), "nope-e"), nativeDir: join(tmp(), "nope-n") },
+      new Set(),
+    );
+    expect(result).toEqual({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false });
+  });
+});
+
+describe("describeOrphanSweep", () => {
+  it("says nothing when nothing was removed", () => {
+    expect(describeOrphanSweep({ ids: 0, files: 0, bytesReclaimed: 0, dryRun: false })).toBeNull();
+  });
+
+  it("reports what it removed", () => {
+    expect(describeOrphanSweep({ ids: 2, files: 4, bytesReclaimed: 1234, dryRun: false })).toBe(
+      "[retention] removed 4 transcript logs, 1234 bytes",
+    );
+  });
+
+  it("reports what a dry run would have removed, using the singular for one file", () => {
+    expect(describeOrphanSweep({ ids: 1, files: 1, bytesReclaimed: 10, dryRun: true })).toBe(
+      "[retention] would remove 1 transcript log, 10 bytes",
+    );
   });
 });

@@ -104,6 +104,21 @@ describe("UsageWhatIfProjection — render", () => {
     expect(html).toContain("API-equivalent");
   });
 
+  it("shows PAYG engines as PAYG and keeps them out of the cost and saved totals", () => {
+    const html = renderToStaticMarkup(
+      createElement(UsageWhatIfProjection, {
+        periodLabel: "Last 30 days",
+        byEngine: [
+          { engineId: "deepseek-harness", totalTokens: 1_000_000, inputTokens: 1_000_000, outputTokens: 0, cachedTokens: 0, actualCostUsd: 0 },
+        ],
+      }),
+    );
+    expect(html).toContain(">PAYG<");
+    expect(html).not.toContain(">$0<");
+    // Row saved, row %, and total % all read as a dash; nothing is booked as saved.
+    expect(html).not.toMatch(/emerald[^>]*>\$[1-9]/);
+  });
+
   it("renders the no-data message when nothing has a pricing block", () => {
     const html = renderToStaticMarkup(
       createElement(UsageWhatIfProjection, { periodLabel: "Last 30 days", byEngine: [] }),

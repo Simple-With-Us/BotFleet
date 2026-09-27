@@ -124,7 +124,7 @@ describe("companionPairingLink", () => {
 
   it("makes the automatic QR hosted-only even when Tailscale and LAN are advertised", () => {
     const endpoints = [
-      { url: "https://device.botfleet.com", kind: "hosted" as const, priority: 0 },
+      { url: "https://device.botfleet.app", kind: "hosted" as const, priority: 0 },
       { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet" as const, priority: 100 },
       { url: "http://192.168.1.42:8810", kind: "lan" as const, priority: 200 },
     ];
@@ -137,15 +137,15 @@ describe("companionPairingLink", () => {
     }, "automatic");
 
     expect(route).toEqual({
-      address: "device.botfleet.com",
+      address: "device.botfleet.app",
       port: 443,
-      hosts: ["device.botfleet.com"],
+      hosts: ["device.botfleet.app"],
       endpoints: [endpoints[0]],
     });
     const link = companionPairingLink({ ...route!, code: "004209", token });
     const url = new URL(link!);
-    expect(url.searchParams.get("address")).toBe("device.botfleet.com:443");
-    expect(url.searchParams.get("hosts")).toBe("device.botfleet.com");
+    expect(url.searchParams.get("address")).toBe("device.botfleet.app:443");
+    expect(url.searchParams.get("hosts")).toBe("device.botfleet.app");
     expect(url.searchParams.get("hosts")).not.toContain("192.168.1.42");
     expect(url.searchParams.get("hosts")).not.toContain("tail1234.ts.net");
     expect(decodedEndpoints(link!)).toEqual([endpoints[0]]);
@@ -180,20 +180,20 @@ describe("companionPairingLink", () => {
       lan: "192.168.1.42",
       hosts: ["192.168.1.42"],
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted" as const, priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted" as const, priority: 0 },
         { url: "http://192.168.1.42:8810", kind: "lan" as const, priority: 200 },
       ],
     };
     const pin = companionPairingRoutePin(opened, "automatic");
     expect(pin?.protectedEndpoint).toEqual({
-      url: "https://device.botfleet.com",
+      url: "https://device.botfleet.app",
       kind: "hosted",
       priority: 0,
     });
     expect(pin?.route).toMatchObject({
-      address: "device.botfleet.com",
+      address: "device.botfleet.app",
       port: 443,
-      hosts: ["device.botfleet.com"],
+      hosts: ["device.botfleet.app"],
     });
 
     const withdrawn = {
@@ -210,7 +210,7 @@ describe("companionPairingLink", () => {
       port: 8810,
       tailnetName: "mac.tail1234.ts.net",
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted" as const, priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted" as const, priority: 0 },
         { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet" as const, priority: 100 },
       ],
     };
@@ -227,14 +227,14 @@ describe("companionPairingLink", () => {
       lan: "192.168.1.42",
       endpoints: [
         { url: "http://192.168.1.42:8810", kind: "lan", priority: 0 },
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 100 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 100 },
       ],
     }, "automatic")?.route).toEqual({
-      address: "device.botfleet.com",
+      address: "device.botfleet.app",
       port: 443,
-      hosts: ["device.botfleet.com"],
+      hosts: ["device.botfleet.app"],
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 100 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 100 },
       ],
     });
   });
@@ -246,7 +246,7 @@ describe("companionPairingLink", () => {
       lan: "192.168.1.42",
       hosts: ["mac.tail1234.ts.net", "192.168.1.42", "botfleet-aa.local"],
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 0 },
         { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet", priority: 100 },
         { url: "http://192.168.1.42:8810", kind: "lan", priority: 200 },
         { url: "http://botfleet-aa.local:8810", kind: "bonjour", priority: 300 },
@@ -263,7 +263,7 @@ describe("companionPairingLink", () => {
     expect(new URL(link!).searchParams.get("address")).toBe("192.168.1.42:8810");
     expect(decodedEndpoints(link!)).toEqual([
       { url: "http://192.168.1.42:8810", kind: "lan", priority: 0 },
-      { url: "https://device.botfleet.com", kind: "hosted", priority: 100 },
+      { url: "https://device.botfleet.app", kind: "hosted", priority: 100 },
       { url: "http://botfleet-aa.local:8810", kind: "bonjour", priority: 200 },
     ]);
   });
@@ -275,7 +275,7 @@ describe("companionPairingLink", () => {
       lan: "192.168.1.42",
       hosts: ["mac.tail1234.ts.net", "192.168.1.42", "botfleet-aa.local"],
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 0 },
         { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet", priority: 100 },
         { url: "http://192.168.1.42:8810", kind: "lan", priority: 200 },
         { url: "http://botfleet-aa.local:8810", kind: "bonjour", priority: 300 },
@@ -290,7 +290,7 @@ describe("companionPairingLink", () => {
     const link = companionPairingLink({ ...route!, code: "004209", token });
     expect(decodedEndpoints(link!)).toEqual([
       { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet", priority: 0 },
-      { url: "https://device.botfleet.com", kind: "hosted", priority: 100 },
+      { url: "https://device.botfleet.app", kind: "hosted", priority: 100 },
     ]);
     expect(new URL(link!).searchParams.get("hosts")).toBe("mac.tail1234.ts.net");
   });
@@ -311,7 +311,7 @@ describe("companionPairingLink", () => {
       tailnetName: "mac.tail1234.ts.net",
       hosts: ["mac.tail1234.ts.net"],
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 0 },
         { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet", priority: 100 },
       ],
     }, "local")).toBeNull();
@@ -323,7 +323,7 @@ describe("companionPairingLink", () => {
       hosts: ["mac.tail1234.ts.net", "botfleet-aa.local"],
       discovery: { advertising: true, name: "botfleet-aa.local" },
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 0 },
         { url: "http://botfleet-aa.local:8810", kind: "bonjour", priority: 300 },
       ],
     }, "local");
@@ -339,7 +339,7 @@ describe("companionPairingLink", () => {
       hosts: ["mac.tail1234.ts.net", "botfleet-aa.local"],
       discovery: { advertising: false, name: "botfleet-aa.local" },
       endpoints: [
-        { url: "https://device.botfleet.com", kind: "hosted", priority: 0 },
+        { url: "https://device.botfleet.app", kind: "hosted", priority: 0 },
         { url: "http://botfleet-aa.local:8810", kind: "bonjour", priority: 300 },
       ],
     }, "local")).toBeNull();

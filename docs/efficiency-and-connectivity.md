@@ -30,6 +30,30 @@ Unattended turns may downgrade to cheaper catalog entries when the bot allows
 it (PR #533).  A 180s provider timeout is treated as silence, not a hard
 failure, when the bot is unattended.
 
+### Unattended Request Ceiling (MiniMax)
+
+Separately from the silence-treatment above, `server/drivers/minimax.ts` gives
+an unattended turn a 900s per-request ceiling (the turn's own wall-clock
+budget) — PR #625, following up on board row bf77b434 (BOTFLEET-V), where the
+Compiler bot's CI-webhook turns were repeatedly cut off at 180s mid-answer.  A
+CONNECTION that goes fully silent is still caught much sooner than 900s by a
+separate idle-stall guard (`STREAM_IDLE_TIMEOUT_MS`, 120s of no bytes from
+the reader) that fails the round as a retryable `provider_error` rather than
+riding the full budget.
+
+### Interactive Round Budget (HTTP Lane)
+
+The fixed 180s interactive ceiling is gone.  Every HTTP-lane driver
+(`grok.ts`, `minimax.ts`, `openai-compat.ts`) now takes the shared
+`runTurnLoop` budget in `server/drivers/chat-completions/loop.ts`: a HARD
+ceiling of 600s on one model round, however live its stream is, plus an IDLE
+clock of 120s that every chunk off the socket re-arms.  A slow reasoning
+round that keeps streaming runs to the hard ceiling; a silent connection ends
+in 120s.  The idle expiry is terminal for the turn, not a retried transient,
+so a first byte that never arrives after a tool call ends the turn at 120s.
+Unattended MiniMax turns keep `readChunkOrStall` as their only idle guard
+(`requestIdleMs: 0`) until the shared clock has run in production.
+
 ## Harness Self-Heal
 
 The always-on LaunchAgent runs `~/apps/botfleet-server-start.sh` against the

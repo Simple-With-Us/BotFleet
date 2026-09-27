@@ -240,7 +240,7 @@ describe("resolveGrants", () => {
   });
 
   it("leaves an ordinary turn alone when runOn is anything else", () => {
-    expect(resolveGrants(["vm"], "maus")).toEqual({ granted: ["vm"], auto: false });
+    expect(resolveGrants(["vm"], "bot")).toEqual({ granted: ["vm"], auto: false });
     expect(resolveGrants(undefined, undefined)).toEqual({ granted: [], auto: true });
   });
 });
@@ -316,7 +316,7 @@ describe("workspace defaults", () => {
     expect(cloudRunUsesBoxAgent("cloud", "box", undefined)).toBe(true);
     expect(cloudRunUsesBoxAgent("cloud", undefined, undefined)).toBe(true);
     expect(cloudRunUsesBoxAgent("cloud", undefined, "box")).toBe(true);
-    expect(cloudRunUsesBoxAgent("maus", "box", undefined)).toBe(false);
+    expect(cloudRunUsesBoxAgent("bot", "box", undefined)).toBe(false);
     expect(cloudRunUsesBoxAgent(undefined, "box", undefined)).toBe(false);
   });
 });

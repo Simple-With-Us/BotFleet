@@ -300,6 +300,29 @@ describe("wire shape", () => {
     expect(first?.metadata.success).toBe(false);
   });
 
+  it("carries the prompt halves' byte counts as two flat numbers, and omits them when the prompt was not split", () => {
+    // Upstream PR #1758's promptBytes {stable, volatile}, flattened: the v2
+    // metadata bag is a `z.record` of primitives, so a nested object would
+    // reject the whole event.  On every slice, like the token figures, so a
+    // reader that filters by tokenType still sees them.
+    const events = build({ inputTokens: 1000, cachedInputTokens: 400, outputTokens: 200, promptBytes: { stable: 4096, volatile: 128 } });
+    expect(events).toHaveLength(3);
+    for (const event of events) {
+      expect(event.metadata.promptStableBytes).toBe(4096);
+      expect(event.metadata.promptVolatileBytes).toBe(128);
+      for (const value of Object.values(event.metadata)) {
+        expect(value === null || typeof value !== "object").toBe(true);
+      }
+    }
+    for (const event of build({ inputTokens: 10 })) {
+      expect(event.metadata).not.toHaveProperty("promptStableBytes");
+      expect(event.metadata).not.toHaveProperty("promptVolatileBytes");
+    }
+    // a size is a non-negative integer or nothing
+    expect(build({ promptBytes: { stable: 12.6, volatile: -3 } })[0]?.metadata).toMatchObject({ promptStableBytes: 13, promptVolatileBytes: 0 });
+    expect(build({ promptBytes: { stable: NaN, volatile: 1 } })[0]?.metadata).not.toHaveProperty("promptStableBytes");
+  });
+
   it("omits unavailable or invalid latency instead of reporting a fabricated zero", () => {
     for (const latencyMs of [undefined, NaN, -1, Infinity]) {
       const [event] = build({ latencyMs });

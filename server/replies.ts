@@ -14,6 +14,16 @@ export function replySpeaker(message: Message, userName = "User"): string {
   return message.role === "user" ? userName : (message.from?.name ?? "Assistant");
 }
 
+/** Human-readable speaker for Markdown transcript exports. */
+export function exportMessageSpeaker(message: Message, userName: string, botName?: string): string {
+  if (message.automationSource === "delegation") {
+    return `Delegated by @${message.from?.name ?? "Peer Bot"}`;
+  }
+  if (message.role === "user") return userName;
+  if (message.role === "system") return "Scheduled Run";
+  return message.from?.name ?? botName ?? "Bot";
+}
+
 /** Add the reply relationship to a provider turn without altering the text
  * persisted in the transcript. The quote is explicitly conversation data:
  * it cannot grant tools or override the current system prompt. */

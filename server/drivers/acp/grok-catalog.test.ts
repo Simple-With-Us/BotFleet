@@ -25,7 +25,13 @@ describe("readGrokModelCatalog", () => {
       default: "grok-4.7",
       options: [
         { id: "grok-4.7", label: "Grok 4.7" },
-        { id: "grok-4.7-build-fast", label: "Grok 4.7 Build Fast" },
+        {
+          id: "grok-4.7-build-fast",
+          label: "Grok 4.7 Build Fast",
+          badge: "2× $",
+          badgeTitle:
+            "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+        },
         { id: "grok-4.6", label: "Grok 4.6" },
         { id: "grok-4.5", label: "Grok 4.5" },
       ],
@@ -57,7 +63,13 @@ name = "MiniMax M3 4bit (oMLX)"
       default: "ollama-ornith-35b-bf16",
       options: [
         { id: "grok-4.7", label: "Grok 4.7" },
-        { id: "grok-4.7-build-fast", label: "Grok 4.7 Build Fast" },
+        {
+          id: "grok-4.7-build-fast",
+          label: "Grok 4.7 Build Fast",
+          badge: "2× $",
+          badgeTitle:
+            "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+        },
         { id: "grok-4.6", label: "Grok 4.6" },
         { id: "grok-4.5", label: "Grok 4.5" },
         { id: "ollama-ornith-35b-bf16", label: "ornith:35b-bf16 (Ollama)", custom: true },

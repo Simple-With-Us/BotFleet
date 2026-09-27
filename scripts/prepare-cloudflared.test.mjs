@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   CLOUDFLARED_ASSETS,
   CLOUDFLARED_VERSION,
+  cloudflaredArchiveCacheDirectory,
+  currentOnlyFromEnv,
+  describeDownloadFailure,
+  downloadRelease,
   executableTarget,
   parsePrepareCloudflaredArgs,
   sha256,
@@ -122,5 +127,80 @@ describe("pinned cloudflared packaging", () => {
     const bytes = executableFixture("darwin-arm64");
     expect(() => verifyPinnedBinary(bytes, "darwin-x64")).toThrow(/architecture mismatch/);
     expect(() => verifyPinnedBinary(bytes, "darwin-arm64")).toThrow(/SHA-256 verification/);
+  });
+});
+
+describe("the download of last resort", () => {
+  it("names the network cause rather than the exception class", () => {
+    const timeout = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    expect(describeDownloadFailure(timeout, 600_000)).toBe("the download timed out after 600s");
+    expect(describeDownloadFailure(new Error("getaddrinfo ENOTFOUND github.com")))
+      .toBe("getaddrinfo ENOTFOUND github.com");
+  });
+
+  it("retries a transfer that drops before it gives up", async () => {
+    let calls = 0;
+    const body = await downloadRelease("https://example.invalid/cloudflared.tgz", "cloudflared-darwin-arm64.tgz", {
+      fetchImpl: async () => {
+        calls += 1;
+        if (calls < 3) throw Object.assign(new Error("timed out"), { name: "TimeoutError" });
+        return { ok: true, arrayBuffer: async () => new TextEncoder().encode("tgz").buffer };
+      },
+      wait: async () => {},
+      log: () => {},
+    });
+    expect(calls).toBe(3);
+    expect(body.toString()).toBe("tgz");
+  });
+
+  it("gives up after the last attempt, saying what the network did", async () => {
+    let calls = 0;
+    await expect(downloadRelease("https://example.invalid/cloudflared.tgz", "cloudflared-darwin-arm64.tgz", {
+      fetchImpl: async () => {
+        calls += 1;
+        throw Object.assign(new Error("timed out"), { name: "TimeoutError" });
+      },
+      timeoutMs: 600_000,
+      wait: async () => {},
+      log: () => {},
+    })).rejects.toThrow(/timed out after 600s/);
+    expect(calls).toBe(3);
+  });
+
+  it("treats a non-2xx answer as a failed attempt, not as an archive", async () => {
+    await expect(downloadRelease("https://example.invalid/cloudflared.tgz", "cloudflared-darwin-arm64.tgz", {
+      fetchImpl: async () => ({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0) }),
+      attempts: 2,
+      wait: async () => {},
+      log: () => {},
+    })).rejects.toThrow(/HTTP 503/);
+  });
+});
+
+describe("where a downloaded archive is cached", () => {
+  const HOME = join("/home", "jay");
+
+  it("keeps the shared cache outside any checkout, per platform", () => {
+    expect(cloudflaredArchiveCacheDirectory({ platform: "darwin", home: HOME, env: {} }))
+      .toBe(join(HOME, "Library", "Caches", "BotFleet", "cloudflared-archives"));
+    expect(cloudflaredArchiveCacheDirectory({ platform: "linux", home: HOME, env: {} }))
+      .toBe(join(HOME, ".cache", "botfleet", "cloudflared-archives"));
+    expect(cloudflaredArchiveCacheDirectory({ platform: "linux", home: HOME, env: { XDG_CACHE_HOME: join("/x", "cache") } }))
+      .toBe(join("/x", "cache", "botfleet", "cloudflared-archives"));
+    expect(cloudflaredArchiveCacheDirectory({ platform: "win32", home: HOME, env: { LOCALAPPDATA: join("C:", "local") } }))
+      .toBe(join("C:", "local", "BotFleet", "Cache", "cloudflared-archives"));
+    // The documented override still wins everywhere, which is how a
+    // reviewed local download is used instead of the network.
+    expect(cloudflaredArchiveCacheDirectory({ platform: "darwin", home: HOME, env: { OMB_CLOUDFLARED_ARCHIVE_DIR: "/tmp/c" } }))
+      .toBe("/tmp/c");
+  });
+});
+
+describe("the Mac updater's single-architecture staging", () => {
+  it("only takes --current from the environment when it is exactly set", () => {
+    expect(currentOnlyFromEnv({})).toBe(false);
+    expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "1" })).toBe(true);
+    expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "true" })).toBe(false);
+    expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "" })).toBe(false);
   });
 });

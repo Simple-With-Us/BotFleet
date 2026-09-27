@@ -5,7 +5,14 @@
 // cards render model output and message previews, so it would leak fragments
 // of private conversations to a third party. Email submissions call
 // identify(), so PostHog's Persons tab doubles as the collected-email list.
-import posthog from "posthog-js";
+//
+// posthog-js is a dynamic import (UI3 in docs/audits/2026-09-24-efficiency-
+// audit.md): an install that is opted out, or simply hasn't called
+// initAnalytics() yet, must not ship the SDK in the main chunk. track() and
+// identifyEmail() calls made while the import is in flight queue and flush
+// once it resolves; if it never resolves (opted out before it finished, or
+// the import itself fails) the queue is dropped rather than held forever.
+import type { PostHog } from "posthog-js";
 
 const TOKEN = "phc_m2hP39w8y2gLPvHgDvSXAu6xcZ3agjf4ruL56rGcMZEe";
 
@@ -16,7 +23,29 @@ const TOKEN = "phc_m2hP39w8y2gLPvHgDvSXAu6xcZ3agjf4ruL56rGcMZEe";
 // through opt_out_capturing(), which also drops anything already queued.
 const OPT_OUT_KEY = "omb-analytics-opt-out";
 
+/** How this module reaches the real SDK — swappable so a test can control
+ * exactly when "the import resolved" happens and with what client, the way
+ * `SentryBrowserPort` lets sentry.ts's tests script the browser SDK without
+ * ever loading it. */
+export type PostHogLoader = () => Promise<PostHog>;
+const realLoader: PostHogLoader = () => import("posthog-js").then((m) => m.default);
+let loadPostHog: PostHogLoader = realLoader;
+
 let ready = false;
+/** The loaded client, once the loader's promise resolves with the install
+ * still opted in at that moment. */
+let posthog: PostHog | null = null;
+/** In flight while the SDK is loading — distinguishes "nothing has asked for
+ * analytics yet" (drop below) from "it is on the way" (queue below). */
+let loading: Promise<PostHog> | null = null;
+/** Calls made while `loading` is in flight, flushed in order once ready.
+ * Capped so a loader that never resolves cannot grow this forever. */
+const QUEUE_MAX = 50;
+let queue: Array<() => void> = [];
+function enqueue(call: () => void): void {
+  if (queue.length >= QUEUE_MAX) queue.shift();
+  queue.push(call);
+}
 
 // The choice as made in THIS process, which outranks storage. Without it a
 // rejected write silently loses an opt-out: the setter would swallow the
@@ -54,10 +83,11 @@ export function setAnalyticsEnabled(enabled: boolean) {
   }
   switch (optAction(enabled, ready)) {
     case "opt-out":
-      posthog.opt_out_capturing(); // also drops whatever is still queued
+      posthog?.opt_out_capturing(); // also drops whatever PostHog itself queued
+      queue = []; // and whatever was waiting on the SDK to finish loading
       break;
     case "opt-in":
-      posthog.opt_in_capturing();
+      posthog?.opt_in_capturing();
       break;
     case "init":
       initAnalytics(); // first opt-in of a session that started opted out
@@ -68,34 +98,60 @@ export function setAnalyticsEnabled(enabled: boolean) {
 }
 
 export function initAnalytics() {
-  if (ready || !analyticsEnabled()) return;
-  posthog.init(TOKEN, {
-    api_host: "https://us.i.posthog.com",
-    autocapture: false, // never capture clicked-element text (conversation leak)
-    capture_pageview: false, // single-window desktop app — no page routes
-    person_profiles: "identified_only",
-    persistence: "localStorage",
-  });
-  // opt_out_capturing() persists in PostHog's own storage, so after
-  // opt-out → restart → opt-in the client would boot opted out and drop
-  // every capture below while the switch says on. Clear the stale flag
-  // before the first capture of the session.
-  if (posthog.has_opted_out_capturing()) posthog.opt_in_capturing();
-  ready = true;
-  const platform = navigator.userAgent.includes("Electron") ? "desktop" : "browser";
-  // one-time install marker — app_first_open counts installs (the closest
-  // truth to "downloads that mattered"; raw download counts live on the
-  // GitHub release assets)
-  if (!localStorage.getItem("omb-installed")) {
-    localStorage.setItem("omb-installed", new Date().toISOString());
-    posthog.capture("app_first_open", { platform });
-  }
-  posthog.capture("app_opened", { platform });
+  if (ready || loading || !analyticsEnabled()) return;
+  loading = loadPostHog();
+  void loading
+    .then((client) => {
+      // Opted out while the SDK was loading: never call init() — the same
+      // rule as an install with no token at all. See the header comment.
+      if (!analyticsEnabled()) {
+        loading = null;
+        queue = []; // drop anything waiting on the load that just got aborted
+        return;
+      }
+      posthog = client;
+      client.init(TOKEN, {
+        api_host: "https://us.i.posthog.com",
+        autocapture: false, // never capture clicked-element text (conversation leak)
+        capture_pageview: false, // single-window desktop app — no page routes
+        person_profiles: "identified_only",
+        persistence: "localStorage",
+      });
+      // opt_out_capturing() persists in PostHog's own storage, so after
+      // opt-out → restart → opt-in the client would boot opted out and drop
+      // every capture below while the switch says on. Clear the stale flag
+      // before the first capture of the session.
+      if (client.has_opted_out_capturing()) client.opt_in_capturing();
+      ready = true;
+      const platform = navigator.userAgent.includes("Electron") ? "desktop" : "browser";
+      // one-time install marker — app_first_open counts installs (the closest
+      // truth to "downloads that mattered"; raw download counts live on the
+      // GitHub release assets)
+      if (!localStorage.getItem("omb-installed")) {
+        localStorage.setItem("omb-installed", new Date().toISOString());
+        client.capture("app_first_open", { platform });
+      }
+      client.capture("app_opened", { platform });
+      const queued = queue;
+      queue = [];
+      for (const call of queued) call();
+    })
+    .catch(() => {
+      // The SDK failed to load (offline first launch, a blocked request, …)
+      // — stay exactly as inert as an install with no client, and do not
+      // hold queued calls forever.
+      loading = null;
+      queue = [];
+    });
 }
 
 export function track(event: string, props?: Record<string, unknown>) {
-  if (!ready || !analyticsEnabled()) return;
-  posthog.capture(event, props);
+  if (!analyticsEnabled()) return;
+  if (ready && posthog) {
+    posthog.capture(event, props);
+    return;
+  }
+  if (loading) enqueue(() => posthog?.capture(event, props));
 }
 
 // Checked here as well as in track(): this is the one call that would send a
@@ -103,9 +159,16 @@ export function track(event: string, props?: Record<string, unknown>) {
 // The address is still stored locally in the profile either way — opting out
 // stops it from being reported, not from being used.
 export function identifyEmail(email: string) {
-  if (!ready || !analyticsEnabled()) return;
-  posthog.identify(email, { email });
-  posthog.capture("email_submitted");
+  if (!analyticsEnabled()) return;
+  const send = () => {
+    posthog?.identify(email, { email });
+    posthog?.capture("email_submitted");
+  };
+  if (ready && posthog) {
+    send();
+    return;
+  }
+  if (loading) enqueue(send);
 }
 
 // first-run email gate state
@@ -115,4 +178,23 @@ export function emailGateDone(): boolean {
 }
 export function setEmailGateDone(status: "submitted" | "skipped") {
   localStorage.setItem(GATE_KEY, status);
+}
+
+/** Install a stand-in loader so a test can script exactly when "the SDK
+ * finished loading" happens, and with what client, without ever importing
+ * the real posthog-js. Pass null to restore the real dynamic import. */
+export function setPostHogLoaderForTests(loader: PostHogLoader | null): void {
+  loadPostHog = loader ?? realLoader;
+}
+
+/** Reset every module-scoped flag a test might have driven. The stored
+ * opt-out itself is not touched — tests manage that through localStorage
+ * directly, the same as a real restart would read it. */
+export function resetAnalyticsForTests(): void {
+  ready = false;
+  posthog = null;
+  loading = null;
+  queue = [];
+  choice = undefined;
+  loadPostHog = realLoader;
 }

