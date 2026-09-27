@@ -9,6 +9,7 @@ import { dirname } from "node:path";
 import { STATIC_ANTIGRAVITY_MODELS } from "./antigravity-models.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { writeFileAtomic } from "./atomic.ts";
+import { doomedDispatches } from "./doomed-dispatch.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
@@ -386,6 +387,36 @@ export function quotaOrCapFromErrorCode(code: ProviderErrorCode | undefined): bo
   return code === "quota_or_region_restriction" || code === "upstream_outage";
 }
 
+// ── setup-dead engines are not fallback candidates ──────────────────────
+// The quota cooldown keeps a bot off a model that is BUSY: the engine starts
+// fine and the provider is rate-limited or capped for a while.  The doomed
+// breaker in doomed-dispatch.ts keeps a bot off an engine that is DEAD: the
+// CLI is not installed, is not executable, or is waiting on an interactive
+// login.  Both refuse the same (bot, engine) pair, and the second gap the
+// breaker left open was the fallback chain: a bot whose primary failed over
+// cleanly was still offered a chain entry naming an equally dead engine, so
+// the turn died again having burned the whole chain.  Measured on the live
+// Mac, 216 of 2,001 runs were `spawn_error` because the process never came
+// up at all, and two bots whose primary is `antigravity` had already fallen
+// back — the fail-over is the exact moment a second dead engine gets picked.
+//
+// Importing doomed-dispatch.ts here is acyclic: its only relative import is
+// ./atomic.ts, which imports nothing but node builtins.
+
+/** Is this (bot, engine) pair currently refusing dispatches?  Takes the same
+ *  `now` the surrounding code already has so a caller can evaluate the whole
+ *  chain against one instant. */
+export type DoomedEngineGate = (botId: string, instanceId: string, now: number) => boolean;
+
+const defaultDoomedGate: DoomedEngineGate = (botId, instanceId, now) =>
+  doomedDispatches.isOpen(botId, instanceId, now);
+
+/** The gate to consult for one call: the caller's own, or the process-wide
+ *  breaker the dispatcher and `canStart` already read. */
+function doomedGate(gate: DoomedEngineGate | undefined): DoomedEngineGate {
+  return gate ?? defaultDoomedGate;
+}
+
 // ── #90 auto-failover priority (server/index.ts's autoFallbackChain) ────
 // Most-preferred first, handed straight to turn-safety.ts's
 // eligibleAutoFallbackChain.  It lives here rather than inline in index.ts
@@ -405,7 +436,13 @@ export const AUTO_FALLBACK_PRIORITY: readonly string[] = [
 
 /** Next saved fallback engine, or undefined when this turn must not fail over.
  * Quota/cap chips ignore prior tool activity.  Chain entries that match the
- * current primary are skipped so a same-model fallback cannot loop. */
+ * current primary are skipped so a same-model fallback cannot loop, and a
+ * chain entry the doomed breaker is refusing is skipped so a fail-over cannot
+ * hand the turn to a second engine that cannot start.
+ *
+ * `botId` is what makes that last skip possible: the breaker is keyed on
+ * (bot, engine), and no bot id means no answer, so a caller that has not
+ * started threading one through gets today's behaviour unchanged. */
 export function selectTurnFallback(input: {
   ok: boolean;
   stopReason?: string | null;
@@ -414,6 +451,11 @@ export function selectTurnFallback(input: {
   fallbacks?: ModelSelection[] | null;
   used: number;
   current?: { instanceId: string; model: string } | null;
+  /** Owning bot, for the doomed-dispatch breaker.  Omit and no entry is
+   *  excluded on its account. */
+  botId?: string;
+  isDoomed?: DoomedEngineGate;
+  now?: number;
 }): TurnFallbackPick | undefined {
   if (input.ok) return undefined;
   if (input.stopReason === "interrupted" || input.stopReason === "cancelled") return undefined;
@@ -425,10 +467,19 @@ export function selectTurnFallback(input: {
   const chain = input.fallbacks;
   if (!chain?.length) return undefined;
   const start = Math.max(0, input.used);
+  // One instant for the whole walk: a chain that crosses a TTL boundary
+  // mid-scan must not decide its entries against two different clocks.
+  const now = input.now ?? Date.now();
+  const { botId } = input;
+  const isDoomed = botId ? doomedGate(input.isDoomed) : undefined;
   for (let i = start; i < chain.length; i++) {
     const next = chain[i];
     if (!next?.instanceId) continue;
     if (input.current && sameEngine(next, input.current)) continue;
+    // Skip in place, never re-order: the remaining entries are still the
+    // owner's saved preference order, and nextUsed still points past the
+    // entry that was chosen so a later failure walks the same chain.
+    if (botId && isDoomed?.(botId, next.instanceId, now)) continue;
     return { instanceId: next.instanceId, model: next.model, effort: next.effort, nextUsed: i + 1 };
   }
   return undefined;
@@ -704,11 +755,20 @@ export class QuotaCooldownRegistry {
    * If the primary model is on active quota cooldown (and has not reached its reset time),
    * returns the first available fallback model.
    * Once the reset time has passed, returns the primary model.
+   *
+   * A fallback the doomed breaker is refusing is skipped for the same reason a
+   * cooling one is: handing the turn to an engine whose CLI is missing, is not
+   * executable, or wants an interactive login is a turn that cannot finish.
+   * The pair is left out, not moved — and a chain with nothing usable left
+   * still returns the primary plus its cooldown, exactly as it did when every
+   * entry was cooling.  The primary itself is never excluded here: refusing to
+   * dispatch a doomed pair is `canStart`'s job, not a new failure mode here.
    */
   resolveModel(
     botId: string,
     primary: ModelSelection,
     now = Date.now(),
+    opts: { isDoomed?: DoomedEngineGate } = {},
   ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
     const cd = this.get(botId, primary.instanceId, primary.model, now);
     if (!cd) {
@@ -716,10 +776,11 @@ export class QuotaCooldownRegistry {
     }
     const fallbacks = primary.fallbacks;
     if (fallbacks && fallbacks.length > 0) {
+      const isDoomed = doomedGate(opts.isDoomed);
       for (const fb of fallbacks) {
-        if (!this.get(botId, fb.instanceId, fb.model, now)) {
-          return { selection: fb, isFallback: true, cooldown: cd };
-        }
+        if (this.get(botId, fb.instanceId, fb.model, now)) continue;
+        if (isDoomed(botId, fb.instanceId, now)) continue;
+        return { selection: fb, isFallback: true, cooldown: cd };
       }
     }
     return { selection: primary, isFallback: false, cooldown: cd };
