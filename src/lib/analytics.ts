@@ -116,6 +116,10 @@ export function initAnalytics() {
         capture_pageview: false, // single-window desktop app — no page routes
         person_profiles: "identified_only",
         persistence: "localStorage",
+        disable_session_recording: true, // a dashboard toggle must never start recording conversation text
+        capture_exceptions: false, // no remote exception autocapture
+        enable_heatmaps: false, // no remote heatmap capture
+        capture_dead_clicks: false, // no remote dead-click capture
       });
       // opt_out_capturing() persists in PostHog's own storage, so after
       // opt-out → restart → opt-in the client would boot opted out and drop
