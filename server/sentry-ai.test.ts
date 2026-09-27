@@ -963,6 +963,7 @@ describe("Sentry provider vocabulary", () => {
     expect(genAiProvider("kimiAgent")).toBe("moonshot");
     expect(genAiProvider("cursorAgent")).toBe("cursor");
     expect(genAiProvider("minimax")).toBe("minimax");
+    expect(genAiProvider("mcodeAgent")).toBe("minimax");
     expect(genAiProvider("boxAgent")).toBe("box");
   });
 

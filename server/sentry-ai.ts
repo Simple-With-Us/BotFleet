@@ -361,6 +361,7 @@ const GEN_AI_PROVIDERS = new Map<string, string>([
   ["cursor", "cursor"],
   ["cursoragent", "cursor"],
   ["minimax", "minimax"],
+  ["mcodeagent", "minimax"],
   ["boxagent", "box"],
 ]);
 
