@@ -94,7 +94,64 @@ async function serveStatic(uiDir, pathname, req, res) {
   stream.pipe(res);
 }
 
-function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
+/**
+ * Returns true if `host` is a loopback address the shim might listen on.
+ */
+function isLoopbackHost(host) {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+}
+
+/**
+ * Reject a request whose Host header does not point back at the shim itself.
+ * The shim only ever proxies for a browser running on the same machine, so
+ * only loopback addresses that match the shim's own port are acceptable.
+ */
+function validateIncomingHost(shimHost, shimPort, req, res) {
+  const hostHeader = req.headers.host ?? "";
+  const colonIdx = hostHeader.lastIndexOf(":");
+  const receivedHost = colonIdx >= 0 ? hostHeader.slice(0, colonIdx) : hostHeader;
+  const receivedPort = colonIdx >= 0 ? hostHeader.slice(colonIdx + 1) : "";
+
+  if (!isLoopbackHost(receivedHost) || receivedPort !== String(shimPort)) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Forbidden" }));
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Reject a request whose Origin header does not point back at the shim.
+ * An Origin is only present in browser requests; absent Origin is allowed
+ * for non-browser clients.
+ */
+function validateIncomingOrigin(shimHost, shimPort, req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+
+  let originHost, originPort;
+  try {
+    const parsed = new URL(origin);
+    originHost = parsed.hostname;
+    originPort = String(parsed.port);
+  } catch {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Forbidden" }));
+    return false;
+  }
+
+  if (!isLoopbackHost(originHost) || originPort !== String(shimPort)) {
+    res.writeHead(403, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Forbidden" }));
+    return false;
+  }
+  return true;
+}
+
+function proxyHttp({ harnessHost, harnessPort, shimHost, shimPort, log }, req, res) {
+  if (!validateIncomingHost(shimHost, shimPort, req, res)) return;
+  if (!validateIncomingOrigin(shimHost, shimPort, req, res)) return;
+
   let attempts = 0;
   let current = null;
   let retryTimer = null;
@@ -143,7 +200,34 @@ function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
   send();
 }
 
-function proxyUpgrade({ harnessHost, harnessPort }, req, socket, head) {
+function proxyUpgrade({ harnessHost, harnessPort, shimHost, shimPort, log }, req, socket, head) {
+  // Host validation for upgrade path: reject foreign hosts before touching the harness.
+  const hostHeader = req.headers.host ?? "";
+  const colonIdx = hostHeader.lastIndexOf(":");
+  const receivedHost = colonIdx >= 0 ? hostHeader.slice(0, colonIdx) : hostHeader;
+  const receivedPort = colonIdx >= 0 ? hostHeader.slice(colonIdx + 1) : "";
+  if (!isLoopbackHost(receivedHost) || receivedPort !== String(shimPort)) {
+    log(`upgrade rejected: foreign Host ${hostHeader}`);
+    socket.destroy();
+    return;
+  }
+
+  // Origin validation for upgrade path.
+  const origin = req.headers.origin;
+  if (origin) {
+    let parsed = null;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      // malformed Origin: treat as mismatched
+    }
+    if (!parsed || !isLoopbackHost(parsed.hostname) || String(parsed.port) !== String(shimPort)) {
+      log(`upgrade rejected: mismatched Origin ${origin}`);
+      socket.destroy();
+      return;
+    }
+  }
+
   const upstream = net.connect(harnessPort, harnessHost, () => {
     const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
@@ -204,7 +288,6 @@ export async function startUiShim({
   listenPorts = [],
   log = () => {},
 }) {
-  const target = { harnessHost, harnessPort, log };
   const server = http.createServer((req, res) => {
     let pathname;
     try {
@@ -230,6 +313,7 @@ export async function startUiShim({
   await listenOnFirstFree(server, host, [...listenPorts, 0]);
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : 0;
+  const target = { harnessHost, harnessPort, shimHost: host, shimPort: port, log };
   return {
     port,
     close: () =>
