@@ -27,6 +27,9 @@ async function freezeClock(page: Page): Promise<void> {
     const RealDate = window.Date;
     class FrozenDate extends RealDate {
       constructor(...args: unknown[]) {
+        // SAFETY: addInitScript clones frozenNow as a plain number, which
+        // Date's constructor accepts as a timestamp; caller-supplied arguments
+        // keep their original types and pass straight through.
         const ctorArgs = (args.length === 0 ? [frozenNow] : args) as ConstructorParameters<
           typeof RealDate
         >;
@@ -36,7 +39,11 @@ async function freezeClock(page: Page): Promise<void> {
         return frozenNow;
       }
     }
-    window.Date = FrozenDate as unknown as typeof RealDate;
+    Object.defineProperty(window, 'Date', {
+      value: FrozenDate,
+      writable: true,
+      configurable: true,
+    });
   }, FROZEN_NOW_MS);
 }
 
@@ -50,6 +57,9 @@ async function stabilize(page: Page): Promise<void> {
   // Blur the focused element first: the onboarding name input autofocuses,
   // and its blinking caret defeats pixel comparison.
   await page.evaluate(() => {
+    // SAFETY: activeElement is Element | null in the DOM; the cast only
+    // narrows to the HTMLElement branch that owns blur(), and the optional
+    // chain no-ops for any other node type.
     (document.activeElement as HTMLElement | null)?.blur();
   });
   await page.addStyleTag({
