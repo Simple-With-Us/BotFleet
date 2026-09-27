@@ -23,6 +23,7 @@ import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseCli
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { firstTurnTitleText } from "./task-title.ts";
 import {
   allowsMultipleBotThreads,
   parseConversationMode,
@@ -3318,12 +3319,11 @@ async function startTurn(
   const task = store.taskByThread(bot.id, threadId);
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
   const commsDepth = opts?.commsDepth ?? 0;
-  // a task takes its name from the first thing you asked it to do.
-  // Auto-delivered instructions are not that — they already named the task
-  // from the routine or webhook.
-  if (text.trim() && !opts?.cardContinuation && !opts?.automationSource) {
-    store.titleTaskFromFirstMessage(bot.id, text, threadId);
-  }
+  // A new task takes its name from its first prompt. For delegations,
+  // use only the shared parser's payload, never the sender wrapper or reason.
+  // Routine/webhook instructions have their own task names.
+  const titleText = firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
+  if (titleText) store.titleTaskFromFirstMessage(bot.id, titleText, threadId);
 
   const fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
