@@ -205,7 +205,9 @@ async function readLinqWebhookAuthed(
       chatId: parsed.data.chat_id,
       fromNumber: parsed.data.from,
       toNumber: parsed.data.to,
-      text: parsed.data.body ?? (textParts.length ? textParts.join("\n") : undefined),
+      text: (typeof parsed.data.body === "string" && parsed.data.body.trim()
+        ? parsed.data.body.trim()
+        : textParts.length ? textParts.join("\n") : undefined),
       media: parsed.data.parts
         ?.filter((p) => Boolean(p.url))
         .map((p) => ({ url: p.url as string, mimeType: p.mime_type, filename: p.filename })),

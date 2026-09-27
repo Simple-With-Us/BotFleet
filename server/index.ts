@@ -301,7 +301,7 @@ import { readThreadEvents } from "./thread-events.ts";
 import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./webhook-ingress.ts";
 import { readLinqWebhook } from "./routes/linq-webhook.ts";
 import { resolveLinqBinding } from "./linq/dispatch.ts";
-import { deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
+import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
@@ -1980,15 +1980,10 @@ bus.subscribe((event: RuntimeEvent) => {
     // dispatches themselves release their exact keys.
     releaseLocalVmThread(event.threadId);
     releaseRoomComputerLease(event.threadId);
-      void stopLinqTypingForThread(event.threadId);
-      // The originating turn has settled (success, failure, or untagged
-      // alike): drop its Linq binding so a later BotFleet-origin turn on
-      // this thread cannot deliver to the previous external caller.
-      // Overlapping inbounds on one thread remain a known residual race
-      // (tracked for turn-scoped correlation); the dispatch reads its
-      // binding synchronously at send time, so the release cannot interrupt
-      // a send already in flight.
-      releaseLinqChat(event.threadId);
+      void stopLinqTypingForThread(event.threadId, event.turnId);
+      // Drop only this turn's Linq binding. A later inbound on the same
+      // thread keeps its own chat id so the first reply cannot retarget.
+      releaseLinqChat(event.threadId, event.turnId);
   }
   broadcast({ kind: "runtime", event });
   const routineRun = routines?.handleRuntimeEvent(event) ?? null;
@@ -2012,7 +2007,7 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.itemType === "assistant_text") {
         pushMessage({ role: "bot", kind: "text", text: event.text });
         if (bot) {
-          void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text).then((r) => {
+          void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text, event.turnId).then((r) => {
             if (r.sent) console.log(`[linq-outbound] delivered thread=${event.threadId}`);
             else if (r.reason && r.reason !== "no_linq_chat" && r.reason !== "not_tagged" && r.reason !== "bot_not_linq") {
               console.warn(`[linq-outbound] failed thread=${event.threadId}: ${r.reason}`);
@@ -2893,13 +2888,13 @@ function drainRoomQueue() {
 }
 
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) =>
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
     // Drain just appended the held lines; userMessage keeps startTurn
     // from duplicating the last one, and excludeIds drops every drained
     // line from the transcript-replay so they are not also in `prompt`.
-    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds }).catch((err) => {
+    startTurn(botId, prompt, { threadId, userMessage, excludeMessageIds: excludeIds, linqChatId }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
         kind: "activity",
@@ -3042,6 +3037,8 @@ async function startTurn(
     cardContinuation?: boolean;
     /** Earlier text message this user turn is replying to. */
     replyTo?: Message;
+    /** Linq chat that originated this turn; bound after sendTurn returns a turnId. */
+    linqChatId?: string;
     onDispatchError?: (message: string) => void;
     /** Override engine for this turn (model fallback).  Persistence is the caller's job. */
     modelSelection?: ModelSelection;
@@ -3672,11 +3669,24 @@ async function startTurn(
         autoApprove: bot.autoApprove === true,
         unattended: isUnattended(bot.id),
       };
+      // Bind before sendTurn so assistant_text emitted during the launch
+      // still has a chat id.  The pending key is migrated onto the
+      // provider turnId once sendTurn returns.
+      if (opts?.linqChatId) {
+        bindLinqChatToTurn(threadId, `pending:${threadId}`, bot.id, opts.linqChatId);
+      }
       const started = await instance.adapter.sendTurn(turnInput);
+      if (opts?.linqChatId && started.turnId) {
+        bindLinqChatToTurn(threadId, started.turnId, bot.id, opts.linqChatId);
+      }
       // A driver may settle before launch (for example, a failed capability
       // preflight).  Its terminal event still drives fallback and cleanup,
       // but it did not make this engine the thread's latest dispatcher.
-      if (started.dispatched === false) return;
+      if (started.dispatched === false) {
+        if (started.turnId) releaseLinqChat(threadId, started.turnId);
+        else if (opts?.linqChatId) releaseLinqChat(threadId, `pending:${threadId}`);
+        return;
+      }
       // dispatched: the rewind is spent, and the old cursors are dead
       if (!activeTurnOwners.isLatest(threadId, dispatchOwner.dispatchId)) return;
       if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
@@ -9104,6 +9114,18 @@ const server = createServer(async (req, res) => {
           return json(res, 403, { error: "imessage_transport_disabled", transport });
         }
       }
+      const fromLinq = body.source === "linq";
+      const linqChatId = fromLinq && typeof body.chatId === "string" && body.chatId.trim()
+        ? body.chatId.trim()
+        : undefined;
+      if (fromLinq) {
+        const transport = loadConfig().botDefaults?.imessagePerBot?.[bot.id];
+        if (transport !== "linq") {
+          console.warn(`[inbound-message] rejecting Linq post for bot ${bot.name} (${bot.id}): imessagePerBot=${transport ?? "unset"}`);
+          return json(res, 403, { error: "imessage_transport_disabled", transport: transport ?? "off" });
+        }
+        if (!linqChatId) return json(res, 400, { error: "chatId required for linq source" });
+      }
       const text = fromImessage ? wrapImessageInbound(rawText) : rawText;
       console.log(`[inbound-message] bot=${bot.name} (${bot.id}) thread=${bot.threadId} origin=${origin} ua=${userAgent} imessage=${fromImessage} len=${text.length}`);
 
@@ -9147,10 +9169,11 @@ const server = createServer(async (req, res) => {
           const queued = queueSteeredMessage(bot, text, {
             replyToId: replyTo?.id,
             prompt: promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"),
+            linqChatId,
           });
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId } };
         }
-        await startTurn(bot.id, text, { replyTo });
+        await startTurn(bot.id, text, { replyTo, linqChatId });
         return { status: 202, body: { ok: true } };
       };
       // A retried send must not run the instruction twice: the key is scoped

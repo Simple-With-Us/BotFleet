@@ -107,6 +107,7 @@ describe("steer-queue module", () => {
     expect(threadId).toBe("thread-b");
     // ONE turn for the whole burst: the texts joined with newlines
     expect(prompt).toBe("first note\nsecond note");
+    expect(run.mock.calls[0][5]).toBeUndefined();
     // appended at drain, last message so startTurn adds nothing new
     expect(store.messages.map((m) => m.text)).toEqual(["first note", "second note"]);
     expect(store.messages.map((m) => m.queueId)).toEqual([first.id, second.id]);
@@ -118,6 +119,47 @@ describe("steer-queue module", () => {
     // drain-once: a second settle finds nothing and fires nothing
     drainSteeredMessages(store, run);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("drains each Linq inbound as its own turn so chat bindings cannot mix", () => {
+    const bot = fakeBot("bot-linq", "thread-linq", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "from chat a", { linqChatId: "chat-a" });
+    queueSteeredMessage(bot, "from chat b", { linqChatId: "chat-b" });
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("from chat a");
+    expect(run.mock.calls[0][5]).toBe("chat-a");
+    expect(_queuedCount("thread-linq")).toBe(1);
+    expect(store.messages.map((m) => m.text)).toEqual(["from chat a"]);
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("from chat b");
+    expect(run.mock.calls[1][5]).toBe("chat-b");
+    expect(_queuedCount("thread-linq")).toBe(0);
+  });
+
+  it("drains ordinary steered notes before a later Linq inbound, then isolates that chat", () => {
+    const bot = fakeBot("bot-mix", "thread-mix", true);
+    const store = fakeStore([bot]);
+    queueSteeredMessage(bot, "desktop note");
+    queueSteeredMessage(bot, "from chat a", { linqChatId: "chat-a" });
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][2]).toBe("desktop note");
+    expect(run.mock.calls[0][5]).toBeUndefined();
+    expect(_queuedCount("thread-mix")).toBe(1);
+
+    drainSteeredMessages(store, run);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][2]).toBe("from chat a");
+    expect(run.mock.calls[1][5]).toBe("chat-a");
+    expect(_queuedCount("thread-mix")).toBe(0);
   });
 
   it("drops a cancelled message so drain does not send it", () => {

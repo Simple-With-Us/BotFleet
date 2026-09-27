@@ -17,7 +17,7 @@ import {
   linqStartTyping,
   linqStopTyping,
 } from "./client.ts";
-import { releaseLinqChat, rememberLinqChat } from "./outbound.ts";
+
 
 export interface ResolvedLinqBinding {
   botNumber: string;
@@ -202,7 +202,6 @@ export async function handleLinqInbound(
   } catch {
     /* typing is advisory */
   }
-  rememberLinqChat(bot.bot.threadId, bot.bot.id, msg.chatId);
   const result = await ingestInbound({
     source: "linq",
     bot: bot.bot,
@@ -213,16 +212,11 @@ export async function handleLinqInbound(
   });
   if (!result.dispatched) {
     void linqStopTyping(msg.chatId).catch(() => undefined);
-    // No turn started, so the turn.completed cleanup cannot run here: drop
-    // the binding so a later tagged reply or voice call on this thread
-    // cannot reach this failed inbound's caller.
-    releaseLinqChat(bot.bot.threadId);
   } else if (result.replayed) {
     // Idempotent replay of an already-completed turn: no new turn starts,
     // so turn.completed never fires.  Typing was just (re)started above for
-    // a turn that will never run — stop it and drop the restored binding.
+    // a turn that will never run — stop it.
     void linqStopTyping(msg.chatId).catch(() => undefined);
-    releaseLinqChat(bot.bot.threadId);
   }
   return result;
 }

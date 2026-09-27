@@ -195,6 +195,22 @@ describe("readLinqWebhook", () => {
     expect(res.body.ok).toBe(true);
   });
 
+  it("falls back from an empty body to text parts", async () => {
+    const body = JSON.stringify({
+      type: "message.received",
+      chat_id: "chat-parts",
+      message_id: "m-parts",
+      from: "+15555550100",
+      to: "+14158707772",
+      body: "",
+      parts: [{ type: "text", value: "hello from parts" }],
+    });
+    const res = await runSigned(body);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect((dispatchCalls[0].msg as { text: string }).text).toBe("hello from parts");
+  });
+
   it("verifies the HMAC over raw bytes when a multibyte character spans two chunks", async () => {
     const secret = "the-real-secret";
     process.env.LINQ_WEBHOOK_SECRET = secret;
