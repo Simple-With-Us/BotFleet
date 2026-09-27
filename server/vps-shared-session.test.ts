@@ -13,11 +13,15 @@ import { SHARED_VPS_TARGET, perBotVpsTarget, vpsTargetFor } from "./vps-computer
 import type { AppConfig } from "./config.ts";
 import { ExactTurnLeases } from "./turn-safety.ts";
 
-const sharedCfg = { botDefaults: { vpsMode: "shared" } } as AppConfig;
-const perBotCfg = { botDefaults: { vpsMode: "per-bot" } } as AppConfig;
+function cfgWithVpsMode(mode: "shared" | "per-bot"): AppConfig {
+  // SAFETY: AppConfig's remaining sections are optional; this test supplies
+  // only botDefaults.vpsMode for shared vs per-bot routing.
+  return { botDefaults: { vpsMode: mode } } as AppConfig;
+}
 
 describe("vps shared session identity", () => {
   it("keeps one shared container target while giving each bot its own occupancy key", () => {
+    const sharedCfg = cfgWithVpsMode("shared");
     expect(vpsTargetFor(sharedCfg, "bot-a")).toBe(SHARED_VPS_TARGET);
     expect(vpsTargetFor(sharedCfg, "bot-b")).toBe(SHARED_VPS_TARGET);
     expect(vpsOccupancyKey(sharedCfg, "bot-a")).not.toBe(vpsOccupancyKey(sharedCfg, "bot-b"));
@@ -35,6 +39,7 @@ describe("vps shared session identity", () => {
   });
 
   it("falls back to the container default socket and display in per-bot mode", () => {
+    const perBotCfg = cfgWithVpsMode("per-bot");
     expect(isSharedVpsMode(perBotCfg)).toBe(false);
     expect(vpsDriverSocket(perBotCfg, "bot-x")).toBe(CUA_SOCKET);
     expect(vpsDriverDisplay(perBotCfg, "bot-x")).toBe(DISPLAY);
@@ -54,6 +59,7 @@ describe("vps shared session identity", () => {
 describe("shared VPS concurrent leases", () => {
   it("lets two bots claim the shared container at once with distinct occupancy keys", () => {
     const leases = new ExactTurnLeases();
+    const sharedCfg = cfgWithVpsMode("shared");
     const a = leases.claim("bot-a", "thread-a", 10, vpsOccupancyKey(sharedCfg, "bot-a"));
     const b = leases.claim("bot-b", "thread-b", 11, vpsOccupancyKey(sharedCfg, "bot-b"));
     expect(a).not.toBeNull();
