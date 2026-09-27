@@ -1794,7 +1794,13 @@ async function interruptThreadEverywhere(threadId: string): Promise<InterruptOut
 }
 /** Room turns re-enter the member engine after turn.completed so failover
  * does not race the sequential roster walk. */
-const pendingMemberFallback = new Map<string, { groupId: string; botId: string; selection: ModelSelection }>();
+const pendingMemberFallback = new Map<
+  string,
+  // instanceId keys the waiter to the turn that armed it: on a thread two
+  // engines touched (audit G16), one engine's settle must not consume the
+  // fallback another engine's failure armed.
+  { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
+>();
 const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
@@ -2470,7 +2476,18 @@ bus.subscribe((event: RuntimeEvent) => {
       // bot so it keeps working. A QUESTION always reaches the human — the
       // whole point of asking is that a person decides — and anything that
       // looks destructive stops even in auto mode.
-      const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
+      // The asker is the bot whose engine raised the request — resolved by
+      // the request's own provider instance, not the thread's speaker
+      // entry: a crossed room can leave the speaker naming the other
+      // member, and an auto verdict against the wrong bot applies the
+      // wrong auto-approve policy (audit G16).
+      const requestOwner = group
+        ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId)
+        : undefined;
+      const asker =
+        bot ??
+        (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
+        (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
@@ -2754,7 +2771,14 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
-      const fallbackBot = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
+      // The turn that ended owns its failover: resolve the member from the
+      // settled owner (this thread, this provider instance) before the
+      // thread's speaker entry, which a crossed room can leave naming the
+      // other member (audit G16).
+      const fallbackBot =
+        bot ??
+        (settledOwner ? store.bot(settledOwner.botId) : undefined) ??
+        (speaker ? store.bot(speaker.botId) : undefined);
       const storedFallbackPolicy = fallbackBot
         ? (bot ? store.taskByThread(fallbackBot.id, event.threadId)?.modelSelection : undefined) ?? fallbackBot.modelSelection
         : undefined;
@@ -2926,11 +2950,19 @@ bus.subscribe((event: RuntimeEvent) => {
             // does not spin forever waiting for a completion that never comes
             tool: { name: `Fell over to ${next.model}${resetNote}`, ok: true, kind: "notice" },
           });
-          if (group && speaker?.botId === fallbackBot.id) {
+          // Arm the waiter for the member whose turn actually ended on
+          // this provider instance (audit G16): the thread's speaker entry
+          // can still name another member when turns have crossed, and a
+          // waiter armed from it re-dispatches the wrong member.
+          const endedRoomTurn = settledOwner
+            ? settledOwner.botId === fallbackBot.id
+            : speaker?.botId === fallbackBot.id;
+          if (group && endedRoomTurn) {
             pendingMemberFallback.set(event.threadId, {
               groupId: group.id,
               botId: fallbackBot.id,
               selection: fallbackSelection,
+              instanceId: event.providerInstanceId,
             });
           }
         } else {
@@ -3342,28 +3374,38 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
-    void runGroupMemberTurn(
-      round.groupId,
-      round.threadId,
-      round.botId,
-      round.hop,
-      new Set(),
-      round.cardContinuation,
-      undefined,
-      undefined,
-      round.turnSelection,
-    ).catch((error) => {
-      store.appendMessage(round.threadId, {
-        role: "bot",
-        kind: "activity",
-        tool: {
-          name: `error: queued round could not start — ${
-            (error instanceof Error ? error.message : String(error)).slice(0, 120)
-          }`,
-          ok: false,
-        },
-      });
-    });
+    // The drained round runs on the room's operation queue, behind any
+    // message dispatch still in flight (audit G16).  Firing it directly
+    // let it start beside the live speaker: on a shared provider instance
+    // the turn claim then failed after the busy flags had already moved,
+    // and on separate instances two members spoke at once — either way the
+    // room's speaker, busy slot and fallback waiter crossed.
+    const prev = groupQueues.get(round.groupId) ?? Promise.resolve();
+    const next = prev.then(() =>
+      runGroupMemberTurn(
+        round.groupId,
+        round.threadId,
+        round.botId,
+        round.hop,
+        new Set(),
+        round.cardContinuation,
+        undefined,
+        undefined,
+        round.turnSelection,
+      ).catch((error) => {
+        store.appendMessage(round.threadId, {
+          role: "bot",
+          kind: "activity",
+          tool: {
+            name: `error: queued round could not start — ${
+              (error instanceof Error ? error.message : String(error)).slice(0, 120)
+            }`,
+            ok: false,
+          },
+        });
+      }).then(() => {}),
+    );
+    groupQueues.set(round.groupId, next.catch(() => {}));
   });
 }
 
@@ -5647,16 +5689,42 @@ async function runGroupMemberTurn(
     // arrived with.
     clearUnattended(bot.id);
   }
+  // Claim the turn BEFORE any busy flag or speaker entry moves (audit
+  // G16).  A claim can lose: a round that reaches dispatch beside the
+  // live speaker finds this provider instance already owned on the
+  // thread and throws.  When the flags moved first, that throw left them
+  // behind — the real speaker's release then no-opped against a busy slot
+  // it no longer owned, and the room showed a speaker that was gone until
+  // restart.  The claim is the gate; the flags follow it, and a lost
+  // claim waits like the busy paths above instead of corrupting the room.
+  let roomDispatch: ReturnType<typeof activeTurnOwners.claim>;
+  try {
+    roomDispatch = activeTurnOwners.claim(threadId, {
+      botId: bot.id,
+      selection,
+      fallbackPolicy: bot.modelSelection,
+      computerInputs: turnComputerInputs(bot),
+    });
+  } catch {
+    const queued = queueRoomRound(
+      { groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection },
+      Date.now(),
+    );
+    const message = queued
+      ? `${bot.name}'s engine is mid-turn in this room — queued for when it frees up`
+      : `${bot.name}'s engine is mid-turn in this room — already queued`;
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: message, ok: true, kind: "notice" },
+    });
+    return true;
+  }
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { inflightThreadId: threadId });
   store.patchGroup(group.id, { busyBotId: bot.id }); // the store's change stream carries the frame
   groupSpeakers.set(threadId, { botId: bot.id, name: bot.name, color: bot.color });
-  const roomDispatch = activeTurnOwners.claim(threadId, {
-    botId: bot.id,
-    selection,
-    fallbackPolicy: bot.modelSelection,
-    computerInputs: turnComputerInputs(bot),
-  });
   /** Hand the room back when no turn.completed will do it.  Only use it while
    * this invocation still owns the room; otherwise it would emit a duplicate
    * group frame or clear a newer speaker's state. */
@@ -6069,7 +6137,14 @@ async function runGroupMemberTurn(
   }
 
   const pendingFallback = pendingMemberFallback.get(threadId);
-  if (pendingFallback && pendingFallback.botId === bot.id && pendingFallback.groupId === groupId) {
+  if (
+    pendingFallback &&
+    pendingFallback.botId === bot.id &&
+    pendingFallback.groupId === groupId &&
+    // The waiter belongs to the turn that armed it (audit G16): only this
+    // invocation's own engine may consume it.
+    (!pendingFallback.instanceId || pendingFallback.instanceId === selection.instanceId)
+  ) {
     pendingMemberFallback.delete(threadId);
     if (!isCancelled?.() && outcome === "settled") {
       spoken.delete(bot.id);
