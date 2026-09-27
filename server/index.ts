@@ -66,9 +66,12 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import { doomedDispatches, enableDoomedDispatchPersist } from "./doomed-dispatch.ts";
+import { spendCeilingDecision } from "./rolling-spend.ts";
+import { effectiveToolRounds, toolBudgetPrompt } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
-import { buildSystemPrompt } from "./system-prompt.ts";
+import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
 import { telemetry } from "./telemetry.ts";
 import { usageQuotaPoller } from "./usage-quota.ts";
 import { getDeepSeekBalance } from "./deepseek-balance.ts";
@@ -639,6 +642,46 @@ bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
 // A shared secret guards the localhost-only /api/internal endpoints the
 // agents-proxy calls; regenerated each boot (the proxy gets it via env).
 const COMMS_TOKEN = randomBytes(24).toString("hex");
+
+/** Feed the doomed-dispatch breaker from the live event bus.
+ *
+ *  Deliberately keyed on `runtime.error` with `setup: true` and nothing else.
+ *  That flag is the driver telling us the process never came up — CLI absent,
+ *  not executable, or needing an interactive login — and it is a fact about
+ *  the ENGINE rather than about the work.  A model that answered badly, a
+ *  provider that timed out, and a driver that threw mid-flight all arrive as
+ *  failures and all deserve a retry; only this one means the next tick will
+ *  fail identically, which is the only thing a breaker can usefully act on.
+ *
+ *  Fed from the bus rather than from the routine tracker on purpose: the
+ *  tracker only sees threads that have a run attached, and it resolves
+ *  `engineId` from the event it is handed rather than from the live instance,
+ *  so a breaker fed from there would miss turns and key on a stale engine. */
+function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): void {
+  if (!bot) return;
+  const instanceId = event.providerInstanceId ?? (event.type === "runtime.error" ? event.provider : undefined);
+  if (!instanceId) return;
+  if (event.type === "runtime.error") {
+    if (event.setup) doomedDispatches.recordFailure(bot.id, instanceId, event.message);
+    return;
+  }
+  // Any turn that reached a result proves the pair is alive, so a breaker left
+  // over from an earlier bad patch does not outlive the fix.
+  if (event.type === "turn.completed" && event.ok) doomedDispatches.recordSuccess(bot.id, instanceId);
+}
+
+/** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
+ *  consulted for work nobody is watching, so a cap can stop background
+ *  automation without silently refusing a message the owner is waiting on. */
+function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
+  if (runOn !== "bot") return false;
+  const decision = spendCeilingDecision(rollingSpendTracker.getSpend(), {
+    ceilingUsd: cfg.usage?.spendCeilingUsd,
+    minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
+  }, rollingSpendTracker.getWindow());
+  if (decision.blocked) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
+  return decision.blocked;
+}
 
 /** Constant-time bearer check for the internal comms endpoints. The token
  * is high-entropy and loopback-only, so a timing oracle is a long shot —
@@ -2284,6 +2327,7 @@ bus.subscribe((event: RuntimeEvent) => {
   broadcast({ kind: "runtime", event });
   const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
+  noteDoomedDispatch(bot ?? null, event);
   const group = bot ? undefined : store.groupByThread(event.threadId);
   if (!bot && !group) return;
   const speaker = group ? groupSpeakers.get(event.threadId) : undefined;
@@ -3896,6 +3940,18 @@ async function startTurn(
         // recall lane mounted by PR #465 (MiniMax, OpenAI-compat, Grok
         // HTTP) without those engines setting `integrations.qdrant`.
         { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRecall }) },
+        // Only an HTTP tool-loop engine has a round ceiling at all — a CLI or
+        // ACP engine runs one process per turn and is not bounded this way, so
+        // telling those models about rounds would be a lie.
+        //
+        // Stable, not volatile: the budget is a setting, so it changes exactly
+        // when the cache SHOULD miss (the owner edited it), and never on a
+        // per-message basis the way memory or skill selection do.
+        {
+          id: "tool-budget",
+          label: "Tool budget",
+          text: usesDriverToolLoop ? toolBudgetPrompt(effectiveToolRounds(resolveMaxToolRounds(bot.maxToolRounds))) : "",
+        },
         // The Chief roster and the status capsule are byte-stable across a
         // teammate's busy flip (PR #617), which is what lets them stay on
         // the stable half.
@@ -3904,6 +3960,7 @@ async function startTurn(
         { id: "routine", label: "Routines", text: routinePrompt },
         { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
         { id: "memory", label: "Memory", text: promptFileTools ? memorySystemPrompt(bot.id) : "" },
+        { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },
         { id: "skills", label: "Skills index", text: promptFileTools ? skillsSystemPrompt(bot.id) : "" },
         { id: "skill-instructions", label: "Skill instructions", text: skillInstructions },
         { id: "playbooks", label: "Playbooks", text: packagePlaybooks },
@@ -4114,11 +4171,21 @@ routines = new RoutineManager({
     const task = bot && threadId ? store.taskByThread(bot.id, threadId) : undefined;
     if (!bot) return true;
     const policy = task?.modelSelection ?? bot.modelSelection;
-    return !turnExternalCredentialPending(
-      bot,
-      quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId,
-      runOn,
-    );
+    const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+    // A (bot, engine) pair that has failed to START repeatedly is not going to
+    // start on the next tick either — the CLI is missing, not executable, or
+    // waiting on an interactive login, and none of those change on a timer.
+    // Declining here leaves the run QUEUED rather than failed, so it still
+    // lands once the breaker half-opens after the TTL.  Same shape as the
+    // credential gate below it: both answer "should this go out right now".
+    if (doomedDispatches.isOpen(bot.id, instanceId)) return false;
+    // Last, and off unless a ceiling is configured: an unattended fleet that
+    // silently stops working is a worse outcome than one that overspends, so
+    // this also refuses to fire when too little of the window is priced to
+    // trust the total.  The reason is logged rather than swallowed, because
+    // "the cap did not hold" needs to be explainable.
+    if (spendBlockedForUnattendedWork(runOn)) return false;
+    return !turnExternalCredentialPending(bot, instanceId, runOn);
   },
   botState: (botId) => {
     const bot = store.bot(botId);
@@ -5761,6 +5828,7 @@ async function runGroupMemberTurn(
     { id: "recall", label: "Recall", text: recallPromptFor({ ...integrations, recall: hasRoomRecall }) },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "memory", label: "Memory", text: roomFileTools ? `\n${memorySystemPrompt(bot.id).trim()}` : "" },
+    { id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt(bot.userNotes) },
     { id: "skills", label: "Skills index", text: roomFileTools ? skillsSystemPrompt(bot.id) : "" },
     { id: "skill-instructions", label: "Skill instructions", text: renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) },
     { id: "playbooks", label: "Playbooks", text: installedPlaybookInstructions(text, bot.playbooks) },
@@ -12809,6 +12877,7 @@ routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
   enableQuotaCooldownPersist(join(DATA_DIR, "quota-cooldowns.json"));
+  enableDoomedDispatchPersist(join(DATA_DIR, "doomed-dispatches.json"));
   // OP3 / HS13: only spawn the CLI while at least one Antigravity instance
   // is actually in the fleet.  `instanceConfigs(cfg)` reads the SAME live,
   // mutated-in-place `cfg` every settings-reload path already uses, so a

@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { renderSkillInstructions, selectBundledSkills, type BundledSkill } from "./skill-library.ts";
+import { ownerNotesPrompt } from "./system-prompt.ts";
 import type { InstalledPlaybook } from "./store.ts";
 import { buildSystemPrompt, isVolatileSection, VOLATILE_SECTIONS, volatileDigest, type PromptPart } from "./system-prompt.ts";
 
@@ -239,5 +240,53 @@ describe("buildSystemPrompt", () => {
       expect(VOLATILE_SECTIONS.has(id)).toBe(true);
       expect(isVolatileSection({ id })).toBe(true);
     }
+  });
+});
+
+describe("ownerNotesPrompt", () => {
+  it("puts the owner's own notes in front of the bot", () => {
+    // `userNotes` is offered in settings, accepted by the API and round-tripped
+    // through every save — and nothing read it.  This is the fix.
+    const text = ownerNotesPrompt("Prefer ruff over eslint. Never push to main.");
+    expect(text).toContain("Prefer ruff over eslint. Never push to main.");
+  });
+
+  it("marks the notes as the owner's and above recall, webhooks and peers", () => {
+    const text = ownerNotesPrompt("Prefer ruff.");
+    expect(text).toMatch(/owner/i);
+    expect(text).toMatch(/outrank/i);
+    expect(text).toMatch(/recall/i);
+    expect(text).toMatch(/webhook/i);
+  });
+
+  it("forbids the bot editing them, so it cannot quietly correct its owner", () => {
+    // MEMORY.md is the bot's own; these are not. Merging the two would let a
+    // bot "fix" what the owner wrote.
+    const text = ownerNotesPrompt("Prefer ruff.");
+    expect(text).toMatch(/do not edit/i);
+    expect(text).toContain("MEMORY.md");
+  });
+
+  it("emits nothing for empty notes so the section never adds weight", () => {
+    for (const empty of [undefined, null, "", "   \n  "]) {
+      expect(ownerNotesPrompt(empty)).toBe("");
+    }
+  });
+});
+
+describe("owner-notes prompt section placement", () => {
+  it("keeps owner notes in the cacheable half", () => {
+    // Rarely-changing owner configuration belongs in the stable prefix, so an
+    // edit invalidates the cache once rather than costing it every turn.
+    // Contrast `memory`, which a bot rewrites mid-conversation.
+    const built = buildSystemPrompt([{ id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt("Prefer ruff.") }]);
+    expect(built.stable).toContain("Prefer ruff.");
+    expect(built.volatile).not.toContain("Prefer ruff.");
+  });
+
+  it("drops the section entirely when there are no notes", () => {
+    const built = buildSystemPrompt([{ id: "owner-notes", label: "Owner notes", text: ownerNotesPrompt("") }]);
+    expect(built.sections).toHaveLength(0);
+    expect(built.stable).toBe("");
   });
 });

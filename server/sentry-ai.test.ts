@@ -497,9 +497,16 @@ describe("failed turns become Issues", () => {
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "auth_required" }), sink);
     observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-3" }), sink);
+    // A turn that spent the tool-round ceiling the owner configured is the
+    // budget working as designed, not a defect. Paging on it buried real
+    // failures under a number that is fixed in Settings. The signal is not
+    // lost: it still reaches the breadcrumb trail and the routine receipt.
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "tool_round_limit", turnId: "turn-3" }), sink);
     expect(exceptions).toHaveLength(0);
-    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(2);
-    expect(spans.map((span) => span.status)).toEqual([undefined, undefined]);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(3);
+    expect(breadcrumbs.some((b) => b.message === "bot turn failed: tool_round_limit")).toBe(true);
+    expect(spans.map((span) => span.status)).toEqual([undefined, undefined, undefined]);
     expect(spans.every((span) => span.ended)).toBe(true);
   });
 

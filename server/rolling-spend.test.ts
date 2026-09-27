@@ -8,6 +8,7 @@ import {
   RollingSpendTracker,
   saveSpendCursor,
   scanRecentSpend,
+  spendCeilingDecision,
   SEVEN_DAYS_MS,
   spendCursorPath,
   type SpendCursor,
@@ -51,6 +52,8 @@ describe("rolling spend calculation", () => {
       instanceId: undefined,
       costUsd: 0.05,
       billingMode: undefined,
+      priced: true,
+      eventId: undefined,
     });
   });
 
@@ -80,15 +83,21 @@ describe("rolling spend calculation", () => {
     expect(spend.claudeAgent).toEqual({
       spend5hUsd: 0.5,
       spend7dUsd: 1.75,
+      unpricedTurns5h: 0,
+      unpricedTurns7d: 0,
     });
     // deepseek and deepseekAgent reflect the DeepSeek spend
     expect(spend.deepseek).toEqual({
       spend5hUsd: 0.02,
       spend7dUsd: 0.02,
+      unpricedTurns5h: 0,
+      unpricedTurns7d: 0,
     });
     expect(spend.deepseekAgent).toEqual({
       spend5hUsd: 0.02,
       spend7dUsd: 0.02,
+      unpricedTurns5h: 0,
+      unpricedTurns7d: 0,
     });
   });
 
@@ -111,9 +120,16 @@ describe("rolling spend calculation", () => {
     ].join("\n");
 
     const parsed = parseTurnSpendFromEventLog(lines, now - SEVEN_DAYS_MS);
-    expect(parsed).toHaveLength(1);
-    expect(parsed[0].provider).toBe("deepseek");
-    expect(parsed[0].costUsd).toBe(0.05);
+    // Both turns are real work, so both are kept — but only the actual one
+    // carries a price.  Dropping the estimate entirely is what used to make
+    // claude invisible in the spend map even while it was being driven.
+    expect(parsed).toHaveLength(2);
+    const estimate = parsed.find((entry) => entry.provider === "claude")!;
+    expect(estimate.priced).toBe(false);
+    expect(estimate.costUsd).toBe(0);
+    const actual = parsed.find((entry) => entry.provider === "deepseek")!;
+    expect(actual.priced).toBe(true);
+    expect(actual.costUsd).toBe(0.05);
 
     const tracker = new RollingSpendTracker();
     tracker.recordTurn({
@@ -122,7 +138,49 @@ describe("rolling spend calculation", () => {
       costUsd: 0.2,
       billingMode: "estimated",
     });
-    expect(tracker.getSpend(now).claude).toBeUndefined();
+    // No dollars, but no longer absent: the engine shows up with a zero total
+    // and one turn it could not price, which is the honest reading.
+    expect(tracker.getSpend(now).claude).toEqual({
+      spend5hUsd: 0,
+      spend7dUsd: 0,
+      unpricedTurns5h: 1,
+      unpricedTurns7d: 1,
+    });
+  });
+
+  it("counts a turn with no cost at all as unpriced rather than free", () => {
+    // The real shape an ACP turn had while every driver hardcoded
+    // `cost: null`: tokens spent, nothing to price them with.  Treating it as
+    // a zero-dollar turn is how the fleet total became a fraction of reality
+    // with nothing to show for the gap.
+    const line = JSON.stringify({
+      type: "turn.completed",
+      provider: "dshAgent",
+      createdAt: new Date(now - 1000).toISOString(),
+      cost: null,
+    });
+    const parsed = parseTurnSpendFromEventLog(line, now - SEVEN_DAYS_MS);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0].priced).toBe(false);
+
+    const tracker = new RollingSpendTracker();
+    tracker.recordTurn({ at: now - 1000, provider: "dshAgent", costUsd: null });
+    const spend = tracker.getSpend(now);
+    expect(spend.dshAgent.spend7dUsd).toBe(0);
+    expect(spend.dshAgent.unpricedTurns7d).toBe(1);
+    expect(spend.dshAgent.unpricedTurns5h).toBe(1);
+  });
+
+  it("keeps a legacy persisted entry with a cost priced after a restart", () => {
+    // A cursor written before the `priced` flag existed has no flag at all.  A
+    // boot onto it must not report previously-priced turns as unpriced, or the
+    // coverage gap would be invented out of nothing on every restart.
+    const legacy = { at: now - 1000, provider: "grok", costUsd: 0.25 } as const;
+    const tracker = new RollingSpendTracker();
+    (tracker as unknown as { records: unknown[] }).records.push(legacy);
+    const spend = tracker.getSpend(now);
+    expect(spend.grok.spend7dUsd).toBeCloseTo(0.25, 6);
+    expect(spend.grok.unpricedTurns7d).toBe(0);
   });
 
   it("aggregates spend from multiple provider aliases without double-counting", () => {
@@ -147,9 +205,9 @@ describe("rolling spend calculation", () => {
     });
 
     const spend = tracker.getSpend(now);
-    expect(spend.deepseekAgent).toEqual({ spend5hUsd: 0.08, spend7dUsd: 0.08 });
-    expect(spend.deepseek).toEqual({ spend5hUsd: 0.08, spend7dUsd: 0.08 });
-    expect(spend.dshAgent).toEqual({ spend5hUsd: 0.10, spend7dUsd: 0.10 });
+    expect(spend.deepseekAgent).toEqual({ spend5hUsd: 0.08, spend7dUsd: 0.08, unpricedTurns5h: 0, unpricedTurns7d: 0 });
+    expect(spend.deepseek).toEqual({ spend5hUsd: 0.08, spend7dUsd: 0.08, unpricedTurns5h: 0, unpricedTurns7d: 0 });
+    expect(spend.dshAgent).toEqual({ spend5hUsd: 0.10, spend7dUsd: 0.10, unpricedTurns5h: 0, unpricedTurns7d: 0 });
   });
 
   it("preserves precision when aggregating small fractional turns", () => {
@@ -379,5 +437,79 @@ describe("incremental spend scan", () => {
     await tracker.init(eventsDir, { now, cursorPath });
     await tracker.init(eventsDir, { now, cursorPath });
     expect(tracker.getSpend(now).claudeAgent.spend7dUsd).toBeCloseTo(0.1, 10);
+  });
+});
+
+describe("spend ceiling", () => {
+  const spend = (entries: Record<string, number>, unpriced: Record<string, number> = {}) => {
+    const map: Record<string, { spend5hUsd: number; spend7dUsd: number; unpricedTurns5h: number; unpricedTurns7d: number }> = {};
+    for (const [k, v] of Object.entries(entries)) {
+      map[k] = { spend5hUsd: v, spend7dUsd: v, unpricedTurns5h: unpriced[k] ?? 0, unpricedTurns7d: unpriced[k] ?? 0 };
+    }
+    for (const [k, v] of Object.entries(unpriced)) {
+      if (!map[k]) map[k] = { spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: v, unpricedTurns7d: v };
+    }
+    return map;
+  };
+
+  it("does nothing unless a ceiling is configured", () => {
+    const decision = spendCeilingDecision(spend({ grok: 99 }), {}, { totalTurns: 4, unpricedTurns: 0 });
+    expect(decision.blocked).toBe(false);
+    expect(decision.reason).toMatch(/no spend ceiling/i);
+  });
+
+  it("blocks once the visible total passes the ceiling", () => {
+    const decision = spendCeilingDecision(spend({ grok: 3 }), { ceilingUsd: 1 }, { totalTurns: 4, unpricedTurns: 0 });
+    expect(decision.blocked).toBe(true);
+    expect(decision.reason).toMatch(/over ceiling/i);
+  });
+
+  it("stays open below the ceiling", () => {
+    const decision = spendCeilingDecision(spend({ grok: 0.5 }), { ceilingUsd: 1 }, { totalTurns: 4, unpricedTurns: 0 });
+    expect(decision.blocked).toBe(false);
+    expect(decision.reason).toMatch(/within ceiling/i);
+  });
+
+  it("REFUSES to enforce when most of the window is unpriced", () => {
+    // The whole reason this gate is not simply `visible > ceiling`.  `dsh`
+    // reported cost: null on every turn, so the visible total read roughly a
+    // third of real spend — and blocking an unattended fleet on a number known
+    // to be a floor stops the work before the owner finds out why.
+    const decision = spendCeilingDecision(
+      spend({ grok: 0.4, dsh: 0 }),
+      { ceilingUsd: 1 },
+      { totalTurns: 100, unpricedTurns: 90 },
+    );
+    expect(decision.visibleUsd).toBeCloseTo(0.4, 6);
+    expect(decision.pricedShare).toBeCloseTo(0.1, 6);
+    expect(decision.blocked).toBe(false);
+    expect(decision.reason).toMatch(/not enforced/i);
+    expect(decision.reason).toMatch(/90 unpriced/);
+  });
+
+  it("enforces once enough of the window is priced", () => {
+    const decision = spendCeilingDecision(
+      spend({ grok: 2 }, { dsh: 5 }),
+      { ceilingUsd: 1 },
+      { totalTurns: 100, unpricedTurns: 5 },
+    );
+    expect(decision.pricedShare).toBeCloseTo(0.95, 6);
+    expect(decision.blocked).toBe(true);
+  });
+
+  it("honours an operator's own visibility requirement", () => {
+    const map = spend({ grok: 2 }, { dsh: 30 });
+    const strict = spendCeilingDecision(map, { ceilingUsd: 1, minPricedShare: 0.9 }, { totalTurns: 40, unpricedTurns: 30 });
+    expect(strict.blocked).toBe(false);
+    const lenient = spendCeilingDecision(map, { ceilingUsd: 1, minPricedShare: 0.2 }, { totalTurns: 40, unpricedTurns: 30 });
+    expect(lenient.blocked).toBe(true);
+  });
+
+  it("treats an empty window as fully visible rather than unknown", () => {
+    // Nothing has settled yet, so the cap is trivially satisfied — refusing
+    // here would stop the fleet from ever starting.
+    const decision = spendCeilingDecision(spend({}), { ceilingUsd: 1 }, { totalTurns: 0, unpricedTurns: 0 });
+    expect(decision.pricedShare).toBe(1);
+    expect(decision.blocked).toBe(false);
   });
 });

@@ -361,6 +361,19 @@ const appConfigSchema = z.object({
         }),
       )
       .optional(),
+    // Hard stop on rolling 5-hour spend, in dollars.  OFF unless a number is
+    // set, because an unattended fleet that stops working is a worse failure
+    // than one that overspends — and the number this is measured against is
+    // only as complete as the engines that report a cost, which is why the
+    // gate also requires `spendCeilingMinPricedShare` below.
+    spendCeilingUsd: z.number().positive().optional(),
+    /** The share of settled turns in the window that must carry a real price
+     *  before the ceiling is allowed to act.  Below it, the visible total is
+     *  too much of a floor to block work on: an engine that reports no cost
+     *  contributes zero to the sum while spending very much more than zero.
+     *  Defaults to 0.5 — the ceiling must be able to see at least half the
+     *  window to be trusted with stopping the fleet. */
+    spendCeilingMinPricedShare: z.number().min(0).max(1).optional(),
   }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
@@ -519,6 +532,12 @@ export interface AppConfig {
     localQuotaRouting?: boolean;
     projects?: Array<{ slug: string; match?: string[] }>;
     enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
+    /** Hard stop on rolling 5-hour spend, in dollars.  Off unless set, and
+     *  consulted only for unattended work. */
+    spendCeilingUsd?: number;
+    /** Share of the window that must be priced before the ceiling may act.
+     *  Absent means `DEFAULT_MIN_PRICED_SHARE`. */
+    spendCeilingMinPricedShare?: number;
   };
   /** Error and performance reporting.  `sentryDsn` is the operator's own
    * Sentry project — BotFleet ships none.  `enabled` is the explicit kill

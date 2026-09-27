@@ -386,6 +386,24 @@ export function normalizeStopReason(raw: unknown): string | undefined {
     .toLowerCase();
 }
 
+/** First finite, non-negative number among `keys` on an ACP usage object, or
+ *  `undefined` when the agent reported none of them.
+ *
+ *  ACP has no single usage spelling.  `session/prompt` results carry
+ *  `inputTokens`/`outputTokens` (opencode), `_meta.input_tokens`
+ *  (grok/gemini) and `cost` in at least three different shapes across the
+ *  agents this driver wraps, and an agent that invents a key we do not know
+ *  must read as UNREPORTED — never as zero, which would price a real turn as
+ *  free.  Keys are tried in order so the preferred spelling wins. */
+function acpNumber(source: any, ...keys: string[]): number | undefined {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return undefined;
+}
+
 function decodeAcpConfig(defaultCli: string) {
   return (raw: unknown): AcpConfig => {
     const o = (raw ?? {}) as Record<string, unknown>;
@@ -830,7 +848,24 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
          * signal is a `session/update` `usage_update` notification carrying
          * a combined context-occupancy figure (see the `usage_update` case
          * in `handleNotification` below), with no input/output split. */
-        let turnUsage: { input: number; output?: number } | undefined;
+        let turnUsage: { input: number; output?: number; cachedInput?: number } | undefined;
+
+        /** A cost THIS agent reported for this turn, if it reported one.
+         *
+         *  Every ACP engine used to hardcode `cost: null` here, and
+         *  `rolling-spend.ts` drops a non-positive cost, so the engines that
+         *  actually carry the fleet — dsh, claude, codex, antigravity —
+         *  contributed nothing at all to the 5-hour and 7-day spend map
+         *  while grok and minimax did.  The fleet spend view was therefore
+         *  a confident fraction of the truth with nothing marking the gap.
+         *
+         *  Only a number the agent itself reported counts.  Inventing one
+         *  from a price table here would be a worse lie than a blank:
+         *  these are subscription logins, so an API-equivalent figure is an
+         *  estimate, not a charge, and `billingMode` exists to say so.
+         *  An agent that reports nothing keeps `null` and is counted as
+         *  UNPRICED by rolling-spend rather than as free. */
+        let turnCost: number | null | undefined;
 
         const settle = (ok: boolean, stopReason: string | null) => {
           if (state.settled || state.retrying) return;
@@ -851,7 +886,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             type: "turn.completed",
             ok,
             stopReason,
-            cost: null,
+            // `turnCost` is only ever a figure the agent itself reported, so
+            // it is a provider number and not an estimate — hence no
+            // `billingMode`, which defaults to "actual".
+            cost: turnCost ?? null,
             ...(turnUsage ? { usage: turnUsage } : {}),
           });
           stop(); // the agent process does not exit on its own
@@ -1400,14 +1438,42 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};
-            if (typeof usage.inputTokens === "number" || typeof usage.outputTokens === "number") {
-              turnUsage = { input: usage.inputTokens ?? 0, output: usage.outputTokens ?? 0 };
+            const input = acpNumber(usage, "inputTokens", "input_tokens", "promptTokens", "input");
+            const output = acpNumber(usage, "outputTokens", "output_tokens", "completionTokens", "output");
+            // Cache reads are a SUBSET of input (the contract's invariant), so
+            // a provider that reports them separately must still be counted
+            // inside `input` — fold them in rather than reporting the cache
+            // figure alongside an input that excluded it.
+            const cachedRaw = acpNumber(
+              usage,
+              "cachedInputTokens",
+              "cacheReadInputTokens",
+              "cache_read_input_tokens",
+              "cachedInput",
+              "cached_input",
+            );
+            if (input != null || output != null) {
+              // A cache figure larger than the input it must sit inside means
+              // the agent's two numbers disagree and neither can be trusted as
+              // a split.  Reporting the input on its own is the honest reading;
+              // clamping the cache down and adding it in would invent a total.
+              const cached =
+                cachedRaw == null || input == null || cachedRaw > input ? undefined : cachedRaw;
+              const total = cached == null ? input : (input ?? 0) + cached;
+              turnUsage = {
+                input: total ?? 0,
+                ...(output != null ? { output } : {}),
+                ...(cached != null ? { cachedInput: cached } : {}),
+              };
               emit({
                 ...base(threadId, turnId),
                 type: "thread.token-usage.updated",
                 ...turnUsage,
               });
             }
+            // Only a figure the agent itself reported.  See `turnCost`.
+            const reportedCost = acpNumber(usage, "cost", "costUsd", "cost_usd", "totalCostUsd");
+            if (reportedCost != null && reportedCost > 0) turnCost = reportedCost;
             const reason = normalizeStopReason(result?.stopReason);
             if (reason === "end_turn" || reason === "max_tokens") settle(true, null);
             else if (reason === "cancelled") settle(true, "cancelled");
