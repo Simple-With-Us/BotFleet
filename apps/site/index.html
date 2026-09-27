@@ -380,6 +380,19 @@
 </footer>
 
 <script>
+  // A fragment pointing at a closed <details> only reaches its summary.
+  // Open before scrolling, both on direct links and when nav is clicked again.
+  const addOns = document.getElementById("add-on-list");
+  const revealAddOns = () => {
+    if (window.location.hash === "#add-on-list" && addOns) addOns.open = true;
+  };
+  document.querySelector('a[href="#add-on-list"]')?.addEventListener("click", () => {
+    if (addOns) addOns.open = true;
+  });
+  window.addEventListener("hashchange", revealAddOns);
+  revealAddOns();
+</script>
+<script>
   window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
 </script>
 <script defer src="/_vercel/insights/script.js"></script>
