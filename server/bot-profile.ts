@@ -20,6 +20,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "avatarCrop",
   "voice",
   "speakReplies",
+  "speechDevices",
   "modelSelection",
   "chiefOfStaff",
   "approvePeerComms",
@@ -105,6 +106,7 @@ const profilePatchSchema = z.object({
     .max(BOT_PROFILE_LIMITS.voice, { error: "voice must be at most 200 characters" })
     .optional(),
   speakReplies: z.boolean({ error: "speakReplies must be true or false" }).optional(),
+  speechDevices: z.array(z.enum(["mac", "iphone"])).max(2).refine((v) => new Set(v).size === v.length, "speechDevices must not repeat a device").optional(),
   modelSelection: z.any().optional(),
   chiefOfStaff: z.boolean({ error: "chiefOfStaff must be true or false" }).optional(),
   approvePeerComms: z.boolean({ error: "approvePeerComms must be true or false" }).optional(),
@@ -136,6 +138,7 @@ export type BotProfilePatch = Partial<
     | "avatarCrop"
     | "voice"
     | "speakReplies"
+    | "speechDevices"
     | "modelSelection"
     | "activeModelSelection"
     | "chiefOfStaff"

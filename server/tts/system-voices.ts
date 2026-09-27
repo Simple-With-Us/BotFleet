@@ -1,24 +1,24 @@
 // Built-in macOS speech synthesis — the zero-key voice provider.
 //
-// Calls and spoken replies work with no ElevenLabs account by using the
-// voices already installed on the Mac (`/usr/bin/say`, the same engine the
-// Spoken Content pane uses). Everything about driving `say` lives in this
-// file: listing voices, and turning one utterance into WAV bytes.
+// Calls and spoken replies work with no account by using the voices already
+// installed on the Mac (`/usr/bin/say`, the same engine the Spoken Content
+// pane uses). Everything about driving `say` lives in this file: listing
+// voices, and turning one utterance into WAV bytes.
 //
-// It runs on the HARNESS for the same reason ElevenLabs does — one place to
+// It runs on the HARNESS for the same reason MiniMax does — one place to
 // spawn processes, one place that owns the utterance split — and the
 // renderer keeps playing opaque audio bytes, so it never learns or cares
 // which provider produced them.
 //
 // Platform-gated: `say` is a Darwin binary. Elsewhere the provider simply
-// never appears as an option, and the ElevenLabs path is unchanged.
+// never appears as an option.
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import type { Audio, Voice } from "./elevenlabs.ts";
+import type { Audio, Voice } from "./types.ts";
 
 const SAY = "/usr/bin/say";
 const execFileAsync = promisify(execFile);

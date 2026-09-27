@@ -152,6 +152,7 @@ struct ChatView: View {
         }
         .onAppear { NotificationCoordinator.shared.viewingThreadId = threadId }
         .onChange(of: threadId) { _, newId in
+            dictation.stop()
             NotificationCoordinator.shared.viewingThreadId = newId
         }
         .onDisappear {
@@ -640,7 +641,7 @@ struct ChatView: View {
 
     private var canSend: Bool {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (!text.isEmpty || !pendingAttachments.isEmpty) && !sending
+        return (!text.isEmpty || !pendingAttachments.isEmpty) && !sending && !(dictation.recordedWAV != nil && current.busy)
     }
 
     private var hasPendingApproval: Bool {
@@ -670,19 +671,29 @@ struct ChatView: View {
         dictation.stop()
         let text = (explicitText ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
         let outgoing = pendingAttachments
+        let recording: (data: Data, transcript: String)? = dictation.recordedWAV.flatMap { data in
+            dictation.recordedTranscript.map { (data: data, transcript: $0) }
+        }
         guard !text.isEmpty || !outgoing.isEmpty, !sending else { return }
+        // The server intentionally refuses recorded sends while a bot is
+        // steering; keep the capture locally rather than upload an orphan.
+        guard recording == nil || !current.busy else { return }
         draft = ""
         pendingAttachments = []
+        dictation.discardRecording()
         showCommandHUD = false
         SoundEffects.playSent()
         Haptics.impact(.medium)
         sending = true
         Task {
-            let ok = await session.send(text, to: current, attachments: outgoing)
+            let ok = await session.send(text, to: current, attachments: outgoing, recording: recording)
             sending = false
             if !ok {
                 if draft.isEmpty { draft = text }
                 if pendingAttachments.isEmpty { pendingAttachments = outgoing }
+                if let recording, dictation.recordedWAV == nil {
+                    dictation.restoreRecording(recording.data, transcript: recording.transcript)
+                }
             }
         }
     }
@@ -692,6 +703,14 @@ struct ChatView: View {
     /// A round + and a glass pill with dictation and send inside it.
     private var composer: some View {
         VStack(spacing: 6) {
+            if dictation.recordedWAV != nil {
+                HStack(spacing: 8) {
+                    Label("Recording saved with this message", systemImage: "waveform")
+                    Button("Discard audio") { dictation.discardRecording() }
+                }
+                .font(.caption)
+                .foregroundStyle(Color.secondary)
+            }
             if let error = dictation.error {
                 Text(error)
                     .font(.system(size: 13))
@@ -1040,6 +1059,9 @@ struct MessageRow: View {
     @EnvironmentObject private var session: Session
     @State private var editingText = ""
     @State private var showingEdit = false
+    @State private var showingRecordingReview = false
+    @State private var recordingCorrection = ""
+    @State private var recordingComment = ""
 
     private static let reactionChoices = ["👍", "❤️", "😂", "🎉", "👀"]
 
@@ -1151,6 +1173,50 @@ struct MessageRow: View {
                     .foregroundStyle(Color.secondary)
             }
 
+            if let recording = message.recording, message.role == .user {
+                VStack(alignment: .leading, spacing: 4) {
+                    Button {
+                        session.playRecording(message, threadId: chat.threadId)
+                    } label: {
+                        Label(session.speakingMessageId == message.id ? "Stop recording" : "Replay recording",
+                              systemImage: session.speakingMessageId == message.id ? "stop.fill" : "waveform")
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    Text("Original transcript: \(recording.transcript.isEmpty ? "(no speech recognized)" : recording.transcript)")
+                        .font(.caption)
+                    if let correction = message.recordingReview?.correction, !correction.isEmpty {
+                        Text("Correction: \(correction)").font(.caption)
+                    }
+                    if let comment = message.recordingReview?.comment, !comment.isEmpty {
+                        Text("Note: \(comment)").font(.caption)
+                    }
+                    Button("Correct or add a note") {
+                        recordingCorrection = message.recordingReview?.correction ?? ""
+                        recordingComment = message.recordingReview?.comment ?? ""
+                        showingRecordingReview = true
+                    }
+                    .font(.caption)
+                    if let translation = message.translation {
+                        Text("Translation (\(translation.language)): \(translation.text)").font(.caption)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if message.role == .bot, message.kind == .text, senderBot != nil,
+               (message.audio?.isEmpty == false || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
+                Button {
+                    session.playVoice(message, threadId: chat.threadId)
+                } label: {
+                    Label(session.speakingMessageId == message.id ? "Stop Voice" : (message.audio?.isEmpty == false ? "Replay Voice" : "Read Aloud"),
+                          systemImage: session.speakingMessageId == message.id ? "stop.fill" : "speaker.wave.2")
+                }
+                .font(.system(size: 12, weight: .medium))
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+            }
+
             if let reactions = message.reactions, !reactions.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(reactionGroups(reactions), id: \.emoji) { group in
@@ -1204,7 +1270,7 @@ struct MessageRow: View {
             }
             if (message.role == .user ||
                 (message.role == .system && message.automationSource == "delegation")),
-               message.kind == .text,
+               message.kind == .text, message.recording == nil,
                WebhookMessageView.parse(message.text) == nil,
                ImessageMessageView.parse(message.text) == nil,
                case let .bot(bot) = chat {
@@ -1220,6 +1286,38 @@ struct MessageRow: View {
                 Divider()
                 Button("Copy Request ID", systemImage: "doc.on.doc") {
                     UIPasteboard.general.string = reqId
+                }
+            }
+        }
+        .sheet(isPresented: $showingRecordingReview) {
+            NavigationStack {
+                Form {
+                    Section("Original transcript") {
+                        Text(message.recording?.transcript ?? "")
+                    }
+                    Section("Correction (keeps the original)") {
+                        TextEditor(text: $recordingCorrection).frame(minHeight: 90)
+                    }
+                    Section("Note") {
+                        TextEditor(text: $recordingComment).frame(minHeight: 90)
+                    }
+                    Section {
+                        Text("Translation is not configured yet.")
+                            .foregroundStyle(Color.secondary)
+                    }
+                }
+                .navigationTitle("Recording review")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showingRecordingReview = false }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            Task { await session.saveRecordingReview(message, threadId: chat.threadId,
+                                                                      correction: recordingCorrection, comment: recordingComment) }
+                            showingRecordingReview = false
+                        }
+                    }
                 }
             }
         }

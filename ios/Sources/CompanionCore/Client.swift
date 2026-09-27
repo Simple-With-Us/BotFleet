@@ -996,6 +996,25 @@ public struct CompanionClient: Sendable {
         ).bot
     }
 
+    public func messageVoice(threadId: String, messageId: String) async throws -> [VoiceClip] {
+        guard Self.validVoiceId(threadId), Self.validVoiceId(messageId) else { throw APIError.badURL }
+        var request = try makeRequest("POST", "/api/threads/\(threadId)/messages/\(messageId)/audio")
+        request.timeoutInterval = 150
+        return try await send(request, as: MessageVoiceResponse.self).audio
+    }
+
+    public func voiceClip(threadId: String, messageId: String, index: Int) async throws -> Data {
+        guard Self.validVoiceId(threadId), Self.validVoiceId(messageId), index >= 0 else { throw APIError.badURL }
+        let request = try makeRequest("GET", "/api/threads/\(threadId)/messages/\(messageId)/audio/\(index)")
+        let (data, response) = try await perform(request)
+        try Self.check(response, data)
+        return data
+    }
+
+    private static func validVoiceId(_ id: String) -> Bool {
+        !id.isEmpty && id.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 }
+    }
+
     public func previewVoice(text: String, voiceId: String) async throws -> Data {
         let request = try makeRequest(
             "POST", "/api/tts/speak",
@@ -1068,16 +1087,48 @@ public struct CompanionClient: Sendable {
         text: String,
         toBot botId: String,
         threadId: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        recording: IncomingRecording? = nil
     ) async throws -> SendMessageResult {
-        try await sendIdempotent(
-            try makeRequest("POST", "/api/bots/\(botId)/messages", body: [
-                "text": text,
-                "threadId": threadId,
-                "idempotencyKey": idempotencyKey,
-            ]),
+        var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let recording {
+            body["recording"] = ["path": recording.path, "mime": recording.mime,
+                                 "transcript": recording.transcript, "engine": recording.engine]
+        }
+        return try await sendIdempotent(
+            try makeRequest("POST", "/api/bots/\(botId)/messages", body: body),
             as: SendMessageResult.self
         )
+    }
+
+    /// Save a recorded WAV as bytes, not as a prompt attachment. The message
+    /// send below links the returned path to exactly one conversation row.
+    public func uploadRecording(_ data: Data) async throws -> String {
+        guard data.count >= 44, data.count <= 25 * 1_024 * 1_024 else {
+            throw APIError.transport("Recording must be a WAV smaller than 25 MB.")
+        }
+        var request = try makeRequest("POST", "/api/attachments")
+        request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        if data.count > 2 * 1_024 * 1_024 { request.timeoutInterval = 60 }
+        let saved = try await send(request, as: AttachmentResponse.self)
+        guard saved.mime == "audio/wav", saved.path.hasPrefix("/api/attachments/") else {
+            throw APIError.transport("The recording could not be saved.")
+        }
+        return saved.path
+    }
+
+    public func recording(threadId: String, messageId: String) async throws -> Data {
+        let request = try makeRequest("GET", "/api/threads/\(threadId)/messages/\(messageId)/recording")
+        let (data, response) = try await perform(request)
+        try Self.check(response, data)
+        return data
+    }
+
+    public func reviewRecording(threadId: String, messageId: String, correction: String, comment: String) async throws -> Message {
+        try await send(try makeRequest("PATCH", "/api/threads/\(threadId)/messages/\(messageId)/recording-review", body: [
+            "correction": correction, "comment": comment,
+        ]), as: MessageResponse.self).message
     }
 
     public func cancelQueued(botId: String, queueId: String) async throws {
@@ -1088,13 +1139,15 @@ public struct CompanionClient: Sendable {
         text: String,
         toRoom groupId: String,
         threadId: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        recording: IncomingRecording? = nil
     ) async throws {
-        try await sendIdempotent(try makeRequest("POST", "/api/groups/\(groupId)/messages", body: [
-            "text": text,
-            "threadId": threadId,
-            "idempotencyKey": idempotencyKey,
-        ]))
+        var body: [String: Any] = ["text": text, "threadId": threadId, "idempotencyKey": idempotencyKey]
+        if let recording {
+            body["recording"] = ["path": recording.path, "mime": recording.mime,
+                                 "transcript": recording.transcript, "engine": recording.engine]
+        }
+        try await sendIdempotent(try makeRequest("POST", "/api/groups/\(groupId)/messages", body: body))
     }
 
     /// Answer an approval or a question.
@@ -1374,3 +1427,5 @@ public struct CompanionClient: Sendable {
         return eventStream(request: streamRequest, session: Self.streaming)
     }
 }
+
+private struct MessageVoiceResponse: Decodable { let audio: [VoiceClip] }

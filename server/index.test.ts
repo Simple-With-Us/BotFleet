@@ -1450,6 +1450,7 @@ describe("harness HTTP API", () => {
         avatarCrop: "circle",
         voice: "voice_fixture",
         speakReplies: true,
+        speechDevices: ["mac", "iphone"],
       });
       expect(saved.status).toBe(200);
       expect(saved.body.bot).toMatchObject({
@@ -1461,6 +1462,7 @@ describe("harness HTTP API", () => {
         avatarCrop: "circle",
         voice: "voice_fixture",
         speakReplies: true,
+        speechDevices: ["mac", "iphone"],
       });
       const frame = await stream.until(
         (candidate) => candidate.kind === "bot" && candidate.bot?.id === bot.id,
@@ -1476,6 +1478,8 @@ describe("harness HTTP API", () => {
         { notifications: "yes" },
         { voice: null },
         { speakReplies: 1 },
+        { speechDevices: ["ipad"] },
+        { speechDevices: ["mac", "mac"] },
       ]) {
         expect((await api("PATCH", `/api/bots/${bot.id}/profile`, invalid)).status).toBe(400);
       }

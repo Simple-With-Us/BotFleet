@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { formatTokens, formatUsd } from "@/lib/usage";
 import {
+  api,
   useStore,
   useStreaming,
   formatTime,
@@ -47,6 +48,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
+import { splitVoiceSummary } from "../../shared/voice-summary";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -62,6 +64,7 @@ import { RenameTitle } from "./RenameTitle";
 import { ThreadTabs } from "./ThreadTabs";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
+import { SpeakButton } from "./SpeakButton";
 import { CallButton, CallOverlay } from "./CallView";
 import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
@@ -279,7 +282,39 @@ function Bubble({
   const humanTyped = alignRight && !message.from?.botId;
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewCorrection, setReviewCorrection] = useState("");
+  const [reviewComment, setReviewComment] = useState("");
+  const [reviewError, setReviewError] = useState("");
+  const [recordingPlaying, setRecordingPlaying] = useState(false);
+  const recordingAudio = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => () => { recordingAudio.current?.pause(); recordingAudio.current = null; }, []);
+  const playRecording = () => {
+    if (recordingAudio.current) {
+      recordingAudio.current.pause();
+      recordingAudio.current = null;
+      setRecordingPlaying(false);
+      return;
+    }
+    const audio = new Audio(`/api/threads/${bot.threadId}/messages/${message.id}/recording`);
+    recordingAudio.current = audio;
+    audio.onended = () => { recordingAudio.current = null; setRecordingPlaying(false); };
+    audio.onerror = () => { recordingAudio.current = null; setRecordingPlaying(false); setReviewError("Could not replay recording."); };
+    setRecordingPlaying(true);
+    void audio.play().catch(() => { recordingAudio.current = null; setRecordingPlaying(false); setReviewError("Could not replay recording."); });
+  };
+  const saveReview = async () => {
+    try {
+      await api(`/api/threads/${bot.threadId}/messages/${message.id}/recording-review`, {
+        method: "PATCH",
+        body: JSON.stringify({ correction: reviewCorrection, comment: reviewComment }),
+      });
+      setReviewOpen(false);
+      setReviewError("");
+    } catch (error) { setReviewError(error instanceof Error ? error.message : "Could not save review."); }
+  };
   const text = message.text ?? "";
+  const voiceSections = message.role === "bot" && message.kind === "text" ? splitVoiceSummary(text) : null;
   const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(text) : null;
   const attachedImages = humanTyped ? splitAttachedImages(text) : null;
   const visibleText = attachedImages?.display ?? text;
@@ -390,6 +425,7 @@ function Bubble({
         {/* Row 3: reactions, the "+", then which model answered — the mark
             is a logo only; the model name still lives in its tooltip. */}
         <div className="flex items-center gap-1.5">
+          {message.role === "bot" && message.kind === "text" && <SpeakButton text={text} botId={bot.id} threadId={bot.threadId} messageId={message.id} voiceId={bot.voice} hasAudio={Boolean(message.audio?.length)} />}
           {message.kind === "text" && <ReactionBar threadId={bot.threadId} message={message} />}
           {bot && bot.modelSelection && (() => {
             const instance = state.instances.find((i: any) => i.instanceId === bot.modelSelection.instanceId);
@@ -439,7 +475,7 @@ function Bubble({
                   reply to or react to your own message today, so row 3 is
                   simply empty. */}
               <div className="flex items-center gap-1.5">
-                {message.kind === "text" && !bot.busy && (
+                {message.kind === "text" && !message.recording && !bot.busy && (
                   <button
                     onClick={onStartEdit}
                     aria-label="Edit Message"
@@ -520,6 +556,32 @@ function Bubble({
               >
                 <MentionText text={visibleText} />
               </div>
+              {message.recording && (
+                <div className="mt-2 rounded-lg border border-hairline/40 p-2 text-[12px]" onClick={(event) => event.stopPropagation()}>
+                  <button type="button" onClick={playRecording} className="font-medium text-accent">
+                    {recordingPlaying ? "Stop recording" : "Replay recording"}
+                  </button>
+                  <p className="mt-1">Original transcript: {message.recording.transcript || "(no speech recognized)"}</p>
+                  {message.recordingReview?.correction && <p>Correction: {message.recordingReview.correction}</p>}
+                  {message.recordingReview?.comment && <p>Note: {message.recordingReview.comment}</p>}
+                  {message.translation ? <p>Translation ({message.translation.language}): {message.translation.text}</p> : <p className="text-ink-secondary">Translation not configured</p>}
+                  <button type="button" onClick={() => {
+                    setReviewCorrection(message.recordingReview?.correction ?? "");
+                    setReviewComment(message.recordingReview?.comment ?? "");
+                    setReviewOpen(!reviewOpen);
+                  }} className="mt-1 text-accent">Correct or add a note</button>
+                  {reviewOpen && <div className="mt-2 space-y-2">
+                    <label className="block">Correction (keeps the original)
+                      <textarea value={reviewCorrection} onChange={(event) => setReviewCorrection(event.target.value)} maxLength={12000} className="mt-1 block w-full rounded border border-hairline bg-inset p-2 text-ink" />
+                    </label>
+                    <label className="block">Note
+                      <textarea value={reviewComment} onChange={(event) => setReviewComment(event.target.value)} maxLength={12000} className="mt-1 block w-full rounded border border-hairline bg-inset p-2 text-ink" />
+                    </label>
+                    <button type="button" onClick={() => void saveReview()} className="text-accent">Save review</button>
+                  </div>}
+                  {reviewError && <p role="alert" className="text-danger">{reviewError}</p>}
+                </div>
+              )}
               {message.steered && (
                 <div className="mt-1 text-[11px] text-ink-secondary/70" title="Sent while the bot was working — it saw this before its next step, inside the same turn.">
                   sent mid-turn
@@ -541,7 +603,13 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={toImessageBody ?? text} />
+              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? text} />
+              {voiceSections && (
+                <details className="mt-2 border-t border-hairline/40 pt-2" onClick={(event) => event.stopPropagation()}>
+                  <summary className="cursor-pointer text-[12px] text-ink-secondary">Spoken Summary</summary>
+                  <div className="mt-2 text-[13px] text-ink-secondary"><ChatMarkdown text={voiceSections.voice} /></div>
+                </details>
+              )}
             </MessageBoundary>
           )}
         </div>

@@ -51,7 +51,6 @@ import { SkinPicker } from "./SkinPicker";
 import { RoomTurnTimeoutSettings } from "./RoomTurnTimeoutSettings";
 import { TranscriptionSettings } from "./TranscriptionSettings";
 import { QdrantRagConnection } from "./QdrantRagConnection";
-import { ElevenLabsConnection } from "./ElevenLabsConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
 
@@ -62,7 +61,7 @@ const SECTIONS: Array<{
   keywords: string[];
 }> = [
   { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "simple", "projects", "threads", "workspace"] },
-  { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps", "elevenlabs", "voice", "tts", "speech"] },
+  { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps", "voice", "tts", "speech"] },
   { id: "remote", label: "Remote Access", icon: Globe, keywords: ["remote", "url", "tunnel", "cloudflare", "access", "jay's tunnel", "health"] },
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
   { id: "models", label: "Models", icon: Layers, keywords: ["model", "fallback", "primary", "engine", "per bot", "fleet"] },
@@ -1148,13 +1147,15 @@ export function SettingsModal() {
                       {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
                     </div>
                   ) : null}
-                  <ElevenLabsConnection />
                   <TranscriptionSettings />
                   <ApiKeyRow section="box" />
                   <VpsConnection />
                   <ApiKeyRow section="opencodeGo" />
                   <ApiKeyRow section="deepseek" />
-                  <EngineKeyRow engine="minimax" />
+                  <div>
+                    <EngineKeyRow engine="minimax" />
+                    <p className="mt-1 text-[12px] text-ink-secondary">MiniMax API key runs models; voice synthesis uses the separate MiniMax voice key in each bot's Voice settings.</p>
+                  </div>
                   <EngineKeyRow engine="openaiCompat" />
                   <QdrantRagConnection />
                   <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">

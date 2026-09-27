@@ -74,6 +74,23 @@ describe("Speaker lifecycle", () => {
     expect(speaker.state).toEqual({ status: "idle" });
   });
 
+  it("uses the saved message audio route and never sends text to the synthesis route", async () => {
+    const endpoint = "/api/threads/task_1/messages/msg_1/audio";
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      calls.push(String(input));
+      if (String(input) === endpoint) return json({ audio: [{ path: "/api/attachments/clip.mp3", mime: "audio/mpeg" }] });
+      return new Response(new Blob(["mp3"]), { status: 200 });
+    }));
+    const speaker = new Speaker();
+    const speaking = speaker.speak("Saved reply", { botId: "bot_1", threadId: "task_1", messageId: "msg_1" });
+    await vi.waitFor(() => expect(FakeAudio.latest).not.toBeNull());
+    FakeAudio.latest!.onended?.();
+    await speaking;
+    expect(calls).toEqual([endpoint, `${endpoint}/0`]);
+    expect(speaker.state).toEqual({ status: "idle" });
+  });
+
   it("passes a per-bot voice through preparation and synthesis", async () => {
     const bodies: unknown[] = [];
     vi.stubGlobal(

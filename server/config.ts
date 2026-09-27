@@ -260,9 +260,9 @@ const appConfigSchema = z.object({
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
+   * engine: "minimax" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), credentialStorage: externalCredentialStorage }).optional(),
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   autoUpdate: z
@@ -393,7 +393,7 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; credentialStorage?: "external" };
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
   imageGen?: { key?: string; credentialStorage?: "external" };
   autoUpdate?: {
     enabled?: boolean;
@@ -888,7 +888,7 @@ export function ensureDirs() {
 
 /** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider
  * absent) to provider: "elevenlabs" so PR #513's MiniMax default does not
- * silently route a valid ElevenLabs key to MiniMax's `/v1/models`.
+ * silently route a valid ElevenLabs key to MiniMax's `/v1/get_voice`.
  * Idempotent: returns false if provider is already set, if the tts section
  * is empty, or if only a voice (no key) is present.  Mutates the cfg in
  * place so the current `loadConfig()` call carries the pin; the call site
@@ -901,7 +901,7 @@ export function ensureDirs() {
  * each bot (`speak()` and `voiceReady()` accept a per-bot `voiceId` when the
  * workspace fallback is absent), so a key-only record is a legitimate legacy
  * shape, not an ambiguous one.  Fresh MiniMax key-only saves are
- * distinguished by `credentialConfigPatch` persisting `provider: "minimax"`
+ * distinguished by new key saves persisting `provider: "minimax"`
  * alongside the key — every post-default save carries the explicit provider,
  * so any record that arrives here without one predates the default. */
 export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
@@ -1040,27 +1040,8 @@ export function loadConfig(): AppConfig {
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
   resolveSecretFields(cfg, process.env, infisicalSnapshot());
-  // Migration: existing installations with `tts.key` + `tts.voice` but no
-  // `tts.provider` were silently ElevenLabs installs before PR #513 flipped
-  // the default to MiniMax.  Without this pin, every legacy ElevenLabs user
-  // would route their valid ElevenLabs key to MiniMax's `/v1/models` after
-  // upgrade and lose audio until they re-entered the provider manually.
-  //
-  // Runs AFTER the env overlay and the secret store so a packaged-app
-  // install whose real key was moved into the OS keychain — leaving an
-  // empty tombstone on disk and surfacing it later as `OMB_TTS_KEY` — sees
-  // the credential that the migration needs.  Earlier (the pre-fix
-  // placement) the file's empty key reached `key?.trim()` and the pin
-  // never fired, so the next TTS call still picked MiniMax and shipped the
-  // ElevenLabs key to the wrong `/v1/models`.
-  //
-  // The pin is in-memory only: re-running the migration next launch is
-  // cheap and idempotent, and persisting it back through `saveConfig` here
-  // would write the env-injected (or store-injected) credential into
-  // config.json in cleartext for desktop installs whose whole point of
-  // moving the key into the keychain was to keep it OUT of that file.  An
-  // operator-driven save can still write the pin alongside any other
-  // tts.* they choose to persist.
+  // Pin pre-MiniMax key-only installs after env and external-secret resolution.
+  // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
   // Migration: existing installs carried the legacy
   // `botDefaults.allowedComputers` shape (an array of three legacy

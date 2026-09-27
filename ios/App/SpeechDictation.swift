@@ -34,6 +34,11 @@ final class SpeechDictation: ObservableObject {
     @Published private(set) var isStarting = false
     @Published private(set) var transcript = ""
     @Published private(set) var error: String?
+    /// A stopped capture stays available until ChatView sends or discards it.
+    @Published private(set) var recordedWAV: Data?
+    @Published private(set) var recordedTranscript: String?
+    private var recordingURL: URL?
+    private var recordingFile: AVAudioFile?
 
     /// Composer text captured when listening started. Frozen for the
     /// session so each partial replaces the last rather than stacking.
@@ -62,9 +67,14 @@ final class SpeechDictation: ObservableObject {
 
     private func start(base: String) {
         guard !isListening, !isStarting else { return }
+        guard recordedWAV == nil else {
+            error = "Send or discard the saved recording before starting another."
+            return
+        }
         error = nil
         self.base = base.trimmingCharacters(in: .whitespacesAndNewlines)
         transcript = ""
+        recordedTranscript = nil
         isStarting = true
         generation += 1
         let gen = generation
@@ -78,7 +88,30 @@ final class SpeechDictation: ObservableObject {
         isStarting = false
         stopping = true
         isListening = false
+        // End the tap before opening the file for reading. A failed capture
+        // never produces a misleading voice clip.
+        let completed = recordingURL
         teardown()
+        if let completed, let bytes = try? Data(contentsOf: completed), bytes.count > 44,
+           bytes.count <= 25 * 1_024 * 1_024 {
+            recordedWAV = bytes
+            recordedTranscript = transcript
+        } else if completed != nil {
+            error = "Recording could not be saved (25 MB maximum). Text is still available to send."
+        }
+        if let completed { try? FileManager.default.removeItem(at: completed) }
+        recordingURL = nil
+    }
+
+    func discardRecording() {
+        recordedWAV = nil
+        recordedTranscript = nil
+        error = nil
+    }
+
+    func restoreRecording(_ data: Data, transcript: String) {
+        recordedWAV = data
+        recordedTranscript = transcript
     }
 
     // MARK: - Authorization
@@ -109,13 +142,20 @@ final class SpeechDictation: ObservableObject {
             isStarting = false
         } catch CaptureError.noRecognizer {
             isStarting = false
-            error = "Dictation isn't available for this language."
+            error = "On-device dictation isn't available for this language or device."
             teardown()
+            discardFile()
         } catch {
             isStarting = false
             self.error = "Couldn't start the microphone."
             teardown()
+            discardFile()
         }
+    }
+
+    private func discardFile() {
+        if let recordingURL { try? FileManager.default.removeItem(at: recordingURL) }
+        recordingURL = nil
     }
 
     private func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
@@ -131,7 +171,7 @@ final class SpeechDictation: ObservableObject {
     private func beginCapture(generation gen: Int) throws {
         let recognizer = Dictation.localeCandidates()
             .compactMap { SFSpeechRecognizer(locale: $0) }
-            .first { $0.isAvailable }
+            .first { $0.isAvailable && $0.supportsOnDeviceRecognition }
         guard let recognizer else {
             throw CaptureError.noRecognizer
         }
@@ -152,9 +192,7 @@ final class SpeechDictation: ObservableObject {
         // commas the recognizer already knows about.
         request.addsPunctuation = true
         request.taskHint = .dictation
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        request.requiresOnDeviceRecognition = true
 
         // Keep the engine on self before start() so a throw still has
         // something for teardown to remove the tap from. A local engine
@@ -172,8 +210,15 @@ final class SpeechDictation: ObservableObject {
         guard format.channelCount > 0 else {
             throw CaptureError.silentInput
         }
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        let file = try AVAudioFile(forWriting: fileURL, settings: format.settings, commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+        recordingURL = fileURL
+        recordingFile = file
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             request.append(buffer)
+            // The tap is serialized by AVAudioEngine. Write its actual input
+            // format, preserving precisely the samples the recognizer heard.
+            try? file.write(from: buffer)
         }
         tapInstalled = true
         engine.prepare()
@@ -237,6 +282,7 @@ final class SpeechDictation: ObservableObject {
             }
             if engine.isRunning { engine.stop() }
         }
+        recordingFile = nil
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest?.endAudio()

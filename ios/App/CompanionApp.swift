@@ -59,7 +59,9 @@ struct CompanionApp: App {
                         session.connect()
                         Task { await session.refreshNotificationAuthorization() }
                         Task { await testFlightUpdate.checkIfDue() }
-                    case .background: session.linger()
+                    case .background:
+                        session.stopVoice()
+                        session.linger()
                     case .inactive: break
                     @unknown default: break
                     }
