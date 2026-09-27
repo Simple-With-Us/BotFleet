@@ -245,6 +245,15 @@ describe("isCoarseApprovalKey", () => {
     ).toMatchObject({ approve: null, source: "no-grant" });
   });
 
+  it("cannot reuse an unscoped coarse grant for an HTTP host bash ask", () => {
+    const bot = { alwaysAllow: ["bash:bash", "Bash:bash"] };
+    expect(autoVerdict(bot, "bash", "bash -c 'echo hi'", { scope: "local-computer" })).toMatchObject({
+      approve: null,
+      source: "no-grant",
+    });
+    expect(autoDecision(bot, "bash", "bash -c 'echo hi'")).toBe("auto-approved bash:bash (always allowed)");
+  });
+
   it("honours a coarse key on a disposable computer, still guarded", () => {
     const bot = { alwaysAllow: ["Bash:bash", "Bash:git"] };
     expect(autoDecision(bot, "Bash", "git status")).toBeTruthy();

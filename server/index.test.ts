@@ -7317,7 +7317,7 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", "Bash:bash"]);
 
       const direct = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:sh" });
-      expect(direct.status).toBe(400);
+      expect(direct.status).toBe(409);
       expect(direct.body.error).toMatch(/not on a pending approval/);
 
       const narrow = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git"] });

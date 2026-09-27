@@ -3920,6 +3920,7 @@ async function startTurn(
                   providerInstanceId: instance.instanceId,
                   tool: ask.tool,
                   summary: ask.summary,
+                  approvalScope: ask.approvalScope,
                   signal: ask.signal,
                 }),
               deps: {
@@ -5688,6 +5689,7 @@ async function runGroupMemberTurn(
               providerInstanceId: instance.instanceId,
               tool: ask.tool,
               summary: ask.summary,
+              approvalScope: ask.approvalScope,
               signal: ask.signal,
             }),
           deps: {

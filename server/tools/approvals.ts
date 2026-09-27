@@ -67,6 +67,7 @@ export interface ApprovalAsk {
   providerInstanceId?: string;
   tool: string;
   summary: string;
+  approvalScope?: "local-computer";
   /** The tool call's own abort signal.  When the turn is interrupted, swept
    *  or torn down this fires, and the ask settles `"unavailable"` rather
    *  than leaving a promise nothing can ever resolve. */
@@ -200,6 +201,7 @@ export function createPermissionBroker(deps: PermissionBrokerDeps): PermissionBr
           requestType: "permission",
           tool: ask.tool,
           summary: ask.summary,
+          approvalScope: ask.approvalScope,
         });
       });
     },
