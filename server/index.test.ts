@@ -2520,6 +2520,37 @@ describe("harness HTTP API", () => {
     }
   }, 30_000);
 
+  it("runs iMessage-relayed text as an unattended imessage turn, not an attended one", async () => {
+    // S8: text from an outside iMessage sender must never get attended
+    // semantics (Auto mode / Always-allow) just because it arrived over the
+    // owner-linked relay.
+    const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const transcript = async () => (await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
+      role: string; text?: string; automationSource?: string;
+    }>;
+    try {
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "[from iMessage] hello from outside", source: "imessage" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).find((message) => message.text?.includes("hello from outside"))?.automationSource, { timeout: 10_000 }).toBe("imessage");
+      const inbound = (await transcript()).find((message) => message.text?.includes("hello from outside"));
+      expect(inbound?.role).toBe("system");
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(async () => (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 10_000 }).toBe(false);
+
+      // An attended send to the same bot keeps attended provenance.
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "owner typing directly" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).some((message) => message.text?.includes("owner typing directly")), { timeout: 10_000 }).toBe(true);
+      const attended = (await transcript()).find((message) => message.text?.includes("owner typing directly"));
+      expect(attended?.automationSource).toBeUndefined();
+      expect(attended?.role).toBe("user");
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId }).catch(() => {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 30_000);
+
   it("drains a queued credential continuation after deferred fallback finds no candidate", async () => {
     const otherInstances = ["claude", "claude2", "crasher"];
     let botId = "";
@@ -7399,5 +7430,183 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     expect(await leaked.text()).toContain("Packaged BotFleet");
     const inside = await fetch(`${BASE}/assets/smoke.css`);
     expect(await inside.text()).toContain("color: white");
+  });
+
+  it("keeps multi-byte UTF-8 intact when a JSON body splits across TCP chunks", async () => {
+    // A raw socket is the only way to control TCP chunk boundaries; fetch
+    // and http.request both coalesce small writes.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const title = "héllo 🙂 wörld";
+      const payload = Buffer.from(JSON.stringify({ title }), "utf8");
+      const emojiAt = payload.indexOf(0xf0); // first byte of the 4-byte emoji
+      expect(emojiAt).toBeGreaterThan(0);
+      const first = payload.subarray(0, emojiAt + 2);
+      const second = payload.subarray(emojiAt + 2);
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = connect(PORT, "127.0.0.1");
+        let response = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => (response += chunk));
+        socket.on("end", () => resolve(response));
+        socket.on("error", reject);
+        socket.on("connect", () => {
+          socket.write(
+            `POST /api/bots/${bot.id}/tasks HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nContent-Type: application/json\r\nContent-Length: ${payload.length}\r\nConnection: close\r\n\r\n`,
+          );
+          socket.write(first);
+          setTimeout(() => {
+            socket.write(second);
+            socket.end();
+          }, 25);
+        });
+      });
+      expect(raw.startsWith("HTTP/1.1 201")).toBe(true);
+      expect(raw).toContain(title);
+      expect(raw).not.toContain("\uFFFD");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+});
+
+describe("CSRF security hardening", () => {
+  /** Makes a raw HTTP request with full header control, returns { status, body } */
+  const rawRequest = (options: {
+    method?: string;
+    path?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  }): Promise<{ status: number; body: string }> => new Promise((resolve, reject) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port: PORT,
+      path: options.path ?? "/api/bots",
+      method: options.method ?? "POST",
+      headers: options.headers ?? {},
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => data += chunk);
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: data }));
+    });
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+
+  it("rejects cross-site sec-fetch-site POST with 403 even with no Origin header", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "sec-fetch-site": "cross-site",
+        "content-type": "application/json",
+        "content-length": "2",
+        // no origin header
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-site request");
+  });
+
+  it("rejects mutating API request with text/plain body and 415", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "content-type": "text/plain",
+        "content-length": "5",
+      },
+      body: "hello",
+    });
+    expect(result.status).toBe(415);
+    expect(result.body).toContain("unsupported media type");
+  });
+
+  it("accepts mutating API request with application/json body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("accepts mutating API request with application/json; charset=utf-8 body", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("rejects Origin from a different loopback port with 403", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": "http://127.0.0.1:9999",
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(403);
+    expect(result.body).toContain("forbidden: cross-origin request");
+  });
+
+  it("accepts Origin from the server's own port", async () => {
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/bots",
+      headers: {
+        "origin": `http://127.0.0.1:${PORT}`,
+        "content-type": "application/json",
+        "content-length": "2",
+      },
+      body: "{}",
+    });
+    expect(result.status).toBe(201);
+  });
+
+  it("allows bodiless mutating POST (e.g. /api/runtime/quiesce)", async () => {
+    const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
+    const result = await rawRequest({
+      method: "POST",
+      path: "/api/runtime/quiesce",
+      headers: {
+        "authorization": `Bearer ${owner.nonce}`,
+        "origin": `http://127.0.0.1:${PORT}`,
+        // no content-type, no content-length
+      },
+      // no body
+    });
+    // 200 means accepted; 409 means active work (acceptable here); either way not 403/415
+    expect([200, 409]).toContain(result.status);
+    // clean up if quiesced
+    if (result.status === 200) {
+      await new Promise<void>((resolve) => {
+        const req = request({
+          hostname: "127.0.0.1",
+          port: PORT,
+          path: "/api/runtime/quiesce",
+          method: "DELETE",
+          headers: { "authorization": `Bearer ${owner.nonce}` },
+        }, () => resolve());
+        req.end();
+      });
+    }
   });
 });

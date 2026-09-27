@@ -27,7 +27,9 @@ function json(res: ServerResponse, status: number, body: JsonValue): void {
 
 function readRawBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let raw = "";
+    // Buffer chunks and decode once: concatenating per-chunk strings
+    // corrupts multi-byte UTF-8 sequences that split across TCP chunks.
+    const chunks: Buffer[] = [];
     let bytes = 0;
     let done = false;
     const fail = (status: number, message: string) => {
@@ -37,14 +39,14 @@ function readRawBody(req: IncomingMessage): Promise<string> {
     };
     req.on("data", (chunk) => {
       if (done) return;
-      bytes += Buffer.byteLength(chunk);
+      bytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
       if (bytes > MAX_WEBHOOK_BODY_BYTES) return fail(413, "Webhook body is too large");
-      raw += chunk;
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
     });
     req.on("end", () => {
       if (done) return;
       done = true;
-      resolve(raw);
+      resolve(Buffer.concat(chunks).toString("utf8"));
     });
     req.on("error", () => fail(400, "Could not read webhook body"));
   });
@@ -124,7 +126,15 @@ export function createWebhookIngressHandler(
   routes: Readonly<Record<string, WebhookIngressRoute | DeferredAdmissionRoute>> = {},
 ) {
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      // A request target like `//host` is protocol-relative, so the WHATWG
+      // parser throws instead of yielding a pathname.  Answer 400 rather than
+      // letting the throw escape the receiver and hang the connection.
+      return json(res, 400, { error: "Malformed request URL" });
+    }
     const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname) ? routes[url.pathname] : undefined;
     if (entry) {
       if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });

@@ -39,7 +39,7 @@ import { startUiShim } from "./attached-ui-shim.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -1647,10 +1647,12 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
 // ~/.botfleet.  A path outside that tree must throw, not open.
 ipcMain.handle("desktop:open-file", async (_event, rawPath) => {
   const filePath = await resolveOpenablePath(rawPath, { home: os.homedir() });
-  const openError = await shell.openPath(filePath);
-  if (openError) {
+  if (!mayOpenBotFile(filePath)) {
     shell.showItemInFolder(filePath);
+    return true;
   }
+  const openError = await shell.openPath(filePath);
+  if (openError) shell.showItemInFolder(filePath);
   return true;
 });
 

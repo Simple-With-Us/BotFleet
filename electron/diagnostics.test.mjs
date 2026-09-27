@@ -113,6 +113,24 @@ describe("buildDiagnosticsReport", () => {
     expect(report).toContain("«redacted");
   });
 
+  it.each([
+    "sk" + "_live_abcdefghijklmnopqrstuvwxyz0123456789",
+    "sk" + "_test_abcdefghijklmnopqrstuvwxyz0123456789",
+    "wh" + "sec_abcdefghijklmnopqrstuvwxyz0123456789",
+    "ya29" + ".abcdefghijklmnopqrstuvwxyz0123456789abcdefghij",
+    "glpat" + "-abcdefghijklmnopqrst",
+  ])("masks the issued-credential shape %s", (token) => {
+    // S13: credential shapes BotFleet itself issues or stores must not ride
+    // out in a diagnostics bundle.
+    const report = buildDiagnosticsReport({
+      appInfo,
+      configSummary: {},
+      logTail: `token ${token} ok`,
+    });
+    expect(report).not.toContain(token);
+    expect(report).toContain("«redacted");
+  });
+
   it.each(["Bearer abcdefghijklmnop", "Basic dXNlcjpwYXNzd29yZA=="])(
     "masks the full Authorization credential for %s",
     (authorization) => {

@@ -122,7 +122,7 @@ describe("Sentry AI data collection kill-switch", () => {
     });
     expect(initOpts).toMatchObject({
       streamGenAiSpans: true,
-      dataCollection: { genAI: { inputs: true, outputs: true } },
+      dataCollection: { genAI: { inputs: true, outputs: true }, httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
     });
 
     resetSentryForTests();
@@ -276,10 +276,19 @@ describe("webhook secrets never reach Sentry", () => {
   it("scrubs every field of an event passed through the init hooks", async () => {
     const hooks = await initWithStandIn();
     for (const hook of [hooks.beforeSend, hooks.beforeSendTransaction]) {
-      const out = hook(leakyEvent());
+      const input = leakyEvent();
+      input.request = {
+        ...(input.request as Record<string, unknown>),
+        data: { key: "synthetic-api-key" }, headers: { authorization: "Bearer synthetic-owner-nonce" },
+        cookies: { session: "synthetic-cookie" }, query_string: "key=synthetic-query-secret",
+      };
+      const out = hook(input);
       const wire = JSON.stringify(out);
       expect(wire).not.toContain("whsec_xyz");
       expect(wire).not.toContain(secret);
+      for (const leaked of ["synthetic-api-key", "synthetic-owner-nonce", "synthetic-cookie", "synthetic-query-secret"]) {
+        expect(wire).not.toContain(leaked);
+      }
       expect(wire).toContain(`/hooks/${endpoint}/:secret`);
       expect(out.transaction).toBe(`POST /hooks/${endpoint}/:secret`);
       expect((out.request as { url: string }).url).toBe(
@@ -296,6 +305,7 @@ describe("webhook secrets never reach Sentry", () => {
     const http = hooks.integrations.find((integration) => integration.name === "Http");
     expect(http?.options?.ignoreIncomingRequests?.(`/hooks/${endpoint}/${secret}`)).toBe(true);
     expect(http?.options?.ignoreIncomingRequests?.("/api/bots")).toBe(false);
+    expect((http?.options as Record<string, unknown>)?.maxIncomingRequestBodySize).toBe("none");
     expect(hooks.integrations.some((integration) => integration.name === "ConsoleLogs")).toBe(true);
     expect(isWebhookIngressPath("/health")).toBe(false);
   });

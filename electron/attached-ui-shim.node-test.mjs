@@ -19,7 +19,9 @@ function makeUiDir() {
 // A stand-in harness: echoes what it received for /api/*, streams one SSE
 // event for /api/events, and answers WebSocket-style upgrades with 101.
 function startFakeHarness() {
+  let requestCount = 0;
   const server = http.createServer((req, res) => {
+    requestCount += 1;
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
@@ -40,7 +42,9 @@ function startFakeHarness() {
     });
   });
   const upgraded = new Set();
+  let upgradeCount = 0;
   server.on("upgrade", (req, socket) => {
+    upgradeCount += 1;
     upgraded.add(socket);
     socket.on("close", () => upgraded.delete(socket));
     socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
@@ -51,6 +55,8 @@ function startFakeHarness() {
     server.listen(0, "127.0.0.1", () =>
       resolve({
         port: server.address().port,
+        upgradeCount: () => upgradeCount,
+        requestCount: () => requestCount,
         close: () =>
           new Promise((r) => {
             for (const socket of upgraded) socket.destroy();
@@ -85,6 +91,8 @@ test("serves the bundled UI and streams /api through to the harness", async () =
   try {
     const base = `http://127.0.0.1:${shim.port}`;
 
+    const malformed = await fetch(`${base}//`);
+    assert.equal(malformed.status, 400);
     const index = await fetch(`${base}/`);
     assert.equal(index.status, 200);
     assert.match(index.headers.get("content-type"), /text\/html/);
@@ -229,5 +237,104 @@ test("prefers the first free port from the list and falls back past busy ones", 
     await shim.close();
     await harness.close();
     await new Promise((r) => blocker.close(r));
+  }
+});
+
+test("rejects a proxied request whose Host header is not the shim's own address", async () => {
+  const harness = await startFakeHarness();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: harness.port });
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port: shim.port,
+        path: "/api/health",
+        headers: { host: "evil.example" },
+      }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    assert.equal(status, 403);
+    assert.equal(harness.requestCount(), 0, "shim should not forward a request with a foreign Host");
+  } finally {
+    await shim.close();
+    await harness.close();
+  }
+});
+
+test("accepts a proxied request whose Host header matches the shim's own address", async () => {
+  const harness = await startFakeHarness();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: harness.port });
+  try {
+    const base = `http://127.0.0.1:${shim.port}`;
+    const res = await fetch(`${base}/api/health`, {
+      headers: { Host: `127.0.0.1:${shim.port}` },
+    });
+    assert.equal(res.status, 200);
+  } finally {
+    await shim.close();
+    await harness.close();
+  }
+});
+
+test("rejects a request whose Origin header is a loopback address on a different port", async () => {
+  const harness = await startFakeHarness();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: harness.port });
+  try {
+    const base = `http://127.0.0.1:${shim.port}`;
+    const otherPort = shim.port + 1;
+    const res = await fetch(`${base}/api/health`, {
+      headers: { Origin: `http://127.0.0.1:${otherPort}` },
+    });
+    assert.equal(res.status, 403);
+  } finally {
+    await shim.close();
+    await harness.close();
+  }
+});
+
+test("accepts a request whose Origin header is the shim's own loopback origin", async () => {
+  const harness = await startFakeHarness();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: harness.port });
+  try {
+    const base = `http://127.0.0.1:${shim.port}`;
+    const res = await fetch(`${base}/api/health`, {
+      headers: { Origin: `http://127.0.0.1:${shim.port}` },
+    });
+    assert.equal(res.status, 200);
+  } finally {
+    await shim.close();
+    await harness.close();
+  }
+});
+
+test("refuses a WebSocket upgrade whose Host header is not the shim's own address", async () => {
+  const harness = await startFakeHarness();
+  const shim = await startUiShim({ uiDir: makeUiDir(), harnessPort: harness.port });
+  try {
+    const base = `http://127.0.0.1:${shim.port}`;
+    await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port: shim.port,
+        path: "/api/ws",
+        headers: { connection: "Upgrade", upgrade: "websocket", host: "evil.example" },
+      });
+      req.on("error", () => {
+        // socket destroyed by shim is expected
+        resolve();
+      });
+      req.on("response", () => reject(new Error("expected no HTTP response")));
+      req.end();
+      // Give the shim time to destroy the socket.
+      setTimeout(resolve, 500);
+    });
+    assert.equal(harness.upgradeCount(), 0, "harness should not see an upgrade with a foreign Host");
+  } finally {
+    await shim.close();
+    await harness.close();
   }
 });

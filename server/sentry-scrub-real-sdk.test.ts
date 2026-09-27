@@ -29,6 +29,7 @@ beforeAll(() => {
     beforeSend: (event) => safeScrubHook(event),
     beforeSendTransaction: (event) => safeScrubHook(event),
     beforeSendLog: (log) => safeScrubHook(log),
+    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
   });
 });
 
@@ -57,6 +58,35 @@ describe("webhook-secret scrub against the real Sentry SDK", () => {
     const names = itemsOfType("transaction").map((t) => (t as { transaction?: string }).transaction);
     expect(names).toContain("invoke_agent plain");
     expect(internalErrorEvents()).toHaveLength(0);
+  });
+
+  it("never sends credential-save bodies or headers in a real HTTP request", async () => {
+    envelopes.length = 0;
+    const marker = ["synthetic", "private", "credential", "7x"].join("-");
+    const bearer = ["synthetic", "owner", "bearer", "8y"].join("-");
+    const server = http.createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        Sentry.captureException(new Error("synthetic save failed"));
+        res.end("ok");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await fetch(`http://127.0.0.1:${port}/api/config`, {
+        method: "PUT", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
+        body: JSON.stringify({ credential: marker }),
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    await Sentry.flush(2000);
+    expect(itemsOfType("event").length).toBeGreaterThan(0);
+    for (const raw of envelopes) {
+      expect(raw).not.toContain(marker);
+      expect(raw).not.toContain(bearer);
+    }
   });
 
   it("keeps the secret out of every envelope sent while a /hooks request is handled", async () => {

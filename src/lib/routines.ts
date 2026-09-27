@@ -6,7 +6,7 @@ export type RoutineSchedule =
   | { type: "once"; at: number }
   | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
 
-export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource";
+export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "imessage";
 
 export type RoutineRunStatus =
   | "queued"

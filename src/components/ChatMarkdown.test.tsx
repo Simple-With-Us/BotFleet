@@ -47,3 +47,13 @@ describe("mermaid fences", () => {
     expect(html).toContain(">ts<");
   });
 });
+
+describe("bot Markdown images", () => {
+  it("does not automatically load remote images", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: "![status](https://collector.example/image.png?private=synthetic)",
+    }));
+    expect(html).not.toContain("<img");
+    expect(html).toContain("status");
+  });
+});

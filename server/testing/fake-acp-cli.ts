@@ -516,6 +516,28 @@ function handle(msg: any) {
               : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
         );
       };
+      if (mode === "quiet-tool-call") {
+        // A tool call that starts and then runs SILENTLY — the `pnpm build`
+        // shape from the audit: one tool_call notification, no traffic while
+        // it runs past the idle window, then a completion and the turn end.
+        // The idle guard must not trip while the call is open.
+        const quietMs = Number(process.env.FAKE_ACP_QUIET_MS) || 400;
+        const callId = "quiet-tool-1";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "pnpm build", kind: "execute", rawInput: { command: "pnpm build" } } },
+        });
+        setTimeout(() => {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "completed", content: [{ type: "content", content: { type: "text", text: "built" } }] } },
+          });
+          complete();
+        }, quietMs);
+        return;
+      }
       if (mode === "drip") {
         // Periodic output for the prompt idle guard's "still alive" side:
         // each chunk is inbound traffic that must renew core.ts's idle

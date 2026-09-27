@@ -318,6 +318,15 @@ function ChatMarkdownComponent({ text, streaming = false }: { text: string; stre
             return <CodeBlock code={code} lang={lang} streaming={streaming} />;
           },
           img({ src, alt }: { src?: string; alt?: string }) {
+            // Bot text is untrusted. Remote images fetch on display and can
+            // encode private context in their URLs; render a link requiring
+            // an explicit click instead of making the request automatically.
+            if (src && /^https?:\/\//i.test(src)) {
+              return <a href={src} target="_blank" rel="noopener noreferrer">{alt || "Open external image"}</a>;
+            }
+            if (!src || !/^(?:\/|blob:|data:image\/(?:png|jpeg|gif|webp);base64,)/i.test(src)) {
+              return <span>{alt || "Image unavailable"}</span>;
+            }
             return (
               <img
                 src={src}
