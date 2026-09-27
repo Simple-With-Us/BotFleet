@@ -124,6 +124,8 @@ if (increased.length > 0) {
   }
   console.error("\nFix the new violations, or (only if intentional) update the baseline with:");
   console.error("  node scripts/check-lint-baseline.mjs --update");
+  console.error("\nNote: CI lints the PR merge commit (refs/pull/<n>/merge), not the branch head.");
+  console.error("If the baseline was generated from the branch alone, merge main and regenerate it.");
 }
 
 if (decreased.length > 0) {
