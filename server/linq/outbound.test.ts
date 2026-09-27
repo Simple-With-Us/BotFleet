@@ -78,6 +78,7 @@ describe("Linq turn-scoped chat binding", () => {
     );
     expect(first).toEqual({ sent: true });
     expect(second).toEqual({ sent: true });
-    expect(linqSendMessage.mock.calls.map((call) => call[0])).toEqual(["chat-a", "chat-b"]);
+    expect(linqSendMessage).toHaveBeenNthCalledWith(1, "chat-a", { text: "hello a" });
+    expect(linqSendMessage).toHaveBeenNthCalledWith(2, "chat-b", { text: "hello b" });
   });
 });
