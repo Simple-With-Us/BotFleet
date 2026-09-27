@@ -441,31 +441,23 @@ describe("incremental spend scan", () => {
 });
 
 describe("spend ceiling", () => {
-  const spend = (entries: Record<string, number>, unpriced: Record<string, number> = {}) => {
-    const map: Record<string, { spend5hUsd: number; spend7dUsd: number; unpricedTurns5h: number; unpricedTurns7d: number }> = {};
-    for (const [k, v] of Object.entries(entries)) {
-      map[k] = { spend5hUsd: v, spend7dUsd: v, unpricedTurns5h: unpriced[k] ?? 0, unpricedTurns7d: unpriced[k] ?? 0 };
-    }
-    for (const [k, v] of Object.entries(unpriced)) {
-      if (!map[k]) map[k] = { spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: v, unpricedTurns7d: v };
-    }
-    return map;
-  };
+  const now = 1_788_912_000_000;
+  const window = (spend5hUsd: number, totalTurns: number, unpricedTurns: number) => ({ spend5hUsd, totalTurns, unpricedTurns });
 
   it("does nothing unless a ceiling is configured", () => {
-    const decision = spendCeilingDecision(spend({ grok: 99 }), {}, { totalTurns: 4, unpricedTurns: 0 });
+    const decision = spendCeilingDecision(window(99, 4, 0));
     expect(decision.blocked).toBe(false);
     expect(decision.reason).toMatch(/no spend ceiling/i);
   });
 
   it("blocks once the visible total passes the ceiling", () => {
-    const decision = spendCeilingDecision(spend({ grok: 3 }), { ceilingUsd: 1 }, { totalTurns: 4, unpricedTurns: 0 });
+    const decision = spendCeilingDecision(window(3, 4, 0), { ceilingUsd: 1 });
     expect(decision.blocked).toBe(true);
     expect(decision.reason).toMatch(/over ceiling/i);
   });
 
   it("stays open below the ceiling", () => {
-    const decision = spendCeilingDecision(spend({ grok: 0.5 }), { ceilingUsd: 1 }, { totalTurns: 4, unpricedTurns: 0 });
+    const decision = spendCeilingDecision(window(0.5, 4, 0), { ceilingUsd: 1 });
     expect(decision.blocked).toBe(false);
     expect(decision.reason).toMatch(/within ceiling/i);
   });
@@ -473,13 +465,9 @@ describe("spend ceiling", () => {
   it("REFUSES to enforce when most of the window is unpriced", () => {
     // The whole reason this gate is not simply `visible > ceiling`.  `dsh`
     // reported cost: null on every turn, so the visible total read roughly a
-    // third of real spend — and blocking an unattended fleet on a number known
+    // third of real spend - and blocking an unattended fleet on a number known
     // to be a floor stops the work before the owner finds out why.
-    const decision = spendCeilingDecision(
-      spend({ grok: 0.4, dsh: 0 }),
-      { ceilingUsd: 1 },
-      { totalTurns: 100, unpricedTurns: 90 },
-    );
+    const decision = spendCeilingDecision(window(0.4, 100, 90), { ceilingUsd: 1 });
     expect(decision.visibleUsd).toBeCloseTo(0.4, 6);
     expect(decision.pricedShare).toBeCloseTo(0.1, 6);
     expect(decision.blocked).toBe(false);
@@ -488,28 +476,60 @@ describe("spend ceiling", () => {
   });
 
   it("enforces once enough of the window is priced", () => {
-    const decision = spendCeilingDecision(
-      spend({ grok: 2 }, { dsh: 5 }),
-      { ceilingUsd: 1 },
-      { totalTurns: 100, unpricedTurns: 5 },
-    );
+    const decision = spendCeilingDecision(window(2, 100, 5), { ceilingUsd: 1 });
     expect(decision.pricedShare).toBeCloseTo(0.95, 6);
     expect(decision.blocked).toBe(true);
   });
 
   it("honours an operator's own visibility requirement", () => {
-    const map = spend({ grok: 2 }, { dsh: 30 });
-    const strict = spendCeilingDecision(map, { ceilingUsd: 1, minPricedShare: 0.9 }, { totalTurns: 40, unpricedTurns: 30 });
+    const strict = spendCeilingDecision(window(2, 40, 30), { ceilingUsd: 1, minPricedShare: 0.9 });
     expect(strict.blocked).toBe(false);
-    const lenient = spendCeilingDecision(map, { ceilingUsd: 1, minPricedShare: 0.2 }, { totalTurns: 40, unpricedTurns: 30 });
+    const lenient = spendCeilingDecision(window(2, 40, 30), { ceilingUsd: 1, minPricedShare: 0.2 });
     expect(lenient.blocked).toBe(true);
   });
 
   it("treats an empty window as fully visible rather than unknown", () => {
-    // Nothing has settled yet, so the cap is trivially satisfied — refusing
+    // Nothing has settled yet, so the cap is trivially satisfied - refusing
     // here would stop the fleet from ever starting.
-    const decision = spendCeilingDecision(spend({}), { ceilingUsd: 1 }, { totalTurns: 0, unpricedTurns: 0 });
+    const decision = spendCeilingDecision(window(0, 0, 0), { ceilingUsd: 1 });
     expect(decision.pricedShare).toBe(1);
     expect(decision.blocked).toBe(false);
+  });
+
+  it("counts each turn once toward the ceiling even though the display map books it twice", () => {
+    // Regression for the double-count: getSpend books a turn under BOTH its
+    // provider and its instance id (and DeepSeek under both aliases) so
+    // Settings can look a bot up by either name.  A ceiling that summed that
+    // map read $1.60 here and tripped at half the real spend; the display
+    // semantics stay, but the total moves to the window's per-record sum.
+    const tracker = new RollingSpendTracker();
+    tracker.recordTurn({ at: now - 1000, provider: "grok", instanceId: "bot-1", costUsd: 0.5 });
+    tracker.recordTurn({ at: now - 1000, provider: "deepseekAgent", instanceId: "bot-2", costUsd: 0.3 });
+
+    // The display map still double-books on purpose...
+    const map = tracker.getSpend(now);
+    const mapTotal = Object.values(map).reduce((sum, entry) => sum + entry.spend5hUsd, 0);
+    expect(mapTotal).toBeCloseTo(1.6, 6);
+    expect(map.grok.spend5hUsd).toBeCloseTo(0.5, 6);
+    expect(map["bot-1"].spend5hUsd).toBeCloseTo(0.5, 6);
+
+    // ...but the window total the ceiling reads counts each turn once.
+    const win = tracker.getWindow(now);
+    expect(win.spend5hUsd).toBeCloseTo(0.8, 6);
+    const decision = spendCeilingDecision(win, { ceilingUsd: 1 });
+    expect(decision.blocked).toBe(false);
+    expect(decision.visibleUsd).toBeCloseTo(0.8, 6);
+    expect(decision.reason).toMatch(/within ceiling/i);
+  });
+
+  it("blocks on the real total, not the doubled one", () => {
+    const tracker = new RollingSpendTracker();
+    tracker.recordTurn({ at: now - 1000, provider: "grok", instanceId: "bot-1", costUsd: 0.5 });
+    tracker.recordTurn({ at: now - 1000, provider: "deepseekAgent", instanceId: "bot-2", costUsd: 0.3 });
+    // $0.80 of real spend against a $0.70 cap blocks; the doubled $1.60 the
+    // map summed to is irrelevant either way.
+    const decision = spendCeilingDecision(tracker.getWindow(now), { ceilingUsd: 0.7 });
+    expect(decision.blocked).toBe(true);
+    expect(decision.visibleUsd).toBeCloseTo(0.8, 6);
   });
 });

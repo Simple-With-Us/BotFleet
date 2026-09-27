@@ -71,9 +71,9 @@ describe("doomed-dispatch breaker", () => {
     expect(r.isOpen("bot", "", T0)).toBe(false);
   });
 
-  it("round-trips through a versioned envelope and drops expired rows on load", () => {
-    // `load()` has no clock parameter — it uses the real one, like
-    // QuotaCooldownRegistry — so a persisted row is written relative to now.
+  it("round-trips through a versioned envelope without resurrecting a refusal", () => {
+    // `load()` has no clock parameter - it uses the real one, like
+    // QuotaCooldownRegistry - so a persisted row is written relative to now.
     const T0 = Date.now();
     const dir = mkdtempSync(join(tmpdir(), "doomed-"));
     const path = join(dir, "doomed-dispatches.json");
@@ -90,6 +90,43 @@ describe("doomed-dispatch breaker", () => {
     reloaded.enablePersist(path, () => {});
     expect(reloaded.isOpen("bot", "dsh", T0)).toBe(true);
     expect(reloaded.isOpen("bot", "dsh", T0 + DOOMED_TTL_MS + 1)).toBe(false);
+  });
+
+  it("keeps an expired breaker's count across a restart, so the probe still re-opens on one failure", () => {
+    // The process died after the breaker had already expired: the row on
+    // disk is past its TTL.  Dropping it on load meant the next failure
+    // started a fresh count and a dead engine got three more dispatches
+    // instead of one.
+    const now = Date.now();
+    const dir = mkdtempSync(join(tmpdir(), "doomed-"));
+    const path = join(dir, "doomed-dispatches.json");
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      doomed: [{
+        botId: "bot",
+        instanceId: "dsh",
+        consecutiveFailures: DOOMED_FAILURE_THRESHOLD,
+        openedAt: now - DOOMED_TTL_MS - 1,
+        lastFailureAt: now - DOOMED_TTL_MS - 1,
+      }],
+    }));
+    const r = new DoomedDispatchRegistry();
+    r.enablePersist(path, () => {});
+    // The refusal itself stays expired...
+    expect(r.isOpen("bot", "dsh", now)).toBe(false);
+    // ...but the count survived the restart, so one more failure re-opens.
+    r.recordFailure("bot", "dsh", "spawn ENOENT", now);
+    expect(r.isOpen("bot", "dsh", now)).toBe(true);
+  });
+
+  it("listing the registry does not delete the half-open state it reports", () => {
+    const r = new DoomedDispatchRegistry();
+    for (let i = 0; i < DOOMED_FAILURE_THRESHOLD; i++) r.recordFailure("bot", "dsh", undefined, T0);
+    // A status view after expiry used to sweep the entry away entirely.
+    expect(r.list(T0 + DOOMED_TTL_MS + 1)).toHaveLength(1);
+    // The probe still re-opens on a single failure.
+    r.recordFailure("bot", "dsh", undefined, T0 + DOOMED_TTL_MS + 2);
+    expect(r.isOpen("bot", "dsh", T0 + DOOMED_TTL_MS + 2)).toBe(true);
   });
 
   it("treats a corrupt file as an empty registry rather than refusing every bot", () => {
@@ -124,25 +161,32 @@ describe("doomed-dispatch breaker", () => {
     expect(r.peek("bot", "dsh")?.consecutiveFailures).toBe(9);
   });
 
-  it("sweeps expired pairs out of list() so a long-lived process does not grow", () => {
+  it("forgets a pair only after a day of silence, so list() stays bounded", () => {
     const T0 = Date.now();
+    const DAY_MS = 24 * 60 * 60_000; // mirrors DOOMED_MEMORY_MS
     const r = new DoomedDispatchRegistry();
     // Three pairs, each opened properly.
     for (const id of ["bot-a", "bot-b", "bot-c"]) {
       for (let i = 0; i < DOOMED_FAILURE_THRESHOLD; i++) r.recordFailure(id, "dsh", undefined, T0);
     }
     expect(r.list(T0)).toHaveLength(3);
-    expect(r.list(T0 + DOOMED_TTL_MS + 1)).toHaveLength(0);
+    // Expired but remembered: the half-open counts are the whole point.
+    expect(r.list(T0 + DOOMED_TTL_MS + 1)).toHaveLength(3);
+    // A day of silence is what finally forgets them.
+    expect(r.list(T0 + DAY_MS + 1)).toHaveLength(0);
   });
 
-  it("forgets a sub-threshold counter once it is stale, so failures must be consecutive", () => {
+  it("keeps a sub-threshold counter past the TTL: consecutive means no success between, not a clock", () => {
     const T0 = Date.now();
     const r = new DoomedDispatchRegistry();
     r.recordFailure("bot", "dsh", undefined, T0);
     expect(r.peek("bot", "dsh")?.consecutiveFailures).toBe(1);
-    // One failure an hour apart is not a pattern, it is a coincidence; the
-    // counter resets rather than accumulating into an open breaker.
+    // A status view used to reset the counter, which let a once-an-hour
+    // routine fail forever without ever opening the breaker.
     r.list(T0 + DOOMED_TTL_MS + 1);
-    expect(r.peek("bot", "dsh")).toBeNull();
+    expect(r.peek("bot", "dsh")?.consecutiveFailures).toBe(1);
+    r.recordFailure("bot", "dsh", undefined, T0 + DOOMED_TTL_MS + 1);
+    r.recordFailure("bot", "dsh", undefined, T0 + DOOMED_TTL_MS + 2);
+    expect(r.isOpen("bot", "dsh", T0 + DOOMED_TTL_MS + 2)).toBe(true);
   });
 });

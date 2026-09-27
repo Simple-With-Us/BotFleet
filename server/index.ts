@@ -754,10 +754,10 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
  *  automation without silently refusing a message the owner is waiting on. */
 function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
   if (runOn !== "bot") return false;
-  const decision = spendCeilingDecision(rollingSpendTracker.getSpend(), {
+  const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
     ceilingUsd: cfg.usage?.spendCeilingUsd,
     minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
-  }, rollingSpendTracker.getWindow());
+  });
   if (decision.blocked) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
   return decision.blocked;
 }

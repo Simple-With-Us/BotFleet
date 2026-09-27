@@ -388,14 +388,20 @@ export class RollingSpendTracker {
     });
   }
 
-  /** Turn counts for the 5-hour window, so the spend ceiling can judge how
-   *  much of the window it can actually see before acting on the total. */
-  getWindow(now = Date.now()): { totalTurns: number; unpricedTurns: number } {
+  /** Turn counts and accountable dollars for the 5-hour window, so the spend
+   *  ceiling can judge how much of the window it can actually see before
+   *  acting on the total.  `spend5hUsd` sums each record ONCE: the per-engine
+   *  map from `getSpend` deliberately books a turn under both its provider
+   *  and its instance id (and DeepSeek under both aliases) so a Settings
+   *  lookup by either name finds it - which makes that map useless for a
+   *  fleet total, because summing its values counts every dollar twice. */
+  getWindow(now = Date.now()): { totalTurns: number; unpricedTurns: number; spend5hUsd: number } {
     const t5h = now - FIVE_HOURS_MS;
     const inWindow = this.records.filter((r) => r.at >= t5h);
     return {
       totalTurns: inWindow.length,
       unpricedTurns: inWindow.filter((r) => !isPriced(r)).length,
+      spend5hUsd: Math.round(inWindow.reduce((sum, r) => sum + (isPriced(r) ? r.costUsd : 0), 0) * 10_000) / 10_000,
     };
   }
 
@@ -517,6 +523,12 @@ export const DEFAULT_MIN_PRICED_SHARE = 0.5;
  *  been reading roughly a third of real spend and would have declared the fleet
  *  nearly free.
  *
+ *  The total compared against the ceiling comes from the tracker's window,
+ *  never from the per-engine spend map: that map books each turn under both
+ *  its provider and its instance id (and DeepSeek under both aliases) so a
+ *  display can look a bot up by either name, and summing its values counts
+ *  every dollar twice - enough to trip the cap at half the real spend.
+ *
  *  So the gate refuses to fire unless it can see enough of the window to be
  *  worth believing.  `minPricedShare` is the operator's own statement of how
  *  much visibility they require; below it the honest answer is "I cannot tell",
@@ -526,12 +538,11 @@ export const DEFAULT_MIN_PRICED_SHARE = 0.5;
  *  finds out that their automation died before they find out why.
  */
 export function spendCeilingDecision(
-  spend: Record<string, EngineSpendSummary>,
+  window: { totalTurns: number; unpricedTurns: number; spend5hUsd: number },
   options: { ceilingUsd?: number; minPricedShare?: number } = {},
-  window: { totalTurns: number; unpricedTurns: number },
 ): SpendCeilingDecision {
   const ceiling = options.ceilingUsd;
-  const visibleUsd = Object.values(spend).reduce((sum, entry) => sum + entry.spend5hUsd, 0);
+  const visibleUsd = window.spend5hUsd;
   const { totalTurns, unpricedTurns } = window;
   // No settled turns in the window means nothing has been spent yet, which is
   // full visibility rather than none.

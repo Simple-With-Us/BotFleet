@@ -29,6 +29,12 @@
  *    than one per tick, and recovers by itself after a `pnpm install` or a
  *    fresh login — no restart, no manual reset.
  *
+ * A pair's count is forgotten only after a day of silence
+ * (`DOOMED_MEMORY_MS`): the TTL governs how long the breaker refuses, not
+ * how long it remembers, and a success clears immediately.  Anything
+ * shorter would delete the half-open state the next time the status
+ * endpoint listed the registry.
+ *
  * The TTL is the only reset mechanism on purpose.  Keying the reset on an
  * "engine snapshot changed" fingerprint, as the hardening plan proposed, needs
  * a synchronous handle on the describe snapshot that the dispatch path does
@@ -56,6 +62,13 @@ export const DOOMED_FAILURE_THRESHOLD = 3;
  *  quota cooldown TTL so both kinds of "stop sending this there" read the same
  *  on a dashboard. */
 export const DOOMED_TTL_MS = 15 * 60_000;
+
+/** How long a quiet pair's count is remembered.  The TTL governs how long an
+ *  open breaker REFUSES; the consecutive-failure count has to outlive it or
+ *  the half-open probe would need three failures to re-open instead of one.
+ *  A day of silence is what finally forgets a pair - long past any realistic
+ *  probe, short enough that a deleted bot does not linger in the map. */
+export const DOOMED_MEMORY_MS = 24 * 60 * 60_000;
 
 export interface DoomedEntry {
   botId: string;
@@ -111,14 +124,16 @@ export class DoomedDispatchRegistry {
     return now - entry.openedAt < DOOMED_TTL_MS;
   }
 
-  /** Drop everything that is both expired and superseded, so a long-lived
-   *  process does not accumulate one entry per (bot, engine) pair it ever
-   *  tried.  Only called on a cold read and on `list`, never on the hot
-   *  dispatch path. */
+  /** Drop pairs quiet long enough to forget, so a long-lived process does
+   *  not accumulate one entry per (bot, engine) pair it ever tried.  An
+   *  expired breaker is NOT dropped: its count is what lets the half-open
+   *  probe re-open on a single failure, and a `list` from the status
+   *  endpoint must not be what destroys it.  Only called on a cold read and
+   *  on `list`, never on the hot dispatch path. */
   private sweep(now: number): boolean {
     let removed = false;
     for (const [k, entry] of this.entries) {
-      if (!this.isEntryOpen(entry, now)) {
+      if (now - (entry.lastFailureAt ?? entry.openedAt) >= DOOMED_MEMORY_MS) {
         this.entries.delete(k);
         removed = true;
       }
@@ -149,7 +164,11 @@ export class DoomedDispatchRegistry {
           removed = true;
           continue;
         }
-        if (now - entry.openedAt >= DOOMED_TTL_MS) {
+        // A restart must not cost the count either: only a pair quiet past
+        // the memory window is forgotten - an expired breaker is kept, so
+        // the half-open probe still re-opens on a single failure.
+        const rememberedAt = typeof entry.lastFailureAt === "number" ? entry.lastFailureAt : entry.openedAt;
+        if (now - rememberedAt >= DOOMED_MEMORY_MS) {
           removed = true;
           continue;
         }
