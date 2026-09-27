@@ -3246,7 +3246,7 @@ function drainRoomQueue() {
 }
 
 function drainQueuedSends() {
-  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds, linqChatId) =>
+  drainSteeredMessages(store, (botId, threadId, prompt, userMessage, excludeIds) =>
     // A plain attended turn — no automationSource, no unattended, no comms
     // depth: exactly what typing the same words into an idle bot would run.
     // Drain just appended the held lines; userMessage keeps startTurn
