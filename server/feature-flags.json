@@ -1,0 +1,6 @@
+{
+  "harness.experimentalAcpDriverV2": {
+    "defaultVariant": "off",
+    "variants": { "off": false, "on": true }
+  }
+}
