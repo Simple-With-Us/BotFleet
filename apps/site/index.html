@@ -56,6 +56,10 @@
   .nav .links { margin-left: auto; display: flex; gap: 18px; font-size: 0.92rem; flex-wrap: wrap; }
   .nav .links a { color: var(--ink-soft); text-decoration: none; }
   .nav .links a:hover { color: var(--ink); text-decoration: underline; }
+  @media (max-width: 600px) {
+    .nav { flex-wrap: wrap; gap: 8px 10px; padding-top: 12px; padding-bottom: 12px; }
+    .nav .links { flex-basis: 100%; margin-left: 0; gap: 6px 14px; font-size: 0.84rem; line-height: 1.4; }
+  }
 
   .hero { padding: 56px 0 44px; }
   .hero .hero-image {
@@ -192,7 +196,7 @@
     </p>
     <div class="cta-row" style="gap: 16px;">
       <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
-        <a class="cta" href="https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg">Download for Mac (Apple Silicon)</a>
+        <a class="cta" href="https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg">Download Mac beta (Apple Silicon)</a>
         <a href="https://github.com/jaywedgeworth22/BotFleet/releases" style="font-size: 13px; color: var(--ink-muted); text-decoration: underline;">See Previous Builds</a>
       </div>
       <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
@@ -213,7 +217,7 @@
   </section>
 
   <div class="legend">
-    <div><span class="badge beta">In Testing</span>  Every BotFleet add-on on this page is in testing.  Cards that run in daily use are still not a finished product surface.</div>
+    <div><span class="badge beta">In Testing</span>  Every BotFleet add-on on this page is in testing.  Some add-ons are used regularly, but their behavior and setup may change.</div>
     <div class="lineage">The detailed add-on list below includes source links where available.</div>
   </div>
 
