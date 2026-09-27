@@ -418,7 +418,7 @@ export function Composer({
           cloudSttConfigured: Boolean(status?.configured),
           appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
           platform: hostPlatform,
-          explicitPreference: state.config?.callStt?.provider,
+          explicitPreference: state.config?.callStt?.provider ?? undefined,
         });
         if (choice.provider === null) {
           if (!detached) {
@@ -443,9 +443,10 @@ export function Composer({
           return;
         }
       }
+      if (detached) return;
       offTranscript = session.onTranscript(handleTranscript);
       offEnd = session.onEnd(handleEnd);
-      session.start().catch(() => {
+      session.start({ keyterms: [...(state.config?.callStt?.keyterms ?? []), ...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])] }).catch(() => {
         if (!detached) {
           setRecording(false);
           setSpeechError("The microphone couldn't start. Check Microphone and Speech Recognition access.");
@@ -456,9 +457,20 @@ export function Composer({
 
     return () => {
       detached = true;
-      offTranscript();
-      offEnd();
-      void session?.stop();
+      // AssemblyAI may deliver its final formatted turn while Terminate
+      // drains. Keep callbacks attached until finalization settles.
+      void (async () => {
+        try {
+          if (session?.provider === "assemblyai") await session.finish();
+          else await session?.stop();
+        } catch {
+          // A provider can close during navigation; still detach listeners.
+        } finally {
+          offTranscript();
+          offEnd();
+          if (sttSessionRef.current === session) sttSessionRef.current = null;
+        }
+      })();
     };
   }, [recording]);
 

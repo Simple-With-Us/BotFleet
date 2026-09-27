@@ -129,12 +129,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     setNote(null);
     const session = sttSessionRef.current;
     if (!session) return;
-    session.start({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: [...(state.config?.callStt?.keyterms ?? []), ...membersRef.current.map((member) => member.name)] }).catch(() => {
       if (alive.current && currentCall() === group.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
     });
-  }, [group.id, move]);
+  }, [group.id, move, state.config?.callStt?.keyterms]);
 
   const scheduleListen = useCallback(
     (force = false, delay = 140) => {
@@ -350,7 +350,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
         cloudSttConfigured: Boolean(status?.configured),
         appleSpeechAvailable: hostPlatform === "darwin",
         platform: hostPlatform,
-        explicitPreference: state.config?.callStt?.provider,
+        explicitPreference: state.config?.callStt?.provider ?? undefined,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === group.id) {

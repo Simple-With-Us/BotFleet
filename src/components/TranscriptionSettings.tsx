@@ -99,7 +99,7 @@ export function TranscriptionSettings() {
       const res = await fetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ callStt: { provider: next === "auto" ? undefined : next } }),
+        body: JSON.stringify({ callStt: { provider: next === "auto" ? null : next } }),
       });
       if (!res.ok) throw new Error(`PUT /api/config → ${res.status}`);
       setProvider(next);
@@ -260,7 +260,6 @@ export function TranscriptionSettings() {
           rows={3}
           aria-label="Global keyterms vocabulary"
           disabled={!callSttLoaded}
-          maxLength={MAX_INPUT_HEIGHT_PX}
           className="block w-full resize-y rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none disabled:opacity-50"
           style={{ minHeight: 72, maxHeight: MAX_INPUT_HEIGHT_PX }}
         />

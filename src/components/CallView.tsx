@@ -270,12 +270,12 @@ function Call({ bot }: { bot: Bot }) {
     setNote(null);
     if (!sttSessionRef.current) return;
     const session = sttSessionRef.current;
-    session.start({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: [...(state.config?.callStt?.keyterms ?? []), bot.name] }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
         setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
       }
     });
-  }, [bot.id, move]);
+  }, [bot.id, bot.name, move, state.config?.callStt?.keyterms]);
 
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
@@ -441,7 +441,7 @@ function Call({ bot }: { bot: Bot }) {
         cloudSttConfigured,
         appleSpeechAvailable: capabilities.dictation.available,
         platform,
-        explicitPreference: state.config?.callStt?.provider,
+        explicitPreference: state.config?.callStt?.provider ?? undefined,
       });
       if (choice.provider === null) {
         if (alive.current && currentCall() === bot.id) {

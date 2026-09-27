@@ -269,6 +269,7 @@ const appConfigSchema = z.object({
    * engine: "minimax" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
   tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   autoUpdate: z
@@ -434,7 +435,7 @@ export interface AppConfig {
    *  vocabulary the model is told to spell correctly — bot names, model
    *  handles, product jargon that `format_turns` alone still mangles. */
   callStt?: {
-    provider?: "apple" | "assemblyai";
+    provider?: "apple" | "assemblyai" | null;
     keyterms?: string[];
   };
   imageGen?: { key?: string; credentialStorage?: "external" };
@@ -1316,7 +1317,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
   // machine identity does not repeat it a third time.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -1324,11 +1325,17 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
     Object.assign(merged, section);
     disk[key] = merged;
   }
-  // `botDefaults.allowedComputers: null` means "clear the allowlist".  The
-  // section merge above cannot express that -- it assigns the null straight
-  // through -- so the key is removed here instead, which keeps config.json
-  // holding only the two states the reader has ever had to understand:
-  // the key is present and narrows, or it is absent and allows everything.
+  // Explicit null resets the STT provider to automatic. Section merging
+  // would otherwise retain the previously saved explicit provider.
+  if (checkedPatch.callStt?.provider === null) {
+    const stored = jsonObjectSchema.safeParse(disk.callStt);
+    if (stored.success) {
+      const { provider: _cleared, ...rest } = stored.data;
+      disk.callStt = rest;
+    }
+  }
+  // `botDefaults.allowedComputers: null` clears the allowlist: the key is
+  // present and narrows, or absent and allows everything.
   if (checkedPatch.botDefaults?.allowedComputers === null) {
     const stored = jsonObjectSchema.safeParse(disk.botDefaults);
     if (stored.success) {
