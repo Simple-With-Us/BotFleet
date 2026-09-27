@@ -336,6 +336,15 @@ export function scrubSentryPayload<T>(payload: T): T {
     if (!isPlainRecord(value)) return;
     for (const key of Object.keys(value)) {
       if (SCRUB_SKIP_KEYS.has(key)) continue;
+      // Fail closed on request payloads, even if another SDK integration or
+      // a future version adds them after HTTP capture is disabled below.
+      if (key === "request" && value[key] !== null && typeof value[key] === "object" &&
+          isPlainRecord(value[key] as object)) {
+        const request = value[key] as Record<string, unknown>;
+        for (const sensitive of ["data", "body", "headers", "cookies", "query_string", "env"]) {
+          delete request[sensitive];
+        }
+      }
       const cur = value[key];
       if (typeof cur === "string") {
         const next = scrubWebhookSecrets(cur);
@@ -464,7 +473,10 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // Replaces the default Http integration by name, keeping its other
   // defaults.  A stand-in SDK installed by a test may not carry the factory.
   if (sdk.httpIntegration) {
-    integrations.push(sdk.httpIntegration({ ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath) }));
+    integrations.push(sdk.httpIntegration({
+      ignoreIncomingRequests: (urlPath) => isWebhookIngressPath(urlPath),
+      maxIncomingRequestBodySize: "none",
+    }));
   }
   // enableLogs alone only produces breadcrumbs; the console integration
   // is what turns a warn or an error into a Sentry log.
@@ -529,7 +541,13 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
       // Opt-out only for self-hosted that cannot ingest them.
       streamGenAiSpans: true,
       // GenAI I/O collection ON by default; kill with SENTRY_AI_DATA_COLLECTION=0.
-      dataCollection: genAiDataCollectionOptions(),
+      dataCollection: {
+        ...genAiDataCollectionOptions(),
+        httpBodies: [],
+        httpHeaders: { request: false, response: false },
+        cookies: false,
+        urlQueryParams: false,
+      },
       profileSessionSampleRate: Number.isFinite(profileSessionSampleRate)
         ? Math.min(Math.max(profileSessionSampleRate, 0), 1)
         : 1,
