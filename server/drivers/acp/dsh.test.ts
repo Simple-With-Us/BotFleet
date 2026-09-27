@@ -63,15 +63,48 @@ describe("DshAgentDriver config", () => {
     });
   });
 
-  it("defaults to the model ids published by the DeepSeek provider package", () => {
+  it("carries the owner-facing DSH model list", () => {
+    // Owner 2026-09-27.  DeepSeek's catalog is only two models: `deepseek-flash`
+    // IS the image/video model, and its image tokens bill at the same rate as
+    // text, so there is deliberately no third DeepSeek row.  MiniMax-M2.7
+    // (non-highspeed) stays out — M3 dominates it on context.
     expect(STATIC_DSH_MODELS.default).toBe("deepseek-v4-flash");
-    // MiniMax-M2.7 dropped — M3 dominates it on context (1M vs 204k) and is
-    // the canonical DSH-hosted MiniMax row that gets the full tool surface.
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
       "deepseek-v4-flash",
       "deepseek-v4-pro",
+      "MiniMax-M3.1-Flash-Preview",
       "MiniMax-M3",
+      "MiniMax-M2.7-highspeed",
     ]);
+  });
+
+  it("badges the two rows where the choice has a cost or availability consequence", () => {
+    const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
+    // Image + Video: same token rate as text, so the capability is the point,
+    // not a price.
+    expect(byId.get("deepseek-v4-flash")?.badge).toBe("Multimodal");
+    // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
+    expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
+    // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
+    expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x Cost");
+    // M3 is the base rate, so it carries no cost chip.
+    expect(byId.get("MiniMax-M3")?.badge).toBeUndefined();
+    expect(byId.get("deepseek-v4-pro")?.badge).toBeUndefined();
+  });
+
+  it("gives every chip a hover explanation, since a bare chip is not a price", () => {
+    for (const option of STATIC_DSH_MODELS.options) {
+      if (!option.badge) continue;
+      expect(option.badgeTitle, `${option.id} badge needs a badgeTitle`).toBeTruthy();
+      expect(option.badge!.length).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it("keeps every MiniMax row on a 1M-or-204k context window", () => {
+    const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
+    expect(byId.get("MiniMax-M3")?.contextWindow).toBe(1_000_000);
+    expect(byId.get("MiniMax-M3.1-Flash-Preview")?.contextWindow).toBe(1_000_000);
+    expect(byId.get("MiniMax-M2.7-highspeed")?.contextWindow).toBe(204_800);
   });
 
   it("encodes the ACP model option with its provider while preserving the picker id", () => {
