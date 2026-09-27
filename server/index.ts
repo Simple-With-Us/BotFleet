@@ -670,6 +670,85 @@ function noteDoomedDispatch(bot: { id: string } | null, event: RuntimeEvent): vo
   if (event.type === "turn.completed" && event.ok) doomedDispatches.recordSuccess(bot.id, instanceId);
 }
 
+/** Count a dispatch the doomed breaker refused, so `doomed_skipped` is a number
+ *  an operator can read instead of an intention in a plan.
+ *
+ *  The audit that motivated the breaker counted 146 dispatches onto an engine
+ *  that could not spawn and had no way to see that the refusal was working: the
+ *  run stayed `queued`, `botState` still said `ready`, and nothing recorded the
+ *  decision.  A breaker nobody can measure is indistinguishable from a breaker
+ *  that silently stopped the fleet, which is the failure mode worth spending
+ *  lines here to avoid.
+ *
+ *  A Sentry custom metric, not a log line and not a breadcrumb, and not a new
+ *  subsystem: `usage_telemetry.outbox` already counts through
+ *  `getSentry()?.metrics.count`, and this is that same call with a different
+ *  name.  A breadcrumb was the other candidate and is the wrong instrument —
+ *  breadcrumbs ride along on the NEXT event rather than accumulating, so they
+ *  cannot answer "how many dispatches did this save over the week" at all.
+ *
+ *  Cheap and total on the hot path, which is the part that needed care:
+ *  `canStart` runs on every tick for every due run, so one dead engine with five
+ *  due routines would otherwise emit 300 calls an hour forever.  Counting
+ *  locally and shipping a DELTA per pair per interval means the per-call work is
+ *  a map lookup and an increment, and the counter arrives as a number that reads
+ *  as a rate rather than as a function of how fast the scheduler ticks.
+ *
+ *  A pair that recovers keeps its pending count until the next drain, so the
+ *  tail of a declining series is still reported — losing a few counts to an
+ *  engine coming back is the right trade against counting a hot loop.
+ *
+ *  Sentry off is not a reason to throw the counts away: a local-only install
+ *  has no reporter, so the tally keeps accumulating and a later window that
+ *  does have one reports the whole run rather than starting from zero.  The map
+ *  is bounded by the number of (bot, engine) pairs that ever declined, which is
+ *  the same bound as the breaker it mirrors. */
+const doomedSkipTotals = new Map<string, { botId: string; instanceId: string; count: number }>();
+
+/** How long doomed-skip counts accumulate before they are shipped.  A minute is
+ *  short enough that a live dashboard moves, and long enough that a fleet of
+ *  bots ticking every second still produces a handful of increments per pair
+ *  rather than one per tick. */
+const DOOMED_SKIP_DRAIN_MS = 60_000;
+
+function drainDoomedSkips(): void {
+  if (!doomedSkipTotals.size || !isSentryActive()) return;
+  const sentry = getSentry();
+  if (!sentry) return;
+  for (const [key, tally] of doomedSkipTotals) {
+    try {
+      sentry.metrics.count("botfleet.dispatcher.doomed_skipped", tally.count, {
+        attributes: {
+          "botfleet.bot.id": tally.botId,
+          "botfleet.instance.id": tally.instanceId,
+        },
+      });
+      doomedSkipTotals.delete(key);
+    } catch {
+      // A refused count must not take the drain down for the other pairs, and
+      // the tally is left in place so the next drain retries the same number
+      // rather than losing it.
+    }
+  }
+}
+
+// Unref'd so a harness that never dispatches anything still exits promptly.
+setInterval(drainDoomedSkips, DOOMED_SKIP_DRAIN_MS).unref?.();
+
+/** The hot path: a map hit and an increment, nothing that can block a tick and
+ *  nothing that reaches the network.  Everything that talks to Sentry lives in
+ *  the drain above. */
+function noteDoomedSkip(botId: string, instanceId: string): void {
+  try {
+    const key = `${botId}:${instanceId}`;
+    const tally = doomedSkipTotals.get(key);
+    if (tally) tally.count += 1;
+    else doomedSkipTotals.set(key, { botId, instanceId, count: 1 });
+  } catch {
+    // A counter must never be the reason a dispatch does not happen.
+  }
+}
+
 /** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
  *  consulted for work nobody is watching, so a cap can stop background
  *  automation without silently refusing a message the owner is waiting on. */
@@ -4178,7 +4257,10 @@ routines = new RoutineManager({
     // Declining here leaves the run QUEUED rather than failed, so it still
     // lands once the breaker half-opens after the TTL.  Same shape as the
     // credential gate below it: both answer "should this go out right now".
-    if (doomedDispatches.isOpen(bot.id, instanceId)) return false;
+    if (doomedDispatches.isOpen(bot.id, instanceId)) {
+      noteDoomedSkip(bot.id, instanceId);
+      return false;
+    }
     // Last, and off unless a ceiling is configured: an unattended fleet that
     // silently stops working is a worse outcome than one that overspends, so
     // this also refuses to fire when too little of the window is priced to
@@ -10999,6 +11081,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return json(res, 200, {
         ok: true,
         cooldowns: quotaCooldowns.list(),
+        // A sibling of cooldowns because it is the same question about a
+        // different failure: cooldowns is "this engine is out of quota", doomed
+        // is "this engine cannot start" — a CLI that is absent, not
+        // executable, or waiting on an interactive login.  Both make the
+        // dispatcher decline and leave the run QUEUED, so a queue that has
+        // stopped draining cannot be told apart without both lists.  `list()`
+        // is the live registry including half-open entries, so the half-open
+        // "we let one probe through" state is visible here too.
+        doomed: doomedDispatches.list(),
         antigravity: lastAntigravityQuotaSnapshot(),
         grok: lastGrokQuotaSnapshot(),
         windows: usageQuotaPoller.getWindows(),
