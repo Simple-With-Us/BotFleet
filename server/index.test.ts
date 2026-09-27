@@ -6094,6 +6094,29 @@ describe("GET /api/quotas", () => {
     expect(Array.isArray(data.cooldowns)).toBe(true);
     expect(data.cooldowns.find((c) => c.instanceId === "codex")).toBeUndefined();
   });
+
+  // A bot whose engine cannot start is refused by the dispatcher and its run
+  // stays QUEUED, which from the outside is indistinguishable from a bot that
+  // is merely busy — so "the queue is not draining" had no way to name the
+  // cause.  Pinned as a sibling of cooldowns rather than folded into it:
+  // quota says an engine is spent, doomed says it never came up, and telling
+  // those apart is the whole point of the field.
+  it("reports the doomed (bot, engine) pairs beside the quota cooldowns", async () => {
+    const res = await fetch(`${BASE}/api/quotas`);
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      ok: boolean;
+      doomed: Array<{ botId: string; instanceId: string; consecutiveFailures: number }>;
+    };
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.doomed)).toBe(true);
+    // Every engine in this fixture starts, so the list is legitimately empty.
+    // The assertion that matters is that the key EXISTS and holds the live
+    // registry's shape: a missing field would read as "nothing is doomed"
+    // rather than "this build does not say", and that is the failure the audit
+    // ran into.
+    expect(data.doomed).toEqual([]);
+  });
 });
 
 describe("the update routes and the admission they hold", () => {
