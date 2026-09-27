@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
+
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
 
@@ -30,11 +32,31 @@ let child: ChildProcess;
 let home: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+type HarnessModelSelection = { instanceId: string; model: string };
+type HarnessRequestBody = {
+  name?: string;
+  autoApprove?: boolean;
+  hidden?: boolean;
+  computers?: string[];
+  acknowledgeLocalAuto?: boolean;
+  modelSelection?: HarnessModelSelection;
+  prompt?: string;
+  botId?: string;
+  runOn?: string;
+  schedule?: { type: string; at: number };
+};
+
+// SAFETY: the harness answers JSON on every route this test calls, and the
+// body shapes are asserted at the point of use.
+const api = async (
+  method: string,
+  path: string,
+  payload?: HarnessRequestBody,
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    headers: payload ? { "content-type": "application/json" } : undefined,
+    body: payload ? JSON.stringify(payload) : undefined,
   });
   return { status: res.status, body: await res.json() };
 };
@@ -79,7 +101,7 @@ async function waitForRunThread(runId: string, ms = 20_000) {
   while (Date.now() < deadline) {
     const { body } = await api("GET", "/api/routines");
     const run = (body.runs ?? []).find((r: { id: string }) => r.id === runId);
-    if (run?.threadId) return run.threadId as string;
+    if (run?.threadId) return run.threadId;
     await new Promise((r) => setTimeout(r, 250));
   }
   return null;
@@ -124,15 +146,16 @@ posixOnly("unattended turns keep asking", () => {
         },
       }),
     );
+    const childEnv: NodeJS.ProcessEnv = {
+      HOME: home,
+      USERPROFILE: home,
+      OMB_PORT: String(PORT),
+    };
+    if (process.env.PATH) childEnv.PATH = process.env.PATH;
+    if (process.env.SystemRoot) childEnv.SystemRoot = process.env.SystemRoot;
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-        HOME: home,
-        USERPROFILE: home,
-        OMB_PORT: String(PORT),
-      },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
@@ -183,7 +206,8 @@ posixOnly("unattended turns keep asking", () => {
         body: JSON.stringify({ status: "failed" }),
       });
       expect(delivered.status).toBe(202);
-      const { runId } = (await delivered.json()) as { runId: string };
+      const webhookAcceptedSchema = z.object({ runId: z.string() });
+      const { runId } = webhookAcceptedSchema.parse(await delivered.json());
 
       const threadId = await waitForRunThread(runId);
       expect(threadId, "the webhook never started a task").toBeTruthy();
