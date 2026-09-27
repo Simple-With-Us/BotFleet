@@ -7311,17 +7311,35 @@ async function resumeInterruptedChatTurns(
         console.log(`[${context}] no resumable prompt for bot ${resumeBot.id} on thread ${resumeThreadId}`);
         continue;
       }
-      await startTurn(resumeBot.id, resumePrompt.text, {
-        threadId: resumeThreadId,
-        userMessage: resumePrompt,
-        automationSource: resumePrompt.automationSource,
-        ...(resumePrompt.automationSource === "delegation" ? {
-          commsDepth: 1,
-          unattended: isUnattended(resumeBot.id),
-          from: resumePrompt.from,
-          comm: resumePrompt.comm,
-        } : {}),
-      });
+      // Forced quiescing consumed the old watch when it mirrored the
+      // interruption. A resumed delegated turn needs a fresh terminal
+      // watch or its reply never reaches the bot-to-bot channel.
+      if (resumePrompt.automationSource === "delegation") {
+        const channelId = resumePrompt.comm?.groupId;
+        const channel = channelId ? store.group(channelId) : undefined;
+        if (channel?.memberIds.includes(resumeBot.id) &&
+            resumePrompt.from?.botId && channel.memberIds.includes(resumePrompt.from.botId)) {
+          delegationWatch.set(resumeThreadId, { channelId: channel.id, toBotId: resumeBot.id });
+        }
+      }
+      try {
+        await startTurn(resumeBot.id, resumePrompt.text, {
+          threadId: resumeThreadId,
+          userMessage: resumePrompt,
+          automationSource: resumePrompt.automationSource,
+          ...(resumePrompt.automationSource === "delegation" ? {
+            commsDepth: 1,
+            unattended: isUnattended(resumeBot.id),
+            from: resumePrompt.from,
+            comm: resumePrompt.comm,
+          } : {}),
+        });
+      } catch (error) {
+        // The provider rejected the redispatch before it could emit a
+        // terminal event. Consume only this re-armed watch and record it.
+        finalizeDelegationWatch(resumeThreadId, false, "", "Delegated turn could not resume");
+        throw error;
+      }
       console.log(`[${context}] re-dispatched interrupted turn for bot ${resumeBot.id}`);
     } catch (err) {
       console.warn(`[${context}] could not resume interrupted turn:`, err);
