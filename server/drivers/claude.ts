@@ -522,6 +522,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         turnId: string;
         settled: boolean;
         sawStreamDelta: boolean;
+        /** Sticky for the life of the turn: any assistant text or tool
+         *  activity.  A transient crash after this point must NOT relaunch -
+         *  the resumed session would replay the user message and re-run the
+         *  tools the turn already ran (E2).  Unlike sawStreamDelta, which is
+         *  a per-frame dedup hint and resets after each assistant frame. */
+        producedOutput: boolean;
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -805,7 +811,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort };
         // stderr feeds the crash message; a warm process still holds turn
         // 1's buffer, which would mislabel turn 2's failure
         live.stderr = "";
@@ -897,7 +903,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -988,7 +994,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             if (ev.type !== "content_block_delta") break;
             const d = ev.delta ?? {};
             if (d.type === "text_delta" && typeof d.text === "string" && d.text) {
-              if (session.turn) session.turn.sawStreamDelta = true;
+              if (session.turn) {
+                session.turn.sawStreamDelta = true;
+                session.turn.producedOutput = true;
+              }
               emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: d.text });
             } else if (d.type === "thinking_delta" && typeof d.thinking === "string" && d.thinking) {
               emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "reasoning_text", delta: d.thinking });
@@ -999,6 +1008,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
             if (text.trim()) {
+              if (session.turn) session.turn.producedOutput = true;
               // fallback delta for CLIs/paths that never streamed the block
               if (!session.turn?.sawStreamDelta) {
                 emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
@@ -1008,6 +1018,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
+                if (session.turn) session.turn.producedOutput = true;
                 // `b.input` names the file, the command, the pattern — the
                 // only part of a step a reader can act on.  It used to be
                 // dropped here, which is why a Claude bot's transcript was a
@@ -1038,6 +1049,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "user":
             for (const b of Array.isArray(o.message?.content) ? o.message.content : []) {
               if (b.type === "tool_result") {
+                if (session.turn) session.turn.producedOutput = true;
                 emit({
                   ...base(threadId, currentTurnId()),
                   type: "item.completed",
@@ -1129,7 +1141,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             !liveTurn.retry.cancelled &&
             code !== 0 &&
             verdict.transient &&
-            !liveTurn.sawStreamDelta &&
+            !liveTurn.producedOutput &&
             liveTurn.retry.attempt < RETRY_MAX_ATTEMPTS - 1
           ) {
             // the CLI is gone but the TURN continues: keep the thread busy,

@@ -174,6 +174,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_DUMP;
     delete process.env.FAKE_CLAUDE_TRANSIENTS;
     delete process.env.FAKE_CLAUDE_PARTIAL_FAILS;
+    delete process.env.FAKE_CLAUDE_TOOL_FAILS;
     delete process.env.FAKE_CLAUDE_STATE;
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
@@ -1046,6 +1047,21 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
     expect(recorder.events.some((e) => e.type === "content.delta" && e.streamKind === "assistant_text")).toBe(true);
     expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+  }, 20_000);
+
+  it("never retries after a tool call already ran - the relaunch would re-run it (E2)", async () => {
+    process.env.FAKE_CLAUDE_TRANSIENTS = "9";
+    process.env.FAKE_CLAUDE_TOOL_FAILS = "1";
+    process.env.FAKE_CLAUDE_STATE = join(scratch, "launches-tool-fail");
+    process.env.FAKE_CLAUDE_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-fail", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
+    expect(recorder.events.some((e) => e.type === "item.started" && e.itemType === "tool")).toBe(true);
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    // no relaunch: the launch counter never moved past the first attempt
+    expect(readFileSync(process.env.FAKE_CLAUDE_STATE!, "utf8")).toBe("1");
   }, 20_000);
 
   it("an interrupt during the retry backoff cancels cleanly without a zombie relaunch", async () => {
