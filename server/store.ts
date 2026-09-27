@@ -1852,21 +1852,54 @@ export class Store {
     return changed;
   }
 
+  /** Drop a saved resume cursor, but only while it still equals `cursor` —
+   *  a newer session saved since must not be discarded. */
+  /** Drop a cursor only if it is still the one saved (a stale invalidation,
+   *  after a newer cursor was stored, is a no-op). */
+  clearResumeCursor(botId: string, instanceId: string, cursor: unknown, threadId?: string) {
+    this.dropResumeCursor(botId, instanceId, threadId, (saved) => saved === cursor);
+  }
+
   setResumeCursor(botId: string, instanceId: string, cursor: unknown, threadId?: string) {
+    // An undefined/null cursor deletes the continuation unconditionally.
+    if (cursor === undefined || cursor === null) {
+      this.dropResumeCursor(botId, instanceId, threadId);
+      return;
+    }
     const bot = this.bot(botId);
     if (!bot) return;
     // the cursor belongs to the task that produced it, not to the bot
     const task = threadId ? this.taskByThread(botId, threadId) : this.activeTask(botId);
-    if (cursor === undefined || cursor === null) {
-      if (task) delete task.resumeCursors[instanceId];
-      if (!threadId || bot.threadId === threadId) delete bot.resumeCursors[instanceId];
-    } else {
-      if (task) task.resumeCursors[instanceId] = cursor;
-      // The legacy mirror follows the task visible in chat, never a detached
-      // routine task working in the background.
-      if (!threadId || bot.threadId === threadId) bot.resumeCursors[instanceId] = cursor;
-    }
+    if (task) task.resumeCursors[instanceId] = cursor;
+    // The legacy mirror follows the task visible in chat, never a detached
+    // routine task working in the background.
+    if (!threadId || bot.threadId === threadId) bot.resumeCursors[instanceId] = cursor;
     this.saveBots();
+    this.emit({ type: "bot", botId });
+  }
+
+  /** Shared delete for `clearResumeCursor` and `setResumeCursor(undefined)`:
+   *  removes the task's cursor and, when that task is the one visible in
+   *  chat, the bot's legacy mirror.  `matches` limits it to a named cursor. */
+  private dropResumeCursor(botId: string, instanceId: string, threadId?: string, matches?: (saved: unknown) => boolean) {
+    const bot = this.bot(botId);
+    if (!bot) return;
+    const task = threadId ? this.taskByThread(botId, threadId) : this.activeTask(botId);
+    const ok = (saved: unknown) => saved !== undefined && (!matches || matches(saved));
+    let changed = false;
+    if (task && ok(task.resumeCursors[instanceId])) {
+      delete task.resumeCursors[instanceId];
+      changed = true;
+    }
+    if ((!threadId || bot.threadId === threadId) && ok(bot.resumeCursors[instanceId])) {
+      delete bot.resumeCursors[instanceId];
+      changed = true;
+    }
+    if (!changed) return;
+    this.saveBots();
+    // Cursor invalidation must survive a restart in the roster debounce
+    // window — the next turn would otherwise resume the rejected thread.
+    this.flushBotsNow();
     this.emit({ type: "bot", botId });
   }
 

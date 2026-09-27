@@ -382,6 +382,8 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
       return (value.sessionId === null || typeof value.sessionId === "string") && stringOrNullOrMissing(value.model);
     case "session.exited":
       return stringOrMissing(value.reason);
+    case "session.invalidated":
+      return typeof value.sessionId === "string" && stringOrMissing(value.reason);
     case "turn.started":
       return true;
     case "turn.retrying":

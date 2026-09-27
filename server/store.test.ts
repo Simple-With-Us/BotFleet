@@ -410,6 +410,21 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({});
   });
 
+  it("clearResumeCursor drops only the cursor it names, durably", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+    store.setResumeCursor(bot.id, "claude", "sess-keep", bot.threadId);
+    // A stale invalidation (a newer thread was saved since) is a no-op.
+    store.clearResumeCursor(bot.id, "claude", "sess-older", bot.threadId);
+    store.clearResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-keep" });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({ claude: "sess-keep" });
+  });
+
   it("seedIfEmpty creates exactly one starter bot, once", () => {
     const store = new Store(selection);
     store.seedIfEmpty();

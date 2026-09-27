@@ -2288,6 +2288,11 @@ bus.subscribe((event: RuntimeEvent) => {
         store.setResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
       }
       break;
+    case "session.invalidated":
+      if (bot && event.providerInstanceId) {
+        store.clearResumeCursor(bot.id, event.providerInstanceId, event.sessionId, event.threadId);
+      }
+      break;
     case "item.completed":
       if (event.itemType === "assistant_text") {
         pushMessage({ role: "bot", kind: "text", text: event.text });

@@ -14,12 +14,15 @@ import { formatDualQuotaBadge } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
 import { modelEffortLevels } from "@/lib/model-effort";
+import { readableModelLabel } from "@/lib/model-label";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
 const COMPACT_MODEL_COUNT = 5;
 
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
-  return instance?.models.options.find((option) => option.id === model)?.label ?? model;
+  // A saved selection the latest-only picker no longer lists still gets a
+  // readable chip instead of its raw id.
+  return instance?.models.options.find((option) => option.id === model)?.label ?? readableModelLabel(model);
 }
 
 const CALLOUT_DRIVER_KINDS = new Set([

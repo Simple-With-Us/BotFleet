@@ -40,6 +40,14 @@ export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from
 
 const DRIVER_KIND = "codex";
 
+// A resumed thread keeps the model it was started with, so changing the bot's
+// model cannot fix a retired one there — only a fresh thread or a rewind can.
+function unknownModelMessage(resumed: boolean): string {
+  return resumed
+    ? "This conversation's Codex model isn't available.  Start a new thread or rewind."
+    : "This Codex model isn't available.  Pick another model in Settings.";
+}
+
 class CodexResumeError extends Error {
   constructor(options?: { cause?: unknown }) {
     super(
@@ -161,6 +169,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     // decision in `sendTurn`: a sandbox is fixed at thread/start, so a later
     // host-control turn can only reuse a thread it knows was started brokered.
     const brokeredThreads = new Set<string>();
+    // codex thread ids whose model was rejected (unknown_model).  A thread
+    // keeps its start model, and the harness has already saved it as the
+    // resume cursor, so resuming it after the user picks another model would
+    // fail the same way.  A cursor in this set is never resumed; the next
+    // turn starts a fresh thread on the newly selected model.
+    const modelRejectedThreads = new Set<string>();
 
     const emit = (event: RuntimeEvent) => {
       for (const l of [...listeners]) l(event);
@@ -267,6 +281,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         settled: false,
         lastText: "",
         sawStreamDelta: false,
+        // this attempt continues a saved codex thread (thread/resume succeeded)
+        resumed: false,
+        // the codex thread this attempt resumed or started, once known
+        codexThreadId: null as string | null,
         // codex reports token usage as a running THREAD total; the harness
         // wants this turn's figure, so the last report is banked on settle
         usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
@@ -324,6 +342,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // Host-scope tagging mirrors claude.ts: when this turn mounts the real
       // Mac (not a VM), every card carries approvalScope so the harness's
       // local-computer-block backstop applies to remembered always-allows.
+      // Never resume this thread again: remembered here for this process,
+      // and announced so the harness drops the saved cursor durably.
+      const rejectThreadModel = (codexThreadId: string) => {
+        modelRejectedThreads.add(codexThreadId);
+        emit({ ...base(threadId, turnId), type: "session.invalidated", sessionId: codexThreadId, reason: "unknown_model" });
+      };
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
@@ -510,7 +534,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "turn/completed": {
             const t = p.turn ?? {};
-            settle(t.status === "completed", t.status === "completed" ? null : (t.error?.message ?? t.status ?? "failed"));
+            const reason = t.error?.message ?? t.status ?? "failed";
+            const unavailable = classifyError({ text: String(reason) }).reason === "unknown_model";
+            const failureMessage = unavailable ? unknownModelMessage(state.resumed) : reason;
+            if (t.status !== "completed" && unavailable && state.codexThreadId) rejectThreadModel(state.codexThreadId);
+            if (t.status !== "completed" && unavailable) {
+              emit({ ...base(threadId, turnId), type: "runtime.error", message: failureMessage });
+            }
+            settle(t.status === "completed", t.status === "completed" ? null : failureMessage);
             break;
           }
           case "error":
@@ -601,13 +632,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // otherwise starts a fresh one.  The cost is one lost codex-side
         // continuation per instance restart, for full-auto bots that also
         // hold this computer; the alternative is an unbrokered host turn.
-        const cursor = brokered && !(resumeCursor && brokeredThreads.has(resumeCursor)) ? null : resumeCursor;
+        const cursor =
+          (brokered && !(resumeCursor && brokeredThreads.has(resumeCursor))) ||
+          (resumeCursor !== null && modelRejectedThreads.has(resumeCursor))
+            ? null
+            : resumeCursor;
         let codexThreadId: string | null = null;
         let startedModel: string | null = null;
         if (cursor && !recoveredMissingSession) {
           try {
             const resumed = await request("thread/resume", { threadId: cursor });
             codexThreadId = resumed?.thread?.id ?? cursor;
+            state.resumed = true;
           } catch (error) {
             const failure = classifyResumeFailure({
               attempted: true,
@@ -655,6 +691,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           // full-auto and replaced rather than trusted.
           if (brokered && codexThreadId) brokeredThreads.add(codexThreadId);
         }
+        state.codexThreadId = codexThreadId;
         emit({
           ...base(threadId, turnId),
           type: "session.started",
@@ -692,11 +729,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           : "text" in failure
             ? failure.text
             : String(failure);
-        const message = resumeFailure && failureMessage !== e.message
-          ? `${e.message}  ${failureMessage}`
-          : failureMessage;
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(failureMessage);
         const verdict = classifyError(failure);
+        if (verdict.reason === "unknown_model" && !resumeFailure && state.codexThreadId) {
+          rejectThreadModel(state.codexThreadId);
+        }
+        const message = resumeFailure
+          ? failureMessage !== e.message ? `${e.message}  ${failureMessage}` : e.message
+          : verdict.reason === "unknown_model"
+            ? unknownModelMessage(state.resumed)
+            : failureMessage;
         // A rejected RPC proves turn/start did not accept the prompt. A
         // timeout, connection loss or error after acceptance cannot prove
         // that; never replay a possibly acted-on turn in those cases.

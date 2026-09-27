@@ -483,6 +483,102 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.some((event) => event.type === "session.started")).toBe(false);
   });
 
+  it("explains how to recover from an unavailable saved Codex model", async () => {
+    await create({ mode: "unknown-model" });
+
+    await instance.adapter.sendTurn({ threadId: "t-model-unavailable", text: "go", model: "gpt-6-luna" });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({
+      message: "This Codex model isn't available.  Pick another model in Settings.",
+    });
+    expect(JSON.stringify(error)).not.toMatch(/gpt-6-luna|model not found|account or CLI/);
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.some((event) => event.type === "turn.retrying")).toBe(false);
+  });
+
+  it("keeps fresh-session guidance when a missing model blocks session resume", async () => {
+    await create({ mode: "resume-unknown-model" });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-missing-model",
+      text: "continue",
+      model: "gpt-5.6-luna",
+      resumeCursor: "old-thread",
+    });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({ message: expect.stringMatching(/Start a fresh task or rewind this conversation/) });
+    expect(JSON.stringify(error)).not.toMatch(/Pick another model in Settings/);
+    expect(done).toMatchObject({ ok: false, stopReason: "resume_failed" });
+  });
+
+  it("shows an asynchronous model rejection in the transcript", async () => {
+    await create({ mode: "async-unknown-model" });
+
+    await instance.adapter.sendTurn({ threadId: "t-async-missing-model", text: "go", model: "gpt-6-luna" });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({
+      message: "This Codex model isn't available.  Pick another model in Settings.",
+    });
+    expect(JSON.stringify(error)).not.toMatch(/gpt-6-luna|model not found|account or CLI/);
+    expect(done).toMatchObject({
+      ok: false,
+      stopReason: "This Codex model isn't available.  Pick another model in Settings.",
+    });
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+  });
+
+  it("never resumes a thread whose model was rejected, so a new model choice takes effect", async () => {
+    await create({ mode: "async-unknown-model" });
+
+    await instance.adapter.sendTurn({ threadId: "t-rejected-1", text: "go", model: "gpt-6-luna" });
+    const started = await recorder.until((event) => event.type === "session.started" && event.threadId === "t-rejected-1");
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-rejected-1");
+    const cursor = (started as { sessionId: string | null }).sessionId;
+    expect(cursor).toBe("codex-thread-1");
+
+    // The harness saved that cursor; the next dispatch (the user picked
+    // another model) must start a fresh thread instead of resuming it.  This
+    // fake answers thread/resume with "no such thread", so a resume attempt
+    // would surface as resume_failed.
+    await instance.adapter.sendTurn({ threadId: "t-rejected-2", text: "go again", model: "gpt-5.6", resumeCursor: cursor });
+    const second = await recorder.until((event) => event.type === "session.started" && event.threadId === "t-rejected-2");
+    const done = await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-rejected-2");
+    expect(second).toMatchObject({ sessionId: "codex-thread-1", model: "fake-codex-model" });
+    // The rejection is also announced so the harness drops the saved cursor
+    // (survives a restart, unlike the in-memory set).
+    expect(recorder.events.find((event) => event.type === "session.invalidated" && event.threadId === "t-rejected-1"))
+      .toMatchObject({ sessionId: "codex-thread-1", reason: "unknown_model" });
+    expect(done).not.toMatchObject({ stopReason: "resume_failed" });
+  });
+
+  it("keeps fresh-session guidance when a resumed session's model is rejected asynchronously", async () => {
+    await create({ mode: "resume-async-unknown-model" });
+
+    await instance.adapter.sendTurn({
+      threadId: "t-resume-async-missing-model",
+      text: "continue",
+      model: "gpt-5.6-luna",
+      resumeCursor: "old-thread",
+    });
+    const error = await recorder.until((event) => event.type === "runtime.error");
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(error).toMatchObject({
+      message: "This conversation's Codex model isn't available.  Start a new thread or rewind.",
+    });
+    expect(JSON.stringify(error)).not.toMatch(/gpt-5\.6-luna|model not found|account or CLI|Pick another model in Settings/);
+    expect(done).toMatchObject({
+      ok: false,
+      stopReason: "This conversation's Codex model isn't available.  Start a new thread or rewind.",
+    });
+  });
+
   it("surfaces an approval request and forwards the user's decision", async () => {
     await create({ mode: "approval" });
     const dump = join(scratch, "dump.json");

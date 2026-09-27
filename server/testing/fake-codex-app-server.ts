@@ -90,6 +90,7 @@ process.stdin.on("data", (chunk) => {
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
         break;
       case "model/list":
+        if (mode === "models-hang") break;
         if (msg.params?.cursor === "page-2") {
           out({
             jsonrpc: "2.0",
@@ -122,7 +123,7 @@ process.stdin.on("data", (chunk) => {
         }
         break;
       case "thread/resume":
-        if (mode === "resume") {
+        if (mode === "resume" || mode === "resume-async-unknown-model") {
           out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: msg.params?.threadId } } });
         } else if (mode === "resume-unauthorized") {
           out({
@@ -130,6 +131,8 @@ process.stdin.on("data", (chunk) => {
             id: msg.id,
             error: { code: -32603, message: "unexpected status 401 Unauthorized: Missing bearer" },
           });
+        } else if (mode === "resume-unknown-model") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
         } else if (mode === "resume-transient" && process.env.FAKE_CODEX_STATE) {
           let launched = 0;
           try {
@@ -151,6 +154,10 @@ process.stdin.on("data", (chunk) => {
         }
         break;
       case "thread/start":
+        if (mode === "unknown-model") {
+          out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
+          break;
+        }
         out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
         break;
       case "turn/start": {
@@ -196,6 +203,10 @@ process.stdin.on("data", (chunk) => {
           }
         }
         out({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+        if (mode === "async-unknown-model" || mode === "resume-async-unknown-model") {
+          notify("turn/completed", { turn: { status: "failed", error: { message: "model not found" } } });
+          break;
+        }
         const command = mode === "windows-command"
           ? [
               "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"",
