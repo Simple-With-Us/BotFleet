@@ -9,7 +9,48 @@ permissions:
   contents: read
 
 jobs:
+  # The Playwright suite (tests/e2e) covers the web shell only, so it runs
+  # when the web app itself could have changed — not on iOS/electron-only
+  # PRs. Includes the automated visual screenshot assertions
+  # (tests/e2e/visual.spec.ts): web UI changes must be covered by those,
+  # never by manual owner screenshots.
+  changes:
+    name: Classify E2E scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      web_changed: ${{ steps.scope.outputs.web_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check whether web-app paths changed
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Fail open: any event we cannot diff takes the full run, matching
+          # the docs_only classifier in ci.yml.
+          if [[ "$EVENT_NAME" != "push" && "$EVENT_NAME" != "pull_request" ]]; then
+            echo "web_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            echo "web_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --no-renames --name-only "$BASE_SHA" "$GITHUB_SHA" | grep -Eq '^(src|shared|tests/e2e|public)/|^(index\.html|vite\.config\.ts|playwright\.config\.ts|package\.json|pnpm-lock\.yaml)$'; then
+            echo "web_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   smoke:
+    needs: changes
+    if: needs.changes.outputs.web_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -23,3 +64,10 @@ jobs:
       - run: pnpm exec vite build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm exec playwright test
+      - name: Upload screenshot diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-visual-failures
+          path: test-results/
+          retention-days: 7
