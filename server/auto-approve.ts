@@ -82,9 +82,21 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
   return scope === "local-computer" ? `${scope}:${key}` : key;
 }
 
-/** Program names that run whatever follows them.  On the person's own
- * desktop (`local-computer` scope) an Always-allow keyed on one of these
- * is the bare "Bash" grant in disguise — `Bash:bash` covers
+/** A summary is not the command. Claude/ACP currently cap it at 200
+ * characters and HTTP bash at 160. Refuse automatic decisions when it may
+ * be truncated, or when a shell has more than one operation. This is a
+ * temporary fail-closed guard until drivers carry full permission input. */
+function unsafeCommandSummary(tool: string, summary: string): boolean {
+  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  if (!COMMAND_TOOLS.has(bare)) return false;
+  if (summary.length >= 160) return true;
+  // Conservative on purpose: shell metacharacters inside quoted strings
+  // also require a card. A card is safer than guessing a shell grammar.
+  return /[;&|`\n\r]|\$\(|[<>]/.test(summary);
+}
+
+/** Program names that run whatever follows them.  An Always-allow keyed on
+ * one of these is the bare "Bash" grant in disguise — `Bash:bash` covers
  * `bash -c <anything>`, `Bash:env` covers `env sh -c …` — so it is never
  * remembered there, and a stored local-scoped one is ignored.  On a
  * disposable remote computer the same key is the right width. */
@@ -181,14 +193,18 @@ export function autoVerdict(
   // stood in the way", which cannot be told apart from an ordinary
   // "nobody granted this" card without knowing both halves.
   const key = approvalKey(tool, summary, context?.scope);
+  const unsafeCommand = unsafeCommandSummary(tool, summary);
   const grant =
-    destructive || sensitive
+    destructive || sensitive || unsafeCommand
       ? null
       : bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
         : bot.autoApprove
           ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
           : null;
+  if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
+  if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
+  if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
