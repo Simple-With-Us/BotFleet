@@ -27,6 +27,16 @@ export interface SteerStore {
   patchMessage(threadId: string, messageId: string, patch: Partial<Message>): Message | null;
 }
 
+interface QueuedItem {
+  messageId: string;
+  text: string;
+  prompt: string;
+  replyToId?: string;
+  /** Set when the words came from an outside channel (iMessage relay), so
+   * the drained turn keeps running unattended (S8). */
+  automationSource?: Message["automationSource"];
+}
+
 interface QueueEntry {
   /** Kept beside the threadId because the settle that frees the bot can
    * happen on a DIFFERENT thread (a room turn) — drain matches on "this
@@ -113,6 +123,7 @@ export function drainSteeredMessages(
           text: item.text,
           replyToId: item.replyToId,
           queueId: item.messageId,
+          automationSource: item.automationSource,
         }),
       );
     }

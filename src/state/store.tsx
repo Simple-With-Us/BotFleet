@@ -95,7 +95,7 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   audio?: Array<{ path: string; mime: string }>;

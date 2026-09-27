@@ -105,7 +105,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** Persisted audio clips for this exact reply, in playback order. */

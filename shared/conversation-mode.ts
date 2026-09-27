@@ -64,7 +64,7 @@ export function groupingNewLabel(mode: ConversationMode, roomSingular: string): 
  * event into the bot's one conversation and never mints these. */
 export function automationLaneTitle(
   mode: ConversationMode,
-  source?: "schedule" | "manual" | "webhook" | "resource" | "delegation",
+  source?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage",
 ): string {
   if (mode === "projects") {
     if (source === "webhook") return "Webhooks";

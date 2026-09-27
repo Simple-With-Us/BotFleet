@@ -2520,6 +2520,37 @@ describe("harness HTTP API", () => {
     }
   }, 30_000);
 
+  it("runs iMessage-relayed text as an unattended imessage turn, not an attended one", async () => {
+    // S8: text from an outside iMessage sender must never get attended
+    // semantics (Auto mode / Always-allow) just because it arrived over the
+    // owner-linked relay.
+    const claude = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const transcript = async () => (await api("GET", `/api/threads/${bot.threadId}/messages?limit=50`)).body.messages as Array<{
+      role: string; text?: string; automationSource?: string;
+    }>;
+    try {
+      await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: claude.models.default } });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "[from iMessage] hello from outside", source: "imessage" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).find((message) => message.text?.includes("hello from outside"))?.automationSource, { timeout: 10_000 }).toBe("imessage");
+      const inbound = (await transcript()).find((message) => message.text?.includes("hello from outside"));
+      expect(inbound?.role).toBe("system");
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId });
+      await expect.poll(async () => (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 10_000 }).toBe(false);
+
+      // An attended send to the same bot keeps attended provenance.
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "owner typing directly" })).status).toBe(202);
+      await expect.poll(async () => (await transcript()).some((message) => message.text?.includes("owner typing directly")), { timeout: 10_000 }).toBe(true);
+      const attended = (await transcript()).find((message) => message.text?.includes("owner typing directly"));
+      expect(attended?.automationSource).toBeUndefined();
+      expect(attended?.role).toBe("user");
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: bot.threadId }).catch(() => {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 30_000);
+
   it("drains a queued credential continuation after deferred fallback finds no candidate", async () => {
     const otherInstances = ["claude", "claude2", "crasher"];
     let botId = "";
