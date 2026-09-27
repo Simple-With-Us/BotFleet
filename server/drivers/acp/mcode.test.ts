@@ -3,7 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { McodeAgentDriver, mcodeAuthenticated, mcodeDataDir, STATIC_MCODE_MODELS } from "./mcode.ts";
+import {
+  McodeAgentDriver,
+  mcodeAuthenticated,
+  mcodeDataDir,
+  mcodeModelOptionValue,
+  mcodePickerId,
+  parseMcodeModelValue,
+  STATIC_MCODE_MODELS,
+} from "./mcode.ts";
 
 const scratchDirs: string[] = [];
 
@@ -89,5 +97,57 @@ describe("McodeAgentDriver", () => {
     expect(McodeAgentDriver.install?.docsUrl).toBe("https://github.com/minimax-ai/minimax-code");
     expect(McodeAgentDriver.install?.signInCommand).toBe("mcode login --region global");
     expect(McodeAgentDriver.install?.command?.darwin).toContain("filecdn.minimax.chat");
+  });
+});
+
+describe("mcodeModelOptionValue", () => {
+  const advertised = [
+    {
+      id: "model",
+      options: [
+        { value: "m:minimax:MiniMax-M3:u", name: "MiniMax-M3" },
+        { value: "m:minimax:MiniMax-M2.7:v:highspeed", name: "MiniMax-M2.7 (highspeed)" },
+      ],
+    },
+  ];
+
+  it("matches a plain model id and returns the advertised value verbatim", () => {
+    expect(mcodeModelOptionValue("MiniMax-M3", advertised)).toBe("m:minimax:MiniMax-M3:u");
+  });
+
+  it("matches the variant folded into the picker id", () => {
+    expect(mcodeModelOptionValue("MiniMax-M2.7-highspeed", advertised)).toBe("m:minimax:MiniMax-M2.7:v:highspeed");
+  });
+
+  it("keeps the user's own BYOK provider id instead of constructing one", () => {
+    const byok = [{ id: "model", options: [{ value: "m:my-openai:MiniMax-M3:u", name: "MiniMax-M3" }] }];
+    expect(mcodeModelOptionValue("MiniMax-M3", byok)).toBe("m:my-openai:MiniMax-M3:u");
+  });
+
+  it("skips the switch when the session advertises no model option (older mcode)", () => {
+    expect(mcodeModelOptionValue("MiniMax-M3", [])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3", undefined)).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3", [{ id: "mode", options: [] }])).toBeNull();
+  });
+
+  it("fails clearly when the model is not in the advertised options", () => {
+    expect(() => mcodeModelOptionValue("MiniMax-M9", advertised)).toThrow(/does not offer MiniMax-M9/);
+    expect(() => mcodeModelOptionValue("MiniMax-M9", advertised)).toThrow(/MiniMax-M2\.7 \(highspeed\)/);
+  });
+});
+
+describe("parseMcodeModelValue / mcodePickerId", () => {
+  it("decodes a wire value back to the picker id, URI-decoded", () => {
+    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M2.7:v:highspeed");
+    expect(parsed).toEqual({ providerId: "minimax", modelId: "MiniMax-M2.7", variant: "highspeed" });
+    expect(mcodePickerId(parsed!)).toBe("MiniMax-M2.7-highspeed");
+    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3:u")!)).toBe("MiniMax-M3");
+    expect(parseMcodeModelValue("m:p:Some%20Model:u")).toEqual({ providerId: "p", modelId: "Some Model" });
+  });
+
+  it("rejects values that are not mcode-shaped", () => {
+    expect(parseMcodeModelValue("m-two")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:x")).toBeNull();
+    expect(parseMcodeModelValue(42)).toBeNull();
   });
 });

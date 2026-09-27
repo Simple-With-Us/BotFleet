@@ -239,8 +239,13 @@ export interface AcpSupport {
   selectModel?: {
     configId: string;
     /** Translate the picker model into the option's opaque ACP wire value.
-     * The UI-facing session event keeps the picker id. */
-    valueForModel?(model: string): string;
+     * Receives the session's advertised configOptions so a driver whose wire
+     * values embed per-login data (mcode's m:<providerId>:<modelId>...) can
+     * match an advertised option instead of constructing one. Return null to
+     * skip the switch entirely (the session keeps its default); undefined
+     * falls back to the picker id as the wire value. The UI-facing session
+     * event keeps the picker id. */
+    valueForModel?(model: string, advertised?: unknown): string | null | undefined;
     /** Translate a confirmed opaque ACP value back to the picker model id
      * when the caller accepts the session default. */
     modelForValue?(value: unknown): string | null;
@@ -1341,8 +1346,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     (o: any) => o?.id === configId,
                   )?.currentValue;
                 let selectedValue = reportedValue(sessionResult);
+                const mappedValue = cliTurn.model && valueForModel
+                  ? valueForModel(cliTurn.model, sessionResult?.configOptions)
+                  : undefined;
                 const requestedValue = cliTurn.model
-                  ? (valueForModel?.(cliTurn.model) ?? cliTurn.model)
+                  ? mappedValue === null
+                    ? null // the support asked to skip the switch: the session keeps its default
+                    : (mappedValue ?? cliTurn.model)
                   : null;
                 if (requestedValue && requestedValue !== selectedValue) {
                   const applied = reportedValue(
