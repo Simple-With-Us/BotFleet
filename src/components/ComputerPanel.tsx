@@ -5,6 +5,7 @@
 // separate preview remains explicitly user-initiated. Auto never selects a
 // Linux user's desktop.
 import { useEffect, useRef, useState } from "react";
+import { z } from "zod";
 import {
   CalendarDays,
   CalendarClock,
@@ -82,6 +83,13 @@ interface LocalVmStatus {
   problem: string | null;
   viewer_url: string;
 }
+
+const liveScreenFrame = z.object({
+  kind: z.literal("screen"),
+  botId: z.string(),
+  png: z.string(),
+  mime: z.string().optional(),
+});
 
 export function ComputerPanel({
   bot,
@@ -401,10 +409,44 @@ export function ComputerPanel({
   // idle bot — a drawer left open overnight must not keep shooting.
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
-  const sseFlowing = Boolean(bot.busy && live);
+  const [screenStreamState, setScreenStreamState] = useState<"connecting" | "connected" | "failed">("connecting");
+  useEffect(() => {
+    if (phase !== "ready" || panelView !== "computer" || viewerOpen || !pageVisible) return;
+    setScreenStreamState("connecting");
+    const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
+    let active = true;
+    let failed = false;
+    stream.onopen = () => {
+      if (!active) return;
+      failed = false;
+      setScreenStreamState("connected");
+    };
+    stream.onerror = () => {
+      if (!active) return;
+      if (!failed) setPolledFrame(null);
+      failed = true;
+      setScreenStreamState("failed");
+    };
+    stream.onmessage = (event) => {
+      if (!active) return;
+      try {
+        const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
+        if (parsed.success && parsed.data.botId === bot.id) {
+          const frame = parsed.data;
+          dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
+        }
+      } catch {
+        // Ignore malformed frames; EventSource reconnects after a broken stream.
+      }
+    };
+    return () => {
+      active = false;
+      stream.close();
+    };
+  }, [phase, panelView, viewerOpen, pageVisible, bot.id, dispatch]);
   const inFlight = useRef(false);
   useEffect(() => {
-    if (phase !== "ready" || sseFlowing || viewerOpen || !pageVisible) return;
+    if (phase !== "ready" || panelView !== "computer" || (bot.busy && screenStreamState !== "failed") || viewerOpen || !pageVisible) return;
     let alive = true;
     const shoot = async () => {
       if (inFlight.current) return;
@@ -424,7 +466,7 @@ export function ComputerPanel({
       alive = false;
       clearInterval(timer);
     };
-  }, [phase, sseFlowing, bot.id, viewerOpen, pageVisible, bot.busy]);
+  }, [phase, panelView, screenStreamState, bot.id, viewerOpen, pageVisible, bot.busy]);
 
   // Local VM preview comes directly from Cua Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
@@ -481,9 +523,9 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
+  const latestPreview = screenStreamState === "failed" ? polledFrame ?? live : live ?? polledFrame;
   const cloudFrame =
-    live ??
-    polledFrame ??
+    latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
   const frameSrc =
     phase === "vm"
@@ -1242,7 +1284,7 @@ export function ComputerPanel({
         <RoutineEditor
           bots={[bot]}
           lockedBotId={bot.id}
-          defaultRunOn={cloudRoutineReady ? "cloud" : "maus"}
+          defaultRunOn={cloudRoutineReady ? "cloud" : "bot"}
           onClose={() => setCreatingRoutine(false)}
         />
       )}

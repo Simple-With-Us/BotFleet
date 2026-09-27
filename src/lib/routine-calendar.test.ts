@@ -8,8 +8,10 @@ import {
   nextCalendarRunLabel,
   projectedRoutineItems,
   routineScheduleLabel,
+  scheduleFireDays,
   timeZoneLabel,
 } from "./routine-calendar";
+import { startOfDayInTimeZone } from "../../shared/time-zone";
 
 function routine(schedule: Routine["schedule"]): Routine {
   return {
@@ -17,7 +19,7 @@ function routine(schedule: Routine["schedule"]): Routine {
     name: "Fixture",
     prompt: "Check",
     botId: "bot",
-    runOn: "maus",
+    runOn: "bot",
     enabled: true,
     schedule,
     durationMinutes: 30,
@@ -88,5 +90,50 @@ describe("routine calendar timezone", () => {
     const now = Date.parse("2026-09-13T04:45:00.000Z");
     const at = Date.parse("2026-09-13T04:55:00.000Z");
     expect(nextCalendarRunLabel(at, now)).toBe("Today, 11:55 PM CDT");
+  });
+});
+
+describe("scheduleFireDays", () => {
+  const zone = "America/Chicago";
+  // 2026-09-01..2026-10-01, both bounds expressed as Chicago midnights so a
+  // fixture change never has to hand-recompute UTC offsets.
+  const septStart = Date.parse("2026-09-01T05:00:00.000Z");
+  const octStart = Date.parse("2026-10-01T05:00:00.000Z");
+
+  it("marks the single day a one-shot schedule fires on, in range", () => {
+    const at = Date.parse("2026-09-14T14:00:00.000Z"); // Mon Sep 14, 9am Central
+    const days = scheduleFireDays({ type: "once", at }, zone, septStart, octStart);
+    expect(days).toEqual(new Set([startOfDayInTimeZone(at, zone)]));
+  });
+
+  it("omits a one-shot day outside the requested range", () => {
+    const at = Date.parse("2026-11-02T14:00:00.000Z");
+    expect(scheduleFireDays({ type: "once", at }, zone, septStart, octStart).size).toBe(0);
+  });
+
+  it("marks every Monday in September 2026 for a weekly recurrence, and only Mondays", () => {
+    const days = scheduleFireDays({ type: "daily", time: "09:00", weekdays: [1], timeZone: zone }, zone, septStart, octStart);
+    expect(days.size).toBe(4); // Sep 2026 has exactly four Mondays: 7, 14, 21, 28
+    for (const day of days) {
+      expect(calendarDayLabel(day).weekday).toBe("Mon");
+    }
+  });
+
+  it("never loops on a recurrence with no weekdays selected", () => {
+    const days = scheduleFireDays({ type: "daily", time: "09:00", weekdays: [], timeZone: zone }, zone, septStart, octStart);
+    expect(days.size).toBe(0);
+  });
+
+  it("keys days by the schedule's own zone, not UTC or the host's", () => {
+    // 00:30 Monday in Tokyo is still Sunday everywhere west of it — the
+    // returned day must be the Tokyo calendar day, matching
+    // projectedRoutineItems' own occurrence (see the timezone test above).
+    const days = scheduleFireDays(
+      { type: "daily", time: "00:30", weekdays: [1], timeZone: "Asia/Tokyo" },
+      "Asia/Tokyo",
+      Date.parse("2026-09-13T05:00:00.000Z"),
+      Date.parse("2026-09-14T05:00:00.000Z"),
+    );
+    expect(days).toEqual(new Set([startOfDayInTimeZone(Date.parse("2026-09-13T15:30:00.000Z"), "Asia/Tokyo")]));
   });
 });

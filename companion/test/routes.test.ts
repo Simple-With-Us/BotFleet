@@ -93,6 +93,21 @@ describe("what the app may do", () => {
     it(`allows ${method} ${path}`, () => expect(ask(method, path)).toBeNull());
   }
 
+  it("carries a thread snooze on the task patch the phone already had, not a new door", () => {
+    // `CompanionClient.snoozeTask` adds a FIELD to an allowed route rather
+    // than a route of its own, so the phone gains per-thread snooze without
+    // widening what a lost phone can reach.  Nothing here validates that
+    // field: the harness does, and refuses anything that is not a
+    // timestamp, 0, or null.
+    expect(allowed("PATCH", "/api/bots/bot_123/tasks/th_1")).toBe(true);
+    // No snooze route was invented on either side; an invented one would be
+    // closed until someone added it here on purpose, which is the point.
+    expect(ask("PATCH", "/api/bots/bot_123/tasks/th_1/snooze")?.status).toBe(404);
+    expect(ask("POST", "/api/bots/bot_123/tasks/th_1/snooze")?.status).toBe(404);
+    // And it is still a paired-device route rather than an open one.
+    expect(ask("PATCH", "/api/bots/bot_123/tasks/th_1", false)?.status).toBe(401);
+  });
+
   it("lets the phone check for a newer BotFleet and install it", () => {
     expect(allowed("GET", "/api/update/status")).toBe(true);
     expect(allowed("POST", "/api/update/check")).toBe(true);
@@ -129,6 +144,7 @@ describe("what it may not", () => {
       "autoApprove",
       "autoReview",
       "composio",
+      "connectorTools",
       "computers",
       "cloudBackend",
       "autoStartVps",

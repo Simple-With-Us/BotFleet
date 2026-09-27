@@ -54,6 +54,7 @@ import {
 } from "./vps-computer.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { freePortBlock } from "./testing/ports.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -231,6 +232,33 @@ describe("the grant a turn resolves is the same on both lanes", () => {
       }),
     ).rejects.toThrow("refused the connection");
     expect(released).toEqual([lease]);
+  });
+
+  it("keeps the caught VPS error when an Auto lookup throws and nothing mounts", async () => {
+    // The auto lookup's SSH/timeout error used to be replaced by the generic
+    // "could not be reached" text in the no-mount branch.
+    const deps = stubDeps({
+      readHostConnection: () => null,
+      vps: {
+        vpsDriverError: () => null,
+        vpsComputerAction: async () => ({ ready: false }),
+        inspectVpsForAuto: async () => {
+          throw new Error("ssh: connect to host vps-1 port 22: Operation timed out");
+        },
+        vpsComputerMcp: () => ({ command: "", args: [], env: {} }),
+        vpsComputerScreenshot: async () => ({ png: "", format: "png" }),
+      },
+    });
+    const run = resolveTurnComputerMounts({
+      bot: { id: "bot-auto-vps", name: "Auto", cloudBackend: "vps" },
+      cfg: EMPTY_CONFIG,
+      engine: ACP_ENGINE,
+      threadId: "thread-auto-vps",
+      dispatchId: 1,
+      allowed: null,
+      deps,
+    });
+    await expect(run).rejects.toThrow("ssh: connect to host vps-1 port 22: Operation timed out");
   });
 
   describe("per-provider toggles are enforced on the cloud backend a bot resolves to", () => {
@@ -609,7 +637,7 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${base}/api/health`)).ok) break;
+        if (await harnessReady(base)) break;
       } catch {
         /* not up yet */
       }

@@ -22,6 +22,31 @@ function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   return instance?.models.options.find((option) => option.id === model)?.label ?? model;
 }
 
+const CALLOUT_DRIVER_KINDS = new Set([
+  "minimax",
+  "claude",
+  "grok",
+  "codex",
+  "antigravity",
+  "cursorAgent",
+  "deepseekAgent",
+  "dshAgent",
+  "antigravityAgent",
+  "grokAgent",
+  "claudeAgent",
+]);
+
+function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNode {
+  if (!CALLOUT_DRIVER_KINDS.has(instance.driverKind)) return null;
+  return (
+    <EngineCallout
+      key={instance.instanceId}
+      driverKind={instance.driverKind}
+      instanceId={instance.instanceId}
+    />
+  );
+}
+
 function engineStatus(instance: InstanceInfo): string {
   if (instance.snapshot.quota?.capped) return "Quota Cap";
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
@@ -67,13 +92,22 @@ function ModelRow({
         quota?.capped && "opacity-60",
       )}
     >
-      <span className="flex min-w-0 items-center gap-2">
-        <span className="truncate" title={option.label}>{option.label}</span>
+      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+        <span className="min-w-0 flex-1 break-words" title={option.label}>{option.label}</span>
         {option.id === defaultId && (
           <span className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary">Default</span>
         )}
         {option.loaded && (
           <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
+        )}
+        {option.badge && (
+          <span
+            className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
+            title={option.badgeTitle ?? option.badge}
+            aria-label={option.badgeTitle ?? option.badge}
+          >
+            {option.badge}
+          </span>
         )}
         {quota?.capped && (
           <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">Exhausted</span>
@@ -325,7 +359,7 @@ export function ModelPicker({
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
             contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
-              : "absolute right-0 top-full z-30 mt-2 w-[380px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
+              : "absolute right-0 top-full z-30 mt-2 w-[420px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
           )}
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
@@ -409,15 +443,7 @@ export function ModelPicker({
                       <strong>Usage cap in effect:</strong> {railInstance.snapshot.quota?.error ?? "Session limit or quota reached."} Turns automatically fail over to configured fallbacks until reset.
                     </div>
                   )}
-                  {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent"].includes(railInstance.driverKind) && (
-                    // Keyed so switching rails remounts the callout and its
-                    // open state resets instead of carrying to the next engine.
-                    <EngineCallout
-                      key={railInstance.instanceId}
-                      driverKind={railInstance.driverKind}
-                      instanceId={railInstance.instanceId}
-                    />
-                  )}
+
                   {railInstance.driverKind === "boxAgent" && (
                     <div className="mt-2 rounded bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-warning-dark border border-warning/20">
                       <strong>Works Alone:</strong>
@@ -441,6 +467,7 @@ export function ModelPicker({
 
                 {blocked ? (
                   <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-1">
+                    <WhyThisEngineCallout instance={railInstance} />
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
                       {pane === "main" && official.length > 0
@@ -467,6 +494,9 @@ export function ModelPicker({
                     )}
 
                     <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+                      <div className="px-2">
+                        <WhyThisEngineCallout instance={railInstance} />
+                      </div>
                       {pane === "main" ? (
                         <>
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">

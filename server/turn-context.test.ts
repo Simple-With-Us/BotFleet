@@ -1,11 +1,67 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
 
 const transcript = [
   { role: "user" as const, text: "my dog is named Biscuit" },
   { role: "assistant" as const, text: "Noted — Biscuit." },
 ];
+
+describe("boundNativeTranscript", () => {
+  it("keeps ordinary replay unchanged", () => {
+    expect(boundNativeTranscript(transcript)).toBe(transcript);
+  });
+
+  it("keeps recent complete turns and marks older history as omitted", () => {
+    const history = [
+      { role: "user" as const, text: "old".repeat(50 * 1024) },
+      { role: "assistant" as const, text: "recent assistant" },
+      { role: "user" as const, text: "recent user" },
+    ];
+    const bounded = boundNativeTranscript(history);
+    expect(bounded.map((entry) => entry.text)).toEqual([
+      "[Earlier conversation omitted for length]",
+      "recent assistant",
+      "recent user",
+    ]);
+    expect(bounded[0].role).toBe("user");
+  });
+
+  it("clips one oversized newest turn at a UTF-8 boundary", () => {
+    const bounded = boundNativeTranscript([{ role: "assistant", text: "é".repeat(100 * 1024) }]);
+    expect(bounded).toHaveLength(2);
+    expect(bounded[1].text).not.toContain("\uFFFD");
+    expect(bounded[1].text.length).toBeLessThan(100 * 1024);
+    expect(Buffer.byteLength(bounded.map((entry) => entry.text).join(""), "utf8")).toBeLessThanOrEqual(128 * 1024);
+  });
+});
+
+describe("boundRoomContextLines", () => {
+  it("preserves short room conversations", () => {
+    expect(boundRoomContextLines(["User: hello", "Bot: hi"])).toBe("User: hello\nBot: hi");
+  });
+
+  it("omits a huge prior room message while retaining the newest request", () => {
+    const current = "User: answer my latest question";
+    const bounded = boundRoomContextLines(["Bot: " + "x".repeat(200 * 1024), current]);
+    expect(bounded).toBe(`[Earlier conversation omitted for length]\n${current}`);
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThan(128 * 1024);
+  });
+
+  it("keeps a deliberately large current room request intact", () => {
+    const current = "User: " + "z".repeat(200 * 1024);
+    expect(boundRoomContextLines(["Bot: older", current])).toBe(`[Earlier conversation omitted for length]\n${current}`);
+  });
+
+  it("clips the newest stored line when a card continuation is the current prompt", () => {
+    const prior = "Bot: " + "é".repeat(100 * 1024);
+    const bounded = boundRoomContextLines(["User: older", prior], false);
+    expect(bounded).toContain("[Earlier conversation omitted for length]");
+    expect(bounded).not.toContain("User: older");
+    expect(bounded).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(bounded, "utf8")).toBeLessThanOrEqual(128 * 1024);
+  });
+});
 
 describe("buildTurnContext", () => {
   it("passes text through untouched on a plain resumed turn", () => {

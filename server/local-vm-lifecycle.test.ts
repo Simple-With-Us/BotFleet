@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 // Real HTTP admission and state changes, with every container executable
 // shadowed by a fixture.  A file gate holds cleanup before any container I/O.
@@ -79,9 +80,19 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     const deadline = Date.now() + 30000;
     for (;;) {
       if (child.exitCode !== null) throw new Error(`fixture exited ${child.exitCode}: ${stderr.slice(-1000)}`);
-      try { if ((await fetch(`${base}/api/health`)).ok) break; } catch {}
+      if (await harnessReady(base)) break;
       if (Date.now() > deadline) throw new Error(`fixture did not start: ${stderr.slice(-1000)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    // Listen awaits the startup idle-backstop probe, so health means that
+    // shared-VM inspect has finished.  Still drain the log briefly in case a
+    // future boot path reintroduces background docker traffic before tests
+    // take the fence snapshot.
+    for (let prev = -1, quiet = 0; quiet < 3; ) {
+      const size = existsSync(log) ? readFileSync(log, "utf8").length : 0;
+      if (size === prev) quiet += 1;
+      else { prev = size; quiet = 0; }
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }, 40000);
 
@@ -113,6 +124,9 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
       const before = readFileSync(log, "utf8");
       expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
       expect((await api("GET", "/api/bots")).body.bots.some((item: any) => item.id === bot.id)).toBe(true);
+      // Exact equality: a blocked delete must not start container I/O.  The
+      // startup idle-backstop probe is awaited before listen so its inspect
+      // cannot appear here as a flake.
       expect(readFileSync(log, "utf8")).toBe(before);
     } finally { release(); await mode; }
     expect((await mode).status).toBe(200);
@@ -130,6 +144,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
       await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
       const before = readFileSync(log, "utf8");
       expect((await api("POST", "/api/local-computer/mode", { mode: "shared" })).status).toBe(409);
+      // Same contract as the deletion fence case above.
       expect(readFileSync(log, "utf8")).toBe(before);
     } finally { release(); await deletion; }
     expect((await deletion).status).toBe(200);

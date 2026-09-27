@@ -1,6 +1,6 @@
 // Engine capability + pricing registry.  The settings panel, the Usage tab,
-// the new "API vs subscription" projection, and the capability matrix all
-// read from a single source — adding a new engine is one row here, not four.
+// the API-vs-subscription projection, and the capability matrix all read
+// from here.  Adding an engine is one row, not four.
 //
 // Sources for every entry:
 //   - `server/contracts.ts` for the canonical DriverKind ids
@@ -8,14 +8,11 @@
 //   - `server/drivers/{grok,claude,codex,minimax,antigravity}.ts` and the
 //     acp/{cursor,deepseek,grok}.ts shims for the model + driver-kind surface
 //   - `src/components/ProviderIcons.tsx` for the badge accent colors
-//   - the fleet-recall "Coding-seat tiers (2026-09-16)" + "Coding-seat tiers
-//     correction (2026-09-18)" notes for subscription pricing
 //
-// Fields marked "MARKED: needs Jay's confirmation" are the ones where I
-// could not find a hard source inside the repo.  Do not silently rewrite
-// them — Jay's correction on 2026-09-18 swapped a Plus for a Pro Lite, so
-// a wrong subscription tier here would surface wrong numbers in three
-// different panels.
+// User-facing copy states the product: plan name, pricing mode, and which
+// capabilities this build exposes.  Public API rates are a what-if catalog,
+// not an invoice.  A capability this build does not wire is a BotFleet gap,
+// not a claim that the model cannot do it.
 
 import * as React from "react";
 
@@ -42,6 +39,15 @@ export interface ApiRates {
   outputPer1k: number;
   /** USD per 1k cached-input tokens when the provider bills them separately. */
   cachedInputPer1k?: number;
+  /** Long-context tier: a request whose prompt reaches `minPromptTokens` is
+   *  billed at these rates for all of its tokens (xAI's "≥ 200k prompt
+   *  tokens" rows). */
+  longContext?: {
+    minPromptTokens: number;
+    inputPer1k: number;
+    outputPer1k: number;
+    cachedInputPer1k?: number;
+  };
   notes?: string;
 }
 
@@ -93,32 +99,28 @@ export interface EngineCapabilityEntry {
   defaultModels: EngineModel[];
 }
 
-// MARKED: needs Jay's confirmation — Cursor Ultra monthly price. The
-// fleet-recall note "Coding-seat tiers (2026-09-16)" bundles Cursor Ultra
-// into the SuperGrok Heavy subscription.  Cursor.com sells Cursor Ultra
-// independently too; if Jay pays for it separately, the costPerMonth here
-// duplicates the spend.  Until confirmed, costPerMonth is `null` and the
-// "What-if API" projection does not surface a Cursor subscription line.
+// Cursor has no separate API block.  costPerMonth stays unset so the
+// pricing chip does not invent a billed amount.  The plan name is the label.
 const CURSOR_ULTRA_NOTE =
-  "Cursor Ultra quota is bundled into Jay's xAI SuperGrok Heavy subscription per fleet-recall 2026-09-16 — the standalone price below is the public catalog number, not what is actually billed.";
+  "Cursor Ultra subscription.  BotFleet does not register a separate Cursor API rate.";
 
 const CLAUDE_MAX_NOTE =
-  "Claude Max 20x per fleet-recall 2026-09-16 ($213.20/mo).  Subscription is the only billing mode available — no Anthropic API key is configured for this engine.";
+  "Claude Max 20× subscription.  BotFleet does not register an Anthropic API rate for this engine.";
 
 const CODEX_PRO_LITE_NOTE =
-  "ChatGPT Pro Lite per fleet-recall correction 2026-09-18 ($100/mo).  Pro was canceled 2026-06; Pro Lite replaced it and the Codex JWT now resolves to 'prolite'.";
+  "ChatGPT Pro Lite subscription.  BotFleet does not register a separate OpenAI API rate for this engine.";
 
 const MINIMAX_TOKEN_PLAN_NOTE =
-  "MiniMax Token Plan Max ($55/mo per fleet-recall 2026-09-16).  The PAYG API rates below are what the registry uses for the 'what-if API' projection; the daily UI never charges against them unless the user explicitly opts into API mode.";
+  "MiniMax Token Plan Max subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const GROK_SUPER_NOTE =
-  "xAI SuperGrok Heavy per fleet-recall 2026-09-16 ($99/mo after the 67% promo on the $300 list price — switches mid-October to the plain $100 SuperGrok plan).  Cursor Ultra and Grok Bot bundles are folded in for Jay's seat.";
+  "xAI SuperGrok Heavy subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const ANTIGRAVITY_ULTRA_NOTE =
-  "Google AI Ultra per fleet-recall 2026-09-16 — $105.79/mo, renewing 2026-10-05 at $50/mo.  Antigravity access is the agent-approval lane behind PR #516.";
+  "Google AI Ultra subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const DEEPSEEK_HARNESS_NOTE =
-  "DeepSeek Harness (DSH) is bundled with Claude Max per fleet-recall 2026-09-16 — there is no separate subscription tier for Jay's seat, the standalone catalog number is what the registry would charge for a PAYG API key.";
+  "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
 
 export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
   grok: {
@@ -131,19 +133,30 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       subscription: {
         tierLabel: "xAI SuperGrok Heavy",
         costPerMonth: 99,
-        includedQuota: "Bundled Cursor Ultra + Grok Bot on Jay's seat",
+        includedQuota: "SuperGrok Heavy plan quota",
         notes: GROK_SUPER_NOTE,
       },
       api: {
-        inputPer1k: 0.005,
-        outputPer1k: 0.015,
-        // xAI does not publish a separate cache-read rate for the
-        // grok-api endpoints — do NOT add `cachedInputPer1k` here.
-        // Codex flagged the previous 0.0005 value as invented; the
-        // projection math now treats cached tokens as fresh input.
-        notes: "xAI PAYG API rates from the public x.ai pricing page.",
+        inputPer1k: 0.002,
+        cachedInputPer1k: 0.0005,
+        outputPer1k: 0.006,
+        // Grok 4.7 API rates: $2 input / $0.50 cached / $6 output per million tokens
+        // under 200k prompt tokens; $4 / $1 / $12 at or above 200k (xAI's
+        // long-context tier, billed on every token of that request).  xAI's
+        // pricing page lists the grok-4.6 card; 4.7 uses the same rates.
+        // Keep these API projections separate from Grok Build subscription billing.
+        longContext: {
+          minPromptTokens: 200_000,
+          inputPer1k: 0.004,
+          cachedInputPer1k: 0.001,
+          outputPer1k: 0.012,
+        },
+        notes:
+          "Grok 4.7 public API rates.  Prompts at or above 200,000 tokens use the long-context rates.  " +
+          "Catalog reference for the what-if projection, not an invoice.  " +
+          "Source:  https://docs.x.ai/developers/models/grok-4.7 and https://docs.x.ai/developers/pricing.",
       },
-      notes: "Subscription is the primary path; API rates exist only for the 'what-if API' projection.",
+      notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
     capabilities: {
       files: "yes",
@@ -156,16 +169,22 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       crossBotCoordination: "limited",
     },
     whyThisEngine: {
-      headline: "Long context + live research in one subscription.",
+      headline: "Grok 4.7 with long context and live research.",
       prose: [
-        "xAI's Grok ships a 1M+ token context window on the SuperGrok Heavy tier, which is the longest window BotFleet has on a subscription today.",
-        "Live web research is a first-class tool — when a bot needs the latest docs, the news, or a fresh pricing page, Grok is the engine that fetches and answers without a separate tool chain.",
-        "On Jay's seat, Grok quota is bundled with Cursor Ultra and Grok Bot under SuperGrok Heavy, so the same subscription covers three of the seven engines.",
+        "Grok 4.7 is available on an xAI subscription.  Files, terminal, this computer, web access, image attachments, long context, and live research are available.",
+        "Cross-bot coordination is limited on this build.  BotFleet does not support connected apps, rooms, voice chat, or computer use on Grok yet.",
+        "A public xAI API rate card is kept for the what-if projection.  Those rates are a catalog reference, not an invoice.",
       ],
     },
     defaultModels: [
-      { id: "grok-4", display: "Grok 4", ctxTokens: 1_000_000 },
+      { id: "grok-4.7", display: "Grok 4.7", ctxTokens: 500_000 },
+      { id: "grok-4.6", display: "Grok 4.6" },
+      // The Grok Build (ACP) catalog id — see server/drivers/acp/grok.ts.
+      { id: "grok-4.7-build-fast", display: "Grok 4.7 Build Fast" },
       { id: "grok-3-mini", display: "Grok 3 mini", ctxTokens: 131_072 },
+      // Retired id kept so legacy tasks banked as model "grok-4" (no engine
+      // metadata) still attribute to Grok via uniqueModelToEngineId.
+      { id: "grok-4", display: "Grok 4", ctxTokens: 1_000_000 },
     ],
   },
 
@@ -177,12 +196,13 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
     pricing: {
       kind: "subscription",
       subscription: {
-        tierLabel: "Cursor Ultra (bundled)",
+        tierLabel: "Cursor Ultra",
         costPerMonth: null,
-        includedQuota: "Bundled into Jay's SuperGrok Heavy",
+        includedQuota: "Cursor Ultra plan quota",
         notes: CURSOR_ULTRA_NOTE,
       },
-      notes: "MARKED: needs Jay's confirmation — Cursor Ultra costPerMonth is null until Jay confirms whether it is billed standalone or only via the xAI bundle.",
+      // No outer `notes`: UsageSection shows `pricing.notes` ahead of the
+      // subscription note.  The plan sentence lives on the subscription block.
     },
     capabilities: {
       files: "yes",
@@ -194,11 +214,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       crossBotCoordination: "yes",
     },
     whyThisEngine: {
-      headline: "Cursor Ultra quota without paying for Cursor twice.",
+      headline: "Cursor's coding agent, driven over ACP.",
       prose: [
-        "Cursor's CLI is the same tool the Cursor desktop app exposes — BotFleet just drives it over ACP.",
-        "On Jay's seat the Cursor Ultra quota is bundled into the xAI SuperGrok Heavy subscription, so the same plan covers Grok and Cursor.",
-        "Cross-bot coordination is reliable here: Cursor Agent participates in groups and rooms, unlike older MCP-only shells.",
+        "BotFleet drives the Cursor CLI over ACP.  Files, terminal, this computer, web access, image attachments, and long context are available.",
+        "Cross-bot coordination is available.  BotFleet does not support connected apps, rooms, voice chat, or computer use on Cursor yet.",
+        "Pricing mode is a Cursor subscription.  BotFleet does not register a separate Cursor API rate.",
       ],
     },
     defaultModels: [
@@ -215,9 +235,9 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
     pricing: {
       kind: "subscription",
       subscription: {
-        tierLabel: "Claude Max 20x",
+        tierLabel: "Claude Max 20×",
         costPerMonth: 213.2,
-        includedQuota: "20x plan usage on Anthropic's Max tier",
+        includedQuota: "20× plan usage on the Max tier",
         notes: CLAUDE_MAX_NOTE,
       },
     },
@@ -237,11 +257,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       computerUse: "yes",
     },
     whyThisEngine: {
-      headline: "Budget tier with voice, computer use, and full room coordination.",
+      headline: "Files, terminal, web, images, rooms, voice, and computer use.",
       prose: [
-        "Claude Max 20x is the only BotFleet engine today that exposes every capability — files, terminal, this-computer, web, images, long context, cross-bot calls, rooms, voice, and computer use.",
-        "The computer-use settings lane surfaces through Claude first because the Anthropic driver is the most complete.  Voice cloning stays out of this pitch: it is a planned MiniMax lane (EFFORT-LOG), not something Claude ships today.",
-        "If you need one engine that handles every class of task, Claude is the safest default on this seat.",
+        "Claude runs on a subscription.  Files, terminal, this computer, web access, image attachments, connected apps, and long context are available.",
+        "Cross-bot coordination, rooms, voice chat, and computer use are available.",
+        "Pricing mode is a Claude subscription.  BotFleet does not register an Anthropic API rate for this engine.",
       ],
     },
     defaultModels: [
@@ -261,7 +281,7 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       subscription: {
         tierLabel: "ChatGPT Pro Lite",
         costPerMonth: 100,
-        includedQuota: "Codex CLI quota on OpenAI's Pro Lite tier",
+        includedQuota: "Codex CLI quota on the Pro Lite plan",
         notes: CODEX_PRO_LITE_NOTE,
       },
     },
@@ -278,11 +298,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       computerUse: "yes",
     },
     whyThisEngine: {
-      headline: "Code-tuned model that pairs with the Xcode / iOS lane.",
+      headline: "OpenAI coding models with files, terminal, and computer use.",
       prose: [
-        "Codex is the OpenAI coding model and the only BotFleet engine with first-class support for the iOS TestFlight lane — `xcodegen generate`, simulator screenshots, and unsigned `xcodebuild` all run through it.",
-        "Pro Lite is the active tier per the 2026-09-18 JWT correction; the older ChatGPT Plus records are stale.",
-        "Computer-use is reliable here even on the lower-tier quota.",
+        "Codex runs OpenAI coding models on a ChatGPT subscription.  Files, terminal, this computer, web access, image attachments, connected apps, and long context are available.",
+        "Computer use is available.  BotFleet does not support cross-bot coordination, rooms, voice chat, or live research on Codex yet.",
+        "Pricing mode is a ChatGPT subscription.  BotFleet does not register a separate OpenAI API rate for this engine.",
       ],
     },
     defaultModels: [
@@ -301,19 +321,18 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       subscription: {
         tierLabel: "Google AI Ultra",
         costPerMonth: 105.79,
-        includedQuota: "Includes Antigravity approval (PR #516) — renews 2026-10-05 at $50/mo",
+        includedQuota: "Google AI Ultra plan quota",
         notes: ANTIGRAVITY_ULTRA_NOTE,
       },
       api: {
-        // MARKED: needs Jay's confirmation — Gemini 2.5 Pro API rates from
-        // the public Google AI Studio pricing page; cached-input rate is the
-        // public "context caching" tier.
+        // Gemini 2.5 Pro public API rates.  Cached input is the public
+        // context-caching tier.  Used only by the what-if projection.
         inputPer1k: 0.00125,
         outputPer1k: 0.01,
         cachedInputPer1k: 0.00031,
-        notes: "Gemini 2.5 Pro PAYG rates — reference only; subscription is the primary billing mode.",
+        notes: "Gemini 2.5 Pro public API rates.  Catalog reference for the what-if projection, not an invoice.",
       },
-      notes: "Subscription is what Jay actually pays; the API block exists for the 'what-if API' projection only.",
+      notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
     capabilities: {
       files: "yes",
@@ -327,11 +346,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       liveResearch: "yes",
     },
     whyThisEngine: {
-      headline: "Google's multimodal + Antigravity's bot approval lane.",
+      headline: "Gemini models with files, web, images, and live research.",
       prose: [
-        "Antigravity is the Google AI bot lane behind PR #516 — it has its own four-window quota model (Gemini Models + Third-Party Models across 5h and weekly periods) and its own session-start signals.",
-        "Google's image and document tools are the strongest in the fleet; when a bot needs to read a PDF, render a chart, or watch a video, Antigravity is the first engine to try.",
-        "The subscription drops from $105.79 to $50 on 2026-10-05 — the renewal is the closest upcoming cost change in the fleet.",
+        "Antigravity runs Gemini models on a Google AI subscription.  Files, terminal, this computer, web access, image attachments, and connected apps are available.",
+        "Live research is available.  Quota is reported as four windows:  Gemini Models and Third-Party Models, each across a 5-hour period and a weekly period.",
+        "BotFleet does not support cross-bot coordination, rooms, voice chat, or computer use on Antigravity yet.  Public Gemini API rates are a catalog reference for the what-if projection, not an invoice.",
       ],
     },
     defaultModels: [
@@ -346,20 +365,14 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
     capabilityBadgeColor: "bg-rose-600 text-white",
     group: "Cloud",
     pricing: {
-      kind: "subscription+api",
-      subscription: {
-        tierLabel: "Bundled with Claude Max",
-        costPerMonth: null,
-        includedQuota: "DSH CLI runs on the same Claude Max seat",
-        notes: DEEPSEEK_HARNESS_NOTE,
-      },
+      kind: "api",
       api: {
         inputPer1k: 0.00027,
         outputPer1k: 0.0011,
         cachedInputPer1k: 0.00007,
-        notes: "DeepSeek PAYG API rates — reference for the 'what-if API' projection.",
+        notes: "DeepSeek public API catalog rates for pay-as-you-go billing.",
       },
-      notes: "Subscription is bundled; API rates exist only for the projection.",
+      notes: DEEPSEEK_HARNESS_NOTE,
     },
     capabilities: {
       files: "yes",
@@ -378,11 +391,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       crossBotCoordination: "yes",
     },
     whyThisEngine: {
-      headline: "Small / fast models on the bundled Claude Max seat.",
+      headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
       prose: [
-        "DSH runs DeepSeek's small and fast models through the harness ACP bridge, with cheap tokens and the same cross-bot coordination as Claude.",
-        "It is the right tool for short, mechanical turns — a code search, a reformat, a one-line edit — where Opus would burn quota for no quality gain.",
-        "DSH pairs well with Claude for connected-app turns: DSH does the file work, Claude drives the apps.  The MiniMax driver wires no Composio channel.",
+        "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
+        "BotFleet does not support image attachments on DeepSeek Harness yet.",
       ],
     },
     defaultModels: [
@@ -399,9 +412,9 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
     pricing: {
       kind: "subscription+api",
       subscription: {
-        tierLabel: "Mavis Token Plan Max",
-        costPerMonth: 55,
-        includedQuota: "4–5 agent seats on Mavis's Token Plan Max tier",
+        tierLabel: "MiniMax Token Plan Max",
+        costPerMonth: 132,
+        includedQuota: "MiniMax Token Plan Max quota",
         notes: MINIMAX_TOKEN_PLAN_NOTE,
       },
       api: {
@@ -409,12 +422,10 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
         outputPer1k: 0.004,
         cachedInputPer1k: 0.0002,
         notes:
-          "MiniMax M3 PAYG API rates from the public platform pricing page. " +
-          "Prompts over 512K input tokens use 2x these rates per the model's own pricing footnote.",
+          "MiniMax M3 public API rates.  Prompts over 512,000 input tokens use 2x these rates.  " +
+          "Catalog reference for the what-if projection, not an invoice.",
       },
-      notes:
-        "Subscription is the primary path for BotFleet. " +
-        "API rates are surfaced ONLY inside the 'what-if API' projection — never in the daily cost breakdown.",
+      notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
     capabilities: {
       files: "yes",
@@ -434,12 +445,11 @@ export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
       longContext: "yes",
     },
     whyThisEngine: {
-      headline: "Cross-bot coordination + room chats + voice, all on the Token Plan.",
+      headline: "Files, terminal, rooms, voice, and long context.",
       prose: [
-        "MiniMax is the strongest choice for cross-bot coordination and room chats — `server/group-routing.ts` was designed around the MiniMax driver's call semantics, so room turn reliability is highest here.",
-        "Voice chat is supported through the Mavis voice channel; voice minutes are part of the Token Plan Max bundle rather than billed as PAYG minutes.",
-        "Connected apps are not wired on MiniMax: the direct driver does not advertise `composioMcp`, `computerMcp`, or `phoneMcp` (see `server/drivers/minimax.ts`), so the matrix shows `no` — bots needing a real MCP channel pick Claude or Cursor.",
-        "On the Mavis Token Plan Max subscription the engine is metered as included; the PAYG API block in the registry is reference data for the what-if projection only.",
+        "MiniMax runs on a Token Plan subscription.  Files, terminal, this computer, long context, cross-bot coordination, and rooms are available.",
+        "Voice chat is available.  BotFleet does not support connected apps on MiniMax yet.",
+        "Public PAYG API rates are kept for the what-if projection.  They are a catalog reference, not an invoice.",
       ],
     },
     defaultModels: [
@@ -549,18 +559,18 @@ export function pricingModeLabel(pricing: PricingMode): string {
     case "subscription": {
       const cost =
         typeof pricing.subscription.costPerMonth === "number"
-          ? `$${pricing.subscription.costPerMonth.toFixed(2)}/mo`
-          : "bundled";
-      return `Subscription · ${cost}`;
+          ? ` · $${pricing.subscription.costPerMonth.toFixed(2)}/mo`
+          : "";
+      return `Subscription${cost}`;
     }
     case "api":
       return `API · $${pricing.api.inputPer1k.toFixed(5)}/1k in`;
     case "subscription+api": {
       const cost =
         typeof pricing.subscription.costPerMonth === "number"
-          ? `$${pricing.subscription.costPerMonth.toFixed(2)}/mo`
-          : "bundled";
-      return `Subscription + API · ${cost}`;
+          ? ` · $${pricing.subscription.costPerMonth.toFixed(2)}/mo`
+          : "";
+      return `Subscription + API${cost}`;
     }
     case "free":
       return "Free";
@@ -600,7 +610,7 @@ export function EngineCalloutBody(props: {
       className={className ?? "rounded-xl border border-hairline/30 bg-inset/30 p-3 text-[12.5px] leading-relaxed text-ink-secondary"}
     >
       <p className="mb-1.5 text-ink">
-        <strong>Why this engine?</strong> {entry.whyThisEngine.headline}
+        <strong>Why This Engine?</strong> {entry.whyThisEngine.headline}
       </p>
       {entry.whyThisEngine.prose.map((line, index) => (
         <p key={index} className="mb-1 last:mb-0">

@@ -6,7 +6,7 @@ import './global.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://docs.botfleet.com'),
+  metadataBase: new URL('https://docs.botfleet.app'),
   title: {
     default: 'BotFleet Docs',
     template: '%s · BotFleet Docs',

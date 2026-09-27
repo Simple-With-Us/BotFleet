@@ -77,6 +77,20 @@ export async function pollServerIdentity({
     // not spawned cannot be the one answering — so an answer during that
     // window is genuinely somebody else's.
     const expectedPid = pid();
+    // The harness binds its port BEFORE the boot work and answers health with
+    // `ready: false` until that work finishes. That is our own child holding
+    // its own port, not a foreign owner — waiting for it is what this loop is
+    // for, and the wall-clock budget above still bounds the wait.
+    if (
+      res.ok &&
+      expectedPid !== undefined &&
+      body?.app === "botfleet" &&
+      body.pid === expectedPid &&
+      (body.booting === true || body.ready === false)
+    ) {
+      await sleep(Math.min(BOOT_PROBE_INTERVAL_MS, Math.max(1, deadline - now())));
+      continue;
+    }
     const identified =
       res.ok &&
       expectedPid !== undefined &&
@@ -114,6 +128,13 @@ export const HARNESS_PROBE_TIMEOUT_MS = 2_000;
 // answering during teardown. Re-probe after a short settle before trusting an
 // existing harness, so we attach to something that will still be there.
 export const ATTACH_SETTLE_MS = 1_500;
+// How long the launcher will wait for a harness that has the port but is
+// still booting.  Generous on purpose: the boot it is waiting on can include
+// a 12 s Infisical preload on a slow network plus a registry load, and the
+// alternative to waiting is an error page in front of a harness that was
+// about to work.
+export const BOOT_WAIT_POLL_MS = 500;
+export const BOOT_WAIT_ATTEMPTS = 60;
 
 /**
  * @param {{ port: number, owner?: import("./harness-ownership.mjs").HarnessOwner | null, expectedBuild?: import("./runtime-identity.mjs").BuildIdentity, timeoutMs?: number, fetchImpl?: typeof fetch }} options
@@ -121,6 +142,7 @@ export const ATTACH_SETTLE_MS = 1_500;
  *   | { kind: "none" }
  *   | { kind: "foreign" }
  *   | { kind: "unavailable" }
+ *   | { kind: "booting", pid: number }
  *   | { kind: "botfleet", pid: number, static: boolean, sourceCommit?: string, apiVersion?: number }
  * >}
  */
@@ -151,6 +173,12 @@ export async function probeHarness({
     return { kind: "unavailable" };
   }
   if (res.ok && body?.app === "botfleet" && Number.isInteger(body.pid)) {
+    // A harness that has bound the port but not finished booting answers
+    // health with `ready: false` and 503s every other route — `/api/runtime`
+    // included, which is the handshake below. Reading that as "unavailable"
+    // would have the launcher give up on a harness that is seconds away from
+    // serving, so say what it actually is and let the caller wait.
+    if (body.booting === true || body.ready === false) return { kind: "booting", pid: body.pid };
     if (expectedBuild) {
       // Never send the private nonce until the health challenge proved the
       // recipient owns this data root.  Redirects cannot forward credentials.
@@ -191,6 +219,8 @@ export async function probeHarness({
  *   attempts?: number,
  *   retrySettleMs?: number,
  *   attachSettleMs?: number,
+ *   bootWaitAttempts?: number,
+ *   bootPollMs?: number,
  *   sleep?: (ms: number) => Promise<void>,
  *   log?: (line: string) => void,
  * }} options
@@ -208,6 +238,8 @@ export async function resolvePackagedServer({
   attempts = 2,
   retrySettleMs = 2_500,
   attachSettleMs = ATTACH_SETTLE_MS,
+  bootWaitAttempts = BOOT_WAIT_ATTEMPTS,
+  bootPollMs = BOOT_WAIT_POLL_MS,
   sleep = defaultSleep,
   log = () => {},
 }) {
@@ -238,6 +270,20 @@ export async function resolvePackagedServer({
     // while a harness owns the data on a later one.
     for (const port of candidatePorts) {
       let seen = await probe(port, currentOwner);
+      // A harness that is still booting is a "not yet", not a "no": it holds
+      // the port, it owns the data, and it will answer in a moment.  Giving
+      // up here is what would show the error page during an ordinary slow
+      // start — and spawning a second harness against the same data dir is
+      // never the answer.
+      for (let waited = 0; seen.kind === "booting" && waited < bootWaitAttempts; waited++) {
+        if (waited === 0) log(`the harness on port ${port} (pid ${seen.pid}) is still booting; waiting for it`);
+        await sleep(bootPollMs);
+        seen = await probe(port, currentOwner);
+      }
+      if (seen.kind === "booting") {
+        log(`the harness on port ${port} (pid ${seen.pid}) is still booting after the wait; not spawning a second one`);
+        seen = { kind: "unavailable" };
+      }
       if (seen.kind === "botfleet" && owner && !currentOwner) {
         // A legacy process cannot prove which data directory it serves.
         // Re-read on the next pass in case an updated owner is still booting.

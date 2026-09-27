@@ -191,6 +191,22 @@ describe("ACP decodeConfig", () => {
     expect(GrokAgentDriver.decodeConfig({ promptTimeoutMs: 20 * 60_000 + 1 }).promptTimeoutMs).toBeUndefined();
   });
 
+  it("accepts only bounded initialize deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 1_000 }).initTimeoutMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 5 * 60_000 }).initTimeoutMs).toBe(5 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 999 }).initTimeoutMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ initTimeoutMs: 5 * 60_000 + 1 }).initTimeoutMs).toBeUndefined();
+    expect("initTimeoutMs" in GrokAgentDriver.decodeConfig({})).toBe(false);
+  });
+
+  it("accepts only bounded prompt idle deadlines", () => {
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 1_000 }).promptIdleMs).toBe(1_000);
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 20 * 60_000 }).promptIdleMs).toBe(20 * 60_000);
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 999 }).promptIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 1_000.5 }).promptIdleMs).toBeUndefined();
+    expect(GrokAgentDriver.decodeConfig({ promptIdleMs: 20 * 60_000 + 1 }).promptIdleMs).toBeUndefined();
+  });
+
   it("advertises local CUA and qdrant in full-auto mode, because a host turn runs brokered", async () => {
     const fullAuto = await GrokAgentDriver.create({
       instanceId: "grok-full-auto",
@@ -244,6 +260,13 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_TRANSIENTS;
+    delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_STATE;
+    delete process.env.FAKE_ACP_RETRY_SCALE;
+    delete process.env.FAKE_ACP_INIT_DELAY_MS;
+    delete process.env.FAKE_ACP_DRIP_MS;
+    delete process.env.FAKE_ACP_DRIP_COUNT;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -382,6 +405,69 @@ describe("ACP turns (fake CLI)", () => {
         // expected once the deadline cleanup has reaped it
       }
     }
+  });
+
+  it("keeps a turn alive past the idle window as long as it keeps streaming", async () => {
+    process.env.FAKE_ACP_DRIP_MS = "30";
+    process.env.FAKE_ACP_DRIP_COUNT = "8";
+    // each gap (30 ms) is well under the idle window (150 ms), but the
+    // whole turn (8 * 30 ms = 240 ms) runs well past it — proving renewal,
+    // not just a generous deadline
+    await create(GrokAgentDriver, "drip", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-drip", text: "keep talking" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.filter((event) => event.type === "content.delta")).toHaveLength(8);
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
+  });
+
+  it("settles a fully silent prompt as a stall once the idle window elapses", async () => {
+    // promptTimeoutMs stays at its real 18-minute default — only the idle
+    // guard is short here, so this proves the idle path fires on its own,
+    // independent of the hard ceiling.
+    await create(GrokAgentDriver, "cancel-exits", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-stall", text: "never finishes" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    expect(recorder.events.filter((event) => event.type === "runtime.error")).toHaveLength(1);
+    expect(recorder.events.find((event) => event.type === "runtime.error")?.message).toMatch(/no output for/i);
+    expect(instance.adapter.hasSession("t-idle-stall")).toBe(false);
+  });
+
+  it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
+    process.env.FAKE_ACP_DRIP_MS = "20";
+    // no FAKE_ACP_DRIP_COUNT: drips forever, so the idle guard (5 s, never
+    // reached in this test) never has a reason to fire — only the 150 ms
+    // hard ceiling can end this turn.
+    await create(GrokAgentDriver, "drip", { promptIdleMs: 5_000, promptTimeoutMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-hard-ceiling-drip", text: "keep talking forever" });
+
+    const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+    expect(recorder.events.some((event) => event.type === "content.delta")).toBe(true);
+    expect(instance.adapter.hasSession("t-hard-ceiling-drip")).toBe(false);
+  });
+
+  it("does not expire the idle guard while a person is answering a permission ask", async () => {
+    await create(GrokAgentDriver, "permission", { promptIdleMs: 150 });
+    await instance.adapter.sendTurn({ threadId: "t-idle-permission", text: "go" });
+
+    const opened = await recorder.until((event) => event.type === "request.opened");
+    // sit on the unanswered ask for several idle windows — waiting for a
+    // person must not read as a wedged agent
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(recorder.events.some((event) => event.type === "turn.completed")).toBe(false);
+
+    await instance.adapter.respondToRequest("t-idle-permission", (opened as any).requestId, { behavior: "allow" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    // the answer resumes the agent — confirm the idle guard does not fire
+    // on some stale deadline left over from before the ask was resolved
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
   });
 
   it("emits each assistant text block before the tool that follows it", async () => {
@@ -796,7 +882,98 @@ describe("ACP turns (fake CLI)", () => {
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false });
     expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(true);
+    // DR2: "simulated crash before result" carries no transient vocabulary,
+    // so the classifier calls it terminal and no relaunch is attempted.  A
+    // CLI that died for its own reasons must not be tried again.
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
   });
+
+  // DR2.  Every ACP engine — Cursor, Droid, Grok CLI, Hermes, Kimi, DeepSeek,
+  // Qwen, OpenCode, DSH — used to fail the whole turn on one 429 or reset,
+  // which then pushed the bot's fallback chain into a cooldown a single retry
+  // would have avoided.
+  it("auto-retries a transient exit, then completes with exactly one reply", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "2";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-retry", text: "go" });
+
+    // Three real child launches on a loaded machine: give the settle room.
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true, 25_000);
+    const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+    expect(retries.map((e) => e.attempt)).toEqual([1, 2]);
+    expect(retries.every((e) => e.delayMs > 0 && typeof e.reason === "string")).toBe(true);
+    // one settled reply across all three launches, not one per launch
+    const replies = recorder.events.filter(
+      (e) => e.type === "item.completed" && e.itemType === "assistant_text",
+    );
+    expect(replies).toHaveLength(1);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 40_000);
+
+  it("stops retrying at the attempt cap and settles the turn as failed", async () => {
+    process.env.FAKE_ACP_TRANSIENTS = "9";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-cap");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-cap", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === false, 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying").map((e) => e.attempt)).toEqual([1, 2]);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(true);
+  }, 40_000);
+
+  // A cold boot that is slow but alive must get its answer in: the deadline is
+  // what used to cut DSH off mid-boot under host load.
+  it("completes a turn whose initialize answers late but inside its deadline", async () => {
+    process.env.FAKE_ACP_INIT_DELAY_MS = "1500";
+    await create(GrokAgentDriver, undefined, { initTimeoutMs: 20_000 });
+    await instance.adapter.sendTurn({ threadId: "t-acp-slow-init", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed", 25_000);
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  }, 40_000);
+
+  // A relaunch repeats the whole cold boot under the same load, so an
+  // initialize timeout spends one retry, not the full transient budget.
+  it("relaunches an initialize timeout once, then fails naming the budget", async () => {
+    process.env.FAKE_ACP_INIT_DELAY_MS = "60000";
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create(GrokAgentDriver, undefined, { initTimeoutMs: 1_000 });
+    await instance.adapter.sendTurn({ threadId: "t-acp-init-timeout", text: "go" });
+
+    await recorder.until((e) => e.type === "turn.completed", 25_000);
+    const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+    expect(retries.map((e) => e.attempt)).toEqual([1]);
+    expect(retries[0]).toMatchObject({ reason: "timeout" });
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    // Keeps the phrase sentry-ai.ts keys its expected-condition breadcrumb on,
+    // and names the budget that ran out.
+    expect(error).toMatchObject({ message: expect.stringContaining("initialize timed out after 1 s (instance setting") });
+    expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: false, stopReason: "rpc_error" });
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 40_000);
+
+  it("never retries a failure that arrived after the agent had already spoken", async () => {
+    // Replay safety comes from PROTOCOL state, not from the error text: the
+    // stderr here is the same transient 503 the test above relaunches on.
+    // What forbids the retry is that a chunk already reached the person.
+    process.env.FAKE_ACP_TRANSIENTS = "1";
+    process.env.FAKE_ACP_PARTIAL_FAILS = "1";
+    process.env.FAKE_ACP_STATE = join(scratch, "acp-launches-partial");
+    process.env.FAKE_ACP_RETRY_SCALE = "0.001";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-acp-partial", text: "go" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed", 25_000);
+    expect(done).toMatchObject({ ok: false });
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    expect(
+      recorder.events.some((e) => e.type === "content.delta" && e.delta === "half an answer"),
+    ).toBe(true);
+  }, 40_000);
 
   it("preserves ACP error codes for provider setup classification", async () => {
     await create(ClassifiedErrorDriver, "auth-required");
@@ -1001,11 +1178,11 @@ describe("ACP turns (fake CLI)", () => {
     expect(JSON.parse(readFileSync(without, "utf8")).argv).not.toContain("--reasoning-effort");
   });
 
-  it("puts Grok -m after agent so ACP stdio binds the local slug", async () => {
+  it("round-trips the Grok 4.7 picker model into the CLI argv", async () => {
     const dump = join(scratch, "grok-argv-order.json");
     await create(GrokAgentDriver);
     process.env.FAKE_ACP_DUMP = dump;
-    await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "grok-4.5", effort: "high" });
+    await instance.adapter.sendTurn({ threadId: "t-argv", text: "hi", model: "grok-4.7", effort: "high" });
     await recorder.until((e) => e.type === "turn.completed");
 
     const argv = JSON.parse(readFileSync(dump, "utf8")).argv as string[];
@@ -1015,7 +1192,7 @@ describe("ACP turns (fake CLI)", () => {
     expect(agent).toBeGreaterThan(-1);
     expect(modelFlag).toBeGreaterThan(agent);
     expect(stdio).toBeGreaterThan(modelFlag);
-    expect(argv[modelFlag + 1]).toBe("grok-4.5");
+    expect(argv[modelFlag + 1]).toBe("grok-4.7");
     expect(argv.indexOf("--reasoning-effort")).toBeGreaterThan(agent);
     expect(argv.indexOf("--permission-mode")).toBeLessThan(agent);
   });

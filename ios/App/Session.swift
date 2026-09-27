@@ -28,6 +28,14 @@ final class Session: ObservableObject {
         /// The token stopped working — revoked on the computer, most likely.
         case unauthorized
         case offline(String)
+        /// A sustained run of gateway failures (502/503/530-family — see
+        /// `ReconnectBackoff.gatewayEscalationThreshold`), distinct from an
+        /// ordinary `.offline`: Cloudflare, not the app, is answering every
+        /// attempt, which means the Mac's sidecar has nothing listening.
+        /// The reconnect loop keeps retrying underneath at the raised
+        /// backoff cap; this status exists so the UI stops implying a
+        /// quick retry will help and offers a manual one instead (IO11).
+        case macOffline
     }
 
     private enum SnapshotHydrationOutcome {
@@ -136,11 +144,10 @@ final class Session: ObservableObject {
     /// Bumped on pair / restore / sign-out so an in-flight instances warm
     /// cannot write the previous computer's provider map onto a new pairing.
     private var pairingGeneration = 0
-    private var reconnectDelay: UInt64 = 0
-    /// How many computer panels are open. A count rather than a flag: the
-    /// panel can be pushed twice in a navigation stack, and the last one to
-    /// close is the one that should turn screens back off.
-    private var screenWatchers = 0
+    private var reconnectBackoff = ReconnectBackoff()
+    /// Open computer panels per bot.  A view can be pushed twice in a
+    /// navigation stack; its last close releases that bot's subscription.
+    private var screenWatchers: [String: Int] = [:]
     /// Authenticated avatar bytes shared by roster, header, group and task
     /// surfaces. Both entry count and byte cost are bounded because one valid
     /// uploaded image may be 10 MB.
@@ -228,7 +235,12 @@ final class Session: ObservableObject {
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
 
-    private static let connectionKey = "companion.connection"
+    static let connectionKey = "companion.connection"
+    /// The last `PostedPushToken` this phone successfully posted — see
+    /// `registerPushToken`.  IO17: without this, a token iOS hands back
+    /// unchanged on almost every launch was POSTed unconditionally, every
+    /// launch, forever.
+    private static let postedPushTokenKey = "companion.pushToken.posted"
 
     // MARK: - Pairing
 
@@ -477,6 +489,10 @@ final class Session: ObservableObject {
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
         )
+        // The sidecar forgets this device's token when the pairing is
+        // removed, so a later re-pair to the very same Mac must be free to
+        // post again even if the token itself never changed.
+        UserDefaults.standard.removeObject(forKey: Self.postedPushTokenKey)
         connection = nil
         client = nil
         token = nil
@@ -516,7 +532,7 @@ final class Session: ObservableObject {
                 return
             }
         }
-        reconnectDelay = 0
+        reconnectBackoff.reset()
         streamGeneration += 1
         let generation = streamGeneration
         streamTask = Task { [weak self] in
@@ -553,13 +569,17 @@ final class Session: ObservableObject {
     /// session, including on cellular, whether or not anyone is looking.
     /// The reconnect resumes from the cursor, so nothing is missed.
     func watchScreen(of botId: String) {
-        screenWatchers += 1
-        if screenWatchers == 1 { restartStream() }
+        let count = screenWatchers[botId, default: 0]
+        screenWatchers[botId] = count + 1
+        if count == 0 { restartStream() }
     }
 
     func stopWatchingScreen(of botId: String) {
-        screenWatchers = max(0, screenWatchers - 1)
-        if screenWatchers == 0 {
+        guard let count = screenWatchers[botId] else { return }
+        if count > 1 {
+            screenWatchers[botId] = count - 1
+        } else {
+            screenWatchers.removeValue(forKey: botId)
             state.clearScreen(botId)
             restartStream()
         }
@@ -632,6 +652,8 @@ final class Session: ObservableObject {
             guard let client else { return }
             status = .connecting
             log.info("opening stream, cursor=\(self.state.cursor ?? "none", privacy: .public)")
+            var isGatewayFailure = false
+            var offlineMessage: String?
             do {
                 // The query is fixed when the connection opens, so changing
                 // it means a new connection — `restartStream()` cancels this
@@ -639,9 +661,13 @@ final class Session: ObservableObject {
                 // breaking out here instead would fall through to the "the
                 // harness went away" path and flash a lost-connection banner
                 // on what is actually a deliberate reconnect.
-                for try await frame in try client.events(since: state.cursor, screens: screenWatchers > 0) {
+                for try await frame in try client.events(
+                    since: state.cursor,
+                    screens: !screenWatchers.isEmpty,
+                    screenBotIds: Array(screenWatchers.keys).sorted()
+                ) {
                     if Task.isCancelled { return }
-                    reconnectDelay = 0
+                    reconnectBackoff.reset()
 
                     if case let .hello(cursor, resumed) = frame.frame {
                         log.info("stream live, resumed=\(resumed, privacy: .public)")
@@ -698,7 +724,7 @@ final class Session: ObservableObject {
                 }
                 // the stream ended without an error — the harness went away
                 log.notice("stream ended without an error")
-                status = .offline("Lost the connection.")
+                offlineMessage = "Lost the connection."
             } catch let error as APIError where error.isUnauthorized {
                 log.error("stream refused: unauthorized")
                 status = .unauthorized
@@ -711,14 +737,23 @@ final class Session: ObservableObject {
                     return
                 }
                 log.error("stream failed: \(error.localizedDescription, privacy: .public)")
-                status = .offline(failureMessage(for: error))
+                isGatewayFailure = ConnectionAdvice.isGatewayOutage(error)
+                offlineMessage = failureMessage(for: error)
             }
 
             if Task.isCancelled { return }
-            // 1s, 2s, 4s… to 15s. A phone that woke on a network which is
-            // not the laptop's should not hammer it.
-            reconnectDelay = reconnectDelay == 0 ? 1 : min(reconnectDelay * 2, 15)
-            try? await Task.sleep(nanoseconds: reconnectDelay * 1_000_000_000)
+            // 1s, 2s, 4s… to 15s ordinarily; the cap raises to 60s, with
+            // ±25% jitter throughout, once `isGatewayFailure` has been true
+            // for `ReconnectBackoff.gatewayEscalationThreshold` attempts in
+            // a row — Cloudflare answering every attempt with a
+            // 502/503/530-family status, which means the Mac's sidecar has
+            // nothing listening rather than an ordinary network blip.  That
+            // same run of failures is what flips the status to
+            // `.macOffline` so the banner stops implying a quick retry will
+            // help (IO11).
+            let delay = reconnectBackoff.recordFailure(isGatewayFailure: isGatewayFailure)
+            status = reconnectBackoff.isMacLikelyOffline ? .macOffline : .offline(offlineMessage ?? "Lost the connection.")
+            try? await Task.sleep(nanoseconds: UInt64((delay * 1_000_000_000).rounded()))
         }
     }
 
@@ -939,8 +974,23 @@ final class Session: ObservableObject {
         }
     }
 
+    /// iOS hands the device token back on almost every launch, unchanged —
+    /// posting it unconditionally meant every launch was a POST the sidecar
+    /// already had the answer to.  Skip it unless the token itself changed
+    /// or the paired endpoint did (a token is meaningless to a *different*
+    /// Mac, so re-pairing must still post it).  See IO17.
     func registerPushToken(_ hex: String) async {
-        await perform(quietly: true) { try await $0.registerPushToken(hex) }
+        let candidate = PostedPushToken(
+            token: hex,
+            endpointURL: connection?.activeEndpoint?.url ?? connection?.host
+        )
+        let lastPosted = UserDefaults.standard.data(forKey: Self.postedPushTokenKey)
+            .flatMap { try? JSONDecoder().decode(PostedPushToken.self, from: $0) }
+        guard PushTokenRegistration.shouldPost(candidate, lastPosted: lastPosted) else { return }
+
+        let posted = await perform(quietly: true) { try await $0.registerPushToken(hex) }
+        guard posted, let data = try? JSONEncoder().encode(candidate) else { return }
+        UserDefaults.standard.set(data, forKey: Self.postedPushTokenKey)
     }
 
     func cancelQueued(botId: String, queueId: String) async {
@@ -1336,21 +1386,52 @@ final class Session: ObservableObject {
         }
     }
 
-    /// Fetch a post-resume snapshot before local-only Live Activities are
-    /// allowed to reappear.  A racing SSE frame invalidates the snapshot; retry
-    /// with bounded backoff until one lands without overwriting newer stream
-    /// state.  The caller cancels this quiet loop on the next background
-    /// transition.
+    /// Wait for the current app-open to settle before local-only Live
+    /// Activities are allowed to reappear, without issuing a second
+    /// full-fleet fetch of our own on top of the one `connect()` may
+    /// already be doing.
+    ///
+    /// `run()`'s hello handling already resumes the SSE cursor and, only
+    /// when the hello frame reports `resumed: false`, performs the one cold
+    /// hydration the app needs.  This used to call `hydrateSnapshot` here
+    /// too, unconditionally — a second full-fleet download on every
+    /// foreground even when the resume needed none at all (IO13).  So this
+    /// now just waits for `connect()`'s own stream to reach `.live`, which
+    /// covers both cases: a resumed stream needed no hydrate, and a cold
+    /// one already got its hydrate from `run()` before flipping to `.live`.
+    /// Only a stream that cannot settle within the deadline — resume not
+    /// possible, or no route to the Mac yet — falls back to one direct
+    /// hydrate here, so Live Activities still get *something*.
     func refreshLiveActivityState() async -> CompanionState? {
+        var clientWaitBackoff = LiveActivityRefreshBackoff()
+        while client == nil, !Task.isCancelled {
+            if restorePending { restore() }
+            guard client == nil else { break }
+            let delay = clientWaitBackoff.takeNextDelay()
+            try? await Task.sleep(nanoseconds: delay)
+        }
+        guard !Task.isCancelled, client != nil else { return nil }
+
+        connect()
+        let deadline = Date().addingTimeInterval(10)
+        while !Task.isCancelled, Date() < deadline {
+            switch status {
+            case .live:
+                return state
+            case .unauthorized:
+                return nil
+            case .unpaired, .connecting, .offline, .macOffline:
+                break
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        guard !Task.isCancelled else { return nil }
+
+        // The stream did not settle in time — fall back to one direct
+        // hydrate, with the same bounded retry the direct fetch always had.
         var retryBackoff = LiveActivityRefreshBackoff()
         while !Task.isCancelled {
-            if client == nil, restorePending { restore() }
-            guard let requestClient = client else {
-                let delay = retryBackoff.takeNextDelay()
-                try? await Task.sleep(nanoseconds: delay)
-                continue
-            }
-            connect()
+            guard let requestClient = client else { return nil }
             do {
                 switch try await hydrateSnapshot(using: requestClient) {
                 case .applied:
@@ -1492,6 +1573,22 @@ final class Session: ObservableObject {
             try await client.renameTask(botId: bot.id, threadId: task.threadId, title: title)
             await refresh()
         } catch { recordActionError(error) }
+    }
+
+    /// Snooze one thread, or wake it with nil.  Refreshes rather than
+    /// guessing: the harness heals a deadline that has already passed, so
+    /// what it hands back is the only reading of "asleep" worth painting.
+    @discardableResult
+    func snoozeTask(_ task: BotTask, for bot: Bot, snoozedUntil: Double?) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.snoozeTask(botId: bot.id, threadId: task.threadId, snoozedUntil: snoozedUntil)
+            await refresh()
+            return true
+        } catch {
+            recordActionError(error)
+            return false
+        }
     }
 
     func deleteTask(_ task: BotTask, for bot: Bot) async {

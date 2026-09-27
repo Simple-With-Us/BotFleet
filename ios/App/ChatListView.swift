@@ -181,7 +181,7 @@ struct ChatListView: View {
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
-                                            state: MausState.forChat(summary.chat, in: session.state),
+                                            state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waitingChats.contains(summary.chat.id),
                                             last: index == roomSummaries.count - 1 && !botsExpanded && customSectionNames.isEmpty && !showingBotChats
                                         )
@@ -236,7 +236,7 @@ struct ChatListView: View {
                                     chat: summary.chat,
                                     preview: summary.preview,
                                     at: summary.lastActivity,
-                                    state: MausState.forChat(summary.chat, in: session.state),
+                                    state: BotState.forChat(summary.chat, in: session.state),
                                     waiting: waitingChats.contains(summary.chat.id),
                                     last: index == rows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (query.isEmpty ? customSectionNames.isEmpty && !showingBotChats : true)
                                 )
@@ -272,7 +272,7 @@ struct ChatListView: View {
                                                     chat: summary.chat,
                                                     preview: summary.preview,
                                                     at: summary.lastActivity,
-                                                    state: MausState.forChat(summary.chat, in: session.state),
+                                                    state: BotState.forChat(summary.chat, in: session.state),
                                                     waiting: waitingChats.contains(summary.chat.id),
                                                     last: index == sectionRows.count - 1 && nestedTasks(for: summary.chat).isEmpty && (section == customSectionNames.last ? !showingBotChats : false)
                                                 )
@@ -307,7 +307,7 @@ struct ChatListView: View {
                                             chat: summary.chat,
                                             preview: summary.preview,
                                             at: summary.lastActivity,
-                                            state: MausState.forChat(summary.chat, in: session.state),
+                                            state: BotState.forChat(summary.chat, in: session.state),
                                             waiting: waitingChats.contains(summary.chat.id),
                                             last: index == botChatSummaries.count - 1
                                         )
@@ -429,6 +429,7 @@ struct ChatListView: View {
         case .live: return "\(name) · connected"
         case .connecting: return "\(name) · connecting…"
         case .offline: return "\(name) · offline"
+        case .macOffline: return "\(name) · Mac offline"
         case .unauthorized: return "\(name) · unpaired"
         case .unpaired: return "Not paired"
         }
@@ -728,7 +729,7 @@ struct GroupTile: View {
                     }
                     if room.unread {
                         Circle()
-                            .fill(MausPalette.color("blue"))
+                            .fill(BotPalette.color("blue"))
                             .frame(width: 10, height: 10)
                             .overlay(Circle().stroke(Color(uiColor: .systemBackground), lineWidth: 2))
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -792,7 +793,7 @@ struct ChatRow: View {
     let chat: Chat
     let preview: String
     let at: Double
-    var state: MausState = .idle
+    var state: BotState = .idle
     var waiting = false
     var last = false
 
@@ -802,7 +803,7 @@ struct ChatRow: View {
             ZStack {
                 if chat.unread && !chat.busy {
                     Circle()
-                        .fill(MausPalette.color(chat.color))
+                        .fill(BotPalette.color(chat.color))
                         .frame(width: 10, height: 10)
                 }
             }
@@ -863,7 +864,7 @@ struct ChatRow: View {
                             .foregroundStyle(.white)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 4)
-                            .background(Capsule().fill(MausPalette.color(chat.color)))
+                            .background(Capsule().fill(BotPalette.color(chat.color)))
                             .padding(.top, 4)
                     }
                 }
@@ -898,7 +899,7 @@ struct UpdatesPill: View {
                             case .needsYou:
                                 Image(systemName: "hand.raised.fill")
                                     .font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(MausPalette.color(first.chat.color))
+                                    .foregroundStyle(BotPalette.color(first.chat.color))
                                 Text("\(first.chat.name) needs you")
                             case .working:
                                 Text("\(first.chat.name) is working")
@@ -950,7 +951,7 @@ struct MascotStack: View {
     var body: some View {
         HStack(spacing: -overlap) {
             ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
-                MausAvatar(color: color, size: size, state: .idle, animated: false)
+                BotMascot(color: color, size: size, state: .idle, animated: false)
                     .padding(2)
                     .background(Circle().fill(Color(uiColor: .systemBackground)))
             }
@@ -993,6 +994,12 @@ struct StatusBanner: View {
                         }
                     }
                 }
+            case .macOffline:
+                // No `openMacApp` follow-up here on purpose: that call goes
+                // through the same paired route that has been failing with
+                // gateway errors, so it would just fail the same way.  The
+                // banner's default tap already retries via `session.refresh()`.
+                banner("Your Mac is not running BotFleet", systemImage: "wifi.slash", tint: .orange)
             case .unauthorized:
                 banner("This phone was unpaired on the computer.", systemImage: "lock.slash", tint: .red)
             }

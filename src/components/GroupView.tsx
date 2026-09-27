@@ -16,7 +16,7 @@ import {
   type GroupDefaultResponder,
   type Message,
 } from "@/state/store";
-import { MausAvatar } from "./Avatar";
+import { BotMascot } from "./Avatar";
 import { TurnPresence } from "./TurnPresence";
 import { showToolCallsEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
 import { normalizeState } from "@/lib/mascot";
@@ -76,11 +76,11 @@ function RoomToolChip({ message }: { message: Message }) {
   return <ToolLine message={message} actor={message.from?.name} />;
 }
 
-/** 16px maus + name, shown once per sender cluster. */
+/** 16px bot + name, shown once per sender cluster. */
 function ClusterLabel({ bot, name, color }: { bot?: Bot; name: string; color: string }) {
   return (
     <div className="mt-1 flex items-center gap-1.5 pl-0.5">
-      <MausAvatar
+      <BotMascot
         color={(bot?.color ?? color) as Bot["color"]}
         state={normalizeState(bot?.mascotExpression) ?? "happy"}
         size={16}
@@ -847,7 +847,7 @@ function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
                             selected ? "bg-accent/10" : "hover:bg-raised",
                           )}
                         >
-                          <MausAvatar
+                          <BotMascot
                             color={member.color}
                             state={normalizeState(member.mascotExpression) ?? "happy"}
                             size={24}
@@ -1226,12 +1226,12 @@ export function GroupView({ group }: { group: Group }) {
     }
   };
 
-  // Static mauses: one per member, stacked with overlap and a counter pill when large.
-  const maxVisibleMauses = 5;
-  const visibleMembers = members.slice(0, maxVisibleMauses);
-  const hiddenMemberCount = members.length - maxVisibleMauses;
+  // Static bots: one per member, stacked with overlap and a counter pill when large.
+  const maxVisibleBots = 5;
+  const visibleMembers = members.slice(0, maxVisibleBots);
+  const hiddenMemberCount = members.length - maxVisibleBots;
 
-  const memberMauses = (
+  const memberBots = (
     <div className="flex items-center -space-x-1.5">
       {visibleMembers.map((b) => (
         <span
@@ -1242,7 +1242,7 @@ export function GroupView({ group }: { group: Group }) {
             group.busyBotId === b.id && "ring-accent/70",
           )}
         >
-          <MausAvatar color={b.color} state={normalizeState(b.mascotExpression) ?? "happy"} size={22} animated={false} />
+          <BotMascot color={b.color} state={normalizeState(b.mascotExpression) ?? "happy"} size={22} animated={false} />
           {group.busyBotId === b.id && (
             <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent" />
           )}
@@ -1292,7 +1292,7 @@ export function GroupView({ group }: { group: Group }) {
             ) : (
               <div className="flex size-7 shrink-0 items-center justify-center -space-x-2 rounded-full bg-control p-0.5">
                 {members.slice(0, 2).map((b) => (
-                  <MausAvatar key={b.id} color={b.color} state="happy" size={14} animated={false} />
+                  <BotMascot key={b.id} color={b.color} state="happy" size={14} animated={false} />
                 ))}
               </div>
             )}
@@ -1317,7 +1317,7 @@ export function GroupView({ group }: { group: Group }) {
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
           {group.dm ? (
-            memberMauses
+            memberBots
           ) : (
             // The roster lives where you already look to see who is in the
             // room; a dashed + says the row is editable without shouting.
@@ -1329,7 +1329,7 @@ export function GroupView({ group }: { group: Group }) {
               aria-label={`Manage members — ${members.length} ${members.length === 1 ? "bot" : "bots"} in this channel`}
               className="flex items-center gap-1.5 rounded-full py-0.5 pl-1 pr-1.5 hover:bg-raised/60"
             >
-              {memberMauses}
+              {memberBots}
               <span className="flex size-[18px] items-center justify-center rounded-full border border-dashed border-hairline/70 text-ink-secondary">
                 <Plus size={11} />
               </span>
@@ -1483,7 +1483,7 @@ export function GroupView({ group }: { group: Group }) {
             <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
               <div className="flex -space-x-2">
                 {members.slice(0, 3).map((b) => (
-                  <MausAvatar
+                  <BotMascot
                     key={b.id}
                     color={b.color}
                     state="happy"
@@ -1536,7 +1536,7 @@ export function GroupView({ group }: { group: Group }) {
           {(speaker || presenceVisible) && (
             <TurnPresence
               avatar={
-                <MausAvatar
+                <BotMascot
                   color={presenceSpeaker?.color ?? "green"}
                   state={toolInFlight ? "working" : "thinking"}
                   size={36}

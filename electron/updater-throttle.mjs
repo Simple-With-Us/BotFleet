@@ -9,6 +9,54 @@ import { updateConfigFile } from "./config-file-lock.mjs";
 
 export const AUTO_CHECK_THROTTLE_MS = 6 * 60 * 60 * 1000;
 
+/** After this many consecutive AUTOMATIC checks fail with the same error
+ * class, the feed is not having a bad minute -- it is broken -- so back off
+ * hard instead of retrying every hour.  The live case this exists for: 67
+ * consecutive hourly `HttpError: 404` because a release shipped DMGs with no
+ * `latest-mac.yml`, each one logging a full stack trace and nobody the wiser
+ * because the 6-hour throttle above never engages (a failed check never
+ * records a successful one, on purpose -- see recordAutomaticCheck's
+ * caller). */
+export const AUTO_CHECK_FAILURE_STREAK_THRESHOLD = 3;
+/** How long the backoff lasts once triggered -- one check per day instead
+ * of one per hour, until a manual check, an app restart, or a success ends
+ * it early. */
+export const AUTO_CHECK_FAILURE_BACKOFF_MS = 24 * 60 * 60 * 1000;
+
+/** A short, comparable fingerprint for a failed automatic check, so a
+ * permanently broken feed (the same class every tick) can be told apart
+ * from sporadic transient failures (a different class most ticks) without
+ * string-matching a full message.  electron-updater's HttpError (from
+ * builder-util-runtime) carries `.statusCode`; falls back to `.code` (Node
+ * network errors like ECONNRESET) and then to the bare error name. */
+export function classifyAutoCheckError(error) {
+  if (error == null) return "unknown";
+  if (typeof error !== "object") return String(error);
+  const name = error.name || error.constructor?.name || "Error";
+  const status = error.statusCode ?? error.status ?? error.code;
+  return status != null ? `${name}:${status}` : name;
+}
+
+/** Advance the in-memory consecutive-automatic-failure streak.  Deliberately
+ * not persisted to disk: an app restart clearing the streak for free is one
+ * of the three ways out of backoff this exists to provide, and in-memory
+ * state gives exactly that with no extra bookkeeping.  A different error
+ * class breaks the streak -- the "keep the transient-failure path
+ * unchanged" half of the fix -- because sporadic, varied failures are not
+ * the same problem as the same request failing the same way every time. */
+export function nextAutoCheckFailureStreak(streak, errorClass) {
+  if (streak && streak.errorClass === errorClass) {
+    return { errorClass, count: streak.count + 1 };
+  }
+  return { errorClass, count: 1 };
+}
+
+/** True once the streak has reached the threshold: the automatic check that
+ * just failed, and every one after it until a reset, should back off. */
+export function isAutoCheckBackoffActive(streak) {
+  return Boolean(streak) && streak.count >= AUTO_CHECK_FAILURE_STREAK_THRESHOLD;
+}
+
 /** The harness- and electron-side read of the persisted autoUpdate config.
  * Always returns an object; a missing file or invalid JSON is "no
  * information", which is the same as the user never having enabled

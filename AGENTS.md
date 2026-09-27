@@ -4,6 +4,8 @@ This file is the **authoritative coordination manifest for AI agent fleets** wor
 
 GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
+Hosting and routing (apexes, hostnames, hosts, deploy paths): see [`Fleet-OPS/docs/DOMAINS-AND-ROUTING.md`](https://github.com/jaywedgeworth22/Fleet-OPS/blob/main/docs/DOMAINS-AND-ROUTING.md). Built from live Cloudflare, Vercel, Coolify, Namecheap/RDAP, and GitHub APIs by CLAUDE on 2026-09-25; refresh via `Fleet-OPS/scripts/domain-inventory/run-all.sh`.
+
 > **2026-09-22 [INSTINCT]:** Updater transition release — must ship and be applied to every Mac BEFORE the bundle rename (PR #524).  It ports the target-bootstrapping wrapper and the updater's legacy-identity acceptance with no bundle ID change, so the old updater can apply it and the rename update is then judged by transition-capable code.  See `docs/rollouts/2026-09-22-updater-transition-bootstrap.md` for the rollout order.
 
 ## Seat Identity And Branches
@@ -41,6 +43,10 @@ Search the `fleet-agents` corpus before re-deriving a lesson (`recall "query"` o
 
 **Never assume a new user message means prior questions or tasks are dropped.**  Treat the full conversation as still active unless the owner explicitly contradicts, cancels, or redirects.
 
+## Verification
+
+Every claim of "it works" points at a recipe that proves it in an isolated fixture.  See `docs/verification/README.md` for the verification discipline, test recipes, and evidence standards.  "Verified" in a PR means a recipe or an existing unit test was run in an isolated fixture, never against live user data.  Fixtures use temporary data directories and free ports; they do not contact the harness on port 8799 or the user's running app.
+
 ## No New GitHub Repositories (owner directive, 2026-09-02)
 
 **Never create a GitHub repository — no forks, no release repos, no site or docs repos, no scratch repos — unless the owner asks for that repository by name.**  One repository per app: BotFleet's releases, site, docs, and CI all live in `jaywedgeworth22/BotFleet`.  Need to send a change upstream?  Ask the owner first, and delete the fork when the PR closes.  Need a public update feed?  This repo's own Releases.  Found an extra repo no directive created?  Surface it to the owner; do not delete it yourself.  Canonical: `AGENT-SYNC.md` § Owner Directives → No new GitHub repositories.
@@ -49,7 +55,7 @@ Search the `fleet-agents` corpus before re-deriving a lesson (`recall "query"` o
 
 **Do not wait for the owner to ask you to commit or open a PR.**  After each coherent finished unit: commit → push → open or update the PR → arm auto-merge → merge when CI is green.  Never merge with red CI.  Never resolve a merge conflict by "keeping both sides"; resolve it to one coherent version and re-run typecheck and tests.  Never idle-watch a PR: a PR that is not merging is waiting on an action (review threads, a conflict, a failing check, auto-merge not armed, a branch behind main) — diagnose and drive it.  Canonical: `AGENT-SYNC.md` § Always commit + land finished work and § Never idle-watch a PR.
 
-Verification gate before every PR: `pnpm typecheck && pnpm test`, plus `cd ios && swift test` and an unsigned `xcodebuild` when iOS files change.  UI changes need screenshots in the PR body.
+Verification gate before every PR: `pnpm typecheck && pnpm test`, plus `cd ios && swift test` and an unsigned `xcodebuild` when iOS files change.  Do not require live screenshots in the PR body for UI changes (owner does not run local UI preview sessions); verify UI changes through code review and CI.
 
 A PR whose complete diff is confined to `docs/**` or the root documentation files allowlisted by `scripts/ci-change-scope.mjs` may use `pnpm test:ci-scope && git diff --check` locally.  The hosted workflow still reports every protected check through its documentation-only fast path.  Any other changed path, plus every scheduled or manually dispatched CI run, keeps the complete gate above.
 

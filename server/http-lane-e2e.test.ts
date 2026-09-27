@@ -32,6 +32,7 @@ import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { startFakeOpenAiServer, type FakeOpenAiServer } from "./testing/fake-openai-server.ts";
 import { freePortBlock } from "./testing/ports.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const posixOnly = describe.skipIf(process.platform === "win32");
@@ -195,7 +196,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
       }),
       { mode: 0o600 },
     );
-    const port = await freePortBlock([0]);
+    const port = await freePortBlock([0, 1]);
     base = `http://127.0.0.1:${port}`;
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
@@ -204,6 +205,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
         HOME: home,
         USERPROFILE: home,
         OMB_PORT: String(port),
+        OMB_WEBHOOK_PORT: String(port + 1),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -213,7 +215,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${base}/api/health`)).ok) break;
+        if (await harnessReady(base)) break;
       } catch {
         // not up yet
       }
@@ -421,7 +423,7 @@ posixOnly("approvals reach an HTTP-lane bot", () => {
         name: "Nightly build",
         prompt: "Handle the incoming build event",
         botId: bot.id,
-        runOn: "maus",
+        runOn: "bot",
       });
       expect(hook.status).toBe(201);
       const delivered = await fetch(hook.body.credential.url, {

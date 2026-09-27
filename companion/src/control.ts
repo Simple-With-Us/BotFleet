@@ -374,16 +374,32 @@ const ago = (at) => {
   return h < 24 ? h + " h ago" : Math.round(h / 24) + " d ago";
 };
 
-/** The two ways a notification is lost before it reaches Apple, one line
- * each, worded the way the phone words them.  A queue-full drop is a local
- * backlog; a circuit-breaker skip is an APNs outage.  One shared line would
- * hide an outage with no overflow and blame a real overflow on either cause.
- * A sidecar that predates circuitDropped simply shows no skip line. */
+/** The two things that happen to a notification before it reaches Apple,
+ * one line each, worded the way the phone words them.  A queue-full drop is
+ * a local backlog and the alert is gone; a circuit-breaker hold is an APNs
+ * outage and the alert is still there.  One shared line would hide an
+ * outage with no overflow and blame a real overflow on either cause.  A
+ * sidecar that predates circuitDropped simply shows no hold line. */
 const pushDropLines = (push) => {
   const dropped = Number(push.dropped) || 0;
-  const skipped = Number(push.circuitDropped) || 0;
+  const held = Number(push.circuitDropped) || 0;
   return (dropped > 0 ? "<p class=dim>" + dropped + " dropped (queue full).</p>" : "") +
-    (skipped > 0 ? "<p class=dim>" + skipped + " skipped (Apple push service unreachable).</p>" : "");
+    (held > 0 ? "<p class=dim>" + held + " held back while Apple's push service was unreachable.</p>" : "");
+};
+
+/** One line naming every phone that has something to say about its own push
+ * lane.  The breaker is per phone, so a fleet-wide number cannot tell "one
+ * phone on a broken link" from "Apple is down"; this can. */
+const pushDeviceLines = (push) => {
+  const rows = Array.isArray(push.devices) ? push.devices : [];
+  const interesting = rows.filter((d) =>
+    d.circuitOpenUntil || d.consecutiveTransportFailures > 0 || d.queued > 0 || d.dropped > 0);
+  if (!interesting.length) return "";
+  return "<p class=dim>Per phone: " + interesting.map((d) =>
+    "<code>" + esc(String(d.deviceId).slice(0, 8)) + "</code> " +
+    (d.circuitOpenUntil ? "paused until " + new Date(d.circuitOpenUntil).toLocaleTimeString() + ", " : "") +
+    d.queued + " waiting, " + d.consecutiveTransportFailures + " failed in a row" +
+    (d.dropped > 0 ? ", " + d.dropped + " dropped" : "")).join("; ") + ".</p>";
 };
 
 /** Call the control API and return the state it answers with. */
@@ -467,11 +483,17 @@ function render(s) {
                   : ".") +
                 "</p>"
               : "") +
+            (s.push.pushesOff && s.push.pushesOffReason === "unreachable"
+              ? "<p>Apple's push service cannot be reached from this computer, so closed-app " +
+                "notifications are waiting rather than going out.&nbsp; They are sent when it " +
+                "comes back.</p>"
+              : "") +
             (s.push.circuitOpenUntil && s.push.circuitOpenUntil > Date.now()
-              ? "<p class=dim>Pushes are paused while the circuit breaker cools down " +
+              ? "<p class=dim>Notifications are held while the circuit breaker cools down, " +
                 "until " + new Date(s.push.circuitOpenUntil).toLocaleTimeString() + ".</p>"
               : "") +
-            pushDropLines(s.push));
+            pushDropLines(s.push) +
+            pushDeviceLines(s.push));
 
   el("start")?.addEventListener("click", async () => render(await api("/pairing", "POST")));
   el("cancel")?.addEventListener("click", async () => render(await api("/pairing", "DELETE")));

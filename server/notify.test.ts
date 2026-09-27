@@ -97,4 +97,12 @@ describe("summarize", () => {
     expect(long.endsWith("…")).toBe(true);
     expect(summarize("short")).toBe("short");
   });
+
+  it("decodes HTML entities and &nbsp; sentence gap tokens", () => {
+    expect(summarize("Sentence one.&nbsp; Sentence two.")).toBe("Sentence one. Sentence two.");
+    expect(summarize("Tom &amp; Jerry &lt;friends&gt;")).toBe("Tom & Jerry <friends>");
+    expect(summarize("Double&#160;gap and &#xA0;hex")).toBe("Double gap and hex");
+    expect(summarize("say &quot;hello&#39;s&quot;")).toBe('say "hello\'s"');
+    expect(summarize("use `run_command` here")).toBe("use run_command here");
+  });
 });

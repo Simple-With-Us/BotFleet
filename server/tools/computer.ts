@@ -24,6 +24,22 @@ import { isInside, realOrResolved } from "../bot-cwd.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import type { AgentToolCallContext } from "./agents.ts";
 
+// DR5 — `read_file` results are embedded verbatim in the transcript, and the
+// HTTP-lane chat-completions engines (MiniMax, OpenAI-compatible, Grok API)
+// replay that whole transcript on every later round of a turn AND on every
+// later turn of the conversation.  An unbounded read of a large file is
+// therefore not a one-time cost: it is paid again, in full, on every
+// remaining round and turn until the conversation ends.  These two constants
+// bound a single `read_file` call so that cannot happen: `limit` defaults to
+// READ_FILE_DEFAULT_LINE_LIMIT lines when the model omits it (or passes
+// something invalid), and the rendered result is separately capped at
+// READ_FILE_MAX_BYTES regardless of `limit` — a run of unusually long lines
+// (minified JS, a single-line data file) could otherwise blow the transcript
+// up even within the line limit.  A model that wants more of the file just
+// pages with `offset`; see the truncation notice appended below.
+export const READ_FILE_DEFAULT_LINE_LIMIT = 400;
+export const READ_FILE_MAX_BYTES = 64 * 1024;
+
 export type ComputerToolExecutor = (
   call: TurnToolCall,
   ctx: AgentToolCallContext,
@@ -171,17 +187,68 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
       const limitArg = call.arguments.limit;
 
       const offset = typeof offsetArg === "number" && Number.isInteger(offsetArg) && offsetArg > 0 ? offsetArg : 1;
-      const limit = typeof limitArg === "number" && Number.isInteger(limitArg) && limitArg > 0 ? limitArg : undefined;
+      // An omitted (or invalid: non-integer, non-positive) `limit` defaults to
+      // READ_FILE_DEFAULT_LINE_LIMIT rather than "the rest of the file" — see
+      // the DR5 comment on that constant above.  A `limit` the model DOES
+      // pass is honored exactly as given (never silently clamped down): the
+      // byte cap just below is what bounds the worst case instead, so a
+      // deliberately large page request still works.
+      const limit =
+        typeof limitArg === "number" && Number.isInteger(limitArg) && limitArg > 0
+          ? limitArg
+          : READ_FILE_DEFAULT_LINE_LIMIT;
 
       const startIdx = Math.max(0, offset - 1);
-      const endIdx = limit ? Math.min(total, startIdx + limit) : total;
-      const sliced = lines.slice(startIdx, endIdx);
+      const lineEndIdx = Math.min(total, startIdx + limit);
+      const sliced = lines.slice(startIdx, lineEndIdx);
+      const renderedLines = sliced.map((line, idx) => `${startIdx + idx + 1}: ${line}`);
 
-      const numbered = sliced.map((line, idx) => `${startIdx + idx + 1}: ${line}`).join("\n");
+      let numbered = renderedLines.join("\n");
+      let returnedCount = renderedLines.length;
+
+      // Byte cap: even within the line limit above, a file of long lines can
+      // still render a huge blob.  Walk forward accumulating whole rendered
+      // lines and stop before the one that would push the total over the
+      // cap — trimming on whole-line boundaries means we never split a line
+      // mid-way, which also means we never split a multi-byte UTF-8
+      // character.
+      if (Buffer.byteLength(numbered, "utf8") > READ_FILE_MAX_BYTES) {
+        let kept = 0;
+        let bytes = 0;
+        for (const rendered of renderedLines) {
+          const addBytes = Buffer.byteLength(rendered, "utf8") + (kept > 0 ? 1 : 0); // +1 for the joining "\n"
+          if (bytes + addBytes > READ_FILE_MAX_BYTES) break;
+          bytes += addBytes;
+          kept++;
+        }
+        // Always return at least one line rather than an empty result, even
+        // in the pathological case where a single line alone exceeds the
+        // cap — the model still learns the true line count and where to
+        // resume, which an empty result would not tell it.
+        returnedCount = kept > 0 ? kept : Math.min(1, renderedLines.length);
+        numbered = renderedLines.slice(0, returnedCount).join("\n");
+      }
+
+      const endIdx = startIdx + returnedCount;
+      const byteCapped = returnedCount < renderedLines.length;
+      const truncated = endIdx < total;
+
+      // Whenever the slice does not reach the end of the file — whether the
+      // line limit stopped it or the byte cap did — tell the model exactly
+      // how to page rather than let it assume it saw everything.
+      if (truncated) {
+        const reason = byteCapped ? `${READ_FILE_MAX_BYTES}-byte cap` : `limit=${limit} lines`;
+        numbered +=
+          `\n\n[truncated: showed lines ${startIdx + 1}-${endIdx} of ${total} (${reason}).  ` +
+          `Call read_file again with offset=${endIdx + 1} to continue, and limit to control how much comes back.]`;
+      }
+
       return {
         kind: "result",
         content: numbered,
-        detail: `lines ${startIdx + 1}-${endIdx} of ${total}`,
+        detail: truncated
+          ? `lines ${startIdx + 1}-${endIdx} of ${total} (truncated)`
+          : `lines ${startIdx + 1}-${endIdx} of ${total}`,
       };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);

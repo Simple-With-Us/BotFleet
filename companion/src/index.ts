@@ -38,7 +38,7 @@ import {
   type ServiceInfo,
 } from "./mdns.ts";
 import { createProxyHandler } from "./proxy.ts";
-import { watchHarnessNotifications } from "./apns.ts";
+import { diskKeyFaultStore, watchHarnessNotifications } from "./apns.ts";
 import { companionOriginSocket, listenCompanionOrigin } from "./origin.ts";
 
 /** A port from the environment, or the default. Anything that is not a whole
@@ -150,6 +150,11 @@ const pushWatch = watchHarnessNotifications({
   forgetToken: (id, token) => {
     devices.clearPushToken(id, token);
   },
+  // A key Apple has refused stays refused across relaunches.  Without this
+  // the sidecar came back up sending at full rate against a .p8 that had
+  // been rejected days earlier, once every forty seconds, while every
+  // surface reported pushes as on.
+  keyFaultStore: diskKeyFaultStore(),
 });
 const proxy = createProxyHandler({
     harnessPort: HARNESS_PORT,

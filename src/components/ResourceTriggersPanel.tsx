@@ -41,7 +41,7 @@ function Editor({
   const [cmp, setCmp] = useState<ResourceCmp>(trigger?.cmp ?? "below");
   const [threshold, setThreshold] = useState(String(trigger?.threshold ?? 80));
   const [cooldownMinutes, setCooldownMinutes] = useState(String(trigger?.cooldownMinutes ?? 45));
-  const [runOn, setRunOn] = useState<RoutineRunOn>(trigger?.runOn ?? "maus");
+  const [runOn, setRunOn] = useState<RoutineRunOn>(trigger?.runOn ?? "bot");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -120,7 +120,7 @@ function Editor({
         <label className="mt-3 block text-[12px] font-medium text-ink-secondary">Prompt</label>
         <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={6} className="mt-1 w-full rounded-xl border border-hairline/50 bg-panel px-3 py-2 text-[13px] text-ink" />
         <label className="mt-3 flex items-center gap-2 text-[12px] text-ink-secondary">
-          <input type="checkbox" checked={runOn === "cloud"} onChange={(event) => setRunOn(event.target.checked ? "cloud" : "maus")} />
+          <input type="checkbox" checked={runOn === "cloud"} onChange={(event) => setRunOn(event.target.checked ? "cloud" : "bot")} />
           Run on ASCII.dev Box
         </label>
         {error && <p className="mt-2 text-[12px] text-danger">{error}</p>}

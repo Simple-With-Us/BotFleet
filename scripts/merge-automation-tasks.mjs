@@ -18,10 +18,11 @@
 //
 // The harness must be stopped: it holds the same SQLite file and keeps bots
 // in memory, so it would write the old roster back over this one.
-import { closeSync, copyFileSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 
 const args = process.argv.slice(2);
 const apply = args.includes("--apply");
@@ -60,14 +61,42 @@ function loadBots() {
   return Array.isArray(raw) ? { bare: true, bots: raw } : { bare: false, raw, bots: raw.bots ?? [] };
 }
 
-function backup(path) {
+// HS9: nothing pruned these — a real fleet accumulated 90 MB of them, most
+// from repeated dry runs during development. Names are
+// `<basename>.bak-merge-<ISO stamp, ":"/"." replaced with "-">`, and that
+// replacement keeps the fixed-width structure a timestamp has, so a plain
+// string sort still orders them oldest to newest.
+export const BACKUP_KEEP = 3;
+
+export function pruneBackups(path, keep = BACKUP_KEEP) {
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.bak-merge-`;
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const backups = names.filter((name) => name.startsWith(prefix)).sort();
+  const stale = backups.slice(0, Math.max(0, backups.length - keep));
+  for (const name of stale) {
+    try {
+      unlinkSync(join(dir, name));
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+export function backup(path) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const target = `${path}.bak-merge-${stamp}`;
   copyFileSync(path, target);
+  pruneBackups(path);
   return target;
 }
 
-function main() {
+export function main() {
   if (!existsSync(BOTS_FILE)) throw new Error(`no bots.json under ${DATA_DIR}`);
   if (!existsSync(DB_FILE)) throw new Error(`no messages.db under ${DATA_DIR}`);
 
@@ -167,4 +196,5 @@ function main() {
   }
 }
 
-main();
+const isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+if (isMain) main();

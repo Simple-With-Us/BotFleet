@@ -47,6 +47,22 @@ Instance `fullAuto: true` adds `--force` (the CLI's documented auto-approve
 switch). BotFleet still answers ACP `session/request_permission` itself:
 full-auto selects an allow option when the CLI offered one.
 
+## Turn deadlines
+
+Every ACP engine's `session/prompt` call — not just Cursor's — is bounded by
+two deadlines instead of one wall clock. A renewable idle deadline
+(`promptIdleMs`, default 180 s) resets on every `session/update` (message
+chunk, thought chunk, tool call, or tool result) and on every permission
+request, so a turn that is legitimately busy — streaming, running tools,
+waiting on a person to answer an ask — is never cut off; only total silence
+trips it. Underneath that, a hard ceiling (`promptTimeoutMs`, default 18
+min) still fires regardless of streaming activity, as a backstop against an
+agent that streams filler forever without ever finishing. Either one
+cancels the prompt, tears the child down the same way an interrupt does,
+and settles the turn as a failure — `prompt_stall` for the idle guard,
+`prompt_timeout` for the hard ceiling — without retrying, because a wedged
+agent must not be relaunched into the same hang.
+
 ## What this driver does not do yet
 
 - Cursor ACP extension methods (`cursor/ask_question`, `cursor/create_plan`,

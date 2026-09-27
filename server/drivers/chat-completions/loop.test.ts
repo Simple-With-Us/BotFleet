@@ -75,6 +75,7 @@ interface Harness {
     retryDelayScale?: number;
     emit?: (event: RuntimeEvent) => void;
     computeCost?: (usage: { input: number; output: number; cachedInput?: number }) => number | null;
+    tools?: ReadonlyArray<{ name: string; timeoutMs?: number }>;
     requestApproval?: (ask: {
       tool: string;
       summary: string;
@@ -90,8 +91,30 @@ type ScriptedRound =
       round: number;
       attempt: number;
       onPublished?: () => void;
+      onChunk?: () => void;
       onUsage?: (usage: { input: number; output: number; cachedInput?: number }) => void;
     }) => Promise<TurnRoundResult>);
+
+/** A model request that reports a raw chunk every `everyMs` and answers
+ *  after `totalMs` — a slow-but-live stream.  Rejects if aborted first. */
+const trickles = (everyMs: number, totalMs: number, text = "slow answer") =>
+  async (opts: { signal: AbortSignal; onChunk?: () => void }): Promise<TurnRoundResult> =>
+    new Promise<TurnRoundResult>((resolve, reject) => {
+      const ticker = setInterval(() => opts.onChunk?.(), everyMs);
+      const done = setTimeout(() => {
+        clearInterval(ticker);
+        resolve({ text, usage: null });
+      }, totalMs);
+      opts.signal.addEventListener(
+        "abort",
+        () => {
+          clearInterval(ticker);
+          clearTimeout(done);
+          reject(new DOMException("aborted", "AbortError"));
+        },
+        { once: true },
+      );
+    });
 
 /** A model request that only ends when something aborts it — the shape a
  *  hung or very slow provider has, and the only shape that exercises the
@@ -135,6 +158,7 @@ function harness(rounds: ScriptedRound[]): Harness {
         now: over?.now,
         retryDelayScale: over?.retryDelayScale,
         computeCost: over?.computeCost,
+        tools: over?.tools,
         runRound: async (roundMessages, opts) => {
           roundsSeen.push(roundMessages.map((m) => ({ ...m })));
           attempts.push({ round: opts.round, attempt: opts.attempt });
@@ -727,6 +751,54 @@ describe("runTurnLoop — rounds", () => {
     }
   });
 
+  // DR9.  One uniform 90s clock is right for a shell command and wrong for a
+  // tool whose job is to wait on a peer's entire turn; `ask_bot` was being cut
+  // off at 90s, well under the three minutes the fleet documents for a peer
+  // reply, and reported as a timeout for a bot that was still working.
+  it("honours a per-tool timeout override from the turn's catalog", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([wantsTools([call("c1", "ask_bot")]), answer("moving on")]);
+      const running = h.run({
+        budget: { toolTimeoutMs: 5_000 },
+        tools: [{ name: "ask_bot", timeoutMs: 60_000 }],
+        toolHost: { execute: async () => new Promise<TurnToolOutcome>(() => undefined) },
+      });
+
+      // long past the uniform ceiling, and the tool is still allowed to run
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(h.messages.some((m) => m.role === "tool")).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      const exit = await running;
+      expect(exit).toBe("settled");
+      const reported = String(h.messages.find((m) => m.role === "tool")?.content);
+      expect(reported).toContain("did not finish");
+      // and the message names the tool's OWN ceiling, not the loop's
+      expect(reported).toContain("60s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a tool with no override on the loop's uniform ceiling", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([wantsTools([call("c1", "bash")]), answer("moving on")]);
+      const running = h.run({
+        budget: { toolTimeoutMs: 5_000 },
+        tools: [{ name: "ask_bot", timeoutMs: 60_000 }],
+        toolHost: { execute: async () => new Promise<TurnToolOutcome>(() => undefined) },
+      });
+      await vi.advanceTimersByTimeAsync(6_000);
+      const exit = await running;
+      expect(exit).toBe("settled");
+      expect(String(h.messages.find((m) => m.role === "tool")?.content)).toContain("did not finish within 5s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("the whole-turn budget cuts off a request that is still streaming", async () => {
     vi.useFakeTimers();
     try {
@@ -746,12 +818,152 @@ describe("the shipped budget", () => {
   it("is the one the design signed off on", () => {
     expect(DEFAULT_TURN_LOOP_BUDGET).toEqual({
       maxRounds: 12,
-      requestTimeoutMs: 180_000,
+      requestTimeoutMs: 600_000,
+      requestIdleMs: 120_000,
       toolTimeoutMs: 90_000,
       wallClockMs: 900_000,
       toolConcurrency: 4,
       maxRequestAttempts: 3,
     });
+  });
+});
+
+describe("runTurnLoop — the round's idle clock and hard ceiling", () => {
+  const errors = (events: RuntimeEvent[]) =>
+    events.filter((e): e is Extract<RuntimeEvent, { type: "runtime.error" }> => e.type === "runtime.error");
+
+  it("lets a stream that keeps delivering bytes run well past the idle window", async () => {
+    vi.useFakeTimers();
+    try {
+      // 300s of work, a chunk every 30s: never 120s of silence, and inside
+      // the 600s hard ceiling — this is the slow reasoning round the old
+      // single 180s number cut off.
+      const h = harness([trickles(30_000, 300_000)]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(301_000);
+      expect(await running).toBe("settled");
+      expect(h.attempts).toHaveLength(1);
+      expect(terminals(h.events)[0]).toMatchObject({ ok: true, stopReason: "end_turn" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("counts published output as progress too", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([
+        async (opts) =>
+          new Promise<TurnRoundResult>((resolve) => {
+            const ticker = setInterval(() => opts.onPublished?.(), 60_000);
+            setTimeout(() => {
+              clearInterval(ticker);
+              resolve(answer("done"));
+            }, 250_000);
+          }),
+      ]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(251_000);
+      expect(await running).toBe("settled");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ends a silent request at the idle deadline as request_timeout, without a retry", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([hangs()]);
+      const running = h.run();
+      await vi.advanceTimersByTimeAsync(119_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await running).toBe("request_timeout");
+      expect(h.attempts).toHaveLength(1);
+      expect(h.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+      expect(terminals(h.events)[0]).toMatchObject({ ok: false, stopReason: "timeout" });
+      // the prefix sentry-ai.ts treats as an expected timeout, not a crash
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 120s — the stream went silent");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("measures silence from the LAST chunk, not from the start of the request", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([
+        async (opts) =>
+          new Promise<TurnRoundResult>((_resolve, reject) => {
+            // live for 100s, then silent forever
+            const ticker = setInterval(() => opts.onChunk?.(), 10_000);
+            setTimeout(() => clearInterval(ticker), 100_000);
+            opts.signal.addEventListener("abort", () => {
+              clearInterval(ticker);
+              reject(new DOMException("aborted", "AbortError"));
+            });
+          }),
+      ]);
+      const running = h.run();
+      // last chunk at 100s: still alive at 215s, gone by 225s
+      await vi.advanceTimersByTimeAsync(215_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await running).toBe("request_timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still enforces the hard ceiling on a stream that never goes quiet", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([trickles(10_000, 10_000_000)]);
+      const running = h.run({ budget: { requestTimeoutMs: 200_000 } });
+      await vi.advanceTimersByTimeAsync(201_000);
+      expect(await running).toBe("request_timeout");
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 200s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("requestIdleMs: 0 turns the idle clock off for a driver with its own stall guard", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness([hangs()]);
+      const running = h.run({ budget: { requestIdleMs: 0, requestTimeoutMs: 400_000 } });
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(terminals(h.events)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(101_000);
+      expect(await running).toBe("request_timeout");
+      expect(errors(h.events)[0].message).toBe("the model did not answer within 400s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count the backoff between attempts as model silence", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const h = harness([
+        async (opts) => {
+          calls += 1;
+          if (calls === 1) throw httpErrorFor(503, "busy");
+          return trickles(30_000, 60_000)(opts);
+        },
+      ]);
+      // The ~1s first backoff scaled x60 is longer than the 40s idle
+      // window, so a clock left running through the wait would abort the
+      // round before the retry ever started.
+      const running = h.run({ budget: { requestIdleMs: 40_000 }, retryDelayScale: 60 });
+      await vi.advanceTimersByTimeAsync(200_000);
+      expect(await running).toBe("settled");
+      expect(h.attempts.map((a) => a.attempt)).toEqual([1, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

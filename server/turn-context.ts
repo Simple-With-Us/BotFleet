@@ -45,6 +45,68 @@ const FRESH_PREAMBLE =
   "[You are joining this conversation mid-thread (the user switched this bot over to you). The conversation so far:]";
 
 const MAX_REPLAY_BYTES = 128 * 1024;
+const OMITTED_HISTORY = "[Earlier conversation omitted for length]";
+
+/** Chat-completions drivers resend this history on every request and tool round.
+ * Keep its newest complete turns within a byte budget; one oversized newest
+ * turn is clipped so a single paste cannot defeat the limit. */
+export function boundNativeTranscript(
+  transcript: Array<{ role: "user" | "assistant"; text: string }>,
+): Array<{ role: "user" | "assistant"; text: string }> {
+  // Leave space for the notice and message framing in the provider payload.
+  const contentBudget = MAX_REPLAY_BYTES - Buffer.byteLength(OMITTED_HISTORY, "utf8") - 64;
+  const kept: typeof transcript = [];
+  let bytes = 0;
+  let omitted = false;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const entry = transcript[i];
+    const entryBytes = Buffer.byteLength(entry.text, "utf8");
+    if (bytes + entryBytes > contentBudget) {
+      omitted = true;
+      if (kept.length === 0) {
+        kept.unshift({ ...entry, text: clipUtf8(entry.text, contentBudget) });
+      }
+      break;
+    }
+    kept.unshift(entry);
+    bytes += entryBytes;
+  }
+  if (!omitted) return transcript;
+  kept.unshift({ role: "user", text: OMITTED_HISTORY });
+  return kept;
+}
+
+/** Room turns send recent messages as one prompt.  Keep the newest message
+ * intact when it triggered the turn; a card continuation instead makes all
+ * stored messages prior history.  An oversized current message needs a
+ * separate explicit size error rather than truncation (board 93034769). */
+export function boundRoomContextLines(lines: string[], preserveNewest = true): string {
+  if (lines.length === 0) return "";
+  const newest = lines[lines.length - 1];
+  const noticeBytes = Buffer.byteLength(OMITTED_HISTORY, "utf8") + 1;
+  // A card/secret continuation is the current prompt, so even the newest
+  // stored room line is prior history and may be clipped when oversized.
+  if (!preserveNewest && Buffer.byteLength(newest, "utf8") > MAX_REPLAY_BYTES - noticeBytes) {
+    return `${OMITTED_HISTORY}\n${clipUtf8(newest, MAX_REPLAY_BYTES - noticeBytes)}`;
+  }
+  const earlierBudget = Math.max(
+    0,
+    MAX_REPLAY_BYTES - noticeBytes - Buffer.byteLength(newest, "utf8"),
+  );
+  const kept = [newest];
+  let bytes = 0;
+  let omitted = false;
+  for (let i = lines.length - 2; i >= 0; i--) {
+    const entryBytes = Buffer.byteLength(lines[i], "utf8") + 1;
+    if (bytes + entryBytes > earlierBudget) {
+      omitted = true;
+      break;
+    }
+    kept.unshift(lines[i]);
+    bytes += entryBytes;
+  }
+  return (omitted ? [OMITTED_HISTORY, ...kept] : kept).join("\n");
+}
 
 /** Clip a string to at most `maxBytes` of UTF-8 without splitting a character. */
 function clipUtf8(value: string, maxBytes: number): string {
@@ -91,7 +153,7 @@ export function buildTurnContext(input: TurnContextInput): {
   return {
     turnText: [
       preamble,
-      ...(truncated ? ["[Earlier conversation omitted for length]", ""] : [""]),
+      ...(truncated ? [OMITTED_HISTORY, ""] : [""]),
       ...lines,
       "",
       "[Now reply to the user's latest message:]",

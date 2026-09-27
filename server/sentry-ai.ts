@@ -18,8 +18,9 @@
 // not be unified — they are different registries that happen to overlap.
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
+import { classifyError } from "./drivers/retry.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { getSentry, isSentryActive } from "./sentry.ts";
+import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
 
 export type SpanLike = {
   setAttribute(key: string, value: string | number | boolean): void;
@@ -30,6 +31,21 @@ export type SpanLike = {
 /** Scope a single capture without touching the global Sentry scope. */
 export type SentryCaptureContext = {
   tags?: Record<string, string>;
+  /** Sentry's grouping key.  Every capture in this file happens at one of
+   * two call sites, so the default stack-trace grouping would fold every
+   * engine's failures into one Issue (BOTFLEET-M); an explicit fingerprint
+   * splits them by driver kind and failure class instead.  The driver kind,
+   * not the gen_ai provider name, because two engines share one provider
+   * name (dshAgent and the DeepSeek HTTP driver are both "deepseek") and
+   * fail for unrelated reasons.  Built only from bounded values — never the
+   * raw free-text message. */
+  fingerprint?: string[];
+};
+
+/** A non-exception capture: a condition worth an Issue at warning level,
+ * such as an engine that is not installed, rather than a crash. */
+export type SentryMessageContext = SentryCaptureContext & {
+  level?: "info" | "warning" | "error";
 };
 
 export type SentryBreadcrumb = {
@@ -55,6 +71,9 @@ export type SentryAiSink = {
     parentSpan?: SpanLike;
   }) => SpanLike;
   captureException: (error: Error, context?: SentryCaptureContext) => void;
+  /** Optional so a stand-in sink with only captureException still works;
+   * without it a setup failure falls back to captureException. */
+  captureMessage?: (message: string, context?: SentryMessageContext) => void;
   addBreadcrumb?: (crumb: SentryBreadcrumb) => void;
 };
 
@@ -84,6 +103,21 @@ const turns = new Map<string, AgentTurn>();
 // provider-error boundary independently from span state so a later failed
 // completion still deduplicates against the captured runtime error.
 const reportedProviderErrors = new Set<string>();
+// An ACP "initialize timed out" is breadcrumbed as an expected condition,
+// but the turn then finishes as a generic rpc_error.  Remember those turns
+// so the completion breadcrumbs too instead of paging a second report.
+const initTimeoutTurns = new Set<string>();
+// A setup runtime.error ("`dsh` isn't installed") is breadcrumbed, and the
+// turn then ends as a reasonless spawn_error.  Keep the setup text per turn
+// so the completion reports what actually went wrong (BOTFLEET-13) instead
+// of "bot turn failed: spawn_error".
+const setupErrorTurns = new Map<string, string>();
+// The chat-completions loop reports its own model-request timeout as
+// runtime.error "the model did not answer within …" and then ends the turn
+// with stopReason "timeout" — the same stop reason its wall-clock budget
+// uses.  Only a turn that saw the request-timeout message may treat
+// "timeout" as expected; a wall-clock stop still pages.
+const modelTimeoutTurns = new Set<string>();
 
 let identityResolver: ((threadId: string) => TurnIdentity | null) | null = null;
 
@@ -134,6 +168,10 @@ export type TurnFailureTags = TurnIdentityAttributes & {
   "botfleet.thread.id": string;
   "gen_ai.provider.name": string;
   "gen_ai.request.model"?: string;
+  /** The completion's stop reason, so an Issue can be filtered by it. */
+  "botfleet.stop_reason"?: string;
+  /** "true" when the failure followed a setup runtime.error. */
+  "botfleet.setup"?: string;
 };
 
 function identityAttributes(identity: TurnIdentity | null): TurnIdentityAttributes {
@@ -174,6 +212,16 @@ type SentryStartSpanOptions = Parameters<
   NonNullable<ReturnType<typeof getSentry>>["startInactiveSpan"]
 >[0];
 
+/** Only the scope fields a capture actually set, so an absent context stays
+ * `undefined` rather than an empty object the SDK would merge. */
+function captureScope(context: SentryCaptureContext | undefined): SentryCaptureContext | undefined {
+  if (!context?.tags && !context?.fingerprint) return undefined;
+  const scope: SentryCaptureContext = {};
+  if (context.tags) scope.tags = context.tags;
+  if (context.fingerprint) scope.fingerprint = context.fingerprint;
+  return scope;
+}
+
 function liveSink(): SentryAiSink | null {
   if (!isSentryActive()) return null;
   const Sentry = getSentry();
@@ -209,7 +257,11 @@ function liveSink(): SentryAiSink | null {
       return span as SpanLike;
     },
     captureException: (error, context) => {
-      Sentry.captureException(error, context?.tags ? { tags: context.tags } : undefined);
+      Sentry.captureException(error, captureScope(context));
+      observability.noteCapture();
+    },
+    captureMessage: (message, context) => {
+      Sentry.captureMessage(message, { ...captureScope(context), level: context?.level ?? "warning" });
       observability.noteCapture();
     },
     addBreadcrumb: (crumb) => {
@@ -223,9 +275,21 @@ function liveSink(): SentryAiSink | null {
   };
 }
 
-function applyConversation(sink: SentryAiSink, threadId: string, identity?: TurnIdentity | null): void {
+/** `conversationId` is the per-TASK id (one invocation chain — see
+ *  `taskConversationId`); `threadId` is the persistent room/thread the task
+ *  ran on, used only to resolve identity for the Conversations User column.
+ *  Kept as two separate arguments so a caller can never accidentally feed
+ *  the thread id into `setConversationId`, which is the exact bug this
+ *  split fixes: gen_ai.conversation.id must change every task, threadId
+ *  never does. */
+function applyConversation(
+  sink: SentryAiSink,
+  conversationId: string,
+  threadId: string,
+  identity?: TurnIdentity | null,
+): void {
   try {
-    sink.setConversationId?.(threadId);
+    sink.setConversationId?.(conversationId);
     if (!sink.setUser) return;
     const resolved = identity === undefined ? identityFor(threadId) : identity;
     const id = clean(resolved?.botId) ?? clean(resolved?.roomId) ?? threadId;
@@ -237,6 +301,18 @@ function applyConversation(sink: SentryAiSink, threadId: string, identity?: Turn
   } catch {
     /* conversation tagging must never take down a turn */
   }
+}
+
+/** The per-task conversation id: one value per agent invocation chain (one
+ *  driver-generated turnId), never per persistent room/thread.  Sentry's
+ *  Conversations view groups by `gen_ai.conversation.id`, and a threadId
+ *  that lives for the bot's whole lifetime made every turn look like the
+ *  same conversation — see the 2026-09-24 telemetry evaluation, "How it's
+ *  working now" → "Data-quality gaps".  Falls back to the thread id only
+ *  for the handful of infra events with no turn in flight (e.g. a
+ *  synthetic runtime.error from the event-log writer). */
+function taskConversationId(event: RuntimeEvent): string {
+  return event.turnId ?? event.threadId;
 }
 
 /** The still-open `gen_ai.invoke_agent` span for a thread, so a span opened
@@ -302,11 +378,50 @@ function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?
   span.setAttribute("gen_ai.usage.cost", cost);
 }
 
+/** Stop reasons that are never a crash on their own.  `host_control_policy`
+ * is Antigravity refusing, fail-closed, to run a host-control turn under an
+ * always-proceed tool policy — a verdict the person is shown, not a fault.
+ * "timeout" is deliberately absent: see `modelTimeoutTurns`. */
+const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted", "host_control_policy"]);
+
+/** Stop reasons a request-timeout turn can end with: the chat-completions
+ * loop maps its `request_timeout` exit to "timeout", and "request_timeout"
+ * is kept for a driver that reports the exit name itself. */
+const MODEL_TIMEOUT_STOPS = new Set(["timeout", "request_timeout"]);
+
+/** The leading words of `antigravityHostPolicyRefusal` in both of its
+ * forms.  Matched as text rather than imported, so this module does not
+ * pull the whole Antigravity driver in; sentry-ai.test.ts pins the match
+ * against the function's real output. */
+const ANTIGRAVITY_POLICY_REFUSAL = "Antigravity's tool execution policy";
+
+/** A bounded failure class for a runtime.error, for the Issue fingerprint.
+ * The retry classifier's reason when it recognizes the text, joined to the
+ * message's shape with every variable part — numbers, ids, paths, quoted
+ * values, URLs — folded to a placeholder, secrets redacted first.  Two
+ * different failures keep two Issues; the same failure with a different
+ * request id or duration stays one. */
+export function classifyMessage(message: string): string {
+  const { reason } = classifyError({ text: message });
+  const template = scrubWebhookSecrets(redactSecretsInText(message))
+    .toLowerCase()
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/g, "<url>")
+    .replace(/(["`])(?:(?!\1).){0,200}\1/g, "<q>")
+    .replace(/(?:~|\.{1,2})?(?:\/[\w.@-]+){2,}/g, "<path>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{8,}\b/g, "<id>")
+    .replace(/\d+(?:\.\d+)?/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return `${reason}: ${template || "empty"}`;
+}
+
 function endTurn(
   key: string,
   ok: boolean,
   usage?: { input?: number; output?: number; cachedInput?: number; cost?: number | null },
   billingMode?: "actual" | "estimated",
+  expectedStop = false,
 ): void {
   const turn = turns.get(key);
   reportedProviderErrors.delete(key);
@@ -317,7 +432,7 @@ function endTurn(
   if (usage?.output != null) turn.span.setAttribute("gen_ai.usage.output_tokens", usage.output);
   if (usage?.cachedInput != null) turn.span.setAttribute("gen_ai.usage.input_tokens.cached", usage.cachedInput);
   applyCost(turn.span, usage?.cost, billingMode);
-  if (!ok) turn.span.setStatus?.({ code: 2, message: "internal_error" });
+  if (!ok && !expectedStop) turn.span.setStatus?.({ code: 2, message: "internal_error" });
   turn.span.end();
   turns.delete(key);
 }
@@ -326,6 +441,7 @@ function failureTags(
   event: RuntimeEvent,
   provider: string,
   turn: AgentTurn | undefined,
+  outcome: { stopReason?: string; setup?: boolean } = {},
 ): TurnFailureTags {
   const identity = turn?.identity ?? identityFor(event.threadId);
   const tags: TurnFailureTags = {
@@ -336,6 +452,8 @@ function failureTags(
   };
   const model = clean(turn?.model) ?? clean(identity?.model);
   if (model) tags["gen_ai.request.model"] = model;
+  if (outcome.stopReason) tags["botfleet.stop_reason"] = outcome.stopReason;
+  if (outcome.setup) tags["botfleet.setup"] = "true";
   return tags;
 }
 
@@ -346,11 +464,17 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
   const provider = genAiProvider(event.provider);
   // Resolve once per event so setUser and span attributes share the same snapshot.
   const eventIdentity = identityFor(event.threadId);
-  applyConversation(sink, event.threadId, eventIdentity);
+  const conversationId = taskConversationId(event);
+  applyConversation(sink, conversationId, event.threadId, eventIdentity);
 
   switch (event.type) {
     case "turn.started": {
       reportedProviderErrors.delete(key);
+      // A turn that never completed (a crashed driver) must not hand its
+      // flags to the next turn on the same key.
+      initTimeoutTurns.delete(key);
+      modelTimeoutTurns.delete(key);
+      setupErrorTurns.delete(key);
       const identity = eventIdentity;
       const named = agentName(identity, event.provider);
       const span = sink.startInactiveSpan({
@@ -360,7 +484,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           "gen_ai.operation.name": "invoke_agent",
           "gen_ai.agent.name": named,
           "gen_ai.provider.name": provider,
-          "gen_ai.conversation.id": event.threadId,
+          "gen_ai.conversation.id": conversationId,
+          "botfleet.room_id": event.threadId,
           "gen_ai.system": provider,
           ...identityAttributes(identity),
         },
@@ -399,7 +524,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         attributes: {
           "gen_ai.operation.name": "execute_tool",
           "gen_ai.tool.name": toolName,
-          "gen_ai.conversation.id": event.threadId,
+          "gen_ai.conversation.id": conversationId,
+          "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
@@ -445,7 +571,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         attributes: {
           "gen_ai.operation.name": "execute_tool",
           "gen_ai.tool.name": toolName,
-          "gen_ai.conversation.id": event.threadId,
+          "gen_ai.conversation.id": conversationId,
+          "botfleet.room_id": event.threadId,
           "gen_ai.agent.name": agentName(turn.identity, event.provider),
           ...identityAttributes(turn.identity),
         },
@@ -482,7 +609,10 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       const turn = turns.get(key);
       if (!turn) break;
       turn.span.setAttribute("gen_ai.usage.input_tokens", event.input);
-      turn.span.setAttribute("gen_ai.usage.output_tokens", event.output);
+      // Optional: a driver that reports only a combined context-occupancy
+      // figure (DSH's ACP `usage_update`) has no real output split to give —
+      // see the `output?:` comment on RuntimeEvent's thread.token-usage.updated.
+      if (event.output != null) turn.span.setAttribute("gen_ai.usage.output_tokens", event.output);
       if (event.cachedInput != null) {
         turn.span.setAttribute("gen_ai.usage.input_tokens.cached", event.cachedInput);
       }
@@ -497,7 +627,10 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         event.setup ||
         event.message.includes("The saved ACP session could not be resumed") ||
         event.message.includes("nobody answered this permission request in time") ||
-        event.message.includes("timeout waiting for response");
+        event.message.includes("timeout waiting for response") ||
+        event.message.includes("initialize timed out") ||
+        event.message.includes("the model did not answer within") ||
+        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL);
 
       if (isExpectedNonCrash) {
         sink.addBreadcrumb?.({
@@ -505,6 +638,9 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           message: event.message.slice(0, 500),
           level: "warning",
         });
+        if (event.message.includes("initialize timed out")) initTimeoutTurns.add(key);
+        if (event.message.includes("the model did not answer within")) modelTimeoutTurns.add(key);
+        if (event.setup) setupErrorTurns.set(key, redactSecretsInText(event.message).slice(0, 500));
         break;
       }
       const turn = turns.get(key);
@@ -515,7 +651,10 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (!providerTurnFailure || !reportedProviderErrors.has(key)) {
         sink.captureException(
           new Error(event.message.slice(0, 500)),
-          { tags: failureTags(event, provider, turn) },
+          {
+            tags: failureTags(event, provider, turn),
+            fingerprint: ["bot-runtime-error", event.provider, classifyMessage(event.message)],
+          },
         );
         if (providerTurnFailure) reportedProviderErrors.add(key);
       }
@@ -523,29 +662,56 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
     }
     case "turn.completed": {
       const runtimeErrorReported = reportedProviderErrors.has(key);
+      const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
+      const afterInitTimeout = initTimeoutTurns.delete(key);
+      const afterModelTimeout = modelTimeoutTurns.delete(key);
+      const setupMessage = setupErrorTurns.get(key);
+      setupErrorTurns.delete(key);
+      const expectedStop =
+        !event.ok &&
+        !runtimeErrorReported &&
+        (EXPECTED_TURN_STOPS.has(stopReason) ||
+          (afterInitTimeout && stopReason === "rpc_error") ||
+          (afterModelTimeout && MODEL_TIMEOUT_STOPS.has(stopReason)));
       if (!event.ok) {
         // A failed turn is the thing an operator wants an Issue for.  Most
         // drivers report the failure only here — they never emit
         // runtime.error — so without this a broken engine was invisible.
-        const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
         // OpenAI-compatible, Grok, BoxAgent, and chat-completions drivers
         // report a user-initiated stop as "interrupted" rather than
         // "cancelled" — both are the expected, benign shape of a stop.
-        if (stopReason === "auth_required" || stopReason === "cancelled" || stopReason === "interrupted") {
+        // A model-request timeout ("the model did not answer within …",
+        // then stopReason "timeout") and an ACP init timeout (then
+        // rpc_error) were already breadcrumbed as expected operational
+        // conditions, so their completions must not page an Issue either.
+        if (expectedStop) {
           sink.addBreadcrumb?.({
             category: "botfleet.turn",
             message: `bot turn failed: ${stopReason}`,
             level: "warning",
             data: { provider: event.provider, threadId: event.threadId },
           });
+        } else if (!runtimeErrorReported && setupMessage) {
+          // The engine could not start for a reason the operator fixes
+          // (install the CLI, sign in).  Report that reason, at warning
+          // level, as one Issue per engine — not a reasonless crash.
+          const turn = turns.get(key);
+          const context: SentryMessageContext = {
+            level: "warning",
+            tags: failureTags(event, provider, turn, { stopReason, setup: true }),
+            fingerprint: ["bot-setup", event.provider],
+          };
+          if (sink.captureMessage) sink.captureMessage(setupMessage, context);
+          else sink.captureException(new Error(setupMessage), context);
         } else if (!runtimeErrorReported) {
           const turn = turns.get(key);
           sink.captureException(new Error(`bot turn failed: ${stopReason}`), {
-            tags: failureTags(event, provider, turn),
+            tags: failureTags(event, provider, turn, { stopReason }),
+            fingerprint: ["bot-turn-failure", event.provider, stopReason],
           });
         }
       }
-      endTurn(key, event.ok, { ...event.usage, cost: event.cost }, event.billingMode);
+      endTurn(key, event.ok, { ...event.usage, cost: event.cost }, event.billingMode, expectedStop);
       break;
     }
     default:
@@ -560,6 +726,9 @@ export function resetSentryAiForTests(): void {
   }
   turns.clear();
   reportedProviderErrors.clear();
+  initTimeoutTurns.clear();
+  setupErrorTurns.clear();
+  modelTimeoutTurns.clear();
   identityResolver = null;
 }
 
@@ -576,9 +745,13 @@ export function recordExecutedTools(
   conversationId: string,
   toolNames: string[],
   sink: SentryAiSink | null = liveSink(),
+  /** The per-task id, when the caller has one (a turnId).  Defaults to
+   *  `conversationId` — the thread — for a caller that does not, so this
+   *  stays per-room rather than reporting nothing. */
+  taskId: string = conversationId,
 ): void {
   if (!sink || toolNames.length === 0) return;
-  applyConversation(sink, conversationId);
+  applyConversation(sink, taskId, conversationId);
   const identityAttrs = identityWithAgentName(identityFor(conversationId));
   for (const raw of toolNames) {
     const toolName = raw.trim() || "tool";
@@ -588,7 +761,8 @@ export function recordExecutedTools(
       attributes: {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": toolName,
-        "gen_ai.conversation.id": conversationId,
+        "gen_ai.conversation.id": taskId,
+        "botfleet.room_id": conversationId,
         ...identityAttrs,
       },
     });
@@ -607,9 +781,17 @@ export interface ChatSpanContext {
   span: SpanLike;
 }
 
-/** Wrap one OpenAI-compatible chat completion.  Never attach messages. */
+/** Wrap one OpenAI-compatible chat completion.  Never attach messages.
+ *
+ *  `conversationId` stays the THREAD id — `openTurnSpan` and `identityFor`
+ *  both key off it, since that is what the harness's identity resolver and
+ *  the `turns` map (keyed `threadId:turnId`) actually know about.  `taskId`
+ *  is the per-task id (the driver's own turnId, when it has one in scope)
+ *  and is what actually becomes `gen_ai.conversation.id`; a caller that
+ *  omits it falls back to `conversationId`, so this stays per-room instead
+ *  of reporting nothing. */
 export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
-  opts: { model: string; conversationId: string; provider?: string },
+  opts: { model: string; conversationId: string; taskId?: string; provider?: string },
   fn: (context: ChatSpanContext) => Promise<T>,
   sink: SentryAiSink | null = liveSink(),
 ): Promise<T> {
@@ -629,6 +811,7 @@ export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
     return fn({ recordUsage: () => {}, span: dummySpan });
   }
   const provider = opts.provider ?? "openai";
+  const taskId = opts.taskId ?? opts.conversationId;
   const identityAttrs = identityWithAgentName(identityFor(opts.conversationId));
   const span = sink.startInactiveSpan({
     op: "gen_ai.chat",
@@ -649,7 +832,8 @@ export async function withChatSpan<T extends { usage?: ChatSpanUsage | null }>(
       "gen_ai.request.model": opts.model,
       "gen_ai.provider.name": provider,
       "gen_ai.system": provider,
-      "gen_ai.conversation.id": opts.conversationId,
+      "gen_ai.conversation.id": taskId,
+      "botfleet.room_id": opts.conversationId,
       ...identityAttrs,
     },
   });

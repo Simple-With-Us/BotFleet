@@ -9,6 +9,7 @@ import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { observeRuntimeEvent, resetSentryAiForTests, type SentryAiSink } from "../sentry-ai.ts";
 import { costUsd } from "./chat-completions/pricing.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 import {
   decodeMinimaxConfig,
   isPricedMinimaxEndpoint,
@@ -661,6 +662,206 @@ describe("MinimaxDriver", () => {
     recorder.stop();
     await instance.dispose();
   });
+
+  // Coverage for PR 625 (unattended turns get the 900s wall-clock budget as
+  // their per-request ceiling instead of the 180s interactive one) and its
+  // follow-up stall guard (STREAM_IDLE_TIMEOUT_MS), added on review — the
+  // original PR shipped with no test proving either the widened ceiling or
+  // its failure mode. All three use fake timers so a 900s-scale budget
+  // does not cost 900s of real wall-clock test time.
+
+  it("gives an unattended turn a per-request ceiling wide enough for a slow-but-live stream to outlive the 180s interactive one", async () => {
+    vi.useFakeTimers();
+    try {
+      const enc = new TextEncoder();
+      const fetchMock = vi.fn(async () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "slow " } }] })}\n`));
+            // Two gaps (90s, 100s) that each stay under the 120s idle
+            // guard, but sum to more than the 180s interactive ceiling —
+            // isolating the widened per-request ceiling from the idle
+            // guard this test is deliberately NOT exercising.
+            setTimeout(() => {
+              controller.enqueue(
+                enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "reasoning" } }] })}\n`),
+              );
+            }, 90_000);
+            setTimeout(() => {
+              controller.enqueue(
+                enc.encode(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 3 } })}\n`),
+              );
+              controller.enqueue(enc.encode("data: [DONE]\n"));
+              controller.close();
+            }, 190_000);
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await MinimaxDriver.create({
+        instanceId: "minimax-unattended-slow",
+        displayName: "MiniMax",
+        enabled: true,
+        config: MinimaxDriver.defaultConfig(),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+      const recorder = recordEvents(instance.adapter);
+
+      await instance.adapter.sendTurn({ threadId: "thread-unattended-slow", text: "hi", unattended: true });
+      const completedPromise = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      await vi.advanceTimersByTimeAsync(200_000);
+      const completed = await completedPromise;
+
+      expect(completed).toMatchObject({ ok: true, stopReason: "end_turn", usage: { input: 7, output: 3 } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(0);
+      recorder.stop();
+      await instance.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("ends a silent interactive (attended) turn at the loop's 120s idle deadline — the widened budget never applies without turn.unattended", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            // Truly silent until the round's own timer aborts it — real
+            // fetch/undici would reject the pending read the same way once
+            // `init.signal` aborts; this mock wires that up explicitly
+            // since it never touches the network.
+            init?.signal?.addEventListener("abort", () => {
+              controller.error(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await MinimaxDriver.create({
+        instanceId: "minimax-attended-ceiling",
+        displayName: "MiniMax",
+        enabled: true,
+        config: MinimaxDriver.defaultConfig(),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+      const recorder = recordEvents(instance.adapter);
+
+      // No `unattended` — this is the interactive path.
+      await instance.adapter.sendTurn({ threadId: "thread-attended-ceiling", text: "hi" });
+      const completedPromise = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      const errorPromise = recorder.until((event) => event.type === "runtime.error", 1_000_000);
+      await vi.advanceTimersByTimeAsync(119_000);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const [completed, error] = await Promise.all([completedPromise, errorPromise]);
+
+      expect(error).toMatchObject({ message: "the model did not answer within 120s — the stream went silent" });
+      expect(completed).toMatchObject({ ok: false, stopReason: "timeout" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      recorder.stop();
+      await instance.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("lets a slow-but-live interactive stream outlive the old 180s ceiling", async () => {
+    vi.useFakeTimers();
+    try {
+      const enc = new TextEncoder();
+      const fetchMock = vi.fn(async () => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "slow " } }] })}\n`));
+            // Gaps of 90s and 100s: each inside the 120s idle window, 190s
+            // in total — past the 180s that used to be this path's ceiling.
+            setTimeout(() => {
+              controller.enqueue(
+                enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "reasoning" } }] })}\n`),
+              );
+            }, 90_000);
+            setTimeout(() => {
+              controller.enqueue(
+                enc.encode(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 3 } })}\n`),
+              );
+              controller.enqueue(enc.encode("data: [DONE]\n"));
+              controller.close();
+            }, 190_000);
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await MinimaxDriver.create({
+        instanceId: "minimax-attended-slow",
+        displayName: "MiniMax",
+        enabled: true,
+        config: MinimaxDriver.defaultConfig(),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+      const recorder = recordEvents(instance.adapter);
+
+      await instance.adapter.sendTurn({ threadId: "thread-attended-slow", text: "hi" });
+      const completedPromise = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      await vi.advanceTimersByTimeAsync(200_000);
+      const completed = await completedPromise;
+
+      expect(completed).toMatchObject({ ok: true, stopReason: "end_turn", usage: { input: 7, output: 3 } });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      recorder.stop();
+      await instance.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it("fails a stalled unattended MiniMax stream via the idle guard long before the 900s ceiling, and retries it like any other transient timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn(async () => {
+        // Truly silent forever: never enqueues, never closes, never
+        // errors.  Only STREAM_IDLE_TIMEOUT_MS explains this test settling
+        // — the round's own ceiling here is 900s, far later than anything
+        // this test advances to.
+        const stream = new ReadableStream<Uint8Array>({ start() {} });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await MinimaxDriver.create({
+        instanceId: "minimax-unattended-stall",
+        displayName: "MiniMax",
+        enabled: true,
+        config: MinimaxDriver.defaultConfig(),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+      const recorder = recordEvents(instance.adapter);
+
+      await instance.adapter.sendTurn({ threadId: "thread-unattended-stall", text: "hi", unattended: true });
+      const completedPromise = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+      // 3 attempts x 120s idle guard, plus ~4s of backoff between them —
+      // comfortably under the 900s wall-clock ceiling this is proving the
+      // turn never has to wait for.
+      await vi.advanceTimersByTimeAsync(500_000);
+      const completed = await completedPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(recorder.events.filter((e) => e.type === "turn.retrying").map((e) => e.reason)).toEqual([
+        "timeout",
+        "timeout",
+      ]);
+      expect(completed).toMatchObject({ ok: false, stopReason: "error" });
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect(error).toMatchObject({ message: expect.stringContaining("MiniMax stream timed out") });
+      recorder.stop();
+      await instance.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20_000);
 
   it("reports a bodyless stream clearly and releases the turn", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 200 })));
@@ -1563,5 +1764,96 @@ describe("MinimaxDriver", () => {
     expect(spans.every((s) => s.ended)).toBe(true);
     recorder.stop();
     await instance.dispose();
+  });
+
+  it("caps an oversized transcript before folding it into the chat-completions payload", async () => {
+    // The Codex review found that an unbounded transcript can grow past the
+    // model's prompt window or the provider's per-request size.  This test
+    // confirms the byte-cap is wired in: a 400 KiB transcript gets trimmed
+    // down to ~200 KiB on the wire, so a long thread no longer re-uploads
+    // its full history on every round.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return sse(
+        '{"choices":[{"delta":{"content":"ok"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+      );
+    }));
+    const instance = await MinimaxDriver.create({
+      instanceId: "minimax",
+      displayName: "MiniMax",
+      enabled: true,
+      config: MinimaxDriver.defaultConfig(),
+      environment: { MINIMAX_API_KEY: "test-key" },
+    });
+    try {
+      const big = "x".repeat(5_000);
+      const transcript = Array.from({ length: 80 }, () => ({ role: "user" as const, text: big }));
+      await instance.adapter.sendTurn({ threadId: "t-cap", transcript, text: "hi" });
+      await new Promise((r) => setTimeout(r, 50));
+      const body = bodies[0];
+      // Capped transcript + system + final user; default cap is 200 KiB
+      // which fits ~40 entries, not 80.
+      const userMsgs = body.messages.filter((m: any) => m.role === "user");
+      expect(userMsgs.length).toBeLessThan(80);
+      const total = userMsgs.reduce(
+        (s: number, m: any) => s + (typeof m.content === "string" ? m.content.length : 0),
+        0,
+      );
+      expect(total).toBeLessThan(80 * 5_000);
+    } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half: the system message is the head of the
+    // resent prefix, so only the stable half belongs there, and the volatile
+    // half (memory, mentions) rides the newest user message every request.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return sse(
+        '{"choices":[{"delta":{"content":"ok"}}]}',
+        '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+      );
+    }));
+    const instance = await MinimaxDriver.create({
+      instanceId: "minimax",
+      displayName: "MiniMax",
+      enabled: true,
+      config: MinimaxDriver.defaultConfig(),
+      environment: { MINIMAX_API_KEY: "test-key" },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-split",
+        system: "You are a test bot. Memory: likes tea.",
+        systemStable: "You are a test bot.",
+        systemVolatile: " Memory: likes tea.",
+        transcript: [{ role: "user", text: "earlier" }, { role: "assistant", text: "noted" }],
+        text: "Summarize it.",
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      expect(bodies[0].messages).toEqual([
+        { role: "system", content: "You are a test bot." },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+      ]);
+
+      // a legacy unsplit turn keeps its whole prompt in the system message
+      await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-unsplit");
+      expect(bodies[1].messages).toEqual([
+        { role: "system", content: "You are a test bot. Memory: likes tea." },
+        { role: "user", content: "hi" },
+      ]);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+    }
   });
 });

@@ -9,6 +9,7 @@ import {
   BASE_IMAGE,
   CUA_DRIVER_VERSION,
   CUA_SOCKET,
+  DISPLAY,
   IMAGE as CUA_IMAGE,
   cuaExecArgs,
   dockerSecurityIsHardened,
@@ -23,6 +24,16 @@ import {
   IMAGE_LAYER_VERSION,
   MANAGED_LABEL,
 } from "./container-computer.ts";
+import {
+  ensureSharedVpsSessionExecArgs,
+  isSharedVpsMode,
+  perBotOccupancyKey,
+  vpsDriverDisplay,
+  vpsDriverSocket,
+  vpsOccupancyKey,
+  vpsScreenshotPath,
+  vpsSharedBotSession,
+} from "./vps-shared-session.ts";
 import type { ComputerReach } from "./computer-capability.ts";
 import {
   VPS_DEFAULT_CPUS,
@@ -57,6 +68,76 @@ export const VPS_VIEWER_LABEL = "com.botfleet.vps-viewer";
 const LEGACY_VPS_MANAGED_LABELS = ["com.openmausbot.vps", "com.opengrokbot.vps"] as const;
 const LEGACY_VPS_CONTAINER_LABELS = ["com.openmausbot.container", "com.opengrokbot.container"] as const;
 export const VPS_CONTAINER_PREFIX = "botfleet-vps";
+
+// ── Shared / per-bot targeting ────────────────────────────────────────────
+// Mirrors LocalVmTarget in container-computer.ts.
+
+export interface VpsTarget {
+  /** Stable, non-secret identity used for leases, caches, and tunnel maps. */
+  key: string;
+  containerName: string;
+  label: string;
+}
+
+export const SHARED_VPS_TARGET: VpsTarget = {
+  key: "shared",
+  containerName: `${VPS_CONTAINER_PREFIX}-shared`,
+  label: "shared",
+};
+
+/** Per-bot target: container name matches the existing vpsContainerName(). */
+export function perBotVpsTarget(botId: string): VpsTarget {
+  const hash = createHash("sha256").update(botId).digest("hex");
+  return {
+    key: `bot:${hash}`,
+    containerName: vpsContainerName(botId),
+    label: hash,
+  };
+}
+
+/** Resolve the VPS target for a bot based on the workspace's vpsMode. */
+export function vpsTargetFor(cfg: AppConfig, botId: string): VpsTarget {
+  if (cfg.botDefaults?.vpsMode === "shared") return SHARED_VPS_TARGET;
+  return perBotVpsTarget(botId);
+}
+
+/** Every VPS target a workspace could have created, deduped by key.
+ *  Used by mode-switch cleanup to find containers from both modes. */
+export function vpsModeSwitchTargets(botIds: readonly string[]): VpsTarget[] {
+  const all: VpsTarget[] = [SHARED_VPS_TARGET, ...botIds.map((id) => perBotVpsTarget(id))];
+  return all.filter((target, i) => all.findIndex((o) => o.key === target.key) === i);
+}
+
+/** Remove a specific VPS target's container if it exists.  Addressed by
+ *  target, not by botId routing, so mode-switch cleanup can tear down
+ *  both shared and per-bot containers regardless of the current mode. */
+export async function vpsRemoveTargetIfPresent(
+  cfg: AppConfig,
+  target: VpsTarget,
+  runner: VpsCommandRunner = defaultRunner,
+): Promise<void> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) return;
+  const run = (args: string[], timeoutMs = 30_000) =>
+    runner(vpsDockerArgs(alias, args), { timeoutMs });
+  try {
+    const stdout = (await run(["inspect", target.containerName])).stdout;
+    const inspected = JSON.parse(stdout) as Array<{
+      Config?: { Labels?: Record<string, string> };
+      State?: { Running?: boolean };
+    }>;
+    const labels = inspected[0]?.Config?.Labels;
+    const managed =
+      labels?.[VPS_MANAGED_LABEL] === "1" ||
+      LEGACY_VPS_MANAGED_LABELS.some((key) => labels?.[key] === "1");
+    if (!managed) return;
+    await run(["rm", "-f", target.containerName], 2 * 60_000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isMissingObjectMessage(message)) return;
+    // Swallow transport errors during best-effort cleanup.
+  }
+}
 export const LEGACY_VPS_CONTAINER_PREFIXES = ["openmausbot-vps", "opengrokbot-vps"] as const;
 // SIGTERM must give ssh + docker time to tear down the remote exec before the
 // SIGKILL escalation; 1s was routinely too short over a WAN round-trip, and an
@@ -67,10 +148,11 @@ const CONTAINER_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/;
 const CONTAINER_ID = /^[a-f0-9]{12,64}$/i;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/i;
 const PIDS_LIMIT = 512;
-const SCREENSHOT_PATH = "/tmp/botfleet-vps-preview.png";
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
+/** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
+const botSessionLocks = new Map<string, Promise<void>>();
 // A held lock means a lifecycle mutation (worst case: a 10-minute image
 // build) is running. Waiting it out would wedge Sleep and the screenshot
 // poll behind it, so acquisition fails fast instead.
@@ -131,13 +213,20 @@ export function vpsContainerName(botId: string): string {
   return `${VPS_CONTAINER_PREFIX}-${containerNamePart(botId)}-${hash}`;
 }
 
-/** Current name first, then predecessors from the OpenMausBot / OpenGrokBot rename. */
+/** Current per-bot name first, then predecessors from the OpenMausBot / OpenGrokBot rename. */
 export function vpsContainerNameCandidates(botId: string): string[] {
-  // Check the single shared container first, fallback to legacy per-bot names for cleanup
   const part = containerNamePart(botId);
   const hash = createHash("sha256").update(botId).digest("hex").slice(0, 12);
   const legacy = [VPS_CONTAINER_PREFIX, ...LEGACY_VPS_CONTAINER_PREFIXES].map((prefix) => `${prefix}-${part}-${hash}`);
   return [vpsContainerName(botId), ...legacy];
+}
+
+/** Container name candidates appropriate to the target's mode.  For the
+ *  shared target, only its deterministic name is searched (no legacy
+ *  per-bot names); for a per-bot target, the full legacy set is tried. */
+function containerNameCandidatesForTarget(target: VpsTarget, botId: string): string[] {
+  if (target.key === SHARED_VPS_TARGET.key) return [SHARED_VPS_TARGET.containerName];
+  return vpsContainerNameCandidates(botId);
 }
 
 export function vpsDockerArgs(alias: string, args: string[]): string[] {
@@ -169,6 +258,8 @@ export function vpsSshTunnelArgs(alias: string, localPort: number, privateIp: st
     "ServerAliveInterval=30",
     "-o",
     "ServerAliveCountMax=3",
+    "-o",
+    "ControlMaster=no",
     "-L",
     `127.0.0.1:${localPort}:${privateIp}:${INTERNAL_VIEWER_PORT}`,
     alias,
@@ -208,21 +299,29 @@ function loopbackAnswers(port: number): Promise<boolean> {
   });
 }
 
-function stopDesktopTunnel(botId: string): boolean {
-  const tunnel = desktopTunnels.get(botId);
+function stopDesktopTunnel(key: string): boolean {
+  const tunnel = desktopTunnels.get(key);
   if (!tunnel) return false;
-  desktopTunnels.delete(botId);
+  desktopTunnels.delete(key);
   clearTimeout(tunnel.expiry);
   if (tunnel.child.exitCode === null && !tunnel.child.killed) tunnel.child.kill("SIGTERM");
   return true;
 }
 
-export function closeVpsDesktopTunnel(botId: string) {
-  return { closed: stopDesktopTunnel(botId) };
+/** Close the VPS desktop tunnel for a bot.  Requires cfg to resolve
+ *  the target in shared vs per-bot mode. */
+export function closeVpsDesktopTunnel(cfg: AppConfig, botId: string) {
+  return { closed: stopDesktopTunnel(vpsOccupancyKey(cfg, botId)) };
+}
+
+/** Close a VPS desktop tunnel by target key directly — used by
+ *  mode-switch cleanup and close-all, which address targets, not bots. */
+export function closeVpsDesktopTunnelForTarget(key: string) {
+  return { closed: stopDesktopTunnel(key) };
 }
 
 export function closeAllVpsDesktopTunnels(): void {
-  for (const botId of desktopTunnels.keys()) stopDesktopTunnel(botId);
+  for (const key of desktopTunnels.keys()) stopDesktopTunnel(key);
 }
 
 const STREAM_CAP_CHARS = 16 * 1024 * 1024;
@@ -318,7 +417,7 @@ export function defaultRunner(args: string[], options: VpsCommandOptions = {}): 
   });
 }
 
-function emptyStatus(botId: string, alias: string | null): VpsComputerStatus {
+function emptyStatus(target: VpsTarget, alias: string | null): VpsComputerStatus {
   return {
     configured: Boolean(alias),
     sshAlias: alias,
@@ -337,7 +436,7 @@ function emptyStatus(botId: string, alias: string | null): VpsComputerStatus {
     image_ref: VPS_IMAGE,
     base_image_ref: BASE_IMAGE,
     driver_version: CUA_DRIVER_VERSION,
-    container_name: vpsContainerName(botId),
+    container_name: target.containerName,
     container_id: null,
     image_id: null,
   };
@@ -425,13 +524,40 @@ function statusProblem(status: VpsComputerStatus): string | null {
  * image inspect right below already proves the daemon answers — even its
  * "No such image" failure is a daemon reply. Anything that is neither JSON
  * nor a "no such object" reply is attributed to the transport instead. */
+function vpsBotSessionLockKey(cfg: AppConfig, botId: string): string | null {
+  const alias = vpsSshAlias(cfg);
+  if (!alias || !isSharedVpsMode(cfg)) return null;
+  return `${alias}:session:${perBotOccupancyKey(botId)}`;
+}
+
+async function ensureSharedVpsBotSession(
+  cfg: AppConfig,
+  botId: string,
+  containerRef: string,
+  runner: VpsCommandRunner,
+): Promise<void> {
+  if (!isSharedVpsMode(cfg)) return;
+  const alias = vpsSshAlias(cfg);
+  if (!alias) return;
+  const session = vpsSharedBotSession(botId);
+  const sessionKey = vpsBotSessionLockKey(cfg, botId);
+  const runEnsure = async () => {
+    await runner(vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)), {
+      timeoutMs: 90_000,
+    });
+  };
+  if (sessionKey) return withVpsLock(botSessionLocks, sessionKey, runEnsure);
+  return runEnsure();
+}
+
 async function computeVpsComputerStatus(
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner,
 ): Promise<VpsComputerStatus> {
   const alias = vpsSshAlias(cfg);
-  const status = emptyStatus(botId, alias);
+  const target = vpsTargetFor(cfg, botId);
+  const status = emptyStatus(target, alias);
   if (!alias) return status;
   viewerConnections.delete(`${alias}:${status.container_name}`);
   const run = (args: string[], timeoutMs = 30_000, input?: string) =>
@@ -481,7 +607,7 @@ async function computeVpsComputerStatus(
     };
     let inspected: InspectedContainer[] | null = null;
     let lastMissing: unknown;
-    for (const name of vpsContainerNameCandidates(botId)) {
+    for (const name of containerNameCandidatesForTarget(target, botId)) {
       try {
         inspected = JSON.parse((await run(["inspect", name])).stdout) as InspectedContainer[];
         status.container_name = name;
@@ -771,30 +897,32 @@ async function waitForVpsReady(
   return status;
 }
 
-async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const previous = lifecycleLocks.get(key);
+async function withVpsLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  operation: () => Promise<T>,
+  acquireTimeoutMs = LOCK_ACQUIRE_TIMEOUT_MS,
+): Promise<T> {
+  const previous = locks.get(key);
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  lifecycleLocks.set(key, current);
+  locks.set(key, current);
   if (previous) {
     let acquireTimer: ReturnType<typeof setTimeout> | undefined;
     const acquired = await Promise.race([
       previous.then(() => true),
       new Promise<boolean>((resolve) => {
-        acquireTimer = setTimeout(() => resolve(false), LOCK_ACQUIRE_TIMEOUT_MS);
+        acquireTimer = setTimeout(() => resolve(false), acquireTimeoutMs);
         acquireTimer.unref?.();
       }),
     ]);
     if (acquireTimer) clearTimeout(acquireTimer);
     if (!acquired) {
-      // Keep the queue serialized: this slot opens only when the holder's
-      // does, so a later caller can never run beside the long operation the
-      // timed-out one refused to wait for.
       void previous.then(() => {
         release();
-        if (lifecycleLocks.get(key) === current) lifecycleLocks.delete(key);
+        if (locks.get(key) === current) locks.delete(key);
       });
       throw Object.assign(new Error("the VPS is being prepared — try again shortly"), { status: 409 });
     }
@@ -803,13 +931,17 @@ async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>)
     return await operation();
   } finally {
     release();
-    if (lifecycleLocks.get(key) === current) lifecycleLocks.delete(key);
+    if (locks.get(key) === current) locks.delete(key);
   }
+}
+
+async function withVpsLifecycleLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  return withVpsLock(lifecycleLocks, key, operation);
 }
 
 function vpsLockKey(cfg: AppConfig, botId: string): string | null {
   const alias = vpsSshAlias(cfg);
-  return alias ? `${alias}:${vpsContainerName(botId)}` : null;
+  return alias ? `${alias}:${vpsTargetFor(cfg, botId).containerName}` : null;
 }
 
 export async function vpsComputerAction(
@@ -820,7 +952,8 @@ export async function vpsComputerAction(
 ): Promise<VpsComputerStatus> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"), { status: 409 });
-  const key = `${alias}:${vpsContainerName(botId)}`;
+  const target = vpsTargetFor(cfg, botId);
+  const key = `${alias}:${target.containerName}`;
   const operation = async () => {
     // A mutation invalidates every cached poll answer, before and after: the
     // panel must never keep showing the pre-action world for a TTL.
@@ -831,7 +964,10 @@ export async function vpsComputerAction(
       // A real lifecycle change invalidates the remote endpoint. Provision
       // is also the turn-start idempotency path, so leave an already-running
       // viewer alone when no start/replacement will occur.
-      if (action !== "provision" || before.container !== "running") stopDesktopTunnel(botId);
+      if (action !== "provision" || before.container !== "running") {
+        if (isSharedVpsMode(cfg)) closeAllVpsDesktopTunnels();
+        else stopDesktopTunnel(vpsOccupancyKey(cfg, botId));
+      }
       const run = (args: string[], timeoutMs = 2 * 60_000) => runner(vpsDockerArgs(alias, args), { timeoutMs });
 
       const containerRef = before.container_id ?? before.container_name;
@@ -874,12 +1010,18 @@ export async function vpsComputerAction(
         assertUsableContainer(before);
         await run(["stop", containerRef]);
       }
-      return action === "stop" ? computeVpsComputerStatus(cfg, botId, runner) : waitForVpsReady(cfg, botId, runner);
+      return action === "stop"
+        ? await computeVpsComputerStatus(cfg, botId, runner)
+        : await waitForVpsReady(cfg, botId, runner);
     } finally {
       statusCache.delete(key);
     }
   };
-  return withVpsLifecycleLock(key, operation);
+  const after = await withVpsLifecycleLock(key, operation);
+  if (isSharedVpsMode(cfg) && after.ready && (after.container_id ?? after.container_name)) {
+    await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
+  }
+  return after;
 }
 
 /** Auto is intentionally read-only: it can attach only to an existing ready
@@ -903,9 +1045,13 @@ export async function inspectVpsForAuto(
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
   const key = vpsLockKey(cfg, botId);
-  return key
-    ? withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
-    : computeVpsComputerStatus(cfg, botId, runner);
+  const status = key
+    ? await withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
+    : await computeVpsComputerStatus(cfg, botId, runner);
+  if (isSharedVpsMode(cfg) && status.ready && (status.container_id ?? status.container_name)) {
+    await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
+  }
+  return status;
 }
 
 /** Open a temporary noVNC connection through the configured SSH alias. The
@@ -919,12 +1065,13 @@ export async function vpsComputerJoin(
 ): Promise<{ joinUrl: string; state: "running" }> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
+  const tunnelKey = vpsOccupancyKey(cfg, botId);
 
-  const existing = desktopTunnels.get(botId);
+  const existing = desktopTunnels.get(tunnelKey);
   if (existing && existing.child.exitCode === null && !existing.child.killed) {
     return { joinUrl: existing.joinUrl, state: "running" };
   }
-  stopDesktopTunnel(botId);
+  stopDesktopTunnel(tunnelKey);
 
   // Always re-inspect here. A cached IP or password from before a container
   // replacement is exactly the sort of secret-bearing stale state a viewer
@@ -958,10 +1105,10 @@ export async function vpsComputerJoin(
     failure = error.message;
   });
   child.once("close", (code) => {
-    const active = desktopTunnels.get(botId);
+    const active = desktopTunnels.get(tunnelKey);
     if (active?.child === child) {
       clearTimeout(active.expiry);
-      desktopTunnels.delete(botId);
+      desktopTunnels.delete(tunnelKey);
     }
     if (!failure) failure = stderr.trim() || `SSH viewer tunnel exited ${code ?? "without a status"}`;
   });
@@ -980,19 +1127,26 @@ export async function vpsComputerJoin(
   const joinUrl = `http://127.0.0.1:${localPort}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
   // Viewer-close is the normal cleanup. This unref'd ceiling is a backstop
   // for a renderer crash or an old browser client that cannot signal close.
-  const expiry = setTimeout(() => stopDesktopTunnel(botId), 8 * 60 * 60_000);
+  const expiry = setTimeout(() => stopDesktopTunnel(tunnelKey), 8 * 60 * 60_000);
   expiry.unref?.();
-  desktopTunnels.set(botId, { child, joinUrl, expiry });
+  desktopTunnels.set(tunnelKey, { child, joinUrl, expiry });
   return { joinUrl, state: "running" };
 }
 
-export function vpsContainerMcpArgs(alias: string, containerName: string): string[] {
+export function vpsContainerMcpArgs(
+  alias: string,
+  containerName: string,
+  socket: string = CUA_SOCKET,
+  display: string = DISPLAY,
+): string[] {
   if (!isValidSshAlias(alias) || (!CONTAINER_NAME.test(containerName) && !CONTAINER_ID.test(containerName))) {
     throw new Error("invalid VPS MCP connection");
   }
+  if (!socket.startsWith("/run/user/1000/")) throw new Error("invalid VPS MCP socket");
+  if (!/^:\d+$/.test(display)) throw new Error("invalid VPS MCP display");
   return vpsDockerArgs(
     alias,
-    cuaExecArgs(["mcp", "--socket", CUA_SOCKET], { container: containerName, interactive: true }),
+    cuaExecArgs(["mcp", "--socket", socket], { container: containerName, interactive: true, display }),
   );
 }
 
@@ -1003,12 +1157,27 @@ export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: str
 } {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw new Error("VPS is not configured — add an SSH config alias first");
+  const target = vpsTargetFor(cfg, botId);
+  const socket = vpsDriverSocket(cfg, botId);
+  const display = vpsDriverDisplay(cfg, botId);
   return {
     command: process.execPath,
-    args: [SPAWNED_PROXIES.vpsContainerMcp, alias, containerRef ?? vpsContainerName(botId)],
+    args: [
+      SPAWNED_PROXIES.vpsContainerMcp,
+      alias,
+      containerRef ?? target.containerName,
+      socket,
+      display,
+    ],
     env: { ELECTRON_RUN_AS_NODE: "1" },
   };
 }
+
+export {
+  isSharedVpsMode,
+  sharedVpsContainerLifecycleBlocked,
+  vpsOccupancyKey,
+} from "./vps-shared-session.ts";
 
 /** Why this engine cannot take a self-hosted VPS, in the words a person
  *  reads.  The RULE lives in `computer-capability.ts` — this function owns
@@ -1028,63 +1197,61 @@ export async function vpsComputerScreenshot(
 ): Promise<{ png: string; format: "png" | "jpeg" }> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
-  const key = `${alias}:${vpsContainerName(botId)}`;
+  const target = vpsTargetFor(cfg, botId);
+  const key = `${alias}:${target.containerName}`;
   const cacheable = runner === defaultRunner;
-  return withVpsLifecycleLock(key, async () => {
-    // Same shape as containerComputerScreenshot's screenshotStatusCache: the
-    // poller runs every few seconds, and re-verifying the whole container
-    // between frames multiplied every frame's SSH cost.
+  const loadStatus = async () => {
     const cached = cacheable ? statusCache.get(key) : undefined;
-    const status =
-      cached && cached.expiresAt > Date.now()
-        ? cached.status
-        : await computeVpsComputerStatus(cfg, botId, runner);
-    if (!status.ready) {
-      if (cacheable) statusCache.delete(key);
-      throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
-    }
-    if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
-    const containerRef = status.container_id ?? status.container_name;
-    // The ref goes straight into docker argv, and a cached status is one
-    // more step removed from the inspect that produced it — revalidate the
-    // exact shapes before spending an exec on it.
-    if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
-      throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
-    }
-    try {
-      await runner(
-        vpsDockerArgs(
-          alias,
-          cuaExecArgs(
-            ["call", "get_desktop_state", "{}", "--socket", CUA_SOCKET, "--screenshot-out-file", SCREENSHOT_PATH],
-            { container: containerRef },
-          ),
+    if (cached && cached.expiresAt > Date.now()) return cached.status;
+    return computeVpsComputerStatus(cfg, botId, runner);
+  };
+  const status = cacheable
+    ? await withVpsLifecycleLock(key, loadStatus)
+    : await loadStatus();
+  if (!status.ready) {
+    if (cacheable) statusCache.delete(key);
+    throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
+  }
+  if (cacheable) statusCache.set(key, { status, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  const containerRef = status.container_id ?? status.container_name;
+  if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
+    throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
+  }
+  await ensureSharedVpsBotSession(cfg, botId, containerRef, runner);
+  const socket = vpsDriverSocket(cfg, botId);
+  const screenshotPath = vpsScreenshotPath(cfg, botId);
+  const display = vpsDriverDisplay(cfg, botId);
+  try {
+    await runner(
+      vpsDockerArgs(
+        alias,
+        cuaExecArgs(
+          ["call", "get_desktop_state", "{}", "--socket", socket, "--screenshot-out-file", screenshotPath],
+          { container: containerRef, display },
         ),
-        { timeoutMs: 30_000 },
-      );
-      const encoded = (await runner(vpsDockerArgs(alias, [
-        "exec",
-        "-u",
-        "cua",
-        "-e",
-        "HOME=/home/cua",
-        containerRef,
-        "base64",
-        "-w0",
-        SCREENSHOT_PATH,
-      ]), { timeoutMs: 30_000 })).stdout.trim();
-      const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
-      if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
-      return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
-    } catch (error) {
-      // The failure may mean the world changed (container stopped, link
-      // dropped); a cached "ready" would keep the poller failing for a TTL.
-      if (cacheable) statusCache.delete(key);
-      throw error;
-    } finally {
-      await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", SCREENSHOT_PATH]), {
-        timeoutMs: 10_000,
-      }).catch(() => {});
-    }
-  });
+      ),
+      { timeoutMs: 30_000 },
+    );
+    const encoded = (await runner(vpsDockerArgs(alias, [
+      "exec",
+      "-u",
+      "cua",
+      "-e",
+      "HOME=/home/cua",
+      containerRef,
+      "base64",
+      "-w0",
+      screenshotPath,
+    ]), { timeoutMs: 30_000 })).stdout.trim();
+    const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
+    if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
+    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
+  } catch (error) {
+    if (cacheable) statusCache.delete(key);
+    throw error;
+  } finally {
+    await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", screenshotPath]), {
+      timeoutMs: 10_000,
+    }).catch(() => {});
+  }
 }

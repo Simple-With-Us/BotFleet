@@ -63,6 +63,8 @@ const LIVE_MODEL_IDS = [
 ] as const;
 
 const OFFICIAL_SLUGS = [
+  "grok-4.7",
+  "grok-4.7-build-fast",
   "claude-sonnet-5",
   "claude-opus-5",
   "grok-4.6",

@@ -14,9 +14,10 @@ import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@
 import { computerDestinationDisabledReason, instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { BotSkillsPanel } from "./BotSkillsPanel";
+import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
-import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
+import { BOT_PROFILE_LIMITS, MAX_TOOL_ROUNDS } from "../../shared/bot-profile";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
 import { modelEffortLevels } from "@/lib/model-effort";
 
@@ -78,6 +79,59 @@ function BotUsageCard({ bot }: { bot: Bot }) {
 
 const inputCls =
   "w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 text-[15px] text-ink placeholder:text-ink-secondary focus:outline-none focus:border-hairline";
+
+/** Per-turn ceiling for engines whose tool loop is the harness HTTP loop.
+ *  Empty clears the field; the server then uses 12. Other engines hide this. */
+function MaxToolRoundsField({
+  value,
+  onChange,
+}: {
+  value: number | null | undefined;
+  onChange: (next: number | null) => void;
+}) {
+  const shown = value == null ? "" : String(value);
+  return (
+    <div className="rounded-xl bg-card p-4">
+      <div className="text-[15px] font-medium text-ink">Maximum Tool Rounds</div>
+      <div className="mt-0.5 text-[13px] text-ink-secondary">Per turn.  Empty uses 12.  Cap is 200.</div>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        maxLength={String(MAX_TOOL_ROUNDS).length}
+        aria-label="Maximum Tool Rounds"
+        placeholder="12"
+        value={shown}
+        onChange={(event) => {
+          const raw = event.target.value.trim();
+          const revert = () => {
+            event.target.value = shown;
+          };
+          if (raw === "") {
+            if (value != null) onChange(null);
+            else revert();
+            return;
+          }
+          if (!/^\d+$/.test(raw)) {
+            revert();
+            return;
+          }
+          const next = Number(raw);
+          if (next < 1 || next > MAX_TOOL_ROUNDS) {
+            revert();
+            return;
+          }
+          if (next === value) {
+            revert();
+            return;
+          }
+          onChange(next);
+        }}
+        className={cn(inputCls, "mt-3 w-28 tabular-nums")}
+      />
+    </div>
+  );
+}
 
 /** Where a bot's shell tools run. Set per bot; each task pins its own copy
  * on its first turn (the server does the pinning — Claude keeps sessions
@@ -371,8 +425,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "approvePeerComms"
         | "composio"
         | "modelSelection"
+        | "maxToolRounds"
       >
-    > & { acknowledgeLocalAuto?: boolean },
+    > & { acknowledgeLocalAuto?: boolean; connectorTools?: Bot["connectorTools"] },
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
@@ -572,6 +627,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             </button>
           </div>
 
+          {connectedAppsConfigured && canUseConnectedApps && connectedAppsEnabled && (
+            <ConnectorToolsSettings bot={bot} onPatch={patch} />
+          )}
+
           <div className="rounded-xl bg-card p-4 flex flex-col gap-4">
             <ModelPicker
               bot={bot}
@@ -675,6 +734,13 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               </div>
             );
           })()}
+
+          {engine?.capabilities?.toolLoop === true && (
+            <MaxToolRoundsField
+              value={bot.maxToolRounds}
+              onChange={(maxToolRounds) => patch({ maxToolRounds })}
+            />
+          )}
 
           <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Computer</div>

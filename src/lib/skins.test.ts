@@ -69,7 +69,7 @@ describe("skins", () => {
     expect(theme).toContain("--color-app: #f6f8fa");
     expect(theme).toContain("--color-ink: #111418");
     expect(root).toContain("--color-scrollbar: #c2cbd4");
-    expect(root).toContain("--color-maus-line: #57606a");
+    expect(root).toContain("--color-bot-line: #57606a");
     expect(css).toContain('[data-skin="midnight"]');
   });
 

@@ -6,6 +6,7 @@ import {
   BASE_IMAGE_LABEL,
   CUA_DRIVER_VERSION,
   DRIVER_LABEL,
+  CUA_SOCKET,
   DISPLAY,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
@@ -263,8 +264,17 @@ describe("VPS computer", () => {
     expect(args).toContain("127.0.0.1:45678:172.17.0.5:6901");
     expect(args.at(-1)).toBe("production-vps");
     expect(args).toContain("ExitOnForwardFailure=yes");
+    expect(args).toContain("ControlMaster=no");
     expect(() => vpsSshTunnelArgs("production-vps", 80, "172.17.0.5")).toThrow(/port/);
     expect(() => vpsSshTunnelArgs("production-vps", 45678, "203.0.113.8")).toThrow(/private/);
+  });
+
+  it("gives status probes the 30s docker-over-SSH deadline slow WAN links need", async () => {
+    const fake = fixture();
+    await vpsComputerStatus(CONFIG, BOT_ID, fake.runner);
+    const probes = fake.calls.filter((call) => ["image", "inspect"].includes(call.args[2] ?? ""));
+    expect(probes.length).toBeGreaterThan(0);
+    for (const probe of probes) expect(probe.options?.timeoutMs).toBe(30_000);
   });
 
   it("reports a ready container only when image, labels, limits, mounts, network, and Cua pass", async () => {
@@ -458,9 +468,10 @@ describe("VPS computer", () => {
   it("mounts the official Cua MCP server through the tiny remote exec bridge", () => {
     const connection = vpsComputerMcp(CONFIG, BOT_ID);
     expect(connection.command).toBe(process.execPath);
-    expect(connection.args.slice(-2)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
+    expect(connection.args.slice(1, 3)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
+    expect(connection.args.at(-2)).toBe(CUA_SOCKET);
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
-    expect(vpsComputerMcp(CONFIG, BOT_ID, CONTAINER_ID).args.slice(-2)).toEqual(["production-vps", CONTAINER_ID]);
+    expect(vpsComputerMcp(CONFIG, BOT_ID, CONTAINER_ID).args.slice(1, 3)).toEqual(["production-vps", CONTAINER_ID]);
     expect(vpsContainerMcpArgs("production-vps", vpsContainerName(BOT_ID))).toEqual([
       "-H",
       "ssh://production-vps",

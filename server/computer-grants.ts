@@ -20,6 +20,7 @@
 import { computerReach, type ComputerReach } from "./computer-capability.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
 
+
 import type { AppConfig } from "./config.ts";
 
 /** One computer granted to a bot for one turn. Exactly one of `box` / `stdio`
@@ -350,7 +351,7 @@ export function resolveCloudBackend(
  * every cloud run made VPS routines die in vpsDriverError.  VPS keeps the
  * bot's own engine selection. */
 export function cloudRunUsesBoxAgent(
-  runOn: "maus" | "cloud" | undefined,
+  runOn: "bot" | "cloud" | undefined,
   botCloudBackend: "box" | "vps" | undefined,
   workspaceDefault?: "box" | "vps",
 ): boolean {
@@ -492,6 +493,8 @@ export interface ResolveTurnComputerMountsInput<Lease> {
   dispatchId: number;
   /** `opts.runOn` from the dispatcher: a cloud routine names its own home. */
   runOn?: string;
+  /** Whether this turn is running unattended (e.g. routine or webhook). */
+  unattended?: boolean;
   /** The operator-level allowlist, already read off the config. */
   allowed: ComputerDestination[] | null;
   deps: TurnComputerDeps<Lease>;
@@ -603,12 +606,13 @@ async function resolveMounts<Lease>(
   // One derivation for every destination — see computer-capability.ts.  The
   // names below are kept because the mount sites read as "does this turn
   // mount X", not "can this engine reach X".
+  const unattendedAgy = Boolean(input.unattended && engine.driverKind === "antigravityAgent");
   const reach = computerReach({
     driverKind: engine.driverKind,
     capabilities: { computerMcp: engine.computerMcp, localComputerMcp: engine.localComputerMcp, toolLoop: engine.toolLoop },
   });
   const mountsCloudComputer = reach.box;
-  const mountsLocalComputer = reach.local;
+  const mountsLocalComputer = reach.local && !unattendedAgy;
   const hasHostComputer = Boolean(wantsLocal && mountsLocalComputer);
 
   // Explicit destinations are strict.  In particular, Local VM must never
@@ -639,11 +643,13 @@ async function resolveMounts<Lease>(
     const cua = hostSupportsLocal && mountsLocalComputer ? deps.readHostConnection() : null;
     const unavailable = !hostSupportsLocal
       ? "local computer control is not available on this platform"
-      : !mountsLocalComputer
-        ? "this model engine has no approval channel for actions on this computer, so BotFleet did not mount it"
-        : !cua && !engine.toolLoop
-          ? "CUA Driver is not ready for this computer — check permissions and restart BotFleet"
-          : null;
+      : unattendedAgy
+        ? "unattended turns with this model engine cannot broker host approvals, so BotFleet did not mount the desktop"
+        : !mountsLocalComputer
+          ? "this model engine has no approval channel for actions on this computer, so BotFleet did not mount it"
+          : !cua && !engine.toolLoop
+            ? "CUA Driver is not ready for this computer — check permissions and restart BotFleet"
+            : null;
     if (unavailable) {
       deps.notice(`local computer not mounted: ${unavailable}`, false);
     } else if (cua) {
@@ -654,15 +660,49 @@ async function resolveMounts<Lease>(
   // A VPS is a local-agent computer mount, never a remote agent runner.
   // Explicit Cloud may prepare/start it.  Auto remains read-only unless the
   // person explicitly opted this bot into remote lifecycle actions.
+  // A turn requested with `runOn: "cloud"`, or one whose ONLY granted
+  // computer is cloud, fails hard if cloud is unreachable — attended or not:
+  // an unattended cloud-only turn must not quietly carry on with the local
+  // shell instead.  A bot that also holds a usable host computer degrades
+  // gracefully so a network blip never kills the turn.  "Usable" means what
+  // actually resolved above, not the grant: a Local VM or desktop that
+  // mounted, or host tools a tool-loop engine really gets through
+  // `hasHostComputer` (host bash and files work without CUA).  An engine
+  // with no host approval channel, an unattended Antigravity turn, or an MCP
+  // engine whose CUA Driver is down mounts nothing on the host, so for it
+  // cloud is the only computer and a failure must say so.
+  const hasUsableFallback =
+    mounts.some((m) => m.kind === "vm" || m.kind === "local") || (hasHostComputer && engine.toolLoop === true);
+  const shouldThrowOnCloudFailure = wantsCloudFiltered && (runOn === "cloud" || !hasUsableFallback);
+
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "vps") {
     const unsupported = deps.vps.vpsDriverError(engine.driverKind, reach);
-    if (unsupported && wantsCloudFiltered) throw new Error(unsupported);
-    if (unsupported && autoCloud) autoVpsProblem = unsupported;
-    if (!unsupported) {
-      vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
-      const remote = wantsCloudFiltered || bot.autoStartVps
-        ? await deps.vps.vpsComputerAction("provision", cfg, bot.id)
-        : await deps.vps.inspectVpsForAuto(cfg, bot.id);
+    if (unsupported) {
+      if (wantsCloudFiltered) {
+        if (shouldThrowOnCloudFailure) throw new Error(unsupported);
+        deps.notice(`VPS computer not mounted: ${unsupported}`, false);
+      }
+      if (autoCloud) autoVpsProblem = unsupported;
+    } else {
+      let remote: RemoteComputerStatus | undefined;
+      try {
+        // Claim inside the try so a shared-desktop contention (another bot
+        // already on the single VPS) degrades like a provision failure when
+        // this turn has a usable fallback, instead of aborting the whole turn.
+        vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
+        remote = wantsCloudFiltered || bot.autoStartVps
+          ? await deps.vps.vpsComputerAction("provision", cfg, bot.id)
+          : await deps.vps.inspectVpsForAuto(cfg, bot.id);
+      } catch (err) {
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
+        if (shouldThrowOnCloudFailure) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        deps.notice(`VPS computer not mounted: ${msg}`, false);
+        autoVpsProblem = msg;
+      }
       if (!(await deps.checkpoint())) return stopped();
       if (remote?.ready && remote.sshAlias) {
         const targetCfg = { ...cfg, vps: { sshAlias: remote.sshAlias } };
@@ -679,12 +719,20 @@ async function resolveMounts<Lease>(
         });
         previewCapture = () => deps.vps.vpsComputerScreenshot(targetCfg, bot.id);
       } else {
-        deps.vpsLeases.release(vpsLease);
-        vpsLease = undefined;
-        if (wantsCloudFiltered) {
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
+        const problem = remote?.problem ?? autoVpsProblem ?? "the VPS computer could not be reached";
+        if (shouldThrowOnCloudFailure) {
           throw new Error(remote?.problem ?? "the VPS computer could not be created or reached");
         }
-        autoVpsProblem = remote?.problem ?? "the VPS computer could not be reached";
+        if (!autoVpsProblem) {
+          deps.notice(`VPS computer not mounted: ${problem}`, false);
+        }
+        // Keep the caught SSH/timeout error when the lookup threw; the
+        // generic text is only for a lookup that returned no usable box.
+        autoVpsProblem = problem;
       }
     }
   }
@@ -693,7 +741,10 @@ async function resolveMounts<Lease>(
   // existing cloud box, then falls back to host CUA without provisioning.
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
-      throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+      if (shouldThrowOnCloudFailure) {
+        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+      }
+      deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();
@@ -701,7 +752,11 @@ async function resolveMounts<Lease>(
     // use.  Auto remains non-surprising and only reuses an existing box.
     if (!b && mountsCloudComputer && (wantsCloudFiltered || engine.driverKind === "boxAgent")) {
       deps.broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });
-      await deps.box.provisionBox(cfg, bot.id, bot.name);
+      try {
+        await deps.box.provisionBox(cfg, bot.id, bot.name);
+      } catch (err) {
+        if (shouldThrowOnCloudFailure) throw err;
+      }
       if (!(await deps.checkpoint())) return stopped();
       b = await deps.box.findBox(cfg, bot.id).catch(() => null);
       if (!(await deps.checkpoint())) return stopped();
@@ -737,7 +792,10 @@ async function resolveMounts<Lease>(
     throw new Error("Cloud box is not configured — add a Box API key or choose Local VM");
   }
   if (wantsCloudFiltered && cloudBackend === "box" && !mounts.some((m) => m.kind === "box")) {
-    throw new Error("the cloud computer could not be created or reached");
+    // With the host computer also granted, fall back to it instead of
+    // killing the turn; the notice says why the cloud tools are missing.
+    if (shouldThrowOnCloudFailure) throw new Error("the cloud computer could not be created or reached");
+    if (mountsCloudComputer) deps.notice("cloud computer not mounted: the cloud computer could not be created or reached", false);
   }
 
   // Auto-only host fallback.  Electron owns cua-driver/TCC attribution; the

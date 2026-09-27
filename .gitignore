@@ -39,6 +39,20 @@ cloudflare/control-plane/worker-configuration.d.ts
 /trace*.py
 /trace*.out
 /test-time.js
+# Throwaway PR-body draft the pr command used to leave at the repo root
+# after a `gh pr create`.  The file is named with a leading dot but git
+# tracks it once it exists — keep it out of the index in the first place.
+.tmp-pr-body*
+.tmp-pr-*.md
+# Local-only debug scratch the Claude audit (`docs/audits/2026-09-24-efficiency-audit.md`,
+# RH4) caught in the index: ad-hoc double-script files a seat drops at the
+# repo root to repro something, never committed intentionally.
+debug-cap.mjs
+/debug-*.cjs
+/debug-*.mjs
+/debug-*.js
+/test-auto*
+/test-verdict*
 
 # Editor / shell backup files (PR #218 inadvertently committed docs/EFFORT-LOG.md.bak)
 *.bak

@@ -35,9 +35,36 @@ describe("UsageWhatIfProjection — math", () => {
     const pricing = ENGINE_CAPABILITIES.grok.pricing;
     if (pricing.kind !== "subscription+api") throw new Error("expected subscription+api");
     const cost = apiEquivalentCost(usage, pricing);
-    // 700k * 0.005/1k + 300k * 0.015/1k = 3.5 + 4.5 = 8.0.
+    // Grok 4.7: 700k * 0.002/1k + 300k * 0.006/1k = 1.4 + 1.8 = 3.2.
     // The /1000 factor is essential — see the cached-subtract test above.
-    expect(cost).toBeCloseTo(8.0, 1);
+    expect(cost).toBeCloseTo(3.2, 2);
+  });
+
+  it("keeps Grok on base rates because the 200k tier is per request, not per period", () => {
+    const pricing = ENGINE_CAPABILITIES.grok.pricing;
+    if (pricing.kind !== "subscription+api") throw new Error("expected subscription+api");
+    const at = (inputTokens: number, cachedTokens = 0) =>
+      apiEquivalentCost(
+        { engineId: "grok", inputTokens, outputTokens: 10_000, totalTokens: inputTokens + 10_000, cachedTokens, actualCostUsd: 0 },
+        pricing,
+      );
+    // A period sum of 300k (say three 100k prompts) is not a long-context request.
+    expect(at(300_000)).toBeCloseTo((300_000 * 0.002 + 10_000 * 0.006) / 1000, 6);
+    expect(at(300_000, 100_000)).toBeCloseTo((100_000 * 0.0005 + 200_000 * 0.002 + 10_000 * 0.006) / 1000, 6);
+    // Grok never takes MiniMax's generic 512K 2x either.
+    expect(at(600_000)).toBeCloseTo((600_000 * 0.002 + 10_000 * 0.006) / 1000, 6);
+  });
+
+  it("shows Grok's long-context tier as a note instead", () => {
+    const html = renderToStaticMarkup(
+      createElement(UsageWhatIfProjection, {
+        periodLabel: "Last 30 days",
+        byEngine: [{ engineId: "grok", inputTokens: 300_000, outputTokens: 10_000, totalTokens: 310_000, cachedTokens: 0, actualCostUsd: 0 }],
+      }),
+    );
+    expect(html).toContain("200,000+ tokens");
+    expect(html).toContain("$4 input / $1 cached / $12 output per million");
+    expect(html).toContain("Per-request prompt sizes are not recorded");
   });
 });
 
@@ -75,6 +102,21 @@ describe("UsageWhatIfProjection — render", () => {
     );
     expect(html).toContain("Saved by plan");
     expect(html).toContain("API-equivalent");
+  });
+
+  it("shows PAYG engines as PAYG and keeps them out of the cost and saved totals", () => {
+    const html = renderToStaticMarkup(
+      createElement(UsageWhatIfProjection, {
+        periodLabel: "Last 30 days",
+        byEngine: [
+          { engineId: "deepseek-harness", totalTokens: 1_000_000, inputTokens: 1_000_000, outputTokens: 0, cachedTokens: 0, actualCostUsd: 0 },
+        ],
+      }),
+    );
+    expect(html).toContain(">PAYG<");
+    expect(html).not.toContain(">$0<");
+    // Row saved, row %, and total % all read as a dash; nothing is booked as saved.
+    expect(html).not.toMatch(/emerald[^>]*>\$[1-9]/);
   });
 
   it("renders the no-data message when nothing has a pricing block", () => {

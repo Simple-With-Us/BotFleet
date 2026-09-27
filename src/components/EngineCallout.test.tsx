@@ -1,5 +1,5 @@
-// EngineCallout shape tests — every known engine renders the headline
-// behind a collapsed "Why this engine?" disclosure by default, and the
+// EngineCallout shape tests — every known engine renders a collapsed
+// "Why This Engine?" disclosure by default, and the headline, prose, and
 // registry pricing pill when expanded.  Replaces the legacy
 // MiniMaxCallout.test.ts; the new copy is shared across all engines so
 // the matrix and the callout cannot drift.
@@ -38,20 +38,21 @@ describe("EngineCallout", () => {
     for (const id of ENGINE_DISPLAY_ORDER) {
       const entry = ENGINE_CAPABILITIES[id];
       const html = renderToStaticMarkup(createElement(EngineCallout, { engineId: id }));
-      expect(html).toContain("Why this engine?");
+      expect(html).toContain("Why This Engine?");
       const decoded = decodeHtmlEntities(html);
-      expect(decoded).toContain(entry.whyThisEngine.headline);
-      // Collapsed: summary only — no prose paragraphs, no pricing line.
+      expect(decoded).not.toContain(entry.whyThisEngine.headline);
+      // Collapsed: one-line summary — no prose paragraphs, no pricing line.
       // Avoid /<p/ — Lucide's <path> would falsely match.
       expect(html).not.toMatch(/<p[\s>]/);
       expect(html).not.toContain("Pricing:");
       expect(html).toContain('aria-expanded="false"');
+      expect(html).toContain("aria-hidden");
       // No dangling reference: the detail region is not rendered collapsed.
       expect(html).not.toContain("aria-controls");
     }
   });
 
-  it("expands to show prose and pricing when defaultOpen is set", () => {
+  it("expands to show headline, prose, and pricing when defaultOpen is set", () => {
     const entry = ENGINE_CAPABILITIES.minimax;
     const html = renderToStaticMarkup(
       createElement(EngineCallout, { engineId: "minimax", defaultOpen: true }),
@@ -59,10 +60,9 @@ describe("EngineCallout", () => {
     expect(html).toContain('aria-expanded="true"');
     expect(html).toMatch(/<p[\s>]/);
     expect(html).toContain("Pricing:");
-    // MiniMax's Token Plan subscription must show; the API block is
-    // present in the registry but not as the primary label.
     expect(html).toContain("Subscription + API");
     const decoded = decodeHtmlEntities(html);
+    expect(decoded).toContain(entry.whyThisEngine.headline);
     expect(decoded).toContain(entry.whyThisEngine.prose[0]);
   });
 
@@ -88,17 +88,17 @@ describe("EngineCallout", () => {
   });
 
   it("resolves driver-kind ids via engineIdFromDriverKind", () => {
-    const html = renderToStaticMarkup(createElement(EngineCallout, { driverKind: "grokAgent" }));
+    const html = renderToStaticMarkup(
+      createElement(EngineCallout, { driverKind: "grokAgent", defaultOpen: true }),
+    );
     const decoded = decodeHtmlEntities(html);
     expect(decoded).toContain(ENGINE_CAPABILITIES.grok.whyThisEngine.headline);
   });
 
-  it("renders nothing for an unknown engine id", () => {
-    const html = renderToStaticMarkup(createElement(EngineCallout, { engineId: "nope" }));
-    // The fallback entry's prose still renders — `engineCapability()`
-    // returns a sentinel entry when the id is missing.  That is by
-    // design: a future engine the registry does not know yet still
-    // gets a visible callout that explains the gap.
+  it("renders the fallback headline when expanded for an unknown engine id", () => {
+    const html = renderToStaticMarkup(
+      createElement(EngineCallout, { engineId: "nope", defaultOpen: true }),
+    );
     expect(html).toContain("Engine not in the capability registry yet");
   });
 
@@ -111,10 +111,6 @@ describe("EngineCallout", () => {
   });
 
   it("renders every capability label as expected prose container", () => {
-    // Sanity: the capability labels are stable strings the matrix
-    // uses; the callout body does not render them directly but the
-    // import is the same source of truth, so pin a couple of them
-    // here to catch a future rename.
     expect(CAPABILITY_LABELS.files).toBe("Files");
     expect(CAPABILITY_LABELS.crossBotCoordination).toBe("Cross-Bot Coordination");
   });

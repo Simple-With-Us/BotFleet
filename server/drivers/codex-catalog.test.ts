@@ -233,9 +233,8 @@ name = "oMLX"
 `,
     });
     const catalog = await readCodexModelCatalog({ HOME: home });
-    // Default flipped from gpt-6-astra to gpt-6-luna (the owner-facing
-    // default most owners reach for first); Astra still appears as a
-    // selectable option rather than being removed.
+    // Default is GPT-6 Luna (the owner-facing default most owners reach
+    // for first); Astra still appears as a selectable option.
     expect(catalog.default).toBe("gpt-6-luna");
     expect(catalog.options.every((option) => !option.custom)).toBe(true);
   });

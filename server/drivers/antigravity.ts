@@ -39,6 +39,7 @@
 // global `~/.gemini/config/mcp_config.json` before each spawn — see
 // ensureAntigravityMcp below.
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -71,6 +72,15 @@ const DRIVER_KIND = "antigravityAgent";
 export interface AntigravityConfig {
   cli: string;
   fullAuto: boolean;
+  /** Hard ceiling on one logical turn, relaunches included, however busy
+   * agy stays.  Validated exactly like acp/core.ts's field of the same name. */
+  promptTimeoutMs?: number;
+  /** Renewable silence window while no tool step is running: any stdout line
+   * restarts it, so only a turn that has gone completely quiet trips it. */
+  promptIdleMs?: number;
+  /** The same window while a tool step is ACTIVE.  A build or a test run can
+   * legitimately print nothing for minutes, so it gets a longer leash. */
+  promptToolIdleMs?: number;
 }
 
 /** Said once, at the start of any turn that can act on the person's own
@@ -189,28 +199,139 @@ export function readAntigravityModelCatalog(env: Record<string, string | undefin
 // failing the turn (the ensureOpenCodeInjectModel discipline).
 export const ANTIGRAVITY_COMPUTER_MCP_KEY = "botfleet-computer";
 
+/** Every key this harness owns in agy's global file starts with this; nothing
+ *  else in it is ours to add, replace, or remove. */
+export const BOTFLEET_MCP_PREFIX = "botfleet-";
+
 export interface AntigravityComputerMcpServer {
   command: string;
   args: string[];
   env: Record<string, string>;
 }
 
-// agy's MCP file is machine-global. Hold this lease for the complete child
-// lifetime so two Antigravity turns cannot see each other's computer tokens.
-let antigravityComputerMcpLease: Promise<void> = Promise.resolve();
+// ── the mount lease (DR4) ───────────────────────────────────────────────
+//
+// agy's MCP file is machine-global, so a turn that MOUNTS a computer into it
+// must exclude every other Antigravity turn for its child's whole lifetime —
+// otherwise a second turn's agy could pick up the first turn's tools and, in
+// their env, its box or control tokens.  That part has not changed.
+//
+// What changed is who has to wait.  The lease used to be one module-global
+// promise taken unconditionally, so a turn with NO computer at all — the
+// overwhelming majority — still serialized behind whatever else was running,
+// for as long as that other turn lasted, which could be up to 11 minutes.
+// Two bots on Antigravity could not answer at the same time.
+//
+// It is a reader/writer lease now, per config path:
+//   • a turn that mounts nothing and has nothing of ours to strip takes the
+//     SHARED side — any number of those run at once, because none of them
+//     writes the file and none of them can inherit a mount that does not
+//     exist;
+//   • a turn that mounts a computer, or that has to strip a leftover
+//     `botfleet-*` key, takes the EXCLUSIVE side: it waits for the readers
+//     already running to finish AND locks everyone else out until its child
+//     is gone.
+//
+// That keeps today's isolation guarantee intact.  The obvious cheaper fixes
+// do not: releasing the lease once the child has "read" the config assumes a
+// read time nobody has measured (agy may start an MCP server lazily, at the
+// first tool call), and skipping the lease outright for computer-less turns
+// would let one start WHILE a mount is installed, which is exactly the
+// token-crossing this lease exists to prevent.
+//
+// TODO(DR4): a MOUNTING turn still holds the file for its child's whole
+// lifetime — up to the turn's hard ceiling (`promptTimeoutMs`, 11 minutes by
+// default), though a silent child is now stopped by the idle windows long
+// before that and a timeout is never relaunched.  Shortening that needs one
+// measured fact nobody has yet: WHEN does `agy` read
+// `~/.gemini/config/mcp_config.json`?  If it reads once at
+// startup, the exclusive hold can end at the init event and mounting turns
+// would stop excluding each other for minutes.  If it re-reads lazily — say,
+// the first time the model calls a computer tool — an early release would
+// hand one turn another turn's tools and box token, so the hold must stay.
+// Measure it against a real `agy` (watch the file with fs events across a
+// turn that calls a tool late) before changing anything here.  Neither the
+// code, the comments below, nor agy 1.1.26's embedded docs answer it.
+interface AntigravityMcpLease {
+  /** Chain of exclusive holders; a reader waits on it while one is active. */
+  writers: Promise<void>;
+  /** True from the moment an exclusive holder starts until it releases. */
+  writing: boolean;
+  /** Shared holders running right now. */
+  readers: number;
+  /** Exclusive holders parked until `readers` reaches zero. */
+  drained: Array<() => void>;
+}
 
-async function acquireAntigravityComputerMcpLease(): Promise<() => void> {
-  const previous = antigravityComputerMcpLease;
+const antigravityMcpLeases = new Map<string, AntigravityMcpLease>();
+
+/** The machine-global file agy actually reads.  Derived from the turn's own
+ *  env so two instances pointed at different HOMEs get different leases —
+ *  they are different files and have no reason to wait on each other. */
+export function antigravityMcpConfigPath(env: Record<string, string | undefined> = process.env): string {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  return join(home, ".gemini", "config", "mcp_config.json");
+}
+
+function leaseFor(path: string): AntigravityMcpLease {
+  const existing = antigravityMcpLeases.get(path);
+  if (existing) return existing;
+  const lease: AntigravityMcpLease = { writers: Promise.resolve(), writing: false, readers: 0, drained: [] };
+  antigravityMcpLeases.set(path, lease);
+  return lease;
+}
+
+/** Does the file already carry one of our keys?  A turn that would have to
+ *  remove one is a WRITER even though it mounts nothing.  An unreadable file
+ *  answers `true` on purpose: "we cannot tell" must take the safe side. */
+export function antigravityConfigHasBotfleetServers(path: string): boolean {
+  try {
+    if (!existsSync(path)) return false;
+    const parsed = mcpConfigFileSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+    if (!parsed.success) return false;
+    return Object.keys(parsed.data.mcpServers ?? {}).some((key) => key.startsWith(BOTFLEET_MCP_PREFIX));
+  } catch {
+    return true;
+  }
+}
+
+/** Take the mount lease for one turn and return its release.
+ *
+ *  `exclusive` turns hold the file; shared turns only promise not to touch
+ *  it.  Both hold until the child is gone, because that is the window in
+ *  which agy might still read the file. */
+export async function acquireAntigravityComputerMcpLease(
+  path: string,
+  exclusive: boolean,
+): Promise<() => void> {
+  const lease = leaseFor(path);
+  let released = false;
+  if (!exclusive) {
+    // Re-checked after every wait: a writer that became active while this
+    // turn was parked must not be overtaken.  When no writer is active this
+    // loop does not await at all, which is the point — the common turn pays
+    // nothing.
+    while (lease.writing) await lease.writers;
+    lease.readers++;
+    return () => {
+      if (released) return;
+      released = true;
+      if (--lease.readers === 0) for (const wake of lease.drained.splice(0)) wake();
+    };
+  }
+  const previous = lease.writers;
   let unlock: (() => void) | undefined;
   const current = new Promise<void>((resolve) => {
     unlock = resolve;
   });
-  antigravityComputerMcpLease = previous.then(() => current);
+  lease.writers = previous.then(() => current);
   await previous;
-  let released = false;
+  lease.writing = true;
+  if (lease.readers > 0) await new Promise<void>((resolve) => lease.drained.push(resolve));
   return () => {
     if (released) return;
     released = true;
+    lease.writing = false;
     unlock?.();
   };
 }
@@ -263,8 +384,7 @@ export function ensureAntigravityMcp(
   servers: Record<string, { command: string; args: string[]; env: Record<string, string> }>,
   env: Record<string, string | undefined> = process.env,
 ): () => void {
-  const home = env.HOME || env.USERPROFILE || homedir();
-  const path = join(home, ".gemini", "config", "mcp_config.json");
+  const path = antigravityMcpConfigPath(env);
   const existed = existsSync(path);
   const original = existed ? readFileSync(path, "utf8") : null;
   let config: any = {};
@@ -277,7 +397,7 @@ export function ensureAntigravityMcp(
   let hasChanges = false;
   
   for (const key of Object.keys(currentServers)) {
-    if (key.startsWith("botfleet-")) {
+    if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
       delete currentServers[key];
       hasChanges = true;
     }
@@ -324,7 +444,7 @@ export function ensureAntigravityMcp(
       const cleanupServers = { ...cleanupConfig.mcpServers };
       let changed = false;
       for (const key of Object.keys(cleanupServers)) {
-        if (key.startsWith("botfleet-")) {
+        if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
           delete cleanupServers[key];
           changed = true;
         }
@@ -336,7 +456,7 @@ export function ensureAntigravityMcp(
            const origParsed = mcpConfigFileSchema.safeParse(JSON.parse(original));
            if (origParsed.success && origParsed.data.mcpServers) {
              for (const [k, v] of Object.entries(origParsed.data.mcpServers)) {
-               if (k.startsWith("botfleet-")) {
+               if (k.startsWith(BOTFLEET_MCP_PREFIX)) {
                  cleanupServers[k] = v;
                  changed = true;
                }
@@ -361,8 +481,7 @@ export function ensureAntigravityMcp(
 export function cleanStaleAntigravityMcp(
   env: Record<string, string | undefined> = process.env,
 ): void {
-  const home = env.HOME || env.USERPROFILE || homedir();
-  const path = join(home, ".gemini", "config", "mcp_config.json");
+  const path = antigravityMcpConfigPath(env);
   if (!existsSync(path)) return;
   try {
     const raw = readFileSync(path, "utf8");
@@ -371,7 +490,7 @@ export function cleanStaleAntigravityMcp(
     const currentServers = { ...parsed.data.mcpServers };
     let hasChanges = false;
     for (const key of Object.keys(currentServers)) {
-      if (key.startsWith("botfleet-")) {
+      if (key.startsWith(BOTFLEET_MCP_PREFIX)) {
         delete currentServers[key];
         hasChanges = true;
       }
@@ -384,8 +503,55 @@ export function cleanStaleAntigravityMcp(
   } catch {}
 }
 
+// ── turn deadlines ──────────────────────────────────────────────────────
+// The turn used to have exactly one clock: an 11-minute wall-clock watchdog
+// that killed a busy turn and a wedged one alike, and told nobody it was
+// coming.  It is now two renewable silence windows plus a hard ceiling, the
+// same shape acp/core.ts uses: a turn that keeps printing is never cut off
+// by the idle windows, and one that goes quiet is stopped long before the
+// ceiling.  The bounds match acp/core.ts so a setting means the same thing
+// on every engine.
+const DEFAULT_PROMPT_MAX_MS = 11 * 60_000;
+const DEFAULT_PROMPT_IDLE_MS = 180_000;
+const DEFAULT_PROMPT_TOOL_IDLE_MS = 8 * 60_000;
+const MIN_PROMPT_WINDOW_MS = 1_000;
+const MAX_PROMPT_WINDOW_MS = 20 * 60_000;
+/** How far into a live window the "still waiting" notice appears. */
+const DEADLINE_WARN_FRACTION = 0.8;
+
+function decodeWindowMs(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= MIN_PROMPT_WINDOW_MS &&
+    value <= MAX_PROMPT_WINDOW_MS
+    ? value
+    : undefined;
+}
+
+/** "3 minutes" for a whole number of minutes, "N s" otherwise (short test
+ *  windows included).  Only ever used in the text a person reads. */
+function describeWindow(ms: number): string {
+  // A minute or more reads in minutes ("about 2 minutes", not "132 s").
+  if (ms >= 60_000) {
+    const minutes = Math.round(ms / 60_000);
+    const about = ms % 60_000 === 0 ? "" : "about ";
+    return `${about}${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  return `${Math.max(1, Math.round(ms / 1000))} s`;
+}
+
+/** agy's own `--print-timeout`, always a whole minute ABOVE our ceiling so
+ *  agy never kills a still-streaming turn before this driver decides to. */
+export function antigravityPrintTimeout(maxMs: number): string {
+  return `${Math.ceil(maxMs / 60_000) + 1}m`;
+}
+
 function decodeConfig(raw: unknown): AntigravityConfig {
   const o = (raw ?? {}) as Record<string, unknown>;
+  const promptTimeoutMs = decodeWindowMs(o.promptTimeoutMs);
+  const promptIdleMs = decodeWindowMs(o.promptIdleMs);
+  const promptToolIdleMs = decodeWindowMs(o.promptToolIdleMs);
   if (o.cli !== undefined && typeof o.cli !== "string") {
     throw new Error(`antigravity: invalid cli ${JSON.stringify(o.cli)}`);
   }
@@ -403,6 +569,11 @@ function decodeConfig(raw: unknown): AntigravityConfig {
     // on the Engines settings row, and the toggle there reflects this value.
     // Still throws above on a non-boolean fullAuto.
     fullAuto: o.fullAuto === true,
+    // An out-of-range or malformed window falls back to the default rather
+    // than throwing: a stale setting must not take the engine offline.
+    ...(promptTimeoutMs === undefined ? {} : { promptTimeoutMs }),
+    ...(promptIdleMs === undefined ? {} : { promptIdleMs }),
+    ...(promptToolIdleMs === undefined ? {} : { promptToolIdleMs }),
   };
 }
 
@@ -500,6 +671,17 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     const active = new Map<string, { stop: () => void; turnId: string }>();
     const pending = new Set<string>();
     let disposed = false;
+    // Retry bookkeeping lives PER THREAD, not per sendTurn call: a relaunch
+    // re-enters sendTurn, and the budget has to survive that hop or every
+    // attempt would look like the first.  claude.ts owns the same shape.
+    // `startedAt` is when the LOGICAL turn's first child launched, so the hard
+    // ceiling covers every relaunch together instead of restarting with each
+    // one.  Time spent queued for the mount lease is not part of it.
+    const retryState = new Map<string, { attempt: number; cancelled: boolean; startedAt: number }>();
+    // A relaunch waits real seconds; the fake agy in antigravity.test.ts
+    // scales that down.  The `turn.retrying` event still reports the REAL
+    // policy delay, so a test asserts the policy without paying for it.
+    const retryScale = Number(process.env.FAKE_AGY_RETRY_SCALE ?? "1");
     // every live agy child, tracked independently of `active`: a child can
     // hang AFTER emitting `result` (so it's already removed from `active`), and
     // dispose()/stopAll() must still be able to reap it. Removed on process exit.
@@ -539,6 +721,14 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
       pending.add(threadId);
       const turnId = newId();
+      // Carried across a relaunch (see maybeRetry): `attempt` counts the
+      // transient failures this logical turn has already absorbed, and
+      // `cancelled` is how a stop during the backoff reaches the pending
+      // relaunch instead of letting it spawn a child nobody wants.
+      const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false, startedAt: Date.now() };
+      retry.cancelled = false;
+      retryState.set(threadId, retry);
+      const retryAbort = new AbortController();
 
       // Host control means the user's real desktop — the Local VM and a VPS
       // also arrive as `localComputer`, but they are isolated and carry no
@@ -578,6 +768,9 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         mkdirSync(workspace, { recursive: true });
       } catch (error) {
         pending.delete(threadId);
+        // nothing launched, so nothing may outlive this call — a stale entry
+        // would hand its start time to the thread's next turn
+        retryState.delete(threadId);
         throw error;
       }
       const cwd = turn.cwd ?? workspace;
@@ -591,11 +784,33 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const resumeCursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
       let settled = false;
-      // Last backstop: a child that neither emits `result` nor exits. The
-      // exit/close handlers below cover a child that dies; this covers one
+      // Set once a relaunch is scheduled: the failed child is still dying and
+      // its close event must not also terminate a turn that is coming back.
+      let retryScheduled = false;
+      // The replay-safety gate, and it is PROTOCOL state rather than a
+      // reading of the error text: it flips the moment this child put
+      // something on the bus a relaunch would duplicate — a tool step, a
+      // streamed token, a refusal.  Before that, a transient failure is a
+      // failure to START, and starting over costs nothing.
+      let sawOutput = false;
+      // The backstops for a child that neither emits `result` nor exits.  The
+      // exit/close handlers below cover a child that dies; these cover one
       // that is alive and wedged, which would otherwise leave the bot busy
-      // forever. Assigned just below; settle() always clears it.
-      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      // forever.  Armed once the child exists; settle() and a scheduled
+      // relaunch always clear them.
+      const maxMs = config.promptTimeoutMs ?? DEFAULT_PROMPT_MAX_MS;
+      const idleMs = config.promptIdleMs ?? DEFAULT_PROMPT_IDLE_MS;
+      const toolIdleMs = config.promptToolIdleMs ?? DEFAULT_PROMPT_TOOL_IDLE_MS;
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let idleWarnTimer: ReturnType<typeof setTimeout> | undefined;
+      let maxTimer: ReturnType<typeof setTimeout> | undefined;
+      let maxWarnTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearDeadlines = () => {
+        clearTimeout(idleTimer);
+        clearTimeout(idleWarnTimer);
+        clearTimeout(maxTimer);
+        clearTimeout(maxWarnTimer);
+      };
       // Assigned once the child exists. A child can emit `result` and then
       // hang, so settling must still arrange for process and MCP cleanup.
       let armPostSettleCleanup = () => {};
@@ -603,11 +818,12 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         ok: boolean,
         stopReason: string | null,
         cost: number | null = null,
-        usage?: { input: number; output: number },
+        usage?: { input: number; output: number; cachedInput?: number },
       ) => {
-        if (settled) return;
+        if (settled || retryScheduled) return;
         settled = true;
-        clearTimeout(watchdog);
+        retryState.delete(threadId);
+        clearDeadlines();
         active.delete(threadId);
         armPostSettleCleanup();
         emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost, ...(usage ? { usage } : {}) });
@@ -629,20 +845,35 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       }
       const useStdin = Buffer.byteLength(prompt) > 64 * 1024;
 
-      // agy's config is global, so every turn — including one without a
-      // computer — owns the mount for its complete child lifetime. This keeps
-      // overlapping turns from inheriting, replacing, or removing each
-      // other's tools and credentials.
-      const releaseMcpLease = await acquireAntigravityComputerMcpLease();
+      // agy's config is global, so a turn that WRITES it owns the mount for
+      // its complete child lifetime — that is what keeps overlapping turns
+      // from inheriting, replacing, or removing each other's tools and
+      // credentials.  A turn that neither mounts anything nor has a leftover
+      // key to strip writes nothing, so it takes the shared side and runs
+      // alongside its peers instead of queueing behind them (DR4).
+      //
+      // Both reads happen in this one synchronous stretch, and the acquire
+      // below claims its side before its first await, so a mounting turn can
+      // never slip in between deciding and claiming.
+      const mcpServers = antigravityMcpServers(turn.integrations);
+      const mcpConfigPath = antigravityMcpConfigPath(env);
+      const mountsComputer = Object.keys(mcpServers).length > 0;
+      const ownsMcpFile = mountsComputer || antigravityConfigHasBotfleetServers(mcpConfigPath);
+      const releaseMcpLease = await acquireAntigravityComputerMcpLease(mcpConfigPath, ownsMcpFile);
       if (disposed) {
         releaseMcpLease();
         pending.delete(threadId);
         settle(false, "disposed");
         return { turnId };
       }
+      // The ceiling's clock starts here, once the lease is held, not when
+      // sendTurn was entered: a turn queued behind another mounting turn must
+      // not arrive with its 11 minutes already spent.  A relaunch keeps the
+      // first launch's start, so the ceiling still spans every attempt.
+      if (retry.attempt === 0) retry.startedAt = Date.now();
       let restoreMcp = () => {};
       try {
-        restoreMcp = ensureAntigravityMcp(antigravityMcpServers(turn.integrations), env);
+        restoreMcp = ensureAntigravityMcp(mcpServers, env);
       } catch (error) {
         releaseMcpLease();
         pending.delete(threadId);
@@ -659,7 +890,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
 
       const args = [
         "--output-format", "stream-json",
-        "--print-timeout", "10m",
+        "--print-timeout", antigravityPrintTimeout(maxMs),
         "--add-dir", cwd,
         // fullAuto approves everything.  accept-edits is the execution mode,
         // NOT a permission setting: it auto-approves file edits and leaves
@@ -759,6 +990,87 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         postSettleReaper.unref?.();
       };
 
+      /** Absorb a transient failure by relaunching the turn, or report false
+       *  and let the caller settle it (DR2).
+       *
+       *  Antigravity had no retry at all: a single 429 or a connection reset
+       *  failed the whole turn and pushed the bot's fallback chain into a
+       *  cooldown one more attempt would have avoided.  The conditions are
+       *  claude.ts's, for claude.ts's reasons — transient by the shared
+       *  classifier, not stopped by the person, budget left, and nothing yet
+       *  put on the bus by this child.
+       *
+       *  A timeout is transient to the shared classifier but never relaunched
+       *  here: agy's own "timeout waiting for response" means the provider
+       *  already hung once on this exact prompt, and relaunching into the same
+       *  hang is how one turn used to occupy a bot for half an hour.  Nor is
+       *  anything relaunched once the turn's hard ceiling has passed. */
+      const maybeRetry = (failure: Parameters<typeof classifyError>[0]): boolean => {
+        if (settled || retryScheduled || sawOutput) return false;
+        if (retry.cancelled || disposed) return false;
+        if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
+        if (Date.now() - retry.startedAt >= maxMs) return false;
+        const verdict = classifyError(failure);
+        if (!verdict.transient || verdict.reason === "timeout") return false;
+
+        retryScheduled = true;
+        clearDeadlines();
+        retry.attempt++;
+        const delayMs = computeBackoff(retry.attempt - 1);
+        emit({
+          ...base(threadId, turnId),
+          type: "turn.retrying",
+          attempt: retry.attempt,
+          delayMs,
+          reason: verdict.reason,
+        });
+        // The thread STAYS claimed through the backoff — that entry is what
+        // makes a stop during the wait reach this turn rather than racing a
+        // relaunch nobody can see yet.
+        const cancelRetry = () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+        };
+        active.set(threadId, { stop: cancelRetry, turnId });
+        void (async () => {
+          const wait = interruptibleDelay(delayMs * retryScale, retryAbort.signal);
+          await wait.promise;
+          active.delete(threadId);
+          if (retry.cancelled || disposed) {
+            retryState.delete(threadId);
+            emit({
+              ...base(threadId, turnId),
+              type: "turn.completed",
+              ok: false,
+              stopReason: retry.cancelled ? "interrupted" : "disposed",
+              cost: null,
+            });
+            return;
+          }
+          try {
+            // The SAME turn: a relaunch keeps the cursor it arrived with, so
+            // it resumes the thread's real conversation rather than the one
+            // this attempt created and abandoned.
+            await sendTurn(turn);
+          } catch (error) {
+            retryState.delete(threadId);
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+            emit({
+              ...base(threadId, turnId),
+              type: "turn.completed",
+              ok: false,
+              stopReason: "exit_before_result",
+              cost: null,
+            });
+          }
+        })();
+        return true;
+      };
+
       // conversation_id from the init event → the resumeCursor (session.started
       // is what the harness persists as the cursor). Also seeds tool item ids.
       let conversationId: string | null = null;
@@ -767,9 +1079,12 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // policy.  The child is killed, but lines already in the pipe would
       // otherwise keep emitting steps into a turn the person was told ended.
       let hostPolicyRefused = false;
+      // Tool steps agy has reported ACTIVE and not yet DONE or ERROR.  While
+      // any is open the silence window is the longer tool window.
+      const activeTools = new Set<string>();
 
       const handleLine = (line: string) => {
-        if (hostPolicyRefused) return;
+        if (settled || retryScheduled || hostPolicyRefused) return;
         let o: any;
         try {
           o = JSON.parse(line);
@@ -807,6 +1122,8 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                     : null;
               if (reported === null || !ANTIGRAVITY_ASKING_POLICIES.has(reported)) {
                 hostPolicyRefused = true;
+                // a refusal is a verdict the person is shown; never re-run it
+                sawOutput = true;
                 emit({
                   ...base(threadId, turnId),
                   type: "runtime.error",
@@ -822,7 +1139,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           case "step_update": {
             if (payload.step_type === "tool") {
               const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
+              // a tool is running, or has run: a relaunch would repeat it
+              sawOutput = true;
               if (payload.state === "ACTIVE") {
+                activeTools.add(itemId);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.started",
@@ -831,22 +1151,34 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   title: payload.tool_name,
                   ...toolFields(payload.tool_name, payload.tool_input ?? payload.input ?? payload.args),
                 });
-              } else if (payload.state === "DONE") {
-                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
-              } else if (payload.state === "ERROR") {
-                emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+              } else {
+                // Any state other than ACTIVE means the step is no longer
+                // running (CANCELED included), so the longer tool window
+                // must not outlive it.
+                activeTools.delete(itemId);
+                if (payload.state === "DONE") {
+                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+                } else if (payload.state === "ERROR") {
+                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+                }
               }
             } else if (payload.step_type === "agent_response") {
               if (typeof payload.text_delta === "string" && payload.text_delta.length > 0) {
                 streamedAssistantText += payload.text_delta;
+                // words the person has already read — see maybeRetry
+                sawOutput = true;
                 emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: payload.text_delta });
               }
               if (payload.usage) {
+                const cacheRead = payload.usage.cache_read_tokens;
                 emit({
                   ...base(threadId, turnId),
                   type: "thread.token-usage.updated",
                   input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                   output: payload.usage.output_tokens || 0,
+                  ...(typeof cacheRead === "number" && Number.isFinite(cacheRead) && cacheRead >= 0
+                    ? { cachedInput: cacheRead }
+                    : {}),
                 });
               }
             }
@@ -854,6 +1186,17 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           }
           case "result": {
             const response = typeof payload.response === "string" ? payload.response : streamedAssistantText;
+            // agy has no error event: a provider 429 or a dropped connection
+            // arrives as an ERROR result like everything else.  One that
+            // carries no answer and followed no tool step is a failure to
+            // START, so it gets the same relaunch a dead child would.
+            if (!response && !sawOutput) {
+              const early = parseAntigravityTurnResult(payload);
+              if (early.status !== "SUCCESS" && maybeRetry({ text: antigravityTurnErrorMessage(early) })) {
+                stop(); // the child has said all it is going to
+                return;
+              }
+            }
             if (response && !streamedAssistantText) {
               emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta: response });
             }
@@ -861,11 +1204,15 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
               emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: response });
             }
             if (payload.usage) {
+              const cacheRead = payload.usage.cache_read_tokens;
               emit({
                 ...base(threadId, turnId),
                 type: "thread.token-usage.updated",
                 input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                 output: payload.usage.output_tokens || 0,
+                ...(typeof cacheRead === "number" && Number.isFinite(cacheRead) && cacheRead >= 0
+                  ? { cachedInput: cacheRead }
+                  : {}),
               });
             }
             // agy has no separate error event: a provider quota, a failed
@@ -876,6 +1223,13 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
             // stops with nothing where the answer should be.
             const result = parseAntigravityTurnResult(payload);
             const ok = result.status === "SUCCESS";
+            // A person who pressed Stop gets a stopped turn, not a crash: agy
+            // may still flush a CANCELED or ERROR result on its way out, and
+            // that is the stop they asked for, not a failure to report.
+            if (!ok && retry.cancelled) {
+              settle(false, "interrupted");
+              break;
+            }
             if (!ok) {
               emit({
                 ...base(threadId, turnId),
@@ -891,6 +1245,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                 ? {
                     input: (payload.usage.input_tokens || 0) + (payload.usage.cache_read_tokens || 0),
                     output: payload.usage.output_tokens || 0,
+                    ...(typeof payload.usage.cache_read_tokens === "number" &&
+                    Number.isFinite(payload.usage.cache_read_tokens) && payload.usage.cache_read_tokens >= 0
+                      ? { cachedInput: payload.usage.cache_read_tokens }
+                      : {}),
                   }
                 : undefined,
             );
@@ -899,16 +1257,100 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       };
 
+      // ── deadlines ────────────────────────────────────────────────────────
+      // Said once the window is 80 % spent, on the same `notice` chip the
+      // host-control warning uses, so a stop never arrives unannounced.
+      let noticeCount = 0;
+      // One idle warning per turn: a long quiet spell that then resumes must
+      // not leave a fresh chip in the transcript every time it recurs.
+      let idleWarned = false;
+      const deadlineNotice = (title: string) => {
+        if (settled || retryScheduled) return;
+        const itemId = `${turnId}:deadline-notice-${++noticeCount}`;
+        emit({ ...base(threadId, turnId), type: "item.started", itemType: "tool", itemId, title, toolKind: "notice" });
+        emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+      };
+      const tripDeadline = (stopReason: "prompt_stall" | "prompt_timeout", message: string) => {
+        // A person already stopped this turn: the child's close settles it
+        // as interrupted, and a deadline firing in that gap is not a stall.
+        if (settled || retryScheduled || retry.cancelled) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message });
+        stop();
+        // prompt_stall and prompt_timeout are the stop reasons index.ts
+        // already treats as a possibly wedged session: the next turn starts a
+        // fresh conversation instead of resuming this one.
+        settle(false, stopReason);
+      };
+      const armIdle = () => {
+        if (settled || retryScheduled) return;
+        clearTimeout(idleTimer);
+        clearTimeout(idleWarnTimer);
+        const toolRunning = activeTools.size > 0;
+        const windowMs = toolRunning ? toolIdleMs : idleMs;
+        const warnMs = Math.round(windowMs * DEADLINE_WARN_FRACTION);
+        if (!idleWarned) {
+          idleWarnTimer = setTimeout(() => {
+            idleWarned = true;
+            deadlineNotice(
+              `Antigravity has gone quiet${toolRunning ? " while a tool runs" : ""}.  If nothing arrives in the next ${describeWindow(windowMs - warnMs)}, BotFleet stops the turn as stalled.`,
+            );
+          }, warnMs);
+          idleWarnTimer.unref?.();
+        }
+        idleTimer = setTimeout(
+          () =>
+            tripDeadline(
+              "prompt_stall",
+              `Antigravity sent nothing for ${describeWindow(windowMs)}${toolRunning ? " while a tool ran" : ""} and was stopped.`,
+            ),
+          windowMs,
+        );
+        idleTimer.unref?.();
+      };
+      // The hard ceiling runs from the start of the LOGICAL turn, so a
+      // relaunch inherits what is left of it rather than a fresh budget.
+      const armMax = () => {
+        const elapsed = Date.now() - retry.startedAt;
+        const warnIn = Math.round(maxMs * DEADLINE_WARN_FRACTION) - elapsed;
+        if (warnIn > 0) {
+          maxWarnTimer = setTimeout(
+            () =>
+              deadlineNotice(
+                `This turn is close to Antigravity's ${describeWindow(maxMs)} limit.  BotFleet stops it in ${describeWindow(maxMs - Math.round(maxMs * DEADLINE_WARN_FRACTION))} if it has not finished.`,
+              ),
+            warnIn,
+          );
+          maxWarnTimer.unref?.();
+        }
+        maxTimer = setTimeout(
+          () =>
+            tripDeadline(
+              "prompt_timeout",
+              `Antigravity ran past its ${describeWindow(maxMs)} limit and was stopped.`,
+            ),
+          Math.max(0, maxMs - elapsed),
+        );
+        maxTimer.unref?.();
+      };
+
       let buf = "";
       child.stdout.setEncoding("utf8"); // decode multibyte across chunk splits
       child.stdout.on("data", (chunk) => {
         buf += chunk;
         let nl;
+        let sawLine = false;
         while ((nl = buf.indexOf("\n")) !== -1) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
+          if (line.trim()) {
+            handleLine(line);
+            sawLine = true;
+          }
         }
+        // Any complete line is proof of life.  Re-armed AFTER the lines are
+        // handled, so a step that just went ACTIVE (or DONE) picks the
+        // window that matches it.
+        if (sawLine) armIdle();
       });
 
       let stderr = "";
@@ -923,10 +1365,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       // The turn must end when the child does, however it goes: a clean exit
-      // with no `result`, a crash, a kill, or a wedged process the watchdog
-      // reaps. Anything that leaves this unsettled leaves the bot busy with
-      // nothing on screen — the stuck-forever bug, of which a silently
-      // dropped quota was only the trigger.
+      // with no `result`, a crash, a kill, or a wedged process the idle or
+      // ceiling deadline reaps.  Anything that leaves this unsettled leaves
+      // the bot busy with nothing on screen — the stuck-forever bug, of which
+      // a silently dropped quota was only the trigger.
       let exitDrain: ReturnType<typeof setTimeout> | undefined;
       const finishOnChildGone = (code: number | null, signal: NodeJS.Signals | null) => {
         childClosed = true;
@@ -935,13 +1377,21 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         clearTimeout(terminationEscalation);
         clearTimeout(exitDrain);
         finalizeMcp();
-        if (settled) return;
+        if (settled || retryScheduled) return;
+        // Stop is not a crash.  The person (or a forced quiesce) asked for
+        // this child to die, so its SIGTERM is the expected ending: settle
+        // as interrupted, with no runtime.error for Sentry to page on.
+        if (retry.cancelled) {
+          settle(false, "interrupted");
+          return;
+        }
         const how = code === null && signal ? `was killed by ${signal}` : `exited ${code}`;
-        emit({
-          ...base(threadId, turnId),
-          type: "runtime.error",
-          message: `agy ${how} before result${stderr ? `: ${stderrExcerpt(stderr)}` : ""}`,
-        });
+        const message = `agy ${how} before result${stderr ? `: ${stderrExcerpt(stderr)}` : ""}`;
+        // The mount lease is already released above, so the relaunch queues
+        // for it honestly instead of deadlocking on a lease this turn still
+        // holds.
+        if (maybeRetry({ exitCode: code, stderr: message })) return;
+        emit({ ...base(threadId, turnId), type: "runtime.error", message });
         settle(false, "exit_before_result");
       };
 
@@ -959,23 +1409,22 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         exitDrain.unref?.();
       });
 
-      active.set(threadId, { stop, turnId });
+      // Wrapped, not bare: a person who stops this turn has stopped the WHOLE
+      // turn, and the child's close must not then read as a transient failure
+      // worth relaunching.  `stop` stays unwrapped for the driver's own use.
+      active.set(threadId, {
+        stop: () => {
+          retry.cancelled = true;
+          retryAbort.abort();
+          clearDeadlines();
+          stop();
+        },
+        turnId,
+      });
       pending.delete(threadId);
 
-      // 11 min — just above agy's own 10m --print-timeout, so agy normally
-      // settles first; this is the backstop for a fully wedged child.
-      watchdog = setTimeout(() => {
-        if (!settled) {
-          emit({
-            ...base(threadId, turnId),
-            type: "runtime.error",
-            message: "Antigravity: the agy CLI stopped responding and never finished this turn — ending it after 11 minutes.",
-          });
-          stop();
-          settle(false, "timeout");
-        }
-      }, 11 * 60_000);
-      watchdog.unref?.();
+      armIdle();
+      armMax();
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
 

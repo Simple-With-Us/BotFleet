@@ -143,4 +143,30 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       result: { sessionId: "ok", seen: [[]] },
     });
   });
+
+  it("exits cleanly when sent SIGTERM without hanging or leaking the process", async () => {
+    scratch = mkdtempSync(join(tmpdir(), "botfleet-dsh-bridge-"));
+    const fake = join(scratch, "sleep.mjs");
+    writeFileSync(
+      fake,
+      `import readline from "node:readline";
+readline.createInterface({ input: process.stdin });
+setInterval(() => {}, 10_000);
+`,
+    );
+    chmodSync(fake, 0o755);
+    child = spawn(process.execPath, ["--experimental-strip-types", BRIDGE, "--", process.execPath, fake], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    child.kill("SIGTERM");
+    const [code, signal] = await Promise.race([
+      once(child, "exit"),
+      new Promise<[never, never]>((_, reject) =>
+        setTimeout(() => reject(new Error("bridge failed to exit within timeout after SIGTERM")), 4000),
+      ),
+    ]);
+    expect(signal === "SIGTERM" || code !== null).toBe(true);
+    child = null;
+  });
 });

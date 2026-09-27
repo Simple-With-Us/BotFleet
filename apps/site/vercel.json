@@ -1,4 +1,5 @@
 {
+  "git": {"deploymentEnabled": {"**": false, "main": true}},
   "outputDirectory": ".",
   "cleanUrls": true,
   "trailingSlash": false,

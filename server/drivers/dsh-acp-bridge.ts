@@ -96,9 +96,12 @@ function main(): void {
     env: process.env,
   });
 
+  let inbound: readline.Interface | null = null;
   const finish = (code: number | null, signal: NodeJS.Signals | null) => {
     cleanup();
+    inbound?.close();
     if (signal) {
+      process.removeAllListeners(signal);
       process.kill(process.pid, signal);
       return;
     }
@@ -106,12 +109,13 @@ function main(): void {
   };
   child.on("error", (error) => {
     cleanup();
+    inbound?.close();
     process.stderr.write(`dsh-acp-bridge: failed to spawn ${parsed.command}: ${error.message}\n`);
     process.exit(1);
   });
   child.on("exit", finish);
 
-  const inbound = readline.createInterface({ input: process.stdin });
+  inbound = readline.createInterface({ input: process.stdin });
   inbound.on("line", (line) => {
     if (!child.stdin.writable) return;
     child.stdin.write(`${rewriteAcpNdjsonLine(line)}\n`);
@@ -123,7 +127,13 @@ function main(): void {
   child.stderr.pipe(process.stderr);
 
   const stop = (signal: NodeJS.Signals) => {
-    if (child.killed || child.exitCode !== null) return;
+    if (child.killed || child.exitCode !== null) {
+      cleanup();
+      inbound?.close();
+      process.removeAllListeners(signal);
+      process.kill(process.pid, signal);
+      return;
+    }
     child.kill(signal);
   };
   process.on("SIGTERM", () => stop("SIGTERM"));

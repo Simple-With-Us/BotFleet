@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,9 +20,12 @@ import {
   dshVersionCompatibilityReason,
   dshWrapSpawn,
   DshAgentDriver,
+  DSH_INIT_TIMEOUT_MS,
   DSH_MINIMUM_ACP_VERSION,
+  readDshModelCatalog,
   STATIC_DSH_MODELS,
 } from "./dsh.ts";
+import { resolveInitDeadline } from "./init-deadline.ts";
 import type { AcpStdioMcpServer } from "./core.ts";
 import { dshMcpPatchYaml, isStockDshCli, writeDshMcpPatch } from "./dsh-mcp.ts";
 
@@ -91,6 +94,17 @@ describe("DshAgentDriver config", () => {
     expect(dshVersionCompatibilityReason("development build")).toMatch(/0\.1\.5-rc\.1 or newer/);
     expect(dshVersionCompatibilityReason("development build", "/opt/dsh-wrapper")).toBeNull();
   });
+
+  // `dsh --profile acp` answers initialize only after loading its whole
+  // Cordis plugin graph; the shared 60 s default cut those boots off.
+  it("gives the heavy DSH cold boot a longer, still load-scaled initialize deadline", () => {
+    expect(dshSupport.initTimeoutMs).toBe(DSH_INIT_TIMEOUT_MS);
+    expect(DSH_INIT_TIMEOUT_MS).toBe(120_000);
+    const quiet = resolveInitDeadline({ engineBaseMs: dshSupport.initTimeoutMs, load: { load1: 4, cores: 10 } });
+    expect(quiet.timeoutMs).toBe(120_000);
+    const busy = resolveInitDeadline({ engineBaseMs: dshSupport.initTimeoutMs, load: { load1: 20, cores: 10 } });
+    expect(busy.timeoutMs).toBe(240_000);
+  });
 });
 
 describe("native DSH ACP turns", () => {
@@ -112,6 +126,7 @@ describe("native DSH ACP turns", () => {
     delete process.env.FAKE_ACP_REASONING_EFFORTS;
     delete process.env.FAKE_ACP_REASONING_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
+    delete process.env.FAKE_ACP_USAGE_UPDATE;
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -160,6 +175,28 @@ describe("native DSH ACP turns", () => {
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: pro } },
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "reasoning_effort", value: "max" } },
     ]);
+  });
+
+  it("reports input tokens (no fabricated output) from DSH's usage_update notification", async () => {
+    // The real @deepseek-ai/dsh-acp package never puts usage on the
+    // session/prompt result — its only signal is a session/update
+    // sessionUpdate:"usage_update" notification carrying a combined
+    // context-occupancy figure, not a real input/output split.  This is
+    // the regression test for BOTFLEET's fix: DSH turns used to report no
+    // token usage at all.
+    process.env.FAKE_ACP_USAGE_UPDATE = "1234";
+    await create();
+
+    await instance!.adapter.sendTurn({ threadId: "dsh-usage-turn", text: "how many tokens" });
+    const done = await recorder!.until((event) => event.type === "turn.completed");
+
+    expect(recorder!.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "thread.token-usage.updated", input: 1234 }),
+    ]));
+    const liveUpdate = recorder!.events.find((event) => event.type === "thread.token-usage.updated");
+    expect(liveUpdate).not.toHaveProperty("output");
+    expect(done).toMatchObject({ ok: true, usage: { input: 1234 } });
+    expect(done).not.toHaveProperty("usage.output");
   });
 
   it("uses session/resume because current DSH rejects session/load", async () => {
@@ -434,5 +471,157 @@ describe("dsh authentication and credentials", () => {
         { cli: "dsh", fullAuto: false },
       ),
     ).toBe(false);
+  });
+});
+
+// The DSH engine's catalog comes from the Harness install's own settings file
+// so a new profile model shows up without a BotFleet release.  The static
+// catalog is the floor, and because a DSH profile is *partial* (it often
+// configures only the minimax provider) the live read unions rather than
+// replaces — the same call readClaudeModelCatalog makes.
+describe("readDshModelCatalog", () => {
+  let home: string;
+  const STATIC_IDS = STATIC_DSH_MODELS.options.map((option) => option.id);
+
+  const writeSettings = (yaml: string) => {
+    mkdirSync(join(home, ".dsh"), { recursive: true });
+    writeFileSync(join(home, ".dsh", "settings.yaml"), yaml, "utf8");
+  };
+
+  /** The live file shape: providers nested under llm-pi-ai. */
+  const llmPiAi = (blocks: string) => `llm-pi-ai:\n  providers:\n${blocks}`;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "dsh-settings-"));
+  });
+
+  afterEach(() => {
+    removeTempDir(home);
+  });
+
+  it("adds a model the static catalog has never heard of", () => {
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n        - id: MiniMax-M4\n"));
+    const catalog = readDshModelCatalog({ HOME: home });
+    expect(catalog.options.map((option) => option.id)).toContain("MiniMax-M4");
+  });
+
+  it("keeps every static row, because a DSH profile is a partial source", () => {
+    // This profile configures only the minimax provider.  deepseek-v4-flash is
+    // the static default and is still reachable, so the live read must not drop
+    // it -- that would silently remove a working engine from the picker.
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n"));
+    const catalog = readDshModelCatalog({ HOME: home });
+    for (const id of STATIC_IDS) expect(catalog.options.map((option) => option.id)).toContain(id);
+  });
+
+  it("never moves the default, since the union always contains it", () => {
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M9\n"));
+    expect(readDshModelCatalog({ HOME: home }).default).toBe(STATIC_DSH_MODELS.default);
+  });
+
+  it("reads the live nesting under llm-pi-ai.providers", () => {
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M7\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toContain("MiniMax-M7");
+  });
+
+  it("also reads a top-level providers map", () => {
+    writeSettings("providers:\n  minimax:\n    models:\n      - id: MiniMax-M6\n");
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toContain("MiniMax-M6");
+  });
+
+  it("falls back to the id when an entry has no name", () => {
+    // Regression: `??` does not fall through on an empty string, so a model
+    // the static catalog has never heard of rendered with a blank label.
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M8\n"));
+    const row = readDshModelCatalog({ HOME: home }).options.find((o) => o.id === "MiniMax-M8");
+    expect(row?.label).toBe("MiniMax-M8");
+  });
+
+  it("falls back to the id when an entry name is whitespace only", () => {
+    writeSettings(llmPiAi('    minimax:\n      models:\n        - id: MiniMax-M8\n          name: "   "\n'));
+    const row = readDshModelCatalog({ HOME: home }).options.find((o) => o.id === "MiniMax-M8");
+    expect(row?.label).toBe("MiniMax-M8");
+  });
+
+  it("takes a live contextWindow for a known id", () => {
+    const known = STATIC_DSH_MODELS.options[0].id;
+    writeSettings(llmPiAi(`    minimax:\n      models:\n        - id: ${known}\n          contextWindow: 2000000\n`));
+    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === known);
+    expect(row?.contextWindow).toBe(2_000_000);
+  });
+
+  it("keeps the hand-written label for a model it already knows", () => {
+    const known = STATIC_DSH_MODELS.options.find((option) => option.id === "MiniMax-M3")!;
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n          name: Renamed By Profile\n"));
+    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3");
+    expect(row?.label).toBe(known.label);
+  });
+
+  it("still drops MiniMax-M2.7 when the settings file offers it", () => {
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M2.7\n        - id: MiniMax-M3\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).not.toContain("MiniMax-M2.7");
+  });
+
+  it("merges several provider blocks into one catalog", () => {
+    writeSettings(llmPiAi(
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3\n",
+    ));
+    const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
+    expect(ids).toContain("deepseek-v4-pro");
+    expect(ids).toContain("MiniMax-M3");
+  });
+
+  it("falls back to the static catalog when there is no settings file", () => {
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("falls back to the static catalog on unparseable YAML", () => {
+    writeSettings("llm-pi-ai: [ this: is: not: valid\n\t- nope");
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("falls back to the static catalog when there is no models block", () => {
+    writeSettings(llmPiAi("    minimax:\n      apiKeyEnv: MINIMAX_API_KEY\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("falls back to the static catalog when the provider map is empty", () => {
+    writeSettings(llmPiAi("    {}\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("ignores a provider whose models are not a list", () => {
+    writeSettings(llmPiAi("    minimax:\n      models: nope\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("ignores a malformed model row instead of emitting a nameless option", () => {
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: ''\n        - id: 7\n        - nonsense\n"));
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toEqual(STATIC_IDS);
+  });
+
+  it("honors DSH_HOME over HOME", () => {
+    const alt = mkdtempSync(join(tmpdir(), "dsh-alt-home-"));
+    try {
+      // DSH_HOME is a home dir, so settings.yaml lives under its .dsh/.
+      mkdirSync(join(alt, "elsewhere", ".dsh"), { recursive: true });
+      writeFileSync(
+        join(alt, "elsewhere", ".dsh", "settings.yaml"),
+        "llm-pi-ai:\n  providers:\n    minimax:\n      models:\n        - id: MiniMax-M9\n",
+        "utf8",
+      );
+      const catalog = readDshModelCatalog({ HOME: home, DSH_HOME: join(alt, "elsewhere") });
+      expect(catalog.options.map((o) => o.id)).toContain("MiniMax-M9");
+    } finally {
+      removeTempDir(alt);
+    }
+  });
+
+  it("reads the real install's settings.yaml without dropping a static row", () => {
+    // Guards the regression this design exists to prevent: on a machine whose
+    // profile declares only the minimax provider, a wholesale replace would
+    // delete the DeepSeek rows.
+    const real = readDshModelCatalog({});
+    for (const id of STATIC_IDS) expect(real.options.map((o) => o.id)).toContain(id);
   });
 });

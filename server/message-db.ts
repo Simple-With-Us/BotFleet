@@ -24,6 +24,7 @@ let handlePath: string | null = null;
 
 function open(): DatabaseSync {
   const file = DB_FILE();
+  const isNewFile = !existsSync(file);
   // Transcripts can contain private conversations and tool output. Create
   // the database with owner-only permissions and also repair an existing
   // file that may have inherited a permissive umask.
@@ -32,6 +33,20 @@ function open(): DatabaseSync {
     chmodSync(file, 0o600);
   } catch {}
   const db = new DatabaseSync(file);
+  // auto_vacuum only takes effect set on an EMPTY database (SQLite ignores
+  // it once a table exists, short of a full VACUUM), so this only ever runs
+  // for a file this call just created — before journal_mode or the first
+  // CREATE TABLE below writes a page. It lets pruneDeadThreads's freed pages
+  // be reclaimed incrementally instead of sitting dead in the file until the
+  // next freelist-triggered VACUUM.
+  if (isNewFile) {
+    try {
+      db.exec("PRAGMA auto_vacuum = INCREMENTAL");
+    } catch {
+      // an older node:sqlite build without the pragma still works correctly;
+      // it just leaves reclaiming freed pages to VACUUM alone
+    }
+  }
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec(`
@@ -84,6 +99,36 @@ export function readThread(threadId: string, legacyFile: string): ThreadRows {
       .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
       .get(threadId) as { active_leaf_id: string | null } | undefined;
     return { messages: rows.map(rowToMessage), activeLeafId: state?.active_leaf_id ?? null };
+  }
+  return importLegacy(threadId, legacyFile);
+}
+
+export interface ThreadTailRows extends ThreadRows {
+  /** `true` means older rows exist beyond this page; `false` means the SQL
+   * read returned the complete thread. Absent for a full legacy import.
+   * Both false and absent results can be cached as a full load. */
+  hasMore?: boolean;
+}
+
+/** The newest `limit` rows only, read at the SQL boundary — the fast path
+ * for a display page (the GET /api/bots hydrate, a fresh scrollback view)
+ * that never needs the rest of a long transcript. Reading every thread in
+ * full through readThread() and caching it forever was the likely driver
+ * of the harness's unbounded RSS (HS12/HS21). Falls back to a full legacy
+ * import on first touch, same as readThread(); that read is a one-time
+ * migration cost regardless of how much of the result the caller keeps. */
+export function readThreadTail(threadId: string, legacyFile: string, limit: number): ThreadTailRows {
+  const rows = db()
+    .prepare("SELECT json FROM messages WHERE thread_id = ? ORDER BY rowid DESC LIMIT ?")
+    .all(threadId, limit + 1) as Array<{ json: string }>;
+  if (rows.length) {
+    const hasMore = rows.length > limit;
+    if (hasMore) rows.length = limit;
+    rows.reverse();
+    const state = db()
+      .prepare("SELECT active_leaf_id FROM thread_state WHERE thread_id = ?")
+      .get(threadId) as { active_leaf_id: string | null } | undefined;
+    return { messages: rows.map(rowToMessage), activeLeafId: state?.active_leaf_id ?? null, hasMore };
   }
   return importLegacy(threadId, legacyFile);
 }
@@ -165,6 +210,147 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
 export function deleteThread(threadId: string): void {
   db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
   db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
+}
+
+/** Freelist bytes above which `pruneDeadThreads` runs a full `VACUUM`
+ * (HS2's 251 MB / 58,532-row database was almost entirely dead pages from
+ * `pruneScreenFrames` rewriting rows in place rather than shrinking the
+ * file). Exposed so a test can force the VACUUM branch without allocating
+ * tens of megabytes to build a real freelist that size. */
+export const DEFAULT_VACUUM_THRESHOLD_BYTES = 32 * 1024 * 1024;
+
+/** How long a thread must sit outside the live set before its rows are
+ * eligible — the same 7-day bar `transcript-retention.ts`'s orphan sweep
+ * uses, so a thread that stopped being used is not treated any less
+ * carefully here than its logs are. */
+export const DEFAULT_PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Refuse to prune when dead threads would be this large a share of every
+ * thread the database holds.  A normal trickle of bot/task/group deletions
+ * is a small fraction of the database; anything near "most of it" reads as
+ * a store that failed to load, not organic cleanup — the same shape of risk
+ * `Store`'s own constructor already guards against for `bots.json` (a file
+ * that exists but fails to parse must not be read as "no bots"). */
+export const DEFAULT_MAX_DEAD_SHARE = 0.5;
+
+export interface PruneResult {
+  /** rows deleted for real, or that a dry run confirms it would delete */
+  messagesDeleted: number;
+  threadStateDeleted: number;
+  vacuumed: boolean;
+  dryRun: boolean;
+  /** set when candidates existed but the sweep declined to touch anything —
+   *  an empty live set against a nonempty database (the likeliest read is a
+   *  store that failed to load, not one with zero bots and real history),
+   *  or dead threads crossing `maxDeadShare`.  Set on a dry run too, so a
+   *  preview never claims a delete that a real run would refuse. */
+  refused?: "empty-live-set" | "dead-share-too-large";
+}
+
+/** Delete every `messages` and `thread_state` row whose thread id is BOTH
+ * not in `liveThreadIds` AND has had no message for `maxAgeMs` (a
+ * thread_state row with no messages behind it has nothing to date by, and
+ * is low-risk enough — a few dozen bytes, no content — to treat as always
+ * old enough), then VACUUM only when that freed enough pages to be worth the
+ * exclusive lock a VACUUM holds.  `deleteThread` already does the same
+ * per-thread delete on an explicit removal, but nothing before this ever
+ * swept the threads a bot/task/group delete missed (harness down at the
+ * time, a pre-this-fix build) or ran the file-shrinking VACUUM at all.
+ *
+ * Two refusals sit in front of the delete, both live under dry run too so a
+ * preview is never rosier than reality: `liveThreadIds` empty against a
+ * nonempty database, and the dead share crossing `maxDeadShare`.  Both exist
+ * for the same reason — an empty or partial `liveThreadIds` from a store
+ * that failed to load looks, from here, identical to "the user deleted
+ * everything", and this delete has no undo once `VACUUM` runs.
+ *
+ * `liveThreadIds` is the caller's job to build: every bot's active and task
+ * threads, every group's active and task threads — the same set the
+ * transcript orphan sweep uses, so a thread the store still knows about is
+ * never at risk here either. */
+export function pruneDeadThreads(
+  liveThreadIds: Iterable<string>,
+  opts: { now?: number; maxAgeMs?: number; vacuumThresholdBytes?: number; maxDeadShare?: number; dryRun?: boolean } = {},
+): PruneResult {
+  const live = new Set(liveThreadIds);
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_PRUNE_AGE_MS;
+  const maxDeadShare = opts.maxDeadShare ?? DEFAULT_MAX_DEAD_SHARE;
+  const dryRun = opts.dryRun ?? false;
+  const database = db();
+  const base = { messagesDeleted: 0, threadStateDeleted: 0, vacuumed: false, dryRun };
+
+  const allIds = new Set<string>();
+  for (const row of database.prepare("SELECT DISTINCT thread_id FROM messages").all() as Array<{ thread_id: string }>) {
+    allIds.add(row.thread_id);
+  }
+  for (const row of database.prepare("SELECT thread_id FROM thread_state").all() as Array<{ thread_id: string }>) {
+    allIds.add(row.thread_id);
+  }
+
+  if (live.size === 0 && allIds.size > 0) {
+    return { ...base, refused: "empty-live-set" };
+  }
+
+  const newestByThread = new Map<string, number>();
+  for (const row of database
+    .prepare("SELECT thread_id, MAX(at) AS max_at FROM messages GROUP BY thread_id")
+    .all() as Array<{ thread_id: string; max_at: number }>) {
+    newestByThread.set(row.thread_id, row.max_at);
+  }
+
+  const dead: string[] = [];
+  for (const id of allIds) {
+    if (live.has(id)) continue;
+    const newest = newestByThread.get(id);
+    if (newest !== undefined && now - newest < maxAgeMs) continue; // too recent to touch
+    dead.push(id);
+  }
+
+  if (allIds.size > 0 && dead.length / allIds.size > maxDeadShare) {
+    return { ...base, refused: "dead-share-too-large" };
+  }
+  if (dead.length === 0) return base;
+
+  if (dryRun) {
+    const countMessages = database.prepare("SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?");
+    const countState = database.prepare("SELECT COUNT(*) AS n FROM thread_state WHERE thread_id = ?");
+    let messagesDeleted = 0;
+    let threadStateDeleted = 0;
+    for (const id of dead) {
+      messagesDeleted += (countMessages.get(id) as { n: number } | undefined)?.n ?? 0;
+      threadStateDeleted += (countState.get(id) as { n: number } | undefined)?.n ?? 0;
+    }
+    return { ...base, messagesDeleted, threadStateDeleted };
+  }
+
+  let messagesDeleted = 0;
+  let threadStateDeleted = 0;
+  const deleteMessages = database.prepare("DELETE FROM messages WHERE thread_id = ?");
+  const deleteState = database.prepare("DELETE FROM thread_state WHERE thread_id = ?");
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    for (const threadId of dead) {
+      messagesDeleted += Number(deleteMessages.run(threadId).changes ?? 0);
+      threadStateDeleted += Number(deleteState.run(threadId).changes ?? 0);
+    }
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+
+  const threshold = opts.vacuumThresholdBytes ?? DEFAULT_VACUUM_THRESHOLD_BYTES;
+  const freelistRow = database.prepare("PRAGMA freelist_count").get() as { freelist_count: number } | undefined;
+  const pageSizeRow = database.prepare("PRAGMA page_size").get() as { page_size: number } | undefined;
+  const freelist = freelistRow?.freelist_count ?? 0;
+  const pageSize = pageSizeRow?.page_size ?? 0;
+  let vacuumed = false;
+  if (freelist * pageSize > threshold) {
+    database.exec("VACUUM");
+    vacuumed = true;
+  }
+  return { messagesDeleted, threadStateDeleted, vacuumed, dryRun };
 }
 
 export interface SearchHit {

@@ -78,6 +78,33 @@ export function coalesce(candidates: readonly GapCandidate[], key: string): GapD
  * the 700 KB prompt that timed out Grok ACP and then failed Antigravity. */
 export const MAX_FOLD_CHARS = 64_000;
 
+interface ExtractedInstruction {
+  header?: string;
+  body: string;
+}
+
+const UNTRUSTED_CLOSE_TAG = "[/UNTRUSTED WEBHOOK EVENT DATA]";
+
+/** Cut one delivery section to `budget` chars without losing the closing
+ * untrusted-data delimiter: a bare slice would leave everything after it
+ * (the rest of the batch prompt) inside the untrusted block. */
+function truncateSection(section: string, budget: number): string {
+  if (section.length <= budget) return section;
+  if (!section.endsWith(UNTRUSTED_CLOSE_TAG)) return section.slice(0, budget);
+  const marker = "\n[Event data truncated for length]\n";
+  const contentBudget = Math.max(0, budget - marker.length - UNTRUSTED_CLOSE_TAG.length);
+  return `${section.slice(0, contentBudget)}${marker}${UNTRUSTED_CLOSE_TAG}`;
+}
+
+function extractInstruction(prompt: string): ExtractedInstruction {
+  const trimmed = prompt.trim();
+  const match = trimmed.match(
+    /^(\[(USER-CONFIGURED WEBHOOK INSTRUCTIONS|DEFAULT WEBHOOK INSTRUCTIONS|AUTHENTICATED WEBHOOK TASK)\][\s\S]*?\[\/\2\])\s*([\s\S]*)$/,
+  );
+  if (!match) return { body: trimmed };
+  return { header: match[1]!.trim(), body: match[3]!.trim() };
+}
+
 /** The one prompt a folded batch runs.
  *
  * Identical prompts are the common case — one webhook, one template — so
@@ -95,6 +122,58 @@ export function foldPrompts(decision: GapDecision): string {
       : `${distinct[0]}\n\n(${prompts.length} deliveries arrived while this trigger was waiting.  They are identical; handle them together.)`;
   }
   const header = `${prompts.length} deliveries arrived while this trigger was waiting.  Handle them together.`;
+
+  const parsed = distinct.map(extractInstruction);
+  const firstHeader = parsed[0]?.header;
+  const allShareHeader = Boolean(firstHeader) && parsed.every((p) => p.header === firstHeader);
+
+  if (allShareHeader && firstHeader) {
+    const bodies = parsed.map((p) => p.body);
+    const sections = bodies.map((body, index) => `--- Delivery ${index + 1} ---\n${body}`);
+
+    const maxHeaderBudget = Math.floor(MAX_FOLD_CHARS / 2);
+    let effectiveHeader = firstHeader;
+    if (effectiveHeader.length > maxHeaderBudget) {
+      const tagMatch = effectiveHeader.match(
+        /^(\[(USER-CONFIGURED WEBHOOK INSTRUCTIONS|DEFAULT WEBHOOK INSTRUCTIONS|AUTHENTICATED WEBHOOK TASK)\])([\s\S]*?)(\[\/\2\])$/,
+      );
+      if (tagMatch) {
+        const openTag = tagMatch[1]!;
+        const closeTag = tagMatch[4]!;
+        const truncationMarker = "\n[Instructions truncated for length]\n";
+        const contentBudget = Math.max(
+          0,
+          maxHeaderBudget - openTag.length - closeTag.length - truncationMarker.length,
+        );
+        const truncatedContent = tagMatch[3]!.slice(0, contentBudget);
+        effectiveHeader = `${openTag}${truncatedContent}${truncationMarker}${closeTag}`;
+      } else {
+        const truncationMarker = "\n[Instructions truncated for length]";
+        effectiveHeader =
+          effectiveHeader.slice(0, maxHeaderBudget - truncationMarker.length) + truncationMarker;
+      }
+    }
+
+    const full = [effectiveHeader, header, ...sections].join("\n\n");
+    if (full.length <= MAX_FOLD_CHARS) return full;
+    // Newest conclusions matter for compile-gate.  Keep from the end.
+    const omitted = "[Earlier deliveries omitted for length]";
+    const kept: string[] = [];
+    let used = effectiveHeader.length + 2 + header.length + 2 + omitted.length;
+    for (let i = sections.length - 1; i >= 0; i--) {
+      const extra = 2 + sections[i]!.length;
+      if (kept.length > 0 && used + extra > MAX_FOLD_CHARS) break;
+      if (kept.length === 0 && used + extra > MAX_FOLD_CHARS) {
+        const budget = Math.max(0, MAX_FOLD_CHARS - used - 2);
+        kept.unshift(truncateSection(sections[i]!, budget));
+        break;
+      }
+      kept.unshift(sections[i]!);
+      used += extra;
+    }
+    return [effectiveHeader, header, omitted, ...kept].join("\n\n");
+  }
+
   const sections = distinct.map((prompt, index) => `--- ${index + 1} ---\n${prompt}`);
   const full = [header, ...sections].join("\n\n");
   if (full.length <= MAX_FOLD_CHARS) return full;
@@ -107,7 +186,7 @@ export function foldPrompts(decision: GapDecision): string {
     if (kept.length > 0 && used + extra > MAX_FOLD_CHARS) break;
     if (kept.length === 0 && used + extra > MAX_FOLD_CHARS) {
       const budget = Math.max(0, MAX_FOLD_CHARS - used - 2);
-      kept.unshift(sections[i]!.slice(0, budget));
+      kept.unshift(truncateSection(sections[i]!, budget));
       break;
     }
     kept.unshift(sections[i]!);

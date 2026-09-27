@@ -6,8 +6,137 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { STATIC_ANTIGRAVITY_MODELS } from "./antigravity-models.ts";
+import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
+
+/** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
+ *  gemini-3.1-pro-high/low yields ids the engine rejects.  Prefer the
+ *  same-family Flash when the catalog has one (2.5), else the newest Flash
+ *  at the same tier, else the catalog default. */
+const ANTIGRAVITY_FLASH_BY_TIER: Record<string, string> = {
+  high: "gemini-3.8-flash-high",
+  medium: "gemini-3.8-flash-medium",
+  low: "gemini-3.8-flash-low",
+};
+
+function antigravityFlashModel(model: string): string {
+  // Only built-in catalog routes are swapped.  A custom or local-inject
+  // model the operator configured (any id outside the static catalog, even
+  // one containing "-pro") is their chosen route and stays as configured.
+  if (!STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === model)) return model;
+  const candidate = model.replace("-pro", "-flash");
+  if (candidate === model) return model;
+  if (STATIC_ANTIGRAVITY_MODELS.options.some((option) => option.id === candidate)) {
+    return candidate;
+  }
+  const tier = /-(high|medium|low)$/.exec(model)?.[1];
+  return (tier && ANTIGRAVITY_FLASH_BY_TIER[tier]) || STATIC_ANTIGRAVITY_MODELS.default;
+}
+
+const OFFICIAL_CLAUDE_SONNET_OPUS_ID = /^claude-(sonnet|opus)-\d+(-\d+)?(-\d{8})?$/;
+
+function isBuiltInClaudeSonnetOrOpus(model: string): boolean {
+  if (!/^claude-(sonnet|opus)-/.test(model)) return false;
+  return (
+    STATIC_CLAUDE_MODELS.options.some((option) => option.id === model) ||
+    OFFICIAL_CLAUDE_SONNET_OPUS_ID.test(model)
+  );
+}
+
+/** A turn inherits the bot's unattended mark only when it continues work that
+ *  mark covers: a card continuation or delegated (commsDepth > 0) work.  A
+ *  scheduled or manual run, or a typed turn, is decided by its own automation
+ *  source, so a webhook's leftover mark (30 min TTL) cannot silently drop it
+ *  to the unattended model.  An explicit caller flag always wins. */
+export function inheritedUnattended(
+  opts: { unattended?: boolean; cardContinuation?: boolean; commsDepth?: number } | undefined,
+  isMarked: () => boolean,
+): boolean {
+  if (opts?.unattended !== undefined) return opts.unattended;
+  const continues = Boolean(opts?.cardContinuation) || (opts?.commsDepth ?? 0) > 0;
+  return continues && isMarked();
+}
+
+/** Downgrade the model for an unattended turn: explicit unattended turns
+ *  and fresh automation deliveries (webhook/resource triggers pass
+ *  automationSource, not unattended).  A caller-supplied modelSelection
+ *  is the caller's choice and is never downgraded.
+ *
+ *  Effort goes only when the selected model offers "low": stamping it from
+ *  engine-wide effortLevels alone 409s startTurn when the model-specific
+ *  modelEffortLevels() list is nonempty but omits "low".  The caller may
+ *  pass a static list or a per-model resolver (preferred; evaluated on the
+ *  post-rewrite id). */
+export function unattendedModelDowngrade(
+  selection: ModelSelection,
+  opts: {
+    unattended?: boolean;
+    automationSource?: string;
+    hasExplicitSelection?: boolean;
+    /** Model-specific allowed efforts for the (post-rewrite) model, or a
+     *  resolver that returns them.  Engine-wide capabilities.effortLevels
+     *  alone is not enough — gate "low" the same way startTurn does. */
+    effortLevels?: readonly string[] | ((model: string) => readonly string[] | undefined);
+    /** Driver kind of the selected instance (e.g. "claudeAgent").  Custom
+     *  instances under arbitrary ids share their driver's downgrade family.
+     *  When present but not a known family, do not fall back to instanceId
+     *  (a reserved-looking id mapped to openai-compat must not get Claude
+     *  Sonnet→Haiku).  Only use instanceId when driverKind is missing. */
+    driverKind?: string;
+    /** Quota cooldowns vetted the pre-downgrade model; the rewrite must not
+     *  route onto a cheaper model that is itself cooling down. */
+    isCooling?: (instanceId: string, model: string) => boolean;
+  },
+): ModelSelection {
+  if (opts.hasExplicitSelection) return selection;
+  const automated =
+    Boolean(opts.unattended) ||
+    opts.automationSource === "webhook" ||
+    opts.automationSource === "resource";
+  if (!automated) return selection;
+  // Resolve the downgrade family from the driver kind so operator-added
+  // instances ("claude2", "gravity") get the same cheaper-model treatment
+  // as the reserved ids.  Fall back to the instance id only when no kind
+  // is given (callers/tests that never resolve one).  A defined but unknown
+  // kind must not inherit the instance id — that would rewrite models for
+  // an openai-compat instance that happens to be named "claude".
+  const kind = opts.driverKind;
+  const family =
+    kind === "claudeAgent" ? "claude"
+    : kind === "antigravityAgent" ? "antigravity"
+    : kind?.includes("gemini") ? "gemini"
+    : kind != null && kind !== "" ? undefined
+    : selection.instanceId;
+  let model = selection.model;
+  if (family === "gemini") {
+    model = model.replace("-pro", "-flash");
+  } else if (family === "antigravity") {
+    model = antigravityFlashModel(model);
+  } else if (family === "claude") {
+    // Only built-in Claude Sonnet/Opus routes are swapped: ids in the static
+    // catalog, plus older official version ids (claude-sonnet-4-5,
+    // claude-opus-4-1-20250805) no longer listed there.  Local-inject ids
+    // (ollama::my-sonnet-model) and custom ids (claude-sonnet-5-custom) are
+    // the operator's chosen route; rewriting them would break
+    // applyClaudeInject host routing.
+    if (isBuiltInClaudeSonnetOrOpus(model)) {
+      // The driver's own current Haiku — claude-3-5-haiku-latest was a
+      // stale alias pinned before Haiku 4.5 shipped.
+      model = STATIC_CLAUDE_MODELS.options.find((o) => o.id.includes("haiku"))?.id
+        ?? "claude-haiku-4-5";
+    }
+  }
+  if (model !== selection.model && opts.isCooling?.(selection.instanceId, model)) {
+    return selection;
+  }
+  const levels =
+    typeof opts.effortLevels === "function" ? opts.effortLevels(model) : opts.effortLevels;
+  return levels?.includes("low")
+    ? { ...selection, model, effort: "low" }
+    : { ...selection, model };
+}
 
 export interface FallbackScanMessage {
   role: string;
@@ -181,7 +310,7 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation";
 
 export interface BootRecoveryResumeUser {
   role?: string;
@@ -325,15 +454,20 @@ export interface BotQuotaCooldown {
 function computeNextOccurrence(targetHour: number, targetMinute: number, tz: string | undefined, now: number): number {
   if (tz) {
     try {
+      // Built once per call, not once per candidate minute.  Constructing an
+      // Intl.DateTimeFormat loads ICU zone data and is by far the costliest
+      // step here; inside the loop it ran up to 2,160 times on the main
+      // thread for every zoned reset chip.  An unrecognized zone still
+      // throws from this constructor and still falls through to local time.
+      const formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hour: "numeric",
+        minute: "numeric",
+        hour12: false,
+      });
       // Find candidate timestamp within the next 36 hours matching the hour:minute in that tz
       for (let offsetMinutes = 1; offsetMinutes <= 36 * 60; offsetMinutes++) {
         const candidate = new Date(now + offsetMinutes * 60 * 1000);
-        const formatter = new Intl.DateTimeFormat("en-US", {
-          timeZone: tz,
-          hour: "numeric",
-          minute: "numeric",
-          hour12: false,
-        });
         const parts = formatter.formatToParts(candidate);
         const h = parseInt(parts.find((p) => p.type === "hour")?.value ?? "-1", 10);
         const m = parseInt(parts.find((p) => p.type === "minute")?.value ?? "-1", 10);

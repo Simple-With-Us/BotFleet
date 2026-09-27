@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { schemaIssue, type JsonValue } from "./schema.ts";
-import type { MausColor } from "./store.ts";
+import type { BotColor } from "./store.ts";
 
 export const TEAM_MANIFEST_FORMAT = "botfleet.team" as const;
 export const LEGACY_TEAM_MANIFEST_FORMATS = ["openmaus.team", "opengrok.team"] as const;
@@ -23,7 +23,7 @@ const COLORS = [
   "yellow",
   "teal",
   "coral",
-] as const satisfies readonly MausColor[];
+] as const satisfies readonly BotColor[];
 
 const requiredText = (max: number) =>
   z.string({ error: "must be text" }).trim().min(1, { message: "is required" }).max(max, { message: "is too long" });
@@ -91,7 +91,7 @@ export interface TeamManifestMember {
   title: string;
   description: string;
   appearance: {
-    color: MausColor;
+    color: BotColor;
     mascotExpression?: string;
   };
 }
@@ -136,7 +136,7 @@ interface ExportableBot {
   name: string;
   title: string;
   description: string;
-  color: MausColor;
+  color: BotColor;
   mascotExpression?: string | null;
 }
 
@@ -203,7 +203,7 @@ export interface ImportedMemberProfile {
   name: string;
   title: string;
   description: string;
-  color: MausColor;
+  color: BotColor;
   mascotExpression?: string;
 }
 

@@ -582,7 +582,9 @@ describe("pending queued chip", () => {
       queueId: "q1",
       text: "later",
     });
-    expect(queued.pendingQueued).toEqual({ t1: [{ queueId: "q1", text: "later" }] });
+    expect(queued.pendingQueued.t1).toEqual([
+      expect.objectContaining({ queueId: "q1", text: "later", at: expect.any(Number) }),
+    ]);
     const landed = reducer(queued, {
       type: "consumePendingQueued",
       threadId: "t1",
@@ -599,7 +601,9 @@ describe("pending queued chip", () => {
       queueId: "q-ml",
       text: "line one\nline two",
     });
-    expect(queued.pendingQueued).toEqual({ t1: [{ queueId: "q-ml", text: "line one\nline two" }] });
+    expect(queued.pendingQueued.t1).toEqual([
+      expect.objectContaining({ queueId: "q-ml", text: "line one\nline two", at: expect.any(Number) }),
+    ]);
     const landed = reducer(queued, {
       type: "consumePendingQueued",
       threadId: "t1",
@@ -620,7 +624,9 @@ describe("pending queued chip", () => {
       type: "botPatched",
       bot: { ...bot, threadId: "t2", messages: [] },
     });
-    expect(switched.pendingQueued).toEqual({ t1: [{ queueId: "q-stay", text: "stay here" }] });
+    expect(switched.pendingQueued.t1).toEqual([
+      expect.objectContaining({ queueId: "q-stay", text: "stay here", at: expect.any(Number) }),
+    ]);
     expect(switched.pendingQueued[switched.bots[0]!.threadId]).toBeUndefined();
     const drained = reducer(switched, {
       type: "consumePendingQueued",
@@ -644,18 +650,18 @@ describe("pending queued chip", () => {
       queueId: "qb",
       text: "same",
     });
-    expect(both.pendingQueued).toEqual({
-      t1: [
-        { queueId: "qa", text: "same" },
-        { queueId: "qb", text: "same" },
-      ],
-    });
+    expect(both.pendingQueued.t1).toEqual([
+      expect.objectContaining({ queueId: "qa", text: "same", at: expect.any(Number) }),
+      expect.objectContaining({ queueId: "qb", text: "same", at: expect.any(Number) }),
+    ]);
     const afterOther = reducer(both, {
       type: "consumePendingQueued",
       threadId: "t1",
       queueId: "qa",
     });
-    expect(afterOther.pendingQueued).toEqual({ t1: [{ queueId: "qb", text: "same" }] });
+    expect(afterOther.pendingQueued.t1).toEqual([
+      expect.objectContaining({ queueId: "qb", text: "same", at: expect.any(Number) }),
+    ]);
   });
 
   it("does not add a chip when the drain frame arrives before the POST continuation", () => {
@@ -715,6 +721,27 @@ describe("pending queued chip", () => {
       queueId: "q-drop",
     });
     expect(cancelled.pendingQueued).toEqual({});
+  });
+
+  it("stamps pending at once and keeps it stable across remember", () => {
+    const withBot = reducer(initialState, { type: "botPatched", bot });
+    const first = reducer(withBot, {
+      type: "pendingQueued",
+      threadId: "t1",
+      queueId: "q-stable",
+      text: "hold",
+      at: 1_700_000_000_000,
+    });
+    expect(first.pendingQueued.t1?.[0]?.at).toBe(1_700_000_000_000);
+    // Re-dispatching the same queueId is a no-op — stamp must not remint.
+    const again = reducer(first, {
+      type: "pendingQueued",
+      threadId: "t1",
+      queueId: "q-stable",
+      text: "hold",
+      at: 1_800_000_000_000,
+    });
+    expect(again.pendingQueued.t1?.[0]?.at).toBe(1_700_000_000_000);
   });
 });
 

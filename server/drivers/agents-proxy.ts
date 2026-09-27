@@ -211,16 +211,24 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     };
   }
   if (name === "list_routines") {
+    const routineId = typeof args.routine_id === "string" ? args.routine_id.trim() : "";
     const query = new URLSearchParams({ fromBotId: BOT_ID, fromThreadId: THREAD_ID });
+    if (routineId) query.set("routineId", routineId);
     const r = await api(`/api/internal/routines?${query.toString()}`);
     const routines = Array.isArray(r.routines) ? r.routines : [];
     const now = typeof r.now === "string" ? r.now : new Date().toISOString();
     const timeZone = typeof r.timeZone === "string" && r.timeZone ? r.timeZone : "local computer timezone";
-    if (!routines.length) {
+    if (r.routine) {
+      return { text: JSON.stringify({ now, timeZone, routine: r.routine }) };
+    }
+    // A budget-trimmed list must say so: pass the omitted count through, and
+    // never report "no routines" when rows were only cut for size.
+    const routinesOmitted = typeof r.routinesOmitted === "number" && r.routinesOmitted > 0 ? r.routinesOmitted : 0;
+    if (!routines.length && !routinesOmitted) {
       return { text: `This bot has no routines. Current time: ${now}. Timezone: ${timeZone}.` };
     }
     return {
-      text: `This bot's routines (current time: ${now}; timezone: ${timeZone}):\n${JSON.stringify(routines, null, 2)}`,
+      text: JSON.stringify({ now, timeZone, routines, ...(routinesOmitted ? { routinesOmitted } : {}) }),
     };
   }
   if (name === "propose_routine") {

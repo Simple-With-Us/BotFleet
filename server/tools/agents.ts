@@ -103,6 +103,7 @@ export interface AskBotRequestInput {
 export interface ListRoutinesRequestInput {
   fromBotId: string;
   fromThreadId?: string;
+  routineId?: string;
 }
 
 export interface DelegateBotRequestInput {
@@ -427,23 +428,33 @@ export function createAgentTools(deps: AgentToolDeps): AgentTools {
       };
     },
 
-    async list_routines(_call, ctx): Promise<TurnToolOutcome> {
+    async list_routines(call, ctx): Promise<TurnToolOutcome> {
+      const routineId = typeof call.arguments.routine_id === "string"
+        ? call.arguments.routine_id.trim()
+        : "";
       const result = await deps.executeListRoutinesRequest({
         fromBotId: ctx.botId,
         fromThreadId: ctx.threadId,
+        ...(routineId ? { routineId } : {}),
       });
       if (result.status !== 200) {
         const message = errorText(result.body, "routines are unavailable");
         return failed(JSON.stringify({ error: message }), message);
       }
       const routines = Array.isArray(result.body.routines) ? result.body.routines : [];
+      const routine = result.body.routine;
+      // A budget-trimmed list must say so, or it reads as complete.
+      const omitted = typeof result.body.routinesOmitted === "number" && result.body.routinesOmitted > 0
+        ? result.body.routinesOmitted
+        : 0;
+      const listed = routines.length === 1 ? "1 routine" : `${routines.length} routines`;
       return ok(
         JSON.stringify({
           now: result.body.now,
           timeZone: result.body.timeZone,
-          routines,
+          ...(routine ? { routine } : { routines, ...(omitted ? { routinesOmitted: omitted } : {}) }),
         }),
-        routines.length === 1 ? "1 routine" : `${routines.length} routines`,
+        routine ? "routine instructions" : omitted ? `${listed} (+${omitted} omitted)` : listed,
       );
     },
 

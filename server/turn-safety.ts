@@ -1,4 +1,5 @@
-import type { CloudBackend, ModelSelection } from "./contracts.ts";
+import { EFFORT_LEVELS, type CloudBackend, type ModelSelection, type EffortLevel } from "./contracts.ts";
+import { modelEffortLevels } from "../src/lib/model-effort.ts";
 
 /** The bot's computer settings as they were when a turn was dispatched, which
  * is what that turn mounted.  A later bot edit changes the stored grants but
@@ -9,7 +10,7 @@ export interface TurnComputerInputs {
   /** The destination an automation dispatched the turn to: a cloud routine,
    * webhook or resource trigger mounts the cloud computer whatever the bot's
    * own computers say. */
-  runOn?: "maus" | "cloud";
+  runOn?: "bot" | "cloud";
   /** The providers the turn actually mounted, once its computers resolved.
    * Auto can fall back from an unavailable cloud computer to This Computer,
    * so the grant alone over-counts what the turn holds. */
@@ -18,6 +19,10 @@ export interface TurnComputerInputs {
 
 export interface ActiveTurnOwner {
   dispatchId: number;
+  /** Monotonic dispatch time, including provider setup and retry backoff. */
+  startedAtMs: number;
+  /** Available only after this exact dispatch settles. */
+  latencyMs?: number;
   botId: string;
   selection: ModelSelection;
   fallbackPolicy: ModelSelection;
@@ -38,8 +43,13 @@ export class ActiveTurnOwners {
   private readonly byThread = new Map<string, Map<string, ActiveTurnOwner>>();
   private readonly latestDispatchByThread = new Map<string, number>();
   private nextDispatchId = 1;
+  private readonly now: () => number;
 
-  claim(threadId: string, owner: Omit<ActiveTurnOwner, "dispatchId">): ActiveTurnOwner {
+  constructor(now: () => number = () => performance.now()) {
+    this.now = now;
+  }
+
+  claim(threadId: string, owner: Omit<ActiveTurnOwner, "dispatchId" | "startedAtMs" | "latencyMs">): ActiveTurnOwner {
     let owners = this.byThread.get(threadId);
     if (!owners) {
       owners = new Map();
@@ -50,7 +60,7 @@ export class ActiveTurnOwners {
         `thread ${threadId} already has a live turn on provider instance ${owner.selection.instanceId}`,
       );
     }
-    const claimed = { ...owner, dispatchId: this.nextDispatchId++ };
+    const claimed = { ...owner, dispatchId: this.nextDispatchId++, startedAtMs: this.now() };
     owners.set(owner.selection.instanceId, claimed);
     this.latestDispatchByThread.set(threadId, claimed.dispatchId);
     return claimed;
@@ -130,6 +140,8 @@ export class ActiveTurnOwners {
   settle(threadId: string, providerInstanceId?: string): ActiveTurnOwner | undefined {
     const owner = this.forEvent(threadId, providerInstanceId);
     if (!owner) return undefined;
+    const elapsed = this.now() - owner.startedAtMs;
+    if (Number.isFinite(elapsed) && elapsed >= 0) owner.latencyMs = Math.round(elapsed);
     const owners = this.byThread.get(threadId)!;
     owners.delete(owner.selection.instanceId);
     if (owners.size === 0) this.byThread.delete(threadId);
@@ -145,16 +157,39 @@ export interface ExactTurnLease {
   readonly botId: string;
   readonly threadId: string;
   readonly dispatchId: number;
+  /** The resource this lease guards.  When set, mutual exclusion is keyed
+   *  by targetKey rather than botId — typically one occupancy key per bot
+   *  on a shared VPS container so several bots can run concurrently. */
+  readonly targetKey?: string;
 }
 
 /** A resource marker owned by one exact dispatch.  A later turn may reuse the
  * same bot and thread before an older asynchronous finalizer finishes, so a
- * thread id alone is not an ownership token. */
+ * thread id alone is not an ownership token.
+ *
+ * When `targetKey` is provided, mutual exclusion is by that key rather than
+ * by bot id alone — two different bots sharing one occupancy key are refused,
+ * while distinct per-bot keys on one shared container can coexist. */
 export class ExactTurnLeases {
   private readonly byBot = new Map<string, ExactTurnLease>();
+  private readonly byTarget = new Map<string, ExactTurnLease>();
 
-  claim(botId: string, threadId: string, dispatchId: number): ExactTurnLease {
-    const lease = { botId, threadId, dispatchId };
+  /** Claim a lease.  When `targetKey` is provided, the claim is keyed by
+   *  that target: if another bot already holds the same target, `null` is
+   *  returned (the caller should throw a user-facing 409).  A successor on
+   *  the same bot+thread replaces the previous lease. */
+  claim(botId: string, threadId: string, dispatchId: number, targetKey?: string): ExactTurnLease | null {
+    const lease: ExactTurnLease = { botId, threadId, dispatchId, targetKey };
+    if (targetKey) {
+      const existing = this.byTarget.get(targetKey);
+      // A different bot already on this desktop: refuse (shared mutual exclusion).
+      // The same bot replaces — successor on the same thread, or recovery when a
+      // prior turn's release never ran and left a stale byTarget entry.  The
+      // historical byBot map always overwrote per bot id; keeping that for the
+      // owning bot avoids a permanent self-block after a missed cleanup.
+      if (existing && existing.botId !== botId) return null;
+      this.byTarget.set(targetKey, lease);
+    }
     this.byBot.set(botId, lease);
     return lease;
   }
@@ -167,12 +202,24 @@ export class ExactTurnLeases {
     return this.byBot.has(botId);
   }
 
+  hasTarget(targetKey: string): boolean {
+    return this.byTarget.has(targetKey);
+  }
+
   release(lease: ExactTurnLease): boolean {
     if (this.byBot.get(lease.botId) !== lease) return false;
-    return this.byBot.delete(lease.botId);
+    this.byBot.delete(lease.botId);
+    if (lease.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
+    return true;
   }
 
   clearBot(botId: string): void {
+    const lease = this.byBot.get(botId);
+    if (lease?.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
     this.byBot.delete(botId);
   }
 
@@ -279,7 +326,35 @@ export interface AutoFallbackCandidate {
       models?: Record<string, { capped: boolean }>;
     };
   };
-  models: { default: string };
+  driverKind?: string;
+  capabilities?: { effortLevels?: readonly string[] };
+  models: {
+    default: string;
+    options?: ReadonlyArray<{ id: string; effortLevels?: readonly EffortLevel[]; supportsEffort?: boolean }>;
+  };
+}
+
+/** Fit the failing dispatch's effort to what the fallback model offers.  The
+ * turn-start check 409s an effort the model does not list (max on a Codex
+ * model that tops out at xhigh), which would lose the turn the failover was
+ * meant to save.  Keep a supported effort as-is, otherwise step down to the
+ * highest offered level below it, otherwise send no effort. */
+function fallbackEffort(candidate: AutoFallbackCandidate, effort: EffortLevel | undefined): EffortLevel | undefined {
+  if (!effort) return undefined;
+  const model = candidate.models.default;
+  const allowed = modelEffortLevels(
+    {
+      driverKind: candidate.driverKind,
+      capabilities: { effortLevels: candidate.capabilities?.effortLevels as readonly EffortLevel[] | undefined },
+    },
+    candidate.models.options?.find((option) => option.id === model),
+    model,
+  );
+  if (allowed.includes(effort)) return effort;
+  const requested = EFFORT_LEVELS.indexOf(effort);
+  return [...allowed]
+    .filter((level) => EFFORT_LEVELS.indexOf(level) < requested)
+    .sort((a, b) => EFFORT_LEVELS.indexOf(b) - EFFORT_LEVELS.indexOf(a))[0];
 }
 
 /** Preserve the existing one-hop automatic failover while refusing candidates
@@ -289,6 +364,7 @@ export function eligibleAutoFallbackChain(
   input: {
     botId: string;
     currentInstanceId: string;
+    effort?: EffortLevel;
     isCooling: (botId: string, instanceId: string, model: string) => boolean;
     priority: readonly string[];
   },
@@ -316,7 +392,11 @@ export function eligibleAutoFallbackChain(
       return rank(a.candidate.instanceId) - rank(b.candidate.instanceId) || a.order - b.order;
     });
   const pick = viable[0]?.candidate;
-  return pick ? [{ instanceId: pick.instanceId, model: pick.models.default }] : [];
+  if (!pick) return [];
+  const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.models.default };
+  const effort = fallbackEffort(pick, input.effort);
+  if (effort) selection.effort = effort;
+  return [selection];
 }
 
 export interface ThreadRuntimeInstance {

@@ -403,7 +403,9 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
         numberOrNullOrMissing(value.cost) &&
         stringsOrMissing(value.denials) &&
         (value.usage === undefined ||
-          (isRecord(value.usage) && typeof value.usage.input === "number" && typeof value.usage.output === "number"))
+          (isRecord(value.usage) &&
+            typeof value.usage.input === "number" &&
+            (value.usage.output === undefined || typeof value.usage.output === "number")))
       );
     case "item.started":
       return (value.itemType === "tool" || value.itemType === "reasoning") && stringOrMissing(value.title);
@@ -431,7 +433,9 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
           value.source === "peer")
       );
     case "thread.token-usage.updated":
-      return typeof value.input === "number" && typeof value.output === "number";
+      return (
+        typeof value.input === "number" && (value.output === undefined || typeof value.output === "number")
+      );
     case "runtime.error":
       return typeof value.message === "string" && (value.setup === undefined || typeof value.setup === "boolean");
     default:

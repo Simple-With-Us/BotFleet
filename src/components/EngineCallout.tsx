@@ -1,4 +1,4 @@
-// Shared "Why this engine?" callout.  Replaces the MiniMax-only
+// Shared "Why This Engine?" callout.  Replaces the MiniMax-only
 // `<MiniMaxCallout>` so every engine row gets the same prose block —
 // the panel used to render detail copy only for the MiniMax row, and a
 // reader flipping through Claude / Codex / Cursor had to infer the
@@ -6,11 +6,10 @@
 // `src/lib/engine-capabilities.tsx` so the prose and the matrix table
 // stay in sync.
 //
-// Compact by default (collapsed) so ModelPicker's header + callout do
-// not crowd out the scrollable model list.  Summary shows
-// "Why this engine?" + the short headline; expand reveals full prose
-// and pricing.  The capability matrix keeps using `<EngineCalloutBody>`
-// directly for the always-expanded hover panel.
+// Compact by default (collapsed to the Title Case label) so ModelPicker
+// can keep the model list on screen.  Expand reveals the headline, full
+// prose, and pricing.  The capability matrix keeps using
+// `<EngineCalloutBody>` directly for the always-expanded hover panel.
 //
 // Props:
 //   - `engineId`  — registry key (e.g. "minimax", "claude", "grok").
@@ -82,19 +81,20 @@ function EngineCalloutDisclosure(props: {
         // Only point at the detail region while it is rendered; a collapsed
         // callout has no element with this id.
         aria-controls={open ? detailId : undefined}
-        className="flex w-full items-start gap-1.5 rounded text-left text-ink hover:text-ink"
+        className="flex w-full items-center gap-1.5 rounded text-left text-ink hover:text-ink"
       >
-        <span className="min-w-0 flex-1">
-          <strong>Why this engine?</strong> {entry.whyThisEngine.headline}
+        <span className="min-w-0 flex-1 truncate">
+          <strong>Why This Engine?</strong>
         </span>
         <ChevronDown
           size={13}
-          className={cn("mt-0.5 shrink-0 text-ink-secondary transition-transform", open && "rotate-180")}
+          className={cn("shrink-0 text-ink-secondary transition-transform", open && "rotate-180")}
           aria-hidden
         />
       </button>
       {open && (
-        <div id={detailId} className="mt-1.5">
+        <div id={detailId} className="mt-1.5 max-h-40 overflow-y-auto">
+          <p className="mb-1.5 text-ink">{entry.whyThisEngine.headline}</p>
           {entry.whyThisEngine.prose.map((line, index) => (
             <p key={index} className="mb-1 last:mb-0">
               {line}
@@ -117,7 +117,7 @@ export function PricingModeChip(props: { entry: EngineCapabilityEntry }): React.
     <span
       className="rounded-full bg-inset/60 px-2 py-0.5 text-[10.5px] font-medium text-ink-secondary"
       title={entry.pricing.kind === "subscription+api"
-        ? `${entry.pricing.subscription.tierLabel}${typeof entry.pricing.subscription.costPerMonth === "number" ? ` · $${entry.pricing.subscription.costPerMonth.toFixed(2)}/mo` : " · bundled"}; API ${entry.pricing.api.inputPer1k}/1k in`
+        ? `${entry.pricing.subscription.tierLabel}${typeof entry.pricing.subscription.costPerMonth === "number" ? ` · $${entry.pricing.subscription.costPerMonth.toFixed(2)}/mo` : ""}; API ${entry.pricing.api.inputPer1k}/1k in`
         : undefined}
     >
       {pricingModeLabel(entry.pricing)}

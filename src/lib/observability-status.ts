@@ -15,6 +15,9 @@ export type ObservabilityStatusView = {
   projectId?: string | null;
   environment?: string;
   tracesSampleRate?: number;
+  aiTracesSampleRate?: number;
+  httpTracesSampleRate?: number;
+  uiTracesSampleRate?: number;
   logsEnabled?: boolean;
   profilingAvailable?: boolean;
   totalCaptured?: number;

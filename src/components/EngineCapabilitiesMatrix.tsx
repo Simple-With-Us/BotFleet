@@ -4,7 +4,7 @@
 //
 // One row per capability, one column per engine — there is no engine
 // duplication, so the layout stays scannable on a 1440×900 viewport.
-// Hover a cell to surface the engine's "Why this engine?" prose for the
+// Hover a cell to surface the engine's "Why This Engine?" prose for the
 // relevant capability (or the engine's overall prose when the registry
 // does not yet differentiate per capability).
 //
@@ -61,7 +61,7 @@ export function EngineCapabilitiesMatrix(): React.ReactElement {
       <div className="flex flex-col gap-0.5">
         <h3 className="text-[14px] font-medium text-ink">Engine Capabilities</h3>
         <p className="text-[12px] leading-relaxed text-ink-secondary">
-          {"What every installed engine can do.\u00A0 Hover a cell for the engine's reasoning — the same prose the per-row \"Why this engine?\" callout shows, kept in one place so the two never drift apart."}
+          {"What every installed engine can do.\u00A0 Hover a cell for the engine's reasoning — the same prose the per-row \"Why This Engine?\" callout shows, kept in one place so the two never drift apart."}
         </p>
       </div>
 

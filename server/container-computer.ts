@@ -36,7 +36,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "4";
+export const IMAGE_LAYER_VERSION = "5";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export const CONTAINER = "botfleet-computer";
@@ -437,7 +437,7 @@ function viewerUrl(password: string | null, port: number | null): string {
  * telemetry knobs can never drift between the Local VM and a VPS container. */
 export function cuaExecArgs(
   args: string[],
-  options: { container?: string; interactive?: boolean } = {},
+  options: { container?: string; interactive?: boolean; display?: string } = {},
 ): string[] {
   return [
     "exec",
@@ -447,7 +447,7 @@ export function cuaExecArgs(
     "-e",
     "HOME=/home/cua",
     "-e",
-    `DISPLAY=${DISPLAY}`,
+    `DISPLAY=${options.display ?? DISPLAY}`,
     "-e",
     "CUA_DRIVER_INSTALL_CHANNEL=python_package",
     "-e",

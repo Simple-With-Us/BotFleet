@@ -48,6 +48,13 @@ const mask = (value: string) => `«redacted ${value.length} chars»`;
 
 const KEY_PREFIXES: RegExp[] = [
   /\bsk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}/g, // anthropic / openai / stripe
+  // xAI ships as a BotFleet engine, so a Grok key pasted into a tool result
+  // or a permission card is a credential this product hands its own users.
+  // Groq and Hugging Face ride along: same shape of prefix, same cost if one
+  // goes out in a bug report.
+  /\bxai-[A-Za-z0-9_-]{20,}/g, // xai (grok)
+  /\bgsk_[A-Za-z0-9]{40,}/g, // groq
+  /\bhf_[A-Za-z0-9]{30,}/g, // hugging face
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, // github classic
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g, // github fine-grained
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g, // slack
@@ -1020,11 +1027,13 @@ export function redactSecretsInText(text: string): string {
   return out;
 }
 
-/** Deep copy with credential VALUES replaced.  Handles the two shapes that
- * actually carry them: a plain object of env vars ({KEY: "v"}) and the ACP
- * wire shape (env: [{name, value}]).  Anything unrecognised is copied as-is. */
-export function redactSecrets(input: unknown, depth = 0): unknown {
-  if (typeof input === "string") return redactSecretsInText(input);
+/** The walk both public deep redactors share.  `text` is what every string
+ * that is NOT under a secret-shaped key goes through: the plain content pass
+ * for `redactSecrets`, the cap-then-content pass for `redactSecretsForLog`.  A
+ * secret-shaped key is masked outright either way, so a caller can never widen
+ * what a known credential field reports. */
+function redactTree(input: unknown, depth: number, text: (value: string) => string): unknown {
+  if (typeof input === "string") return text(input);
   if (depth > 12 || input === null || typeof input !== "object") return input;
 
   if (Array.isArray(input)) {
@@ -1042,11 +1051,9 @@ export function redactSecrets(input: unknown, depth = 0): unknown {
         // not clear the value of suspicion — the same content pass every
         // other string in this tree gets is what catches a credential
         // someone stashed under an ordinary-looking name.
-        return isSecretName(entry.name)
-          ? { ...entry, value: mask(entry.value) }
-          : { ...entry, value: redactSecretsInText(entry.value) };
+        return isSecretName(entry.name) ? { ...entry, value: mask(entry.value) } : { ...entry, value: text(entry.value) };
       }
-      return redactSecrets(item, depth + 1);
+      return redactTree(item, depth + 1, text);
     });
   }
 
@@ -1058,7 +1065,55 @@ export function redactSecrets(input: unknown, depth = 0): unknown {
     }
     // any other string may still CONTAIN a credential (a command line, a
     // header value, a bot's reply) — the content pass catches those
-    out[key] = redactSecrets(value, depth + 1);
+    out[key] = redactTree(value, depth + 1, text);
   }
   return out;
+}
+
+/** Deep copy with credential VALUES replaced.  Handles the two shapes that
+ * actually carry them: a plain object of env vars ({KEY: "v"}) and the ACP
+ * wire shape (env: [{name, value}]).  Anything unrecognised is copied as-is. */
+export function redactSecrets(input: unknown, depth = 0): unknown {
+  return redactTree(input, depth, redactSecretsInText);
+}
+
+/** Cap on how much of one string the canonical event log keeps.
+ *
+ * The unit is UTF-16 code units rather than bytes on purpose: `String.length`
+ * is O(1) where a byte count is a scan of the very string the cap exists to
+ * avoid scanning, and code units bound the regex work exactly, which is the
+ * whole point.  The marker reports the same unit it cut in.
+ *
+ * 256 KB is three orders of magnitude more than a human reads out of one log
+ * record and two orders below the tool results that made the tee the harness's
+ * hottest path: a 5 MB `read_file` body used to run through every pattern in
+ * this file, on the main thread, while every other bot's turn, the SSE
+ * fan-out and `/api/health` waited behind it. */
+export const LOG_TEE_MAX_STRING_CHARS = 256 * 1024;
+
+/** Content pass for the log tee: redact, THEN cut.
+ *
+ * The order is load-bearing and is the reason this is not "slice and call
+ * `redactSecretsInText`".  `KEY_VALUE_UNTERMINATED` exists because a
+ * credential whose closing quote was lost to a clip is still a credential, and
+ * it anchors at end-of-text — so the head has to be redacted while the clip is
+ * still the last thing in the string.  Cutting first would end it in a marker
+ * instead, and a secret straddling the boundary would ship its prefix in the
+ * clear.
+ *
+ * The elided tail is never written, redacted or not, so nothing in it can
+ * leak.  A string within the cap takes exactly the path it took before this
+ * function existed. */
+export function redactSecretsInLogText(text: string, maxChars = LOG_TEE_MAX_STRING_CHARS): string {
+  if (text.length <= maxChars) return redactSecretsInText(text);
+  const elided = text.length - maxChars;
+  return `${redactSecretsInText(text.slice(0, maxChars))}[… ${elided} characters elided from log]`;
+}
+
+/** `redactSecrets` for a destination that is a log file rather than a live
+ * consumer: identical tree, identical masking, plus a per-string length cap so
+ * the cost of redacting one event is bounded by the cap and the shape of the
+ * event instead of by the size of whatever a tool just read. */
+export function redactSecretsForLog(input: unknown, maxChars = LOG_TEE_MAX_STRING_CHARS): unknown {
+  return redactTree(input, 0, (value) => redactSecretsInLogText(value, maxChars));
 }

@@ -143,3 +143,23 @@ export function calendarDayLabel(at: number): { weekday: string; day: number } {
   const date = calendarDate(at, CENTRAL_TIME_ZONE);
   return { weekday: DAY_NAMES[calendarWeekday(date)], day: date.day };
 }
+
+/** Start-of-day epochs (in `timeZone`) that `schedule` fires on within
+ * [from, to) — the same occurrence enumeration `projectedRoutineItems`
+ * uses, without the run-receipt/routine-list bookkeeping, for a
+ * lightweight calendar preview (MiniMonth) to highlight. */
+export function scheduleFireDays(schedule: RoutineSchedule, timeZone: string, from: number, to: number): Set<number> {
+  const days = new Set<number>();
+  if (schedule.type === "once") {
+    if (schedule.at >= from && schedule.at < to) days.add(startOfDayInTimeZone(schedule.at, timeZone));
+    return days;
+  }
+  let cursor = from - 1;
+  for (;;) {
+    const at = nextZonedOccurrence(schedule, cursor, timeZone);
+    if (at === null || at >= to) break;
+    days.add(startOfDayInTimeZone(at, timeZone));
+    cursor = at;
+  }
+  return days;
+}

@@ -314,11 +314,14 @@ describe("pairing page push drop lines", () => {
     return new Function(`return ${source};`)() as (push: Record<string, unknown>) => string;
   };
 
-  it("shows a circuit-breaker skip on its own, with no queue overflow", async () => {
+  it("shows a circuit-breaker hold on its own, with no queue overflow", async () => {
     const lines = await loadPushDropLines();
     const html = lines({ dropped: 0, circuitDropped: 4 });
-    expect(html).toContain("4 skipped (Apple push service unreachable)");
+    // Held, not lost: an open circuit leaves every alert on its lane, so the
+    // copy must not read like a drop.
+    expect(html).toContain("4 held back while Apple's push service was unreachable");
     expect(html).not.toContain("queue full");
+    expect(html).not.toContain("dropped");
   });
 
   it("blames a queue drop on the queue only", async () => {
@@ -332,7 +335,7 @@ describe("pairing page push drop lines", () => {
     const lines = await loadPushDropLines();
     const html = lines({ dropped: 2, circuitDropped: 5 });
     expect(html).toContain("2 dropped (queue full)");
-    expect(html).toContain("5 skipped (Apple push service unreachable)");
+    expect(html).toContain("5 held back while Apple's push service was unreachable");
   });
 
   it("shows nothing when neither counter moved, including an older sidecar with no circuitDropped", async () => {

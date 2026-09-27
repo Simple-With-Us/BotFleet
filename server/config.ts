@@ -351,6 +351,15 @@ const appConfigSchema = z.object({
     projects: z
       .array(z.object({ slug: z.string(), match: z.array(z.string()).optional() }))
       .optional(),
+    enginePlans: z
+      .record(
+        z.string(),
+        z.object({
+          planName: z.string().optional(),
+          costPerMonth: z.number().nullable().optional(),
+        }),
+      )
+      .optional(),
   }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
@@ -360,6 +369,9 @@ const appConfigSchema = z.object({
     enabled: z.boolean().optional(),
     environment: optionalText,
     tracesSampleRate: z.number().min(0).max(1).optional(),
+    aiTracesSampleRate: z.number().min(0).max(1).optional(),
+    httpTracesSampleRate: z.number().min(0).max(1).optional(),
+    uiTracesSampleRate: z.number().min(0).max(1).optional(),
     logsEnabled: z.boolean().optional(),
   }).optional(),
   // An optional external secret store.  Unconfigured is inert: with no
@@ -495,6 +507,7 @@ export interface AppConfig {
      *  Absent means on; only a stored `false` turns it off. */
     localQuotaRouting?: boolean;
     projects?: Array<{ slug: string; match?: string[] }>;
+    enginePlans?: Record<string, { planName?: string; costPerMonth?: number | null }>;
   };
   /** Error and performance reporting.  `sentryDsn` is the operator's own
    * Sentry project — BotFleet ships none.  `enabled` is the explicit kill
@@ -505,6 +518,9 @@ export interface AppConfig {
     enabled?: boolean;
     environment?: string;
     tracesSampleRate?: number;
+    aiTracesSampleRate?: number;
+    httpTracesSampleRate?: number;
+    uiTracesSampleRate?: number;
     logsEnabled?: boolean;
   };
   /** The optional external secret store.  When it holds one of the names in
@@ -704,6 +720,9 @@ export function usageProjectRules(cfg: AppConfig): Array<{ slug: string; match: 
  * long-running harness.  A fifth of turns is enough to see a latency
  * regression without paying for every span. */
 export const DEFAULT_SENTRY_TRACES_SAMPLE_RATE = 0.2;
+export const DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE = 1.0;
+export const DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE = 0.1;
+export const DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE = 0.1;
 
 /** Everything the Sentry runtime reads out of app config, already
  * defaulted.  `dsn` is null when nothing usable is stored — the operator's
@@ -713,6 +732,9 @@ export interface ObservabilitySettings {
   enabled: boolean;
   environment: string;
   tracesSampleRate: number;
+  aiTracesSampleRate: number;
+  httpTracesSampleRate: number;
+  uiTracesSampleRate: number;
   logsEnabled: boolean;
 }
 
@@ -742,6 +764,22 @@ export function observabilitySettings(cfg: AppConfig): ObservabilitySettings {
   const rate =
     cfg.observability?.tracesSampleRate ??
     (Number.isFinite(envRate) ? envRate : DEFAULT_SENTRY_TRACES_SAMPLE_RATE);
+
+  const envAiRate = Number(process.env.SENTRY_AI_TRACES_SAMPLE_RATE);
+  const aiRate =
+    cfg.observability?.aiTracesSampleRate ??
+    (Number.isFinite(envAiRate) ? envAiRate : DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE);
+
+  const envHttpRate = Number(process.env.SENTRY_HTTP_TRACES_SAMPLE_RATE);
+  const httpRate =
+    cfg.observability?.httpTracesSampleRate ??
+    (Number.isFinite(envHttpRate) ? envHttpRate : DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE);
+
+  const envUiRate = Number(process.env.SENTRY_UI_TRACES_SAMPLE_RATE);
+  const uiRate =
+    cfg.observability?.uiTracesSampleRate ??
+    (Number.isFinite(envUiRate) ? envUiRate : DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE);
+
   const environment =
     cfg.observability?.environment?.trim() ||
     (process.env.SENTRY_ENV || process.env.NODE_ENV || "production").trim() ||
@@ -751,6 +789,9 @@ export function observabilitySettings(cfg: AppConfig): ObservabilitySettings {
     enabled: observabilityEnabled(cfg),
     environment: environment.slice(0, MAX_OBSERVABILITY_ENVIRONMENT_LENGTH),
     tracesSampleRate: Math.min(Math.max(rate, 0), 1),
+    aiTracesSampleRate: Math.min(Math.max(aiRate, 0), 1),
+    httpTracesSampleRate: Math.min(Math.max(httpRate, 0), 1),
+    uiTracesSampleRate: Math.min(Math.max(uiRate, 0), 1),
     logsEnabled: cfg.observability?.logsEnabled !== false,
   };
 }

@@ -22,10 +22,12 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
 import { classifyHttpError, httpErrorFor, type HttpErrorClassification } from "./chat-completions/errors.ts";
-import { runTurnLoop, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
+import { runTurnLoop, DEFAULT_TURN_LOOP_BUDGET, type ChatMessage, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { costUsd, type ChatCompletionsPriceTable } from "./chat-completions/pricing.ts";
+import { capReplayedTranscript } from "./chat-completions/replay-cap.ts";
 import { genAiProvider, withChatSpan } from "../sentry-ai.ts";
 
 const DRIVER_KIND = "minimax";
@@ -42,6 +44,21 @@ const CN_URL = "https://api.minimaxi.com/v1";
 // two, per PR 10's "off the same fetch".
 const SNAPSHOT_CACHE_MS = 60_000;
 const SNAPSHOT_PROBE_TIMEOUT_MS = 8_000;
+// A stall guard independent of the per-request ceiling `complete()` reads
+// off `opts.signal`.  Unattended turns run at the full 900s wall-clock
+// budget (see `sendTurn`'s `runTurnLoop` call below) so a slow-but-working
+// stream has room to finish, but a CONNECTION that stops producing bytes
+// entirely must not get to hold the bot busy for the full 900s before
+// anything notices — that is exactly the failure board row bf77b434 (a
+// MiniMax round stalling right after a tool call) tracks.  Measured
+// against `reader.read()` resolving with a real chunk, not against parsed
+// content: MiniMax can send frames this driver's `takeSseLine` does not
+// turn into a delta (an empty `choices` array, an unparsed keep-alive),
+// and "is the socket still moving" is the question, not "did the model
+// say something new."  90–120s was the reviewed range on PR 625's
+// follow-up; 120s errs toward not cutting off a merely-slow-but-live
+// reasoning burst.
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 // Plain MiniMax-M2.7 dropped: it billed the same $0.30/$1.20 per million as
 // M3's own <=512K tier for a fifth of the context, so M3 strictly dominated
@@ -130,6 +147,47 @@ function toTurnUsage(raw: any): TurnUsage {
   const cached = raw?.prompt_tokens_details?.cached_tokens;
   if (Number.isFinite(cached)) usage.cachedInput = cached;
   return usage;
+}
+
+/** Thrown by `readChunkOrStall` when the SSE reader goes `STREAM_IDLE_TIMEOUT_MS`
+ *  with no chunk.  The message deliberately contains "timed out" — that is
+ *  the phrase `classifyError` (server/drivers/retry.ts) matches onto the
+ *  `timeout` transient reason, so a stall before anything published rides
+ *  the SAME up-to-three-attempt retry policy a slow-to-connect socket
+ *  already gets, and a stall AFTER a delta published never retries because
+ *  `published` is already true by then (loop.ts's retry guard) — replaying
+ *  it would show the person text they already read twice. */
+class StreamStallError extends Error {
+  constructor(idleMs: number) {
+    super(`MiniMax stream timed out: no data received for ${Math.round(idleMs / 1000)}s`);
+    this.name = "StreamStallError";
+  }
+}
+
+/** Races one `reader.read()` against an idle timer, so a connection that
+ *  stops producing bytes fails in `idleMs`, not in whatever's left of the
+ *  round's full request ceiling.  Every read that resolves — `done`
+ *  included, the stream closing IS activity — gets a fresh window on the
+ *  NEXT call; only true silence trips it.  The timer is `unref`'d so a
+ *  turn nobody is waiting on cannot hold the process open, matching
+ *  `unrefTimer` in chat-completions/loop.ts (not imported — that file's
+ *  helper is module-private and this is a two-line duplicate, not a
+ *  dependency worth adding). */
+async function readChunkOrStall(reader: ReadableStreamDefaultReader<Uint8Array>, idleMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stall = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new StreamStallError(idleMs)), idleMs);
+    // Node's timer carries `unref`; the DOM's does not, and this file is
+    // typed against both — declared type, not a cast, so nothing here
+    // asserts past what `timer` actually is.
+    const handle: { unref?: () => void } = timer;
+    handle.unref?.();
+  });
+  try {
+    return await Promise.race([reader.read(), stall]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Where `MinimaxConfig.url` came from.  "default" is the ONLY value that
@@ -345,6 +403,17 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         onDelta?: (d: string, streamKind?: "assistant_text" | "reasoning_text") => void;
         onToolCallDelta?: (index: number, id?: string, name?: string, args?: string) => void;
         onUsage?: (usage: TurnUsage) => void;
+        // Guards a WIDENED per-request ceiling only — see STREAM_IDLE_TIMEOUT_MS.
+        // Undefined (the interactive-turn default) leaves reading plain: the
+        // turn loop's own idle clock (`requestIdleMs`, fed by `onChunk`)
+        // already bounds total silence there.  Only the unattended caller
+        // (900s ceiling, loop idle clock off) sets this, because that is
+        // the path where a stalled connection would otherwise sit
+        // unnoticed for a long time.
+        idleTimeoutMs?: number;
+        /** Raw-bytes liveness for the turn loop's idle clock
+         *  (`requestIdleMs` in chat-completions/loop.ts). */
+        onChunk?: () => void;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -381,6 +450,8 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // MiniMax's own `Retry-After` instead of regexing this message.
         throw httpErrorFor(res.status, body, res.headers);
       }
+      // headers are progress too: the socket answered
+      opts.onChunk?.();
 
       if (!opts.stream) {
         const json: any = await res.json();
@@ -462,7 +533,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
 
       try {
         for (;;) {
-          const { done, value } = await reader.read();
+          const { done, value } = opts.idleTimeoutMs
+            ? await readChunkOrStall(reader, opts.idleTimeoutMs)
+            : await reader.read();
+          if (!done) opts.onChunk?.();
           if (done) {
             // Flush whatever is left in the decoder and the line buffer.
             // MiniMax's stream_options.include_usage frame — the one
@@ -512,9 +586,18 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const model = turn.model || models.default;
       // Round 1's prefix.  The loop owns this array from here and only ever
       // APPENDS to it, so rounds 2..N re-send a byte-identical prefix.
+      // The transcript is byte-capped and entry-count-capped first so a
+      // long thread cannot grow past the model's prompt window or the
+      // provider's per-request size — see chat-completions/replay-cap.ts.
+      const cappedTranscript = capReplayedTranscript(turn.transcript);
+      // Only the stable half of the prompt heads the request; the volatile
+      // half rides the newest user message, every request, so the resent
+      // prefix stays byte-identical across a memory write (see
+      // prompt-split.ts splitChatPrompt).
+      const chat = splitChatPrompt(turn);
       const messages: ChatMessage[] = [
-        ...(turn.system ? [{ role: "system" as const, content: turn.system }] : []),
-        ...(turn.transcript ?? []).flatMap((m): ChatMessage[] => {
+        ...(chat.system ? [{ role: "system" as const, content: chat.system }] : []),
+        ...cappedTranscript.flatMap((m): ChatMessage[] => {
           const res: ChatMessage[] = [];
           if (m.role === "assistant") {
             const assistantMsg: ChatMessage = { role: "assistant", content: m.text || "" };
@@ -537,7 +620,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           }
           return res;
         }),
-        ...(turn.text ? [{ role: "user" as const, content: turn.text }] : []),
+        ...(chat.text ? [{ role: "user" as const, content: chat.text }] : []),
       ];
 
       emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -574,12 +657,21 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // item.started at all; calling it here would double every tool
         // span.
         const { text, reasoning, usage, tool_calls } = await withChatSpan(
-          { model, conversationId: threadId, provider: genAiProvider(DRIVER_KIND) },
+          { model, conversationId: threadId, taskId: turnId, provider: genAiProvider(DRIVER_KIND) },
           ({ recordUsage }) =>
             complete(roundMessages, model, {
               stream: true,
               tools: openAiTools,
               signal: opts.signal,
+              // Only the unattended path gets a per-request ceiling wide
+              // enough (900s, below) for a stalled connection to go
+              // unnoticed for a long time — see STREAM_IDLE_TIMEOUT_MS and
+              // the `budget` comment on this turn's runTurnLoop call.
+              idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
+              // Every raw chunk feeds the loop's idle clock, which is what
+              // bounds silence on the interactive path now that its hard
+              // ceiling is the loop's default rather than 180s.
+              onChunk: opts.onChunk,
               // `onPublished` before every emit that reaches the bus: it
               // is what tells the loop this round can no longer be
               // retried, because a replay would show the person text they
@@ -645,6 +737,36 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         emit,
         runRound,
         messages,
+        // Only `timeoutMs` is read from this; the provider payload is built
+        // separately above from name/description/parameters.
+        tools: turn.tools,
+        // Unattended turns (webhook- or resource-triggered) may need much
+        // longer than the interactive ceiling (180s when PR 625 landed) to
+        // stream a full reasoning and code response, such as the Compiler
+        // bot analysing a CI failure.  BOTFLEET-V (board row bf77b434)
+        // showed the Compiler failing this shape of turn at 180s repeatedly.  Use the wall-clock budget as
+        // the per-request ceiling so a genuinely slow-but-live stream can
+        // finish instead of being cut off mid-answer.  This is a SEPARATE
+        // policy from efficiency-and-connectivity.md's "180s timeout
+        // treated as silence" note (PR #533) — that is alert-silencing
+        // for the timeout that still fires at 180s; this changes when it
+        // fires at all.  See docs/efficiency-and-connectivity.md's
+        // "Unattended Request Ceiling" section for the fuller writeup and
+        // why only MiniMax has this override today.  A stalled CONNECTION
+        // (as opposed to a slow but live one) is still caught well before
+        // 900s by `readChunkOrStall`'s STREAM_IDLE_TIMEOUT_MS below.
+        //
+        // Interactive turns take the loop's shared defaults: a hard ceiling
+        // plus an idle clock fed by `onChunk`, so a slow-but-live stream is
+        // no longer cut off at 180s while a silent one still ends in 120s.
+        // The unattended path keeps `readChunkOrStall` as its ONLY idle
+        // guard for now (`requestIdleMs: 0`): it retries a pre-output stall
+        // as a transient `timeout`, which the loop's own idle clock does
+        // not, and retiring it waits until the shared clock has run in
+        // production.
+        budget: turn.unattended
+          ? { requestTimeoutMs: DEFAULT_TURN_LOOP_BUDGET.wallClockMs, requestIdleMs: 0 }
+          : undefined,
         toolHost: turn.toolHost,
         // The harness's permission broker, carried across on the same
         // per-turn service object caller identity rides on.  The driver

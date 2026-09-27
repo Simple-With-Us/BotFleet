@@ -8,7 +8,7 @@
 // memory/ holds topic files the bot reads on demand with its ordinary
 // file tools. Plain markdown on purpose — the user can open, edit, or
 // delete anything the bot believes.
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
@@ -169,4 +169,108 @@ export function memorySystemPrompt(botId: string): string {
     ? ` [MEMORY.md exceeds the ${MEMORY_MAX_LINES}-line/${MEMORY_MAX_BYTES}-byte budget and was cut off here — trim it.]`
     : "";
   return `${guidance}\n\nYour memory (MEMORY.md):\n${memory.text}${truncatedNote}`;
+}
+
+// ── Orphan sweep (HS3) ──────────────────────────────────────────────────
+//
+// ensureWorkspace is called on every dispatch; deleteBot is the only
+// removal, so a bot deleted while the harness was down — or whose delete
+// otherwise never reached this directory — leaves its workspace forever.
+// Workspaces are the CLI's cwd and may hold clones and node_modules, so the
+// rule is conservative: an id absent from the live bot roster AND untouched
+// for two weeks, never just one or the other.
+
+/** How long an orphaned workspace survives before the boot sweep removes
+ * it — longer than the transcript orphan window because a workspace can
+ * hold a clone the user still means to come back to. */
+export const WORKSPACE_ORPHAN_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** Recursive, best-effort directory size — used only to report bytes freed,
+ * never to decide anything, so a file that vanishes mid-walk (another
+ * process editing a clone) just counts as a little less rather than
+ * throwing. */
+function directorySize(dir: string): number {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      total += directorySize(full);
+      continue;
+    }
+    try {
+      total += statSync(full).size;
+    } catch {
+      /* gone between the listing and the stat */
+    }
+  }
+  return total;
+}
+
+export interface WorkspaceSweepResult {
+  /** directories removed, or that would be removed under dry run */
+  removed: number;
+  bytesReclaimed: number;
+  dryRun: boolean;
+}
+
+/** Remove `WORKSPACES_DIR` entries whose id is not in `liveBotIds` and whose
+ * directory mtime is older than `maxAgeMs`.  `dryRun` reports what would be
+ * removed without touching disk — same flag, same shape as the transcript
+ * orphan sweep, so `OMB_RETENTION_DRY_RUN=1` covers both. */
+export function sweepOrphanedWorkspaces(
+  liveBotIds: ReadonlySet<string>,
+  opts: { now?: number; maxAgeMs?: number; dryRun?: boolean } = {},
+): WorkspaceSweepResult {
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? WORKSPACE_ORPHAN_MAX_AGE_MS;
+  const dryRun = opts.dryRun ?? false;
+
+  let entries: string[];
+  try {
+    entries = readdirSync(WORKSPACES_DIR);
+  } catch {
+    return { removed: 0, bytesReclaimed: 0, dryRun };
+  }
+
+  let removed = 0;
+  let bytesReclaimed = 0;
+  for (const botId of entries) {
+    // Never remove a live id's workspace — checked before anything else
+    // here touches the directory.
+    if (liveBotIds.has(botId)) continue;
+    const dir = join(WORKSPACES_DIR, botId);
+    let stat: { isDirectory(): boolean; mtimeMs: number };
+    try {
+      stat = statSync(dir);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    if (now - stat.mtimeMs < maxAgeMs) continue;
+    const size = directorySize(dir);
+    if (!dryRun) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        continue; // not actually freed — do not count it
+      }
+    }
+    removed += 1;
+    bytesReclaimed += size;
+  }
+  return { removed, bytesReclaimed, dryRun };
+}
+
+/** One line for the boot log, or null when there was nothing to report. */
+export function describeWorkspaceSweep(result: WorkspaceSweepResult): string | null {
+  if (result.removed === 0) return null;
+  const verb = result.dryRun ? "would remove" : "removed";
+  const dirs = result.removed === 1 ? "workspace" : "workspaces";
+  return `[retention] ${verb} ${result.removed} ${dirs}, ${result.bytesReclaimed} bytes`;
 }

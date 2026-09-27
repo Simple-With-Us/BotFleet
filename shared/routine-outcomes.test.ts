@@ -6,6 +6,7 @@ describe("routine execution outcomes", () => {
     expect(routineFailureCode("interrupted")).toBe("cancelled");
     expect(routineFailureCode("resume_failed", true)).toBe("resume_failed");
     expect(routineFailureCode("prompt_timeout")).toBe("timeout");
+    expect(routineFailureCode("prompt_stall")).toBe("timeout");
     expect(routineFailureCode("arbitrary text containing secrets", true)).toBe("auth_required");
     expect(routineFailureCode(null, false, true)).toBe("capability_denied");
     expect(routineFailureCode("arbitrary upstream error")).toBe("execution_failed");

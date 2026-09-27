@@ -1,8 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { ModelSelection } from "./contracts.ts";
+import type { EffortLevel, ModelSelection } from "./contracts.ts";
 import {
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
@@ -21,7 +21,9 @@ import {
   turnHitQuotaOrCap,
   turnQuotaOrCapEvidence,
   turnProducedAssistantOutput,
+  inheritedUnattended,
   type FallbackScanMessage,
+  unattendedModelDowngrade,
 } from "./model-fallback.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
 
@@ -458,6 +460,37 @@ describe("AUTO_FALLBACK_PRIORITY — #90 auto-failover ordering", () => {
       priority: AUTO_FALLBACK_PRIORITY,
     })[0]?.instanceId;
 
+  it("fits the failing dispatch's effort to what the fallback model offers", () => {
+    const codex: AutoFallbackCandidate = {
+      instanceId: "codex",
+      driverKind: "codex",
+      capabilities: { effortLevels: ["low", "medium", "high", "xhigh"] },
+      snapshot: { state: "available", authenticated: true },
+      models: { default: "gpt-6" },
+    };
+    const run = (effort: EffortLevel | undefined, candidate = codex) =>
+      eligibleAutoFallbackChain([candidate], {
+        botId: "bot-1",
+        currentInstanceId: "claude",
+        effort,
+        isCooling: () => false,
+        priority: AUTO_FALLBACK_PRIORITY,
+      })[0];
+    // max is not offered by Codex: step down to its top level, not a 409.
+    expect(run("max")?.effort).toBe("xhigh");
+    // A supported effort is kept as-is.
+    expect(run("medium")?.effort).toBe("medium");
+    // No lower offered level: send no effort.
+    expect(run("none")).not.toHaveProperty("effort");
+    // A fallback engine without effort support never gets one.
+    const noEffort = { ...codex, capabilities: {} };
+    expect(run("high", noEffort)).not.toHaveProperty("effort");
+    // Per-model levels win over the engine's list.
+    const perModel = { ...codex, models: { default: "gpt-6", options: [{ id: "gpt-6", effortLevels: ["low", "high"] as EffortLevel[] }] } };
+    expect(run("xhigh", perModel)?.effort).toBe("high");
+    expect(run(undefined)).not.toHaveProperty("effort");
+  });
+
   it("prefers minimax over the lower-priority openaiCompat and grok instances", () => {
     expect(pick(["grok", "openaiCompat", "minimax"])).toBe("minimax");
   });
@@ -606,6 +639,42 @@ describe("parseQuotaResetTime", () => {
     expect(res.isQuotaOrCap).toBe(true);
     expect(typeof res.resetsAt).toBe("number");
     expect(res.resetsAt).toBeGreaterThan(Date.now() - 1000);
+  });
+
+  // Behaviour pin for the hoisted Intl.DateTimeFormat in computeNextOccurrence:
+  // the zoned search must land on the same instant it always did, and it must
+  // build its formatter once per parse rather than once per candidate minute.
+  it("resolves a zoned time-of-day reset to the exact next instant in that zone", () => {
+    // 12:00 UTC on Fri, Sep 25, 2026 is 7:00 AM CDT (UTC-5).
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+    // The next 12:10 AM in Chicago is 05:10 UTC the following day.
+    expect(res.resetsAt).toBe(Date.UTC(2026, 8, 26, 5, 10, 0));
+
+    // Same wall time in winter, when Chicago is UTC-6.
+    const winter = Date.UTC(2026, 0, 15, 12, 0, 0);
+    const winterRes = parseQuotaResetTime("You've hit your session limit · resets 3:30pm (America/Chicago)", winter);
+    expect(winterRes.resetsAt).toBe(Date.UTC(2026, 0, 15, 21, 30, 0));
+  });
+
+  it("builds the zone formatter once per parse, not once per candidate minute", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const spy = vi.spyOn(Intl, "DateTimeFormat");
+    try {
+      parseQuotaResetTime("You've hit your session limit · resets 12:10am (America/Chicago)", now);
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("falls back to local time for a zone Intl does not recognize", () => {
+    const now = Date.UTC(2026, 8, 25, 12, 0, 0);
+    const res = parseQuotaResetTime("You've hit your session limit · resets 12:10am (Not/AZone)", now);
+    const local = new Date(now);
+    local.setHours(0, 10, 0, 0);
+    if (local.getTime() <= now) local.setDate(local.getDate() + 1);
+    expect(res.resetsAt).toBe(local.getTime());
   });
 
   it("parses midnight reset", () => {
@@ -849,5 +918,262 @@ describe("QuotaCooldownRegistry", () => {
     expect(cd).toBeDefined();
     expect(cd?.resetsAt).toBe(now + DEFAULT_QUOTA_COOLDOWN_TTL_MS);
     expect(registry.get("bot1", "antigravity", "gemini-3.8-flash-high", now + DEFAULT_QUOTA_COOLDOWN_TTL_MS + 1)).toBeUndefined();
+  });
+});
+
+describe("inheritedUnattended", () => {
+  const marked = () => true;
+  it("does not let a leftover mark downgrade a scheduled, manual, or typed turn", () => {
+    expect(inheritedUnattended({}, marked)).toBe(false);
+    expect(inheritedUnattended(undefined, marked)).toBe(false);
+    expect(inheritedUnattended({ commsDepth: 0 }, marked)).toBe(false);
+  });
+  it("inherits the mark for card continuations and delegated work", () => {
+    expect(inheritedUnattended({ cardContinuation: true }, marked)).toBe(true);
+    expect(inheritedUnattended({ commsDepth: 1 }, marked)).toBe(true);
+    expect(inheritedUnattended({ cardContinuation: true }, () => false)).toBe(false);
+  });
+  it("honors an explicit caller flag", () => {
+    expect(inheritedUnattended({ unattended: true }, () => false)).toBe(true);
+    expect(inheritedUnattended({ unattended: false, cardContinuation: true }, marked)).toBe(false);
+  });
+});
+
+describe("unattendedModelDowngrade", () => {
+  const gemini: ModelSelection = { instanceId: "gemini", model: "gemini-3.1-pro-preview" };
+  const claude: ModelSelection = { instanceId: "claude", model: "claude-sonnet-5" };
+
+  it("leaves attended turns untouched", () => {
+    expect(unattendedModelDowngrade(gemini, { effortLevels: ["low"] })).toEqual(gemini);
+    expect(
+      unattendedModelDowngrade(gemini, {
+        unattended: false,
+        automationSource: undefined,
+        effortLevels: ["low"],
+      }),
+    ).toEqual(gemini);
+  });
+
+  it("downgrades model and effort on unattended turns when the engine offers effort", () => {
+    expect(
+      unattendedModelDowngrade(gemini, { unattended: true, effortLevels: ["low"] }),
+    ).toEqual({ ...gemini, model: "gemini-3.1-flash-preview", effort: "low" });
+  });
+
+  it("downgrades the model but omits effort when the engine has no effortLevels", () => {
+    // Antigravity / some API drivers reject effort at the turn-start capability
+    // check; stamping "low" would 409 the whole unattended turn.
+    const antigravity: ModelSelection = { instanceId: "antigravity", model: "claude-opus-4-1" };
+    const out = unattendedModelDowngrade(antigravity, { unattended: true, effortLevels: undefined });
+    expect(out).toEqual({ ...antigravity, model: "claude-opus-4-1".replace("-pro", "-flash") });
+    expect(out).not.toHaveProperty("effort");
+  });
+
+  it("downgrades fresh webhook and resource deliveries, which carry automationSource not unattended", () => {
+    for (const automationSource of ["webhook", "resource"]) {
+      expect(
+        unattendedModelDowngrade(gemini, { automationSource, effortLevels: ["low"] }),
+      ).toEqual({ ...gemini, model: "gemini-3.1-flash-preview", effort: "low" });
+    }
+  });
+
+  it("leaves schedule/manual automation and plain turns on the selected model", () => {
+    for (const automationSource of ["schedule", "manual", undefined]) {
+      expect(
+        unattendedModelDowngrade(gemini, { automationSource, effortLevels: ["low"] }),
+      ).toEqual(gemini);
+    }
+  });
+
+  it("never overrides an explicit caller modelSelection", () => {
+    expect(
+      unattendedModelDowngrade(gemini, {
+        unattended: true,
+        automationSource: "webhook",
+        hasExplicitSelection: true,
+        effortLevels: ["low"],
+      }),
+    ).toEqual(gemini);
+  });
+
+  it("never downgrades onto a model that is itself in quota cooldown", () => {
+    const pro: ModelSelection = { instanceId: "antigravity", model: "gemini-3.1-pro-high" };
+    // Flash is cooling: keep the resolver-vetted Pro selection untouched.
+    expect(
+      unattendedModelDowngrade(pro, {
+        unattended: true,
+        isCooling: (_instanceId, model) => model === "gemini-3.8-flash-high",
+      }),
+    ).toEqual(pro);
+    // Flash is free: downgrade as usual.
+    expect(
+      unattendedModelDowngrade(pro, {
+        unattended: true,
+        isCooling: () => false,
+      }),
+    ).toEqual({ ...pro, model: "gemini-3.8-flash-high" });
+  });
+
+  it("resolves downgrade families from the driver kind for custom instances", () => {
+    // An operator-added second Claude under an arbitrary id shares the
+    // claude family downgrade; a second Antigravity shares antigravity's.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude2", model: "claude-sonnet-4-5" },
+        { unattended: true, driverKind: "claudeAgent" },
+      ).model,
+    ).toBe("claude-haiku-4-5");
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "gravity", model: "gemini-3.1-pro-high" },
+        { unattended: true, driverKind: "antigravityAgent" },
+      ).model,
+    ).toBe("gemini-3.8-flash-high");
+    // An unknown driver kind downgrades nothing — even when the instance id
+    // looks like a reserved family (openai-compat mounted as "claude").
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "mystery", model: "mystery-large" },
+        { unattended: true, driverKind: "mysteryDriver" },
+      ).model,
+    ).toBe("mystery-large");
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-sonnet-5" },
+        { unattended: true, driverKind: "openai-compat" },
+      ).model,
+    ).toBe("claude-sonnet-5");
+    // Missing driverKind still falls back to the instance id (tests / callers
+    // that never resolve a kind).
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-sonnet-5" },
+        { unattended: true },
+      ).model,
+    ).toBe("claude-haiku-4-5");
+  });
+
+  it("gates effort:low on the model-specific allowed efforts, not engine-wide", () => {
+    // Engine advertises low, but this model's catalog omits it — stamping
+    // low would 409 at startTurn's modelEffortLevels check.
+    const selection: ModelSelection = { instanceId: "codex", model: "gpt-special" };
+    const engineWide = ["low", "medium", "high"] as const;
+    const modelOnly = ["medium", "high"] as const;
+    expect(
+      unattendedModelDowngrade(selection, {
+        unattended: true,
+        effortLevels: modelOnly,
+      }),
+    ).toEqual(selection);
+    expect(
+      unattendedModelDowngrade(selection, {
+        unattended: true,
+        effortLevels: engineWide,
+      }),
+    ).toEqual({ ...selection, effort: "low" });
+    // Resolver is evaluated on the post-rewrite model id.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-sonnet-5" },
+        {
+          unattended: true,
+          driverKind: "claudeAgent",
+          effortLevels: (model) => (model === "claude-haiku-4-5" ? ["medium", "high"] : engineWide),
+        },
+      ),
+    ).toEqual({ instanceId: "claude", model: "claude-haiku-4-5" });
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-sonnet-5" },
+        {
+          unattended: true,
+          driverKind: "claudeAgent",
+          effortLevels: (model) => (model === "claude-haiku-4-5" ? ["low", "medium"] : []),
+        },
+      ),
+    ).toEqual({ instanceId: "claude", model: "claude-haiku-4-5", effort: "low" });
+  });
+
+  it("maps Antigravity Pro ids to Flash ids the catalog actually offers", () => {
+    // gemini-3.1-flash-high/low do not exist on Antigravity — the rewrite
+    // must land on an offered id or the unattended turn fails at turn start.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "antigravity", model: "gemini-3.1-pro-high" },
+        { unattended: true },
+      ).model,
+    ).toBe("gemini-3.8-flash-high");
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "antigravity", model: "gemini-3.1-pro-low" },
+        { unattended: true },
+      ).model,
+    ).toBe("gemini-3.8-flash-low");
+    // Same-family Flash exists for 2.5, so keep it.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "antigravity", model: "gemini-2.5-pro" },
+        { unattended: true },
+      ).model,
+    ).toBe("gemini-2.5-flash");
+    // Custom / local-inject routes outside the static catalog keep the
+    // configured model, even with "-pro" in the id.
+    for (const model of ["my-proxy-gemini-pro-high", "gemini-3.9-pro-high", "local-qwen-pro"]) {
+      expect(
+        unattendedModelDowngrade(
+          { instanceId: "antigravity", model },
+          { unattended: true, driverKind: "antigravityAgent" },
+        ).model,
+      ).toBe(model);
+    }
+    // Non-Pro Antigravity models are left alone.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "antigravity", model: "claude-sonnet-4-6" },
+        { unattended: true },
+      ).model,
+    ).toBe("claude-sonnet-4-6");
+  });
+
+  it("keeps custom and local-inject Claude routes as configured", () => {
+    for (const model of ["ollama::my-sonnet-model", "lmstudio::qwen-opus-distill", "my-opus-proxy"]) {
+      expect(
+        unattendedModelDowngrade(
+          { instanceId: "claude", model },
+          { unattended: true, driverKind: "claudeAgent" },
+        ).model,
+      ).toBe(model);
+    }
+    // Built-in Claude routes still downgrade.
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-opus-5" },
+        { unattended: true, driverKind: "claudeAgent" },
+      ).model,
+    ).toBe("claude-haiku-4-5");
+  });
+
+  it("rewrites only built-in Claude Sonnet/Opus ids, not custom look-alikes", () => {
+    const down = (model: string) =>
+      unattendedModelDowngrade({ instanceId: "claude", model }, { unattended: true, driverKind: "claudeAgent" }).model;
+    for (const model of ["claude-sonnet-5-custom", "claude-opus-5-local", "claude-sonnet-latest-proxy"]) {
+      expect(down(model)).toBe(model);
+    }
+    // Catalog ids and older official version ids still downgrade.
+    for (const model of ["claude-sonnet-5", "claude-opus-5", "claude-sonnet-4-5", "claude-opus-4-1-20250805"]) {
+      expect(down(model)).toBe("claude-haiku-4-5");
+    }
+  });
+
+  it("pins Claude downgrades to the driver's current Haiku", () => {
+    expect(
+      unattendedModelDowngrade(claude, { unattended: true, effortLevels: ["low"] }),
+    ).toEqual({ ...claude, model: "claude-haiku-4-5", effort: "low" });
+    expect(
+      unattendedModelDowngrade(
+        { instanceId: "claude", model: "claude-opus-4-1" },
+        { unattended: true, effortLevels: ["low"] },
+      ),
+    ).toEqual({ instanceId: "claude", model: "claude-haiku-4-5", effort: "low" });
   });
 });

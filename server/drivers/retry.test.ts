@@ -92,6 +92,44 @@ describe("classifyError", () => {
     expect(classifyError(null)).toEqual({ transient: false, reason: "unknown" });
     expect(classifyError(new Error(""))).toEqual({ transient: false, reason: "unknown" });
   });
+
+  // The 2026-09-24 efficiency audit caught the old regex set firing the
+  // wrong reason on substrings that appear in benign prose: bare "402",
+  // "billing" without a verb near it, "subscription" alone, "5.3 of the
+  // spec" matching 5xx.  Each of these must now land as `unknown` rather
+  // than the pattern-specific terminal reason — a successful call still
+  // proceeds and gets retried/dropped by the calling driver, instead of
+  // being treated as a permanent give-up.
+  it("does not fire quota on bare substrings the audit caught", () => {
+    expect(classifyError(new Error("page 402 of the changelog"))).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyError(new Error("billing address field is required"))).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyError(new Error("subscribe to our newsletter for 402 reasons"))).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyError(new Error("free-tier limit on signup"))).toEqual({ transient: false, reason: "unknown" });
+  });
+
+  it("does not fire rate_limit/server_error on bare 5xx/4xx fragments", () => {
+    expect(classifyError(new Error("see section 503 of the spec for details"))).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyError(new Error("we shipped 429 widgets today"))).toEqual({ transient: false, reason: "unknown" });
+  });
+
+  it("does not fire auth on bare 401/403 in benign contexts", () => {
+    expect(classifyError(new Error("free range 401 chickens for sale"))).toEqual({ transient: false, reason: "unknown" });
+    expect(classifyError(new Error("issue 403 was marked wontfix last week"))).toEqual({ transient: false, reason: "unknown" });
+  });
+
+  it("still recognizes real error shapes with the tightened patterns", () => {
+    // The textual cues the existing tests rely on keep working.
+    expect(classifyError(new Error("xAI HTTP 429: Too Many Requests"))).toEqual({ transient: true, reason: "rate_limited" });
+    expect(classifyError(new Error("OpenAI HTTP 402 Payment Required"))).toMatchObject({ transient: false, reason: "quota" });
+    expect(classifyError(new Error("status: 503 Service Unavailable"))).toMatchObject({ transient: true, reason: "server_error" });
+    // The Claude CLI's own shape: status in parens, "temporarily" in the phrase.
+    expect(classifyError(new Error("claude: API error (503): service temporarily unavailable"))).toMatchObject({ transient: true, reason: "server_error" });
+    expect(classifyError(new Error("API error (502)"))).toMatchObject({ transient: true, reason: "server_error" });
+    expect(classifyError(new Error("status [504]"))).toMatchObject({ transient: true, reason: "server_error" });
+    expect(classifyError(new Error("error(500)"))).toMatchObject({ transient: true, reason: "server_error" });
+    expect(classifyError(new Error("service temporarily unavailable"))).toMatchObject({ transient: true, reason: "server_error" });
+    expect(classifyError(new Error("error: 401 Unauthorized: missing bearer"))).toMatchObject({ transient: false, reason: "auth" });
+  });
 });
 
 describe("computeBackoff", () => {

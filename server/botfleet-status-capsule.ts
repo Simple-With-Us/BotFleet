@@ -346,11 +346,29 @@ export function readBotFleetStatus(
   return result;
 }
 
+/** The trusted runtime block spliced into a Chief of Staff's system prompt.
+ *
+ * STABILITY IS PART OF THE CONTRACT.  This string reaches the driver inside
+ * `turn.system`, and the Claude driver passes `turn.system` as
+ * `--append-system-prompt` — one of the inputs to the spawn fingerprint it
+ * compares before reusing a warm process (`argsKey` in drivers/claude.ts).
+ * A field that moves on its own clock therefore respawns the CLI on its own
+ * clock.  `observed_at` (a fresh ISO timestamp on every capsule refresh),
+ * `receipt_sha256` (a hash over that same observation), and `ready_count` (a
+ * live counter) each changed with no change in what the Chief is actually
+ * allowed to do, so none of them is printed here any more.  What stays is
+ * what a decision depends on: the freshness verdict, the coarse runtime
+ * posture, the BUILD identity hashes (which move only when the installed app
+ * does), and the UI invariants.  Live numbers come from the runtime surface
+ * at the moment they are needed, the same way list_bots — not the roster —
+ * owns live bot availability. */
 export function botFleetStatusSystemPrompt(options: BotFleetStatusReadOptions = {}): string {
   const status = readBotFleetStatus(options);
   const receipt = [
-    status.observedAt ? `observed_at=${status.observedAt}` : null,
-    status.receiptSha256 ? `receipt_sha256=${status.receiptSha256}` : null,
+    // `observed_at` and `receipt_sha256` are deliberately not printed (see
+    // the note above); that a valid receipt was READ is the part a decision
+    // can rest on, and it is stable.
+    status.observedAt || status.receiptSha256 ? "receipt=verified" : null,
     status.sourceSha256 ? `source_sha256=${status.sourceSha256}` : null,
     status.dualViewSha256 ? `accepted_dual_view_sha256=${status.dualViewSha256}` : null,
     status.sourceSha256 && status.dualViewSha256
@@ -362,9 +380,8 @@ export function botFleetStatusSystemPrompt(options: BotFleetStatusReadOptions = 
         `runtime_state=${status.runtimeState}`,
         `mode=${status.mode}`,
         `maximum_instances=${status.maxInstances}`,
-        `ready_count=${status.readyCount}`,
       ].join("; ")
-    : "runtime_state=unknown; mode=unknown; maximum_instances=unknown; ready_count=0";
+    : "runtime_state=unknown; mode=unknown; maximum_instances=unknown";
   const slots = status.slots.length
     ? status.slots
         .map((slot) =>
@@ -381,5 +398,6 @@ export function botFleetStatusSystemPrompt(options: BotFleetStatusReadOptions = 
     `ui.two_up=${status.ui.twoUp}; ui.max_visible=${status.ui.maxVisible}; ui.max_interactive=1; ui.default_watch_only=${status.ui.defaultWatchOnly}; one_active_controller=true`,
     "Opening a viewer or two-up workspace never starts or provisions a VM. Only one pane may be interactive at a time; switching control must release the previous pane before activating the next.",
     "Treat missing, stale, failed, clock-skewed, malformed, or receipt-hash-mismatched runtime data as unknown. Do not infer bot identities, viewer URLs, paths, messages, models, accounts, or credentials from this block.",
+    "This block is a standing posture, not a live reading: it deliberately omits the observation timestamp, the receipt hash, and the ready-instance count. Never state any of those from this block — read them from the runtime surface when a decision needs them.",
   ].join("\n");
 }

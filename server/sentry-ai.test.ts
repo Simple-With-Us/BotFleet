@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  classifyMessage,
   configureTurnIdentity,
   genAiProvider,
   observeRuntimeEvent,
@@ -8,6 +9,7 @@ import {
   type SentryAiSink,
   type SentryBreadcrumb,
   type SentryCaptureContext,
+  type SentryMessageContext,
   type SpanLike,
   withChatSpan,
 } from "./sentry-ai.ts";
@@ -46,6 +48,7 @@ function recordingSink() {
   const exceptions: unknown[] = [];
   const contexts: Array<SentryCaptureContext | undefined> = [];
   const breadcrumbs: SentryBreadcrumb[] = [];
+  const messages: Array<{ message: string; context?: SentryMessageContext }> = [];
   const conversations: string[] = [];
   const users: Array<{ id?: string; username?: string; email?: string } | null> = [];
   const sink: SentryAiSink = {
@@ -83,9 +86,12 @@ function recordingSink() {
       exceptions.push(error);
       contexts.push(context);
     },
+    captureMessage: (message, context) => {
+      messages.push({ message, context });
+    },
     addBreadcrumb: (crumb) => breadcrumbs.push(crumb),
   };
-  return { sink, spans, exceptions, contexts, breadcrumbs, conversations, users };
+  return { sink, spans, exceptions, contexts, breadcrumbs, messages, conversations, users };
 }
 
 afterEach(() => {
@@ -120,6 +126,21 @@ describe("Sentry AI observability", () => {
     expect(invalid.spans[0].attributes["gen_ai.usage.cost"]).toBeUndefined();
   });
 
+  it("stamps input tokens without a fabricated output figure when a driver reports only one side (DSH)", () => {
+    // DSH's ACP `usage_update` reports a combined context-occupancy number,
+    // never a real input/output split (see server/drivers/acp/core.ts's
+    // usage_update handling) — output must stay unset, not a fake 0.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "thread.token-usage.updated", input: 900 }), sink);
+    expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(900);
+    expect(spans[0].attributes).not.toHaveProperty("gen_ai.usage.output_tokens");
+
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 950 } }), sink);
+    expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(950);
+    expect(spans[0].attributes).not.toHaveProperty("gen_ai.usage.output_tokens");
+  });
+
   it("keeps the turn alive when conversation tagging throws", () => {
     const { sink, spans } = recordingSink();
     sink.setConversationId = () => {
@@ -150,9 +171,15 @@ describe("Sentry AI observability", () => {
     observeRuntimeEvent(base({ type: "thread.token-usage.updated", input: 11, output: 7 }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: true, usage: { input: 11, output: 7 } }), sink);
 
-    expect(conversations[0]).toBe("thread-1");
+    // The conversation id is the per-task turnId, not the persistent
+    // threadId — see "Sentry Agents conversation identity" below.  The
+    // threadId still rides along as botfleet.room_id so it is never lost.
+    expect(conversations[0]).toBe("turn-1");
     expect(spans.map((s) => s.op)).toEqual(["gen_ai.invoke_agent", "gen_ai.execute_tool"]);
-    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("thread-1");
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-1");
+    expect(spans[1].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[1].attributes["botfleet.room_id"]).toBe("thread-1");
     expect(spans[0].attributes["gen_ai.request.model"]).toBe("gpt-test");
     expect(spans[0].attributes["gen_ai.usage.input_tokens"]).toBe(11);
     expect(spans[0].attributes["gen_ai.usage.output_tokens"]).toBe(7);
@@ -305,6 +332,29 @@ describe("Sentry AI observability", () => {
     expect(JSON.stringify(spans)).not.toMatch(/prompt|messages|sk-/);
   });
 
+  it("uses taskId for gen_ai.conversation.id when the caller has a turnId, and keeps conversationId as botfleet.room_id", async () => {
+    const { sink, spans } = recordingSink();
+    await withChatSpan(
+      { model: "MiniMax-M3", conversationId: "thread-9", taskId: "turn-42", provider: "minimax" },
+      async () => ({ text: "ok", usage: undefined }),
+      sink,
+    );
+    const chat = spans.find((s) => s.op === "gen_ai.chat");
+    expect(chat?.attributes["gen_ai.conversation.id"]).toBe("turn-42");
+    expect(chat?.attributes["botfleet.room_id"]).toBe("thread-9");
+  });
+
+  it("recordExecutedTools takes an optional taskId the same way, defaulting to the thread", () => {
+    const { sink, spans } = recordingSink();
+    recordExecutedTools("thread-9", ["grep"], sink, "turn-42");
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-42");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-9");
+
+    const untagged = recordingSink();
+    recordExecutedTools("thread-9", ["grep"], untagged.sink);
+    expect(untagged.spans[0].attributes["gen_ai.conversation.id"]).toBe("thread-9");
+  });
+
   it("attaches cached input tokens to the chat span when present", async () => {
     const { sink, spans } = recordingSink();
     await withChatSpan(
@@ -442,25 +492,153 @@ describe("failed turns become Issues", () => {
   });
 
   it("does not Issue expected setup or cancel stop reasons", () => {
-    const { sink, exceptions, breadcrumbs } = recordingSink();
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "auth_required" }), sink);
     observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled", turnId: "turn-2" }), sink);
     expect(exceptions).toHaveLength(0);
     expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(2);
+    expect(spans.map((span) => span.status)).toEqual([undefined, undefined]);
+    expect(spans.every((span) => span.ended)).toBe(true);
+  });
+
+  it("does not Issue a request_timeout completion after the timeout runtime.error breadcrumb", () => {
+    // The 180s model-request timeout breadcrumbs runtime.error ("the model
+    // did not answer within") as an expected condition, then the turn ends
+    // not-ok with stopReason "request_timeout".  The completion must not
+    // escalate to a Sentry Issue.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "request_timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("does not Issue an rpc_error completion after an ACP init-timeout breadcrumb", () => {
+    // An ACP "initialize timed out" is breadcrumbed as expected, then the
+    // turn completes as a generic rpc_error — that completion must not page
+    // a second report for the same condition.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "initialize timed out" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("still Issues an rpc_error completion with no preceding init timeout", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: rpc_error");
+  });
+
+  it("still Issues a genuinely failed completion after an expected timeout breadcrumb", () => {
+    // Marking nothing as reported: a later real failure on the same turn
+    // must still page.
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "exit code 1" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: exit code 1");
   });
 
   it("does not Issue an 'interrupted' stop reason (openai-compat/Grok/BoxAgent stop shape)", () => {
     // Those drivers report a user-initiated stop as stopReason "interrupted"
     // rather than "cancelled" — this must be treated as the same expected,
     // benign shape of a stop, not sent to Sentry as an error.
-    const { sink, exceptions, breadcrumbs } = recordingSink();
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "interrupted" }), sink);
     expect(exceptions).toHaveLength(0);
     expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+    expect(spans[0].status).toBeUndefined();
+    expect(spans[0].ended).toBe(true);
   });
+
+  it("keeps a provider error status when a later stop says cancelled", () => {
+    const { sink, exceptions, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "upstream HTTP 500" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "cancelled" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(spans[0].status).toEqual({ code: 2, message: "internal_error" });
+  });
+
+  it("does not Issue a request_timeout completion after the timeout runtime.error breadcrumb", () => {
+    // The 180s model-request timeout breadcrumbs runtime.error ("the model
+    // did not answer within") as an expected condition, then the turn ends
+    // not-ok with stopReason "request_timeout".  The completion must not
+    // escalate to a Sentry Issue.
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(
+      base({ type: "runtime.error", message: "the model did not answer within 180s" }),
+      sink,
+    );
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "request_timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("does not Issue an rpc_error completion after an ACP init-timeout breadcrumb", () => {
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "initialize timed out" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:")).length).toBe(1);
+  });
+
+  it("still Issues an rpc_error completion with no preceding init timeout", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "rpc_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: rpc_error");
+  });
+
+  it("still Issues a stop_sequence completion — it is not a benign stop reason here", () => {
+    // BOTFLEET-K / board 28a249c3 / Seer PR #605: production events tagged
+    // stopReason "stop_sequence" were all real Anthropic API failures
+    // (is_error: true, terminal_reason "api_error", api_error_status 429) —
+    // "stop_sequence" was a stale value left over from the CLI's
+    // result-builder on a request that never got a real model response, not
+    // a genuine benign model-side stop. A genuinely benign stop_sequence
+    // completion has is_error: false and so never reaches this branch at
+    // all (see the "normalizes a full turn" driver test's stopReason:
+    // "end_turn" pin). Allowlisting "stop_sequence" here, as #605 proposed,
+    // would silently swallow every one of those rate-limit failures instead
+    // of surfacing them. The real fix is in the driver
+    // (server/drivers/claude.ts): prefer terminal_reason over stop_reason
+    // on a failed turn, so this case now arrives here as stopReason
+    // "api_error", asserted below — not "stop_sequence".
+    const { sink, exceptions, breadcrumbs } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "stop_sequence" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: stop_sequence");
+    expect(breadcrumbs.filter((b) => b.message.startsWith("bot turn failed:"))).toHaveLength(0);
+  });
+
+  it("still Issues an api_error completion — a real Anthropic-side failure, not expected/setup", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "api_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: api_error");
+  });
+
 });
 
 describe("approval, retry, and session lifecycle", () => {
@@ -734,6 +912,7 @@ describe("bot and room identity", () => {
     const { sink, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
     expect(Object.keys(spans[0].attributes).sort()).toEqual([
+      "botfleet.room_id",
       "gen_ai.agent.name",
       "gen_ai.conversation.id",
       "gen_ai.operation.name",
@@ -803,9 +982,164 @@ describe("Sentry Agents conversation identity", () => {
     }));
     const { sink, conversations, users, spans } = recordingSink();
     observeRuntimeEvent(base({ type: "turn.started" }), sink);
-    expect(conversations[0]).toBe("thread-1");
+    expect(conversations[0]).toBe("turn-1");
     expect(users[0]).toEqual({ id: "bot-fixer", username: "Fixer" });
     expect(spans[0].attributes["gen_ai.agent.name"]).toBe("Fixer");
-    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("thread-1");
+    expect(spans[0].attributes["gen_ai.conversation.id"]).toBe("turn-1");
+    expect(spans[0].attributes["botfleet.room_id"]).toBe("thread-1");
+  });
+
+  it("gives two turns on the same thread two different conversation ids", () => {
+    // This is the whole point of the change: gen_ai.conversation.id used to
+    // be the threadId, so every turn a bot ever ran landed in the same
+    // Sentry Conversation.  It must now change per task (turnId) while
+    // botfleet.room_id keeps the thread constant.
+    const { sink, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-a" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, turnId: "turn-a" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-b" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: true, turnId: "turn-b" }), sink);
+
+    const turns = spans.filter((s) => s.op === "gen_ai.invoke_agent");
+    expect(turns).toHaveLength(2);
+    expect(turns[0].attributes["gen_ai.conversation.id"]).toBe("turn-a");
+    expect(turns[1].attributes["gen_ai.conversation.id"]).toBe("turn-b");
+    expect(turns[0].attributes["botfleet.room_id"]).toBe("thread-1");
+    expect(turns[1].attributes["botfleet.room_id"]).toBe("thread-1");
+  });
+
+  it("falls back to the thread id when an event carries no turnId", () => {
+    const { sink, conversations } = recordingSink();
+    observeRuntimeEvent(base({ type: "runtime.error", message: "boom", turnId: undefined }), sink);
+    expect(conversations[0]).toBe("thread-1");
+  });
+});
+
+describe("honest failure classification", () => {
+  it("reports a setup failure's own reason at warning level, not a reasonless spawn_error", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    const setup = "`dsh` isn't installed, or isn't on this app's PATH";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message: setup, setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "dshAgent", ok: false, stopReason: "spawn_error" }), sink);
+
+    expect(exceptions).toHaveLength(0);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].message).toContain("isn't installed");
+    expect(messages[0].message).not.toContain("bot turn failed: spawn_error");
+    expect(messages[0].context?.level).toBe("warning");
+    expect(messages[0].context?.fingerprint).toEqual(["bot-setup", "dshAgent"]);
+    expect(messages[0].context?.tags).toMatchObject({
+      "botfleet.stop_reason": "spawn_error",
+      "botfleet.setup": "true",
+    });
+  });
+
+  it("falls back to captureException with the setup text for a sink without captureMessage", () => {
+    const { sink, exceptions, contexts } = recordingSink();
+    delete sink.captureMessage;
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`grok` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("isn't installed");
+    expect(contexts[0]?.fingerprint).toEqual(["bot-setup", "openai-compat"]);
+  });
+
+  it("does not carry a setup message into the next turn", () => {
+    const { sink, exceptions, messages } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "`dsh` isn't installed", setup: true }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "spawn_error" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "spawn_error" }), sink);
+    expect(messages).toHaveLength(1);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: spawn_error");
+  });
+
+  it("gives two engines failing at the same throw site different fingerprints", () => {
+    const { sink, contexts } = recordingSink();
+    const message = "session/new timed out after 30000ms";
+    observeRuntimeEvent(base({ type: "turn.started", provider: "dshAgent" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "dshAgent", message }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", provider: "minimax", threadId: "thread-2" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", provider: "minimax", threadId: "thread-2", message }), sink);
+    const [first, second] = contexts.map((context) => context?.fingerprint);
+    expect(first?.[0]).toBe("bot-runtime-error");
+    expect(second?.[0]).toBe("bot-runtime-error");
+    expect(first).not.toEqual(second);
+    expect(first?.[1]).toBe("dshAgent");
+    expect(second?.[1]).toBe("minimax");
+    expect(first?.[2]).toBe(second?.[2]);
+  });
+
+  it("fingerprints failed completions by engine and stop reason", () => {
+    const { sink, contexts } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started", provider: "claudeAgent" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", provider: "claudeAgent", ok: false, stopReason: "api_error" }), sink);
+    expect(contexts[0]?.fingerprint).toEqual(["bot-turn-failure", "claudeAgent", "api_error"]);
+    expect(contexts[0]?.tags?.["botfleet.stop_reason"]).toBe("api_error");
+  });
+
+  it("classifies a message by shape, never by its raw variable text", () => {
+    const a = classifyMessage("session/new timed out after 30000ms (request 7f3a9c2e11)");
+    const b = classifyMessage("session/new timed out after 45000ms (request 0b1c2d3e4f)");
+    expect(a).toBe(b);
+    expect(a).not.toContain("30000");
+    expect(a).not.toContain("7f3a9c2e11");
+    expect(classifyMessage("upstream HTTP 500")).not.toBe(a);
+    const leaky = classifyMessage("POST /hooks/wh_abc/whsec_xyz0123456789 failed");
+    expect(leaky).not.toContain("whsec_xyz");
+  });
+
+  it("does not Issue a timeout completion after the model-request timeout breadcrumb", () => {
+    // chat-completions/loop.ts maps its request_timeout exit to stopReason
+    // "timeout" — the stop a real turn ends with, not "request_timeout".
+    const { sink, exceptions, breadcrumbs, spans } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(0);
+    expect(breadcrumbs.filter((b) => b.message === "bot turn failed: timeout")).toHaveLength(1);
+    expect(spans[0].status).toBeUndefined();
+  });
+
+  it("still Issues a wall-clock timeout, which ends with the same stop reason", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+    expect(String(exceptions[0])).toContain("bot turn failed: timeout");
+  });
+
+  it("does not carry a model-timeout flag into the next turn", () => {
+    const { sink, exceptions } = recordingSink();
+    observeRuntimeEvent(base({ type: "turn.started" }), sink);
+    observeRuntimeEvent(base({ type: "runtime.error", message: "the model did not answer within 180s" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", ok: false, stopReason: "timeout" }), sink);
+    observeRuntimeEvent(base({ type: "turn.started", turnId: "turn-2" }), sink);
+    observeRuntimeEvent(base({ type: "turn.completed", turnId: "turn-2", ok: false, stopReason: "timeout" }), sink);
+    expect(exceptions).toHaveLength(1);
+  });
+
+  it("does not page an Antigravity host-control policy refusal", async () => {
+    const { antigravityHostPolicyRefusal } = await import("./drivers/antigravity.ts");
+    for (const reported of ["always-proceed", null, "turbo"]) {
+      const { sink, exceptions, breadcrumbs } = recordingSink();
+      observeRuntimeEvent(base({ type: "turn.started", provider: "antigravity" }), sink);
+      observeRuntimeEvent(
+        base({ type: "runtime.error", provider: "antigravity", message: antigravityHostPolicyRefusal(reported) }),
+        sink,
+      );
+      observeRuntimeEvent(
+        base({ type: "turn.completed", provider: "antigravity", ok: false, stopReason: "host_control_policy" }),
+        sink,
+      );
+      expect(exceptions).toHaveLength(0);
+      expect(breadcrumbs.some((b) => b.level === "warning" && b.message.startsWith("Antigravity's tool execution policy"))).toBe(true);
+      expect(breadcrumbs.some((b) => b.message === "bot turn failed: host_control_policy")).toBe(true);
+      resetSentryAiForTests();
+    }
   });
 });

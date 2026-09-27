@@ -20,6 +20,24 @@ function scratchConfig(toml: string): string {
 }
 
 describe("readGrokModelCatalog", () => {
+  it("uses the current Grok Build lineup with 4.7 as the default", () => {
+    expect(STATIC_GROK_MODELS).toEqual({
+      default: "grok-4.7",
+      options: [
+        { id: "grok-4.7", label: "Grok 4.7" },
+        {
+          id: "grok-4.7-build-fast",
+          label: "Grok 4.7 Build Fast",
+          badge: "2× $",
+          badgeTitle:
+            "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+        },
+        { id: "grok-4.6", label: "Grok 4.6" },
+        { id: "grok-4.5", label: "Grok 4.5" },
+      ],
+    });
+  });
+
   it("returns the static cloud pair when there is no config", () => {
     expect(readGrokModelCatalog({ HOME: join(tmpdir(), "omb-grok-missing-home") })).toEqual(STATIC_GROK_MODELS);
   });
@@ -44,6 +62,14 @@ name = "MiniMax M3 4bit (oMLX)"
     expect(readGrokModelCatalog({ HOME: home })).toEqual({
       default: "ollama-ornith-35b-bf16",
       options: [
+        { id: "grok-4.7", label: "Grok 4.7" },
+        {
+          id: "grok-4.7-build-fast",
+          label: "Grok 4.7 Build Fast",
+          badge: "2× $",
+          badgeTitle:
+            "Same Grok 4.7 model on high-performance infrastructure — 2× the output speed at 2× the per-token price.",
+        },
         { id: "grok-4.6", label: "Grok 4.6" },
         { id: "grok-4.5", label: "Grok 4.5" },
         { id: "ollama-ornith-35b-bf16", label: "ornith:35b-bf16 (Ollama)", custom: true },
@@ -64,8 +90,19 @@ name = "nope"
 name = "OK"
 `);
     const catalog = readGrokModelCatalog({ HOME: home });
-    expect(catalog.default).toBe("grok-4.6");
-    expect(catalog.options.map((o) => o.id)).toEqual(["grok-4.6", "grok-4.5", "ok-model"]);
+    expect(catalog.default).toBe("grok-4.7");
+    expect(catalog.options.map((o) => o.id)).toEqual([
+      "grok-4.7",
+      "grok-4.7-build-fast",
+      "grok-4.6",
+      "grok-4.5",
+      "ok-model",
+    ]);
+  });
+
+  it.each(["grok-4.6", "grok-4.5"])("preserves an explicitly configured legacy default %s", (model) => {
+    const home = scratchConfig(`[models]\ndefault = "${model}"\n`);
+    expect(readGrokModelCatalog({ HOME: home }).default).toBe(model);
   });
 
   it("honors GROK_HOME over HOME", () => {
@@ -88,7 +125,7 @@ default = "grok-4.5"
 [model.ok-model]
 name = "OK"
 `);
-    expect(readGrokModelCatalog({ HOME: home }).default).toBe("grok-4.6");
+    expect(readGrokModelCatalog({ HOME: home }).default).toBe("grok-4.7");
   });
 });
 

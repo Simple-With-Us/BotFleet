@@ -602,6 +602,9 @@ public struct CompanionClient: Sendable {
 
     private struct HealthIdentity: Decodable {
         let app: String
+        // Older sidecars did not include readiness; their 2xx identity was
+        // already the complete health signal.
+        let ready: Bool?
     }
 
     private static func healthy(_ connection: Connection, session: URLSession) async -> Bool {
@@ -616,7 +619,7 @@ public struct CompanionClient: Sendable {
             else { return false }
             let identity = try JSONDecoder().decode(HealthIdentity.self, from: data)
             let app = identity.app.lowercased()
-            guard app == "botfleet" || app == "botfleet" else { return false }
+            guard app == "botfleet", identity.ready != false else { return false }
             return true
         } catch {
             return false
@@ -1194,6 +1197,22 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: ["title": title]))
     }
 
+    /// Put one thread to sleep, or wake it: `0` sleeps until the thread's
+    /// next activity, a timestamp in epoch milliseconds until that moment,
+    /// and nil wakes it now.
+    ///
+    /// Waking travels as JSON `null`, not as an omitted field — the harness
+    /// reads an absent key as "leave the snooze alone", which is what lets a
+    /// rename on the same route not disturb one.  `NSNull()` is how that
+    /// null survives `JSONSerialization`.
+    public func snoozeTask(botId: String, threadId: String, snoozedUntil: Double?) async throws {
+        try await send(try makeRequest(
+            "PATCH",
+            "/api/bots/\(botId)/tasks/\(threadId)",
+            body: ["snoozedUntil": snoozedUntil ?? NSNull()]
+        ))
+    }
+
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {
         try await send(try makeRequest("DELETE", "/api/bots/\(botId)/tasks/\(threadId)"), as: BotResponse.self).bot
     }
@@ -1334,11 +1353,12 @@ public struct CompanionClient: Sendable {
     /// `screens` defaults off, and should stay off unless something is
     /// actually showing them: the harness pushes a base64 desktop capture
     /// every few seconds to every client that asks, which is a poor thing to
-    /// send a phone on cellular. The computer panel turns it on for exactly
-    /// as long as it is open, which costs a reconnect — cheap, because the
-    /// stream resumes from its cursor and loses nothing.
-    public func events(since cursor: String?, screens: Bool = false) throws -> AsyncThrowingStream<StreamFrame, Error> {
+    /// send a phone on cellular.  The computer panel turns it on for exactly
+    /// as long as it is open and names the watched bot.  The stream resumes
+    /// from its cursor after the reconnect, so nothing is missed.
+    public func events(since cursor: String?, screens: Bool = false, screenBotIds: [String] = []) throws -> AsyncThrowingStream<StreamFrame, Error> {
         var query = [URLQueryItem(name: "screens", value: screens ? "on" : "off")]
+        if screens { query += screenBotIds.map { URLQueryItem(name: "botId", value: $0) } }
         if let cursor { query.append(URLQueryItem(name: "since", value: cursor)) }
         var streamRequest = try makeRequest("GET", "/api/events", query: query)
         streamRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")

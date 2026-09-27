@@ -90,7 +90,7 @@ export type TurnBillingMode = "actual" | "estimated";
 
 export type RuntimeEvent = RuntimeEventBase &
   (
-    | { type: "session.started"; sessionId: string | null; model?: string | null }
+    | { type: "session.started"; sessionId: string | null; model?: string | null; rebuilt?: boolean }
     | { type: "session.exited"; reason?: string }
     | { type: "turn.started" }
     | {
@@ -125,8 +125,12 @@ export type RuntimeEvent = RuntimeEventBase &
          * `input` (claude.ts sums cache reads into input; codex reports it
          * that way natively).  Usage Monitor telemetry subtracts it back out
          * to bill cache reads at their own rate, so a driver that reports
-         * input EXCLUDING cache must fold the cache figure in first. */
-        usage?: { input: number; output: number; cachedInput?: number };
+         * input EXCLUDING cache must fold the cache figure in first.
+         * `output` is optional: DSH's ACP server reports only a combined
+         * context-occupancy figure (session/update `usage_update`), never a
+         * real input/output split, so a driver that only knows one side
+         * omits the other rather than reporting a fabricated 0. */
+        usage?: { input: number; output?: number; cachedInput?: number };
       }
     | {
         type: "item.started";
@@ -181,8 +185,9 @@ export type RuntimeEvent = RuntimeEventBase &
         source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
         approvalScope?: "local-computer";
       }
-    // Same invariant as turn.completed.usage: `cachedInput` is a subset of `input`.
-    | { type: "thread.token-usage.updated"; input: number; output: number; cachedInput?: number }
+    // Same invariant as turn.completed.usage: `cachedInput` is a subset of
+    // `input`, and `output` is optional for the same reason (see there).
+    | { type: "thread.token-usage.updated"; input: number; output?: number; cachedInput?: number }
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
@@ -207,6 +212,16 @@ export interface SendTurnInput {
   model?: string;
   effort?: EffortLevel;
   resumeCursor?: unknown;
+  /** The turn with the conversation so far replayed inline, attached only
+   * alongside resumeCursor. A cursor-resuming driver sends it once, on a
+   * fresh session, when the provider refuses the cursor before reading the
+   * prompt (server/resume-recovery.ts) — so a session the provider lost
+   * does not brick the thread, and the new session is not blank. */
+  recoveryText?: string;
+  /** recoveryText is the replay this turn would have been sent without a
+   * resume cursor (it carries an update from outside the session). A driver
+   * that rebuilds only some lost sessions may also rebuild this one. */
+  recoveryIsReplay?: boolean;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
@@ -228,8 +243,31 @@ export interface SendTurnInput {
       result: string;
     }>;
   }>;
-  /** Bot persona (name/title/description) as a system prompt. */
+  /** Bot persona (name/title/description) as a system prompt.  Always the
+   *  whole prompt, every section in order, so a driver that has not adopted
+   *  the split below keeps sending exactly what it sent before. */
   system?: string;
+  /** `system` split at the sections that legitimately change
+   *  mid-conversation (memory, mentions; upstream also outstanding teammate
+   *  work and recent work): `systemStable` is everything else, `systemVolatile`
+   *  is those sections' text.  A driver that keeps one CLI process per thread
+   *  keys that process on the stable half, so a memory edit no longer
+   *  respawns the session and makes the provider re-cache the entire prompt;
+   *  the changed half is delivered inside the next turn instead.  Drivers
+   *  that rebuild their request every turn keep only the stable half in
+   *  their system message and carry the volatile half inside the newest user
+   *  message, so the resent prefix stays byte-identical.  Both are present
+   *  or neither is (see drivers/prompt-split.ts promptHalves). */
+  systemStable?: string;
+  systemVolatile?: string;
+  /** sha256 hex of `systemVolatile`, computed once by the server so a driver
+   *  comparing halves against a receipt need not hash the text itself. */
+  volatileDigest?: string;
+  /** True when this turn's user message tags teammates: the mentions part
+   *  of systemVolatile describes this turn even when its text is unchanged
+   *  from the previous turn, so digest-based delivery must not suppress the
+   *  note. */
+  mentionTurn?: boolean;
   /** Tool definitions the agent may call this turn, in OpenAI function-calling
    * shape.  An HTTP driver (MiniMax, OpenAI-compatible) hands these to the
    * model verbatim; a CLI driver that mounts MCP servers is free to ignore
@@ -547,6 +585,15 @@ export interface ModelCatalog {
     label: string;
     custom?: boolean;
     loaded?: boolean;
+    /** Short tag rendered next to the label in the model picker (e.g. a
+     * price/speed tradeoff the user should see before picking).  Drivers
+     * set it on static catalog rows; the picker renders it as a chip with
+     * `badgeTitle` (full sentence) on hover.  Keep the chip under ~10 chars
+     * so it does not push the label to a second line on narrow chat heads. */
+    badge?: string;
+    /** Hover explanation for `badge`.  Without this the chip renders
+     * without a tooltip and a screen-reader hint. */
+    badgeTitle?: string;
     /** total context window in tokens, when the driver knows it — sizes
      * the model-facing rebuild (server/context-rebuild.ts). Unknown falls
      * back to a pattern table over the model id, then a conservative default. */

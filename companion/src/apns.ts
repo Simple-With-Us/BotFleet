@@ -3,9 +3,11 @@
 // leaves this process; tests inject sendImpl.
 import { connect as http2Connect, constants as http2Constants, type ClientHttp2Session, type ClientHttp2Stream } from "node:http2";
 import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { DATA_DIR, writeFileAtomic } from "./state.ts";
 
 export interface ApnsConfig {
   keyId: string;
@@ -21,13 +23,16 @@ export function apnsKeyPath(): string {
   return process.env.APNS_P8_PATH?.trim() || join(homedir(), ".secrets", `AuthKey_${keyId}.p8`);
 }
 
-/** A fingerprint of the key FILE — modification time and size, never a
- * byte of the key itself.  Cheap enough to take every few minutes, and
- * enough to notice a rotated .p8 that kept its path. */
+/** A fingerprint of the key FILE — its path, modification time and size,
+ * never a byte of the key itself.  Cheap enough to take every few minutes,
+ * and enough to notice a rotated .p8 that kept its path.  The path is part
+ * of it because `APNS_P8_PATH` can move the key: pointing the sidecar at a
+ * different file is a key change, and a fault recorded against the old one
+ * must not survive it. */
 export function apnsKeyStamp(path = apnsKeyPath()): string | null {
   try {
     const info = statSync(path);
-    return `${info.mtimeMs}:${info.size}`;
+    return `${path}:${info.mtimeMs}:${info.size}`;
   } catch {
     return null;
   }
@@ -1112,6 +1117,37 @@ export function classifyHttpResponse(status: number, reason: string | undefined)
 
 // --- Sender health --------------------------------------------------------
 
+/** Why this sidecar is not sending pushes at all.  A word rather than a
+ * sentence, so the phone and the pairing page can each say it their own
+ * way: `no-key` (no usable .p8 on disk), `key-rejected` (Apple refuses the
+ * one we have), `unreachable` (every paired phone's circuit is open because
+ * Apple's push service cannot be reached). */
+export type PushesOffReason = "no-key" | "key-rejected" | "unreachable";
+
+/** One paired phone's own push state.
+ *
+ * Per device because the breaker is per device.  A single shared counter
+ * could not open: `deliver` fans every notification out to every
+ * disconnected phone, so one other phone's `400 BadDeviceToken` zeroed the
+ * run before it could reach the threshold, and a link that was down for two
+ * days never tripped anything. */
+export interface PushDeviceHealth {
+  deviceId: string;
+  /** The bucketed shape of this phone's last failure. */
+  failureKind: ApnsFailureKind;
+  /** Transport-family failures in a row for THIS phone. */
+  consecutiveTransportFailures: number;
+  /** `err.code` from this phone's last failure, verbatim. */
+  lastErrorCode: string | null;
+  /** Epoch ms; non-null means this phone's lane is holding its alerts until
+   * then.  They are held, not discarded. */
+  circuitOpenUntil: number | null;
+  /** Alerts waiting on this phone's lane right now. */
+  queued: number;
+  /** Alerts this phone's lane has dropped because it was full. */
+  dropped: number;
+}
+
 /** What the desktop and the phone may know about the push sender.  Every
  * field here is either a count, a timestamp, or a status Apple sent us —
  * nothing derived from the signing key. */
@@ -1136,9 +1172,11 @@ export interface PushSenderHealth {
   keyRejected: string | null;
   /** Notifications dropped because a device's queue was already full. */
   dropped: number;
-  /** Notifications skipped because the circuit breaker was open — Apple's
+  /** Drain passes HELD BACK because the circuit breaker was open — Apple's
    * push service was unreachable, not a full queue on this computer.  Kept
-   * apart from `dropped` so the phone can say which one happened. */
+   * apart from `dropped` so the phone can say which one happened, and it is
+   * deliberately not a count of lost notifications: an open circuit now
+   * leaves every alert on its lane and sends it when the circuit closes. */
   circuitDropped: number;
   /** The bucketed shape of the last failure — Apple vs transport vs key.
    * "none" when the last attempt succeeded or no attempt has happened yet.
@@ -1154,19 +1192,31 @@ export interface PushSenderHealth {
    * the owner sees exactly what Node raised (e.g. `ECONNRESET`,
    * `ERR_HTTP2_PROTOCOL_ERROR`).  Null between failures. */
   lastErrorCode: string | null;
-  /** Epoch ms; non-null means we are intentionally not sending because
-   * transport failures exceeded the threshold.  The watcher's
-   * `recordOutcome` short-circuits and increments `circuitDropped` while this is
-   * in the future.  Null when the circuit is closed. */
+  /** Epoch ms; non-null means at least one phone's lane is intentionally
+   * holding its alerts because transport failures exceeded the threshold.
+   * The latest of the open circuits, so it reads as "everything is moving
+   * again by then".  Null when every circuit is closed. */
   circuitOpenUntil: number | null;
+  /** One row per phone the sender knows something about — its own failure
+   * run, its own circuit, its own backlog.  Empty when nothing has failed
+   * and nothing is queued. */
+  devices: PushDeviceHealth[];
+  /** True when this sidecar is not going to deliver a push right now, for
+   * any reason.  The one field a phone can trust to say "closed-app
+   * notifications are off" — `lastSentAt` cannot, because a sender that
+   * stopped working an hour ago still has one. */
+  pushesOff: boolean;
+  /** Why, when `pushesOff`.  Null when pushes are on. */
+  pushesOffReason: PushesOffReason | null;
 }
 
 interface HealthTracker {
   snapshot(): PushSenderHealth;
   setConfigured(config: ApnsConfig | null): void;
   rejectKey(at: number, reason: string, errorTimestamp?: number): void;
-  recordSent(at: number): void;
+  recordSent(deviceId: string, at: number): void;
   recordError(
+    deviceId: string,
     at: number,
     status: number,
     reason?: string,
@@ -1174,25 +1224,56 @@ interface HealthTracker {
     errorCode?: string,
     errorTimestamp?: number,
   ): void;
-  recordDropped(): void;
-  /** A send skipped because the circuit is open. */
-  recordCircuitDropped(): void;
-  /** HTTP/2 protocol errors in a row — only `http2_protocol` failures, so
-   * timeouts and socket drops never trip the tighter protocol breaker. */
-  protocolFailureRun(): number;
-  /** True iff `circuitOpenUntil` is in the future — the next send must
-   * be skipped without incrementing `failed`. */
-  circuitIsOpen(at: number): boolean;
-  /** Open the circuit for 60 seconds.  Used by the watcher when the
-   * transport-failure or http2-protocol threshold trips. */
-  openCircuit(at: number, ms: number): void;
+  recordDropped(deviceId: string): void;
+  /** A drain pass held back because that phone's circuit is open. */
+  recordCircuitDeferred(): void;
+  /** Transport-family failures in a row for one phone. */
+  transportFailureRun(deviceId: string): number;
+  /** HTTP/2 protocol errors in a row for one phone — only `http2_protocol`
+   * failures, so timeouts and socket drops never trip the tighter protocol
+   * breaker. */
+  protocolFailureRun(deviceId: string): number;
+  /** True iff this phone's circuit is open — its lane must hold rather than
+   * send, and without incrementing `failed`. */
+  circuitIsOpen(deviceId: string, at: number): boolean;
+  /** When this phone's circuit closes, or null. */
+  circuitClosesAt(deviceId: string): number | null;
+  /** Open one phone's circuit for 60 seconds.  Used by the watcher when the
+   * transport-failure or http2-protocol threshold trips for that phone. */
+  openCircuit(deviceId: string, at: number, ms: number): void;
 }
 
 export const APNS_CIRCUIT_WINDOW_MS = 60_000;
 export const APNS_TRANSPORT_THRESHOLD = 20;
 export const APNS_HTTP2_PROTOCOL_THRESHOLD = 5;
 
-function createHealthTracker(tokensRegistered: () => number): HealthTracker {
+/** The failure shapes that mean the request never reached Apple.  These are
+ * the only ones the breaker counts: an answer from Apple — a dead token, a
+ * rate limit, a refused key — says the connection is fine, and counting it
+ * as transport weather is what kept the breaker from ever opening.
+ *
+ * `http2_protocol` belongs here.  It used to increment the run and then be
+ * excluded from the branch that trips, so a GOAWAY arriving on the run's
+ * twentieth failure skipped the trip entirely. */
+export function isTransportFailure(kind: ApnsFailureKind | undefined): boolean {
+  return kind === "transport" || kind === "socket_closed" || kind === "timeout" || kind === "http2_protocol";
+}
+
+/** One phone's slice of the sender state. */
+interface DeviceCircuit {
+  consecutiveTransportFailures: number;
+  consecutiveProtocolFailures: number;
+  failureKind: ApnsFailureKind;
+  lastErrorCode: string | null;
+  circuitOpenUntil: number | null;
+  dropped: number;
+}
+
+function createHealthTracker(
+  tokensRegistered: () => number,
+  queueDepths: () => Map<string, number>,
+  now: () => number,
+): HealthTracker {
   let configured = false;
   let production: boolean | null = null;
   let sent = 0;
@@ -1203,29 +1284,86 @@ function createHealthTracker(tokensRegistered: () => number): HealthTracker {
   let keyRejected: string | null = null;
   let dropped = 0;
   let circuitDropped = 0;
-  let consecutiveProtocolFailures = 0;
   let failureKind: ApnsFailureKind = "none";
-  let consecutiveTransportFailures = 0;
   let lastErrorCode: string | null = null;
-  let circuitOpenUntil: number | null = null;
+  const perDevice = new Map<string, DeviceCircuit>();
+
+  const state = (deviceId: string): DeviceCircuit => {
+    let found = perDevice.get(deviceId);
+    if (!found) {
+      found = {
+        consecutiveTransportFailures: 0,
+        consecutiveProtocolFailures: 0,
+        failureKind: "none",
+        lastErrorCode: null,
+        circuitOpenUntil: null,
+        dropped: 0,
+      };
+      perDevice.set(deviceId, found);
+    }
+    return found;
+  };
+
+  const isOpen = (device: DeviceCircuit, at: number): boolean =>
+    device.circuitOpenUntil !== null && device.circuitOpenUntil > at;
+
   return {
-    snapshot: () => ({
-      configured,
-      production,
-      tokensRegistered: tokensRegistered(),
-      sent,
-      failed,
-      lastSentAt,
-      lastErrorAt,
-      lastError,
-      keyRejected,
-      dropped,
-      circuitDropped,
-      failureKind,
-      consecutiveTransportFailures,
-      lastErrorCode,
-      circuitOpenUntil,
-    }),
+    snapshot: () => {
+      const at = now();
+      const depths = queueDepths();
+      const ids = new Set([...perDevice.keys(), ...depths.keys()]);
+      const devices: PushDeviceHealth[] = [...ids].map((deviceId) => {
+        const device = perDevice.get(deviceId);
+        return {
+          deviceId,
+          failureKind: device?.failureKind ?? "none",
+          consecutiveTransportFailures: device?.consecutiveTransportFailures ?? 0,
+          lastErrorCode: device?.lastErrorCode ?? null,
+          circuitOpenUntil: device && isOpen(device, at) ? device.circuitOpenUntil : null,
+          queued: depths.get(deviceId) ?? 0,
+          dropped: device?.dropped ?? 0,
+        };
+      });
+      const open = devices.filter((device) => device.circuitOpenUntil !== null);
+      const tokens = tokensRegistered();
+      // Pushes are off when there is no usable key, when Apple refuses the
+      // one we have, or when every phone that holds a token is behind an
+      // open circuit.  A quiet fleet with nothing queued is not "off".
+      let pushesOffReason: PushesOffReason | null = null;
+      if (keyRejected !== null) pushesOffReason = "key-rejected";
+      else if (!configured) pushesOffReason = "no-key";
+      else if (tokens > 0 && open.length >= tokens) pushesOffReason = "unreachable";
+      return {
+        configured,
+        production,
+        tokensRegistered: tokens,
+        sent,
+        failed,
+        lastSentAt,
+        lastErrorAt,
+        lastError,
+        keyRejected,
+        dropped,
+        circuitDropped,
+        failureKind,
+        // The worst run across the fleet: the number the owner wants when a
+        // single phone's link is the thing that is broken.
+        consecutiveTransportFailures: devices.reduce(
+          (worst, device) => Math.max(worst, device.consecutiveTransportFailures),
+          0,
+        ),
+        lastErrorCode,
+        // The latest of the open circuits, so the page can say when
+        // everything is moving again rather than when the first one is.
+        circuitOpenUntil: open.reduce<number | null>(
+          (latest, device) => (latest === null || (device.circuitOpenUntil ?? 0) > latest ? device.circuitOpenUntil : latest),
+          null,
+        ),
+        devices,
+        pushesOff: pushesOffReason !== null,
+        pushesOffReason,
+      };
+    },
     setConfigured: (config) => {
       configured = config !== null;
       production = config ? config.production : null;
@@ -1247,31 +1385,40 @@ function createHealthTracker(tokensRegistered: () => number): HealthTracker {
         lastError = reason;
       }
     },
-    recordSent: (at) => {
+    recordSent: (deviceId, at) => {
       sent += 1;
       lastSentAt = at;
-      // A successful send resets the transport-failure run and clears the
-      // circuit.  Even a 200 against the test seam means the round trip
-      // worked, which is the only signal the circuit should react to.
-      consecutiveTransportFailures = 0;
-      consecutiveProtocolFailures = 0;
+      // A successful send resets THIS phone's transport-failure run and
+      // closes its circuit.  Even a 200 against the test seam means the
+      // round trip worked, which is the only signal the circuit reacts to.
+      // Another phone's run is untouched: its link may still be broken.
+      const device = state(deviceId);
+      device.consecutiveTransportFailures = 0;
+      device.consecutiveProtocolFailures = 0;
+      device.failureKind = "none";
+      device.lastErrorCode = null;
+      device.circuitOpenUntil = null;
       failureKind = "none";
       lastErrorCode = null;
-      circuitOpenUntil = null;
     },
-    recordError: (at, status, reason, kind, code, errorTimestamp) => {
+    recordError: (deviceId, at, status, reason, kind, code, errorTimestamp) => {
       failed += 1;
       lastErrorAt = at;
       failureKind = kind ?? "transport";
-      // A transport-layer failure increments the run; an HTTP-layer Apple
-      // verdict does not.  Apple's `lastError`/`lastErrorCode` describe
-      // the bucket either way.
-      if (failureKind === "transport" || failureKind === "http2_protocol" || failureKind === "socket_closed" || failureKind === "timeout") {
-        consecutiveTransportFailures += 1;
+      const device = state(deviceId);
+      device.failureKind = failureKind;
+      // A transport-layer failure increments THIS phone's run; an HTTP-layer
+      // Apple verdict zeroes it — but only for the phone it was about.  One
+      // shared counter, reset by any device's 400, is why the breaker shipped
+      // in #525 could never reach its threshold.
+      if (isTransportFailure(failureKind)) {
+        device.consecutiveTransportFailures += 1;
       } else {
-        consecutiveTransportFailures = 0;
+        device.consecutiveTransportFailures = 0;
       }
-      consecutiveProtocolFailures = failureKind === "http2_protocol" ? consecutiveProtocolFailures + 1 : 0;
+      device.consecutiveProtocolFailures =
+        failureKind === "http2_protocol" ? device.consecutiveProtocolFailures + 1 : 0;
+      device.lastErrorCode = code ?? null;
       lastErrorCode = code ?? null;
       let formatted: string;
       if (reason) {
@@ -1292,16 +1439,99 @@ function createHealthTracker(tokensRegistered: () => number): HealthTracker {
       }
       lastError = formatted;
     },
-    recordDropped: () => {
+    recordDropped: (deviceId) => {
       dropped += 1;
+      state(deviceId).dropped += 1;
     },
-    recordCircuitDropped: () => {
+    recordCircuitDeferred: () => {
       circuitDropped += 1;
     },
-    protocolFailureRun: () => consecutiveProtocolFailures,
-    circuitIsOpen: (at) => circuitOpenUntil !== null && circuitOpenUntil > at,
-    openCircuit: (at, ms) => {
-      circuitOpenUntil = at + ms;
+    transportFailureRun: (deviceId) => perDevice.get(deviceId)?.consecutiveTransportFailures ?? 0,
+    protocolFailureRun: (deviceId) => perDevice.get(deviceId)?.consecutiveProtocolFailures ?? 0,
+    circuitIsOpen: (deviceId, at) => {
+      const device = perDevice.get(deviceId);
+      return device !== undefined && isOpen(device, at);
+    },
+    circuitClosesAt: (deviceId) => perDevice.get(deviceId)?.circuitOpenUntil ?? null,
+    openCircuit: (deviceId, at, ms) => {
+      state(deviceId).circuitOpenUntil = at + ms;
+    },
+  };
+}
+
+// --- Key-fault persistence ------------------------------------------------
+//
+// `InvalidProviderToken` means Apple refuses the signing KEY, not this
+// request: a fresh signature earns the identical answer, forever.  Holding
+// that verdict in a process-local `let` meant every Electron relaunch
+// resumed full-rate sends against a key Apple had already refused — two
+// days of them, one failure every forty seconds, with every surface still
+// reporting pushes as on.
+//
+// So the verdict goes on disk, beside the device registry, keyed to the key
+// FILE: replacing the file is what clears it, and nothing else does.  What
+// is written is a fingerprint — path, mtime, size — plus Apple's own words.
+// Never a byte of the key.
+
+export interface PersistedKeyFault {
+  /** Apple's reason string, e.g. `InvalidProviderToken`. */
+  reason: string;
+  /** When the verdict was recorded, epoch ms. */
+  at: number;
+  /** `apnsKeyStamp()` at the moment of the fault.  A different value means a
+   * different file, which is the only thing that turns pushes back on. */
+  keyStamp: string | null;
+  /** Apple's own `timestamp` field, for the debug page. */
+  errorTimestamp?: number;
+}
+
+/** Where a key fault is remembered across restarts.  A seam rather than a
+ * bare file path so a test can hold one in memory, and so a watcher given
+ * no store behaves exactly as it did before — in memory, for this process
+ * only. */
+export interface KeyFaultStore {
+  load(): PersistedKeyFault | null;
+  save(fault: PersistedKeyFault | null): void;
+}
+
+/** The file name, beside `devices.json` rather than inside it: the registry
+ * rewrites its whole document on every change, so a second key living in
+ * that object would be erased by the next pairing. */
+export const KEY_FAULT_FILE = "push-key-fault.json";
+
+/** The production store.  Every failure is swallowed: a full or read-only
+ * disk is a reason for the fault to be forgotten at the next restart, never
+ * a reason to take down the sidecar every paired phone depends on. */
+export function diskKeyFaultStore(dir: string = DATA_DIR): KeyFaultStore {
+  const file = join(dir, KEY_FAULT_FILE);
+  return {
+    load: () => {
+      try {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<PersistedKeyFault>;
+        if (typeof parsed?.reason !== "string") return null;
+        return {
+          reason: parsed.reason,
+          at: typeof parsed.at === "number" && Number.isFinite(parsed.at) ? parsed.at : 0,
+          keyStamp: typeof parsed.keyStamp === "string" ? parsed.keyStamp : null,
+          errorTimestamp: typeof parsed.errorTimestamp === "number" ? parsed.errorTimestamp : undefined,
+        };
+      } catch {
+        return null;
+      }
+    },
+    save: (fault) => {
+      try {
+        if (fault === null) {
+          rmSync(file, { force: true });
+          return;
+        }
+        // 0700, the same posture the registry keeps: this file names a path
+        // on this machine, and nothing else on it needs to read that.
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileAtomic(file, JSON.stringify(fault, null, 2));
+      } catch {
+        /* the fault still holds in memory; it just will not survive a restart */
+      }
     },
   };
 }
@@ -1319,6 +1549,13 @@ export const APNS_KEY_RECHECK_MS = 5 * 60 * 1000;
  * unbounded backlog inside a sidecar that runs for weeks, and when a
  * backlog does form the newest alerts are the ones worth keeping. */
 export const APNS_MAX_QUEUED_PER_DEVICE = 8;
+
+/** How often a link that keeps failing is allowed to say so.  A broken
+ * transport produced 6,003 identical log lines over two days — one per
+ * attempt cycle, forever — because transport failures were the one outcome
+ * class with no dedupe.  The first failure of a kind is logged; after that
+ * one summary line carries the count. */
+export const APNS_TRANSPORT_SUMMARY_MS = 10 * 60 * 1000;
 
 export interface PushWatch {
   /** Stop tailing the harness and sending. */
@@ -1346,14 +1583,43 @@ export function watchHarnessNotifications(options: {
   now?: () => number;
   keyRecheckMs?: number;
   maxQueuedPerDevice?: number;
+  /** Where a key fault is remembered across restarts.  The sidecar hands in
+   * `diskKeyFaultStore()`; a watcher without one keeps the fault in memory
+   * for this process only, which is what a test wants. */
+  keyFaultStore?: KeyFaultStore;
+  /** Test seam: how a lane holding alerts behind an open circuit schedules
+   * its retry.  Production uses an unref'd `setTimeout`; a test with a fake
+   * clock hands in something it can fire itself.  Returns its own cancel. */
+  scheduleRetry?: (run: () => void, ms: number) => () => void;
 }): PushWatch {
-  const health = createHealthTracker(() => options.tokensForDisconnected().length);
   const fixed = options.config;
   const loadConfig = options.loadConfig ?? loadApnsConfig;
   const keyStamp = options.keyStamp ?? (() => apnsKeyStamp());
   const now = options.now ?? Date.now;
   const recheckMs = options.keyRecheckMs ?? APNS_KEY_RECHECK_MS;
   const maxQueued = Math.max(1, options.maxQueuedPerDevice ?? APNS_MAX_QUEUED_PER_DEVICE);
+  const keyFaultStore = options.keyFaultStore ?? null;
+  const scheduleRetry =
+    options.scheduleRetry ??
+    ((run: () => void, ms: number) => {
+      const handle = setTimeout(run, ms);
+      handle.unref?.();
+      return () => clearTimeout(handle);
+    });
+
+  // One queue per device, drained on its own chain.  A phone Apple is rate
+  // limiting sleeps out its own Retry-After without holding up any other
+  // phone, and each phone still sees its notifications in order.  Declared
+  // here, above the pinned-off early return, because the health snapshot
+  // reads the queue depths and a pinned-off watcher still answers health().
+  const queues = new Map<string, DeviceQueue>();
+  const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
+
+  const health = createHealthTracker(
+    () => options.tokensForDisconnected().length,
+    () => new Map([...queues].map(([deviceId, queue]) => [deviceId, queueDepth(queue)])),
+    () => now(),
+  );
 
   // An explicit null means "this process does not send pushes" — the desktop
   // saying so, or a test.  Honour it without holding a stream open.
@@ -1389,9 +1655,21 @@ export function watchHarnessNotifications(options: {
    * watcher reloads a rotated key — a TLS session tied to the old key is
    * not safe to reuse, even with the same keyId. */
   const sessionFingerprints = new Map<string, string>();
-  /** Hosts we've already announced the circuit opening for, so a 60-second
-   * blip does not log a warning every drain iteration. */
+  /** What each phone's circuit has already been announced for, so a
+   * 60-second blip does not log a warning every drain iteration.  The key is
+   * the device and the CAUSE and nothing else: it used to carry the failure
+   * count, which only ever resets on success, so no key ever matched twice,
+   * a warning was logged on every trip, and the set grew without bound. */
   const loggedCircuitOpen = new Set<string>();
+  /** Phones whose full backlog has already been reported once. */
+  const loggedQueueFull = new Set<string>();
+  /** Per phone: the transport failure being lived through right now, so a
+   * broken link writes one line for the state change and then one summary
+   * line every ten minutes instead of one line per attempt forever. */
+  const transportLogs = new Map<string, { key: string; count: number; since: number; lastLoggedAt: number }>();
+  /** Per phone: cancel the pending retry of a lane held behind an open
+   * circuit, so stop() leaves no timer behind. */
+  const circuitRetries = new Map<string, () => void>();
 
   if (fixed) health.setConfigured(fixed);
 
@@ -1402,28 +1680,103 @@ export function watchHarnessNotifications(options: {
     return true;
   };
 
-  const onKeyFault = (reason: string, errorTimestamp?: number) => {
+  /** One line when a phone's transport starts failing, and one summary line
+   * every ten minutes while it keeps failing the same way.  Keyed on the
+   * device and the failure shape, so a link that changes its mind (a DNS
+   * failure becoming a GOAWAY) still says so once. */
+  const noteTransportFailure = (deviceId: string, at: number, result: ApnsSendResult) => {
+    const kind = result.failureKind ?? "transport";
+    const key = `${kind}:${result.errorCode ?? result.reason ?? ""}`;
+    const entry = transportLogs.get(deviceId);
+    if (!entry || entry.key !== key) {
+      transportLogs.set(deviceId, { key, count: 1, since: at, lastLoggedAt: at });
+      console.warn(
+        `companion: APNs ${kind}${result.errorCode ? ` (${result.errorCode})` : ""} — a phone's push connection is failing.  ` +
+          `Further identical failures are summarised every ${APNS_TRANSPORT_SUMMARY_MS / 60_000} minutes.`,
+      );
+      return;
+    }
+    entry.count += 1;
+    if (at - entry.lastLoggedAt < APNS_TRANSPORT_SUMMARY_MS) return;
+    entry.lastLoggedAt = at;
+    console.warn(
+      `companion: APNs ${entry.key} — ${entry.count} transport failures for one phone over ` +
+        `${Math.max(1, Math.round((at - entry.since) / 60_000))} min.  Still retrying.`,
+    );
+  };
+
+  /** A phone's link came back.  Say so once if it had been failing, and
+   * forget every key that was deduping its failures — otherwise the next
+   * outage would be silent, which is the opposite mistake. */
+  const clearTransportLog = (deviceId: string) => {
+    const entry = transportLogs.get(deviceId);
+    if (!entry) return;
+    transportLogs.delete(deviceId);
+    if (entry.count > 1) {
+      console.log(`companion: APNs delivery recovered for a phone after ${entry.count} transport failures`);
+    }
+  };
+
+  /** Everything a phone's success should make us forget. */
+  const forgetFailureLogs = (deviceId: string) => {
+    clearTransportLog(deviceId);
+    loggedCircuitOpen.delete(`${deviceId}:transport`);
+    loggedCircuitOpen.delete(`${deviceId}:http2_protocol`);
+    loggedCircuitOpen.delete(`${deviceId}:defer`);
+    loggedQueueFull.delete(deviceId);
+  };
+
+  const onKeyFault = (config: ApnsConfig, reason: string, errorTimestamp?: number) => {
     if (keyFault) return;
     keyFault = true;
-    discovered = null;
-    health.rejectKey(now(), reason, errorTimestamp);
+    // Pin the verdict to the file that is on disk right now: only a
+    // DIFFERENT file clears it, here and across restarts.
+    const stamp = keyStamp();
+    if (stamp !== null) discoveredStamp = stamp;
+    // `discovered` is deliberately kept.  Nulling it here is what used to
+    // make a later rotation skip the key-identity comparison in
+    // `refreshConfig`, so the replacement .p8 was signed against the
+    // provider token cached for the key Apple had just refused — and was
+    // refused in turn, permanently.  The refused key's token and its TLS
+    // sessions are worthless either way, so drop them now.
+    invalidateProviderToken(config);
+    dropHttp2Sessions();
+    sessionFingerprints.clear();
+    const at = now();
+    health.rejectKey(at, reason, errorTimestamp);
+    keyFaultStore?.save({ reason, at, keyStamp: discoveredStamp, errorTimestamp });
     console.warn(`companion: APNs refused the signing key (${reason}); pushes are off until the key file changes`);
     // Leave the stream so the pump re-enters the key check rather than
     // sending the same doomed request for every notification that follows.
     abort?.abort();
   };
 
-  /** Open the circuit breaker.  Called when transport failures exceed the
-   * threshold OR when http2_protocol errors cluster — a hot loop burning
-   * provider-token re-signs against an unreachable gateway is what we
-   * are guarding against.  Logs once per host. */
-  const tripCircuit = (host: string, reason: string) => {
-    const at = now();
-    health.openCircuit(at, APNS_CIRCUIT_WINDOW_MS);
-    if (!loggedCircuitOpen.has(`${host}:${reason}`)) {
-      loggedCircuitOpen.add(`${host}:${reason}`);
-      console.warn(`companion: APNs circuit open for ${APNS_CIRCUIT_WINDOW_MS / 1000}s after ${reason} on ${host}`);
-    }
+  /** Open one phone's circuit breaker.  Called when that phone's transport
+   * failures exceed the threshold OR when its http2_protocol errors cluster
+   * — a hot loop burning provider-token re-signs against an unreachable
+   * gateway is what we are guarding against.  Logged once per phone per
+   * cause, and that key is cleared by the phone's next success. */
+  const tripCircuit = (deviceId: string, host: string, cause: "transport" | "http2_protocol", detail: string) => {
+    health.openCircuit(deviceId, now(), APNS_CIRCUIT_WINDOW_MS);
+    const key = `${deviceId}:${cause}`;
+    if (loggedCircuitOpen.has(key)) return;
+    loggedCircuitOpen.add(key);
+    console.warn(`companion: APNs circuit open for ${APNS_CIRCUIT_WINDOW_MS / 1000}s after ${detail} on ${host}`);
+  };
+
+  /** Come back to a lane that is holding alerts behind an open circuit.
+   * Without this the backlog would wait for an unrelated notification to
+   * that same phone — which for a blocking approval is exactly the delay
+   * the lane exists to prevent. */
+  const scheduleCircuitRetry = (deviceId: string, ms: number) => {
+    if (circuitRetries.has(deviceId)) return;
+    const cancel = scheduleRetry(() => {
+      circuitRetries.delete(deviceId);
+      const queue = queues.get(deviceId);
+      if (stopped || !queue || queue.running || queueDepth(queue) === 0) return;
+      void drain(deviceId, queue);
+    }, ms);
+    circuitRetries.set(deviceId, cancel);
   };
 
   /** Look at the key file and reload when it has changed.  Runs on a timer
@@ -1431,13 +1784,29 @@ export function watchHarnessNotifications(options: {
    * stays up for days never reconnects, and a key dropped in or rotated
    * under it would otherwise go unnoticed for exactly as long. */
   const refreshConfig = (): ApnsConfig | null => {
-    if (fixed) return keyFault ? null : fixed;
     const stamp = keyStamp();
     if (keyFault) {
       // Apple refuses what is on disk.  Only a different file can help.
       if (stamp === null || stamp === discoveredStamp) return null;
       keyFault = false;
-    } else if (discovered && stamp !== null && stamp === discoveredStamp) {
+      keyFaultStore?.save(null);
+      console.log("companion: the APNs key file changed; closed-app phone wake is being tried again");
+      if (fixed) {
+        // A pinned config cannot be reloaded, but the key file under it
+        // changed: the cached provider token and the TLS sessions that were
+        // built for the refused key must not be reused against the new one.
+        health.setConfigured(fixed);
+        invalidateProviderToken(fixed);
+        dropHttp2Sessions();
+        sessionFingerprints.clear();
+        resumeIdleQueues();
+      }
+    }
+    if (fixed) {
+      discoveredStamp = stamp;
+      return fixed;
+    }
+    if (discovered && stamp !== null && stamp === discoveredStamp) {
       // The same file as last time: keep the config, and the provider token
       // cached against it.
       return discovered;
@@ -1481,6 +1850,28 @@ export function watchHarnessNotifications(options: {
     return fixed ?? discovered;
   };
 
+  // A key fault Apple has already delivered survives this process.  Without
+  // this, every Electron relaunch resumed full-rate sends against a key
+  // Apple had refused days earlier — and every surface, including the
+  // phone's own settings row, went on reporting pushes as on.
+  const persistedFault = keyFaultStore?.load() ?? null;
+  if (persistedFault) {
+    const stamp = keyStamp();
+    if (stamp !== null && stamp === persistedFault.keyStamp) {
+      keyFault = true;
+      discoveredStamp = stamp;
+      health.rejectKey(persistedFault.at, persistedFault.reason, persistedFault.errorTimestamp);
+      console.warn(
+        `companion: APNs pushes stay off — Apple refused this signing key (${persistedFault.reason}) ` +
+          `and the key file has not changed since.  Replace ${apnsKeyPath()} to turn them back on.`,
+      );
+    } else {
+      // A different file, or no file at all: the verdict was about a key we
+      // no longer hold, so it has nothing left to say.
+      keyFaultStore?.save(null);
+    }
+  }
+
   const keyTimer = setInterval(() => {
     refreshConfig();
   }, recheckMs);
@@ -1496,9 +1887,6 @@ export function watchHarnessNotifications(options: {
       }, ms);
     });
 
-  // One queue per device, drained on its own chain.  A phone Apple is rate
-  // limiting sleeps out its own Retry-After without holding up any other
-  // phone, and each phone still sees its notifications in order.
   interface QueuedAlert {
     token: string;
     alert: ApnsAlert;
@@ -1511,32 +1899,28 @@ export function watchHarnessNotifications(options: {
     normal: QueuedAlert[];
     running: boolean;
   }
-  const queues = new Map<string, DeviceQueue>();
 
-  const queueDepth = (queue: DeviceQueue): number => queue.blocking.length + queue.normal.length;
-
+  // The circuit is checked by `drain` BEFORE it takes an alert off a lane,
+  // not here: this function is only reached for an alert that is already
+  // detached from its queue, and skipping it there is what used to destroy
+  // a backlog — including a blocking approval — in a single loop.
   const sendOne = async (config: ApnsConfig, deviceId: string, token: string, alert: ApnsAlert) => {
     const at = now();
-    if (health.circuitIsOpen(at)) {
-      // The circuit is open: do not call `send` at all.  Skipping keeps
-      // the http2 session idle so PING keepalives can recover it, and
-      // avoids burning provider-token re-signs against an unreachable
-      // gateway.  Counted apart from queue-full drops: this is Apple being
-      // unreachable, and the phone must not call it a full queue.
-      health.recordCircuitDropped();
-      if (!loggedCircuitOpen.has("circuit-skip")) {
-        loggedCircuitOpen.add("circuit-skip");
-        console.warn(`companion: APNs circuit is open — dropping notifications until ${new Date(health.snapshot().circuitOpenUntil ?? at).toISOString()}`);
-      }
-      return;
-    }
     let result: ApnsSendResult;
     try {
       result = await send(config, token, alert);
     } catch (err) {
       const info = inspectTransportError(err);
-      health.recordError(at, 0, TRANSPORT_FAILURE_REASON, classifyTransportError(info), info.code || undefined);
-      console.warn(`companion: APNs send failed (${info.code || info.name})`);
+      const kind = classifyTransportError(info);
+      health.recordError(deviceId, at, 0, TRANSPORT_FAILURE_REASON, kind, info.code || undefined);
+      noteTransportFailure(deviceId, at, {
+        ok: false,
+        status: 0,
+        reason: TRANSPORT_FAILURE_REASON,
+        attempts: 0,
+        failureKind: kind,
+        errorCode: info.code || undefined,
+      });
       return;
     }
     // Everything below is bookkeeping, and some of it writes to disk:
@@ -1553,12 +1937,14 @@ export function watchHarnessNotifications(options: {
 
   const recordOutcome = (config: ApnsConfig, deviceId: string, token: string, result: ApnsSendResult) => {
     if (result.ok) {
-      health.recordSent(now());
+      health.recordSent(deviceId, now());
+      forgetFailureLogs(deviceId);
       return;
     }
     const at = now();
     const host = config.production ? "api.push.apple.com" : "api.sandbox.push.apple.com";
     health.recordError(
+      deviceId,
       at,
       result.status,
       result.reason,
@@ -1566,17 +1952,20 @@ export function watchHarnessNotifications(options: {
       result.errorCode,
       result.errorTimestamp,
     );
-    // Trip the circuit when the failure shape is what we open on.  We
-    // count AFTER recording so the health snapshot reflects the run that
-    // tripped it.
-    const h = health.snapshot();
-    if (
-      (result.failureKind === "transport" || result.failureKind === "socket_closed" || result.failureKind === "timeout") &&
-      h.consecutiveTransportFailures >= APNS_TRANSPORT_THRESHOLD
-    ) {
-      tripCircuit(host, `${h.consecutiveTransportFailures} transport failures in a row`);
-    } else if (result.failureKind === "http2_protocol" && health.protocolFailureRun() >= APNS_HTTP2_PROTOCOL_THRESHOLD) {
-      tripCircuit(host, `${health.protocolFailureRun()} HTTP/2 protocol errors in a row`);
+    // Trip THIS phone's circuit when the failure shape is what we open on.
+    // Counted after recording, so the run below includes the failure that
+    // tripped it.  `http2_protocol` is part of the transport family here:
+    // excluding it from the branch meant a GOAWAY landing on the twentieth
+    // failure of a run skipped the trip and started the count again.
+    const kind = result.failureKind ?? "transport";
+    if (isTransportFailure(kind)) {
+      const transportRun = health.transportFailureRun(deviceId);
+      const protocolRun = health.protocolFailureRun(deviceId);
+      if (transportRun >= APNS_TRANSPORT_THRESHOLD) {
+        tripCircuit(deviceId, host, "transport", `${transportRun} transport failures in a row`);
+      } else if (kind === "http2_protocol" && protocolRun >= APNS_HTTP2_PROTOCOL_THRESHOLD) {
+        tripCircuit(deviceId, host, "http2_protocol", `${protocolRun} HTTP/2 protocol errors in a row`);
+      }
     }
 
     // The key, not the phone: every device is about to fail the same way.
@@ -1594,7 +1983,7 @@ export function watchHarnessNotifications(options: {
       // rotation and wave through a rejection of the key still in use.
       const current = fixed ?? discovered;
       if (current !== null && providerTokenKey(config) === providerTokenKey(current)) {
-        onKeyFault(result.reason, result.errorTimestamp);
+        onKeyFault(config, result.reason, result.errorTimestamp);
       } else if (!keyFault) {
         console.warn("companion: APNs refused a signing key that has since been replaced; the replacement stands");
       }
@@ -1626,6 +2015,14 @@ export function watchHarnessNotifications(options: {
     if (result.status === 400 || result.status === 403) {
       if (!firstTime(`${deviceId}:${result.status}:${result.reason ?? ""}`)) return;
     }
+    // A transport failure never reached Apple, so there is no verdict to
+    // report and no reason to report the same weather every forty seconds.
+    // This was the one outcome class that fell through to an unconditional
+    // log line, and on a link that stayed down it wrote 6,003 of them.
+    if (isTransportFailure(kind) || result.status === 0) {
+      noteTransportFailure(deviceId, at, result);
+      return;
+    }
     console.warn(`companion: APNs ${result.status}${result.reason ? ` ${result.reason}` : ""}`);
   };
 
@@ -1642,6 +2039,30 @@ export function watchHarnessNotifications(options: {
         // swallow whatever was queued behind it — uncounted, and unsent.
         const config = activeConfig();
         if (!config) break;
+        // Nothing left is the ordinary way out, and it comes before the
+        // circuit check so an empty lane never reports itself as held.
+        if (queueDepth(queue) === 0) break;
+        // The circuit, also before the shift, and for the same reason.  An
+        // open circuit is Apple being briefly unreachable; every alert stays
+        // exactly where it is and goes out when the circuit closes.  Taking
+        // them off the lane and discarding them emptied a whole backlog in
+        // one loop, and a blocking approval caught by that was never
+        // delivered at all.
+        const at = now();
+        if (health.circuitIsOpen(deviceId, at)) {
+          health.recordCircuitDeferred();
+          const until = health.circuitClosesAt(deviceId) ?? at;
+          if (!loggedCircuitOpen.has(`${deviceId}:defer`)) {
+            loggedCircuitOpen.add(`${deviceId}:defer`);
+            console.warn(
+              `companion: APNs is unreachable — holding ${queueDepth(queue)} notification(s) for a phone ` +
+                `until ${new Date(until).toISOString()}`,
+            );
+          }
+          scheduleCircuitRetry(deviceId, Math.max(1, until - at));
+          break;
+        }
+        loggedCircuitOpen.delete(`${deviceId}:defer`);
         const next = queue.blocking.shift() ?? queue.normal.shift();
         if (!next) break;
         await sendOne(config, deviceId, next.token, next.alert);
@@ -1701,11 +2122,18 @@ export function watchHarnessNotifications(options: {
       if (queueDepth(queue) > maxQueued) {
         // Drop a report before an approval, whatever the order they arrived
         // in.  A stale report is worth nothing; a dropped approval leaves a
-        // bot waiting on an answer nobody was ever asked for.
+        // bot waiting on an answer nobody was ever asked for.  This cap is
+        // what keeps a lane holding alerts through an outage bounded: the
+        // count lands on that phone's own row on the health page.
         const lane = queue.normal.length ? queue.normal : queue.blocking;
         lane.shift();
-        health.recordDropped();
-        console.warn("companion: APNs backlog for a phone is full; dropped its oldest notification");
+        health.recordDropped(row.deviceId);
+        if (!loggedQueueFull.has(row.deviceId)) {
+          loggedQueueFull.add(row.deviceId);
+          console.warn(
+            `companion: APNs backlog for a phone is full at ${maxQueued}; dropping its oldest notifications`,
+          );
+        }
       }
       if (!queue.running) void drain(row.deviceId, queue);
     }
@@ -1809,6 +2237,11 @@ export function watchHarnessNotifications(options: {
       if (timer) clearTimeout(timer);
       clearInterval(keyTimer);
       retry?.();
+      for (const cancel of circuitRetries.values()) cancel();
+      circuitRetries.clear();
+      transportLogs.clear();
+      loggedCircuitOpen.clear();
+      loggedQueueFull.clear();
       for (const queue of queues.values()) {
         queue.blocking.length = 0;
         queue.normal.length = 0;

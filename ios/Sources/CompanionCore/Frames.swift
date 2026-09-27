@@ -58,8 +58,8 @@ public enum Frame: Sendable {
     case roomDeleted(groupId: String)
     /// Something worth interrupting for.
     case notify(NotificationFrame)
-    /// A live frame of a bot's computer (base64). Only sent to clients that
-    /// did not pass `screens=off`.
+    /// A live frame of a bot's computer (base64).  Only sent to clients that
+    /// explicitly pass `screens=on` for this bot.
     case screen(botId: String, png: String, mime: String)
     /// The bot's cloud computer is being provisioned.
     case computer(botId: String, state: String)
