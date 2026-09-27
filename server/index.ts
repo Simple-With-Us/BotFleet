@@ -2357,9 +2357,15 @@ bus.subscribe((event: RuntimeEvent) => {
       releaseLinqChat(event.threadId, event.turnId);
   }
   broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
-  const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
   const group = bot ? undefined : store.groupByThread(event.threadId);
+  // A turn.completed receipts only after the failover pick below: a turn a
+  // fallback is about to save must not fail (or falsely complete) its
+  // routine run first (E5).  Threads with no failover path receipt here.
+  let routineRun: RoutineRun | null = null;
+  if (event.type !== "turn.completed" || (!bot && !group)) {
+    routineRun = routines?.handleRuntimeEvent(event) ?? null;
+  }
   if (!bot && !group) return;
   const speaker = group ? groupSpeakers.get(event.threadId) : undefined;
 
@@ -2786,6 +2792,10 @@ bus.subscribe((event: RuntimeEvent) => {
           token: completionToken,
         });
       }
+      if (!fallbackBot) {
+        // No failover can launch on this thread, so the run receipts now.
+        routineRun = routines?.handleRuntimeEvent(event) ?? null;
+      }
       let fallbackUserMessage: Message | undefined;
       let fallbackSelection: ModelSelection | undefined;
       let deferredAutoFallback = false;
@@ -2849,7 +2859,7 @@ bus.subscribe((event: RuntimeEvent) => {
         let chain = configuredChain && configuredChain.length > 0 ? configuredChain : undefined;
         if (!chain && quotaOrCap) {
           deferredAutoFallback = true;
-          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
+          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
         }
         // A provider reload fences every dispatch, including a fallback to an
         // unrelated instance.  Keep this completion fold and its busy owner
@@ -2870,7 +2880,7 @@ bus.subscribe((event: RuntimeEvent) => {
               await waitForProviderReloads();
             }
             const refreshedAt = providerReloadGeneration;
-            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
+            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
             if (!providerReloadInProgress && providerReloadGeneration === refreshedAt) break;
           }
         }
@@ -2891,6 +2901,12 @@ bus.subscribe((event: RuntimeEvent) => {
             model: actualSelection.model,
           },
         });
+        // Receipt now that the failover decision exists: while a fallback is
+        // launching the run stays open and receipts on the fallback's own
+        // completion; otherwise it receipts exactly as it always has (E5).
+        routineRun = routines?.handleRuntimeEvent(event, {
+          fallingOver: Boolean(next && fallbackUserMessage && typeof fallbackUserMessage.text === "string"),
+        }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
           const { nextUsed, instanceId, model, effort } = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
@@ -2996,6 +3012,10 @@ bus.subscribe((event: RuntimeEvent) => {
             modelSelection: fallbackSelection,
             automationSource: userMsg.automationSource,
             unattended: isUnattended(fallbackBotId),
+            // the destination travels with the turn: a cloud routine or
+            // webhook falls over to another engine in the same cloud, never
+            // silently back to the local bot (E5)
+            runOn: settledOwner?.computerInputs?.runOn,
           }).catch((error) => {
             if (isExternalCredentialPendingError(error)) {
               pendingCredentialFallback.set(`${fallbackBotId}:${event.threadId}`, {
@@ -3123,13 +3143,40 @@ bus.subscribe((event: RuntimeEvent) => {
  * instance (by fleet priority) is offered as a one-step chain. The caller
  * still runs it through selectTurnFallback, so the produced / quota /
  * stop-reason rules apply exactly as they do for a configured chain. */
-async function autoFallbackChain(botId: string, currentInstanceId: string, effort?: EffortLevel): Promise<ModelSelection[]> {
+/** The computer destinations a fallback engine must reach to take over the
+ *  failing turn: what the turn actually mounted wins over its grant, and a
+ *  cloud runOn needs the matching cloud destination whatever was granted. */
+function fallbackComputerReach(inputs: TurnComputerInputs | undefined): Partial<Record<"box" | "vps" | "vm" | "local", boolean>> {
+  const requires: Partial<Record<"box" | "vps" | "vm" | "local", boolean>> = {};
+  if (!inputs) return requires;
+  const need = (kind: "box" | "vps" | "vm" | "local") => { requires[kind] = true; };
+  if (inputs.mounted) {
+    if (inputs.mounted.includes("asciiBox")) need("box");
+    if (inputs.mounted.includes("selfHostedVps")) need("vps");
+    if (inputs.mounted.includes("localVm")) need("vm");
+    if (inputs.mounted.includes("localMac")) need("local");
+  } else {
+    if (inputs.computers?.includes("cloud")) need(inputs.cloudBackend === "vps" ? "vps" : "box");
+    if (inputs.computers?.includes("vm")) need("vm");
+    if (inputs.computers?.includes("local")) need("local");
+  }
+  if (inputs.runOn === "cloud") need(inputs.cloudBackend === "vps" ? "vps" : "box");
+  return requires;
+}
+
+async function autoFallbackChain(
+  botId: string,
+  currentInstanceId: string,
+  effort?: EffortLevel,
+  requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>,
+): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
     return eligibleAutoFallbackChain(described, {
       botId,
       currentInstanceId,
       effort,
+      requires,
       // The fleet ladder itself lives in model-fallback.ts so the ordering
       // is unit-testable without booting the server — minimax sits after
       // codex and ahead of openaiCompat, per the PR 10 owner decision.

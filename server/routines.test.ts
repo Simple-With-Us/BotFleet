@@ -322,6 +322,30 @@ describe("RoutineManager", () => {
     expect(new RoutineManager(h.options).listRuns()).toEqual(finished);
   });
 
+  it("keeps a run open across a failover and receipts it on the fallback's completion (E5)", async () => {
+    const h = harness();
+    h.setBot("busy");
+    h.manager.enqueueWebhook({ webhookId: "failover-fixture", webhookName: "Failover fixture",
+      prompt: "Synthetic delivery", botId: "maus-1", runOn: "bot", deliveryId: "delivery-fo", receivedAt: 1000 });
+    await h.manager.tick();
+    h.setBot("ready");
+    await h.manager.tick();
+    const run = h.manager.listRuns().find((r) => r.status === "running")!;
+    const base = { eventId: "event", provider: "claude" as const, providerInstanceId: "claude-fixture", threadId: run.threadId!, createdAt: new Date().toISOString() };
+    // the first engine's turn failed, but the failover pick already launched
+    // a fallback: the run must not receipt failed yet
+    const open = h.manager.handleRuntimeEvent({ ...base, type: "turn.completed", ok: false, stopReason: "quota_exceeded" }, { fallingOver: true });
+    expect(open?.status).toBe("running");
+    expect(h.manager.listRuns().find((r) => r.id === run.id)!.status).toBe("running");
+    expect(h.failed).toHaveLength(0);
+    // the fallback's own completion on the same thread receipts the run
+    h.manager.handleRuntimeEvent({ ...base, providerInstanceId: "codex-fixture", type: "turn.completed", ok: true, stopReason: "end_turn", cost: 0.01 });
+    const settled = h.manager.listRuns().find((r) => r.id === run.id)!;
+    expect(settled.status).toBe("completed");
+    expect(settled.engineId).toBe("codex-fixture");
+    expect(settled.cost).toBe(0.01);
+  });
+
   it("cancels the owning execution and all combined deliveries when any combined receipt is cancelled", async () => {
     const h = harness();
     h.setBot("busy");
