@@ -435,7 +435,11 @@ function handleBootRequest(req: IncomingMessage, res: ServerResponse): void {
 
 const server = createServer((req, res) => {
   if (booting || !handleRequest) return handleBootRequest(req, res);
-  void handleRequest(req, res);
+  void Promise.resolve(handleRequest(req, res)).catch((error: unknown) => {
+    console.error("[request] unhandled route failure:", error);
+    if (!res.headersSent) json(res, 500, { error: "internal error" });
+    else res.destroy();
+  });
 });
 server.on("error", (error: NodeJS.ErrnoException) => {
   if (listenErrorDisposition(error) === "named-exit") {
@@ -7657,7 +7661,12 @@ function endRuntimeQuiesce() {
 // The lock is process-local; the persisted message's audio list survives restarts.
 const voiceJobs = new Map<string, Promise<Array<{ path: string; mime: string }>>>();
 handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
-  const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+  } catch {
+    return json(res, 400, { error: "bad request" });
+  }
   const path = url.pathname;
   const method = req.method ?? "GET";
   /** scratch for route matches, shared by every `path.match` below */

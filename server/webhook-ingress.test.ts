@@ -44,6 +44,12 @@ afterAll(async () => {
 });
 
 describe("webhook-only ingress", () => {
+  it("returns 400 for a malformed doubled-slash URL without killing the receiver", async () => {
+    const malformed = await fetch(`${ingress.baseUrl}//`);
+    expect(malformed.status).toBe(400);
+    expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
+  });
+
   it("exposes health but nothing from the main BotFleet API", async () => {
     const health = await fetch(`${ingress.baseUrl}/health`);
     expect(health.status).toBe(200);

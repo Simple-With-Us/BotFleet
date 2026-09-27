@@ -206,7 +206,14 @@ export async function startUiShim({
 }) {
   const target = { harnessHost, harnessPort, log };
   const server = http.createServer((req, res) => {
-    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    let pathname;
+    try {
+      pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    } catch {
+      res.writeHead(400, { "content-type": "text/plain" });
+      res.end("bad request");
+      return;
+    }
     if (!isApiPath(pathname) && (req.method === "GET" || req.method === "HEAD")) {
       serveStatic(uiDir, pathname, req, res).catch(() => {
         if (!res.headersSent) res.writeHead(500);

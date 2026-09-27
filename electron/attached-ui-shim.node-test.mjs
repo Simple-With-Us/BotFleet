@@ -85,6 +85,8 @@ test("serves the bundled UI and streams /api through to the harness", async () =
   try {
     const base = `http://127.0.0.1:${shim.port}`;
 
+    const malformed = await fetch(`${base}//`);
+    assert.equal(malformed.status, 400);
     const index = await fetch(`${base}/`);
     assert.equal(index.status, 200);
     assert.match(index.headers.get("content-type"), /text\/html/);
