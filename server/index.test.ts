@@ -7524,6 +7524,9 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       }
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
+      // the test enabled this instance explicitly; leave the fleet as it
+      // was found so later suites rebuild from a disabled baseline
+      await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
 });
