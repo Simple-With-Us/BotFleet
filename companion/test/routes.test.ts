@@ -77,6 +77,8 @@ describe("what the app may do", () => {
     ["GET", "/api/attachments/avatar-123.webp"],
     ["GET", "/api/tts/voices"],
     ["POST", "/api/tts/speak"],
+    ["POST", "/api/threads/th_1/messages/msg_2/audio"],
+    ["GET", "/api/threads/th_1/messages/msg_2/audio/0"],
     ["GET", "/api/routines"],
     ["POST", "/api/routines"],
     ["PATCH", "/api/routines/routine_1"],
@@ -160,6 +162,13 @@ describe("what it may not", () => {
         error: `${field} can only be changed in BotFleet on your computer`,
       });
     }
+  });
+
+  it("permits message-linked audio but not arbitrary attachment audio", () => {
+    expect(ask("POST", "/api/threads/th_1/messages/msg_1/audio")).toBeNull();
+    expect(ask("GET", "/api/threads/th_1/messages/msg_1/audio/0")).toBeNull();
+    expect(allowed("GET", "/api/attachments/voice.mp3")).toBe(false);
+    expect(allowed("GET", "/api/threads/th_1/messages/msg_1/audio/../../config")).toBe(false);
   });
 
   it("serves exactly the image formats the native client can render", () => {

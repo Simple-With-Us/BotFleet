@@ -50,6 +50,7 @@ import { appendDecision, readDecisions } from "./decision-log.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
 import { resolveStaticFile } from "./static-files.ts";
 import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
+import { incomingRecording, recordingReview } from "./recorded-message.ts";
 import { openBotFleetDesktop } from "./desktop-open.ts";
 import { IdempotencyCache } from "./idempotency.ts";
 import { initializeHarnessOwnership, harnessOwnerProof } from "../electron/harness-ownership.mjs";
@@ -268,6 +269,8 @@ import {
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
+import { speechUsageTotals } from "./tts/usage.ts";
+import { VOICE_SUMMARY_PROMPT, spokenReply } from "../shared/voice-summary.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
 import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
@@ -3287,6 +3290,7 @@ async function startTurn(
     replyTo?: Message;
     /** Linq chat that originated this turn; bound after sendTurn returns a turnId. */
     linqChatId?: string;
+    recording?: Message["recording"];
     onDispatchError?: (message: string) => void;
     /** Override engine for this turn (model fallback).  Persistence is the caller's job. */
     modelSelection?: ModelSelection;
@@ -3456,6 +3460,7 @@ async function startTurn(
           kind: "text",
           text,
           replyToId: opts?.replyTo?.id,
+          recording: opts?.recording,
           automationSource: opts?.automationSource,
           from: opts?.from,
           comm: opts?.comm,
@@ -3847,6 +3852,7 @@ async function startTurn(
       const promptFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
       const prompt = buildSystemPrompt([
         { id: "persona", label: "Identity", text: persona },
+        { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
         {
           id: "computer",
           label: "Computer",
@@ -5714,6 +5720,7 @@ async function runGroupMemberTurn(
   const roomFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
+    { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
     // Same sentence the 1:1 lane sends, in the same position: a computer the
     // bot is never told about is one it reaches for by accident.
     {
@@ -5953,7 +5960,7 @@ async function runGroupMemberTurn(
   return true;
 }
 
-function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
+function startGroupTurn(groupId: string, text: string, replyTo?: Message, recording?: Message["recording"]) {
   const group = store.group(groupId);
   if (!group) throw Object.assign(new Error("no such group"), { status: 404 });
   if (roomSetupPending(group)) {
@@ -5962,7 +5969,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
   // Capture the active thread once. Every queued responder below is bound to
   // this task even if another client asks to switch later.
   const threadId = group.threadId;
-  store.appendMessage(threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
+  store.appendMessage(threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id, recording });
   if (!group.dm) store.titleGroupTaskFromFirstMessage(group.id, text, threadId);
 
   const members = group.memberIds
@@ -7264,7 +7271,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-function readBody(req: IncomingMessage): Promise<any> {
+function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   return new Promise((resolve, reject) => {
     let data = "";
     let bytes = 0;
@@ -7278,7 +7285,7 @@ function readBody(req: IncomingMessage): Promise<any> {
     req.on("data", (c) => {
       if (done) return;
       bytes += typeof c === "string" ? Buffer.byteLength(c) : c.length;
-      if (bytes > 1_000_000) {
+      if (bytes > maxBytes) {
         // Keep draining the socket, but stop retaining attacker-controlled
         // bytes. Destroying the request here prevents the caller from
         // receiving the useful 413 response.
@@ -7639,6 +7646,9 @@ function endRuntimeQuiesce() {
   return { ...currentRuntimeReadiness(), quiescing: false };
 }
 
+// A concurrent Mac/iPhone request must never bill twice for the same reply.
+// The lock is process-local; the persisted message's audio list survives restarts.
+const voiceJobs = new Map<string, Promise<Array<{ path: string; mime: string }>>>();
 handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const path = url.pathname;
@@ -8241,6 +8251,30 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 404, { error: "no such message" });
       }
       return json(res, 200, messagePage(threadId, limit ?? DEFAULT_PAGE, before));
+    }
+
+    // A note about a recorded message is not a conversation edit: it cannot
+    // fork the thread, rerun the bot, or rewrite the recognizer's original.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/recording-review$/);
+    if (m && method === "PATCH") {
+      if (!store.botByThread(m[1]) && !store.groupByThread(m[1])) return json(res, 404, { error: "no such conversation" });
+      const message = store.messagesFor(m[1]).find((row) => row.id === m![2]);
+      if (message?.role !== "user" || !message.recording) return json(res, 404, { error: "no such recording" });
+      const body = await readBody(req);
+      const review = recordingReview(message.recordingReview, body);
+      if (!review) return json(res, 400, { error: "correction or comment must be text up to 12000 characters" });
+      return json(res, 200, { message: store.patchMessage(m[1], m[2], { recordingReview: review }) });
+    }
+
+    m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/recording$/);
+    if (m && method === "GET") {
+      if (!store.botByThread(m[1]) && !store.groupByThread(m[1])) return json(res, 404, { error: "no such conversation" });
+      const message = store.messagesFor(m[1]).find((row) => row.id === m![2]);
+      const file = message?.role === "user" ? message.recording?.path.match(/^\/api\/attachments\/([\w-]+\.wav)$/)?.[1] : undefined;
+      const stored = file ? readAttachment(file) : null;
+      if (!stored || stored.mime !== "audio/wav") return json(res, 404, { error: "no such recording" });
+      res.writeHead(200, { "content-type": "audio/wav", "content-length": String(stored.bytes.byteLength), "cache-control": "private, max-age=31536000, immutable", "x-content-type-options": "nosniff" });
+      return res.end(stored.bytes);
     }
 
     // the pixels of one screen message, fetched only when something shows it
@@ -9172,6 +9206,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
+      const recording = body.recording === undefined ? undefined : incomingRecording(body.recording) ?? undefined;
+      if (body.recording !== undefined && !recording) return json(res, 400, { error: "recording must be a saved WAV attachment" });
       const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
       if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR });
       const expectedThreadId = body.threadId ?? group.threadId;
@@ -9199,7 +9235,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
       const replyTo = resolveReplyTarget(group.threadId, body.replyToId);
       const reply = await replyOnce(scopedIdempotencyKey, async () => {
-        startGroupTurn(group.id, text, replyTo);
+        startGroupTurn(group.id, text, replyTo, recording);
         return { status: 202, body: { ok: true } };
       });
       return json(res, reply.status, reply.body);
@@ -9920,6 +9956,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.threadId !== undefined && (typeof body.threadId !== "string" || !/^[\w-]+$/.test(body.threadId))) {
         return json(res, 400, { error: "threadId must be a task id" });
       }
+      const recording = body.recording === undefined ? undefined : incomingRecording(body.recording) ?? undefined;
+      if (body.recording !== undefined && !recording) return json(res, 400, { error: "recording must be a saved WAV attachment" });
       const idempotencyKey = idempotencyKeyFrom(body.idempotencyKey);
       if (idempotencyKey === null) return json(res, 400, { error: IDEMPOTENCY_KEY_ERROR });
       const expectedThreadId = body.threadId ?? bot.threadId;
@@ -9973,6 +10011,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
       const replyTo = resolveReplyTarget(bot.threadId, body.replyToId);
       const deliver = async (): Promise<RouteReply> => {
+        // Steering/queueing does not preserve message metadata. A recorded
+        // turn waits for idle rather than pretending its audio was retained.
+        if (recording && bot.busy) return { status: 409, body: { error: "wait for the current turn before sending a recording" } };
         // Claude can accept the message inside its live turn. If the write
         // loses a race with turn settlement, or the engine cannot steer, the
         // existing server-side queue records it atomically for the next turn.
@@ -10004,7 +10045,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           });
           return { status: 202, body: { ok: true, queued: true, queueId: queued.id, threadId: bot.threadId } };
         }
-        await startTurn(bot.id, text, { replyTo, linqChatId });
+        await startTurn(bot.id, text, { replyTo, linqChatId, recording });
         return { status: 202, body: { ok: true } };
       };
       // A retried send must not run the instruction twice: the key is scoped
@@ -10045,7 +10086,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // auto-delivered routine/webhook/resource instruction — Regenerate
       // and edit-last both retarget the same turn-starter on an
       // automation-only thread, so both roles are editable here.
-      if (!source || (source.role !== "user" && source.role !== "system") || source.kind !== "text") {
+      if (!source || (source.role !== "user" && source.role !== "system") || source.kind !== "text" || source.recording) {
         return json(res, 404, { error: "only user or system-instruction messages can be edited" });
       }
       if (!registry.get(bot.modelSelection.instanceId)) {
@@ -11943,12 +11984,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const check = await box.verifyToken(newBoxToken.trim());
         if (!check.ok) return json(res, 400, { error: check.message });
       }
-      // same rule for a voice key — and check it against the provider the
-      // patch SELECTS, not the one already saved, or pasting a Cartesia key
-      // while switching from ElevenLabs validates against the wrong service
+      // Check the new key against the effective selected provider, including
+      // the existing choice when the patch changes only the key.
       const newTts = patch.tts;
       if (newTts?.key?.trim()) {
-        const check = await tts.verifyKey(newTts.key.trim(), { tts: newTts });
+        const check = await tts.verifyKey(newTts.key.trim(), { tts: { ...cfg.tts, ...newTts } });
         if (!check.ok) return json(res, 400, { error: check.message });
       }
       // The secret store is canonical for the names it holds, so a save of one
@@ -12225,11 +12265,71 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
+    // Message-linked speech is generated only once, then served as immutable
+    // clips. The thread/message guard prevents guessed ids from creating work.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/messages\/([\w-]+)\/audio(?:\/(\d+))?$/);
+    if (m && (method === "POST" || method === "GET")) {
+      const [, threadId, messageId, clipIndex] = m;
+      if (!store.botByThread(threadId) && !store.groupByThread(threadId)) return json(res, 404, { error: "no such conversation" });
+      const message = store.messagesFor(threadId).find((row) => row.id === messageId);
+      if (message?.role !== "bot" || message.kind !== "text" || !message.text?.trim()) return json(res, 404, { error: "no such reply" });
+      if (method === "GET") {
+        if (clipIndex === undefined) return json(res, 405, { error: "clip index required" });
+        const clip = message.audio?.[Number(clipIndex)];
+        const stored = clip?.path.match(/^\/api\/attachments\/([\w.-]+)$/);
+        const audio = stored ? readAttachment(stored[1]!) : null;
+        if (!audio || !clip || !["audio/mpeg", "audio/wav"].includes(audio.mime)) return json(res, 404, { error: "no such voice clip" });
+        res.writeHead(200, { "content-type": audio.mime, "content-length": String(audio.bytes.byteLength), "cache-control": "private, max-age=31536000, immutable", "x-content-type-options": "nosniff" });
+        return res.end(audio.bytes);
+      }
+      if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
+      if (message.audio?.length && message.audio.length === toUtterances(spokenReply(message.text)).length && message.audio.every((clip) => {
+        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+        return name && attachmentExists(name);
+      })) return json(res, 200, { audio: message.audio });
+      const owner = message.from?.botId ? store.bot(message.from.botId) : store.botByThread(threadId);
+      if (!owner) return json(res, 404, { error: "no voice owner" });
+      if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
+      const utterances = toUtterances(spokenReply(message.text));
+      if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000) return json(res, 413, { error: "reply exceeds voice clip limit" });
+      const key = `${threadId}:${messageId}`;
+      let job = voiceJobs.get(key);
+      if (!job) {
+        job = (async () => {
+          const clips: Array<{ path: string; mime: string }> = [];
+          for (const clip of message.audio ?? []) {
+            const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+            if (!name || !attachmentExists(name)) break;
+            clips.push(clip);
+          }
+          if (clips.length !== (message.audio?.length ?? 0)) store.patchMessage(threadId, messageId, { audio: [...clips] });
+          for (const utterance of utterances.slice(clips.length)) {
+            const audio = await tts.speak(cfg, utterance, owner.voice);
+            if (!["audio/mpeg", "audio/wav"].includes(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
+            const saved = saveAttachment(Buffer.from(audio.bytes), audio.mime);
+            clips.push({ path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime });
+            store.patchMessage(threadId, messageId, { audio: [...clips] });
+          }
+          return clips;
+        })();
+        voiceJobs.set(key, job);
+        void job.finally(() => voiceJobs.delete(key)).catch(() => {});
+      }
+      try { return json(res, 200, { audio: await job }); }
+      catch (error) {
+        if (error instanceof tts.NoVoiceConfigured) return json(res, 409, { error: error.message });
+        return json(res, 502, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
     // ── voice ─────────────────────────────────────────────────────────
     // Splitting text into utterances lives HERE, not in the renderer, for
     // the same reason approvalKey does — it is the piece most likely to be
     // tuned against real transcripts, and it belongs next to the transform
     // that produced it.
+    if (method === "GET" && path === "/api/tts/usage") {
+      return json(res, 200, { totals: speechUsageTotals(), unit: "characters", note: "Speech providers bill by characters; these are not model tokens." });
+    }
     if (method === "POST" && path === "/api/tts/prepare") {
       const body = await readBody(req);
       return json(res, 200, {
@@ -12270,6 +12370,29 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // "you haven't set this up yet" is not a provider failure — 409 so
         // the client can point at App Settings instead of showing a 502
         if (e instanceof tts.NoVoiceConfigured) return json(res, 409, { error: e.message });
+        return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    // ── voice clone (MiniMax only) ────────────────────────────────────
+    // Uses the same authenticated workspace-settings boundary as key changes.
+    // Never treat an arbitrary nonce as proof of ownership.
+    if (method === "POST" && path === "/api/tts/voice-clone") {
+      // The clone clip is up to 20 MB; base64 expands it to ~27 MB.
+      // Only this route accepts the larger body, after the normal host/origin gate.
+      const body = await readBody(req, 28_000_000);
+      const voiceId = typeof body?.voiceId === "string" ? body.voiceId : "";
+      if (!/^[A-Za-z][A-Za-z0-9_-]{6,62}[A-Za-z0-9]$/.test(voiceId)) {
+        return json(res, 400, { error: "Voice ID must be 8–64 characters, start with a letter, and contain only letters, numbers, - or _ (not at the end)" });
+      }
+      const audioFile = body?.audioFile as string | undefined; // base64
+      const filename = typeof body?.filename === "string" ? body.filename : "";
+      if (!audioFile) return json(res, 400, { error: "audioFile required" });
+      if (!/\.(mp3|m4a|wav)$/i.test(filename)) return json(res, 400, { error: "Use MP3, M4A, or WAV audio" });
+      if (audioFile.length > 28_000_000) return json(res, 413, { error: "Audio clip must be 20 MB or less" });
+      try {
+        const result = await tts.cloneVoice(cfg, { voiceId, audioBase64: audioFile, filename });
+        return json(res, 200, { voiceId: result.id });
+      } catch (e) {
         return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
       }
     }

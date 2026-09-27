@@ -12,6 +12,37 @@
 import Foundation
 
 // MARK: - Messages
+public struct IncomingRecording: Codable, Hashable, Sendable {
+    public var path: String
+    public var mime: String
+    public var transcript: String
+    public var engine: String
+
+    public init(path: String, transcript: String) {
+        self.path = path
+        self.mime = "audio/wav"
+        self.transcript = transcript
+        self.engine = "apple-on-device"
+    }
+}
+
+public struct RecordingReview: Codable, Hashable, Sendable {
+    public var correction: String?
+    public var comment: String?
+    public var updatedAt: Double
+}
+
+public struct SavedTranslation: Codable, Hashable, Sendable {
+    public var language: String
+    public var text: String
+    public var provider: String
+}
+
+public struct VoiceClip: Codable, Hashable, Sendable {
+    public var path: String
+    public var mime: String
+}
+
 
 public struct OptionCard: Codable, Hashable, Sendable {
     public var title: String
@@ -137,6 +168,10 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     public var kind: Kind
     public var at: Double
     public var text: String?
+    public var audio: [VoiceClip]?
+    public var recording: IncomingRecording?
+    public var recordingReview: RecordingReview?
+    public var translation: SavedTranslation?
     /// For a `role == .system` message: what actually fired it —
     /// "schedule", "manual", "webhook", or "resource". Raw string (not an
     /// enum) so an older phone that predates a new trigger kind still
@@ -303,6 +338,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var extraCwds: [String]?
     public var userNotes: String?
     public var speakReplies: Bool?
+    public var speechDevices: [String]?
     public var voice: String?
     public var mascotExpression: String?
     public var tasks: [BotTask]?
@@ -810,6 +846,7 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var avatarCrop: AvatarCrop?
     public var voice: String?
     public var speakReplies: Bool?
+    public var speechDevices: [String]?
     public var modelSelection: ModelSelection?
     public var section: SectionString?
     /// `nil` leaves the stored ceiling alone. `.clear` sends JSON null so the
@@ -843,6 +880,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         avatarCrop: AvatarCrop? = nil,
         voice: String? = nil,
         speakReplies: Bool? = nil,
+        speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
         maxToolRounds: MaxToolRounds? = nil
@@ -855,13 +893,14 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.avatarCrop = avatarCrop
         self.voice = voice
         self.speakReplies = speakReplies
+        self.speechDevices = speechDevices
         self.modelSelection = modelSelection
         self.section = section
         self.maxToolRounds = maxToolRounds
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, modelSelection, section, maxToolRounds
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -879,6 +918,7 @@ public struct BotProfilePatch: Encodable, Sendable {
         try values.encodeIfPresent(avatarCrop, forKey: .avatarCrop)
         try values.encodeIfPresent(voice, forKey: .voice)
         try values.encodeIfPresent(speakReplies, forKey: .speakReplies)
+        try values.encodeIfPresent(speechDevices, forKey: .speechDevices)
         try values.encodeIfPresent(modelSelection, forKey: .modelSelection)
         if let section {
             switch section {

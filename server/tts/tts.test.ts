@@ -2,11 +2,12 @@
 // rule as the box and computer-proxy contract tests: what we send, and how
 // a refusal is reported, are the things that break.
 //
-// The stub serves both providers from the same port: MiniMax paths
-// (`/v1/voice/list`, `/v1/t2a_v2`) and ElevenLabs paths (`/v1/voices`,
-// `/v1/text-to-speech/...`).  A single `refuse` switch flips whichever
-// provider the test is exercising into its failure shape.
+// The stub serves MiniMax paths (`/v1/get_voice`, `/v1/t2a_v2`).
+// A single `refuse` switch flips the provider into its failure shape.
 import { createServer, type Server } from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { AppConfig } from "../config.ts";
@@ -39,15 +40,28 @@ beforeAll(async () => {
       const path = (req.url ?? "").split("?")[0];
 
       // ---- MiniMax (default provider) ----
-      if (req.method === "GET" && path === "/v1/voice/list") {
+      if (req.method === "POST" && path === "/v1/get_voice") {
         return send(200, {
-          voice_list: [
+          system_voice: [
             { voice_id: "English_Graceful_Lady", voice_name: "Graceful Lady", language: "en", gender: "female" },
             { voice_id: "English_Persuasive_Man", voice_name: "Persuasive Man", language: "en", gender: "male" },
             { voice_id: "female-shaonv", voice_name: "Shaonv", language: "zh", gender: "female" },
           ],
           base_resp: { status_code: 0, status_msg: "success" },
         });
+      }
+      if (req.method === "GET" && path === "/v1/voices") {
+        return send(200, { voices: [{ voice_id: "eleven-v", name: "Eleven" }] });
+      }
+      if (req.method === "POST" && path.startsWith("/v1/text-to-speech/")) {
+        res.writeHead(200, { "content-type": "audio/mpeg" });
+        return res.end(MP3_BYTES);
+      }
+      if (req.method === "POST" && path === "/v1/files/upload") {
+        return send(200, { file: { file_id: 12345 }, base_resp: { status_code: 0 } });
+      }
+      if (req.method === "POST" && path === "/v1/voice_clone") {
+        return send(200, { base_resp: { status_code: 0 } });
       }
       if (req.method === "POST" && path === "/v1/t2a_v2") {
         return send(200, {
@@ -57,26 +71,13 @@ beforeAll(async () => {
         });
       }
 
-      // ---- ElevenLabs (legacy provider, opt-in) ----
-      // A RESTRICTED key — the common real-world case. It can read voices
-      // and speak, but has no user_read. Verifying against /user would
-      // reject it, which is exactly the bug this stub exists to catch.
-      if (path === "/v1/user") return send(401, { detail: { status: "missing_permissions" } });
-      if (path === "/v1/voices") {
-        return send(200, {
-          voices: [{ voice_id: "v-1", name: "Rachel", labels: { accent: "american", description: "calm" } }],
-        });
-      }
-      if (path.startsWith("/v1/text-to-speech/")) {
-        res.writeHead(200, { "content-type": "audio/mpeg" });
-        return res.end(MP3_BYTES);
-      }
       send(404, { detail: "no such stub route" });
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
   process.env.MINIMAX_API_URL = `http://127.0.0.1:${port}`;
+  process.env.OMB_DATA_DIR = mkdtempSync(join(tmpdir(), "botfleet-voice-"));
   process.env.OMB_ELEVENLABS_API = `http://127.0.0.1:${port}/v1`;
 });
 
@@ -89,7 +90,7 @@ const voice = () => import("./index.ts");
 const cfg = (tts: AppConfig["tts"]): AppConfig => ({ tts });
 
 describe("configuration", () => {
-  it("needs both a key and a voice before it can speak", async () => {
+  it("needs a key and an explicit voice; MiniMax has no product-default id", async () => {
     const { voiceConfigured, voiceReady } = await voice();
     expect(voiceConfigured({})).toBe(false);
     expect(voiceConfigured(cfg({ key: "k" }))).toBe(false);
@@ -102,7 +103,7 @@ describe("configuration", () => {
   it("defaults the provider to MiniMax and never reports the key itself", async () => {
     const { describeVoice } = await voice();
     const described = describeVoice(cfg({ key: "sk-secret", voice: "English_Graceful_Lady" }));
-    expect(described).toEqual({ configured: true, ready: true, voice: "English_Graceful_Lady", provider: "minimax" });
+    expect(described).toEqual({ configured: true, ready: true, voice: "English_Graceful_Lady", provider: "minimax", optimizedSummary: false });
     expect(JSON.stringify(described)).not.toContain("sk-secret");
   });
 
@@ -113,7 +114,7 @@ describe("configuration", () => {
     expect(() => speak({}, "hi")).toThrow(
       "Add a MiniMax key in Settings on the computer to turn on voice.",
     );
-    expect(() => speak(cfg({ key: "k" }), "hi")).toThrow(
+    expect(() => speak(cfg({ key: "k", provider: "elevenlabs" }), "hi")).toThrow(
       "Pick a voice in the agent profile.",
     );
   });
@@ -129,14 +130,14 @@ describe("configuration", () => {
 describe("MiniMax (default provider)", () => {
   const ready = { key: "sk-mm", voice: "English_Graceful_Lady" };
 
-  it("verifies a key against /v1/voice/list with Bearer auth, not the key in the URL", async () => {
+  it("verifies a key against /v1/get_voice with Bearer auth, not the key in the URL", async () => {
     refuse = null;
     seen.length = 0;
     const { verifyKey } = await voice();
     expect(await verifyKey("sk-mm", cfg(ready))).toEqual({ ok: true });
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk-mm");
     expect(call.url).not.toContain("sk-mm");
   });
@@ -162,8 +163,8 @@ describe("MiniMax (default provider)", () => {
       expect.arrayContaining(["English_Graceful_Lady", "English_Persuasive_Man", "female-shaonv"]),
     );
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
   });
 
   it("POSTs /v1/t2a_v2 with the native shape and hex-decodes the mp3 bytes", async () => {
@@ -185,6 +186,8 @@ describe("MiniMax (default provider)", () => {
     expect(body.output_format).toBe("hex");
     expect(body.voice_setting.voice_id).toBe("English_Graceful_Lady");
     expect(body.audio_setting.format).toBe("mp3");
+    const { speechUsageTotals } = await import("./usage.ts");
+    expect(speechUsageTotals().minimax.characters).toBeGreaterThanOrEqual("hello there".length);
   });
 
   it("lets a caller override the voice per bot", async () => {
@@ -215,57 +218,40 @@ describe("MiniMax (default provider)", () => {
   });
 });
 
-describe("ElevenLabs (legacy opt-in)", () => {
-  const ready = { provider: "elevenlabs" as const, key: "el-key", voice: "v-1" };
-
-  it("verifies via the legacy /v1/user probe so a restricted key still passes", async () => {
-    // The legacy driver uses /v1/user which 401s on missing scopes — the
-    // stub deliberately 401s that path to hold the line that a working
-    // restricted key is still valid.  MiniMax verify is exercised above.
+describe("MiniMax clone", () => {
+  it("uploads accepted audio and sends the operator-chosen voice ID", async () => {
     refuse = null;
     seen.length = 0;
-    const { verifyKey } = await voice();
-    expect(await verifyKey("el-key", cfg(ready))).toEqual({ ok: true });
+    const { cloneVoice, listVoices } = await voice();
+    const result = await cloneVoice(cfg({ key: "sk-mm", provider: "minimax" }), {
+      voiceId: "Jay-Wedgeworth-001", filename: "sample.wav", audioBase64: Buffer.from("RIFF-example").toString("base64"),
+    });
+    expect(result.id).toBe("Jay-Wedgeworth-001");
+    const calls = seen.slice(-2);
+    expect(calls.map((call) => call.url)).toEqual(["/v1/files/upload", "/v1/voice_clone"]);
+    expect(JSON.parse(calls[1].body).voice_id).toBe("Jay-Wedgeworth-001");
+    expect((await listVoices(cfg({ key: "sk-mm" }))).some((voice) => voice.id === result.id)).toBe(true);
   });
-
-  it("says what to do when the ElevenLabs key is genuinely refused", async () => {
-    refuse = { status: 401, body: { detail: "invalid api key" } };
-    const { verifyKey } = await voice();
-    const result = await verifyKey("nope", cfg(ready));
-    refuse = null;
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.message).toMatch(/permission|restricted/i);
-  });
-
-  it("lists ElevenLabs voices with their labels", async () => {
-    const { listVoices } = await voice();
-    expect(await listVoices(cfg(ready))).toEqual([
-      { id: "v-1", label: "Rachel", description: "american · calm" },
-    ]);
-  });
-
-  it("posts to ElevenLabs with the voice in the URL and xi-api-key header", async () => {
+  it("refuses malformed audio data before contacting the provider", async () => {
     seen.length = 0;
-    const { speak } = await voice();
-    const audio = await speak(cfg(ready), "hello there");
-    expect(audio.mime).toBe("audio/mpeg");
+    const { cloneVoice } = await voice();
+    await expect(cloneVoice(cfg({ key: "sk-mm" }), { voiceId: "Jay-Wedgeworth-002", filename: "x.wav", audioBase64: "not base64" })).rejects.toThrow("base64");
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe("optional ElevenLabs", () => {
+  it("verifies, lists, and synthesizes with the selected provider", async () => {
+    refuse = null;
+    const { verifyKey, listVoices, speak } = await voice();
+    const settings = cfg({ provider: "elevenlabs", key: "eleven-key", voice: "eleven-v" });
+    expect(await verifyKey("eleven-key", settings)).toEqual({ ok: true });
+    expect((await listVoices(settings))[0]).toMatchObject({ id: "eleven-v" });
+    const audio = await speak(settings, "test speech");
     expect(Buffer.from(audio.bytes)).toEqual(MP3_BYTES);
-
-    const call = seen.at(-1)!;
-    expect(call.method).toBe("POST");
-    expect(call.url).toContain("/v1/text-to-speech/v-1");
-    expect(call.url).toContain("output_format=mp3");
-    expect(call.headers["xi-api-key"]).toBe("el-key");
-    expect(call.url).not.toContain("el-key");
-    expect(JSON.parse(call.body)).toMatchObject({ text: "hello there", model_id: "eleven_flash_v2_5" });
-  });
-
-  it("surfaces the service's own refusal rather than a bare status", async () => {
-    refuse = { status: 429, body: { detail: "You have exceeded your quota." } };
-    const { speak } = await voice();
-    const message = await speak(cfg(ready), "hi").catch((e: Error) => e.message);
-    refuse = null;
-    expect(message).toContain("exceeded your quota");
+    expect(seen.at(-1)?.headers["xi-api-key"]).toBe("eleven-key");
+    const { speechUsageTotals } = await import("./usage.ts");
+    expect(speechUsageTotals().elevenlabs.characters).toBeGreaterThanOrEqual("test speech".length);
   });
 });
 
@@ -306,7 +292,7 @@ describe("built-in macOS voices", () => {
       configured: onMac,
       ready: onMac,
       voice: "Albert",
-      provider: "system",
+      provider: "system", optimizedSummary: false,
     });
   });
 

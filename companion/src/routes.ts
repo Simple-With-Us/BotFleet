@@ -56,6 +56,7 @@ export const COMPANION_PROFILE_PATCH_FIELDS = [
   "avatarCrop",
   "voice",
   "speakReplies",
+  "speechDevices",
   "modelSelection",
 ] as const;
 
@@ -154,9 +155,11 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/attachments\/[\w-]+\.(?:png|jpe?g|gif|webp)$/i },
 
   // Renderer-neutral voice operations. Neither route reads or writes the
-  // workspace ElevenLabs key; the phone receives labels or audio only.
+  // workspace MiniMax key; the phone receives labels or audio only.
   { method: "GET", path: /^\/api\/tts\/voices$/ },
   { method: "POST", path: /^\/api\/tts\/speak$/ },
+  { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio$/ },
+  { method: "GET", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/audio\/\d+$/ },
 
   // Routines create ordinary tasks using an existing agent configuration.
   // Webhook management remains explicitly denied below.

@@ -173,7 +173,7 @@ public struct CompanionState: Sendable {
     }
 
     public func bot(forThread threadId: String) -> Bot? {
-        bots.first { $0.threadId == threadId }
+        bots.first { $0.threadId == threadId || $0.tasks?.contains(where: { $0.threadId == threadId }) == true }
     }
 
     public func room(forThread threadId: String) -> Room? {

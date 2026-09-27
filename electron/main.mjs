@@ -1837,12 +1837,15 @@ const CREDENTIAL_PATCH = {
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
-  ttsKey: (value) => ({ tts: { key: value, provider: "minimax" } }),
+  ttsKey: (value, provider = "minimax") => ({ tts: { key: value, provider } }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };
 
-ipcMain.handle("credential:set", async (_event, name, value) => {
+ipcMain.handle("credential:set", async (_event, name, value, provider) => {
+  if (name === "ttsKey" && provider !== undefined && !["minimax", "elevenlabs", "system"].includes(provider)) {
+    throw new Error("Unsupported voice engine");
+  }
   const patchFor = CREDENTIAL_PATCH[name];
   if (!patchFor || typeof value !== "string") {
     throw new Error("Unsupported credential");
@@ -1859,7 +1862,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(patchFor(secret)),
+      body: JSON.stringify(patchFor(secret, provider)),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);

@@ -183,7 +183,7 @@ contextBridge.exposeInMainWorld("ogb", {
       throw new Error(message.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, ""));
     }),
   /** Store a provider credential with OS-backed encryption. */
-  setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
+  setCredential: (name, value, provider) => ipcRenderer.invoke("credential:set", name, value, provider),
   /** Store a user-added custom engine's API key with the same OS-backed
    * encryption, keyed by its dynamic instance id rather than a fixed name. */
   setInstanceCredential: (instanceId, value) => ipcRenderer.invoke("credential:set-instance", instanceId, value),

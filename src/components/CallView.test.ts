@@ -19,7 +19,7 @@ describe("CallTargetButton visibility", () => {
   });
 
   it("derives that flag from the provider-scoped tts.configured, not from a raw key check", () => {
-    // Server-side `configured` means: ElevenLabs -> a key is on file; system -> Mac voices exist.
+    // Server-side `configured` means: MiniMax -> a key is on file; system -> Mac voices exist.
     // Reading it (rather than inventing a key check) is what keeps built-in voices working.
     expect(SRC).toMatch(/const configured = Boolean\(state\.config\?\.tts\?\.configured\);/);
     expect(SRC).toMatch(/const voiceProviderConfigured = configured;/);

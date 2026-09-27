@@ -38,6 +38,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { spokenReply } from "../../shared/voice-summary";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
@@ -97,6 +98,10 @@ export interface Message {
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  audio?: Array<{ path: string; mime: string }>;
+  recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
+  recordingReview?: { correction?: string; comment?: string; updatedAt: number };
+  translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
@@ -310,6 +315,7 @@ export interface Bot {
   maxToolRounds?: number | null;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
+  speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
   pinned?: boolean;
@@ -449,10 +455,10 @@ export interface ConfigStatus {
   ingress?: { publicUrl?: string; enabled?: boolean };
   localVm: { mode: "shared" | "per-bot"; maxInstances: number };
   opencodeGo?: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
+  /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "elevenlabs" | "system" };
+  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
@@ -2711,11 +2717,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // the whole point of listening while you do something else. A
             // Auto-speak is disabled during any call. Call mode owns both the
             // singleton speaker and microphone ordering for its whole lifetime.
-            const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId);
-            if (owner?.speakReplies && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(frame.message.text, {
+            const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
+            if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
+              void speaker.speak(spokenReply(frame.message.text), {
                 botId: owner.id,
                 messageId: frame.message.id,
+                threadId: frame.threadId,
                 voiceId: owner.voice,
               });
             }

@@ -30,9 +30,9 @@ beforeAll(async () => {
       };
       if (refuse) return send(refuse.status, refuse.body);
       const path = (req.url ?? "").split("?")[0];
-      if (req.method === "GET" && path === "/v1/voice/list") {
+      if (req.method === "POST" && path === "/v1/get_voice") {
         return send(200, {
-          voice_list: [
+          system_voice: [
             { voice_id: "English_Graceful_Lady", voice_name: "Graceful Lady", language: "en", gender: "female" },
             { voice_id: "English_Persuasive_Man", voice_name: "Persuasive Man", language: "en", gender: "male" },
             { voice_id: "female-shaonv", voice_name: "Shaonv", language: "zh", gender: "female" },
@@ -62,19 +62,19 @@ afterAll(() => new Promise<void>((r) => server.close(() => r())));
 const driver = () => import("./minimax.ts");
 
 describe("verifyKey", () => {
-  it("returns ok against a real /v1/voice/list probe", async () => {
+  it("returns ok against a real /v1/get_voice probe", async () => {
     refuse = null;
     seen.length = 0;
     const { verifyKey } = await driver();
     expect(await verifyKey("sk-good")).toEqual({ ok: true });
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk-good");
   });
 
   it("rejects a key when MiniMax returns HTTP 200 with a non-zero base_resp", async () => {
-    refuse = { status: 200, body: { voice_list: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
+    refuse = { status: 200, body: { system_voice: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
     const { verifyKey } = await driver();
     const result = await verifyKey("bad");
     refuse = null;
@@ -124,19 +124,19 @@ describe("listVoices", () => {
     const voices = await listVoices("sk");
     expect(voices).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: "English_Graceful_Lady", label: "Graceful Lady", description: "en · female" }),
-        expect.objectContaining({ id: "English_Persuasive_Man", label: "Persuasive Man", description: "en · male" }),
-        expect.objectContaining({ id: "female-shaonv", label: "Shaonv", description: "zh · female" }),
+        expect.objectContaining({ id: "English_Graceful_Lady", label: "Graceful Lady", description: undefined }),
+        expect.objectContaining({ id: "English_Persuasive_Man", label: "Persuasive Man", description: undefined }),
+        expect.objectContaining({ id: "female-shaonv", label: "Shaonv", description: undefined }),
       ]),
     );
     const call = seen.at(-1)!;
-    expect(call.method).toBe("GET");
-    expect(call.url.split("?")[0]).toBe("/v1/voice/list");
+    expect(call.method).toBe("POST");
+    expect(call.url.split("?")[0]).toBe("/v1/get_voice");
     expect(call.headers["authorization"]).toBe("Bearer sk");
   });
 
   it("throws when the upstream returns a non-zero base_resp", async () => {
-    refuse = { status: 200, body: { voice_list: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
+    refuse = { status: 200, body: { system_voice: [], base_resp: { status_code: 1001, status_msg: "auth failed" } } };
     const { listVoices } = await driver();
     const msg = await listVoices("sk").catch((e: Error) => e.message);
     refuse = null;

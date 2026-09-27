@@ -237,6 +237,7 @@ type SkillRecordingPayload = {
           | "openaiImageApiKey"
           | "infisicalClientSecret",
         value: string,
+        provider?: "minimax" | "elevenlabs" | "system",
       ): Promise<ConfigStatus>;
       /** Save a user-added custom engine's API key through the same
        * OS-backed store `setCredential` uses — a sibling method, not a name

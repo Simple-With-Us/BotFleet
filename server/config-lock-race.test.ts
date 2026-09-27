@@ -64,14 +64,12 @@ describe("config.json lost-update race between the server and the Electron proce
     const other = electronSide(configPath, N);
     await other.ready;
     // Each save stays synchronous, like the real route handler.  Yield after
-    // small batches so a slow Windows runner can schedule the child between
-    // lock releases instead of timing it out while this process immediately
-    // reacquires the lock 40 times in one event-loop turn.
+    // each release so the child can acquire the lock before this process
+    // reacquires it; Windows runners can otherwise starve the child for
+    // the lock's entire five-second timeout.
     for (let i = 1; i <= N; i += 1) {
       saveConfig({ instances: { [`bot-${i}`]: { driver: "grok" } } });
-      if (i % 4 === 0 && i < N) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 10));
-      }
+      if (i < N) await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
     await other.done;
 

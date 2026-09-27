@@ -134,6 +134,12 @@ export {
 
 
 export function UsageSection() {
+  const [speechUsage, setSpeechUsage] = React.useState<{ minimax: { characters: number; requests: number }; elevenlabs: { characters: number; requests: number } } | null>(null);
+  React.useEffect(() => {
+    let active = true;
+    api("/api/tts/usage").then((data) => { if (active) setSpeechUsage(data.totals); }).catch(() => {});
+    return () => { active = false; };
+  }, []);
   const { state, dispatch } = useStore();
   const [telemetryStatus, setTelemetryStatus] = React.useState<TelemetryStatusView | null>(null);
   const [telemetryFetchError, setTelemetryFetchError] = React.useState<string | null>(null);
@@ -548,6 +554,12 @@ export function UsageSection() {
   }
 
   return (
+    <>
+      <Card title="Speech synthesis" subtitle="Speech is measured in characters, not model tokens. Counts include successful requests on this computer only.">
+        <div className="text-[13px] text-ink-secondary">
+          {speechUsage ? <>MiniMax: {speechUsage.minimax.characters.toLocaleString()} characters ({speechUsage.minimax.requests} requests) · ElevenLabs: {speechUsage.elevenlabs.characters.toLocaleString()} submitted characters ({speechUsage.elevenlabs.requests} requests)</> : "Speech usage unavailable"}
+        </div>
+      </Card>
     <div className="flex flex-col gap-4">
       <Card
         title="Usage"
@@ -1535,6 +1547,7 @@ export function UsageSection() {
         </div>
       </Card>
     </div>
+    </>
   );
 }
 

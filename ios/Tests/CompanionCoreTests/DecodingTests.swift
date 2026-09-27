@@ -30,6 +30,13 @@ final class DecodingTests: XCTestCase {
         try JSONDecoder().decode(type, from: try fixture(name))
     }
 
+    func testVoiceClipsDecodeWithOlderMessagesAndNewerReplies() throws {
+        let plain = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"old","role":"bot","kind":"text","at":1,"text":"Hi"}"#.utf8))
+        XCTAssertNil(plain.audio)
+        let voiced = try JSONDecoder().decode(Message.self, from: Data(#"{"id":"new","role":"bot","kind":"text","at":2,"text":"Hi","audio":[{"path":"/api/attachments/clip.mp3","mime":"audio/mpeg"}]}"#.utf8))
+        XCTAssertEqual(voiced.audio?.first?.path, "/api/attachments/clip.mp3")
+    }
+
     // MARK: - Hydration
 
     func testDecodesThePagedFleet() throws {

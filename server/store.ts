@@ -108,6 +108,14 @@ export interface Message {
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  /** Persisted audio clips for this exact reply, in playback order. */
+  audio?: Array<{ path: string; mime: string }>;
+  /** Original incoming microphone recording and recognizer output never change. */
+  recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
+  /** Corrections are annotations, not edits to the audio or original transcript. */
+  recordingReview?: { correction?: string; comment?: string; updatedAt: number };
+  /** Reserved for a later configured translator; never implies a translation ran. */
+  translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
@@ -538,6 +546,8 @@ export interface BotRecord {
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
   speakReplies?: boolean;
+  /** Selected playback endpoints. Legacy true means Mac only. */
+  speechDevices?: Array<"mac" | "iphone">;
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
@@ -1631,7 +1641,9 @@ export class Store {
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
-    if (!source) return null;
+    // A recorded utterance keeps its original bytes and recognition result.
+    // Review it separately instead of branching away from the evidence.
+    if (!source || source.recording) return null;
     const full: Message = {
       id: newId(),
       at: Date.now(),

@@ -13,16 +13,16 @@
       "title": "BotFleet Add-Ons",
       "badge": "beta",
       "badgeLabel": "In Testing",
-      "sub": "Everything this fork layered on after OpenMausBot.  All of these are in testing — they run in daily use on this fleet, they are not a finished product surface, and they can still change.",
+      "sub": "Everything this fork layered on after OpenMausBot.  All of these are in testing — some are used regularly on this fleet, but none are a finished product surface and their behavior can still change.",
       "features": [
         {
           "title": "Always-On iMessage Relay",
-          "desc": "A host daemon plus LaunchAgents keep bot group chats in Messages.app wired to the BotFleet backend in both directions while the relay is running.",
+          "desc": "A Mac relay can connect bot group chats in Messages.app to BotFleet while its host service is running.",
           "prov": { "type": "host", "note": "In testing" }
         },
         {
           "title": "iOS Companion on Public TestFlight",
-          "desc": "Pairing, universal links on botfleet.app, App Groups, thread tabs, unread Live Activities, and display-aware transcript windows.  Alerts are SSE plus local notifications while the companion is open.  A killed or backgrounded app wakes over APNs when the Mac sidecar is running.  iPad still runs in compatibility mode.",
+          "desc": "The public TestFlight companion pairs with a running Mac host to show conversations and approvals.  Notification behavior depends on the Mac sidecar and iOS permissions; iPad runs in compatibility mode.",
           "prov": { "type": "pr", "prs": [26, 155], "state": "merged", "note": "Public TestFlight · in testing" }
         },
         {
@@ -57,7 +57,7 @@
         },
         {
           "title": "Gemini &amp; Antigravity Engines",
-          "desc": "Gemini 3.8 Flash plus Antigravity, with full tool loading and local computer dispatch on those harnesses after opt-in.",
+          "desc": "Gemini and Antigravity engine options, including tool access and local computer dispatch where configured and approved.",
           "prov": { "type": "pr", "prs": [144, 151], "state": "merged", "note": "In testing" }
         },
         {
@@ -107,7 +107,7 @@
         },
         {
           "title": "Mid-Task Crash &amp; Restart Recovery",
-          "desc": "Interrupted turns and mid-flight tool executions are automatically detected on boot, prompting immediate resumption instead of leaving tasks stuck in an unknown state.",
+          "desc": "The Mac host checks interrupted turns on restart and can resume work that is safe to retry.",
           "prov": { "type": "host", "note": "In testing" }
         },
         {

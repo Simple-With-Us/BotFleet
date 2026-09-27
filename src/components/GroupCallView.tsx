@@ -11,6 +11,7 @@ import { routeSpokenGroupMessage } from "@/lib/group-call";
 import { track } from "@/lib/analytics";
 import { normalizeState } from "@/lib/mascot";
 import { speaker } from "@/lib/tts";
+import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { useStore, type Bot, type Group, type Message } from "@/state/store";
@@ -390,7 +391,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     );
     for (const reply of replies) {
       const member = members.find((candidate) => candidate.id === reply.from?.botId);
-      enqueueSpeech(reply.text!, member);
+      enqueueSpeech(spokenReply(reply.text!), member);
     }
     if (!replies.length) {
       const chip = [...fresh].reverse().find((message) => message.kind === "activity" && message.tool?.spoken);

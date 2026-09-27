@@ -434,6 +434,21 @@ describe("Store", () => {
     expect(store.activePath(bot.threadId).map((m) => m.id)).toEqual(messages.map((m) => m.id));
   });
 
+  it("keeps a recorded utterance and its original transcript when a review is added", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const recording = { path: "/api/attachments/one.wav", mime: "audio/wav" as const,
+      transcript: "what the recognizer heard", engine: "apple-on-device" as const };
+    const original = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "what the recognizer heard", recording });
+    const review = { correction: "what I meant", comment: "Name spelled wrong", updatedAt: 10 };
+    store.patchMessage(bot.threadId, original.id, { recordingReview: review });
+    expect(store.branchMessage(bot.threadId, original.id, "rewrite history")).toBeNull();
+    const restored = new Store(selection).messagesFor(bot.threadId).find((message) => message.id === original.id);
+    expect(restored?.text).toBe("what the recognizer heard");
+    expect(restored?.recording).toEqual(recording);
+    expect(restored?.recordingReview).toEqual(review);
+  });
+
   it("branchMessage forks at the edited message and hides the old tail", () => {
     const store = new Store(selection);
     const bot = store.createBot();
