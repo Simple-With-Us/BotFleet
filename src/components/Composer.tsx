@@ -417,14 +417,14 @@ export function Composer({
         setSpeechError(
           reason === "no-provider"
             ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
-            : "Dictation needs a working provider. Add an AssemblyAI key or use BotFleet for macOS.",
+            : "Dictation needs a working provider.\u00A0 Add an AssemblyAI key or use BotFleet for macOS.",
         );
       } else if (code === 1) {
         setSpeechError(
           session?.provider === "assemblyai"
-            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
-              ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
         );
       }
@@ -470,8 +470,8 @@ export function Composer({
         if (!detached) {
           setRecording(false);
           setSpeechError(session?.provider === "assemblyai"
-            ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
-            : "The microphone couldn't start. Check Microphone and Speech Recognition access.");
+            ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
         }
       });
     };

@@ -119,7 +119,7 @@ export function CallTargetButton({
     : !supported
       ? provider.provider === null && provider.missing === "cloud-stt-key"
         ? "Add an AssemblyAI API key in Settings to make calls on this computer."
-        : "This dictation provider is unavailable. Check your choice in Settings or restart BotFleet."
+        : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
       : !configured
         ? "Add an ElevenLabs API key or choose an available voice provider so the bot can speak during calls."
         : !voiceReady
@@ -227,8 +227,8 @@ function Call({ bot }: { bot: Bot }) {
   const sttSessionRef = useRef<STTSession | null>(null);
   const pushToTalk = usePushToTalk(bot.id, phase === "listening", sttSessionRef, () => {
     setNote(sttSessionRef.current?.provider === "assemblyai"
-      ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
-      : "Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+      ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
   });
 
   const messages = visibleMessages(bot);
@@ -285,8 +285,8 @@ function Call({ bot }: { bot: Bot }) {
     session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms([bot.name], state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
         setNote(session?.provider === "assemblyai"
-          ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
-          : "The microphone couldn't start. Check Microphone and Speech Recognition access.");
+          ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
       }
     });
   }, [bot.id, bot.name, move, state.config?.callStt?.keyterms]);
@@ -342,8 +342,8 @@ function Call({ bot }: { bot: Bot }) {
       if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
         setNote(sttSessionRef.current?.provider === "assemblyai"
-          ? "Cloud dictation stopped unexpectedly. Check the AssemblyAI key, connection, and microphone access."
-          : "Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+          ? "Cloud dictation stopped unexpectedly.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "Dictation stopped unexpectedly.\u00A0 Check Microphone and Speech Recognition access.");
         return;
       }
       if (typeof line.text !== "string") return;
@@ -432,15 +432,15 @@ function Call({ bot }: { bot: Bot }) {
     const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       if (!alive.current || currentCall() !== bot.id) return;
       if (code === 2) {
-        setNote("Calls need a working dictation provider. Add an AssemblyAI key in Settings, or use BotFleet for macOS.");
+        setNote("Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.");
         return;
       }
       if (code === 1) {
         setNote(
           session?.provider === "assemblyai"
-            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
-              ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access in System Settings.",
         );
         return;
@@ -467,7 +467,7 @@ function Call({ bot }: { bot: Bot }) {
           setNote(
             choice.missing === "cloud-stt-key"
               ? "Add an AssemblyAI API key in Settings to use voice on this computer."
-              : "Dictation isn't available in this app build. Restart or update BotFleet.",
+              : "Dictation isn't available in this app build.\u00A0 Restart or update BotFleet.",
           );
         }
         return;

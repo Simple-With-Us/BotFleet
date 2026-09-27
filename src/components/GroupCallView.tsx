@@ -71,8 +71,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   const sttSessionRef = useRef<STTSession | null>(null);
   const pushToTalk = usePushToTalk(group.id, phase === "listening", sttSessionRef, () => {
     setNote(sttSessionRef.current?.provider === "assemblyai"
-      ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
-      : "Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+      ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
   });
 
   const messages = group.messages;
@@ -136,8 +136,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms(membersRef.current.map((member) => member.name), state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === group.id) {
         setNote(session?.provider === "assemblyai"
-          ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
-          : "The microphone couldn't start. Check Microphone and Speech Recognition access.");
+          ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
       }
     });
   }, [group.id, move, state.config?.callStt?.keyterms]);
@@ -228,8 +228,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
         setNote(sttSessionRef.current?.provider === "assemblyai"
-          ? "Cloud dictation stopped unexpectedly. Check the AssemblyAI key, connection, and microphone access."
-          : "Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+          ? "Cloud dictation stopped unexpectedly.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "Dictation stopped unexpectedly.\u00A0 Check Microphone and Speech Recognition access.");
         return;
       }
       if (typeof line.text !== "string") return;
@@ -335,16 +335,16 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (!alive.current || currentCall() !== group.id) return;
       if (code === 2) {
         setNote(
-          "Calls need a working dictation provider. Add an AssemblyAI key in Settings, or use BotFleet for macOS.",
+          "Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.",
         );
         return;
       }
       if (code === 1) {
         setNote(
           session?.provider === "assemblyai"
-            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
-              ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access in System Settings.",
         );
         return;
@@ -368,7 +368,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
           setNote(
             choice.missing === "cloud-stt-key"
               ? "Add an AssemblyAI API key in Settings to use voice on this computer."
-              : "Dictation isn't available in this app build. Restart or update BotFleet.",
+              : "Dictation isn't available in this app build.\u00A0 Restart or update BotFleet.",
           );
         }
         return;

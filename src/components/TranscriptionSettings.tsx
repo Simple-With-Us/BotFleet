@@ -113,7 +113,7 @@ export function TranscriptionSettings() {
           {configured && <span className="text-[11px] text-success">Connected</span>}
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
-          Live narration for recorded skills. Audio is sent to AssemblyAI while recording; the
+          Live narration for recorded skills.{"\u00A0 "}Audio is sent to AssemblyAI while recording; the
           API key is protected by your operating system.
         </p>
         <div className="flex gap-2">
@@ -167,7 +167,7 @@ export function TranscriptionSettings() {
           <span className="text-ink">Voice Calls & Dictation</span>
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
-          Voice mode works everywhere. macOS uses on-device Apple Speech Recognition until a
+          Voice mode works everywhere.{"\u00A0 "}macOS uses on-device Apple Speech Recognition until a
           key is added, then opts into the same cloud engine that powers skill narration —
           quicker turnaround, custom vocabulary, server-side turn detection.
         </p>
@@ -185,13 +185,13 @@ export function TranscriptionSettings() {
                 value: "apple" as Provider,
                 title: "Apple Speech Recognition",
                 description:
-                  "macOS only. Audio never leaves the device. Lower accuracy on technical jargon.",
+                  "macOS only.\u00A0 Audio never leaves the device.\u00A0 Lower accuracy on technical jargon.",
               },
               {
                 value: "assemblyai" as Provider,
                 title: "AssemblyAI Cloud Recognition",
                 description:
-                  "Cross-platform. Requires an API key above. Better accuracy and custom vocabulary.",
+                  "Cross-platform.\u00A0 Requires an API key above.\u00A0 Better accuracy and custom vocabulary.",
               },
             ]
           ).map((option) => (
@@ -226,7 +226,7 @@ export function TranscriptionSettings() {
         </div>
         <p className="mb-2 text-[12px] leading-relaxed text-ink-secondary">
           Bot names, model handles, and product jargon added here are added to the model's
-          recognition vocabulary. Comma-separated; up to {KEYTERMS_MAX} terms.
+          recognition vocabulary.{"\u00A0 "}Comma-separated; up to {KEYTERMS_MAX} terms.
         </p>
         <textarea
           value={globalKeyterms}
