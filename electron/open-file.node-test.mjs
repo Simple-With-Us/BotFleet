@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
-import { resolveOpenablePath } from "./open-file.mjs";
+import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
 
 let home;
 let botHome;
@@ -75,3 +75,9 @@ describe("open-file / show-in-folder path confinement", () => {
     });
   });
 });
+
+// OS openers execute these on at least one supported desktop platform.
+assert.equal(mayOpenBotFile("/tmp/report.pdf"), true);
+for (const unsafe of ["run.command", "run.sh", "run.bat", "run.cmd", "run.js", "run.ps1", "run.exe", "run.desktop", "run.app", "run.html"]) {
+  assert.equal(mayOpenBotFile(`/tmp/${unsafe}`), false);
+}
