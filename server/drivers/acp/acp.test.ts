@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ensureDirs } from "../../config.ts";
-import type { ProviderInstance } from "../../contracts.ts";
+import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
@@ -99,6 +99,28 @@ const ClassifiedErrorDriver = createAcpDriver({
       ? "invalid_credentials"
       : undefined,
 });
+
+/** Proves createAcpDriver overlays perModelEffortLevels onto the described
+ *  model catalog: a model in the map gets its entry as the option's
+ *  effortLevels (which the client prefers over the engine-wide list), an
+ *  option that already declares its own levels keeps them, and every other
+ *  model falls back to the driver-wide list. */
+const perModelEffortCatalog = {
+  default: "m-one",
+  options: [
+    { id: "m-one", label: "One" },
+    { id: "m-two", label: "Two", effortLevels: ["low"] as const },
+    { id: "m-three", label: "Three" },
+  ],
+} satisfies ModelCatalog;
+const PerModelEffortSupport: AcpSupport = {
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "perModelEffortTest",
+  effortLevels: ["low", "medium", "high"],
+  perModelEffortLevels: { "m-one": ["none", "high", "max"] },
+  models: perModelEffortCatalog,
+};
+const PerModelEffortDriver = createAcpDriver(PerModelEffortSupport);
 
 describe("skipSubscriptionAuthForLocalInject", () => {
   it("is true only for a host:: inject id", () => {
@@ -1190,6 +1212,54 @@ describe("ACP turns (fake CLI)", () => {
 
     await create(KimiAgentDriver);
     expect(instance.adapter.capabilities.effortLevels).toBeUndefined();
+  });
+
+  it("overlays per-model effort levels onto the described model catalog", () => {
+    const options = PerModelEffortDriver.models.options;
+    // A model in the map gets the map's entry as the option's effortLevels.
+    expect(options.find((option) => option.id === "m-one")?.effortLevels).toEqual(["none", "high", "max"]);
+    // An option that already declares its own levels keeps them.
+    expect(options.find((option) => option.id === "m-two")?.effortLevels).toEqual(["low"]);
+    // A model absent from the map gets none: it falls back to the
+    // driver-wide list.
+    expect(options.find((option) => option.id === "m-three")?.effortLevels).toBeUndefined();
+  });
+
+  it("leaves the catalog untouched when no per-model map is declared", () => {
+    const driver = createAcpDriver({ ...SELECT_MODEL_SUPPORT, driverKind: "noPerModelMapTest" });
+    expect(driver.models).toBe(SELECT_MODEL_SUPPORT.models);
+  });
+
+  it("keeps the driver-wide effort capability alongside per-model levels", async () => {
+    await create(PerModelEffortDriver);
+    expect(instance.adapter.capabilities.effortLevels).toEqual(["low", "medium", "high"]);
+  });
+
+  it("overlays per-model effort levels onto a refreshed catalog", async () => {
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "perModelEffortRefreshTest",
+      defaultCli: FAKE_CLI,
+      perModelEffortLevels: { "dynamic-model": ["high", "max"] },
+      resolveModels: async () => ({
+        default: "dynamic-model",
+        options: [{ id: "dynamic-model", label: "Dynamic model" }],
+      }),
+    });
+    const inst = await driver.create({
+      instanceId: "per-model-effort-refresh-test",
+      displayName: "Per-Model Effort Refresh Test",
+      environment: {},
+      enabled: true,
+      config: driver.defaultConfig(),
+    });
+    try {
+      expect(inst.models.options).toEqual([
+        { id: "dynamic-model", label: "Dynamic model", effortLevels: ["high", "max"] },
+      ]);
+    } finally {
+      await inst.dispose();
+    }
   });
 
   it("passes effort to Grok, and omits the flag when unset", async () => {
