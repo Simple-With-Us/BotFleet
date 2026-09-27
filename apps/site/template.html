@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BotFleet — Add-On Features (In Testing)</title>
-<meta name="description" content="BotFleet is a friendly fork of OpenMausBot.  This page lists the add-ons this fork layered on — all of them in testing — then the features OpenMausBot already shipped when we forked.">
-<meta property="og:title" content="BotFleet — Add-On Features (In Testing)">
-<meta property="og:description" content="BotFleet add-ons (all in testing), then the OpenMausBot features this fork inherited.">
+<title>BotFleet — Coordinate Bots on Your Mac</title>
+<meta name="description" content="Set up bots on your Mac, organize their conversations, and review their work.  BotFleet is a beta fork of OpenMausBot with an iOS companion on TestFlight.">
+<meta property="og:title" content="BotFleet — Coordinate Bots on Your Mac">
+<meta property="og:description" content="Set up bots, organize conversations, and review their work from your Mac or the iOS companion beta.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://botfleet.app/">
 <link rel="icon" type="image/png" href="/favicon-64.png" sizes="64x64">
@@ -56,6 +56,10 @@
   .nav .links { margin-left: auto; display: flex; gap: 18px; font-size: 0.92rem; flex-wrap: wrap; }
   .nav .links a { color: var(--ink-soft); text-decoration: none; }
   .nav .links a:hover { color: var(--ink); text-decoration: underline; }
+  @media (max-width: 600px) {
+    .nav { flex-wrap: wrap; gap: 8px 10px; padding-top: 12px; padding-bottom: 12px; }
+    .nav .links { flex-basis: 100%; margin-left: 0; gap: 6px 14px; font-size: 0.84rem; line-height: 1.4; }
+  }
 
   .hero { padding: 56px 0 44px; }
   .hero .hero-image {
@@ -72,6 +76,11 @@
   }
   .hero h1 .thin { color: var(--ink-soft); font-weight: 500; }
   .hero p.lede { font-size: 1.08rem; color: var(--ink-soft); max-width: 46rem; margin-bottom: 20px; }
+  .workflow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 28px 0 8px; }
+  .workflow article { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .workflow h2 { font-size: 1rem; margin-bottom: 6px; }
+  .workflow p { color: var(--ink-soft); font-size: 0.92rem; }
+  @media (max-width: 720px) { .workflow { grid-template-columns: 1fr; } }
   .cta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-bottom: 26px; }
   .cta {
     display: inline-block; background: var(--tile); color: #ffffff;
@@ -128,6 +137,9 @@
   }
   .card .prov a { color: var(--ink-soft); text-decoration: none; }
   .card .prov a:hover { text-decoration: underline; }
+  .add-on-details { margin-top: 40px; }
+  .add-on-details summary { cursor: pointer; font-weight: 650; font-size: 1.1rem; padding: 14px 0; }
+  .add-on-details summary:focus-visible, a:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
 
   section.from-upstream { padding: 44px 0 8px; }
   section.from-upstream h2 {
@@ -153,7 +165,11 @@
   }
   footer.site .inner { padding-top: 36px; padding-bottom: 44px; font-size: 0.9rem; }
   footer.site a { color: var(--silver-hi); }
+  footer.site a:focus-visible { outline-color: var(--silver-hi); }
   footer.site .fine { color: var(--silver-lo); margin-top: 10px; font-size: 0.82rem; }
+  footer.site .swu-attribution { display: inline-flex; align-items: center; gap: 5px; margin-top: 12px; color: var(--silver-lo); font-size: 0.72rem; text-decoration: none; }
+  footer.site .swu-attribution:hover { color: var(--silver-hi); text-decoration: underline; }
+  footer.site .swu-attribution img { display: block; width: min(288px, calc(100vw - 92px)); height: auto; border-radius: 2px; background: #fff; }
 </style>
 </head>
 <body>
@@ -163,7 +179,8 @@
     <img src="/logo-256.png" alt="BotFleet app icon">
     <span class="word">BotFleet</span>
     <nav class="links">
-      <a href="#addons">Add-Ons</a>
+      <a href="#workflow">How It Works</a>
+      <a href="#add-on-list">Add-Ons</a>
       <a href="#from-openmausbot">From OpenMausBot</a>
       <a href="{{TESTFLIGHT_URL}}">TestFlight</a>
       <a href="{{REPO_URL}}">GitHub</a>
@@ -175,17 +192,15 @@
 <main class="wrap">
 
   <section class="hero">
-    <img class="hero-image" src="/hero-bots.png" alt="BotFleet Metallic Robot Trio">
-    <h1>A Fleet of Bots, <span class="thin">Built on OpenMausBot</span></h1>
+    <img class="hero-image" src="/hero-bots.png" alt="Illustration of three BotFleet robots">
+    <h1>Give Each Bot a Job. <span class="thin">Keep the Work Together.</span></h1>
     <p class="lede">
-      BotFleet is a friendly fork of the open-source
-      <a href="{{UPSTREAM_URL}}">OpenMausBot</a> desktop app, extended to run a coordinated fleet of
-      specialized bots on your own computer.  Every add-on listed here is in testing. 
-      The OpenMausBot features this fork inherited are listed below the add-ons.
+      Set up bots on your Mac, give them channels for different projects, and review their conversations and approvals in one place. 
+      BotFleet builds on the open-source <a href="{{UPSTREAM_URL}}">OpenMausBot</a> desktop app.  BotFleet add-ons are in testing.
     </p>
     <div class="cta-row" style="gap: 16px;">
       <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
-        <a class="cta" href="{{MAC_DOWNLOAD_URL}}">Download for Mac (Apple Silicon)</a>
+        <a class="cta" href="{{MAC_DOWNLOAD_URL}}">Download Mac beta (Apple Silicon)</a>
         <a href="{{RELEASES_URL}}" style="font-size: 13px; color: var(--ink-muted); text-decoration: underline;">See Previous Builds</a>
       </div>
       <div style="display: flex; flex-direction: column; gap: 8px; align-items: center;">
@@ -193,19 +208,27 @@
         <span class="cta-note" style="margin: 0; max-width: 250px; text-align: center;">Public beta of the iOS companion.</span>
       </div>
     </div>
-    <p class="roster-label">An example fleet — the bots the maintainer runs today:</p>
+    <p class="roster-label">For example, a project can have:</p>
     <div class="roster" role="group" aria-label="Example bot roster">
       {{ROSTER}}
     </div>
   </section>
 
+  <section class="workflow" id="workflow" aria-label="How BotFleet works">
+    <article><h2>Set Up Your Bots</h2><p>Choose a bot's engine and role in the Mac app.  Use the accounts and tools you configure.</p></article>
+    <article><h2>Organize Conversations</h2><p>Put project work in channels and task threads so the team and its context stay together.</p></article>
+    <article><h2>Review and Continue</h2><p>Follow replies and approval requests on your Mac.  The iOS companion is available as a public TestFlight beta.</p></article>
+  </section>
+
   <div class="legend">
-    <div><span class="badge beta">In Testing</span>  Every BotFleet add-on on this page is in testing.  Cards that run in daily use are still not a finished product surface.</div>
-    <div class="lineage">Cards cite a pull request only when that number is verified.  Host or main
-      notes mean the work is on this Mac or already on BotFleet main without a single originating PR.</div>
+    <div><span class="badge beta">In Testing</span>  Every BotFleet add-on on this page is in testing.  Some add-ons are used regularly, but their behavior and setup may change.</div>
+    <div class="lineage">The detailed add-on list below includes source links where available.</div>
   </div>
 
+  <details class="add-on-details" id="add-on-list">
+    <summary>Explore BotFleet Add-Ons in Testing</summary>
   {{SECTIONS}}
+  </details>
 
   <section class="from-upstream" id="from-openmausbot">
     <h2>From OpenMausBot</h2>
@@ -235,9 +258,23 @@
       <a href="{{REPO_URL}}">github.com/jaywedgeworth22/BotFleet</a>.  iOS companion:
       <a href="{{TESTFLIGHT_URL}}">public TestFlight</a>.</div>
     <div class="fine">© 2026 BotFleet.  Last updated {{UPDATED}}.</div>
+    <a class="swu-attribution" href="https://simplewithus.com/" aria-label="From Simple With Us"><span>From</span><img src="/swu-logo-wide.webp" alt="Simple With Us by Jay Wedgeworth" width="288" height="30"></a>
   </div>
 </footer>
 
+<script>
+  // A fragment pointing at a closed <details> only reaches its summary.
+  // Open before scrolling, both on direct links and when nav is clicked again.
+  const addOns = document.getElementById("add-on-list");
+  const revealAddOns = () => {
+    if (window.location.hash === "#add-on-list" && addOns) addOns.open = true;
+  };
+  document.querySelector('a[href="#add-on-list"]')?.addEventListener("click", () => {
+    if (addOns) addOns.open = true;
+  });
+  window.addEventListener("hashchange", revealAddOns);
+  revealAddOns();
+</script>
 <script>
   window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
 </script>
