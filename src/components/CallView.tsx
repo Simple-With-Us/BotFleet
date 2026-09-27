@@ -216,8 +216,11 @@ function Call({ bot }: { bot: Bot }) {
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
-  const pushToTalk = usePushToTalk(bot.id, phase === "listening", () => {
-    setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+  const sttSessionRef = useRef<STTSession | null>(null);
+  const pushToTalk = usePushToTalk(bot.id, phase === "listening", sttSessionRef, () => {
+    setNote(sttSessionRef.current?.provider === "assemblyai"
+      ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start. Check Microphone and Speech Recognition access.");
   });
 
   const messages = visibleMessages(bot);
@@ -250,7 +253,7 @@ function Call({ bot }: { bot: Bot }) {
   // The STT provider session is chosen once per call and reused across every
   // listen cycle. The provider picker decides apple (macOS, no cloud key) vs
   // assemblyai (cross-platform, or macOS-with-key per the picker default).
-  const sttSessionRef = useRef<STTSession | null>(null);
+
 
   /** Change the rendered phase and the synchronous phase used by native
    * callbacks together. React state alone is too late: the helper can exit
@@ -410,6 +413,7 @@ function Call({ bot }: { bot: Bot }) {
         askedQuestion.current = null;
         dispatch({ type: "answerCard", botId: bot.id, messageId: openQuestion.messageId, answer: said });
         move("working");
+        hush();
         return;
       }
 
@@ -426,7 +430,7 @@ function Call({ bot }: { bot: Bot }) {
       if (code === 1) {
         setNote(
           session?.provider === "assemblyai"
-            ? `Cloud dictation stopped: ${reason ?? "connection or microphone error"}. Check the AssemblyAI key, connection, and microphone access.`
+            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
               ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access in System Settings.",

@@ -405,7 +405,7 @@ export function Composer({
       } else if (code === 1) {
         setSpeechError(
           session?.provider === "assemblyai"
-            ? `Cloud dictation stopped: ${reason ?? "connection or microphone error"}. Check the AssemblyAI key, connection, and microphone access.`
+            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
               ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",

@@ -68,8 +68,11 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [speakingMemberId, setSpeakingMemberId] = useState<string | null>(null);
-  const pushToTalk = usePushToTalk(group.id, phase === "listening", () => {
-    setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+  const sttSessionRef = useRef<STTSession | null>(null);
+  const pushToTalk = usePushToTalk(group.id, phase === "listening", sttSessionRef, () => {
+    setNote(sttSessionRef.current?.provider === "assemblyai"
+      ? "Cloud dictation couldn't start. Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start. Check Microphone and Speech Recognition access.");
   });
 
   const messages = group.messages;
@@ -111,7 +114,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   // (cross-platform, or macOS-with-key per the picker default). The same
   // `useOnCall` micro-task lifecycle means a session can outlive one render
   // but the cleanup hook releases it before the timer ref is reset.
-  const sttSessionRef = useRef<STTSession | null>(null);
+
 
   const move = useCallback((next: Phase) => {
     phaseRef.current = next;
@@ -310,6 +313,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
           message: said,
         });
         move("working");
+        hush();
         return;
       }
 
@@ -338,7 +342,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       if (code === 1) {
         setNote(
           session?.provider === "assemblyai"
-            ? `Cloud dictation stopped: ${reason ?? "connection or microphone error"}. Check the AssemblyAI key, connection, and microphone access.`
+            ? "Cloud dictation stopped. Check the AssemblyAI key, connection, and microphone access."
             : reason === "helper-build-failed"
               ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
               : "Dictation needs Microphone + Speech Recognition access in System Settings.",
