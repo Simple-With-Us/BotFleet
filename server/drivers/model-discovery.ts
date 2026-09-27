@@ -40,26 +40,32 @@ export interface ModelDiscoveryResult {
 
 const DEFAULT_TIMEOUT_MS = 8_000;
 
+/** Rows out of either provider payload shape: a bare array, or an envelope
+ *  carrying one under `data`. */
+function rowsFromModelsPayload(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  // SAFETY: `data` is only read to decide whether this is the `{ data: [...] }`
+  // envelope, and Array.isArray re-checks the result, so a payload that does
+  // not match the declared shape yields [] instead of a bad read.
+  const data = (payload as { data?: unknown } | null)?.data;
+  return Array.isArray(data) ? data : [];
+}
+
 /** One `GET {baseUrl}/models`, normalized across the two shapes providers
  *  use: a bare array, or `{ data: [...] }`.  Never throws — a network
  *  failure is `ok: false` with no status, same as an unreachable host. */
 export async function fetchProviderModels(input: ModelDiscoveryInput): Promise<ModelDiscoveryResult> {
   const { baseUrl, apiKey, headers, timeoutMs } = input;
   try {
-    const requestHeaders: Record<string, string> = { ...headers };
-    if (apiKey) requestHeaders.authorization = `Bearer ${apiKey}`;
+    const requestHeaders = new Headers(headers);
+    if (apiKey) requestHeaders.set("authorization", `Bearer ${apiKey}`);
     const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
       headers: requestHeaders,
       signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
     });
     if (!res.ok) return { ok: false, status: res.status };
-    const json: unknown = await res.json().catch(() => null);
-    const rows: unknown[] = Array.isArray(json)
-      ? json
-      : Array.isArray((json as { data?: unknown })?.data)
-        ? ((json as { data: unknown[] }).data)
-        : [];
-    return { ok: true, status: res.status, rows };
+    const payload: unknown = await res.json().catch(() => null);
+    return { ok: true, status: res.status, rows: rowsFromModelsPayload(payload) };
   } catch {
     return { ok: false };
   }
@@ -76,6 +82,21 @@ export interface MergeModelsOptions {
   keepDefault?: boolean;
 }
 
+/** The two fields a provider row may contribute beyond its id.  Narrowed once,
+ *  at the point the untrusted row enters, so the merge below works with real
+ *  strings instead of re-asserting the same shape per field. */
+function readProviderRow(row: unknown): { id: string; name: string } | null {
+  if (!row || typeof row !== "object") return null;
+  // SAFETY: the row came off a provider's JSON, so `id` and `name` may be any
+  // type.  Both are read here and nowhere else, and each is re-checked with
+  // typeof before use, so a row that breaks the declared shape contributes
+  // nothing rather than a mis-typed value.
+  const record = row as { id?: unknown; name?: unknown };
+  if (typeof record.id !== "string" || !record.id) return null;
+  const name = typeof record.name === "string" && record.name.trim() ? record.name : "";
+  return { id: record.id, name };
+}
+
 /** Fold discovered rows into a catalog, preserving the hand-written
  *  metadata for ids we already know.  Returns `null` when the result would
  *  be empty — the caller keeps its existing catalog. */
@@ -86,32 +107,33 @@ export function mergeDiscoveredModels(
 ): ModelCatalog | null {
   const excluded = new Set(options.excludeIds ?? []);
   const seen = new Set<string>();
-  const options_: ModelCatalog["options"] = [];
-  for (const row of rows) {
-    const candidate = row as { id?: unknown };
-    const id = typeof candidate?.id === "string" ? candidate.id : "";
-    if (!id || seen.has(id) || excluded.has(id)) continue;
-    seen.add(id);
-    const previous = known.options.find((option) => option.id === id);
+  const merged: ModelCatalog["options"] = [];
+  for (const candidate of rows) {
+    const row = readProviderRow(candidate);
+    if (!row) continue;
+    if (seen.has(row.id) || excluded.has(row.id)) continue;
+    seen.add(row.id);
+    const previous = known.options.find((option) => option.id === row.id);
     // `name` is an OpenAI-compatible courtesy field; prefer the hand-written
     // label, then the provider's own name, then the bare id.
-    const providedName = (row as { name?: unknown }).name;
-    const label =
-      previous?.label ??
-      (typeof providedName === "string" && providedName.trim() ? providedName : id);
-    options_.push({
-      id,
-      label,
-      ...(previous?.badge ? { badge: previous.badge } : {}),
-      ...(previous?.badgeTitle ? { badgeTitle: previous.badgeTitle } : {}),
-      ...(previous?.contextWindow ? { contextWindow: previous.contextWindow } : {}),
-      ...(previous?.loaded !== undefined ? { loaded: previous.loaded } : {}),
-    });
+    const option: ModelCatalog["options"][number] = {
+      id: row.id,
+      // `||` not `??`: readProviderRow reports a missing name as "", and `??`
+      // would let that empty string win over the id instead of falling back.
+      label: previous?.label ?? (row.name || row.id),
+    };
+    // Metadata is copied only when present, so an option never carries a key
+    // set to undefined.
+    if (previous?.badge) option.badge = previous.badge;
+    if (previous?.badgeTitle) option.badgeTitle = previous.badgeTitle;
+    if (previous?.contextWindow) option.contextWindow = previous.contextWindow;
+    if (previous?.loaded !== undefined) option.loaded = previous.loaded;
+    merged.push(option);
   }
-  if (options_.length === 0) return null;
+  if (merged.length === 0) return null;
   const keepDefault = options.keepDefault ?? true;
-  const defaultId = keepDefault && seen.has(known.default) ? known.default : options_[0].id;
-  return { default: defaultId, options: options_ };
+  const defaultId = keepDefault && seen.has(known.default) ? known.default : merged[0].id;
+  return { default: defaultId, options: merged };
 }
 
 /** Memoize a discovery fetch for `ttlMs`.  Drivers used to hand-roll this —

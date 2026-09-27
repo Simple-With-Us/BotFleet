@@ -41,7 +41,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
 /** Models the product keeps out of the picker even when the installed
  *  Harness offers them.  Same expression that builds STATIC_DSH_MODELS, so
  *  the live read below and the static fallback agree on what is excluded. */
-const DSH_EXCLUDED_MODEL_IDS = ["MiniMax-M2.7"] as const;
+const DSH_EXCLUDED_MODEL_IDS: readonly string[] = ["MiniMax-M2.7"];
 
 /** The Harness install declares the models it can actually serve in its own
  *  settings file, under a provider map at `llm-pi-ai.providers.<id>.models[]`
@@ -65,48 +65,83 @@ function readDshSettingsPath(environment: Record<string, string | undefined>): s
   return join(home, ".dsh", "settings.yaml");
 }
 
+/** The only slice of `settings.yaml` this driver reads.  Parsed once at the
+ *  file boundary, so nothing below handles `unknown` or re-asserts its way
+ *  down the document.  Every field is optional because the document is
+ *  user-authored: `Array.isArray` on a hand-edited file is the real check. */
+interface DshModelEntry {
+  readonly id?: string;
+  readonly name?: string;
+  readonly contextWindow?: number;
+}
+
+interface DshProviderBlock {
+  readonly models?: readonly DshModelEntry[];
+}
+
+interface DshSettings {
+  readonly "llm-pi-ai"?: { readonly providers?: Readonly<Record<string, DshProviderBlock>> };
+  readonly providers?: Readonly<Record<string, DshProviderBlock>>;
+}
+
+function isExcludedModelId(id: string): boolean {
+  return DSH_EXCLUDED_MODEL_IDS.includes(id);
+}
+
+function parseDshSettings(raw: string): DshSettings {
+  // SAFETY: parseYaml returns whatever the document happens to contain, so
+  // this assertion is a promise the document may break.  DshSettings makes
+  // every field optional and the only narrowing that matters — a real model
+  // list — is re-checked with Array.isArray before use, so a hand-edited or
+  // malformed file degrades to the static catalog instead of trusting a shape.
+  return parseYaml(raw) as DshSettings;
+}
+
 /** Every provider map in the document, most specific first.  The live shape
  *  nests it at `llm-pi-ai.providers`; a top-level `providers` is accepted too
  *  so a profile written that way still works. */
-function providerMapsIn(settings: unknown): Record<string, unknown>[] {
-  if (!settings || typeof settings !== "object") return [];
-  const root = settings as Record<string, unknown>;
-  const maps: Record<string, unknown>[] = [];
-  const llm = root["llm-pi-ai"];
-  const nested = llm && typeof llm === "object" ? (llm as Record<string, unknown>).providers : undefined;
-  if (nested && typeof nested === "object") maps.push(nested as Record<string, unknown>);
-  if (root.providers && typeof root.providers === "object") maps.push(root.providers as Record<string, unknown>);
-  return maps;
+function providerMapsIn(settings: DshSettings): Readonly<Record<string, DshProviderBlock>>[] {
+  const candidates: (Readonly<Record<string, DshProviderBlock>> | undefined)[] = [
+    settings["llm-pi-ai"]?.providers,
+    settings.providers,
+  ];
+  return candidates.filter((maps): maps is Readonly<Record<string, DshProviderBlock>> => Boolean(maps));
 }
 
-function modelRowsFromSettings(settings: unknown): ModelCatalog["options"] {
+function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
   const rows: ModelCatalog["options"] = [];
   const seen = new Set<string>();
   for (const providers of providerMapsIn(settings)) {
     for (const provider of Object.values(providers)) {
-      const models = (provider as { models?: unknown } | null)?.models;
+      // `!provider` also covers a null block, which would throw on the next
+      // line; a scalar block yields `undefined` here and is skipped.
+      if (!provider) continue;
+      const models = provider.models;
       if (!Array.isArray(models)) continue;
       for (const entry of models) {
-        if (!entry || typeof entry !== "object") continue;
-        const row = entry as { id?: unknown; name?: unknown; contextWindow?: unknown };
-        const id = typeof row.id === "string" ? row.id : "";
-        if (!id || seen.has(id)) continue;
+        const id = entry?.id;
+        // The declared entry type is a promise the hand-edited file may break,
+        // so the id is re-checked as a string here: a numeric or object id
+        // would otherwise reach the picker and fail at turn time instead.
+        if (typeof id !== "string" || !id) continue;
+        if (seen.has(id)) continue;
         seen.add(id);
-        if ((DSH_EXCLUDED_MODEL_IDS as readonly string[]).includes(id)) continue;
+        if (isExcludedModelId(id)) continue;
         const previous = STATIC_DSH_MODELS.options.find((option) => option.id === id);
-        const providedName = typeof row.name === "string" && row.name.trim() ? row.name : "";
-        rows.push({
+        const providedName = entry.name?.trim() ? entry.name : "";
+        const row: ModelCatalog["options"][number] = {
           id,
           // Hand-written copy wins over the settings file's own name.
           label: previous?.label ?? providedName ?? id,
-          ...(typeof row.contextWindow === "number" && row.contextWindow > 0
-            ? { contextWindow: row.contextWindow }
-            : previous?.contextWindow
-              ? { contextWindow: previous.contextWindow }
-              : {}),
-          ...(previous?.badge ? { badge: previous.badge } : {}),
-          ...(previous?.badgeTitle ? { badgeTitle: previous.badgeTitle } : {}),
-        });
+        };
+        // A live contextWindow is the one number a profile edit actually
+        // changes, so it beats the static value; otherwise keep the static one.
+        const contextWindow =
+          entry.contextWindow && entry.contextWindow > 0 ? entry.contextWindow : previous?.contextWindow;
+        if (contextWindow) row.contextWindow = contextWindow;
+        if (previous?.badge) row.badge = previous.badge;
+        if (previous?.badgeTitle) row.badgeTitle = previous.badgeTitle;
+        rows.push(row);
       }
     }
   }
@@ -130,13 +165,13 @@ export function readDshModelCatalog(
   const options = STATIC_DSH_MODELS.options.map((option) => ({ ...option }));
   let discovered: ModelCatalog["options"] = [];
   try {
-    discovered = modelRowsFromSettings(parseYaml(readFileSync(readDshSettingsPath(environment), "utf8")));
+    discovered = modelRowsFromSettings(parseDshSettings(readFileSync(readDshSettingsPath(environment), "utf8")));
   } catch {
     // No settings file, unreadable, or unparseable YAML: the static catalog
     // stands.  A discovery miss is never fatal.
   }
   for (const row of discovered) {
-    if ((DSH_EXCLUDED_MODEL_IDS as readonly string[]).includes(row.id)) continue;
+    if (isExcludedModelId(row.id)) continue;
     const index = options.findIndex((option) => option.id === row.id);
     if (index === -1) {
       options.push(row);
@@ -144,11 +179,9 @@ export function readDshModelCatalog(
     }
     // A known id: keep the static label and badge, take the live context
     // window, which is the one number a profile edit actually changes.
-    const existing = options[index];
-    options[index] = {
-      ...existing,
-      ...(row.contextWindow ? { contextWindow: row.contextWindow } : {}),
-    };
+    const merged = options[index];
+    if (row.contextWindow) merged.contextWindow = row.contextWindow;
+    options[index] = merged;
   }
   // The static default is always in the union, so a refresh cannot move a
   // selection out from under the user.

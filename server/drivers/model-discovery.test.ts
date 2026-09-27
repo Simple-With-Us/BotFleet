@@ -45,9 +45,21 @@ describe("fetchProviderModels", () => {
       new Response(JSON.stringify({ data: [] })));
     vi.stubGlobal("fetch", fetchMock);
     await fetchProviderModels({ baseUrl: "https://x", apiKey: "secret", headers: { "api-version": "2026-01" } });
-    const init = fetchMock.mock.calls[0][1] ?? {};
-    expect((init.headers as Record<string, string>).authorization).toBe("Bearer secret");
-    expect((init.headers as Record<string, string>)["api-version"]).toBe("2026-01");
+    // A real Headers instance, not a plain object, so the assertion reads it
+    // through the Headers API rather than indexing.
+    const sent = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(sent.get("authorization")).toBe("Bearer secret");
+    expect(sent.get("api-version")).toBe("2026-01");
+    vi.unstubAllGlobals();
+  });
+
+  it("omits the authorization header when there is no key", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify({ data: [] })));
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchProviderModels({ baseUrl: "https://x" });
+    const sent = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(sent.has("authorization")).toBe(false);
     vi.unstubAllGlobals();
   });
 
