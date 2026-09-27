@@ -60,6 +60,7 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   { displayName: "OpenCode", driverKind: "opencodeGo", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Qwen", driverKind: "qwenAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
   { displayName: "Hermes", driverKind: "hermesAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
+  { displayName: "MiniMax Code", driverKind: "mcodeAgent", capabilities: { computerMcp: true, localComputerMcp: true } },
 
   // The remote agent.  Its driver declares no computer flag at all: the turn
   // runs on the box, so there is nothing to mount.

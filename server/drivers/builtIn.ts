@@ -8,6 +8,7 @@ import { CodexDriver } from "./codex.ts";
 import { GrokDriver } from "./grok.ts";
 import { GrokAgentDriver } from "./acp/grok.ts";
 import { KimiAgentDriver } from "./acp/kimi.ts";
+import { McodeAgentDriver } from "./acp/mcode.ts";
 import { DroidAgentDriver } from "./acp/droid.ts";
 import { CursorAgentDriver } from "./acp/cursor.ts";
 import { OpenCodeDriver } from "./acp/opencode-go.ts";
@@ -26,6 +27,7 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   DeepSeekAgentDriver,
   DshAgentDriver,
   KimiAgentDriver,
+  McodeAgentDriver,
   DroidAgentDriver,
   CursorAgentDriver,
   OpenCodeDriver,
