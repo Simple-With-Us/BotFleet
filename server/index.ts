@@ -10122,7 +10122,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // owner — it must run unattended, or Auto mode and Always-allow
         // would apply to words the owner never typed.
         await startTurn(bot.id, text, { replyTo, ...(fromImessage ? { automationSource: "imessage" as const } : {}) });
->>>>>>> 5c6458b7 (fix(security): treat iMessage relay turns as unattended)
         return { status: 202, body: { ok: true } };
       };
       // A retried send must not run the instruction twice: the key is scoped
