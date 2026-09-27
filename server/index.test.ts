@@ -601,6 +601,14 @@ describe("harness HTTP API", () => {
     expect(body.static).toBe(true);
   });
 
+  it("returns 400 for a doubled-slash request target without killing the harness", async () => {
+    // audit C1: `new URL("//", base)` throws; the parse must stay inside the
+    // request guard so a proxy that passes `//` cannot crash the API port.
+    const malformed = await api("GET", "//");
+    expect(malformed.status).toBe(400);
+    expect((await api("GET", "/api/health")).status).toBe(200);
+  });
+
   it("authenticates a reversible runtime admission fence", async () => {
     const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8")) as { nonce: string };
     const unauthorized = await fetch(`${BASE}/api/runtime/quiesce`, { method: "POST" });
