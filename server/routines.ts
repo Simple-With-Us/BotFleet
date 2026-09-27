@@ -1144,7 +1144,7 @@ export class RoutineManager {
     }
   }
 
-  handleRuntimeEvent(event: RuntimeEvent): RoutineRun | null {
+  handleRuntimeEvent(event: RuntimeEvent, opts?: { fallingOver?: boolean }): RoutineRun | null {
     const run = this.runs.find((r) => !r.coalescedInto && r.threadId === event.threadId && ["running", "waiting"].includes(r.status));
     if (!run) return null;
     run.engineId = event.providerInstanceId ?? event.provider;
@@ -1165,6 +1165,13 @@ export class RoutineManager {
       // receipt-worthy failure, so keep the run running and stay quiet
       return null;
     } else if (event.type === "turn.completed") {
+      if (opts?.fallingOver) {
+        // A fallback dispatch is already launching for this turn: receipt
+        // waits for the fallback's own completion, the same way a driver
+        // retry keeps the run open.  The caller still gets the run so the
+        // fallback can inherit what it needs from it.
+        return { ...run };
+      }
       run.cost = event.cost;
       run.denials = event.denials;
       const reason = event.stopReason ?? run.error;

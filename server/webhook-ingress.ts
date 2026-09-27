@@ -249,7 +249,18 @@ export async function listenWebhookIngress(
   },
 ): Promise<WebhookIngress> {
   const host = options.host ?? "127.0.0.1";
-  const server = createServer(createWebhookIngressHandler(manager, options.beginAdmission, options.routes));
+  const handler = createWebhookIngressHandler(manager, options.beginAdmission, options.routes);
+  // Same boundary guard as the API port's createServer callback (audit
+  // C1): an async route that throws must not escape as an unhandled
+  // rejection — there is deliberately no process-level handler, so one
+  // would take the receiver down.  Log, answer 500, stay up.
+  const server = createServer((req, res) => {
+    void Promise.resolve(handler(req, res)).catch((error: unknown) => {
+      console.error("[webhook-ingress] unhandled route failure:", error);
+      if (!res.headersSent) json(res, 500, { error: "internal error" });
+      else res.destroy();
+    });
+  });
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
     server.once("error", onError);

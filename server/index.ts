@@ -1466,6 +1466,81 @@ function cursorSeq(raw: string | string[] | undefined): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+
+// ── runtime-event redaction for the wire ─────────────────────────────────
+// Runtime events went to every SSE client and into the replay buffer whole,
+// while the transcript they fold into is scrubbed at append
+// (store.redactBotAuthored). Scrub the text-bearing fields on the broadcast
+// copy only: the server-side fold below and the HTTP tool executor still
+// read the raw event (the executor replays `arguments` verbatim).
+//
+// Deltas are provisional — the settled assistant_text item is what persists
+// — so a pattern that fires only ACROSS a delta boundary holds that
+// fragment back instead of shipping half a secret: the completed item still
+// delivers the full redacted text. The tail is raw context from the same
+// thread's recent deltas so such a split secret still matches a pattern.
+const DELTA_REDACT_TAIL_CHARS = 256;
+const deltaRedactTail = new Map<string, string>();
+
+function redactStreamDelta(threadId: string, delta: string): string {
+  const tail = deltaRedactTail.get(threadId) ?? "";
+  deltaRedactTail.set(threadId, (tail + delta).slice(-DELTA_REDACT_TAIL_CHARS));
+  const redactedTail = redactSecretsInText(tail);
+  const joined = redactSecretsInText(tail + delta);
+  // When redaction is prefix-stable (the common case: nothing secret-shaped
+  // near the boundary), the joined redaction is the redacted tail plus this
+  // delta's redacted text. When a pattern fired across the boundary the
+  // prefixes disagree — emit nothing and let the settled item carry the text.
+  return joined.startsWith(redactedTail) ? joined.slice(redactedTail.length) : "";
+}
+
+function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
+  switch (event.type) {
+    case "content.delta": {
+      const delta = redactStreamDelta(event.threadId, event.delta);
+      return delta === event.delta ? event : { ...event, delta };
+    }
+    case "item.started": {
+      const title = typeof event.title === "string" ? redactSecretsInText(event.title) : event.title;
+      const target = typeof event.target === "string" ? redactSecretsInText(event.target) : event.target;
+      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
+      if (title === event.title && target === event.target && args === event.arguments) return event;
+      return { ...event, title, target, arguments: args };
+    }
+    case "item.completed": {
+      if (event.itemType === "assistant_text") {
+        const text = redactSecretsInText(event.text);
+        return text === event.text ? event : { ...event, text };
+      }
+      const detail = typeof event.detail === "string" ? redactSecretsInText(event.detail) : event.detail;
+      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
+      if (detail === event.detail && args === event.arguments) return event;
+      return { ...event, detail, arguments: args };
+    }
+    case "request.opened": {
+      const summary = redactSecretsInText(event.summary);
+      const choices = event.choices?.map((choice) => redactSecretsInText(choice));
+      if (summary === event.summary && (!choices || choices.every((choice, i) => choice === event.choices?.[i]))) return event;
+      return { ...event, summary, choices };
+    }
+    case "turn.retrying": {
+      const reason = redactSecretsInText(event.reason);
+      return reason === event.reason ? event : { ...event, reason };
+    }
+    case "turn.completed": {
+      deltaRedactTail.delete(event.threadId);
+      const stopReason = typeof event.stopReason === "string" ? redactSecretsInText(event.stopReason) : event.stopReason;
+      return stopReason === event.stopReason ? event : { ...event, stopReason };
+    }
+    case "runtime.error": {
+      const message = redactSecretsInText(event.message);
+      return message === event.message ? event : { ...event, message };
+    }
+    default:
+      return event;
+  }
+}
+
 function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
@@ -1719,7 +1794,13 @@ async function interruptThreadEverywhere(threadId: string): Promise<InterruptOut
 }
 /** Room turns re-enter the member engine after turn.completed so failover
  * does not race the sequential roster walk. */
-const pendingMemberFallback = new Map<string, { groupId: string; botId: string; selection: ModelSelection }>();
+const pendingMemberFallback = new Map<
+  string,
+  // instanceId keys the waiter to the turn that armed it: on a thread two
+  // engines touched (audit G16), one engine's settle must not consume the
+  // fallback another engine's failure armed.
+  { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
+>();
 const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
@@ -2281,10 +2362,16 @@ bus.subscribe((event: RuntimeEvent) => {
       // thread keeps its own chat id so the first reply cannot retarget.
       releaseLinqChat(event.threadId, event.turnId);
   }
-  broadcast({ kind: "runtime", event });
-  const routineRun = routines?.handleRuntimeEvent(event) ?? null;
+  broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const bot = store.botByThread(event.threadId);
   const group = bot ? undefined : store.groupByThread(event.threadId);
+  // A turn.completed receipts only after the failover pick below: a turn a
+  // fallback is about to save must not fail (or falsely complete) its
+  // routine run first (E5).  Threads with no failover path receipt here.
+  let routineRun: RoutineRun | null = null;
+  if (event.type !== "turn.completed" || (!bot && !group)) {
+    routineRun = routines?.handleRuntimeEvent(event) ?? null;
+  }
   if (!bot && !group) return;
   const speaker = group ? groupSpeakers.get(event.threadId) : undefined;
 
@@ -2389,7 +2476,18 @@ bus.subscribe((event: RuntimeEvent) => {
       // bot so it keeps working. A QUESTION always reaches the human — the
       // whole point of asking is that a person decides — and anything that
       // looks destructive stops even in auto mode.
-      const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
+      // The asker is the bot whose engine raised the request — resolved by
+      // the request's own provider instance, not the thread's speaker
+      // entry: a crossed room can leave the speaker naming the other
+      // member, and an auto verdict against the wrong bot applies the
+      // wrong auto-approve policy (audit G16).
+      const requestOwner = group
+        ? activeTurnOwners.forEvent(event.threadId, event.providerInstanceId)
+        : undefined;
+      const asker =
+        bot ??
+        (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
+        (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
@@ -2673,7 +2771,14 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
-      const fallbackBot = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
+      // The turn that ended owns its failover: resolve the member from the
+      // settled owner (this thread, this provider instance) before the
+      // thread's speaker entry, which a crossed room can leave naming the
+      // other member (audit G16).
+      const fallbackBot =
+        bot ??
+        (settledOwner ? store.bot(settledOwner.botId) : undefined) ??
+        (speaker ? store.bot(speaker.botId) : undefined);
       const storedFallbackPolicy = fallbackBot
         ? (bot ? store.taskByThread(fallbackBot.id, event.threadId)?.modelSelection : undefined) ?? fallbackBot.modelSelection
         : undefined;
@@ -2710,6 +2815,10 @@ bus.subscribe((event: RuntimeEvent) => {
           dispatchId: settledOwner?.dispatchId,
           token: completionToken,
         });
+      }
+      if (!fallbackBot) {
+        // No failover can launch on this thread, so the run receipts now.
+        routineRun = routines?.handleRuntimeEvent(event) ?? null;
       }
       let fallbackUserMessage: Message | undefined;
       let fallbackSelection: ModelSelection | undefined;
@@ -2774,7 +2883,7 @@ bus.subscribe((event: RuntimeEvent) => {
         let chain = configuredChain && configuredChain.length > 0 ? configuredChain : undefined;
         if (!chain && quotaOrCap) {
           deferredAutoFallback = true;
-          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
+          chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
         }
         // A provider reload fences every dispatch, including a fallback to an
         // unrelated instance.  Keep this completion fold and its busy owner
@@ -2795,7 +2904,7 @@ bus.subscribe((event: RuntimeEvent) => {
               await waitForProviderReloads();
             }
             const refreshedAt = providerReloadGeneration;
-            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort);
+            chain = await autoFallbackChain(fallbackBot.id, actualSelection.instanceId, actualSelection.effort, fallbackComputerReach(settledOwner?.computerInputs));
             if (!providerReloadInProgress && providerReloadGeneration === refreshedAt) break;
           }
         }
@@ -2816,6 +2925,12 @@ bus.subscribe((event: RuntimeEvent) => {
             model: actualSelection.model,
           },
         });
+        // Receipt now that the failover decision exists: while a fallback is
+        // launching the run stays open and receipts on the fallback's own
+        // completion; otherwise it receipts exactly as it always has (E5).
+        routineRun = routines?.handleRuntimeEvent(event, {
+          fallingOver: Boolean(next && fallbackUserMessage && typeof fallbackUserMessage.text === "string"),
+        }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
           const { nextUsed, instanceId, model, effort } = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
@@ -2835,11 +2950,19 @@ bus.subscribe((event: RuntimeEvent) => {
             // does not spin forever waiting for a completion that never comes
             tool: { name: `Fell over to ${next.model}${resetNote}`, ok: true, kind: "notice" },
           });
-          if (group && speaker?.botId === fallbackBot.id) {
+          // Arm the waiter for the member whose turn actually ended on
+          // this provider instance (audit G16): the thread's speaker entry
+          // can still name another member when turns have crossed, and a
+          // waiter armed from it re-dispatches the wrong member.
+          const endedRoomTurn = settledOwner
+            ? settledOwner.botId === fallbackBot.id
+            : speaker?.botId === fallbackBot.id;
+          if (group && endedRoomTurn) {
             pendingMemberFallback.set(event.threadId, {
               groupId: group.id,
               botId: fallbackBot.id,
               selection: fallbackSelection,
+              instanceId: event.providerInstanceId,
             });
           }
         } else {
@@ -2921,6 +3044,10 @@ bus.subscribe((event: RuntimeEvent) => {
             modelSelection: fallbackSelection,
             automationSource: userMsg.automationSource,
             unattended: isUnattended(fallbackBotId),
+            // the destination travels with the turn: a cloud routine or
+            // webhook falls over to another engine in the same cloud, never
+            // silently back to the local bot (E5)
+            runOn: settledOwner?.computerInputs?.runOn,
           }).catch((error) => {
             if (isExternalCredentialPendingError(error)) {
               pendingCredentialFallback.set(`${fallbackBotId}:${event.threadId}`, {
@@ -3048,13 +3175,40 @@ bus.subscribe((event: RuntimeEvent) => {
  * instance (by fleet priority) is offered as a one-step chain. The caller
  * still runs it through selectTurnFallback, so the produced / quota /
  * stop-reason rules apply exactly as they do for a configured chain. */
-async function autoFallbackChain(botId: string, currentInstanceId: string, effort?: EffortLevel): Promise<ModelSelection[]> {
+/** The computer destinations a fallback engine must reach to take over the
+ *  failing turn: what the turn actually mounted wins over its grant, and a
+ *  cloud runOn needs the matching cloud destination whatever was granted. */
+function fallbackComputerReach(inputs: TurnComputerInputs | undefined): Partial<Record<"box" | "vps" | "vm" | "local", boolean>> {
+  const requires: Partial<Record<"box" | "vps" | "vm" | "local", boolean>> = {};
+  if (!inputs) return requires;
+  const need = (kind: "box" | "vps" | "vm" | "local") => { requires[kind] = true; };
+  if (inputs.mounted) {
+    if (inputs.mounted.includes("asciiBox")) need("box");
+    if (inputs.mounted.includes("selfHostedVps")) need("vps");
+    if (inputs.mounted.includes("localVm")) need("vm");
+    if (inputs.mounted.includes("localMac")) need("local");
+  } else {
+    if (inputs.computers?.includes("cloud")) need(inputs.cloudBackend === "vps" ? "vps" : "box");
+    if (inputs.computers?.includes("vm")) need("vm");
+    if (inputs.computers?.includes("local")) need("local");
+  }
+  if (inputs.runOn === "cloud") need(inputs.cloudBackend === "vps" ? "vps" : "box");
+  return requires;
+}
+
+async function autoFallbackChain(
+  botId: string,
+  currentInstanceId: string,
+  effort?: EffortLevel,
+  requires?: Partial<Record<"box" | "vps" | "vm" | "local", boolean>>,
+): Promise<ModelSelection[]> {
   try {
     const described = await registry.describe({ maxAgeMs: DEFAULT_SELECTION_DESCRIBE_MAX_AGE_MS });
     return eligibleAutoFallbackChain(described, {
       botId,
       currentInstanceId,
       effort,
+      requires,
       // The fleet ladder itself lives in model-fallback.ts so the ordering
       // is unit-testable without booting the server — minimax sits after
       // codex and ahead of openaiCompat, per the PR 10 owner decision.
@@ -3220,28 +3374,38 @@ bus.subscribe((event: RuntimeEvent) => {
 function drainRoomQueue() {
   drainRoomRounds(store, Date.now(), (round) => {
     credentialPendingRoomRounds.delete(`${round.groupId}:${round.threadId}:${round.botId}`);
-    void runGroupMemberTurn(
-      round.groupId,
-      round.threadId,
-      round.botId,
-      round.hop,
-      new Set(),
-      round.cardContinuation,
-      undefined,
-      undefined,
-      round.turnSelection,
-    ).catch((error) => {
-      store.appendMessage(round.threadId, {
-        role: "bot",
-        kind: "activity",
-        tool: {
-          name: `error: queued round could not start — ${
-            (error instanceof Error ? error.message : String(error)).slice(0, 120)
-          }`,
-          ok: false,
-        },
-      });
-    });
+    // The drained round runs on the room's operation queue, behind any
+    // message dispatch still in flight (audit G16).  Firing it directly
+    // let it start beside the live speaker: on a shared provider instance
+    // the turn claim then failed after the busy flags had already moved,
+    // and on separate instances two members spoke at once — either way the
+    // room's speaker, busy slot and fallback waiter crossed.
+    const prev = groupQueues.get(round.groupId) ?? Promise.resolve();
+    const next = prev.then(() =>
+      runGroupMemberTurn(
+        round.groupId,
+        round.threadId,
+        round.botId,
+        round.hop,
+        new Set(),
+        round.cardContinuation,
+        undefined,
+        undefined,
+        round.turnSelection,
+      ).catch((error) => {
+        store.appendMessage(round.threadId, {
+          role: "bot",
+          kind: "activity",
+          tool: {
+            name: `error: queued round could not start — ${
+              (error instanceof Error ? error.message : String(error)).slice(0, 120)
+            }`,
+            ok: false,
+          },
+        });
+      }).then(() => {}),
+    );
+    groupQueues.set(round.groupId, next.catch(() => {}));
   });
 }
 
@@ -5525,16 +5689,42 @@ async function runGroupMemberTurn(
     // arrived with.
     clearUnattended(bot.id);
   }
+  // Claim the turn BEFORE any busy flag or speaker entry moves (audit
+  // G16).  A claim can lose: a round that reaches dispatch beside the
+  // live speaker finds this provider instance already owned on the
+  // thread and throws.  When the flags moved first, that throw left them
+  // behind — the real speaker's release then no-opped against a busy slot
+  // it no longer owned, and the room showed a speaker that was gone until
+  // restart.  The claim is the gate; the flags follow it, and a lost
+  // claim waits like the busy paths above instead of corrupting the room.
+  let roomDispatch: ReturnType<typeof activeTurnOwners.claim>;
+  try {
+    roomDispatch = activeTurnOwners.claim(threadId, {
+      botId: bot.id,
+      selection,
+      fallbackPolicy: bot.modelSelection,
+      computerInputs: turnComputerInputs(bot),
+    });
+  } catch {
+    const queued = queueRoomRound(
+      { groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection },
+      Date.now(),
+    );
+    const message = queued
+      ? `${bot.name}'s engine is mid-turn in this room — queued for when it frees up`
+      : `${bot.name}'s engine is mid-turn in this room — already queued`;
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: message, ok: true, kind: "notice" },
+    });
+    return true;
+  }
   store.setActivity(bot.id, "working");
   store.patchBot(bot.id, { inflightThreadId: threadId });
   store.patchGroup(group.id, { busyBotId: bot.id }); // the store's change stream carries the frame
   groupSpeakers.set(threadId, { botId: bot.id, name: bot.name, color: bot.color });
-  const roomDispatch = activeTurnOwners.claim(threadId, {
-    botId: bot.id,
-    selection,
-    fallbackPolicy: bot.modelSelection,
-    computerInputs: turnComputerInputs(bot),
-  });
   /** Hand the room back when no turn.completed will do it.  Only use it while
    * this invocation still owns the room; otherwise it would emit a duplicate
    * group frame or clear a newer speaker's state. */
@@ -5947,7 +6137,14 @@ async function runGroupMemberTurn(
   }
 
   const pendingFallback = pendingMemberFallback.get(threadId);
-  if (pendingFallback && pendingFallback.botId === bot.id && pendingFallback.groupId === groupId) {
+  if (
+    pendingFallback &&
+    pendingFallback.botId === bot.id &&
+    pendingFallback.groupId === groupId &&
+    // The waiter belongs to the turn that armed it (audit G16): only this
+    // invocation's own engine may consume it.
+    (!pendingFallback.instanceId || pendingFallback.instanceId === selection.instanceId)
+  ) {
     pendingMemberFallback.delete(threadId);
     if (!isCancelled?.() && outcome === "settled") {
       spoken.delete(bot.id);

@@ -31,6 +31,11 @@ beforeAll(async () => {
   secret = created.secret;
   ingress = await listenWebhookIngress(manager, {
     port: 0,
+    routes: {
+      "/hooks/boom": async () => {
+        throw new Error("boom");
+      },
+    },
     beginAdmission: () => {
       if (!admitting) return null;
       activeAdmissions += 1;
@@ -48,6 +53,12 @@ describe("webhook-only ingress", () => {
   it("returns 400 for a malformed doubled-slash URL without killing the receiver", async () => {
     const malformed = await fetch(`${ingress.baseUrl}//`);
     expect(malformed.status).toBe(400);
+    expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
+  });
+
+  it("answers 500 when a route throws, without killing the receiver", async () => {
+    const boom = await fetch(`${ingress.baseUrl}/hooks/boom`, { method: "POST" });
+    expect(boom.status).toBe(500);
     expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
   });
 

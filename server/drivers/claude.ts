@@ -514,8 +514,24 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
        * turn just written; committed to the receipt store on the first frame
        * after submission (see drivers/prompt-split.ts) */
       pendingReceipt: { key: string; receipt: PromptSplitReceipt } | null;
-      /** the running turn, or null between turns */
-      turn: { turnId: string; settled: boolean; sawStreamDelta: boolean } | null;
+      /** the running turn, or null between turns.  Carries everything the
+       * close handler needs to relaunch THIS turn: the handler is registered
+       * by the first spawn, and on a warm session a crash during turn 2
+       * must replay turn 2's prompt, not the spawn's original. */
+      turn: {
+        turnId: string;
+        settled: boolean;
+        sawStreamDelta: boolean;
+        /** Sticky for the life of the turn: any assistant text or tool
+         *  activity.  A transient crash after this point must NOT relaunch -
+         *  the resumed session would replay the user message and re-run the
+         *  tools the turn already ran (E2).  Unlike sawStreamDelta, which is
+         *  a per-frame dedup hint and resets after each assistant frame. */
+        producedOutput: boolean;
+        input: SendTurnInput;
+        retry: { attempt: number; cancelled: boolean };
+        retryAbort: AbortController;
+      } | null;
       idleTimer: ReturnType<typeof setTimeout> | null;
       closing: boolean;
       stderr: string;
@@ -795,8 +811,21 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const live = sessions.get(threadId);
       if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false };
-        active.set(threadId, { stop: () => killCliTree(live.child), turnId, broker: live.broker });
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort };
+        // stderr feeds the crash message; a warm process still holds turn
+        // 1's buffer, which would mislabel turn 2's failure
+        live.stderr = "";
+        active.set(threadId, {
+          stop: () => {
+            // cancel before killing so the close handler's retry path stands
+            // down instead of relaunching behind the interrupt
+            retry.cancelled = true;
+            retryAbort.abort();
+            killCliTree(live.child);
+          },
+          turnId,
+          broker: live.broker,
+        });
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
@@ -874,7 +903,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
@@ -965,7 +994,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             if (ev.type !== "content_block_delta") break;
             const d = ev.delta ?? {};
             if (d.type === "text_delta" && typeof d.text === "string" && d.text) {
-              if (session.turn) session.turn.sawStreamDelta = true;
+              if (session.turn) {
+                session.turn.sawStreamDelta = true;
+                session.turn.producedOutput = true;
+              }
               emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: d.text });
             } else if (d.type === "thinking_delta" && typeof d.thinking === "string" && d.thinking) {
               emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "reasoning_text", delta: d.thinking });
@@ -976,6 +1008,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
             if (text.trim()) {
+              if (session.turn) session.turn.producedOutput = true;
               // fallback delta for CLIs/paths that never streamed the block
               if (!session.turn?.sawStreamDelta) {
                 emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
@@ -985,6 +1018,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
+                if (session.turn) session.turn.producedOutput = true;
                 // `b.input` names the file, the command, the pattern — the
                 // only part of a step a reader can act on.  It used to be
                 // dropped here, which is why a Claude bot's transcript was a
@@ -1015,6 +1049,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "user":
             for (const b of Array.isArray(o.message?.content) ? o.message.content : []) {
               if (b.type === "tool_result") {
+                if (session.turn) session.turn.producedOutput = true;
                 emit({
                   ...base(threadId, currentTurnId()),
                   type: "item.completed",
@@ -1097,14 +1132,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // process that exited between turns (idle close, contract change)
         // is just a session ending
         if (session.turn && !session.turn.settled) {
+          // the turn that was actually running when the process died — on a
+          // warm session this is NOT the turn this closure spawned with
+          const liveTurn = session.turn;
           const message = `claude exited ${code} before result${session.stderr ? `: ${stderrExcerpt(session.stderr)}` : ""}`;
           const verdict = classifyError({ exitCode: code, stderr: message });
           if (
-            !retry.cancelled &&
+            !liveTurn.retry.cancelled &&
             code !== 0 &&
             verdict.transient &&
-            !session.turn.sawStreamDelta &&
-            retry.attempt < RETRY_MAX_ATTEMPTS - 1
+            !liveTurn.producedOutput &&
+            liveTurn.retry.attempt < RETRY_MAX_ATTEMPTS - 1
           ) {
             // the CLI is gone but the TURN continues: keep the thread busy,
             // emit no terminal event, and relaunch after the backoff. The
@@ -1122,25 +1160,25 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             sessions.delete(threadId);
             session.turn = null;
-            retry.attempt++;
-            const delayMs = computeBackoff(retry.attempt - 1);
+            liveTurn.retry.attempt++;
+            const delayMs = computeBackoff(liveTurn.retry.attempt - 1);
             emit({
-              ...base(threadId, turnId),
+              ...base(threadId, liveTurn.turnId),
               type: "turn.retrying",
-              attempt: retry.attempt,
+              attempt: liveTurn.retry.attempt,
               delayMs,
               reason: verdict.reason,
             });
             void (async () => {
-              const wait = interruptibleDelay(delayMs * retryScale, retryAbort.signal);
+              const wait = interruptibleDelay(delayMs * retryScale, liveTurn.retryAbort.signal);
               await wait.promise;
               // an interrupt during the backoff landed here via stop(); the
               // turn settles as interrupted and no zombie relaunch happens
-              if (retry.cancelled) {
+              if (liveTurn.retry.cancelled) {
                 active.delete(threadId);
                 retryState.delete(threadId);
                 emit({
-                  ...base(threadId, turnId),
+                  ...base(threadId, liveTurn.turnId),
                   type: "turn.completed",
                   ok: false,
                   stopReason: "interrupted",
@@ -1159,16 +1197,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                 // few hundred bytes; a skipped one loses the memory for the
                 // rest of the session.
                 if (cursor) clearPromptSplitReceipt(DRIVER_KIND, cursor);
-                await sendTurn({ ...turn, resumeCursor: cursor });
+                await sendTurn({ ...liveTurn.input, resumeCursor: cursor });
               } catch (e) {
                 retryState.delete(threadId);
                 emit({
-                  ...base(threadId, turnId),
+                  ...base(threadId, liveTurn.turnId),
                   type: "runtime.error",
                   message: e instanceof Error ? e.message : String(e),
                 });
                 emit({
-                  ...base(threadId, turnId),
+                  ...base(threadId, liveTurn.turnId),
                   type: "turn.completed",
                   ok: false,
                   stopReason: "exit_before_result",
@@ -1179,12 +1217,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             return;
           }
           retryState.delete(threadId);
-          emit({
-            ...base(threadId, currentTurnId()),
-            type: "runtime.error",
-            message,
-          });
-          settle(false, "exit_before_result");
+          // A user stop cancels the retry and kills the process (audit E6):
+          // the close that follows is the interrupt landing, not a crash —
+          // no runtime.error, and the turn settles interrupted under the
+          // same convention #647 set for Antigravity.
+          if (liveTurn.retry.cancelled) {
+            settle(false, "interrupted");
+          } else {
+            emit({
+              ...base(threadId, currentTurnId()),
+              type: "runtime.error",
+              message,
+            });
+            settle(false, "exit_before_result");
+          }
         }
         if (session.idleTimer) clearTimeout(session.idleTimer);
         session.broker?.close();

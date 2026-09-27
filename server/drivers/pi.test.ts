@@ -608,13 +608,13 @@ describe("PiDriver turns (fake CLI)", () => {
     await expect(instance.adapter.respondToRequest("t-none", "nope", { behavior: "allow" })).resolves.toBe("unavailable");
   });
 
-  it("interruptTurn cancels a running turn", async () => {
+  it("interruptTurn settles a running turn interrupted, not as a success", async () => {
     await create("permission");
     await instance.adapter.sendTurn({ threadId: "t-interrupt", text: "go" });
     await recorder.until((e) => e.type === "request.opened");
     await instance.adapter.interruptTurn("t-interrupt");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ ok: true, stopReason: "cancelled" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
   });
 
   it("writes models.json and set_model for a host::model inject pick", async () => {

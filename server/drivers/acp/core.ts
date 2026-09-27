@@ -595,9 +595,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
           return { turnId, dispatched: false as const };
         };
+        // A stop that lands during setup is still a stop (audit E6):
+        // interrupted, not a success and not a crash.
         const cancelledBeforeDispatch = () =>
           preflightCancelled || disposed
-            ? finishBeforeDispatch(true, "cancelled")
+            ? finishBeforeDispatch(false, "interrupted")
             : null;
 
         // Snapshot status is advisory and callers can dispatch directly.  A
@@ -1196,6 +1198,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         });
         child.on("close", (code) => {
           if (!state.settled && !state.deadlineTerminating && !state.retrying) {
+            // A user stop cancels the retry and kills the process (audit
+            // E6): the close that follows is the interrupt landing, not a
+            // crash — no runtime.error, settle interrupted (#647
+            // convention).
+            if (retry.cancelled) {
+              settle(false, "interrupted");
+              return;
+            }
             const message = `${DRIVER_KIND} exited ${code} before the prompt result${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`;
             // A CLI that died on a provider hiccup before saying anything is
             // worth one more launch; a CLI that died for its own reasons is
@@ -1210,7 +1220,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (sessionId) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
           else stop();
           if (interruptTimer) clearTimeout(interruptTimer);
-          interruptTimer = setTimeout(() => settle(true, "cancelled"), 5_000);
+          // The cancel got no answer: the turn still ends because a person
+          // stopped it — interrupted, not a success (audit E6).
+          interruptTimer = setTimeout(() => settle(false, "interrupted"), 5_000);
           interruptTimer.unref?.();
         };
         // Wrapped, not bare: a person who stops this turn has stopped the

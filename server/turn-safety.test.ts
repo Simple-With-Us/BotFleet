@@ -278,6 +278,50 @@ describe("automatic fallback eligibility", () => {
     )).toEqual([{ instanceId: "custom-b", model: "custom-b-model" }]);
   });
 
+  it("refuses fallback engines that cannot reach the failing turn's computer destinations (E5)", () => {
+    const chain = eligibleAutoFallbackChain(
+      [
+        candidate("no-box", { computerReach: { box: false, vps: false, vm: false, local: true } }),
+        candidate("boxable", { computerReach: { box: true, vps: false, vm: false, local: true } }),
+      ],
+      {
+        botId: "bot-1",
+        currentInstanceId: "current",
+        requires: { box: true },
+        isCooling: () => false,
+        priority: ["no-box", "boxable"],
+      },
+    );
+    expect(chain).toEqual([{ instanceId: "boxable", model: "boxable-model" }]);
+  });
+
+  it("requires every held destination, so a local-only engine cannot take a cloud turn", () => {
+    expect(eligibleAutoFallbackChain(
+      [candidate("local-only", { computerReach: { box: false, vps: false, vm: false, local: true } })],
+      {
+        botId: "bot-1",
+        currentInstanceId: "current",
+        requires: { box: true, local: true },
+        isCooling: () => false,
+        priority: ["local-only"],
+      },
+    )).toEqual([]);
+  });
+
+  it("keeps candidates without a shipped reach eligible, matching the pre-gate behavior", () => {
+    const chain = eligibleAutoFallbackChain(
+      [candidate("legacy")],
+      {
+        botId: "bot-1",
+        currentInstanceId: "current",
+        requires: { box: true },
+        isCooling: () => false,
+        priority: ["legacy"],
+      },
+    );
+    expect(chain).toEqual([{ instanceId: "legacy", model: "legacy-model" }]);
+  });
+
   it("treats a MiniMax candidate as eligible when its chat model is uncapped, regardless of an unrelated video-pool exhaustion", () => {
     // server/harness/registry.ts maps MiniMax's "general" (chat) pool onto
     // every catalog model id and keeps other pools ("video", …) out of

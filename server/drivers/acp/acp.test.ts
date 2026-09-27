@@ -937,13 +937,14 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
-  it("interrupt settles a hung turn as cancelled", async () => {
+  it("interrupt settles a hung turn interrupted, not as a success and not a crash", async () => {
     await create(GrokAgentDriver, "hang");
     await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
     await instance.adapter.interruptTurn("t-int");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ type: "turn.completed" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it("an exit before result becomes runtime.error + failed turn", async () => {
@@ -1386,7 +1387,7 @@ describe("ACP snapshot", () => {
       expect(instance.adapter.hasSession("version-race")).toBe(false);
       expect(existsSync(rpcDump)).toBe(false);
       expect(recorder.events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "turn.completed", ok: true, stopReason: "cancelled" }),
+        expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "interrupted" }),
       ]));
     } finally {
       recorder.stop();
