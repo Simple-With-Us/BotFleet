@@ -1,5 +1,6 @@
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { acceptComposerTranscript } from "@/lib/composer-dictation";
 import { pickSTTProvider } from "@/lib/transcription-provider";
 import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
@@ -393,6 +394,7 @@ export function Composer({
   useEffect(() => {
     if (!recording || onCall) return;
     let detached = false;
+    let finalizing = false;
     let offTranscript: () => void = () => {};
     let offEnd: () => void = () => {};
     const bridge = window.ogb;
@@ -404,7 +406,7 @@ export function Composer({
     let session: STTSession | null = sttSessionRef.current;
 
     const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
-      if (!detached && !currentCall() && typeof line.text === "string") {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && typeof line.text === "string") {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
@@ -480,6 +482,7 @@ export function Composer({
       // A call takes the microphone, so drop the composer listener at once
       // and close its cloud socket without a final hidden draft update.
       const callStarted = Boolean(currentCall());
+      finalizing = !callStarted && session?.provider === "assemblyai";
       if (callStarted) {
         offTranscript();
         offEnd();
@@ -492,6 +495,7 @@ export function Composer({
         } catch {
           // A provider can close during navigation; still detach listeners.
         } finally {
+          finalizing = false;
           offTranscript();
           offEnd();
           if (session?.provider === "apple") disposeAppleSTTSession(session);
