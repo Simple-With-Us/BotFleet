@@ -510,3 +510,111 @@ describe("GrokDriver round deadlines (fake timers)", () => {
     }
   }, 20_000);
 });
+
+// The xAI driver used to ship three hardcoded rows as its only catalog, so a
+// newly released Grok could not reach the picker without a BotFleet release.
+describe("GrokDriver live model catalog", () => {
+  let previousFetch: typeof globalThis.fetch;
+  let requestedUrls: string[];
+
+  const create = () =>
+    GrokDriver.create({
+      instanceId: "grok-catalog",
+      displayName: "Grok Catalog",
+      environment: { XAI_API_KEY: "xai-fake" },
+      enabled: true,
+      config: { url: "https://fake.xai.invalid/v1", apiKeyEnv: "XAI_API_KEY" },
+    });
+
+  const serve = (body: unknown, status = 200) => {
+    globalThis.fetch = (async (input) => {
+      requestedUrls.push(String(input));
+      return new Response(JSON.stringify(body), { status });
+    }) as typeof globalThis.fetch;
+  };
+
+  beforeEach(() => {
+    previousFetch = globalThis.fetch;
+    requestedUrls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  it("adopts the ids xAI lists, including one the static catalog never had", async () => {
+    serve({ data: [{ id: "grok-4.7" }, { id: "grok-5" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.map((option) => option.id)).toEqual(["grok-4.7", "grok-5"]);
+  });
+
+  it("asks xAI for the list rather than trusting the built-in rows", async () => {
+    serve({ data: [] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(requestedUrls).toContain("https://fake.xai.invalid/v1/models");
+  });
+
+  it("keeps the hand-written label for a model it already knows", async () => {
+    serve({ data: [{ id: "grok-4.7" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options[0].label).toBe("Grok 4.7");
+  });
+
+  it("keeps the current default across a refresh", async () => {
+    serve({ data: [{ id: "grok-5" }, { id: "grok-4.7" }] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("keeps the static catalog when xAI answers with an error", async () => {
+    serve({ error: "nope" }, 503);
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.map((option) => option.id)).toEqual([
+      "grok-4.7",
+      "grok-4.6",
+      "grok-4.5",
+    ]);
+  });
+
+  it("keeps the static catalog when xAI answers 200 with an empty list", async () => {
+    serve({ data: [] });
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.options.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the static catalog when the network fails outright", async () => {
+    globalThis.fetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof globalThis.fetch;
+    const instance = await create();
+    await instance.refreshModels?.();
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("does not call xAI at all without a key", async () => {
+    serve({ data: [{ id: "grok-5" }] });
+    const instance = await GrokDriver.create({
+      instanceId: "grok-no-key",
+      displayName: "Grok No Key",
+      environment: {},
+      enabled: true,
+      config: { url: "https://fake.xai.invalid/v1", apiKeyEnv: "XAI_API_KEY_MISSING" },
+    });
+    await instance.refreshModels?.();
+    expect(requestedUrls).toEqual([]);
+    expect(instance.models.default).toBe("grok-4.7");
+  });
+
+  it("collapses a burst of refreshes into one request", async () => {
+    serve({ data: [{ id: "grok-4.7" }] });
+    const instance = await create();
+    await Promise.all([instance.refreshModels?.(), instance.refreshModels?.(), instance.refreshModels?.()]);
+    expect(requestedUrls.filter((url) => url.endsWith("/models"))).toHaveLength(1);
+  });
+});
