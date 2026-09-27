@@ -65,9 +65,9 @@ export const DEFAULT_COMPUTER_PROVIDERS: ComputerProviders = {
 };
 
 /** Default VPS mode whenever `selfHostedVps` is on.  Both modes are
- * implemented: shared gives every bot one container, per-bot gives each
- * bot its own container and durable workspace.  Shared mutual exclusion
- * is enforced by `ExactTurnLeases` keyed by target rather than bot id. */
+ * implemented: shared gives every bot one container with per-bot isolated
+ * desktops, per-bot gives each bot its own container and durable workspace.
+ * Shared turn leases are keyed per bot while lifecycle stays on one container. */
 export const DEFAULT_VPS_MODE: VpsMode = "per-bot";
 
 /** All four keys as a stable iteration order so tests and UI code do not

@@ -9,6 +9,7 @@ import {
   BASE_IMAGE,
   CUA_DRIVER_VERSION,
   CUA_SOCKET,
+  DISPLAY,
   IMAGE as CUA_IMAGE,
   cuaExecArgs,
   dockerSecurityIsHardened,
@@ -23,6 +24,15 @@ import {
   IMAGE_LAYER_VERSION,
   MANAGED_LABEL,
 } from "./container-computer.ts";
+import {
+  ensureSharedVpsSessionExecArgs,
+  isSharedVpsMode,
+  vpsDriverDisplay,
+  vpsDriverSocket,
+  vpsOccupancyKey,
+  vpsScreenshotPath,
+  vpsSharedBotSession,
+} from "./vps-shared-session.ts";
 import type { ComputerReach } from "./computer-capability.ts";
 import {
   VPS_DEFAULT_CPUS,
@@ -137,7 +147,6 @@ const CONTAINER_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]+$/;
 const CONTAINER_ID = /^[a-f0-9]{12,64}$/i;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/i;
 const PIDS_LIMIT = 512;
-const SCREENSHOT_PATH = "/tmp/botfleet-vps-preview.png";
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
@@ -299,8 +308,7 @@ function stopDesktopTunnel(key: string): boolean {
 /** Close the VPS desktop tunnel for a bot.  Requires cfg to resolve
  *  the target in shared vs per-bot mode. */
 export function closeVpsDesktopTunnel(cfg: AppConfig, botId: string) {
-  const target = vpsTargetFor(cfg, botId);
-  return { closed: stopDesktopTunnel(target.key) };
+  return { closed: stopDesktopTunnel(vpsOccupancyKey(cfg, botId)) };
 }
 
 /** Close a VPS desktop tunnel by target key directly — used by
@@ -513,6 +521,22 @@ function statusProblem(status: VpsComputerStatus): string | null {
  * image inspect right below already proves the daemon answers — even its
  * "No such image" failure is a daemon reply. Anything that is neither JSON
  * nor a "no such object" reply is attributed to the transport instead. */
+async function ensureSharedVpsBotSession(
+  cfg: AppConfig,
+  botId: string,
+  containerRef: string,
+  runner: VpsCommandRunner,
+): Promise<void> {
+  if (!isSharedVpsMode(cfg)) return;
+  const alias = vpsSshAlias(cfg);
+  if (!alias) return;
+  const session = vpsSharedBotSession(botId);
+  await runner(
+    vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)),
+    { timeoutMs: 90_000 },
+  );
+}
+
 async function computeVpsComputerStatus(
   cfg: AppConfig,
   botId: string,
@@ -921,7 +945,10 @@ export async function vpsComputerAction(
       // A real lifecycle change invalidates the remote endpoint. Provision
       // is also the turn-start idempotency path, so leave an already-running
       // viewer alone when no start/replacement will occur.
-      if (action !== "provision" || before.container !== "running") stopDesktopTunnel(target.key);
+      if (action !== "provision" || before.container !== "running") {
+        if (isSharedVpsMode(cfg)) closeAllVpsDesktopTunnels();
+        else stopDesktopTunnel(vpsOccupancyKey(cfg, botId));
+      }
       const run = (args: string[], timeoutMs = 2 * 60_000) => runner(vpsDockerArgs(alias, args), { timeoutMs });
 
       const containerRef = before.container_id ?? before.container_name;
@@ -964,7 +991,12 @@ export async function vpsComputerAction(
         assertUsableContainer(before);
         await run(["stop", containerRef]);
       }
-      return action === "stop" ? computeVpsComputerStatus(cfg, botId, runner) : waitForVpsReady(cfg, botId, runner);
+      const after =
+        action === "stop" ? await computeVpsComputerStatus(cfg, botId, runner) : await waitForVpsReady(cfg, botId, runner);
+      if (after.ready && after.container_id) {
+        await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
+      }
+      return after;
     } finally {
       statusCache.delete(key);
     }
@@ -993,9 +1025,14 @@ export async function inspectVpsForAuto(
   runner: VpsCommandRunner = defaultRunner,
 ): Promise<VpsComputerStatus> {
   const key = vpsLockKey(cfg, botId);
-  return key
-    ? withVpsLifecycleLock(key, () => computeVpsComputerStatus(cfg, botId, runner))
-    : computeVpsComputerStatus(cfg, botId, runner);
+  const inspect = async () => {
+    const status = await computeVpsComputerStatus(cfg, botId, runner);
+    if (status.ready && status.container_id) {
+      await ensureSharedVpsBotSession(cfg, botId, status.container_id ?? status.container_name, runner);
+    }
+    return status;
+  };
+  return key ? withVpsLifecycleLock(key, inspect) : inspect();
 }
 
 /** Open a temporary noVNC connection through the configured SSH alias. The
@@ -1009,13 +1046,13 @@ export async function vpsComputerJoin(
 ): Promise<{ joinUrl: string; state: "running" }> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
-  const target = vpsTargetFor(cfg, botId);
+  const tunnelKey = vpsOccupancyKey(cfg, botId);
 
-  const existing = desktopTunnels.get(target.key);
+  const existing = desktopTunnels.get(tunnelKey);
   if (existing && existing.child.exitCode === null && !existing.child.killed) {
     return { joinUrl: existing.joinUrl, state: "running" };
   }
-  stopDesktopTunnel(target.key);
+  stopDesktopTunnel(tunnelKey);
 
   // Always re-inspect here. A cached IP or password from before a container
   // replacement is exactly the sort of secret-bearing stale state a viewer
@@ -1049,10 +1086,10 @@ export async function vpsComputerJoin(
     failure = error.message;
   });
   child.once("close", (code) => {
-    const active = desktopTunnels.get(target.key);
+    const active = desktopTunnels.get(tunnelKey);
     if (active?.child === child) {
       clearTimeout(active.expiry);
-      desktopTunnels.delete(target.key);
+      desktopTunnels.delete(tunnelKey);
     }
     if (!failure) failure = stderr.trim() || `SSH viewer tunnel exited ${code ?? "without a status"}`;
   });
@@ -1071,19 +1108,26 @@ export async function vpsComputerJoin(
   const joinUrl = `http://127.0.0.1:${localPort}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
   // Viewer-close is the normal cleanup. This unref'd ceiling is a backstop
   // for a renderer crash or an old browser client that cannot signal close.
-  const expiry = setTimeout(() => stopDesktopTunnel(target.key), 8 * 60 * 60_000);
+  const expiry = setTimeout(() => stopDesktopTunnel(tunnelKey), 8 * 60 * 60_000);
   expiry.unref?.();
-  desktopTunnels.set(target.key, { child, joinUrl, expiry });
+  desktopTunnels.set(tunnelKey, { child, joinUrl, expiry });
   return { joinUrl, state: "running" };
 }
 
-export function vpsContainerMcpArgs(alias: string, containerName: string): string[] {
+export function vpsContainerMcpArgs(
+  alias: string,
+  containerName: string,
+  socket: string = CUA_SOCKET,
+  display: string = DISPLAY,
+): string[] {
   if (!isValidSshAlias(alias) || (!CONTAINER_NAME.test(containerName) && !CONTAINER_ID.test(containerName))) {
     throw new Error("invalid VPS MCP connection");
   }
+  if (!socket.startsWith("/run/user/1000/")) throw new Error("invalid VPS MCP socket");
+  if (!/^:\d+$/.test(display)) throw new Error("invalid VPS MCP display");
   return vpsDockerArgs(
     alias,
-    cuaExecArgs(["mcp", "--socket", CUA_SOCKET], { container: containerName, interactive: true }),
+    cuaExecArgs(["mcp", "--socket", socket], { container: containerName, interactive: true, display }),
   );
 }
 
@@ -1095,12 +1139,22 @@ export function vpsComputerMcp(cfg: AppConfig, botId: string, containerRef?: str
   const alias = vpsSshAlias(cfg);
   if (!alias) throw new Error("VPS is not configured — add an SSH config alias first");
   const target = vpsTargetFor(cfg, botId);
+  const socket = vpsDriverSocket(cfg, botId);
+  const display = vpsDriverDisplay(cfg, botId);
   return {
     command: process.execPath,
-    args: [SPAWNED_PROXIES.vpsContainerMcp, alias, containerRef ?? target.containerName],
+    args: [
+      SPAWNED_PROXIES.vpsContainerMcp,
+      alias,
+      containerRef ?? target.containerName,
+      socket,
+      display,
+    ],
     env: { ELECTRON_RUN_AS_NODE: "1" },
   };
 }
+
+export { vpsOccupancyKey } from "./vps-shared-session.ts";
 
 /** Why this engine cannot take a self-hosted VPS, in the words a person
  *  reads.  The RULE lives in `computer-capability.ts` — this function owns
@@ -1144,13 +1198,17 @@ export async function vpsComputerScreenshot(
     if (!CONTAINER_ID.test(containerRef) && !CONTAINER_NAME.test(containerRef)) {
       throw Object.assign(new Error("the VPS container reference is malformed"), { status: 409 });
     }
+    await ensureSharedVpsBotSession(cfg, botId, containerRef, runner);
+    const socket = vpsDriverSocket(cfg, botId);
+    const screenshotPath = vpsScreenshotPath(cfg, botId);
+    const display = vpsDriverDisplay(cfg, botId);
     try {
       await runner(
         vpsDockerArgs(
           alias,
           cuaExecArgs(
-            ["call", "get_desktop_state", "{}", "--socket", CUA_SOCKET, "--screenshot-out-file", SCREENSHOT_PATH],
-            { container: containerRef },
+            ["call", "get_desktop_state", "{}", "--socket", socket, "--screenshot-out-file", screenshotPath],
+            { container: containerRef, display },
           ),
         ),
         { timeoutMs: 30_000 },
@@ -1164,7 +1222,7 @@ export async function vpsComputerScreenshot(
         containerRef,
         "base64",
         "-w0",
-        SCREENSHOT_PATH,
+        screenshotPath,
       ]), { timeoutMs: 30_000 })).stdout.trim();
       const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
       if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
@@ -1175,7 +1233,7 @@ export async function vpsComputerScreenshot(
       if (cacheable) statusCache.delete(key);
       throw error;
     } finally {
-      await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", SCREENSHOT_PATH]), {
+      await runner(vpsDockerArgs(alias, ["exec", "-u", "cua", containerRef, "rm", "-f", screenshotPath]), {
         timeoutMs: 10_000,
       }).catch(() => {});
     }

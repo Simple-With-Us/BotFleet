@@ -2222,15 +2222,11 @@ function turnComputerDeps(
     box,
     vpsLeases: {
       claim(claimBotId: string, claimThreadId: string, dispatchId: number) {
-        const target = vps.vpsTargetFor(cfg, claimBotId);
-        const lease = activeVpsThreads.claim(claimBotId, claimThreadId, dispatchId, target.key);
+        const occupancyKey = vps.vpsOccupancyKey(cfg, claimBotId);
+        const lease = activeVpsThreads.claim(claimBotId, claimThreadId, dispatchId, occupancyKey);
         if (!lease) {
           throw Object.assign(
-            new Error(
-              target.key === "shared"
-                ? "the shared VPS is already being used by another turn — wait for that turn to finish"
-                : "this bot's VPS is already being used by another turn — wait for that turn to finish",
-            ),
+            new Error("this bot's VPS is already being used by another turn — wait for that turn to finish"),
             { status: 409 },
           );
         }
@@ -12357,12 +12353,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 409, { error: "Auto may start this VPS only after Start VPS automatically is enabled" });
         }
         if (m[2] === "sleep" || m[2] === "remove") {
-          const target = vps.vpsTargetFor(cfg, botId);
-          if (bot.busy || activeVpsThreads.hasBot(botId) || activeVpsThreads.hasTarget(target.key)) {
+          const occupancyKey = vps.vpsOccupancyKey(cfg, botId);
+          if (bot.busy || activeVpsThreads.hasBot(botId) || activeVpsThreads.hasTarget(occupancyKey)) {
             return json(res, 409, {
-              error: target.key === "shared"
-                ? "the shared VPS is being used by a bot — interrupt that turn first"
-                : "the VPS computer is being used by this bot — interrupt the turn first",
+              error: "the VPS computer is being used by this bot — interrupt the turn first",
             });
           }
         }
