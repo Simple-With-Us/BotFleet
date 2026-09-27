@@ -596,6 +596,25 @@ final class DecodingTests: XCTestCase {
             from: Data(#"{"instanceId":"legacy","driverKind":"legacy","snapshot":{"state":"available"},"models":{"default":"default","options":[]}}"#.utf8)
         )
         XCTAssertNil(old.capabilities)
+        XCTAssertNotEqual(old.capabilities?.toolLoop, true)
+
+        let loop = try JSONDecoder().decode(
+            Instance.self,
+            from: Data(#"{"instanceId":"grok","driverKind":"grok","snapshot":{"state":"available"},"models":{"default":"grok","options":[]},"capabilities":{"toolLoop":true}}"#.utf8)
+        )
+        XCTAssertEqual(loop.capabilities?.toolLoop, true)
+
+        let capped = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b","threadId":"t","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1,"maxToolRounds":40}"#.utf8)
+        )
+        XCTAssertEqual(capped.maxToolRounds, 40)
+
+        let unset = try JSONDecoder().decode(
+            Bot.self,
+            from: Data(#"{"id":"b2","threadId":"t2","name":"N","title":"","description":"","notifications":true,"color":"blue","unread":false,"modelSelection":{"instanceId":"grok","model":"grok"},"createdAt":1}"#.utf8)
+        )
+        XCTAssertNil(unset.maxToolRounds)
     }
 
     // MARK: - Frames

@@ -1,3 +1,4 @@
+import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
@@ -7,7 +8,6 @@ import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
-import type { RoutineRunOn } from "./routines.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 
 export const RESOURCE_METRICS = [
@@ -83,7 +83,10 @@ const triggerInputSchema = z.object({
   name: z.string(),
   prompt: z.string(),
   botId: z.string(),
-  runOn: z.enum(["maus", "cloud"]).optional(),
+  runOn: z
+    .enum(["bot", "cloud", "maus"])
+    .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value))
+    .optional(),
   enabled: z.boolean().optional(),
   metric: z.enum(RESOURCE_METRICS),
   cmp: z.enum(["below", "above"]),
@@ -99,7 +102,9 @@ const storedSchema = z.object({
   name: z.string(),
   prompt: z.string(),
   botId: z.string(),
-  runOn: z.enum(["maus", "cloud"]),
+  runOn: z
+    .enum(["bot", "cloud", "maus"])
+    .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value)),
   enabled: z.boolean(),
   metric: z.enum(RESOURCE_METRICS),
   cmp: z.enum(["below", "above"]),
@@ -352,8 +357,12 @@ export class ResourceTriggerManager {
     mkdirSync(dirname(this.file), { recursive: true });
     if (existsSync(this.file)) {
       try {
-        const parsed = fileSchema.safeParse(parseJson(readFileSync(this.file, "utf8")));
-        if (parsed.success) this.triggers = parsed.data.triggers;
+        const rawText = readFileSync(this.file, "utf8");
+        const parsed = fileSchema.safeParse(parseJson(rawText));
+        if (parsed.success) {
+          this.triggers = parsed.data.triggers;
+          if (/"runOn"\s*:\s*"maus"/.test(rawText)) this.save();
+        }
       } catch {
         this.triggers = [];
       }
@@ -379,9 +388,9 @@ export class ResourceTriggerManager {
     const prompt = parsed.data.prompt.trim().slice(0, 20_000);
     const botId = parsed.data.botId.trim();
     if (!name) fail(400, "Give the trigger a name");
-    if (!botId) fail(400, "Choose a MAUS");
+    if (!botId) fail(400, "Choose a Bot");
     if (!prompt) fail(400, "Give the bot a prompt");
-    const runOn = parsed.data.runOn ?? "maus";
+    const runOn = normalizeRunOn(parsed.data.runOn);
     const cooldownMinutes = Math.max(5, Math.min(24 * 60, Math.round(parsed.data.cooldownMinutes ?? 45)));
     const sustainSamples = Math.max(1, Math.min(20, Math.round(parsed.data.sustainSamples ?? 3)));
     const now = this.now();

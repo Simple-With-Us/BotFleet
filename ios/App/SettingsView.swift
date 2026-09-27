@@ -638,10 +638,10 @@ private struct ComputerSettingsRow: View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(MausPalette.color("blue").opacity(0.14))
+                    .fill(BotPalette.color("blue").opacity(0.14))
                     .frame(width: 38, height: 38)
                 Image(systemName: "laptopcomputer")
-                    .foregroundStyle(MausPalette.color("blue"))
+                    .foregroundStyle(BotPalette.color("blue"))
             }
             .accessibilityHidden(true)
 
@@ -818,6 +818,8 @@ struct ConnectionSecurityView: View {
             return "BotFleet is trying the saved connection automatically."
         case let .offline(reason):
             return reason
+        case .macOffline:
+            return "Your Mac is not running BotFleet.  Open the app on your computer, then retry."
         case .unauthorized:
             return "This phone was removed from the computer. Pair it again to reconnect."
         case .unpaired:
@@ -840,6 +842,7 @@ private extension Session.Status {
         case .unpaired: return "Not paired"
         case .unauthorized: return "Needs pairing"
         case .offline: return "Offline"
+        case .macOffline: return "Mac offline"
         }
     }
 }

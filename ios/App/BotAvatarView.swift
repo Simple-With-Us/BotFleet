@@ -8,8 +8,8 @@ import CompanionCore
 struct BotAvatarView: View {
     let bot: Bot
     let size: CGFloat
-    var state: MausState = .idle
-    /// Opt-in, mirroring MausAvatar: an animated face is a 30fps canvas.
+    var state: BotState = .idle
+    /// Opt-in, mirroring BotMascot: an animated face is a 30fps canvas.
     var animated = false
     var comets = false
 
@@ -29,7 +29,7 @@ struct BotAvatarView: View {
                     .frame(width: size, height: size)
                     .clipShape(mask)
             } else {
-                MausAvatar(color: bot.color, size: size, state: state, animated: animated, comets: comets)
+                BotMascot(color: bot.color, size: size, state: state, animated: animated, comets: comets)
             }
         }
         .frame(width: size, height: size)
@@ -62,7 +62,7 @@ struct BotAvatarView: View {
 struct RoomAvatarView: View {
     let room: Room
     let size: CGFloat
-    var state: MausState = .idle
+    var state: BotState = .idle
     var animated = false
     var comets = false
 
@@ -89,7 +89,7 @@ struct RoomAvatarView: View {
                     .frame(width: size, height: size)
                     .clipShape(mask)
             } else {
-                MausAvatar(color: "blue", size: size, state: state, animated: animated, comets: comets)
+                BotMascot(color: "blue", size: size, state: state, animated: animated, comets: comets)
             }
         }
         .frame(width: size, height: size)
@@ -114,8 +114,8 @@ struct RoomAvatarView: View {
 struct ChatAvatarView: View {
     let chat: Chat
     let size: CGFloat
-    var state: MausState = .idle
-    /// Opt-in, mirroring MausAvatar: an animated face is a 30fps canvas.
+    var state: BotState = .idle
+    /// Opt-in, mirroring BotMascot: an animated face is a 30fps canvas.
     var animated = false
     var comets = false
 

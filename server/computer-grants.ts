@@ -351,7 +351,7 @@ export function resolveCloudBackend(
  * every cloud run made VPS routines die in vpsDriverError.  VPS keeps the
  * bot's own engine selection. */
 export function cloudRunUsesBoxAgent(
-  runOn: "maus" | "cloud" | undefined,
+  runOn: "bot" | "cloud" | undefined,
   botCloudBackend: "box" | "vps" | undefined,
   workspaceDefault?: "box" | "vps",
 ): boolean {
@@ -684,13 +684,20 @@ async function resolveMounts<Lease>(
       }
       if (autoCloud) autoVpsProblem = unsupported;
     } else {
-      vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
       let remote: RemoteComputerStatus | undefined;
       try {
+        // Claim inside the try so a shared-desktop contention (another bot
+        // already on the single VPS) degrades like a provision failure when
+        // this turn has a usable fallback, instead of aborting the whole turn.
+        vpsLease = deps.vpsLeases.claim(bot.id, threadId, dispatchId);
         remote = wantsCloudFiltered || bot.autoStartVps
           ? await deps.vps.vpsComputerAction("provision", cfg, bot.id)
           : await deps.vps.inspectVpsForAuto(cfg, bot.id);
       } catch (err) {
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
         if (shouldThrowOnCloudFailure) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         deps.notice(`VPS computer not mounted: ${msg}`, false);
@@ -712,8 +719,10 @@ async function resolveMounts<Lease>(
         });
         previewCapture = () => deps.vps.vpsComputerScreenshot(targetCfg, bot.id);
       } else {
-        deps.vpsLeases.release(vpsLease);
-        vpsLease = undefined;
+        if (vpsLease) {
+          deps.vpsLeases.release(vpsLease);
+          vpsLease = undefined;
+        }
         const problem = remote?.problem ?? autoVpsProblem ?? "the VPS computer could not be reached";
         if (shouldThrowOnCloudFailure) {
           throw new Error(remote?.problem ?? "the VPS computer could not be created or reached");

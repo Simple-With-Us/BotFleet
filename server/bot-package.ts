@@ -2,7 +2,7 @@ import { z } from "zod";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import { schemaIssue, type JsonValue } from "./schema.ts";
-import type { MausColor } from "./store.ts";
+import type { BotColor } from "./store.ts";
 import type { TeamManifestMember } from "./team-manifest.ts";
 import { validTimeZone } from "../shared/time-zone.ts";
 
@@ -21,7 +21,7 @@ const COLORS = [
   "yellow",
   "teal",
   "coral",
-] as const satisfies readonly MausColor[];
+] as const satisfies readonly BotColor[];
 
 const requiredText = (max: number) =>
   z.string({ error: "must be text" }).trim().min(1, { message: "is required" }).max(max, { message: "is too long" });
@@ -91,7 +91,9 @@ const packageSchema = z.object({
       name: requiredText(80),
       agent: key,
       prompt: requiredText(20_000),
-      runOn: z.enum(["maus", "cloud"]),
+      runOn: z
+        .enum(["bot", "cloud", "maus"])
+        .transform((value): "bot" | "cloud" => (value === "maus" ? "bot" : value)),
       schedule: z.discriminatedUnion("type", [
         z.object({ type: z.literal("once"), at: z.number().int() }),
         z.object({

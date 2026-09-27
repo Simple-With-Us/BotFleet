@@ -35,7 +35,10 @@ otherwise.
   database.
 - The app contains no advertising or product-analytics SDK, does not track
   users across other companies' apps or websites, and does not sell personal
-  data.
+  data.  This is a statement about BotFleetMobile (the iOS app) only; the
+  desktop app is a different product with a different data-handling
+  statement — see [Observability](observability.md) for what it bundles and
+  how to opt out.
 - The app includes the Sentry crash-reporting SDK.  When a build is cut with a
   Sentry DSN, the app sends crash reports, app-hang reports, a sample of
   performance traces, and failed-request diagnostics (HTTP 5xx responses and

@@ -112,6 +112,31 @@ const markToolRan = () => {
 if (process.env.FAKE_AGY_STDERR) writeSync(2, process.env.FAKE_AGY_STDERR);
 if (process.env.FAKE_AGY_DIE) process.exit(Number(process.env.FAKE_AGY_DIE));
 
+// Transient-failure script for the retry tests, the same shape
+// fake-claude-cli uses.  FAKE_AGY_TRANSIENTS is how many launches die with
+// 503-shaped stderr; the launch count lives in a state FILE because a child
+// cannot mutate its parent's environment.  Once the quota is spent the turn
+// runs normally, so one test asserts "failed twice, then answered once".
+// FAKE_AGY_PARTIAL_FAILS streams a step first and THEN dies, which the
+// replay-safety guard must refuse to retry.
+let agyFailAfterStep = false;
+if (process.env.FAKE_AGY_TRANSIENTS && process.env.FAKE_AGY_STATE) {
+  let launched = 0;
+  try {
+    launched = Number(readFileSync(process.env.FAKE_AGY_STATE, "utf8")) || 0;
+  } catch {}
+  const quota = Number(process.env.FAKE_AGY_TRANSIENTS) || 0;
+  writeFileSync(process.env.FAKE_AGY_STATE, String(launched + 1));
+  if (launched < quota) {
+    if (process.env.FAKE_AGY_PARTIAL_FAILS) {
+      agyFailAfterStep = true;
+    } else {
+      writeSync(2, "agy: HTTP 503 service temporarily unavailable\n");
+      process.exit(5);
+    }
+  }
+}
+
 // The prompt is the value that follows --print or -p on argv, or read from stdin.
 const printIdx = argv.indexOf("--print") !== -1 ? argv.indexOf("--print") : argv.indexOf("-p");
 let prompt = printIdx !== -1 && argv[printIdx + 1] && !argv[printIdx + 1].startsWith("-") ? argv[printIdx + 1] : undefined;
@@ -160,11 +185,34 @@ if (process.env.FAKE_AGY_RESULT_ERROR) {
 
 out({ event: "init", conversation_id: CONV, init: { cwd: process.cwd(), tools: ["run_command", "write_to_file"], ...initPolicy } });
 await holdAfterInit();
+if (agyFailAfterStep) {
+  // A tool step the person has already seen, and only then the transport
+  // failure: the driver must NOT relaunch this one.
+  markToolRan();
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 0, state: "ACTIVE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
+  flush();
+  writeSync(2, "agy: HTTP 503 service temporarily unavailable\n");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  process.exit(5);
+}
 markToolRan();
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 0, state: "ACTIVE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
+// FAKE_AGY_TOOL_HOLD_MS: the tool step stays ACTIVE and the stream goes
+// completely silent for this long — a build or test run that prints nothing
+// — before it reports DONE.  A hold longer than the driver's tool window is
+// a wedged tool, which the driver must stop as a stall.
+const toolHoldMs = Number(process.env.FAKE_AGY_TOOL_HOLD_MS ?? 0);
+if (Number.isFinite(toolHoldMs) && toolHoldMs > 0) {
+  flush();
+  await new Promise((resolve) => setTimeout(resolve, toolHoldMs));
+}
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 0, state: "DONE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
 out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 1, state: "DONE", step_type: "agent_response", usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 0, cache_read_tokens: 5, total_tokens: 125 } } });
 out({ event: "result", conversation_id: CONV, result: { conversation_id: CONV, status: "SUCCESS", response: "done from fake agy", duration_seconds: 1, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 0, cache_read_tokens: 5, total_tokens: 125 } } });
+if (process.env.FAKE_AGY_TRAILING_AFTER_RESULT === "1") {
+  // Same buffered stdout chunk as `result`: no timer or process-exit race.
+  out({ event: "step_update", conversation_id: CONV, step_update: { conversation_id: CONV, step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "write_to_file", tool_info: { name: "write_to_file", parameters: {} } } });
+}
 flush();
 const postResultDelayMs = Number(process.env.FAKE_AGY_POST_RESULT_DELAY_MS ?? 0);
 if (Number.isFinite(postResultDelayMs) && postResultDelayMs > 0) {

@@ -1,10 +1,11 @@
-// VPS mode control: per-bot (each bot that has the VPS in its grant gets
-// its own private container + durable workspace) and "not used" (the
-// operator has decided not to enable the VPS provider, so the mode is
-// moot).  Shared is hidden until it has a runtime; see OPTIONS.  The button row is the same visual idiom as the legacy VM-mode
-// picker in `LocalComputerSection.tsx` so the settings panel keeps a
-// consistent look.  Behavior lives in the parent: the parent computes
-// the next value, calls `onChange`, and re-reads `state.config` for the
+// VPS mode control: shared (one container for the whole workspace),
+// per-bot (each bot that has the VPS in its grant gets its own private
+// container + durable workspace), and "not used" (the operator has
+// decided not to enable the VPS provider, so the mode is moot).  The
+// button row is the same visual idiom as the legacy VM-mode picker in
+// `LocalComputerSection.tsx` so the settings panel keeps a consistent
+// look.  Behavior lives in the parent: the parent computes the next
+// value, calls `onChange`, and re-reads `state.config` for the
 // confirmation message — this component does not own the dispatch.
 import { cn } from "@/lib/cn";
 import type { VpsMode } from "../../shared/local-auto-consent";
@@ -15,26 +16,19 @@ export type VpsModeToggleProps = {
   onChange: (next: VpsMode) => void;
 };
 
-// "Shared" (one container for the whole workspace) is deliberately not
-// offered: the VPS runtime (`server/vps-computer.ts`) derives one container,
-// workspace and lease per bot id and never reads `vpsMode`, so a Shared
-// button would persist a choice with no effect.  The value stays in the
-// type and the config schema so a stored "shared" still loads; it renders
-// as Per-Bot, which is what actually runs.  Add the option back here once
-// the shared runtime exists.
 const OPTIONS: ReadonlyArray<{ value: VpsMode; label: string; aria: string }> = [
+  { value: "shared", label: "Shared", aria: "Shared VPS — one container for every bot" },
   { value: "per-bot", label: "Per-Bot", aria: "Per-bot VPS — one container and workspace each" },
   { value: null, label: "Not Used", aria: "VPS off" },
 ];
 
 const CAPTION: Record<"shared" | "per-bot", string> = {
-  shared: "Shared VPS is a single bot-net across all bots — every bot that has the VPS in its grant lands on the same container.",
+  shared: "Shared VPS is one container for every bot — each bot gets its own isolated desktop session inside it.\u00a0 Several bots can use it at the same time.",
   "per-bot": "Per-bot VPS gives each bot a private container, durable workspace, and loopback viewer.\u00a0 Idle desktops stop on their own after 8 hours.",
 };
 
 export function VpsModeToggle({ value: stored, busy, onChange }: VpsModeToggleProps) {
-  // See OPTIONS: a stored "shared" runs per-bot, so show it as such.
-  const value: VpsMode = stored === "shared" ? "per-bot" : stored;
+  const value: VpsMode = stored;
   return (
     <div className="flex flex-col gap-1.5" data-testid="vps-mode-toggle">
       <div className="flex overflow-hidden rounded-lg border border-hairline/40">

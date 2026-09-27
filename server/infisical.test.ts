@@ -652,6 +652,73 @@ describe("bootLine", () => {
   });
 });
 
+// OP11: bootLine() used to print at boot and again on every Settings PATCH
+// that carried an `infisical` block, even one that changed nothing.
+describe("bootLineIfChanged", () => {
+  it("returns the line the first time, then null while nothing changes", () => {
+    withSettings({ projectId: "", clientId: "", clientSecret: "" });
+    expect(infisical.bootLineIfChanged()).toBe(
+      "[infisical] disabled: not configured (add a machine identity in Settings > Secrets)",
+    );
+    expect(infisical.bootLineIfChanged()).toBeNull();
+    expect(infisical.bootLineIfChanged()).toBeNull();
+  });
+
+  it("returns a fresh line the moment the state actually changes", () => {
+    withSettings({ projectId: "", clientId: "", clientSecret: "" });
+    expect(infisical.bootLineIfChanged()).not.toBeNull();
+
+    withSettings({ enabled: false });
+    expect(infisical.bootLineIfChanged()).toBe("[infisical] disabled by settings");
+    expect(infisical.bootLineIfChanged()).toBeNull();
+  });
+
+  it("ignores a changed sync duration alone", async () => {
+    vi.useFakeTimers();
+    try {
+      withSettings({});
+      let advanceMsPerCall = 5;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          vi.advanceTimersByTime(advanceMsPerCall);
+          if (url.includes("/login")) {
+            return new Response(JSON.stringify({ accessToken: SENTINEL_TOKEN }), { status: 200 });
+          }
+          return new Response(
+            JSON.stringify({ secrets: [{ secretKey: "COMPOSIO_API_KEY", secretValue: SENTINEL_VAULT_VALUE }] }),
+            { status: 200 },
+          );
+        }),
+      );
+
+      await infisical.refresh("manual");
+      expect(infisical.bootLineIfChanged()).toMatch(/ms=10$/); // login + list, 5ms each
+
+      // A later Settings PATCH re-syncs (server/index.ts calls refresh()
+      // before printing) and stamps a NEW lastSyncMs even though nothing
+      // configuration-shaped moved — a much slower round trip this time.
+      advanceMsPerCall = 50;
+      await infisical.refresh("settings");
+      expect(infisical.bootLine()).toMatch(/ms=100$/); // the raw line did change...
+      expect(infisical.bootLineIfChanged()).toBeNull(); // ...but the deduped one ignores timing alone
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts over when a new settings provider is installed", () => {
+    withSettings({ projectId: "", clientId: "", clientSecret: "" });
+    expect(infisical.bootLineIfChanged()).not.toBeNull();
+    expect(infisical.bootLineIfChanged()).toBeNull();
+
+    // Same effective state, but reconfigured — as boot does once and a
+    // fresh test case's beforeEach effectively does too.
+    withSettings({ projectId: "", clientId: "", clientSecret: "" });
+    expect(infisical.bootLineIfChanged()).not.toBeNull();
+  });
+});
+
 describe("no secret ever leaves this module", () => {
   it("keeps the client secret, bearer token and vault value out of the status view and the boot line", async () => {
     withSettings({});

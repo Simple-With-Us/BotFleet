@@ -64,11 +64,10 @@ export const DEFAULT_COMPUTER_PROVIDERS: ComputerProviders = {
   localMac: true,
 };
 
-/** Default VPS mode whenever `selfHostedVps` is on.  Per-bot is the only
- * mode the VPS runtime implements (`server/vps-computer.ts` derives one
- * container and lease per bot id); "shared" is accepted on disk for
- * forward compatibility but is not offered in the UI until it has a
- * runtime. */
+/** Default VPS mode whenever `selfHostedVps` is on.  Both modes are
+ * implemented: shared gives every bot one container with per-bot isolated
+ * desktops, per-bot gives each bot its own container and durable workspace.
+ * Shared turn leases are keyed per bot while lifecycle stays on one container. */
 export const DEFAULT_VPS_MODE: VpsMode = "per-bot";
 
 /** All four keys as a stable iteration order so tests and UI code do not

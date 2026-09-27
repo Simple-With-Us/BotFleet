@@ -160,8 +160,10 @@ describe("tasks", () => {
     // simulate a record saved before tasks existed
     const legacy = store.bot(bot.id)!;
     delete (legacy as { tasks?: unknown }).tasks;
-    // patchBot persists, so what lands on disk is the pre-tasks shape
+    // patchBot marks the roster dirty and the shutdown flush writes it, so
+    // what lands on disk is the pre-tasks shape
     store.patchBot(bot.id, { resumeCursors: { claude: "old-session" } });
+    store.flushBotsNow();
 
     const { Store } = await import("./store.ts");
     const reloaded = new Store(() => ({ instanceId: "claude", model: "m" }));

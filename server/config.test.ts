@@ -36,6 +36,9 @@ import {
   observabilitySettings,
   sentryDsnConfigured,
   DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+  DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
   MAX_OBSERVABILITY_ENVIRONMENT_LENGTH,
   DEFAULT_INFISICAL_ENVIRONMENT,
   DEFAULT_INFISICAL_REFRESH_MINUTES,
@@ -1197,6 +1200,9 @@ describe("observability settings", () => {
       enabled: true,
       environment: "production",
       tracesSampleRate: DEFAULT_SENTRY_TRACES_SAMPLE_RATE,
+      aiTracesSampleRate: DEFAULT_SENTRY_AI_TRACES_SAMPLE_RATE,
+      httpTracesSampleRate: DEFAULT_SENTRY_HTTP_TRACES_SAMPLE_RATE,
+      uiTracesSampleRate: DEFAULT_SENTRY_UI_TRACES_SAMPLE_RATE,
       logsEnabled: true,
     });
   });
@@ -1204,14 +1210,40 @@ describe("observability settings", () => {
   it("prefers a saved value over the long-standing env names", () => {
     process.env.SENTRY_ENV = "from-env";
     process.env.SENTRY_TRACES_SAMPLE_RATE = "0.9";
-    expect(observabilitySettings({})).toMatchObject({ environment: "from-env", tracesSampleRate: 0.9 });
+    process.env.SENTRY_AI_TRACES_SAMPLE_RATE = "0.75";
+    process.env.SENTRY_HTTP_TRACES_SAMPLE_RATE = "0.05";
+    process.env.SENTRY_UI_TRACES_SAMPLE_RATE = "0.02";
+    expect(observabilitySettings({})).toMatchObject({
+      environment: "from-env",
+      tracesSampleRate: 0.9,
+      aiTracesSampleRate: 0.75,
+      httpTracesSampleRate: 0.05,
+      uiTracesSampleRate: 0.02,
+    });
     expect(
-      observabilitySettings({ observability: { environment: "operator", tracesSampleRate: 0.05 } }),
-    ).toMatchObject({ environment: "operator", tracesSampleRate: 0.05 });
+      observabilitySettings({
+        observability: {
+          environment: "operator",
+          tracesSampleRate: 0.05,
+          aiTracesSampleRate: 1.0,
+          httpTracesSampleRate: 0.2,
+          uiTracesSampleRate: 0.15,
+        },
+      }),
+    ).toMatchObject({
+      environment: "operator",
+      tracesSampleRate: 0.05,
+      aiTracesSampleRate: 1.0,
+      httpTracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.15,
+    });
   });
 
   it("keeps an explicit zero sample rate instead of defaulting it away", () => {
     expect(observabilitySettings({ observability: { tracesSampleRate: 0 } }).tracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { aiTracesSampleRate: 0 } }).aiTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { httpTracesSampleRate: 0 } }).httpTracesSampleRate).toBe(0);
+    expect(observabilitySettings({ observability: { uiTracesSampleRate: 0 } }).uiTracesSampleRate).toBe(0);
     expect(observabilitySettings({ observability: { logsEnabled: false } }).logsEnabled).toBe(false);
   });
 });

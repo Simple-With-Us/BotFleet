@@ -48,6 +48,31 @@ describe("desktop Settings Models layout", () => {
   });
 });
 
+describe("Maximum Tool Rounds", () => {
+  it("shows a capped desktop control only for a toolLoop engine", () => {
+    const panel = source("src/components/SettingsPanel.tsx");
+    expect(panel).toContain("Maximum Tool Rounds");
+    expect(panel).toContain("Per turn.  Empty uses 12.  Cap is 200.");
+    expect(panel).toContain("engine?.capabilities?.toolLoop === true");
+    expect(panel).toContain("MAX_TOOL_ROUNDS");
+    expect(panel).toContain('from "../../shared/bot-profile"');
+    expect(panel).toContain("onChange(null)");
+    expect(panel).toContain('| "maxToolRounds"');
+  });
+
+  it("shows the same capped control on iOS only when the engine reports toolLoop", () => {
+    const profile = source("ios/App/AgentProfileView.swift");
+    const models = source("ios/Sources/CompanionCore/Models.swift");
+    expect(profile).toContain("Maximum Tool Rounds");
+    expect(profile).toContain("Per turn.  Empty uses 12.  Cap is 200.");
+    expect(profile).toContain("capabilities?.toolLoop == true");
+    expect(profile).toContain("maximumToolRoundsCap = 200");
+    expect(profile).toContain("return .clear");
+    expect(models).toContain("var toolLoop: Bool?");
+    expect(models).toContain("var maxToolRounds: Int?");
+  });
+});
+
 describe("iOS Models settings layout", () => {
   const profile = source("ios/App/AgentProfileView.swift");
 

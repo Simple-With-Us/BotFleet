@@ -12,7 +12,12 @@ struct TaskManagerView: View {
     @State private var title = ""
 
     private var current: Bot { session.state.bot(bot.id) ?? bot }
-    private var tasks: [BotTask] { current.tasks ?? [] }
+    /// A snoozed thread SINKS rather than disappearing, and the one the
+    /// person has open stays where it is — snoozing the conversation you are
+    /// reading must not move it out from under the tap that snoozed it.
+    private var tasks: [BotTask] {
+        ThreadSnooze.ordered(current.tasks ?? [], keepInPlace: [current.threadId])
+    }
 
     var body: some View {
         NavigationStack {
@@ -42,9 +47,19 @@ struct TaskManagerView: View {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(task.title.isEmpty ? "Untitled task" : task.title)
                                     .foregroundStyle(Color.primary)
-                                Text(RelativeStamp.list(task.createdAt))
-                                    .font(.caption)
-                                    .foregroundStyle(Color.secondary)
+                                    .opacity(task.isSnoozed() ? 0.6 : 1)
+                                // The badge replaces the stamp while a thread
+                                // sleeps: when it wakes is the more useful
+                                // fact than when it started.
+                                if let snoozed = task.snoozeLabel() {
+                                    Label(snoozed, systemImage: "moon.zzz")
+                                        .font(.caption)
+                                        .foregroundStyle(Color.secondary)
+                                } else {
+                                    Text(RelativeStamp.list(task.createdAt))
+                                        .font(.caption)
+                                        .foregroundStyle(Color.secondary)
+                                }
                             }
                             Spacer()
                             if task.threadId == current.threadId {
@@ -56,6 +71,22 @@ struct TaskManagerView: View {
                         Button("Rename", systemImage: "pencil") {
                             title = task.title
                             taskToRename = task
+                        }
+                        // Sentence case: these are values in a menu, not
+                        // headings.  Resolved on the TAP rather than when the
+                        // menu was built, so a sheet left open overnight does
+                        // not snooze until a morning already gone.
+                        Menu {
+                            Button("For 1 hour") { snooze(task, until: ThreadSnoozePreset.hour()) }
+                            Button("Until tomorrow morning") {
+                                snooze(task, until: ThreadSnoozePreset.tomorrowMorning())
+                            }
+                            Button("Until activity") { snooze(task, until: threadSnoozeUntilActivity) }
+                        } label: {
+                            Label("Snooze", systemImage: "moon.zzz")
+                        }
+                        if task.isSnoozed() {
+                            Button("Stop snoozing", systemImage: "bell") { snooze(task, until: nil) }
                         }
                     }
                     .swipeActions(edge: .trailing) {
@@ -102,5 +133,12 @@ struct TaskManagerView: View {
                 taskToRename = nil
             }
         }
+    }
+
+    /// Snooze one thread, or wake it with nil.  Only a bot thread can sleep:
+    /// the bot-wide snooze is a wider thing and waking a thread never wakes
+    /// the bot, because the person who stopped a bot did not ask for it back.
+    private func snooze(_ task: BotTask, until snoozedUntil: Double?) {
+        Task { await session.snoozeTask(task, for: current, snoozedUntil: snoozedUntil) }
     }
 }

@@ -22,7 +22,13 @@ enum SentryTelemetry {
             options.attachViewHierarchy = false
             options.sendDefaultPii = false
             options.sessionReplay.sessionSampleRate = 0.1
-            options.sessionReplay.onErrorSampleRate = 1.0
+            // A Mac-offline window means Cloudflare answers every companion
+            // request with a 502/503/530-family status, and the old value
+            // (1.0) armed a full session-replay upload for every one of
+            // those — on top of the events `beforeSend` below already
+            // drops. 10% still catches a real crash without paying for a
+            // gateway-outage storm. See IO10.
+            options.sessionReplay.onErrorSampleRate = 0.1
             options.sessionReplay.maskAllText = true
             options.sessionReplay.maskAllImages = true
             options.beforeSend = { event in

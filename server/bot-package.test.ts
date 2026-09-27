@@ -82,7 +82,7 @@ describe("bot packages", () => {
       name: "Morning brief",
       agent: "lead",
       prompt: "Prepare the brief.",
-      runOn: "maus",
+      runOn: "bot",
       schedule: { type: "daily", time: "09:00", weekdays: [1, 2, 3, 4, 5], timeZone: "America/Chicago" },
       durationMinutes: 30,
       enabledAfterInstall: false,

@@ -11,6 +11,7 @@ import {
   SkillRow,
   skillRowView,
   skillsEngineNote,
+  skillsNotIndexedNotice,
   skillsPanelPlaceholder,
   type SkillListingRow,
 } from "./BotSkillsPanel";
@@ -144,5 +145,30 @@ describe("panel chrome", () => {
     expect(note).toContain("runs on the Computer engine");
     expect(note).toContain("Imported skills never reach it.");
     expect(note).toContain("  ");
+  });
+});
+
+describe("skillsNotIndexedNotice (Finding 2: the index cap no longer drops silently)", () => {
+  it("says nothing when every enabled skill made the index", () => {
+    expect(skillsNotIndexedNotice(undefined)).toBeNull();
+    expect(skillsNotIndexedNotice([])).toBeNull();
+  });
+
+  it("names the count and every left-out skill, singular and plural", () => {
+    const one = skillsNotIndexedNotice(["zeta-writer"]);
+    expect(one).toContain("1 enabled skill not indexed");
+    expect(one).toContain("zeta-writer");
+    expect(one).not.toContain("skills not indexed");
+
+    const many = skillsNotIndexedNotice(["zeta-writer", "zulu-reviewer"]);
+    expect(many).toContain("2 enabled skills not indexed");
+    expect(many).toContain("zeta-writer");
+    expect(many).toContain("zulu-reviewer");
+  });
+
+  it("separates sentences with a gap that survives HTML collapsing", () => {
+    for (const match of skillsNotIndexedNotice(["x"])!.matchAll(/[.;] +[A-Z]/g)) {
+      throw new Error(`plain space between sentences (will collapse): ${JSON.stringify(match[0])}`);
+    }
   });
 });

@@ -54,6 +54,7 @@ import {
 } from "./vps-computer.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { freePortBlock } from "./testing/ports.ts";
+import { harnessReady } from "./testing/harness-ready.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
@@ -636,7 +637,7 @@ posixOnly("room turns carry the same computers as a direct chat", () => {
     const deadline = Date.now() + 20_000;
     for (;;) {
       try {
-        if ((await fetch(`${base}/api/health`)).ok) break;
+        if (await harnessReady(base)) break;
       } catch {
         /* not up yet */
       }

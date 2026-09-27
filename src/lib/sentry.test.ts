@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   attachFeedbackEventDetails,
   buildFallbackIssueUrl,
+  captureException,
+  captureMessage,
   initSentry,
   initSentryFromRuntime,
   isSentryFeedbackAvailable,
@@ -13,11 +15,13 @@ import {
   resetSentryForTests,
   setActiveFeedbackDetailsForTests,
   setObservabilityReaderForTests,
+  setSentryModuleLoaderForTests,
   setSentryPortForTests,
   type ObservabilityReader,
   type RuntimeObservability,
   type SentryBrowserPort,
   type SentryClientOptions,
+  type SentryModule,
 } from "./sentry";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -106,7 +110,7 @@ describe("browser Sentry", () => {
     const swift = readFileSync(join(ROOT, "ios/App/SentryTelemetry.swift"), "utf8");
     expect(swift).toMatch(/forInfoDictionaryKey: "SENTRY_DSN"/);
     expect(swift).toMatch(/profilesSampleRate = 0\.1/);
-    expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 1\.0/);
+    expect(swift).toMatch(/sessionReplay\.onErrorSampleRate = 0\.1/);
     expect(swift).not.toMatch(/ingest\.sentry\.io/);
     expect(swift).not.toMatch(/\?\? "https:\/\//);
     const yml = readFileSync(join(ROOT, "ios/project.yml"), "utf8");
@@ -158,6 +162,23 @@ describe("renderer diagnostics refresh", () => {
       dsn: ROTATED_DSN,
       environment: "staging",
       tracesSampleRate: 0.5,
+    });
+  });
+
+  it("prefers uiTracesSampleRate over tracesSampleRate when reported by the runtime", async () => {
+    harness.answer({
+      enabled: true,
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.2,
+      uiTracesSampleRate: 0.05,
+    });
+    await initSentryFromRuntime();
+    expect(sentry.record.inits).toHaveLength(1);
+    expect(sentry.record.inits[0]).toMatchObject({
+      dsn: RUNTIME_DSN,
+      environment: "production",
+      tracesSampleRate: 0.05,
     });
   });
 
@@ -386,5 +407,92 @@ describe("renderer diagnostics refresh", () => {
     setActiveFeedbackDetailsForTests(null);
     const clearedFeedback = attachFeedbackEventDetails({ type: "feedback" } as import("@sentry/react").Event);
     expect(clearedFeedback.contexts).toBeUndefined();
+  });
+
+  // UI3: @sentry/react is a dynamic import now, so a capture made before
+  // anything ever asked to load it (no init() this session) must not throw
+  // and must not pretend an event was sent.
+  it("captureException/captureMessage drop and report nothing when the SDK was never asked to load", () => {
+    expect(captureException(new Error("boom"))).toBeUndefined();
+    expect(captureMessage("boom")).toBeUndefined();
+  });
+});
+
+// The capture functions and the init/close race below drive the REAL
+// browserPort (sentryPort is left as its default), with the dynamic
+// `import("@sentry/react")` itself swapped for a stand-in — so these cover
+// the loader-and-queue behavior UI3 added without ever loading the real SDK,
+// the same non-goal the fakeSentryPort suite above already keeps.
+describe("browser Sentry capture gate and queue", () => {
+  // Kept as separate typed vi.fn() references, asserted on directly — a
+  // fake cast through `as unknown as SentryModule` would re-type these
+  // members as the real SDK's plain function signatures on the way out,
+  // losing the Mock-only matchers (toHaveBeenCalled, toHaveBeenCalledWith).
+  let fakeInit: ReturnType<typeof vi.fn>;
+  let fakeCaptureException: ReturnType<typeof vi.fn>;
+  let fakeModule: SentryModule;
+  let resolveLoad: ((module: SentryModule) => void) | undefined;
+
+  beforeEach(() => {
+    resetSentryForTests();
+    vi.stubGlobal("window", {});
+    resolveLoad = undefined;
+    fakeInit = vi.fn();
+    fakeCaptureException = vi.fn(() => "fake-event-id");
+    fakeModule = {
+      init: fakeInit,
+      close: () => Promise.resolve(true),
+      getClient: () => undefined,
+      browserTracingIntegration: () => ({}),
+      feedbackIntegration: () => ({}),
+      replayIntegration: () => ({}),
+      ErrorBoundary: () => null,
+      captureException: fakeCaptureException,
+      captureMessage: vi.fn(() => "fake-event-id"),
+      addEventProcessor: vi.fn(),
+      getFeedback: () => undefined,
+    } as unknown as SentryModule;
+    setSentryModuleLoaderForTests(() => new Promise((resolve) => { resolveLoad = resolve; }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    setSentryModuleLoaderForTests(null);
+    resetSentryForTests();
+  });
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("queues a capture made while the SDK is loading and delivers it once init() resolves", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", "https://fake@o0.ingest.sentry.io/1");
+    initSentry(); // real browserPort.init() — routed through the fake loader above, not a network import
+
+    const eventId = captureException(new Error("boom"));
+    expect(eventId).toBeUndefined(); // nothing to hand back yet — queued, not sent
+    expect(fakeCaptureException).not.toHaveBeenCalled();
+
+    resolveLoad?.(fakeModule);
+    await settle();
+
+    expect(fakeInit).toHaveBeenCalledTimes(1); // the client actually started
+    expect(fakeCaptureException).toHaveBeenCalledWith(expect.any(Error), undefined);
+  });
+
+  it("cancels a pending init() when an opt-out closes the client before the load resolves", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", "https://fake@o0.ingest.sentry.io/1");
+    setObservabilityReaderForTests(async () => ({ requestedEnabled: false, enabled: false, dsn: null }));
+
+    initSentry(); // begins loading via the fake loader; sets runtimeIdentity synchronously
+    // requestedEnabled: false → applyRuntimeObservability → closeClient() →
+    // the real browserPort.close(), which bumps the generation synchronously.
+    await refreshSentryFromRuntime();
+
+    resolveLoad?.(fakeModule);
+    await settle();
+
+    // The import resolved AFTER close() asked to cancel it — init() must
+    // never reach the real SDK, or a "closed" client would silently return.
+    expect(fakeInit).not.toHaveBeenCalled();
   });
 });

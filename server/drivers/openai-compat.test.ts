@@ -3,6 +3,7 @@ import * as sentryAi from "../sentry-ai.ts";
 import { recordEvents } from "../testing/events.ts";
 import { startFakeOpenAiServer, type FakeOpenAiServer } from "../testing/fake-openai-server.ts";
 import { OpenAICompatDriver, sentryProviderForUrl } from "./openai-compat.ts";
+import { VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 
 describe("OpenAICompatDriver", () => {
   const savedUrl = process.env.OPENAI_COMPAT_URL;
@@ -659,6 +660,89 @@ describe("OpenAICompatDriver driver-owned tool loop", () => {
     await instance.dispose();
   });
 
+  // 120s is this driver's IDLE budget now, not its whole-request ceiling:
+  // bytes on the wire keep a round alive, silence ends it.  Fake timers so
+  // the minutes are not real.
+  describe("the 120s idle budget", () => {
+    const enc = new TextEncoder();
+    const streamingFetch = (script: (controller: ReadableStreamDefaultController<Uint8Array>) => void) =>
+      vi.fn(async (_input: unknown, init?: RequestInit) => {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            // Real fetch rejects a pending read once its signal aborts.
+            init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+            script(controller);
+          },
+        });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      });
+    const createIdle = (instanceId: string) =>
+      OpenAICompatDriver.create({
+        instanceId,
+        displayName: "Idle budget",
+        enabled: true,
+        config: { url: "https://example.test/v1", apiKeyEnv: "TEST_KEY", models: ["fake-model"] },
+        environment: { TEST_KEY: "secret" },
+      });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("does not abort a stream that is still delivering bytes at 130s", async () => {
+      vi.useFakeTimers();
+      // SSE comment keep-alives only — nothing the reader turns into a
+      // delta — until the answer lands at 140s.  Only raw-chunk liveness
+      // explains this round surviving past 120s.
+      const fetchMock = streamingFetch((controller) => {
+        for (let at = 20_000; at <= 130_000; at += 20_000) {
+          setTimeout(() => controller.enqueue(enc.encode(": keep-alive\n")), at);
+        }
+        setTimeout(() => {
+          controller.enqueue(enc.encode('data: {"choices":[{"delta":{"content":"late but live"}}]}\n'));
+          controller.enqueue(enc.encode("data: [DONE]\n"));
+          controller.close();
+        }, 140_000);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await createIdle("idle-live");
+      const recorder = recordEvents(instance.adapter);
+      try {
+        await instance.adapter.sendTurn({ threadId: "idle-live", text: "hi", model: "fake-model" });
+        const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+        await vi.advanceTimersByTimeAsync(141_000);
+        expect(await completed).toMatchObject({ ok: true, stopReason: "end_turn" });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(recorder.events.filter((e) => e.type === "runtime.error")).toHaveLength(0);
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    }, 20_000);
+
+    it("aborts after 125s of silence as a timeout", async () => {
+      vi.useFakeTimers();
+      // Headers, then nothing at all.
+      const fetchMock = streamingFetch(() => undefined);
+      vi.stubGlobal("fetch", fetchMock);
+      const instance = await createIdle("idle-silent");
+      const recorder = recordEvents(instance.adapter);
+      try {
+        await instance.adapter.sendTurn({ threadId: "idle-silent", text: "hi", model: "fake-model" });
+        const completed = recorder.until((event) => event.type === "turn.completed", 1_000_000);
+        await vi.advanceTimersByTimeAsync(125_000);
+        expect(await completed).toMatchObject({ ok: false, stopReason: "timeout" });
+        expect(recorder.events.find((e) => e.type === "runtime.error")).toMatchObject({
+          message: expect.stringContaining("the model did not answer within 120s"),
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    }, 20_000);
+  });
+
   it("rejects an invalid dispatch before starting a turn", async () => {
     const instance = await OpenAICompatDriver.create({
       instanceId: "openaiCompat",
@@ -716,6 +800,62 @@ describe("OpenAICompatDriver driver-owned tool loop", () => {
       );
       expect(total).toBeLessThan(80 * 5_000);
     } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("heads the request with the stable half and carries the volatile half on the newest user message", async () => {
+    // Upstream PR #1758, HTTP half: the system message is the head of the
+    // resent prefix, so only the stable half belongs there, and the volatile
+    // half (memory, mentions) rides the newest user message every request.
+    const bodies: any[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "openai-compat-split",
+      displayName: "Split Test",
+      enabled: true,
+      config: { url: "https://example.com/v1", apiKeyEnv: "OPENAI_COMPAT_API_KEY", key: "test-key" },
+      environment: {},
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-split",
+        system: "You are a test bot. Memory: likes tea.",
+        systemStable: "You are a test bot.",
+        systemVolatile: " Memory: likes tea.",
+        transcript: [{ role: "user", text: "earlier" }, { role: "assistant", text: "noted" }],
+        text: "Summarize it.",
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      const body = bodies.find((b: any) => Array.isArray(b.messages));
+      expect(body.messages).toEqual([
+        { role: "system", content: "You are a test bot." },
+        { role: "user", content: "earlier" },
+        { role: "assistant", content: "noted" },
+        { role: "user", content: `${VOLATILE_CONTEXT_NOTE_PREFIX}\n\nMemory: likes tea.\n\nSummarize it.` },
+      ]);
+
+      // a legacy unsplit turn keeps its whole prompt in the system message
+      await instance.adapter.sendTurn({ threadId: "t-unsplit", system: "You are a test bot. Memory: likes tea.", text: "hi" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "t-unsplit");
+      const legacy = bodies.filter((b: any) => Array.isArray(b.messages)).at(-1);
+      expect(legacy.messages).toEqual([
+        { role: "system", content: "You are a test bot. Memory: likes tea." },
+        { role: "user", content: "hi" },
+      ]);
+    } finally {
+      recorder.stop();
       await instance.dispose();
     }
   });

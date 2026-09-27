@@ -10,7 +10,7 @@ export interface TurnComputerInputs {
   /** The destination an automation dispatched the turn to: a cloud routine,
    * webhook or resource trigger mounts the cloud computer whatever the bot's
    * own computers say. */
-  runOn?: "maus" | "cloud";
+  runOn?: "bot" | "cloud";
   /** The providers the turn actually mounted, once its computers resolved.
    * Auto can fall back from an unavailable cloud computer to This Computer,
    * so the grant alone over-counts what the turn holds. */
@@ -157,16 +157,39 @@ export interface ExactTurnLease {
   readonly botId: string;
   readonly threadId: string;
   readonly dispatchId: number;
+  /** The resource this lease guards.  When set, mutual exclusion is keyed
+   *  by targetKey rather than botId — typically one occupancy key per bot
+   *  on a shared VPS container so several bots can run concurrently. */
+  readonly targetKey?: string;
 }
 
 /** A resource marker owned by one exact dispatch.  A later turn may reuse the
  * same bot and thread before an older asynchronous finalizer finishes, so a
- * thread id alone is not an ownership token. */
+ * thread id alone is not an ownership token.
+ *
+ * When `targetKey` is provided, mutual exclusion is by that key rather than
+ * by bot id alone — two different bots sharing one occupancy key are refused,
+ * while distinct per-bot keys on one shared container can coexist. */
 export class ExactTurnLeases {
   private readonly byBot = new Map<string, ExactTurnLease>();
+  private readonly byTarget = new Map<string, ExactTurnLease>();
 
-  claim(botId: string, threadId: string, dispatchId: number): ExactTurnLease {
-    const lease = { botId, threadId, dispatchId };
+  /** Claim a lease.  When `targetKey` is provided, the claim is keyed by
+   *  that target: if another bot already holds the same target, `null` is
+   *  returned (the caller should throw a user-facing 409).  A successor on
+   *  the same bot+thread replaces the previous lease. */
+  claim(botId: string, threadId: string, dispatchId: number, targetKey?: string): ExactTurnLease | null {
+    const lease: ExactTurnLease = { botId, threadId, dispatchId, targetKey };
+    if (targetKey) {
+      const existing = this.byTarget.get(targetKey);
+      // A different bot already on this desktop: refuse (shared mutual exclusion).
+      // The same bot replaces — successor on the same thread, or recovery when a
+      // prior turn's release never ran and left a stale byTarget entry.  The
+      // historical byBot map always overwrote per bot id; keeping that for the
+      // owning bot avoids a permanent self-block after a missed cleanup.
+      if (existing && existing.botId !== botId) return null;
+      this.byTarget.set(targetKey, lease);
+    }
     this.byBot.set(botId, lease);
     return lease;
   }
@@ -179,12 +202,24 @@ export class ExactTurnLeases {
     return this.byBot.has(botId);
   }
 
+  hasTarget(targetKey: string): boolean {
+    return this.byTarget.has(targetKey);
+  }
+
   release(lease: ExactTurnLease): boolean {
     if (this.byBot.get(lease.botId) !== lease) return false;
-    return this.byBot.delete(lease.botId);
+    this.byBot.delete(lease.botId);
+    if (lease.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
+    return true;
   }
 
   clearBot(botId: string): void {
+    const lease = this.byBot.get(botId);
+    if (lease?.targetKey && this.byTarget.get(lease.targetKey) === lease) {
+      this.byTarget.delete(lease.targetKey);
+    }
     this.byBot.delete(botId);
   }
 

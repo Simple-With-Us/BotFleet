@@ -16,10 +16,16 @@ executable can be staged:
 | Windows x64 | `cloudflared-windows-amd64.exe` | `c29eee2b121f5436a642eed69fd9767da7e7b8c510fa50aaa130337f931357b5` | same as release asset |
 
 The staged executables are generated build output and are intentionally not
-checked into git. Set `OMB_CLOUDFLARED_ARCHIVE_DIR` to a directory containing
-the exact official release assets to prepare a package from a reviewed local
-download. Otherwise the preparation script downloads them from the release URL
-above.
+checked into git. The preparation script downloads release archives from the
+URL above (10 minute timeout, 3 attempts, 5 second delay between attempts)
+and keeps a verified copy of each in a shared cache
+(`~/Library/Caches/BotFleet/cloudflared-archives` on macOS) so a later
+`build:cloudflared` run does not re-download an asset it already has. Set
+`OMB_CLOUDFLARED_ARCHIVE_DIR` to point that cache at a directory containing
+the exact official release assets instead, such as a reviewed local download.
+A cached or provided archive is still checked against the SHA-256 digests
+below before it is trusted; a mismatch is treated as a cache miss and
+re-downloaded.
 
 The macOS release process applies BotFleet's Developer ID signature to the
 staged executable as part of signing the app bundle. It verifies the unsigned

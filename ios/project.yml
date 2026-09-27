@@ -12,8 +12,6 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: '17.0'
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: CC8UTF7ATG
-    ASSETCATALOG_FILTER_FOR_THINNING: false
-    ENABLE_ASSET_THINNING: false
     # Native Sentry. Empty unless xcodebuild/CI passes SENTRY_DSN=...
     # Do not put a live DSN in this file or in Info.plist.
     SENTRY_DSN: ""
@@ -117,8 +115,8 @@ targets:
     - path: Widgets
     - path: Shared
     - path: Assets.xcassets
-    - path: App/MausAvatar.swift
-    - path: App/MausFaceData.swift
+    - path: App/BotMascot.swift
+    - path: App/BotFaceData.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.botfleet.ios.widgets

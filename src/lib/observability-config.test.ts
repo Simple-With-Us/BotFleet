@@ -135,6 +135,42 @@ describe("buildObservabilityConfigPatch", () => {
       patch: { enabled: false, environment: "", tracesSampleRate: 0.2, logsEnabled: false },
     });
   });
+
+  it("round-trips separate trace sample rates for AI, HTTP, and UI", () => {
+    const result = buildObservabilityConfigPatch({
+      ...base,
+      aiTracesSampleRate: 1.0,
+      httpTracesSampleRate: 0.05,
+      uiTracesSampleRate: 0.15,
+    });
+    expect(result).toEqual({
+      ok: true,
+      patch: {
+        enabled: true,
+        environment: "",
+        tracesSampleRate: 0.2,
+        aiTracesSampleRate: 1.0,
+        httpTracesSampleRate: 0.05,
+        uiTracesSampleRate: 0.15,
+        logsEnabled: true,
+      },
+    });
+  });
+
+  it("rejects separate trace sample rates outside 0..1", () => {
+    expect(buildObservabilityConfigPatch({ ...base, aiTracesSampleRate: 1.2 })).toEqual({
+      ok: false,
+      error: "AI traces sample rate must be between 0 and 1.",
+    });
+    expect(buildObservabilityConfigPatch({ ...base, httpTracesSampleRate: -0.05 })).toEqual({
+      ok: false,
+      error: "HTTP traces sample rate must be between 0 and 1.",
+    });
+    expect(buildObservabilityConfigPatch({ ...base, uiTracesSampleRate: 2 })).toEqual({
+      ok: false,
+      error: "UI traces sample rate must be between 0 and 1.",
+    });
+  });
 });
 
 describe("initialSendDiagnostics", () => {

@@ -4,6 +4,8 @@ This file is the **authoritative coordination manifest for AI agent fleets** wor
 
 GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
+Hosting and routing (apexes, hostnames, hosts, deploy paths): see [`Fleet-OPS/docs/DOMAINS-AND-ROUTING.md`](https://github.com/jaywedgeworth22/Fleet-OPS/blob/main/docs/DOMAINS-AND-ROUTING.md). Built from live Cloudflare, Vercel, Coolify, Namecheap/RDAP, and GitHub APIs by CLAUDE on 2026-09-25; refresh via `Fleet-OPS/scripts/domain-inventory/run-all.sh`.
+
 > **2026-09-22 [INSTINCT]:** Updater transition release — must ship and be applied to every Mac BEFORE the bundle rename (PR #524).  It ports the target-bootstrapping wrapper and the updater's legacy-identity acceptance with no bundle ID change, so the old updater can apply it and the rename update is then judged by transition-capable code.  See `docs/rollouts/2026-09-22-updater-transition-bootstrap.md` for the rollout order.
 >
 > **2026-09-22 [MM]:** Bundle identifier migration landed — `com.botfleet.app` → `app.botfleet.macos`, `com.jay.botfleet-server` → `app.botfleet.server`, `app.botfleet` → `app.botfleet.ios`, `app.botfleet.widgets` → `app.botfleet.ios.widgets`, `com.botfleet.app.recorder` → `app.botfleet.recorder.macos`, `com.botfleet.app.speech-helper` → `app.botfleet.speech.macos`, plus new app group `group.app.botfleet` and associated domain `botfleet.app`.  See `docs/rollouts/2026-09-22-bundle-id-migration.md` for the rollout doc and the new IDs table.
@@ -42,6 +44,10 @@ Search the `fleet-agents` corpus before re-deriving a lesson (`recall "query"` o
 ## Prior Messages Stay In Scope (owner preference — ALL agents, ALL platforms)
 
 **Never assume a new user message means prior questions or tasks are dropped.**  Treat the full conversation as still active unless the owner explicitly contradicts, cancels, or redirects.
+
+## Verification
+
+Every claim of "it works" points at a recipe that proves it in an isolated fixture.  See `docs/verification/README.md` for the verification discipline, test recipes, and evidence standards.  "Verified" in a PR means a recipe or an existing unit test was run in an isolated fixture, never against live user data.  Fixtures use temporary data directories and free ports; they do not contact the harness on port 8799 or the user's running app.
 
 ## No New GitHub Repositories (owner directive, 2026-09-02)
 

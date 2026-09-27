@@ -20,7 +20,11 @@ import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
   ANTIGRAVITY_HOST_CONTROL_NOTICE,
   AntigravityDriver,
+  acquireAntigravityComputerMcpLease,
+  antigravityPrintTimeout,
+  antigravityConfigHasBotfleetServers,
   antigravityHostPolicyRefusal,
+  antigravityMcpConfigPath,
   antigravityMcpServers,
   antigravityTurnErrorMessage,
   parseAntigravityTurnResult,
@@ -81,6 +85,26 @@ describe("Antigravity decodeConfig", () => {
   it("rejects invalid types (throws → shadow snapshot)", () => {
     expect(() => AntigravityDriver.decodeConfig({ cli: 5 })).toThrow(/invalid cli/);
     expect(() => AntigravityDriver.decodeConfig({ fullAuto: "yes" })).toThrow(/invalid fullAuto/);
+  });
+  it("keeps turn deadline windows within acp/core.ts's bounds and drops the rest", () => {
+    expect(
+      AntigravityDriver.decodeConfig({ promptTimeoutMs: 600_000, promptIdleMs: 120_000, promptToolIdleMs: 300_000 }),
+    ).toEqual({ cli: "agy", fullAuto: false, promptTimeoutMs: 600_000, promptIdleMs: 120_000, promptToolIdleMs: 300_000 });
+    // Too short, too long, fractional, or not a number: fall back to the
+    // default rather than throw — a stale setting must not take the engine down.
+    expect(
+      AntigravityDriver.decodeConfig({
+        promptTimeoutMs: 999,
+        promptIdleMs: 20 * 60_000 + 1,
+        promptToolIdleMs: 1_500.5,
+      }),
+    ).toEqual({ cli: "agy", fullAuto: false });
+    expect(AntigravityDriver.decodeConfig({ promptIdleMs: "180000" })).toEqual({ cli: "agy", fullAuto: false });
+  });
+  it("sets agy's own print timeout a whole minute above the driver's ceiling", () => {
+    expect(antigravityPrintTimeout(11 * 60_000)).toBe("12m");
+    expect(antigravityPrintTimeout(90_000)).toBe("3m");
+    expect(antigravityPrintTimeout(1_000)).toBe("2m");
   });
 });
 
@@ -160,8 +184,19 @@ describe("Antigravity turns (fake CLI)", () => {
   });
 
   afterEach(async () => {
+    delete process.env.FAKE_AGY_RETRY_SCALE;
     recorder?.stop();
     await instance?.dispose();
+  });
+
+  it("ignores a trailing buffered line after result settles the turn", async () => {
+    await create({ FAKE_AGY_BURST: "1", FAKE_AGY_TRAILING_AFTER_RESULT: "1" });
+    await instance.adapter.sendTurn({ threadId: "t-trailing", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const types = recorder.events.map((e) => e.type);
+    expect(types.at(-1)).toBe("turn.completed");
+    expect(recorder.events.filter((e) => e.type === "item.started" && (e as any).itemId === "conv-fake-123:2")).toHaveLength(0);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
   });
 
   it("normalizes a full print-mode turn into the canonical event sequence", async () => {
@@ -262,6 +297,8 @@ describe("Antigravity turns (fake CLI)", () => {
     const error = recorder.events.find((e) => e.type === "runtime.error")!;
     expect((error as any).message).toContain("agy exited 3 before result");
     expect((error as any).message).toContain("authentication expired");
+    // DR2: an expired login is the person's to fix, so no relaunch is tried
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
     expect(recorder.events.at(-1)).toMatchObject({
       type: "turn.completed",
       ok: false,
@@ -269,6 +306,68 @@ describe("Antigravity turns (fake CLI)", () => {
     });
     expect(instance.adapter.hasSession("t-crash")).toBe(false);
   });
+
+  // DR2.  Antigravity had no transient-failure retry at all, so one 429 or
+  // connection reset failed the whole turn and pushed the bot's fallback
+  // chain into a cooldown a single relaunch would have avoided.
+  it("auto-retries a transient exit, then completes with exactly one reply", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-retry-"));
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    try {
+      await create({ FAKE_AGY_TRANSIENTS: "2", FAKE_AGY_STATE: join(scratch, "launches") });
+      await instance.adapter.sendTurn({ threadId: "t-agy-retry", text: "go" });
+
+      await recorder.until((e) => e.type === "turn.completed" && (e as any).ok === true, 25_000);
+      const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+      expect(retries.map((e) => (e as any).attempt)).toEqual([1, 2]);
+      expect(retries.every((e) => (e as any).delayMs > 0 && typeof (e as any).reason === "string")).toBe(true);
+      const replies = recorder.events.filter(
+        (e) => e.type === "item.completed" && (e as any).itemType === "assistant_text",
+      );
+      expect(replies).toHaveLength(1);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it("stops retrying at the attempt cap and settles the turn as failed", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-retry-cap-"));
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    try {
+      await create({ FAKE_AGY_TRANSIENTS: "9", FAKE_AGY_STATE: join(scratch, "launches") });
+      await instance.adapter.sendTurn({ threadId: "t-agy-cap", text: "go" });
+
+      await recorder.until((e) => e.type === "turn.completed" && (e as any).ok === false, 25_000);
+      expect(recorder.events.filter((e) => e.type === "turn.retrying").map((e) => (e as any).attempt)).toEqual([1, 2]);
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  it("never retries a failure that arrived after a tool step had already run", async () => {
+    // Replay safety is PROTOCOL state, not error text: the stderr here is the
+    // same transient 503 the test above relaunches on.  What forbids the
+    // retry is that a tool already started on this computer.
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-retry-partial-"));
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    try {
+      await create({
+        FAKE_AGY_TRANSIENTS: "1",
+        FAKE_AGY_PARTIAL_FAILS: "1",
+        FAKE_AGY_STATE: join(scratch, "launches"),
+      });
+      await instance.adapter.sendTurn({ threadId: "t-agy-partial", text: "go" });
+
+      const done = await recorder.until((e) => e.type === "turn.completed", 25_000);
+      expect(done).toMatchObject({ ok: false });
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      expect(recorder.events.some((e) => e.type === "item.started" && (e as any).itemType === "tool")).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 40_000);
 
   it("ends the turn on a silent EOF — exit 0, no stream, no result", async () => {
     await create({ FAKE_AGY_DIE: "0" });
@@ -336,6 +435,11 @@ describe("Antigravity turns (fake CLI)", () => {
       const mode = defaults.indexOf("--mode");
       expect(defaults.slice(mode, mode + 2)).toEqual(["--mode", "accept-edits"]);
 
+      // agy's own timeout sits above the driver's 11-minute ceiling, so agy
+      // never kills a still-streaming turn before the driver decides to
+      const printTimeout = defaults.indexOf("--print-timeout");
+      expect(defaults.slice(printTimeout, printTimeout + 2)).toEqual(["--print-timeout", "12m"]);
+
       const opted = await argvFor({ cli: FAKE_CLI, fullAuto: true }, "bypass");
       expect(opted).toContain("--dangerously-skip-permissions");
       expect(opted).not.toContain("--mode");
@@ -343,6 +447,201 @@ describe("Antigravity turns (fake CLI)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+// ede5d0a7 / BOTFLEET-6 / BOTFLEET-10.  The turn used to have one clock, an
+// 11-minute wall-clock watchdog, and agy's own "timeout waiting for response"
+// was relaunched into the same hang.  These run the real driver against the
+// fake agy with the windows scaled down to seconds.
+describe("Antigravity turn deadlines (fake CLI)", () => {
+  let instance: ProviderInstance | undefined;
+  let recorder: EventRecorder | undefined;
+
+  const create = async (
+    environment: Record<string, string>,
+    windows: { promptTimeoutMs?: number; promptIdleMs?: number; promptToolIdleMs?: number },
+  ) => {
+    instance = await AntigravityDriver.create({
+      instanceId: "agy-deadlines",
+      displayName: undefined,
+      environment,
+      enabled: true,
+      // through decodeConfig, so the windows pass the same validation a
+      // stored setting does
+      config: AntigravityDriver.decodeConfig({ cli: FAKE_CLI, fullAuto: true, ...windows }),
+    });
+    recorder = recordEvents(instance.adapter);
+    return { instance, recorder };
+  };
+  const notices = (rec: EventRecorder) =>
+    rec.events.filter((e) => e.type === "item.started" && (e as any).toolKind === "notice");
+
+  beforeEach(() => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+  });
+
+  afterEach(async () => {
+    delete process.env.FAKE_AGY_RETRY_SCALE;
+    recorder?.stop();
+    await instance?.dispose();
+    instance = undefined;
+    recorder = undefined;
+  });
+
+  it("does not kill a turn whose tool step is silent for longer than the plain idle window", async () => {
+    // idle 5 s, tool 15 s: the tool is quiet for 6.5 s, past the plain
+    // window, and the turn still completes because a tool is running.
+    const { instance, recorder } = await create({ FAKE_AGY_TOOL_HOLD_MS: "6500" }, {
+      promptIdleMs: 5_000,
+      promptToolIdleMs: 15_000,
+    });
+    await instance.adapter.sendTurn({ threadId: "t-agy-tool-quiet", text: "build it" });
+    const done = await recorder.until((e) => e.type === "turn.completed", 25_000);
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 30_000);
+
+  it("stops a tool step that stays silent past the tool window as a stall, and warns first", async () => {
+    // The tool window is deliberately the SHORTER one here, so the plain
+    // window cannot be what fires: the message has to name the tool.
+    const { instance, recorder } = await create({ FAKE_AGY_TOOL_HOLD_MS: "60000" }, {
+      promptIdleMs: 30_000,
+      promptToolIdleMs: 3_000,
+    });
+    await instance.adapter.sendTurn({ threadId: "t-agy-tool-wedged", text: "build it" });
+    const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    const errors = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as any).message).toBe(
+      "Antigravity sent nothing for 3 s while a tool ran and was stopped.",
+    );
+    // the pre-cliff chip lands before the stop, not with it
+    const warned = notices(recorder);
+    expect(warned).toHaveLength(1);
+    expect((warned[0] as any).title).toMatch(/^Antigravity has gone quiet while a tool runs\.  /);
+    const types = recorder.events.map((e) => e.type);
+    expect(recorder.events.indexOf(warned[0])).toBeLessThan(types.indexOf("runtime.error"));
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+  }, 30_000);
+
+  it("stops a turn with no output and no tool as a stall, without relaunching it", async () => {
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    const { instance, recorder } = await create({ FAKE_AGY_DELAY_MS: "60000" }, { promptIdleMs: 1_500 });
+    await instance.adapter.sendTurn({ threadId: "t-agy-silent", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_stall" });
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    expect((error as any).message).toBe("Antigravity sent nothing for 2 s and was stopped.");
+    // give a (wrong) relaunch time to show itself before counting
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+  }, 30_000);
+
+  it("ends the turn at the hard ceiling even when the idle window has not run out", async () => {
+    const { instance, recorder } = await create({ FAKE_AGY_DELAY_MS: "60000" }, {
+      promptTimeoutMs: 2_000,
+      promptIdleMs: 30_000,
+    });
+    await instance.adapter.sendTurn({ threadId: "t-agy-ceiling", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "prompt_timeout" });
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    expect((error as any).message).toBe("Antigravity ran past its 2 s limit and was stopped.");
+  }, 30_000);
+
+  it("settles an ERROR result carrying agy's timeout text once, without a relaunch", async () => {
+    // An ERROR `result` settles directly and never reaches maybeRetry; this
+    // pins that the timeout text keeps that shape.  The relaunch guard for a
+    // timeout on the exit path is the next test.
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-timeout-"));
+    try {
+      const launches = join(scratch, "launches");
+      const { instance, recorder } = await create(
+        { FAKE_AGY_RESULT_ERROR: "timeout waiting for response", FAKE_AGY_TRANSIENTS: "0", FAKE_AGY_STATE: launches },
+        {},
+      );
+      await instance.adapter.sendTurn({ threadId: "t-agy-timeout", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "ERROR" });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+      expect(Number(readFileSync(launches, "utf8"))).toBe(1);
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect((error as any).message).toBe("Antigravity: timeout waiting for response");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("never relaunches a child that exits with agy's own \"timeout waiting for response\"", async () => {
+    // Transient to the shared classifier, and that is exactly the trap: the
+    // provider already hung once on this prompt, and three relaunches used
+    // to hold the bot for up to half an hour.  An exit with no `result` is
+    // the only path that reaches maybeRetry, so this is the one that proves
+    // the timeout guard there.
+    process.env.FAKE_AGY_RETRY_SCALE = "0.001";
+    const { instance, recorder } = await create(
+      { FAKE_AGY_STDERR: "agy: timeout waiting for response\n", FAKE_AGY_DIE: "1" },
+      {},
+    );
+    await instance.adapter.sendTurn({ threadId: "t-agy-exit-timeout", text: "hi" });
+    const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+    expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+    // give a (wrong) relaunch time to show itself before counting
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(1);
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+    const error = recorder.events.find((e) => e.type === "runtime.error");
+    expect((error as any).message).toMatch(/^agy exited 1 before result: .*timeout waiting for response/);
+  }, 30_000);
+
+  it("does not count time queued for the mount lease against the turn's ceiling", async () => {
+    // A turn queued behind a mounting turn used to arrive with its ceiling
+    // already spent, and was killed on the next tick as prompt_timeout.
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-lease-clock-"));
+    try {
+      const { instance, recorder } = await create({ HOME: home }, { promptTimeoutMs: 2_000, promptIdleMs: 30_000 });
+      const releaseWriter = await acquireAntigravityComputerMcpLease(antigravityMcpConfigPath({ HOME: home }), true);
+      const sent = instance.adapter.sendTurn({ threadId: "t-agy-lease-queue", text: "hi" });
+      // queued for longer than the whole ceiling
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(recorder.events.some((e) => e.type === "turn.started")).toBe(false);
+      releaseWriter();
+      await sent;
+      const done = await recorder.until((e) => e.type === "turn.completed", 20_000);
+      expect(done).toMatchObject({ ok: true });
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("settles a stopped turn as interrupted, with no runtime.error", async () => {
+    // BOTFLEET-10: Stop used to surface as "agy was killed by SIGTERM before
+    // result", a crash Sentry paged on for something the person asked for.
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-stop-"));
+    const readyFile = join(scratch, "ready");
+    try {
+      const { instance, recorder } = await create({ FAKE_AGY_DELAY_MS: "10000", FAKE_AGY_READY_FILE: readyFile }, {});
+      await instance.adapter.sendTurn({ threadId: "t-agy-stop", text: "hi" });
+      await expect.poll(() => existsSync(readyFile), { timeout: 10_000 }).toBe(true);
+      await instance.adapter.interruptTurn("t-agy-stop");
+      const done = await recorder.until((e) => e.type === "turn.completed", 15_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+      expect(recorder.events.filter((e) => e.type === "runtime.error")).toHaveLength(0);
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      expect(instance.adapter.hasSession("t-agy-stop")).toBe(false);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("Antigravity snapshot", () => {
@@ -632,6 +931,131 @@ describe("Antigravity computer MCP config", () => {
     } finally {
       recorder.stop();
       await instance.dispose();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // DR4.  The lease used to be one module-global promise taken by EVERY
+  // turn, held for the child's whole lifetime — so two Antigravity bots with
+  // no computer between them still answered one at a time, for up to the
+  // 10-minute print timeout.  It is a reader/writer lease now: only a turn
+  // that writes the shared file excludes anyone.
+  it("lets computer-free turns run at the same time instead of queueing", async () => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-mcpshared-"));
+    const first = await AntigravityDriver.create({
+      instanceId: "agy-shared-first",
+      displayName: undefined,
+      environment: { HOME: home, FAKE_AGY_DELAY_MS: "400" },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const second = await AntigravityDriver.create({
+      instanceId: "agy-shared-second",
+      displayName: undefined,
+      environment: { HOME: home },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const firstRecorder = recordEvents(first.adapter);
+    const secondRecorder = recordEvents(second.adapter);
+    try {
+      await first.adapter.sendTurn({ threadId: "t-shared-first", text: "first" });
+      let secondSpawned = false;
+      const secondTurn = second.adapter
+        .sendTurn({ threadId: "t-shared-second", text: "second" })
+        .then((result) => {
+          secondSpawned = true;
+          return result;
+        });
+
+      // The first child is still alive (its output is held back 400ms).
+      // Under the old module-global lease the second turn could not even
+      // spawn until that child was gone.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(secondSpawned).toBe(true);
+      await secondTurn;
+      await firstRecorder.until((event) => event.type === "turn.completed", 20_000);
+      await secondRecorder.until((event) => event.type === "turn.completed", 20_000);
+      // neither turn touched agy's global file
+      expect(existsSync(configPath(home))).toBe(false);
+    } finally {
+      firstRecorder.stop();
+      secondRecorder.stop();
+      await first.dispose();
+      await second.dispose();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("shares the lease between computer-free turns and still excludes a mounting one", async () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-leaseunit-"));
+    const other = mkdtempSync(join(tmpdir(), "omb-agy-leaseunit2-"));
+    try {
+      const path = antigravityMcpConfigPath({ HOME: home });
+      const settled = <T,>(promise: Promise<T>) => {
+        let done = false;
+        const tracked = promise.then((value) => ((done = true), value));
+        return { tracked, isDone: () => done };
+      };
+      const tick = () => new Promise((resolve) => setTimeout(resolve, 15));
+
+      // two computer-free turns hold it at once
+      const readerA = await acquireAntigravityComputerMcpLease(path, false);
+      const readerB = await acquireAntigravityComputerMcpLease(path, false);
+
+      // a mounting turn waits for BOTH of them
+      const writer = settled(acquireAntigravityComputerMcpLease(path, true));
+      await tick();
+      expect(writer.isDone()).toBe(false);
+      readerA();
+      await tick();
+      expect(writer.isDone()).toBe(false);
+      readerB();
+      const releaseWriter = await writer.tracked;
+      expect(writer.isDone()).toBe(true);
+
+      // and while it holds the file, a computer-free turn waits its turn
+      const readerC = settled(acquireAntigravityComputerMcpLease(path, false));
+      await tick();
+      expect(readerC.isDone()).toBe(false);
+
+      // a DIFFERENT config path is a different file and a different lease
+      const otherPath = antigravityMcpConfigPath({ HOME: other });
+      const elsewhere = settled(acquireAntigravityComputerMcpLease(otherPath, true));
+      await tick();
+      expect(elsewhere.isDone()).toBe(true);
+      (await elsewhere.tracked)();
+
+      releaseWriter();
+      (await readerC.tracked)();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a leftover botfleet mount as a reason to take the file exclusively", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-leftover-"));
+    try {
+      const path = antigravityMcpConfigPath({ HOME: home });
+      expect(antigravityConfigHasBotfleetServers(path)).toBe(false);
+
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      writeFileSync(path, JSON.stringify({ mcpServers: { "sqlite-helper": { command: "x", args: [] } } }));
+      expect(antigravityConfigHasBotfleetServers(path)).toBe(false);
+
+      writeFileSync(
+        path,
+        JSON.stringify({ mcpServers: { [ANTIGRAVITY_COMPUTER_MCP_KEY]: { command: "x", args: [], env: {} } } }),
+      );
+      expect(antigravityConfigHasBotfleetServers(path)).toBe(true);
+
+      // unreadable is not "clean": a turn that cannot tell takes the safe side
+      writeFileSync(path, "{ not json");
+      expect(antigravityConfigHasBotfleetServers(path)).toBe(true);
+    } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });

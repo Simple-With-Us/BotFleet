@@ -201,6 +201,24 @@ the field leaves the stored value untouched).
    scripts/with-sentry-dsn.sh pnpm package:mac:local
    ```
 
+## Product analytics (PostHog) — desktop only
+
+This is a separate product from the Sentry reporting above: the desktop app
+(Electron renderer, `src/lib/analytics.ts`) bundles PostHog and initializes
+it unconditionally on mount (`src/App.tsx`), **on by default**.  It sends a
+write-only client token (`phc_…`, safe to ship — it cannot read data back)
+to `us.i.posthog.com` with autocapture and pageview capture both off, and
+captures only two named events today: `app_first_open` (once, on first
+launch) and `app_opened` (every launch), plus a `platform` property and the
+identity created by an email-gate submission.  It never captures clicked-
+element text, message content, or transcripts.  An install can opt out at
+**Settings → General**, which calls `posthog.opt_out_capturing()` and drops
+anything already queued; the choice persists in `localStorage` and is
+checked before `posthog.init()` ever runs, so an opted-out install makes no
+request to PostHog at all, not even to load the library.  The iOS app is a
+different product with no analytics SDK at all — see
+[iOS privacy](ios-privacy.md).
+
 ## What is intentionally out of scope
 
 - A second Sentry project — everything lands in `jays-services/botfleet`.

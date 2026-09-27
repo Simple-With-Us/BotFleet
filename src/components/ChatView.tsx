@@ -36,7 +36,8 @@ import {
   type InstanceInfo,
   type Message,
 } from "@/state/store";
-import { BotAvatar, MausAvatar } from "./Avatar";
+import { BotAvatar, BotMascot } from "./Avatar";
+import { usePageVisible } from "@/lib/page-visible";
 import { ProviderMark } from "./ProviderIcons";
 import { TurnPresence } from "./TurnPresence";
 import { showToolCallsEnabled, summarizeToolCallsEnabled } from "@/lib/feature-flags";
@@ -72,6 +73,8 @@ import { ToolLine } from "./ToolLine";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
+import { delegationMessageView, isDelegationMessage } from "../../shared/delegation-message";
+import { DelegationCard } from "./DelegationCard";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import {
@@ -272,7 +275,7 @@ function Bubble({
   // bot's `ask_bot` reply mirrored into this thread (`from.botId` set) —
   // but purple is reserved for what the human actually typed.  Auto
   // instructions are `role: "system"` and never sit on the human side.
-  const alignRight = message.role === "user";
+  const alignRight = message.role === "user" && !isDelegationMessage(message);
   const humanTyped = alignRight && !message.from?.botId;
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -414,7 +417,7 @@ function Bubble({
           to. */}
       {alignRight && !humanTyped && message.from?.name && (
         <div className="mb-1 flex items-center gap-1.5 pr-1">
-          <MausAvatar color={message.from.color} state="happy" size={16} animated={false} />
+          <BotMascot color={message.from.color} state="happy" size={16} animated={false} />
           <span className="text-[11px] font-medium text-ink-secondary">{message.from.name}</span>
         </div>
       )}
@@ -618,7 +621,9 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
           <div className="flex flex-col gap-2 rounded-xl border border-hairline/40 bg-panel p-3 shadow-sm min-w-[320px] max-w-[480px]">
              <div className="flex items-center justify-between">
                 <button onClick={() => setExpanded(false)} className="flex items-center gap-2 text-[13px] text-ink-secondary hover:text-ink">
-                  <MausAvatar color={comm.withColor} state="happy" size={16} />
+                  {/* This chip is a settled transcript row (emergingId hides
+                      the live one), so the face never needs to move — UI1. */}
+                  <BotMascot color={comm.withColor} state="happy" size={16} animated={false} />
                   <span className="font-medium truncate" title={tool.name}>{tool.name}</span>
                   <ChevronDown size={13} />
                 </button>
@@ -644,7 +649,8 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
           title={`Expand message`}
           className="flex items-center gap-2 rounded-xl border border-hairline/40 bg-panel px-3 py-1.5 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink"
         >
-          <MausAvatar color={comm.withColor} state="happy" size={16} />
+          {/* Settled row, same as the expanded chip above — UI1. */}
+          <BotMascot color={comm.withColor} state="happy" size={16} animated={false} />
           <span className="max-w-[480px] truncate" title={tool.name}>{tool.name}</span>
           <ChevronRight size={13} />
         </button>
@@ -739,7 +745,9 @@ const MessagesList = memo(function MessagesList({
     <>
       {messages.length === 0 && !bot.busy && (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
-          <BotAvatar bot={bot} state={stateForBot(bot)} size={64} motion="none" motionKey={0} />
+          {/* The guard above already requires !bot.busy to reach this row,
+              so the mascot has nothing to show motion for — UI1. */}
+          <BotAvatar bot={bot} state={stateForBot(bot)} size={64} motion="none" motionKey={0} animated={false} />
           <RenameTitle
             value={bot.name}
             onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
@@ -821,8 +829,12 @@ const MessagesList = memo(function MessagesList({
               // system message the same way it forks a user one
               // (store.branchMessage), so its siblings must stay selectable
               // and its edit state must actually render, not just be armed.
-              const systemEditing = m.role === "system" && editingId === m.id;
-              const systemVersions = m.role === "system" ? messageVersions(bot, m) : [m];
+              const delegationView = delegationMessageView(m.role, m.text ?? "", m.from?.name, m.automationSource);
+              // Legacy delegation starters were stored as user messages but
+              // now render as cards. Keep their editor and branches reachable.
+              const cardStarter = m.role === "system" || Boolean(delegationView);
+              const systemEditing = cardStarter && editingId === m.id;
+              const systemVersions = cardStarter ? messageVersions(bot, m) : [m];
               const systemVersionIndex = systemVersions.findIndex((v) => v.id === m.id);
               const withSystemChrome = (card: ReactNode) => {
                 if (systemEditing) {
@@ -882,6 +894,11 @@ const MessagesList = memo(function MessagesList({
                   </div>
                 );
               };
+              if (delegationView) {
+                return withSystemChrome(
+                  <DelegationCard view={delegationView} comm={m.comm} targetBotName={bot.name} />,
+                );
+              }
               const webhookView = autoDelivered ? webhookMessageView(m.text ?? "") : null;
               if (webhookView) return withSystemChrome(<WebhookCard view={webhookView} />);
               const imessageView = autoDelivered ? imessageMessageView(m.text ?? "") : null;
@@ -1011,6 +1028,10 @@ export function ChatView({ bot }: { bot: Bot }) {
   const reasoning = stream.reasoning[bot.threadId];
   const provisioning = state.provisioning[bot.id];
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
+  // The header avatar is the one ChatView mascot that can be on screen while
+  // its bot is actually working — animate only then, and never behind a
+  // hidden tab, the same rule the roster and GroupView already apply (UI1).
+  const pageVisible = usePageVisible();
   const [findOpen, setFindOpen] = useState(false);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [composerHeight, setComposerHeight] = useState(140);
@@ -1354,6 +1375,7 @@ export function ChatView({ bot }: { bot: Bot }) {
               size={28}
               motion={mascotMotion?.kind ?? "none"}
               motionKey={mascotMotion?.nonce ?? 0}
+              animated={Boolean(bot.busy) && pageVisible}
             />
           </button>
           <RenameTitle
@@ -1522,7 +1544,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           )}
           <TurnPresence
             avatar={
-              <MausAvatar
+              <BotMascot
                 color={bot.color}
                 state={toolInFlight ? "working" : "thinking"}
                 size={36}

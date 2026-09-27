@@ -89,3 +89,118 @@ describe("UsageWhatIfProjection", () => {
     expect(html).toContain("No engines with a published API rate");
   });
 });
+
+import {
+  ENGINE_PLAN_OPTIONS,
+  defaultEnginePlan,
+  findMatchingPreset,
+  getInitialEnginePlans,
+  modelDisplayName,
+} from "@/lib/usage-plans";
+
+
+
+describe("modelDisplayName", () => {
+  it("maps raw engine model ids to clean picker display names", () => {
+    expect(modelDisplayName("MiniMax-M3")).toBe("MiniMax M3");
+    expect(modelDisplayName("grok-4.7-build-fast")).toBe("Grok 4.7 Build Fast");
+    expect(modelDisplayName("deepseek-chat")).toBe("DeepSeek Chat");
+    expect(modelDisplayName("claude-sonnet-4.5")).toBe("Claude Sonnet 4.5");
+    expect(modelDisplayName("gpt-5-codex")).toBe("GPT-5 Codex");
+    expect(modelDisplayName("gemini-2.5-pro")).toBe("Gemini 2.5 Pro");
+    expect(modelDisplayName("cursor-default")).toBe("Cursor Default");
+  });
+
+  it("prefers instance model options when provided", () => {
+    const instances = [
+      {
+        models: {
+          options: [{ id: "custom-ollama-llama3", label: "Llama 3 8B (Local)" }],
+        },
+      },
+    ];
+    expect(modelDisplayName("custom-ollama-llama3", instances)).toBe("Llama 3 8B (Local)");
+  });
+
+  it("falls back gracefully for unknown models", () => {
+    expect(modelDisplayName("unknown-provider-model")).toBe("unknown-provider-model");
+  });
+});
+
+describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
+  it("matches first-paint registry defaults for Cursor and DeepSeek Harness", () => {
+    const cursorPreset = findMatchingPreset("cursor", "Cursor Ultra", null);
+    expect(cursorPreset).toBeDefined();
+    expect(cursorPreset?.label).toBe("Cursor Ultra");
+    expect(cursorPreset?.costPerMonth).toBeNull();
+
+    const dshPreset = findMatchingPreset("deepseek-harness", "Pay-as-you-go (API)", null);
+    expect(dshPreset).toBeDefined();
+    expect(dshPreset?.label).toBe("Pay-as-you-go (API)");
+    expect(dshPreset?.costPerMonth).toBeNull();
+  });
+
+  it("uses Unicode multiplication sign in Claude Max presets and matches with ASCII x", () => {
+    const claude20x = findMatchingPreset("claude", "Claude Max 20×", 213.2);
+    expect(claude20x).toBeDefined();
+    expect(claude20x?.label).toBe("Claude Max 20× ($213.20/mo)");
+
+    // Matching handles legacy ASCII 'x'
+    const legacyMatch = findMatchingPreset("claude", "Claude Max 20x", 213.2);
+    expect(legacyMatch).toBeDefined();
+  });
+
+  it("does not include a confusing $0 custom row for DeepSeek Harness", () => {
+    const options = ENGINE_PLAN_OPTIONS["deepseek-harness"];
+    expect(options.length).toBe(1);
+    expect(options[0].costPerMonth).toBeNull();
+    expect(options.some((o) => o.costPerMonth === 0)).toBe(false);
+  });
+
+  it("returns default plan from registry via defaultEnginePlan", () => {
+    expect(defaultEnginePlan("minimax")).toEqual({
+      planName: "MiniMax Token Plan Max",
+      costPerMonth: 132,
+    });
+    expect(defaultEnginePlan("cursor")).toEqual({
+      planName: "Cursor Ultra",
+      costPerMonth: null,
+    });
+    expect(defaultEnginePlan("deepseek-harness")).toEqual({
+      planName: "Pay-as-you-go (API)",
+      costPerMonth: null,
+    });
+  });
+
+  it("identifies custom plans as undefined preset match", () => {
+    expect(findMatchingPreset("cursor", "Custom Cursor Plan", 50)).toBeUndefined();
+    expect(findMatchingPreset("minimax", "MiniMax Token Plan Max", 200)).toBeUndefined();
+  });
+
+  it("maps legacy saved preset names and costs to new official presets", () => {
+    // Legacy DeepSeek Pay-as-you-go maps to Pay-as-you-go (API)
+    const dshLegacy = findMatchingPreset("deepseek-harness", "DeepSeek Pay-as-you-go", null);
+    expect(dshLegacy?.planName).toBe("Pay-as-you-go (API)");
+
+    // Legacy Cursor Ultra at $40 maps to Cursor Ultra with null cost
+    const cursorLegacy = findMatchingPreset("cursor", "Cursor Ultra", 40);
+    expect(cursorLegacy?.planName).toBe("Cursor Ultra");
+    expect(cursorLegacy?.costPerMonth).toBeNull();
+  });
+
+  it("initializes plans from saved configuration or defaults via getInitialEnginePlans", () => {
+    const plans = getInitialEnginePlans({
+      minimax: { planName: "Custom MiniMax", costPerMonth: 80 },
+      "deepseek-harness": { planName: "DeepSeek Pay-as-you-go", costPerMonth: null },
+      cursor: { planName: "Cursor Ultra", costPerMonth: 40 },
+    });
+    expect(plans.minimax).toEqual({ planName: "Custom MiniMax", costPerMonth: 80 });
+    // Legacy stored names are migrated to official presets
+    expect(plans["deepseek-harness"]).toEqual({ planName: "Pay-as-you-go (API)", costPerMonth: null });
+    expect(plans.cursor).toEqual({ planName: "Cursor Ultra", costPerMonth: null });
+    // Unset engines take their defaults
+    expect(plans.grok).toEqual({ planName: "xAI SuperGrok Heavy", costPerMonth: 99 });
+  });
+});
+
+

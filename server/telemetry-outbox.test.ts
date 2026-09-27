@@ -444,4 +444,214 @@ describe("UsageTelemetryOutbox", () => {
     expect(JSON.parse(readFileSync(path, "utf8")).queue).toHaveLength(1);
     await outbox.dispose();
   });
+
+  it.each([401, 403, 404, 413, 422] as const)(
+    "quarantines terminal HTTP %i the same way as 400 and 409",
+    async (status) => {
+      const path = fixture();
+      const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+      const outbox = new UsageTelemetryOutbox({ path });
+      outbox.enqueue(destinationHash, batch("poison"));
+      outbox.configure(() => ({
+        destinationHash,
+        deliver: async () => ({ acknowledged: false, rejected: 0, terminalStatus: status }),
+      }));
+      await outbox.flushNow();
+
+      expect(outbox.status()).toMatchObject({
+        queuedBatches: 0,
+        terminalQuarantinedBatches: 1,
+        lastTerminalStatus: status,
+      });
+      await outbox.dispose();
+    },
+  );
+
+  it("logs one line naming the status and a short batch id when a batch is quarantined", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const lines: string[] = [];
+    const outbox = new UsageTelemetryOutbox({ path, log: (message) => lines.push(message) });
+    outbox.enqueue(destinationHash, batch("poison"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async () => ({ acknowledged: false, rejected: 0, terminalStatus: 409 }),
+    }));
+    await outbox.flushNow();
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("409");
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    const queueId = stored.terminalQuarantine[0].entry.queueId as string;
+    expect(queueId.length).toBe(64);
+    expect(lines[0]).toContain(queueId.slice(0, 12));
+    await outbox.dispose();
+  });
+
+  it("parks a batch in dead-letter after repeated failures so a newer batch is not blocked forever", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    let now = 0;
+    const delivered: string[] = [];
+    const lines: string[] = [];
+    const outbox = new UsageTelemetryOutbox({
+      path,
+      now: () => now,
+      retryBaseMs: 1,
+      maxHeadAttempts: 3,
+      log: (message) => lines.push(message),
+    });
+    outbox.enqueue(destinationHash, batch("poison"));
+    outbox.enqueue(destinationHash, batch("later"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => {
+        const id = posted.events[0]!.eventId;
+        delivered.push(id);
+        // "poison" never succeeds — a stand-in for a batch a downed
+        // endpoint, a timeout, or a network error keeps failing on, none
+        // of which are terminal HTTP statuses.
+        return id === "poison" ? { acknowledged: false, rejected: 0 } : { acknowledged: true, rejected: 0 };
+      },
+    }));
+
+    for (let i = 0; i < 3; i += 1) {
+      await outbox.flushNow();
+      now += 10_000; // well past any backoff this small retryBaseMs produces
+    }
+
+    expect(delivered.filter((id) => id === "poison")).toHaveLength(3);
+    // "later" gets its turn in the SAME pass that dead-letters "poison" —
+    // it does not wait out a whole extra retry cycle behind it.
+    expect(delivered).toContain("later");
+    expect(outbox.status()).toMatchObject({ queuedBatches: 0, deadLetterBatches: 1 });
+    expect(lines.some((line) => line.includes("dead-letter") && line.includes("3 failed attempts"))).toBe(true);
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.deadLetter[0].entry.batch.events[0].eventId).toBe("poison");
+    await outbox.dispose();
+  });
+
+  it("bounds the dead-letter list with an explicit eviction count", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    const outbox = new UsageTelemetryOutbox({ path, maxHeadAttempts: 1, maxDeadLetterBatches: 1 });
+    outbox.enqueue(destinationHash, batch("first"));
+    outbox.enqueue(destinationHash, batch("second"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async () => ({ acknowledged: false, rejected: 0 }),
+    }));
+    await outbox.flushNow();
+
+    expect(outbox.status()).toMatchObject({
+      queuedBatches: 0,
+      deadLetterBatches: 1,
+      deadLetterEvictedBatches: 1,
+    });
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.deadLetter[0].entry.batch.events[0].eventId).toBe("second");
+    await outbox.dispose();
+  });
+
+  it("persists once per flush pass instead of once per batch (HS8)", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    let writeCount = 0;
+    const outbox = new UsageTelemetryOutbox({
+      path,
+      writeState: () => {
+        writeCount += 1;
+      },
+    });
+    for (const id of ["a", "b", "c", "d", "e"]) {
+      outbox.enqueue(destinationHash, batch(id));
+    }
+    writeCount = 0; // only the flush pass below is under test, not the 5 enqueue-time persists
+    const delivered: string[] = [];
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => {
+        delivered.push(posted.events[0]!.eventId);
+        return { acknowledged: true, rejected: 0 };
+      },
+    }));
+    await outbox.flushNow();
+
+    expect(delivered).toEqual(["a", "b", "c", "d", "e"]);
+    expect(outbox.status().queuedBatches).toBe(0);
+    expect(writeCount).toBe(1);
+    await outbox.dispose();
+  });
+
+  it("rolls the whole pass back, not just the last mutation, when the final persist fails", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    let failNextWrite = false;
+    const outbox = new UsageTelemetryOutbox({
+      path,
+      writeState: (target, state) => {
+        if (failNextWrite) throw new Error("disk full");
+        writeFileSync(target, JSON.stringify(state));
+      },
+    });
+    outbox.enqueue(destinationHash, batch("first"));
+    outbox.enqueue(destinationHash, batch("second"));
+    failNextWrite = true;
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async () => ({ acknowledged: true, rejected: 0 }),
+    }));
+    await outbox.flushNow();
+
+    // Both acks happened in memory during the pass, but the single
+    // end-of-pass persist failed, so the whole pass rolled back: neither
+    // batch is lost, and the on-disk file still shows both queued.
+    expect(outbox.status()).toMatchObject({ queuedBatches: 2, persistenceFailures: 1 });
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    expect(stored.queue).toHaveLength(2);
+    await outbox.dispose();
+  });
+  it("emits dead-letter logs, diagnostics and ack counters only after the pass persists", async () => {
+    const path = fixture();
+    const destinationHash = usageTelemetryDestinationHash("https://usage.example.com/api/ingest/usage");
+    let failWrites = false;
+    const lines: string[] = [];
+    const diagnostics: string[] = [];
+    let persistedAcks = 0;
+    const outbox = new UsageTelemetryOutbox({
+      path,
+      maxHeadAttempts: 1,
+      log: (message) => lines.push(message),
+      onDiagnostic: (name) => diagnostics.push(name),
+      writeState: (target, state) => {
+        if (failWrites) throw new Error("disk full");
+        writeFileSync(target, JSON.stringify(state));
+      },
+    });
+    outbox.enqueue(destinationHash, batch("poison"));
+    outbox.enqueue(destinationHash, batch("good"));
+    outbox.configure(() => ({
+      destinationHash,
+      deliver: async (posted) => posted.events[0]!.eventId === "poison"
+        ? { acknowledged: false, rejected: 0 }
+        : { acknowledged: true, rejected: 0, onPersisted: () => { persistedAcks += 1; } },
+    }));
+
+    failWrites = true;
+    await outbox.flushNow();
+    // The pass rolled back: no dead-letter line, no dead_lettered count,
+    // and the ack is not counted, because none of it reached disk.
+    expect(outbox.status()).toMatchObject({ queuedBatches: 2, deadLetterBatches: 0 });
+    expect(lines.filter((line) => line.includes("dead-letter"))).toHaveLength(0);
+    expect(diagnostics).not.toContain("dead_lettered");
+    expect(persistedAcks).toBe(0);
+
+    failWrites = false;
+    await outbox.flushNow();
+    expect(outbox.status()).toMatchObject({ queuedBatches: 0, deadLetterBatches: 1 });
+    expect(lines.filter((line) => line.includes("dead-letter"))).toHaveLength(1);
+    expect(diagnostics.filter((name) => name === "dead_lettered")).toHaveLength(1);
+    expect(persistedAcks).toBe(1);
+    await outbox.dispose();
+  });
 });

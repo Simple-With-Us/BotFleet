@@ -117,7 +117,7 @@ export function PricingModeChip(props: { entry: EngineCapabilityEntry }): React.
     <span
       className="rounded-full bg-inset/60 px-2 py-0.5 text-[10.5px] font-medium text-ink-secondary"
       title={entry.pricing.kind === "subscription+api"
-        ? `${entry.pricing.subscription.tierLabel}${typeof entry.pricing.subscription.costPerMonth === "number" ? ` · $${entry.pricing.subscription.costPerMonth.toFixed(2)}/mo` : " · bundled"}; API ${entry.pricing.api.inputPer1k}/1k in`
+        ? `${entry.pricing.subscription.tierLabel}${typeof entry.pricing.subscription.costPerMonth === "number" ? ` · $${entry.pricing.subscription.costPerMonth.toFixed(2)}/mo` : ""}; API ${entry.pricing.api.inputPer1k}/1k in`
         : undefined}
     >
       {pricingModeLabel(entry.pricing)}

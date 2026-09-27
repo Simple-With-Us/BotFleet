@@ -1,3 +1,5 @@
+import { classifyAutoCheckError } from "./updater-throttle.mjs";
+
 export function createUpdaterCoordinator(updater, setState) {
   let checkOperation = null;
   let downloadOperation = null;
@@ -87,7 +89,11 @@ export function createUpdaterCoordinator(updater, setState) {
         .catch((error) => {
           if (operation.supersededByDownload) return { ok: true };
           handleRejectedOperation(operation.manual, error);
-          return { ok: false };
+          // errorClass lets a caller (updater.mjs's trackedCheck) tell a
+          // permanently broken feed (the same class every automatic tick)
+          // apart from sporadic transient failures without inspecting the
+          // raw Error itself.
+          return { ok: false, errorClass: classifyAutoCheckError(error) };
         })
         .finally(() => {
           if (checkOperation === operation) checkOperation = null;
@@ -95,7 +101,9 @@ export function createUpdaterCoordinator(updater, setState) {
     } catch (error) {
       if (!operation.supersededByDownload) handleRejectedOperation(operation.manual, error);
       checkOperation = null;
-      operation.promise = Promise.resolve({ ok: operation.supersededByDownload });
+      operation.promise = Promise.resolve(
+        operation.supersededByDownload ? { ok: true } : { ok: false, errorClass: classifyAutoCheckError(error) },
+      );
     }
     return operation.promise;
   }

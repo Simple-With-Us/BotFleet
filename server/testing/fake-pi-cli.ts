@@ -6,9 +6,13 @@
 // modes mirror how the real CLI misbehaves:
 //
 //   FAKE_PI_MODE   happy (default) | tooluse | permission | interleave | turn-error | no-models | exit-early
+//                  | model-refused (set_model answers success:false) | resume-fail (switch_session answers
+//                  success:false) | stderr-flood (on prompt: 100 KB to stderr, then exit 1) | length (the
+//                  reply is cut off by the output-token limit)
 //   FAKE_PI_MODELS comma-separated provider/model pairs (default "ollama-cloud/glm-5.2,openai/gpt-4o")
 //   FAKE_PI_DUMP   path to append {argv, env} JSON, so a test can assert argv shape
-//                  and env hygiene (no leaked secrets into the pi child).
+//                  and env hygiene (no leaked secrets into the pi child).  Also records
+//                  the child pid, the MCP config path, and each prompt received.
 
 import { appendFileSync, readFileSync } from "node:fs";
 
@@ -47,6 +51,8 @@ if (process.env.FAKE_PI_DUMP) {
       process.env.FAKE_PI_DUMP,
       JSON.stringify({
         argv,
+        pid: process.pid,
+        mcpConfigPath: process.env.OMB_MCP_CONFIG ?? null,
         envConfigured: ["PATH", "HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "BOX_TOKEN"].filter(
           (k) => process.env[k] !== undefined,
         ),
@@ -77,6 +83,15 @@ const streamTurn = () => {
     send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
   }
   send({ type: "turn_end", message: { stopReason: "end_turn", usage: { input: 12, output: 3 } }, usage: { input: 12, output: 3 } });
+  send({ type: "agent_end" });
+};
+
+// length: the reply stops at the output-token limit.
+const streamLengthTurn = () => {
+  send({ type: "agent_start" });
+  send({ type: "turn_start" });
+  send({ type: "message_update", usage: { input: 0, output: 0 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "The answer is" } });
+  send({ type: "turn_end", message: { stopReason: "length", usage: { input: 12, output: 4096 } }, usage: { input: 12, output: 4096 } });
   send({ type: "agent_end" });
 };
 
@@ -178,6 +193,10 @@ function handle(cmd: any) {
       send({ type: "response", command: "new_session", success: true, data: { sessionId: `s-${sessionCounter}`, sessionFile: currentSessionFile } });
       return;
     case "switch_session":
+      if (mode === "resume-fail") {
+        send({ type: "response", command: "switch_session", success: false, error: "session file not found" });
+        return;
+      }
       currentSessionFile = cmd.sessionPath ?? currentSessionFile;
       send({ type: "response", command: "switch_session", success: true, data: { sessionId: "s-resumed", sessionFile: currentSessionFile } });
       return;
@@ -188,6 +207,10 @@ function handle(cmd: any) {
         } catch {
           /* never let dumping break a run */
         }
+      }
+      if (mode === "model-refused") {
+        send({ type: "response", command: "set_model", success: false, error: `Model not found: ${cmd.provider}/${cmd.modelId}` });
+        return;
       }
       send({ type: "response", command: "set_model", success: true, data: { id: cmd.modelId, provider: cmd.provider } });
       return;
@@ -204,12 +227,27 @@ function handle(cmd: any) {
       send({ type: "response", command: "set_thinking_level", success: true });
       return;
     case "prompt":
+      if (process.env.FAKE_PI_DUMP) {
+        try {
+          appendFileSync(process.env.FAKE_PI_DUMP, JSON.stringify({ prompt: cmd.message }) + "\n");
+        } catch {
+          /* never let dumping break a run */
+        }
+      }
+      if (mode === "stderr-flood") {
+        // A crash that logs more than a pipe buffer: without a reader on
+        // stderr this write never completes and the process never exits.
+        const flood = `FATAL: provider stream exploded\n${"x".repeat(100 * 1024)}\nlast words: giving up\n`;
+        process.stderr.write(flood, () => process.exit(1));
+        return;
+      }
       // acknowledge acceptance; the completion comes via events
       send({ type: "response", command: "prompt", success: true });
       if (mode === "tooluse") streamToolTurn();
       else if (mode === "permission") streamPermissionTurn();
       else if (mode === "interleave") streamInterleaveTurn();
       else if (mode === "turn-error") streamErrorTurn();
+      else if (mode === "length") streamLengthTurn();
       else streamTurn();
       return;
     case "extension_ui_response":

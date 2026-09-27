@@ -58,6 +58,9 @@ export interface AppendQueueOptions<Context> {
   now?: () => number;
   /** Seam for the summary line. */
   report?: (line: string) => void;
+  /** Which log the summary line names.  More than one tee runs on this
+   * queue, so a drop line has to say which one filled. */
+  label?: string;
 }
 
 interface QueuedAppend<Context> {
@@ -75,6 +78,7 @@ export class BoundedAppendQueue<Context> {
   private readonly onWritten: (context: Context) => void;
   private readonly now: () => number;
   private readonly report: (line: string) => void;
+  private readonly label: string;
 
   private queue: QueuedAppend<Context>[] = [];
   private queuedBytes = 0;
@@ -96,6 +100,7 @@ export class BoundedAppendQueue<Context> {
     this.onWritten = options.onWritten ?? (() => undefined);
     this.now = options.now ?? Date.now;
     this.report = options.report ?? ((line) => console.error(line));
+    this.label = options.label ?? "event log tee";
   }
 
   enqueue(file: string, data: string, context: Context): void {
@@ -179,7 +184,7 @@ export class BoundedAppendQueue<Context> {
     const entries = this.dropsSinceReport === 1 ? "1 entry" : `${this.dropsSinceReport} entries`;
     this.guarded(() =>
       this.report(
-        `append-queue: dropped ${entries} (${this.dropBytesSinceReport} bytes) from the event log tee — ` +
+        `append-queue: dropped ${entries} (${this.dropBytesSinceReport} bytes) from the ${this.label} — ` +
           `writes are behind the fleet and the queue is capped at ${this.maxQueuedBytes} bytes.  Live delivery is unaffected.`,
       ),
     );

@@ -148,6 +148,10 @@ class InfisicalManager {
   private lastError: string | null = null;
   private stale = false;
   private pendingProviderReload = false;
+  /** What `bootLineIfChanged()` last handed back a caller to print, with
+   * `bootLine()`'s own trailing `ms=NNN` timing stripped — see that
+   * method for why. */
+  private lastLoggedBootLineSignature: string | null = null;
 
   /** Live view of app config, installed by the server at boot.  A getter
    * (not a snapshot) so a Settings save takes effect on the next refresh
@@ -155,6 +159,10 @@ class InfisicalManager {
   configure(getter: (() => InfisicalSettings) | null, onApplied: ((reason: RefreshReason) => void) | null = null): void {
     this.settingsGetter = getter;
     this.onApplied = onApplied ?? null;
+    // A new settings source starts the "have we already printed this"
+    // question over — mainly so repeated test setup does not inherit a
+    // signature from a previous manager configuration.
+    this.lastLoggedBootLineSignature = null;
   }
 
   private settings(): InfisicalSettings {
@@ -493,6 +501,26 @@ class InfisicalManager {
     }
     const fields = status.appliedFields.join(",");
     return `[infisical] enabled env=${status.environment} path=${status.secretPath} vault=${status.vaultCount} applied=${status.appliedCount} fields=${fields} unused=${status.unusedVaultNames.length} ms=${status.lastSyncMs ?? 0}`;
+  }
+
+  /** `bootLine()`'s text, or `null` when it is unchanged from the last time
+   * THIS method was called (OP11).  `server/index.ts` prints unconditionally
+   * at boot and used to print again on every Settings PATCH that carried an
+   * `infisical` block, even one that changed nothing — on this Mac, which
+   * has no machine identity configured, that meant "disabled: not
+   * configured" on every unrelated settings save.  Both call sites route
+   * through here so there is one source of truth for "did this change".
+   *
+   * The comparison strips `bootLine()`'s own trailing `ms=NNN`: that field
+   * is a fresh sync's timing, not part of the configuration, and changes on
+   * every successful refresh even when nothing else did — comparing the
+   * raw string would make this never dedupe at all. */
+  bootLineIfChanged(): string | null {
+    const line = this.bootLine();
+    const signature = line.replace(/ ms=\d+$/, "");
+    if (signature === this.lastLoggedBootLineSignature) return null;
+    this.lastLoggedBootLineSignature = signature;
+    return line;
   }
 }
 

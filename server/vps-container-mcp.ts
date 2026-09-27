@@ -3,14 +3,15 @@
 // user's normal SSH config and agent; this process stores no credentials.
 // The piping, drain-safe exit, and dead-transport watchdog live in
 // mcp-bridge.ts, shared with the Local VM entry point.
+import { CUA_SOCKET, DISPLAY } from "./container-computer.ts";
 import { runMcpBridge } from "./mcp-bridge.ts";
 import { vpsContainerMcpArgs, vpsDockerArgs } from "./vps-computer.ts";
 
-const [alias, containerName] = process.argv.slice(2);
+const [alias, containerName, socket = CUA_SOCKET, display = DISPLAY] = process.argv.slice(2);
 const sshAlias = alias ?? "";
 let args: string[];
 try {
-  args = vpsContainerMcpArgs(sshAlias, containerName ?? "");
+  args = vpsContainerMcpArgs(sshAlias, containerName ?? "", socket, display);
 } catch {
   process.stderr.write("invalid VPS MCP connection\n");
   process.exit(2);

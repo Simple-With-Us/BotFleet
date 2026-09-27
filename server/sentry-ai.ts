@@ -18,8 +18,9 @@
 // not be unified — they are different registries that happen to overlap.
 import type { RuntimeEvent } from "./contracts.ts";
 import { observability } from "./observability.ts";
+import { classifyError } from "./drivers/retry.ts";
 import { redactSecretsInText } from "./redact.ts";
-import { getSentry, isSentryActive } from "./sentry.ts";
+import { getSentry, isSentryActive, scrubWebhookSecrets } from "./sentry.ts";
 
 export type SpanLike = {
   setAttribute(key: string, value: string | number | boolean): void;
@@ -30,6 +31,21 @@ export type SpanLike = {
 /** Scope a single capture without touching the global Sentry scope. */
 export type SentryCaptureContext = {
   tags?: Record<string, string>;
+  /** Sentry's grouping key.  Every capture in this file happens at one of
+   * two call sites, so the default stack-trace grouping would fold every
+   * engine's failures into one Issue (BOTFLEET-M); an explicit fingerprint
+   * splits them by driver kind and failure class instead.  The driver kind,
+   * not the gen_ai provider name, because two engines share one provider
+   * name (dshAgent and the DeepSeek HTTP driver are both "deepseek") and
+   * fail for unrelated reasons.  Built only from bounded values — never the
+   * raw free-text message. */
+  fingerprint?: string[];
+};
+
+/** A non-exception capture: a condition worth an Issue at warning level,
+ * such as an engine that is not installed, rather than a crash. */
+export type SentryMessageContext = SentryCaptureContext & {
+  level?: "info" | "warning" | "error";
 };
 
 export type SentryBreadcrumb = {
@@ -55,6 +71,9 @@ export type SentryAiSink = {
     parentSpan?: SpanLike;
   }) => SpanLike;
   captureException: (error: Error, context?: SentryCaptureContext) => void;
+  /** Optional so a stand-in sink with only captureException still works;
+   * without it a setup failure falls back to captureException. */
+  captureMessage?: (message: string, context?: SentryMessageContext) => void;
   addBreadcrumb?: (crumb: SentryBreadcrumb) => void;
 };
 
@@ -88,6 +107,17 @@ const reportedProviderErrors = new Set<string>();
 // but the turn then finishes as a generic rpc_error.  Remember those turns
 // so the completion breadcrumbs too instead of paging a second report.
 const initTimeoutTurns = new Set<string>();
+// A setup runtime.error ("`dsh` isn't installed") is breadcrumbed, and the
+// turn then ends as a reasonless spawn_error.  Keep the setup text per turn
+// so the completion reports what actually went wrong (BOTFLEET-13) instead
+// of "bot turn failed: spawn_error".
+const setupErrorTurns = new Map<string, string>();
+// The chat-completions loop reports its own model-request timeout as
+// runtime.error "the model did not answer within …" and then ends the turn
+// with stopReason "timeout" — the same stop reason its wall-clock budget
+// uses.  Only a turn that saw the request-timeout message may treat
+// "timeout" as expected; a wall-clock stop still pages.
+const modelTimeoutTurns = new Set<string>();
 
 let identityResolver: ((threadId: string) => TurnIdentity | null) | null = null;
 
@@ -138,6 +168,10 @@ export type TurnFailureTags = TurnIdentityAttributes & {
   "botfleet.thread.id": string;
   "gen_ai.provider.name": string;
   "gen_ai.request.model"?: string;
+  /** The completion's stop reason, so an Issue can be filtered by it. */
+  "botfleet.stop_reason"?: string;
+  /** "true" when the failure followed a setup runtime.error. */
+  "botfleet.setup"?: string;
 };
 
 function identityAttributes(identity: TurnIdentity | null): TurnIdentityAttributes {
@@ -178,6 +212,16 @@ type SentryStartSpanOptions = Parameters<
   NonNullable<ReturnType<typeof getSentry>>["startInactiveSpan"]
 >[0];
 
+/** Only the scope fields a capture actually set, so an absent context stays
+ * `undefined` rather than an empty object the SDK would merge. */
+function captureScope(context: SentryCaptureContext | undefined): SentryCaptureContext | undefined {
+  if (!context?.tags && !context?.fingerprint) return undefined;
+  const scope: SentryCaptureContext = {};
+  if (context.tags) scope.tags = context.tags;
+  if (context.fingerprint) scope.fingerprint = context.fingerprint;
+  return scope;
+}
+
 function liveSink(): SentryAiSink | null {
   if (!isSentryActive()) return null;
   const Sentry = getSentry();
@@ -213,7 +257,11 @@ function liveSink(): SentryAiSink | null {
       return span as SpanLike;
     },
     captureException: (error, context) => {
-      Sentry.captureException(error, context?.tags ? { tags: context.tags } : undefined);
+      Sentry.captureException(error, captureScope(context));
+      observability.noteCapture();
+    },
+    captureMessage: (message, context) => {
+      Sentry.captureMessage(message, { ...captureScope(context), level: context?.level ?? "warning" });
       observability.noteCapture();
     },
     addBreadcrumb: (crumb) => {
@@ -330,7 +378,43 @@ function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?
   span.setAttribute("gen_ai.usage.cost", cost);
 }
 
-const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted", "request_timeout"]);
+/** Stop reasons that are never a crash on their own.  `host_control_policy`
+ * is Antigravity refusing, fail-closed, to run a host-control turn under an
+ * always-proceed tool policy — a verdict the person is shown, not a fault.
+ * "timeout" is deliberately absent: see `modelTimeoutTurns`. */
+const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted", "host_control_policy"]);
+
+/** Stop reasons a request-timeout turn can end with: the chat-completions
+ * loop maps its `request_timeout` exit to "timeout", and "request_timeout"
+ * is kept for a driver that reports the exit name itself. */
+const MODEL_TIMEOUT_STOPS = new Set(["timeout", "request_timeout"]);
+
+/** The leading words of `antigravityHostPolicyRefusal` in both of its
+ * forms.  Matched as text rather than imported, so this module does not
+ * pull the whole Antigravity driver in; sentry-ai.test.ts pins the match
+ * against the function's real output. */
+const ANTIGRAVITY_POLICY_REFUSAL = "Antigravity's tool execution policy";
+
+/** A bounded failure class for a runtime.error, for the Issue fingerprint.
+ * The retry classifier's reason when it recognizes the text, joined to the
+ * message's shape with every variable part — numbers, ids, paths, quoted
+ * values, URLs — folded to a placeholder, secrets redacted first.  Two
+ * different failures keep two Issues; the same failure with a different
+ * request id or duration stays one. */
+export function classifyMessage(message: string): string {
+  const { reason } = classifyError({ text: message });
+  const template = scrubWebhookSecrets(redactSecretsInText(message))
+    .toLowerCase()
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/g, "<url>")
+    .replace(/(["`])(?:(?!\1).){0,200}\1/g, "<q>")
+    .replace(/(?:~|\.{1,2})?(?:\/[\w.@-]+){2,}/g, "<path>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{8,}\b/g, "<id>")
+    .replace(/\d+(?:\.\d+)?/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return `${reason}: ${template || "empty"}`;
+}
 
 function endTurn(
   key: string,
@@ -357,6 +441,7 @@ function failureTags(
   event: RuntimeEvent,
   provider: string,
   turn: AgentTurn | undefined,
+  outcome: { stopReason?: string; setup?: boolean } = {},
 ): TurnFailureTags {
   const identity = turn?.identity ?? identityFor(event.threadId);
   const tags: TurnFailureTags = {
@@ -367,6 +452,8 @@ function failureTags(
   };
   const model = clean(turn?.model) ?? clean(identity?.model);
   if (model) tags["gen_ai.request.model"] = model;
+  if (outcome.stopReason) tags["botfleet.stop_reason"] = outcome.stopReason;
+  if (outcome.setup) tags["botfleet.setup"] = "true";
   return tags;
 }
 
@@ -383,6 +470,11 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
   switch (event.type) {
     case "turn.started": {
       reportedProviderErrors.delete(key);
+      // A turn that never completed (a crashed driver) must not hand its
+      // flags to the next turn on the same key.
+      initTimeoutTurns.delete(key);
+      modelTimeoutTurns.delete(key);
+      setupErrorTurns.delete(key);
       const identity = eventIdentity;
       const named = agentName(identity, event.provider);
       const span = sink.startInactiveSpan({
@@ -537,7 +629,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         event.message.includes("nobody answered this permission request in time") ||
         event.message.includes("timeout waiting for response") ||
         event.message.includes("initialize timed out") ||
-        event.message.includes("the model did not answer within");
+        event.message.includes("the model did not answer within") ||
+        event.message.startsWith(ANTIGRAVITY_POLICY_REFUSAL);
 
       if (isExpectedNonCrash) {
         sink.addBreadcrumb?.({
@@ -546,6 +639,8 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
           level: "warning",
         });
         if (event.message.includes("initialize timed out")) initTimeoutTurns.add(key);
+        if (event.message.includes("the model did not answer within")) modelTimeoutTurns.add(key);
+        if (event.setup) setupErrorTurns.set(key, redactSecretsInText(event.message).slice(0, 500));
         break;
       }
       const turn = turns.get(key);
@@ -556,7 +651,10 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       if (!providerTurnFailure || !reportedProviderErrors.has(key)) {
         sink.captureException(
           new Error(event.message.slice(0, 500)),
-          { tags: failureTags(event, provider, turn) },
+          {
+            tags: failureTags(event, provider, turn),
+            fingerprint: ["bot-runtime-error", event.provider, classifyMessage(event.message)],
+          },
         );
         if (providerTurnFailure) reportedProviderErrors.add(key);
       }
@@ -566,11 +664,15 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
       const runtimeErrorReported = reportedProviderErrors.has(key);
       const stopReason = clean(event.stopReason)?.slice(0, 200) ?? "unknown";
       const afterInitTimeout = initTimeoutTurns.delete(key);
+      const afterModelTimeout = modelTimeoutTurns.delete(key);
+      const setupMessage = setupErrorTurns.get(key);
+      setupErrorTurns.delete(key);
       const expectedStop =
         !event.ok &&
         !runtimeErrorReported &&
         (EXPECTED_TURN_STOPS.has(stopReason) ||
-          (afterInitTimeout && stopReason === "rpc_error"));
+          (afterInitTimeout && stopReason === "rpc_error") ||
+          (afterModelTimeout && MODEL_TIMEOUT_STOPS.has(stopReason)));
       if (!event.ok) {
         // A failed turn is the thing an operator wants an Issue for.  Most
         // drivers report the failure only here — they never emit
@@ -578,10 +680,10 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
         // OpenAI-compatible, Grok, BoxAgent, and chat-completions drivers
         // report a user-initiated stop as "interrupted" rather than
         // "cancelled" — both are the expected, benign shape of a stop.
-        // "request_timeout" is the driver's own model-request timeout:  the
-        // matching runtime.error was already breadcrumbed as an expected
-        // operational condition, so the completion must not page an Issue.
-        // request_timeout + ACP init→rpc_error covered via expectedStop above.
+        // A model-request timeout ("the model did not answer within …",
+        // then stopReason "timeout") and an ACP init timeout (then
+        // rpc_error) were already breadcrumbed as expected operational
+        // conditions, so their completions must not page an Issue either.
         if (expectedStop) {
           sink.addBreadcrumb?.({
             category: "botfleet.turn",
@@ -589,10 +691,23 @@ export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | nu
             level: "warning",
             data: { provider: event.provider, threadId: event.threadId },
           });
+        } else if (!runtimeErrorReported && setupMessage) {
+          // The engine could not start for a reason the operator fixes
+          // (install the CLI, sign in).  Report that reason, at warning
+          // level, as one Issue per engine — not a reasonless crash.
+          const turn = turns.get(key);
+          const context: SentryMessageContext = {
+            level: "warning",
+            tags: failureTags(event, provider, turn, { stopReason, setup: true }),
+            fingerprint: ["bot-setup", event.provider],
+          };
+          if (sink.captureMessage) sink.captureMessage(setupMessage, context);
+          else sink.captureException(new Error(setupMessage), context);
         } else if (!runtimeErrorReported) {
           const turn = turns.get(key);
           sink.captureException(new Error(`bot turn failed: ${stopReason}`), {
-            tags: failureTags(event, provider, turn),
+            tags: failureTags(event, provider, turn, { stopReason }),
+            fingerprint: ["bot-turn-failure", event.provider, stopReason],
           });
         }
       }
@@ -612,6 +727,8 @@ export function resetSentryAiForTests(): void {
   turns.clear();
   reportedProviderErrors.clear();
   initTimeoutTurns.clear();
+  setupErrorTurns.clear();
+  modelTimeoutTurns.clear();
   identityResolver = null;
 }
 
