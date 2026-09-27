@@ -42,7 +42,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, isCoarseApprovalKey } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -9210,15 +9210,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       if (!allowKey) return json(res, 400, { error: "allowKey required" });
-      if (isCoarseApprovalKey(allowKey)) {
-        return json(res, 400, { error: `${allowKey} would cover every shell command — approve this one instead` });
-      }
-      const pending = store.messagesFor(bot.threadId).some((message) =>
+      const pendingCard = store.messagesFor(bot.threadId).find((message) =>
         message.card?.requestId &&
         !message.card.answered &&
         message.card.dismissed !== true &&
         message.card.allowKey === allowKey
-      );
+      )?.card;
+      if (coarseAlwaysAllowRefused(allowKey, { scope: pendingCard?.approvalScope })) {
+        return json(res, 400, { error: `${allowKey} would cover every shell command — approve this one instead` });
+      }
+      const pending = Boolean(pendingCard);
       if (!pending) {
         return json(res, 409, { error: "that grant is not on a pending approval for this bot" });
       }
@@ -9398,12 +9399,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // when it is new; one stored before this rule existed is dropped
         // rather than failing every later save that carries it along.
         const introduced = requested.find(
-          (key) => isCoarseApprovalKey(key) && !existingBot?.alwaysAllow?.includes(key),
+          (key) => coarseAlwaysAllowRefused(key) && !existingBot?.alwaysAllow?.includes(key),
         );
         if (introduced) {
           return json(res, 400, { error: `${introduced} would cover every shell command — approve it once instead` });
         }
-        patch.alwaysAllow = requested.filter((key) => !isCoarseApprovalKey(key)).slice(0, 200);
+        patch.alwaysAllow = requested.filter((key) => !coarseAlwaysAllowRefused(key)).slice(0, 200);
       }
       if (existingBot && body.computers !== undefined) {
         await interruptIfHostRevoked(existingBot, body.computers);

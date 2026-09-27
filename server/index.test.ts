@@ -7303,15 +7303,23 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     }
   });
 
-  it("refuses to remember an always-allow that is a shell in disguise", async () => {
+  it("refuses coarse always-allow on the host but allows it for disposable computers", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
-      const coarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
-      expect(coarse.status).toBe(400);
-      expect(coarse.body.error).toMatch(/every shell command/);
+      const hostCoarse = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: ["Bash:git", "local-computer:Bash:bash"],
+      });
+      expect(hostCoarse.status).toBe(400);
+      expect(hostCoarse.body.error).toMatch(/every shell command/);
+
+      const virtualCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
+      expect(virtualCoarse.status).toBe(200);
+      expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", "Bash:bash"]);
+
       const direct = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:sh" });
       expect(direct.status).toBe(400);
-      expect(direct.body.error).toMatch(/every shell command/);
+      expect(direct.body.error).toMatch(/not on a pending approval/);
+
       const narrow = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git"] });
       expect(narrow.status).toBe(200);
       expect(narrow.body.bot.alwaysAllow).toEqual(["Bash:git"]);

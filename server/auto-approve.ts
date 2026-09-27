@@ -82,11 +82,12 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
   return scope ? `${scope}:${key}` : key;
 }
 
-/** Program names that run whatever follows them.  An Always-allow keyed on
- * one of these is the bare "Bash" grant in disguise — `Bash:bash` covers
+/** Program names that run whatever follows them.  On the person's own
+ * desktop (`local-computer` scope) an Always-allow keyed on one of these
+ * is the bare "Bash" grant in disguise — `Bash:bash` covers
  * `bash -c <anything>`, `Bash:env` covers `env sh -c …` — so it is never
- * remembered, and a stored one is ignored.  The only way through is the
- * card, every time. */
+ * remembered there, and a stored local-scoped one is ignored.  On a
+ * disposable remote computer the same key is the right width. */
 const COARSE_PROGRAMS = new Set([
   "sh", "bash", "zsh", "fish", "ksh", "dash", "csh", "tcsh",
   "eval", "exec", "source", ".", "env", "xargs", "nohup", "command", "builtin", "time", "timeout", "nice", "su",
@@ -106,6 +107,19 @@ export function isCoarseApprovalKey(key: string): boolean {
   if (colon === -1) return true;
   const program = unscoped.slice(colon + 1).toLowerCase();
   return program === "" || COARSE_PROGRAMS.has(program);
+}
+
+/** Whether Always-allow must refuse to remember or honor this coarse key.
+ * Non-local / virtual computers may remember `Bash:bash` and friends; the
+ * host may not. */
+export function coarseAlwaysAllowRefused(
+  key: string,
+  context?: { scope?: "local-computer" },
+): boolean {
+  if (!isCoarseApprovalKey(key)) return false;
+  if (key.startsWith("local-computer:")) return true;
+  if (context?.scope === "local-computer") return true;
+  return false;
 }
 
 export interface AutoApprover {
@@ -164,7 +178,7 @@ export function autoVerdict(
   const grant =
     destructive || sensitive
       ? null
-      : bot.alwaysAllow?.includes(key) && !isCoarseApprovalKey(key)
+      : bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
         : bot.autoApprove
           ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
