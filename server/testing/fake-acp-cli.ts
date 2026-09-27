@@ -646,7 +646,7 @@ function handle(msg: any) {
       }
       if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
-      if (mode === "permission") {
+      if (mode === "permission" || mode === "remote-computer-permission") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
         onPermissionAnswered = complete;
@@ -655,7 +655,9 @@ function handle(msg: any) {
           id: pendingPermissionId,
           method: "session/request_permission",
           params: {
-            toolCall: { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
+            toolCall: { kind: mode === "remote-computer-permission" ? "mcp" : "execute", rawInput: mode === "remote-computer-permission"
+              ? { serverName: "computer_shared_vm", toolName: "bash", command: "bash -c echo hi" }
+              : { command: "echo hi" }, title: "echo hi" },
             options: [
               { optionId: "allow-once", kind: "allow_once" },
               { optionId: "reject", kind: "reject_once" },

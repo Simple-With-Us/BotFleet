@@ -195,7 +195,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // Reached from a room as well as a 1:1 chat since the room lane started
       // resolving computers, so a full-auto Codex bot with This Computer now
       // asks in BOTH lanes.
-      const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
+      const computerMounts = turnComputerMounts(turn.integrations);
+      const hostPrefix = hostToolPrefix(computerMounts);
+      const controlsHost = hostPrefix !== null;
       const brokered = controlsHost && config.fullAuto;
       const turnFullAuto = config.fullAuto && !brokered;
       // a retry relaunches the whole app-server; the backoff is scaled down in
@@ -321,9 +323,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       };
 
       // server→client approval request → canonical request.opened
-      // Host-scope tagging mirrors claude.ts: when this turn mounts the real
-      // Mac (not a VM), every card carries approvalScope so the harness's
-      // local-computer-block backstop applies to remembered always-allows.
+      // Native shell/file asks can run on the host, even with a remote
+      // computer mounted. Only an MCP elicitation explicitly naming a
+      // different granted computer may use that computer's coarse grants.
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
@@ -353,6 +355,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           });
         }
         const requestId = newId();
+        const remoteComputerAsk = isMcpElicitation && computerMounts.some((mount) =>
+          mount.kind !== "local" && params.serverName === mount.name &&
+          typeof mcpTool === "string" && mcpTool.length > 0,
+        );
+        const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
         const summary =
           isMcpElicitation && typeof params.message === "string"
             ? params.message
@@ -402,7 +409,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           tool,
           summary,
           choices,
-          approvalScope: controlsHost ? "local-computer" : undefined,
+          approvalScope,
         });
       };
 

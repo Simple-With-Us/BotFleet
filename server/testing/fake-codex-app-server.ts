@@ -205,16 +205,18 @@ process.stdin.on("data", (chunk) => {
           : "ls -la";
         notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
         notify("item/started", { item: { id: "w1", type: "webSearch", query: "BotFleet" } });
-        if (mode === "mcp-elicitation") {
+        if (mode === "mcp-elicitation" || mode === "remote-computer-elicitation") {
           out({
             jsonrpc: "2.0",
             id: 101,
             method: "mcpServer/elicitation/request",
             params: {
-              serverName: "agents",
+              serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : "agents",
               mode: "form",
               _meta: { codex_approval_kind: "mcp_tool_call", tool_params: {} },
-              message: 'Allow the agents MCP server to run tool "list_bots"?',
+              message: mode === "remote-computer-elicitation"
+                ? 'Allow the computer_shared_vm MCP server to run tool "bash"?'
+                : 'Allow the agents MCP server to run tool "list_bots"?',
               requestedSchema: { type: "object", properties: {} },
             },
           });

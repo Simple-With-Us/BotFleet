@@ -510,7 +510,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // harness, where the bot's Auto policy, the destructive and sensitive
         // guards, and the unattended block decide. That is what lets a
         // full-auto bot mount the local computer at all.
-        const controlsHost = hostToolPrefix(turnComputerMounts(turn.integrations)) !== null;
+        const computerMounts = turnComputerMounts(turn.integrations);
+        const controlsHost = hostToolPrefix(computerMounts) !== null;
         const turnConfig: AcpConfig = controlsHost && config.fullAuto ? { ...config, fullAuto: false } : config;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const turnId = newId();
@@ -932,6 +933,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           const tool = kind === "execute" ? "shell" : kind === "edit" ? "edit" : kind || "tool";
           const summary = String(toolCall.rawInput?.command ?? toolCall.title ?? tool).slice(0, 200);
           const requestId = newId();
+          // ACP toolCall metadata can name an MCP server in rawInput. Trust
+          // only an exact granted remote mount; unknown/native calls stay
+          // host-scoped so missing metadata cannot expose host shell grants.
+          const remoteComputerAsk = computerMounts.some((mount) =>
+            kind !== "execute" && kind !== "edit" && mount.kind !== "local" &&
+            toolCall.rawInput?.serverName === mount.name &&
+            typeof toolCall.rawInput?.toolName === "string" && toolCall.rawInput.toolName.length > 0,
+          );
+          const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
           const finish = (behavior: string, source: "user" | "timeout" | "system" = "user") => {
             if (!asks.delete(requestId)) return;
             clearTimeout(timer);
@@ -949,7 +959,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               requestId,
               behavior: optionId && behavior === "allow" ? "allow" : "deny",
               source: optionId ? source : "system",
-              approvalScope: controlsHost ? "local-computer" : undefined,
+              approvalScope,
             });
           };
           const timer = setTimeout(() => {
@@ -964,7 +974,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             requestType: "permission",
             tool,
             summary,
-            approvalScope: controlsHost ? "local-computer" : undefined,
+            approvalScope,
           });
         };
 
