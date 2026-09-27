@@ -1,5 +1,7 @@
 # Delta Audit Reconciliation And P0/P1 Fix Wave — Wed, Sep 2, 2026
 
+> **2026-09-22 [MM] archaeology note:** historical references to `com.jay.botfleet-server` and `com.botfleet.app` kept verbatim as the bundle IDs that were live at audit time.  Both were renamed on 2026-09-22 (PR forthcoming): macOS app `app.botfleet.macos`, server LaunchAgent `app.botfleet.server`, iOS app `app.botfleet.ios`, iOS widgets `app.botfleet.ios.widgets`, Electron Recorder `app.botfleet.recorder.macos`, Electron Speech helper `app.botfleet.speech.macos`, plus the new app group `group.app.botfleet` and associated domain `botfleet.app`.  See `docs/rollouts/2026-09-22-bundle-id-migration.md`.
+
 **Seat:** CLAUDE.  **Branch:** `claude/fleet-docs`.  **Worktree:** `~/apps/botfleet-claude`.  **Board:** `781554fd` (analysis), `ef0c48c6` (main repair), wave rows `92cbbb32` `bb105568` `c5ffa6db` `292b248b` `05e95a05` `3307a1db`.  **Owner input:** `BotFleet-Delta-Audit-2026-09-01.docx` (Grok seat, HEAD `b34ac90`).
 
 **Method:** 16 specialist reviewers over `b34ac90` (238 raw findings), adversarial verification (144 confirmed, 89 left unverified when the session capped, 4 refuted), Grok's pickup report (`2026-09-01-botfleet-analysis-v2.md`), then a hands-on repair of `main` on Sep 2 and an owner-authorized fixer wave.  Section numbers continue the docx so the two documents can be read together.

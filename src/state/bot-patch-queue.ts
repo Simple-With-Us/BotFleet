@@ -17,6 +17,7 @@ export type BotUpdatePatch = Partial<
     | "avatarCrop"
     | "autoApprove"
     | "speakReplies"
+    | "speechDevices"
     | "maxToolRounds"
     | "voice"
     | "pinned"

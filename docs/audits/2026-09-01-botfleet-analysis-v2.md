@@ -1,5 +1,7 @@
 # BotFleet Analysis v2 — 1 September 2026
 
+> **2026-09-22 [MM] archaeology note:** historical references to `com.jay.botfleet-server` and `com.botfleet.app` kept verbatim as the bundle IDs that were live at audit time.  Both were renamed on 2026-09-22 (PR forthcoming): macOS app `app.botfleet.macos`, server LaunchAgent `app.botfleet.server`, iOS app `app.botfleet.ios`, iOS widgets `app.botfleet.ios.widgets`, Electron Recorder `app.botfleet.recorder.macos`, Electron Speech helper `app.botfleet.speech.macos`, plus the new app group `group.app.botfleet` and associated domain `botfleet.app`.  See `docs/rollouts/2026-09-22-bundle-id-migration.md`.
+
 **Seat:** GROK pickup of CLAUDE.  **Branch:** `claude/analysis-v2` (not rebranded).  **Worktree:** `~/apps/botfleet-claude`.  **HEAD audited:** `6888f3e` (`origin/main`, includes #87–#92).  **Board:** `781554fd`.  **Issue:** #22 (audit series).  **Journal:** `wf_3ee20724-a39`.
 
 **Method:** Claude's 16-finder workflow produced 238 raw findings, then the session limit killed verification round 2, the critic, and synthesis (`report: null`, `round2: 0`).  GROK salvaged the journal, treated every transcript claim as stale, merged `origin/main`, re-read current source, probed live Mac ops and public URLs, and reconciled with the owner Delta Audit docx.

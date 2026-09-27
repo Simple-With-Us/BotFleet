@@ -33,6 +33,7 @@ export function buildTurnTools(
     workspace?: unknown;
     recall?: unknown;
     phone?: unknown;
+    linq?: unknown;
   },
   gate?: Partial<ToolGateContext>,
 ): ToolDefinition[] {
@@ -47,6 +48,7 @@ export function buildTurnTools(
     // wire catalog must derive it the same way host.ts's gate does, or the
     // two would disagree about whether github_* tools exist this turn.
     github: Boolean(integrations.localComputer),
+    linq: Boolean(integrations.linq ?? gate?.linq),
     commsDepth: 0,
     // The caller's own depth gate already ran; without explicit numbers the
     // registry ceiling must not subtract a second time.

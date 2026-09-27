@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>speech-helper</string>
     <key>CFBundleIdentifier</key>
-    <string>com.botfleet.app.speech-helper</string>
+    <string>app.botfleet.speech.macos</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

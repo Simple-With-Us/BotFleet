@@ -50,7 +50,7 @@ cat > "${REPO}/${MANIFEST_REL}" <<'JSON'
   "schemaVersion": 1,
   "updatedAt": "2026-09-04T03:58:13Z",
   "apps": {
-    "app.botfleet": {
+    "app.botfleet.ios": {
       "marketingVersion": "1.0.29",
       "build": "202609032050",
       "appleId": 6806379515,
@@ -110,12 +110,12 @@ read_field() {
 
 echo
 echo "=== publish-ios-versions.sh: fresh ship updates all four fields ==="
-out="$(run_pub app.botfleet 1.0.32 202609180412 6806379515 BotFleet)"
+out="$(run_pub app.botfleet.ios 1.0.32 202609180412 6806379515 BotFleet)"
 echo "$out" | sed 's/^/    /'
-check "marketingVersion written"   "1.0.32"      "$(read_field app.botfleet marketingVersion)"
-check "build written"              "202609180412" "$(read_field app.botfleet build)"
-check "appleId written"            "6806379515"  "$(read_field app.botfleet appleId)"
-check "displayName written"        "BotFleet"    "$(read_field app.botfleet displayName)"
+check "marketingVersion written"   "1.0.32"      "$(read_field app.botfleet.ios marketingVersion)"
+check "build written"              "202609180412" "$(read_field app.botfleet.ios build)"
+check "appleId written"            "6806379515"  "$(read_field app.botfleet.ios appleId)"
+check "displayName written"        "BotFleet"    "$(read_field app.botfleet.ios displayName)"
 check "updatedAt refreshed"        "yes"         "$(
   before="$(git -C "$REPO" log --format=%s HEAD~1 2>/dev/null || echo '')"
   after="$(git -C "$REPO" log --format=%s HEAD 2>/dev/null || echo '')"
@@ -125,22 +125,22 @@ check "updatedAt refreshed"        "yes"         "$(
 echo
 echo "=== idempotent re-run with identical args must not produce a commit ==="
 git -C "$REPO" rev-parse HEAD > "${TMP}/before-sha"
-run_pub app.botfleet 1.0.32 202609180412 6806379515 BotFleet >/dev/null
+run_pub app.botfleet.ios 1.0.32 202609180412 6806379515 BotFleet >/dev/null
 git -C "$REPO" rev-parse HEAD > "${TMP}/after-sha"
 check "HEAD unchanged" "$(cat "${TMP}/before-sha")" "$(cat "${TMP}/after-sha")"
 check "log line says already current" "1" "$(
   AI_FLEET_COORDINATOR_ROOT="$REPO" bash "$PUB" \
-    --bundle-id app.botfleet --version 1.0.32 --build 202609180412 \
+    --bundle-id app.botfleet.ios --version 1.0.32 --build 202609180412 \
     --apple-id 6806379515 --display-name BotFleet 2>&1 | grep -c "already current"
 )"
 
 echo
 echo "=== partial args (version only) preserves appleId, displayName, build ==="
-run_pub app.botfleet 1.0.33 >/dev/null
-check "marketingVersion updated"   "1.0.33"     "$(read_field app.botfleet marketingVersion)"
-check "build preserved"           "202609180412" "$(read_field app.botfleet build)"
-check "appleId preserved"         "6806379515" "$(read_field app.botfleet appleId)"
-check "displayName preserved"     "BotFleet"   "$(read_field app.botfleet displayName)"
+run_pub app.botfleet.ios 1.0.33 >/dev/null
+check "marketingVersion updated"   "1.0.33"     "$(read_field app.botfleet.ios marketingVersion)"
+check "build preserved"           "202609180412" "$(read_field app.botfleet.ios build)"
+check "appleId preserved"         "6806379515" "$(read_field app.botfleet.ios appleId)"
+check "displayName preserved"     "BotFleet"   "$(read_field app.botfleet.ios displayName)"
 
 echo
 echo "=== brand-new bundle id is created with caller-supplied fields ==="

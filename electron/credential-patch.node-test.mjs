@@ -38,11 +38,7 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
   });
 
   it("every patch builder yields { section: { ... } } and passes the value through unchanged", () => {
-    // ttsKey intentionally persists a second field alongside the key
-    // (provider: "minimax") so migrateLegacyElevenLabsTtsProvider can
-    // distinguish fresh MiniMax saves from legacy ElevenLabs installs;
-    // that extra field is pinned by the dedicated regression test below
-    // rather than by a one-field assertion here.
+    // ttsKey pins the selected provider alongside the key.
     const multiField = new Set(["ttsKey"]);
     for (const name of names) {
       const sentinel = `sentinel-${name}`;
@@ -78,15 +74,13 @@ describe("desktop credential:set patches (CREDENTIAL_PATCH)", () => {
     assert.deepEqual(patch.infisicalClientSecret("shh"), { infisical: { clientSecret: "shh" } });
   });
 
-  it("persists provider: 'minimax' alongside the key on a fresh ttsKey save", () => {
-    // Mirror of shared/credential-request.ts credentialConfigPatch("ttsKey", …):
-    // a fresh MiniMax save must carry the explicit provider so the legacy
-    // ElevenLabs migration (server/config.ts migrateLegacyElevenLabsTtsProvider)
-    // skips it. Without this, a packaged Electron save — which routes through
-    // CREDENTIAL_PATCH instead of the shared helper — looks identical to a
-    // legacy ElevenLabs install and the just-validated MiniMax key gets
-    // routed to ElevenLabs on the next TTS call.
+  it("pins the selected voice engine on each key save, including new installations", () => {
+    // A fresh MiniMax save must carry the explicit provider field so the
+    // config reader always knows which voice engine to use without guessing.
+    // This is tested at the CREDENTIAL_PATCH level because packaged Electron
+    // saves route through CREDENTIAL_PATCH rather than the shared helper.
     assert.ok(Object.hasOwn(patch, "ttsKey"), "CREDENTIAL_PATCH is missing ttsKey");
     assert.deepEqual(patch.ttsKey("sk-fresh"), { tts: { key: "sk-fresh", provider: "minimax" } });
+    assert.deepEqual(patch.ttsKey("sk-eleven", "elevenlabs"), { tts: { key: "sk-eleven", provider: "elevenlabs" } });
   });
 });

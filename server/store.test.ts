@@ -410,6 +410,21 @@ describe("Store", () => {
     expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({});
   });
 
+  it("clearResumeCursor drops only the cursor it names, durably", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    store.setResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+    store.setResumeCursor(bot.id, "claude", "sess-keep", bot.threadId);
+    // A stale invalidation (a newer thread was saved since) is a no-op.
+    store.clearResumeCursor(bot.id, "claude", "sess-older", bot.threadId);
+    store.clearResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
+
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-keep" });
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({ claude: "sess-keep" });
+  });
+
   it("seedIfEmpty creates exactly one starter bot, once", () => {
     const store = new Store(selection);
     store.seedIfEmpty();
@@ -434,6 +449,21 @@ describe("Store", () => {
     expect(store.activePath(bot.threadId).map((m) => m.id)).toEqual(messages.map((m) => m.id));
   });
 
+  it("keeps a recorded utterance and its original transcript when a review is added", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const recording = { path: "/api/attachments/one.wav", mime: "audio/wav" as const,
+      transcript: "what the recognizer heard", engine: "apple-on-device" as const };
+    const original = store.appendMessage(bot.threadId, { role: "user", kind: "text", text: "what the recognizer heard", recording });
+    const review = { correction: "what I meant", comment: "Name spelled wrong", updatedAt: 10 };
+    store.patchMessage(bot.threadId, original.id, { recordingReview: review });
+    expect(store.branchMessage(bot.threadId, original.id, "rewrite history")).toBeNull();
+    const restored = new Store(selection).messagesFor(bot.threadId).find((message) => message.id === original.id);
+    expect(restored?.text).toBe("what the recognizer heard");
+    expect(restored?.recording).toEqual(recording);
+    expect(restored?.recordingReview).toEqual(review);
+  });
+
   it("branchMessage forks at the edited message and hides the old tail", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -452,6 +482,29 @@ describe("Store", () => {
     expect(store.messagesFor(bot.threadId).map((m) => m.id)).toContain(original.id);
 
     expect(store.branchMessage(bot.threadId, "nope", "x")).toBeNull();
+  });
+
+  it("branchMessage retains delegated attribution but drops the stale peer-thread link", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const from = { botId: "sender", name: "Compiler", color: "blue" };
+    const comm = { groupId: "peer-thread", withBotId: "sender", withName: "Compiler", withColor: "blue" };
+    const original = store.appendMessage(bot.threadId, {
+      role: "system", kind: "text", text: "Run CI",
+      automationSource: "delegation", from, comm,
+    });
+
+    const edited = store.branchMessage(bot.threadId, original.id, "Run tests")!;
+    expect(edited).toMatchObject({ role: "system", automationSource: "delegation", from });
+    expect(edited.from).not.toBe(original.from);
+    expect(edited.comm).toBeUndefined();
+    const regenerated = store.branchMessage(bot.threadId, edited.id, "Run tests")!;
+    expect(regenerated).toMatchObject({ role: "system", automationSource: "delegation", from });
+    expect(regenerated.comm).toBeUndefined();
+    store.flushBotsNow();
+    const reloaded = new Store(selection);
+    expect(reloaded.messagesFor(bot.threadId).find((message) => message.id === regenerated.id))
+      .toMatchObject({ role: "system", automationSource: "delegation", from });
   });
 
   it("setActiveLeaf switches branches and descends to the newest leaf", () => {

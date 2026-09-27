@@ -4,9 +4,11 @@ This file is the **authoritative coordination manifest for AI agent fleets** wor
 
 GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
-Hosting and routing (apexes, hostnames, hosts, deploy paths): see [`Fleet-OPS/docs/DOMAINS-AND-ROUTING.md`](https://github.com/jaywedgeworth22/Fleet-OPS/blob/main/docs/DOMAINS-AND-ROUTING.md). Built from live Cloudflare, Vercel, Coolify, Namecheap/RDAP, and GitHub APIs by CLAUDE on 2026-09-25; refresh via `Fleet-OPS/scripts/domain-inventory/run-all.sh`.
+Consult the private operations inventory for hosting and routing details.
 
 > **2026-09-22 [INSTINCT]:** Updater transition release — must ship and be applied to every Mac BEFORE the bundle rename (PR #524).  It ports the target-bootstrapping wrapper and the updater's legacy-identity acceptance with no bundle ID change, so the old updater can apply it and the rename update is then judged by transition-capable code.  See `docs/rollouts/2026-09-22-updater-transition-bootstrap.md` for the rollout order.
+>
+> **2026-09-22 [MM]:** Bundle identifier migration landed — `com.botfleet.app` → `app.botfleet.macos`, `com.jay.botfleet-server` → `app.botfleet.server`, `app.botfleet` → `app.botfleet.ios`, `app.botfleet.widgets` → `app.botfleet.ios.widgets`, `com.botfleet.app.recorder` → `app.botfleet.recorder.macos`, `com.botfleet.app.speech-helper` → `app.botfleet.speech.macos`, plus new app group `group.app.botfleet` and associated domain `botfleet.app`.  See `docs/rollouts/2026-09-22-bundle-id-migration.md` for the rollout doc and the new IDs table.
 
 ## Seat Identity And Branches
 
@@ -61,7 +63,7 @@ A PR whose complete diff is confined to `docs/**` or the root documentation file
 
 ## Mac Local Processes (binding)
 
-BotFleet runs always-on pieces on the Mac: `com.jay.botfleet-server` (harness on `127.0.0.1:8799`, webhook receiver `8800`), `com.jay.botfleet-imessage-relay`, `com.jay.mac-resource-watch`, and the on-demand `~/apps/update-botfleet.sh`.  If you create, change, load, bootout, or retire any LaunchAgent, cron row, pm2 job, or helper script other agents run, you **must** update `/Users/jay/apps/MAC-LOCAL-PROCESSES.md` and refresh the Apple Note (`apple-notes-coding.sh --update`) in the same change, and say whether it is always-on or on-demand.  The always-on harness runs from a detached `origin/main` checkout, never from a seat's feature branch.  Canonical: `AGENT-SYNC.md` § Mac local processes.
+BotFleet runs always-on pieces on the Mac: `app.botfleet.server` (harness on `127.0.0.1:8799`, webhook receiver `8800`), `com.jay.botfleet-imessage-relay`, `com.jay.mac-resource-watch`, and the on-demand `~/apps/update-botfleet.sh`.  If you create, change, load, bootout, or retire any LaunchAgent, cron row, pm2 job, or helper script other agents run, you **must** update `/Users/jay/apps/MAC-LOCAL-PROCESSES.md` and refresh the Apple Note (`apple-notes-coding.sh --update`) in the same change, and say whether it is always-on or on-demand.  The always-on harness runs from a detached `origin/main` checkout, never from a seat's feature branch.  Canonical: `AGENT-SYNC.md` § Mac local processes.
 
 ## Apple Notes For Owner-Facing Documents
 
@@ -86,6 +88,23 @@ When the owner gives you a secret, read it from `chmod 600` files under `/Users/
 ## Observability
 
 Sentry org `jays-services`, project `botfleet` (web client, harness spans, iOS Cocoa).  Do not stand up a second project.  CI reports deploys through the fleet Sentry reporter workflows.  Canonical: `AGENT-SYNC.md` § Observability.
+
+## Bundle Identifiers (2026-09-22 — `[MM]` migration)
+
+Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the app group, `<name>.app` for the associated domain.
+
+| Surface | Bundle ID | Where it lives |
+|---|---|---|
+| macOS app (Electron main) | `app.botfleet.macos` | `electron-builder.yml` `appId`, `electron/main.mjs` `setAppUserModelId`, `electron/cua.mjs`, `electron/cua-linux-runtime.cjs` |
+| macOS Recorder helper | `app.botfleet.recorder.macos` | `electron/resources/recorder-helper-Info.plist` |
+| macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
+| Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
+| iOS app | `app.botfleet.ios` | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
+| iOS widgets | `app.botfleet.ios.widgets` | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
+| App group | `group.app.botfleet` | `ios/App/BotFleet.entitlements`, `ios/Widgets/BotFleetWidgets.entitlements` |
+| Associated domain | `botfleet.app` (Universal Links + web credentials) | `ios/project.yml` `com.apple.developer.associated-domains` |
+
+macOS signing uses `build/entitlements.mac.plist` for the main app and `build/entitlements.mac.inherit.plist` for nested Electron Helper apps (`electron-builder.yml` `entitlements` / `entitlementsInherit`).  Restricted capabilities (`com.apple.security.application-groups: [group.app.botfleet]`, `com.apple.developer.associated-domains: [applinks:botfleet.app, webcredentials:botfleet.app]`) must go only on the main plist when the App ID is provisioned — never on the inherit plist.
 
 ## Skills In This Repo
 

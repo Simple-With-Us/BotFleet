@@ -38,6 +38,7 @@ import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib
 import { currentCall } from "@/lib/call";
 import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
+import { spokenReply } from "../../shared/voice-summary";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 
@@ -94,9 +95,13 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  audio?: Array<{ path: string; mime: string }>;
+  recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
+  recordingReview?: { correction?: string; comment?: string; updatedAt: number };
+  translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
@@ -310,6 +315,7 @@ export interface Bot {
   maxToolRounds?: number | null;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;
+  speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
   pinned?: boolean;
@@ -449,10 +455,10 @@ export interface ConfigStatus {
   ingress?: { publicUrl?: string; enabled?: boolean };
   localVm: { mode: "shared" | "per-bot"; maxInstances: number };
   opencodeGo?: { configured: boolean };
-  /** Voice (ElevenLabs). `configured` = a key is saved; `ready` = a key AND
+  /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "elevenlabs" | "system" };
+  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean };
   /** Shared write-only credential for on-demand GPT Image avatars. */
   imageGen?: { configured: boolean };
   /** who's using the app — collected in onboarding, shown in the sidebar */
@@ -539,6 +545,19 @@ export interface ConfigStatus {
     hasError: boolean;
     pendingProviderReload: boolean;
   };
+  /** Linq partner-API transport configuration.  The token never crosses the
+   *  /api/config wire — `configured` is the only signal of token presence;
+   *  `botNumber` and the per-bot transport map are operator-curated values
+   *  saved through `PUT /api/config`. */
+  imessageLinq?: {
+    configured: boolean;
+    botNumber: string;
+    perBot: Record<string, "off" | "mac-relay" | "linq">;
+    ignoredSenders: string[];
+    allowedSenders: string[];
+    allowVoiceByDefault: boolean;
+    webhookReady: boolean;
+  };
 }
 
 export type { RoomTerminology };
@@ -563,7 +582,7 @@ export function getConversationMode(config?: ConfigStatus | null): ConversationM
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical"
+  "xai" | "deepseek" | "composio" | "box" | "vps" | "rooms" | "botDefaults" | "host" | "ingress" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "autoUpdate" | "terminology" | "roomLabels" | "conversationMode" | "qdrant" | "usage" | "features" | "observability" | "infisical" | "imessageLinq"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -594,6 +613,9 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     features: frame.features,
     observability: frame.observability,
     infisical: frame.infisical,
+    // Without this every SSE `config` frame wipes Linq status and resets
+    // LinqSettings back to its empty defaults.
+    imessageLinq: frame.imessageLinq,
   };
 }
 
@@ -2696,11 +2718,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             // the whole point of listening while you do something else. A
             // Auto-speak is disabled during any call. Call mode owns both the
             // singleton speaker and microphone ordering for its whole lifetime.
-            const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId);
-            if (owner?.speakReplies && currentCall() === null && frame.message.text?.trim()) {
-              void speaker.speak(frame.message.text, {
+            const owner = stateRef.current.bots.find((b) => b.threadId === frame.threadId || b.tasks?.some((t) => t.threadId === frame.threadId));
+            if (owner && (owner.speechDevices ? owner.speechDevices.includes("mac") : owner.speakReplies) && currentCall() === null && frame.message.text?.trim()) {
+              void speaker.speak(spokenReply(frame.message.text), {
                 botId: owner.id,
                 messageId: frame.message.id,
+                threadId: frame.threadId,
                 voiceId: owner.voice,
               });
             }

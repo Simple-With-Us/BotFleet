@@ -172,6 +172,12 @@ const computerProvidersSchema = z.object({
 const botDefaultsSchema = z.object({
   computers: z.array(z.enum(["cloud", "vm", "local"])).max(3).optional(),
   cloudBackend: z.enum(["box", "vps"]).optional(),
+  /** Per-bot iMessage transport choice.  Absent = "off" (no surprise Linq
+   *  activation).  Stored alongside the other botDefaults because the
+   *  settings panel carries the whole block on every save, and because
+   *  `saveConfig` merges section-by-section so an unrelated edit never
+   *  wipes the per-bot mapping. */
+  imessagePerBot: z.record(z.string(), z.enum(["off", "mac-relay", "linq"])).optional(),
   // `null` is the wire spelling of "no allowlist — every destination is
   // allowed", and it has to be accepted, not merely tolerated: the settings
   // panel carries the whole botDefaults block on every save, so a fresh
@@ -260,9 +266,9 @@ const appConfigSchema = z.object({
    * scope, not per-bot. */
   deepseek: z.object({ key: optionalText, url: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
+   * engine: "minimax" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), credentialStorage: externalCredentialStorage }).optional(),
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
   autoUpdate: z
@@ -282,6 +288,33 @@ const appConfigSchema = z.object({
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
   rooms: roomConfigSchema.optional(),
   botDefaults: botDefaultsSchema.optional(),
+  /** Linq transport credentials live in `process.env` — never on disk — so
+   *  a stolen config.json does not hand an attacker a phone number.  Only
+   *  the workspace phone + per-bot toggle + sender policy live on disk. */
+  imessageLinq: z.object({
+    /** Linq phone number that receives iMessage on this workspace's behalf
+     *  — typically the Director bot's number.  Formatted E.164.  Stored
+     *  because operators want to see the number they bound. */
+    botNumber: optionalText,
+    /** Partner API token. Prefer env/Infisical; kept optional on disk for sync only. */
+    apiToken: optionalText,
+    /** Webhook signing secret. Prefer env/Infisical; kept optional on disk for sync only. */
+    webhookSecret: optionalText,
+    /** Per-bot transport choice.  Absent means the bot defaults to
+     *  "mac-relay" (the existing python relay path); setting this to "linq"
+     *  routes that bot's inbound through Linq.  We surface "mac-relay" for
+     *  completeness even though this lane adds no new behavior on that
+     *  side. */
+    perBot: z.record(z.string(), z.enum(["off", "mac-relay", "linq"])).optional(),
+    /** Hub workspace-level allow/deny lists, applied before per-bot
+     *  overrides.  Phone numbers in E.164. */
+    ignoredSenders: z.array(z.string()).optional(),
+    allowedSenders: z.array(z.string()).optional(),
+    /** Toggle for the optional `send_voice_message` tool.  Off by default
+     *  because a hosted voice costs per character and we will not enable it
+     *  without the operator's explicit consent. */
+    allowVoiceByDefault: z.boolean().optional(),
+  }).optional(),
   ingress: z.object({
     publicUrl: z
       .string()
@@ -393,7 +426,7 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; credentialStorage?: "external" };
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
   imageGen?: { key?: string; credentialStorage?: "external" };
   autoUpdate?: {
     enabled?: boolean;
@@ -413,6 +446,12 @@ export interface AppConfig {
      * back-fills `allowedComputers` from the new shape for the cut-over
      * so server-side allowlist gates keep working. */
     allowedComputers?: Array<"cloud" | "vm" | "local"> | null;
+    /** Per-bot iMessage transport.  Lives under `botDefaults` (not in the
+     *  bot record) so settings can carry it as part of the same workspace
+     *  config the user patches in one round-trip.  Resolution per inbound:
+     *    1. `perBot[botId]` — explicit operator choice.
+     *    2. absent — treated as "off" (no surprise Linq activation). */
+    imessagePerBot?: Record<string, "off" | "mac-relay" | "linq">;
     /** Per-provider allowlist written by the redesigned Computer settings
      * UI.  Boots migrate any pre-existing `allowedComputers` to this
      * shape via `migrateComputerProvidersConfig` below. */
@@ -425,6 +464,21 @@ export interface AppConfig {
     /** Shared-vs-per-bot VPS mode.  `null` means "not configured" and
      * is only valid when `selfHostedVps` is off. */
     vpsMode?: "shared" | "per-bot" | null;
+  };
+  /** Workspace Linq binding.  Phone number + sender policy + voice-tool
+   *  consent live here, not on the bot itself, because Linq hands one phone
+   *  number per workspace in hobby tier — multiple bots share it; the
+   *  per-bot transport choice picks WHICH bot each inbound routes to.
+   *
+   *  Tokens never live here: `LINQ_API_TOKEN` and `LINQ_WEBHOOK_SECRET`
+   *  come from `process.env` (the runtime secret layer). */
+  imessageLinq?: {
+    botNumber?: string;
+    apiToken?: string;
+    webhookSecret?: string;
+    ignoredSenders?: string[];
+    allowedSenders?: string[];
+    allowVoiceByDefault?: boolean;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
@@ -888,7 +942,7 @@ export function ensureDirs() {
 
 /** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider
  * absent) to provider: "elevenlabs" so PR #513's MiniMax default does not
- * silently route a valid ElevenLabs key to MiniMax's `/v1/models`.
+ * silently route a valid ElevenLabs key to MiniMax's `/v1/get_voice`.
  * Idempotent: returns false if provider is already set, if the tts section
  * is empty, or if only a voice (no key) is present.  Mutates the cfg in
  * place so the current `loadConfig()` call carries the pin; the call site
@@ -901,7 +955,7 @@ export function ensureDirs() {
  * each bot (`speak()` and `voiceReady()` accept a per-bot `voiceId` when the
  * workspace fallback is absent), so a key-only record is a legitimate legacy
  * shape, not an ambiguous one.  Fresh MiniMax key-only saves are
- * distinguished by `credentialConfigPatch` persisting `provider: "minimax"`
+ * distinguished by new key saves persisting `provider: "minimax"`
  * alongside the key — every post-default save carries the explicit provider,
  * so any record that arrives here without one predates the default. */
 export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
@@ -1040,27 +1094,8 @@ export function loadConfig(): AppConfig {
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
   resolveSecretFields(cfg, process.env, infisicalSnapshot());
-  // Migration: existing installations with `tts.key` + `tts.voice` but no
-  // `tts.provider` were silently ElevenLabs installs before PR #513 flipped
-  // the default to MiniMax.  Without this pin, every legacy ElevenLabs user
-  // would route their valid ElevenLabs key to MiniMax's `/v1/models` after
-  // upgrade and lose audio until they re-entered the provider manually.
-  //
-  // Runs AFTER the env overlay and the secret store so a packaged-app
-  // install whose real key was moved into the OS keychain — leaving an
-  // empty tombstone on disk and surfacing it later as `OMB_TTS_KEY` — sees
-  // the credential that the migration needs.  Earlier (the pre-fix
-  // placement) the file's empty key reached `key?.trim()` and the pin
-  // never fired, so the next TTS call still picked MiniMax and shipped the
-  // ElevenLabs key to the wrong `/v1/models`.
-  //
-  // The pin is in-memory only: re-running the migration next launch is
-  // cheap and idempotent, and persisting it back through `saveConfig` here
-  // would write the env-injected (or store-injected) credential into
-  // config.json in cleartext for desktop installs whose whole point of
-  // moving the key into the keychain was to keep it OUT of that file.  An
-  // operator-driven save can still write the pin alongside any other
-  // tts.* they choose to persist.
+  // Pin pre-MiniMax key-only installs after env and external-secret resolution.
+  // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
   // Migration: existing installs carried the legacy
   // `botDefaults.allowedComputers` shape (an array of three legacy
@@ -1144,6 +1179,13 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   // ride into an unrelated engine through `...process.env`.
   "MINIMAX_API_KEY",
   "MINIMAX_BASE_URL",
+  // Linq partner-API token (and its Infisical alias).  The harness holds it
+  // for webhook outbound / voice upload; no spawned engine CLI should inherit it.
+  "BOTFLEET_LINQAPP_API_KEY",
+  "LINQ_API_TOKEN",
+  // Linq webhook signing secret: the harness holds it to verify inbound
+  // webhooks; no spawned engine CLI should inherit it.
+  "LINQ_WEBHOOK_SECRET",
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
@@ -1264,7 +1306,7 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
   // machine identity does not repeat it a third time.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults"] as const) {
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

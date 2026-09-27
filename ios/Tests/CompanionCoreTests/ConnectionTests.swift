@@ -234,4 +234,13 @@ final class ConnectionTests: XCTestCase {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
+
+    func testParsesBotfleetIosSchemeInvite() throws {
+        let token = "omb_pair_" + String(repeating: "a", count: 43)
+        let url = try XCTUnwrap(URL(string: "botfleet-ios://pair?address=mac.local%3A8810&token=\(token)&code=004209"))
+        let invite = try XCTUnwrap(PairingInvite.parse(url))
+        XCTAssertEqual(invite.connection.host, "mac.local")
+        XCTAssertEqual(invite.connection.port, 8810)
+        XCTAssertEqual(invite.credential, token)
+    }
 }

@@ -23,6 +23,7 @@ import { Loader2, Phone, PhoneOff, X } from "lucide-react";
 import { useStore, visibleMessages, type Bot } from "@/state/store";
 import { currentCall, deferCallCleanup, endCall, startCall, useOnCall } from "@/lib/call";
 import { speaker } from "@/lib/tts";
+import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { BotMascot } from "./Avatar";
@@ -77,8 +78,8 @@ export function CallTargetButton({
   const configured = Boolean(state.config?.tts?.configured);
   // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
   // rather than render disabled with an explanation.  `configured` is provider-scoped server-side
-  // (ElevenLabs => a key is on file; system => the Mac's built-in voices are available), so this
-  // hides the button when there is no ElevenLabs key AND system voices are not the chosen provider,
+  // (MiniMax => a key is on file; system => the Mac's built-in voices are available), so this
+  // hides the button when there is no MiniMax key AND system voices are not the chosen provider,
   // while leaving it working for anyone who deliberately picked the built-in voices.
   const voiceProviderConfigured = configured;
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
@@ -109,7 +110,7 @@ export function CallTargetButton({
       : !window.ogb?.speechStart
         ? "The speech service is unavailable in this app build. Restart or update BotFleet."
         : !configured
-          ? "Add an ElevenLabs API key — or switch to the built-in Mac voices — so the bot can speak during calls."
+          ? "Add a MiniMax API key — or switch to the built-in Mac voices — so the bot can speak during calls."
           : !voiceReady
             ? voices.length > 1
               ? "Give every channel member a voice before starting a channel call."
@@ -485,7 +486,7 @@ function Call({ bot }: { bot: Bot }) {
     for (const m of fresh) spokenIds.current.add(m.id);
 
     if (reply?.text) {
-      void sayThenListen(reply.text);
+      void sayThenListen(spokenReply(reply.text));
     } else if (chip?.tool?.spoken && phase === "working") {
       void say(chip.tool.spoken).then((stillMine) => {
         if (stillMine && phaseRef.current === "speaking") move("working");

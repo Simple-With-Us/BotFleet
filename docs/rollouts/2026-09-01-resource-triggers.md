@@ -1,5 +1,7 @@
 # 2026-09-01 — Resource-threshold triggers
 
+> **2026-09-22 [MM] archaeology note:** this rollout predates the 2026-09-22 bundle-ID migration; the `com.jay.botfleet-server` LaunchAgent label referenced below is the historical one and stays verbatim.  The live label is now `app.botfleet.server` (see `docs/rollouts/2026-09-22-bundle-id-migration.md`).  The Restart step below now reads "Restart `app.botfleet.server`".
+
 ## Why
 
 Jay asked for a BotFleet mechanism that wakes a bot when disk, RAM, or CPU crosses a threshold, as part of moving Housekeeper off Grok Bot.

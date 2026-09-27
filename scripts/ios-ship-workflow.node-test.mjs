@@ -126,16 +126,16 @@ test("retired ios-testflight.yml is gone so hosted ships do not double-upload", 
   assert.equal(existed, false);
 });
 
-test("vendored ios-fleet ships app.botfleet on the 1.0.N train", () => {
+test("vendored ios-fleet ships app.botfleet.ios on the 1.0.N train", () => {
   const apps = JSON.parse(read("scripts/ios-fleet/apps.json"));
   const botfleet = apps.apps.botfleet;
   assert.equal(apps.teamId, "CC8UTF7ATG");
-  assert.equal(botfleet.bundleId, "app.botfleet");
+  assert.equal(botfleet.bundleId, "app.botfleet.ios");
   assert.equal(botfleet.scheme, "BotFleet");
   assert.equal(botfleet.appleId, 6806379515);
   assert.equal(botfleet.xcodegenDir, "ios");
   assert.match(botfleet.marketingVersionDefault, /^1\.0\.\d+$/);
-  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.widgets"]);
+  assert.deepEqual(botfleet.extraBundleIds, ["app.botfleet.ios.widgets"]);
   assert.equal(Object.keys(apps.apps).join(","), "botfleet");
 
   const ship = read("scripts/ios-fleet/ship-testflight.sh");

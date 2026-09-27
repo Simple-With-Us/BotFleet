@@ -108,6 +108,19 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     const mode = api("POST", "/api/local-computer/mode", { mode: "per-bot" });
     try {
       await expect.poll(() => existsSync(entered), { timeout: 10000 }).toBe(true);
+      // The boot-time IIFE (server/index.ts — the shared-target
+      // containerComputerStatus fired at module load) writes one `info`
+      // line in its own subprocess, and that write can land AFTER
+      // `entered` becomes visible to the test on macos.  Wait until at
+      // least two lines are present before snapshotting so the IIFE's
+      // flush and the held-gate info have both landed.  The fake writes
+      // the log line synchronously before signalling `entered`, so once
+      // two lines exist the only thing that can add a third is the test
+      // asserting it didn't.
+      await expect.poll(
+        () => readFileSync(log, "utf8").split("\n").filter(Boolean).length,
+        { timeout: 5000 },
+      ).toBeGreaterThanOrEqual(2);
       const before = readFileSync(log, "utf8");
       expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
       expect((await api("GET", "/api/bots")).body.bots.some((item: any) => item.id === bot.id)).toBe(true);
@@ -118,7 +131,7 @@ fs.appendFileSync(path.join(home, "runtime.log"), args.join(" ") + "\\n");
     } finally { release(); await mode; }
     expect((await mode).status).toBe(200);
     expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
-  });
+  }, 30_000);
 
   it("refuses mode changes while deletion owns a target fence, then permits retry", async () => {
     // Establish this case's own starting mode.  It must not depend on the

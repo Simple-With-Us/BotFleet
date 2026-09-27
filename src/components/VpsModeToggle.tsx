@@ -23,7 +23,7 @@ const OPTIONS: ReadonlyArray<{ value: VpsMode; label: string; aria: string }> = 
 ];
 
 const CAPTION: Record<"shared" | "per-bot", string> = {
-  shared: "Shared VPS is a single desktop across all bots — every bot that has the VPS in its grant lands on the same container.\u00a0 Only one bot can use it at a time.",
+  shared: "Shared VPS is one container for every bot — each bot gets its own isolated desktop session inside it.\u00a0 Several bots can use it at the same time.",
   "per-bot": "Per-bot VPS gives each bot a private container, durable workspace, and loopback viewer.\u00a0 Idle desktops stop on their own after 8 hours.",
 };
 

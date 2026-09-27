@@ -58,6 +58,16 @@ describe("parseBotProfilePatch (both modes)", () => {
     expect(result).toEqual({ ok: true, patch: { name: "Mira" } });
   });
 
+  it("restricts voice playback to distinct known devices", () => {
+    expect(parseBotProfilePatch({ speechDevices: ["mac", "iphone"] }, true)).toEqual({
+      ok: true, patch: { speechDevices: ["mac", "iphone"] },
+    });
+    expect(parseBotProfilePatch({ speechDevices: [] }, true)).toEqual({ ok: true, patch: { speechDevices: [] } });
+    for (const speechDevices of [["mac", "mac"], ["ipad"], ["iphone", "mac", "iphone"]]) {
+      expect(parseBotProfilePatch({ speechDevices } as never, true).ok).toBe(false);
+    }
+  });
+
   it("rejects a blank or oversized name", () => {
     expect(parseBotProfilePatch({ name: "   " }, true).ok).toBe(false);
     expect(parseBotProfilePatch({ name: "x".repeat(101) }, true).ok).toBe(false);

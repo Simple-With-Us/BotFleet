@@ -92,6 +92,10 @@ export type RuntimeEvent = RuntimeEventBase &
   (
     | { type: "session.started"; sessionId: string | null; model?: string | null; rebuilt?: boolean }
     | { type: "session.exited"; reason?: string }
+    /** The native session `sessionId` must never be resumed again (e.g. its
+     *  model was rejected); the harness drops it if it is still the saved
+     *  resume cursor, so the next turn starts fresh even after a restart. */
+    | { type: "session.invalidated"; sessionId: string; reason?: string }
     | { type: "turn.started" }
     | {
         type: "turn.retrying";

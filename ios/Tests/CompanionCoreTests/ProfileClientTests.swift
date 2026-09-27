@@ -97,6 +97,13 @@ final class ProfileClientTests: XCTestCase {
         XCTAssertEqual(body["voice"] as? String, "", "empty explicitly selects the workspace default")
     }
 
+    func testVoiceDevicePatchCanExplicitlyTurnOffAllDevices() throws {
+        let data = try JSONEncoder().encode(BotProfilePatch(speechDevices: []))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body.keys.sorted(), ["speechDevices"])
+        XCTAssertEqual(body["speechDevices"] as? [String], [])
+    }
+
     func testProfileClientSendsOnlyFieldsOwnedByTheAction() async throws {
         ProfileRequestStub.responseBody = Self.botResponse
 

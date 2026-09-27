@@ -10,6 +10,8 @@
 // client already splits text into utterances and fetches the next while the
 // current one plays, which gets the same perceived latency with far fewer
 // moving parts — and no socket to leak when a turn is interrupted.
+import { recordSpeechUsage } from "./usage.ts";
+
 const API = process.env.OMB_ELEVENLABS_API || "https://api.elevenlabs.io/v1";
 const MODEL = "eleven_flash_v2_5";
 // 64kbps mono is indistinguishable for speech and a third of the bytes
@@ -100,5 +102,7 @@ export async function synthesize(text: string, voiceId: string, key: string): Pr
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) throw new Error(message(res.status, "speaking", await safeJson(res)));
-  return { bytes: new Uint8Array(await res.arrayBuffer()), mime: "audio/mpeg" };
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length) recordSpeechUsage("elevenlabs", text.length, "submitted");
+  return { bytes, mime: "audio/mpeg" };
 }

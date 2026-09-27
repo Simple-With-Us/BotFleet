@@ -57,7 +57,12 @@ import {
 } from "./managed-companion-tunnel.mjs";
 import { createSecureCredentialState } from "./secure-credential-state.mjs";
 import { isKnownSkin } from "./skin-overlay.cjs";
-import { readSecureCredentials } from "./secure-credentials.mjs";
+import {
+  applySafeStorageMigration,
+  readSecureCredentials,
+  SAFE_STORAGE_MIGRATION_BASENAME,
+  wantsSafeStorageExport,
+} from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
 import {
   companionAccountCleanupPending,
@@ -99,7 +104,7 @@ const APP_ICON = path.join(__dirname, "resources/app-icon.png");
 // inherit it from electron-builder's appId; set it here so unpackaged runs
 // still match.
 if (process.platform === "win32") {
-  app.setAppUserModelId("com.botfleet.app");
+  app.setAppUserModelId("app.botfleet.macos");
 }
 let desktopViewerWindow = null;
 let desktopViewerOwner = null;
@@ -254,7 +259,11 @@ const CREDENTIALS_FILE = path.join(app.getPath("userData"), "credentials.bin");
  * installation — keys off this rather than off an empty object. */
 let credentialStoreUnavailable = false;
 
-async function loadSecureCredentials() {
+function safeStorageMigrationFile() {
+  return path.join(path.dirname(CREDENTIALS_FILE), SAFE_STORAGE_MIGRATION_BASENAME);
+}
+
+async function readSecureCredentialStore() {
   const result = await readSecureCredentials({
     exists: () => fs.existsSync(CREDENTIALS_FILE),
     isAvailable: () => safeStorage.isAsyncEncryptionAvailable(),
@@ -262,11 +271,27 @@ async function loadSecureCredentials() {
     decrypt: (buffer) => safeStorage.decryptStringAsync(buffer),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
+  return applySafeStorageMigration(result, {
+    migrationExists: () => fs.existsSync(safeStorageMigrationFile()),
+    readMigration: () => fs.readFileSync(safeStorageMigrationFile(), "utf8"),
+    removeMigration: () => fs.rmSync(safeStorageMigrationFile(), { force: true }),
+  });
+}
+
+async function loadSecureCredentials() {
+  const result = await readSecureCredentialStore();
   credentialStoreUnavailable = result.status === "unavailable";
   if (credentialStoreUnavailable) {
     // Deliberately loud. A silent {} here is what made a keychain hiccup
     // look like "your connected apps are gone".
     slog(`credential store unreadable after retries (${result.error}); saved keys are not loaded this launch`);
+    return result.credentials;
+  }
+  if (result.fromMigration) {
+    // Re-encrypt under this executable's designated requirement, then drop
+    // the plaintext handoff the predecessor wrote.
+    await saveSecureCredentials(result.credentials);
+    fs.rmSync(safeStorageMigrationFile(), { force: true });
   }
   return result.credentials;
 }
@@ -1837,12 +1862,15 @@ const CREDENTIAL_PATCH = {
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
-  ttsKey: (value) => ({ tts: { key: value, provider: "minimax" } }),
+  ttsKey: (value, provider = "minimax") => ({ tts: { key: value, provider } }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };
 
-ipcMain.handle("credential:set", async (_event, name, value) => {
+ipcMain.handle("credential:set", async (_event, name, value, provider) => {
+  if (name === "ttsKey" && provider !== undefined && !["minimax", "elevenlabs", "system"].includes(provider)) {
+    throw new Error("Unsupported voice engine");
+  }
   const patchFor = CREDENTIAL_PATCH[name];
   if (!patchFor || typeof value !== "string") {
     throw new Error("Unsupported credential");
@@ -1859,7 +1887,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(patchFor(secret)),
+      body: JSON.stringify(patchFor(secret, provider)),
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
@@ -2162,6 +2190,30 @@ function setupApplicationMenu() {
 }
 
 app.whenReady().then(async () => {
+  if (wantsSafeStorageExport(process.argv)) {
+    try {
+      const result = await readSecureCredentials({
+        exists: () => fs.existsSync(CREDENTIALS_FILE),
+        isAvailable: () => safeStorage.isAsyncEncryptionAvailable(),
+        readFile: () => fs.readFileSync(CREDENTIALS_FILE),
+        decrypt: (buffer) => safeStorage.decryptStringAsync(buffer),
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      });
+      if (result.status === "unavailable") {
+        throw new Error(result.error || "the operating-system credential store could not be read");
+      }
+      const dest = safeStorageMigrationFile();
+      const temporary = `${dest}.${process.pid}.tmp`;
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(temporary, JSON.stringify(result.credentials), { mode: 0o600 });
+      fs.renameSync(temporary, dest);
+      app.exit(0);
+    } catch (error) {
+      console.error(`[desktop] safeStorage export failed: ${error instanceof Error ? error.message : error}`);
+      app.exit(1);
+    }
+    return;
+  }
   if (updateCredentialPreparationPath) {
     try {
       if (!app.isPackaged) throw new Error("Credential preparation requires an installed BotFleet build");

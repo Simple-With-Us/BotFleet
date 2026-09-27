@@ -18,7 +18,7 @@ struct AgentProfileView: View {
     @State private var notifications: Bool
     @State private var crop: AvatarCrop
     @State private var voice: String
-    @State private var speakReplies: Bool
+    @State private var speechDevices: Set<String>
     @State private var instanceId: String
     @State private var modelId: String
     @State private var effort: String?
@@ -45,7 +45,7 @@ struct AgentProfileView: View {
         _notifications = State(initialValue: bot.notifications)
         _crop = State(initialValue: bot.avatarCrop ?? .mascot)
         _voice = State(initialValue: bot.voice ?? "")
-        _speakReplies = State(initialValue: bot.speakReplies == true)
+        _speechDevices = State(initialValue: Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : [])))
         _instanceId = State(initialValue: bot.modelSelection.instanceId)
         _modelId = State(initialValue: bot.modelSelection.model)
         _effort = State(initialValue: bot.modelSelection.effort)
@@ -301,9 +301,17 @@ struct AgentProfileView: View {
                                 .tag(option.id)
                             }
                         }
-                        Toggle("Speak replies", isOn: $speakReplies)
-                            .disabled(!selectedVoiceCanSpeak)
-                        Button("Preview voice", systemImage: "speaker.wave.2") {
+                        Toggle("Play on Mac", isOn: Binding(
+                            get: { speechDevices.contains("mac") },
+                            set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
+                        ))
+                        .disabled(!selectedVoiceCanSpeak)
+                        Toggle("Play on iPhone (while app is open)", isOn: Binding(
+                            get: { speechDevices.contains("iphone") },
+                            set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
+                        ))
+                        .disabled(!selectedVoiceCanSpeak)
+                        Button("Preview Voice", systemImage: "speaker.wave.2") {
                             Task { await previewVoice() }
                         }
                         .disabled(busy || !selectedVoiceCanSpeak)
@@ -327,6 +335,16 @@ struct AgentProfileView: View {
                     } else {
                         Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
                     }
+                }
+
+                Section("Speech to text") {
+                    Label("Apple on-device dictation", systemImage: "waveform")
+                    Text("Recordings you send from this iPhone keep their original audio and transcript on the message. Available languages depend on this device.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Text("Cloud fallback and translation are not configured. Siri and iOS 27 speech features still need device testing.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 if let tasks = current.tasks, !tasks.isEmpty {
@@ -408,7 +426,7 @@ struct AgentProfileView: View {
                 }
                 instancesLoaded = true
                 if let loadedConfig, !loadedConfig.canSpeak(agentVoice: voice) {
-                    speakReplies = false
+                    speechDevices.removeAll()
                 }
             }
             .onChange(of: photo) { _, item in
@@ -468,7 +486,7 @@ struct AgentProfileView: View {
     }
 
     private func profilePatch() -> BotProfilePatch {
-        let savedSpeakReplies = config.map { $0.canSpeak(agentVoice: voice) && speakReplies } ?? speakReplies
+        let savedDevices = config.map { $0.canSpeak(agentVoice: voice) ? speechDevices : [] } ?? speechDevices
         let newModelSelection = ModelSelection(
             instanceId: instanceId,
             model: modelId,
@@ -483,7 +501,7 @@ struct AgentProfileView: View {
             notifications: notifications == baseline.notifications ? nil : notifications,
             avatarCrop: crop == baseline.crop ? nil : crop,
             voice: voice == baseline.voice ? nil : voice,
-            speakReplies: savedSpeakReplies == baseline.speakReplies ? nil : savedSpeakReplies,
+            speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
             modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
             maxToolRounds: maxToolRoundsPatch
         )
@@ -642,7 +660,7 @@ struct AgentProfileView: View {
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
         voice = bot.voice ?? ""
-        speakReplies = bot.speakReplies == true
+        speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         instanceId = bot.modelSelection.instanceId
         modelId = bot.modelSelection.model
         effort = bot.modelSelection.effort
@@ -659,7 +677,7 @@ private struct ProfileFormSnapshot {
     var notifications: Bool
     var crop: AvatarCrop
     var voice: String
-    var speakReplies: Bool
+    var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
 
@@ -670,7 +688,7 @@ private struct ProfileFormSnapshot {
         notifications = bot.notifications
         crop = bot.avatarCrop ?? .mascot
         voice = bot.voice ?? ""
-        speakReplies = bot.speakReplies == true
+        speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
     }

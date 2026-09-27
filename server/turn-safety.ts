@@ -158,8 +158,8 @@ export interface ExactTurnLease {
   readonly threadId: string;
   readonly dispatchId: number;
   /** The resource this lease guards.  When set, mutual exclusion is keyed
-   *  by targetKey rather than botId so two bots sharing the same target
-   *  (shared VPS mode) cannot both hold a lease. */
+   *  by targetKey rather than botId — typically one occupancy key per bot
+   *  on a shared VPS container so several bots can run concurrently. */
   readonly targetKey?: string;
 }
 
@@ -167,9 +167,9 @@ export interface ExactTurnLease {
  * same bot and thread before an older asynchronous finalizer finishes, so a
  * thread id alone is not an ownership token.
  *
- * When `targetKey` is provided, mutual exclusion is by target rather than by
- * bot — two different bots trying to use the same shared desktop are refused
- * the same way two dispatches on one bot used to be. */
+ * When `targetKey` is provided, mutual exclusion is by that key rather than
+ * by bot id alone — two different bots sharing one occupancy key are refused,
+ * while distinct per-bot keys on one shared container can coexist. */
 export class ExactTurnLeases {
   private readonly byBot = new Map<string, ExactTurnLease>();
   private readonly byTarget = new Map<string, ExactTurnLease>();

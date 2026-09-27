@@ -178,7 +178,7 @@ describe("exact turn leases", () => {
     expect(leases.size).toBe(0);
   });
 
-  it("prevents two different bots from holding the same shared target key", () => {
+  it("prevents two different bots from holding the same occupancy target key", () => {
     const leases = new ExactTurnLeases();
     const first = leases.claim("bot-a", "thread-a", 10, "shared");
     expect(first).not.toBeNull();

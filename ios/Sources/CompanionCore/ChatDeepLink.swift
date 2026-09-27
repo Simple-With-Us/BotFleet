@@ -1,10 +1,12 @@
 import Foundation
 
 /// Lock-screen Live Activity tap target, and any other in-app jump to a
-/// specific bot thread. Pairing stays on `botfleet://pair`; this host is
-/// `botfleet://chat`.
+/// specific bot thread. Pairing stays on `<scheme>://pair`; this host is
+/// `<scheme>://chat`. New builds emit `botfleet-ios`; parsers still accept
+/// the legacy `botfleet` scheme so older links keep working.
 public enum ChatDeepLink: Sendable {
-    public static let scheme = "botfleet"
+    public static let scheme = CompanionURLScheme.primary
+    public static let legacyScheme = CompanionURLScheme.legacy
     public static let host = "chat"
 
     public static func url(botId: String, threadId: String) -> URL? {
@@ -19,7 +21,7 @@ public enum ChatDeepLink: Sendable {
     }
 
     public static func parse(_ url: URL) -> (botId: String, threadId: String)? {
-        guard url.scheme?.lowercased() == scheme else { return nil }
+        guard CompanionURLScheme.accepts(url.scheme) else { return nil }
         guard url.host?.lowercased() == host else { return nil }
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ name: String) -> String? {

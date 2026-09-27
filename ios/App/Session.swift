@@ -13,6 +13,7 @@ import SwiftUI
 import CompanionCore
 import UserNotifications
 import UIKit
+import AVFoundation
 
 /// Stream lifecycle, in Console.app and the Xcode console. A companion that
 /// is silently not connected looks exactly like one with nothing to say, so
@@ -96,6 +97,13 @@ final class Session: ObservableObject {
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
     @Published private(set) var notificationChat: Chat?
+
+    // Shared across chat screens so a settled reply keeps playing when the
+    // person switches chats. Audio bytes stay on the paired computer.
+    private var voiceTask: Task<Void, Never>?
+    private var voiceGeneration = UUID()
+    private var voicePlayer: AVAudioPlayer?
+    @Published private(set) var speakingMessageId: String?
 
     private var client: CompanionClient?
     /// The device token, kept in memory so the client can be rebuilt when the
@@ -235,7 +243,7 @@ final class Session: ObservableObject {
     /// paired client can be rebuilt after unlock.
     private var pendingNotification: NotificationTarget?
 
-    static let connectionKey = "companion.connection"
+    static let connectionKey = CompanionConnectionStore.connectionKey
     /// The last `PostedPushToken` this phone successfully posted — see
     /// `registerPushToken`.  IO17: without this, a token iOS hands back
     /// unchanged on almost every launch was POSTed unconditionally, every
@@ -274,6 +282,10 @@ final class Session: ObservableObject {
             return
         }
 #endif
+        // Write the private-container blob into the app group before restore
+        // so a sibling `app.botfleet.ios` install can import it. No-op when
+        // the suite already holds data or this container was never paired.
+        CompanionConnectionStore.exportLegacyPairingToSharedStorage()
         restore()
         Task { await refreshNotificationAuthorization() }
     }
@@ -317,9 +329,16 @@ final class Session: ObservableObject {
     /// only the first should ever send someone back to the pairing screen.
     private func restore() {
         restorePending = false
-        guard let data = UserDefaults.standard.data(forKey: Self.connectionKey),
-              let saved = try? JSONDecoder().decode(Connection.self, from: data)
+        guard let loaded = CompanionConnectionStore.loadConnectionData(),
+              let saved = try? JSONDecoder().decode(Connection.self, from: loaded.data)
         else { return }
+        // Same-container dual-compat: a standard-only blob is promoted into
+        // the app-group suite so a later sibling install (or relaunch) can
+        // import it once the legacy export path also writes here.
+        CompanionConnectionStore.promoteStandardToSharedIfNeeded(
+            source: loaded.source,
+            data: loaded.data
+        )
 
         let stored: String?
         do {
@@ -406,9 +425,8 @@ final class Session: ObservableObject {
                 forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
             )
         } saveConnection: {
-            UserDefaults.standard.set(
-                try? JSONEncoder().encode(stored),
-                forKey: Self.connectionKey
+            CompanionConnectionStore.saveConnectionData(
+                try? JSONEncoder().encode(stored)
             )
         }
 
@@ -471,6 +489,7 @@ final class Session: ObservableObject {
     }
 
     func signOut() {
+        stopVoice()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -485,7 +504,7 @@ final class Session: ObservableObject {
             after: .signedOut
         )
         if let id = connection?.id { Keychain.remove(id) }
-        UserDefaults.standard.removeObject(forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(nil)
         UserDefaults.standard.removeObject(
             forKey: CompanionOnboardingPreferences.pendingNotificationOnboardingKey
         )
@@ -598,6 +617,7 @@ final class Session: ObservableObject {
     /// anyway; dropping it deliberately means the cursor is written down at
     /// a known point instead of wherever the socket happened to die.
     func disconnect() {
+        stopVoice()
         streamTask?.cancel()
         streamTask = nil
         endpointRefreshTask?.cancel()
@@ -713,6 +733,14 @@ final class Session: ObservableObject {
                         continue
                     }
                     state.apply(frame)
+                    if case let .message(threadId, message) = frame.frame,
+                       message.role == .bot, message.kind == .text,
+                       let bot = state.bot(forThread: threadId),
+                       bot.speechDevices?.contains("iphone") == true,
+                       UIApplication.shared.applicationState == .active,
+                       !(message.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        playVoice(message, threadId: threadId)
+                    }
                     if case let .notify(notification) = frame.frame {
                         NotificationCoordinator.shared.deliver(notification, sequence: frame.seq)
                     }
@@ -827,7 +855,7 @@ final class Session: ObservableObject {
               updated.activeEndpoint?.url != winner.url else { return }
         updated.promote(winner)
         connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
     }
 
     /// Learn routes enabled after this phone originally paired. The endpoint
@@ -851,10 +879,7 @@ final class Session: ObservableObject {
 
                 updated.reconcile(metadata)
                 self.connection = updated
-                UserDefaults.standard.set(
-                    try? JSONEncoder().encode(updated),
-                    forKey: Self.connectionKey
-                )
+                CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
 
                 // Keep the currently live route first until this stream ends.
                 // CandidateRotation applies the same no-downgrade policy used
@@ -885,7 +910,7 @@ final class Session: ObservableObject {
         ) else { return false }
         updated.resetRoutePolicy(selecting: endpoint)
         connection = updated
-        UserDefaults.standard.set(try? JSONEncoder().encode(updated), forKey: Self.connectionKey)
+        CompanionConnectionStore.saveConnectionData(try? JSONEncoder().encode(updated))
         rotation = CandidateRotation(endpoints: updated.orderedEndpoints)
         if let token {
             client = CompanionClient(connection: updated.dialing(endpoint), token: token)
@@ -906,7 +931,7 @@ final class Session: ObservableObject {
     // harness so the phone does not invent a second fold.
 
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = []) async -> Bool {
+    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> Bool {
         guard let client else { return false }
         do {
             var prompt = text
@@ -924,6 +949,13 @@ final class Session: ObservableObject {
                 prompt = ChatAttachments.composeMessage(text: text, attachments: uploaded)
             }
             guard !prompt.isEmpty else { return false }
+            let savedRecording: IncomingRecording?
+            if let recording {
+                let path = try await client.uploadRecording(recording.data)
+                savedRecording = IncomingRecording(path: path, transcript: recording.transcript)
+            } else {
+                savedRecording = nil
+            }
             let threadId: String
             switch chat {
             case let .bot(bot): threadId = bot.threadId
@@ -938,7 +970,8 @@ final class Session: ObservableObject {
                         text: prompt,
                         toBot: bot.id,
                         threadId: threadId,
-                        idempotencyKey: localId
+                        idempotencyKey: localId,
+                        recording: savedRecording
                     )
                     if result.queued == true, let queueId = result.queueId, !queueId.isEmpty {
                         let dest = result.threadId ?? bot.threadId
@@ -954,7 +987,8 @@ final class Session: ObservableObject {
                         text: prompt,
                         toRoom: room.id,
                         threadId: threadId,
-                        idempotencyKey: localId
+                        idempotencyKey: localId,
+                        recording: savedRecording
                     )
                 }
                 return true
@@ -1743,6 +1777,80 @@ final class Session: ObservableObject {
         catch { recordActionError(error); return [] }
     }
 
+    func stopVoice() {
+        let wasPlaying = voiceTask != nil || voicePlayer != nil
+        voiceGeneration = UUID()
+        voiceTask?.cancel()
+        voiceTask = nil
+        voicePlayer?.stop()
+        voicePlayer = nil
+        speakingMessageId = nil
+        if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+    }
+
+    func playVoice(_ message: Message, threadId: String) {
+        if speakingMessageId == message.id { stopVoice(); return }
+        stopVoice()
+        guard let client else { return }
+        speakingMessageId = message.id
+        let generation = voiceGeneration
+        voiceTask = Task { [weak self] in
+            do {
+                let clips = try await client.messageVoice(threadId: threadId, messageId: message.id)
+                try Task.checkCancellation()
+                let audioSession = AVAudioSession.sharedInstance()
+                try audioSession.setCategory(.playback, mode: .spokenAudio)
+                try audioSession.setActive(true)
+                for index in clips.indices {
+                    let data = try await client.voiceClip(threadId: threadId, messageId: message.id, index: index)
+                    try Task.checkCancellation()
+                    let player = try AVAudioPlayer(data: data)
+                    guard player.prepareToPlay(), player.play() else { throw APIError.transport("Voice clip could not be played.") }
+                    self?.voicePlayer = player
+                    while player.isPlaying && !Task.isCancelled {
+                        try await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                    try Task.checkCancellation()
+                }
+            } catch {
+                if !Task.isCancelled { self?.recordActionError(error) }
+            }
+            if self?.voiceGeneration == generation { self?.stopVoice() }
+        }
+    }
+
+    func playRecording(_ message: Message, threadId: String) {
+        if speakingMessageId == message.id { stopVoice(); return }
+        guard message.recording != nil, let client else { return }
+        stopVoice()
+        speakingMessageId = message.id
+        let generation = voiceGeneration
+        voiceTask = Task { [weak self] in
+            do {
+                let data = try await client.recording(threadId: threadId, messageId: message.id)
+                try Task.checkCancellation()
+                let audioSession = AVAudioSession.sharedInstance()
+                try audioSession.setCategory(.playback, mode: .spokenAudio)
+                try audioSession.setActive(true)
+                let player = try AVAudioPlayer(data: data)
+                guard player.prepareToPlay(), player.play() else { throw APIError.transport("Recording could not be played.") }
+                self?.voicePlayer = player
+                while player.isPlaying && !Task.isCancelled {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+            } catch {
+                if !Task.isCancelled { self?.recordActionError(error) }
+            }
+            if self?.voiceGeneration == generation { self?.stopVoice() }
+        }
+    }
+
+    func saveRecordingReview(_ message: Message, threadId: String, correction: String, comment: String) async {
+        guard let client else { return }
+        do { _ = try await client.reviewRecording(threadId: threadId, messageId: message.id, correction: correction, comment: comment) }
+        catch { recordActionError(error) }
+    }
+
     func previewVoice(_ voiceId: String, for bot: Bot) async -> Data? {
         guard let client else { return nil }
         do { return try await client.previewVoice(text: "Hello, I'm \(bot.name).", voiceId: voiceId) }
@@ -2463,7 +2571,7 @@ final class Session: ObservableObject {
 
     func consumeNotificationChat() { notificationChat = nil }
 
-    /// Lock-screen Live Activity (and any `botfleet://chat` URL) lands on
+    /// Lock-screen Live Activity (and any `botfleet-ios://chat` / legacy `botfleet://chat` URL) lands on
     /// the named bot, switching task when the thread is not the active one.
     func openChat(botId: String, threadId: String) async {
         guard let target = NotificationTarget(botId: botId, threadId: threadId) else { return }

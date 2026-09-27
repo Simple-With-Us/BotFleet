@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import {
   decodeCodexSelection,
   encodeCodexSelection,
   OFFICIAL_CODEX_PROVIDER,
+  readCodexAppServerModelCatalog,
   readCodexModelCatalog,
   STATIC_CODEX_MODELS,
 } from "./codex-catalog.ts";
@@ -75,6 +76,26 @@ describe("readCodexModelCatalog", () => {
     expect(await readCodexModelCatalog({ HOME: join(tmpdir(), "omb-codex-missing-home") })).toEqual(
       STATIC_CODEX_MODELS,
     );
+  });
+
+  it("uses the current OAuth fallback when the app-server probe fails", async () => {
+    const home = scratchHome({});
+    const missingCli = join(home, "missing-codex-cli");
+    expect(await readCodexModelCatalog({ HOME: home }, fetch, missingCli)).toEqual(STATIC_CODEX_MODELS);
+  });
+
+  it("ends a stalled app-server model probe instead of inventing availability", async () => {
+    chmodSync(FAKE_CLI, 0o755);
+    const home = scratchHome({});
+    const dumpPath = join(home, "calls.json");
+    const catalog = await readCodexAppServerModelCatalog(
+      FAKE_CLI,
+      { HOME: home, PATH: process.env.PATH, FAKE_CODEX_MODE: "models-hang", FAKE_CODEX_DUMP: dumpPath },
+      2_000,
+    );
+    expect(catalog).toBeNull();
+    const calls = JSON.parse(readFileSync(dumpPath, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("model/list");
   });
 
   it("uses every visible page from the installed Codex app-server catalog", async () => {
@@ -170,6 +191,19 @@ model = "gpt-5.4"
       custom: true,
     });
   });
+
+  it.each(["gpt-5.4"])(
+    "keeps saved legacy OAuth selection %s without making it a fallback recommendation",
+    async (model) => {
+      const home = scratchHome({ "config.toml": `model = "${model}"\n` });
+      const catalog = await readCodexModelCatalog({ HOME: home });
+      const saved = encodeCodexSelection("openai", model);
+      expect(catalog.default).toBe(saved);
+      expect(catalog.options).toContainEqual({ id: saved, label: model, custom: true });
+      expect(STATIC_CODEX_MODELS.options.some((option) => option.id === model)).toBe(false);
+      expect(decodeCodexSelection(saved)).toEqual({ model, modelProvider: "openai" });
+    },
+  );
 
   it("preserves profile models when the main provider defaults to OpenAI", async () => {
     const home = scratchHome({

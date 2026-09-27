@@ -5,6 +5,7 @@
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { isDelegationMessage } from "../shared/delegation-message.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { peerAllowKey, type PeerAction } from "./peer-approval-key.ts";
 import { DATA_DIR } from "./config.ts";
@@ -104,9 +105,17 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  /** Persisted audio clips for this exact reply, in playback order. */
+  audio?: Array<{ path: string; mime: string }>;
+  /** Original incoming microphone recording and recognizer output never change. */
+  recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
+  /** Corrections are annotations, not edits to the audio or original transcript. */
+  recordingReview?: { correction?: string; comment?: string; updatedAt: number };
+  /** Reserved for a later configured translator; never implies a translation ran. */
+  translation?: { language: string; text: string; provider: string };
   card?: OptionCardData;
   connector?: ConnectorCardData;
   secret?: SecretRequestCardData;
@@ -537,6 +546,8 @@ export interface BotRecord {
    * Off by default: a hosted voice costs money per character, so speaking
    * is something you turn on, never something that happens to you. */
   speakReplies?: boolean;
+  /** Selected playback endpoints. Legacy true means Mac only. */
+  speechDevices?: Array<"mac" | "iphone">;
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
@@ -1624,13 +1635,15 @@ export class Store {
 
   /** Fork the conversation: a new message that replaces `sourceId`
    * (same parent, new text) and becomes the active leaf.  Preserves the
-   * source's role and automationSource — regenerating or editing an
-   * auto-delivered instruction (role="system") must produce another
-   * system-attributed prompt, not a fabricated human user bubble. */
+   * source's role, automationSource, and sender. A branched delegation is
+   * rerun directly, not mirrored into its former bot-to-bot channel, so it
+   * must not claim a peer-thread link to an exchange that never happened. */
   branchMessage(threadId: string, sourceId: string, text: string): Message | null {
     const t = this.thread(threadId);
     const source = t.messages.find((m) => m.id === sourceId);
-    if (!source) return null;
+    // A recorded utterance keeps its original bytes and recognition result.
+    // Review it separately instead of branching away from the evidence.
+    if (!source || source.recording) return null;
     const full: Message = {
       id: newId(),
       at: Date.now(),
@@ -1640,6 +1653,10 @@ export class Store {
       parentId: source.parentId ?? null,
       replyToId: source.replyToId,
       automationSource: source.automationSource,
+      from: source.from ? { ...source.from } : undefined,
+      comm: source.comm && source.automationSource !== "delegation" &&
+        !isDelegationMessage({ role: source.role, text: source.text, automationSource: source.automationSource })
+        ? { ...source.comm } : undefined,
     };
     mdb.appendMessage(threadId, full);
     t.messages.push(full);
@@ -1835,21 +1852,54 @@ export class Store {
     return changed;
   }
 
+  /** Drop a saved resume cursor, but only while it still equals `cursor` —
+   *  a newer session saved since must not be discarded. */
+  /** Drop a cursor only if it is still the one saved (a stale invalidation,
+   *  after a newer cursor was stored, is a no-op). */
+  clearResumeCursor(botId: string, instanceId: string, cursor: unknown, threadId?: string) {
+    this.dropResumeCursor(botId, instanceId, threadId, (saved) => saved === cursor);
+  }
+
   setResumeCursor(botId: string, instanceId: string, cursor: unknown, threadId?: string) {
+    // An undefined/null cursor deletes the continuation unconditionally.
+    if (cursor === undefined || cursor === null) {
+      this.dropResumeCursor(botId, instanceId, threadId);
+      return;
+    }
     const bot = this.bot(botId);
     if (!bot) return;
     // the cursor belongs to the task that produced it, not to the bot
     const task = threadId ? this.taskByThread(botId, threadId) : this.activeTask(botId);
-    if (cursor === undefined || cursor === null) {
-      if (task) delete task.resumeCursors[instanceId];
-      if (!threadId || bot.threadId === threadId) delete bot.resumeCursors[instanceId];
-    } else {
-      if (task) task.resumeCursors[instanceId] = cursor;
-      // The legacy mirror follows the task visible in chat, never a detached
-      // routine task working in the background.
-      if (!threadId || bot.threadId === threadId) bot.resumeCursors[instanceId] = cursor;
-    }
+    if (task) task.resumeCursors[instanceId] = cursor;
+    // The legacy mirror follows the task visible in chat, never a detached
+    // routine task working in the background.
+    if (!threadId || bot.threadId === threadId) bot.resumeCursors[instanceId] = cursor;
     this.saveBots();
+    this.emit({ type: "bot", botId });
+  }
+
+  /** Shared delete for `clearResumeCursor` and `setResumeCursor(undefined)`:
+   *  removes the task's cursor and, when that task is the one visible in
+   *  chat, the bot's legacy mirror.  `matches` limits it to a named cursor. */
+  private dropResumeCursor(botId: string, instanceId: string, threadId?: string, matches?: (saved: unknown) => boolean) {
+    const bot = this.bot(botId);
+    if (!bot) return;
+    const task = threadId ? this.taskByThread(botId, threadId) : this.activeTask(botId);
+    const ok = (saved: unknown) => saved !== undefined && (!matches || matches(saved));
+    let changed = false;
+    if (task && ok(task.resumeCursors[instanceId])) {
+      delete task.resumeCursors[instanceId];
+      changed = true;
+    }
+    if ((!threadId || bot.threadId === threadId) && ok(bot.resumeCursors[instanceId])) {
+      delete bot.resumeCursors[instanceId];
+      changed = true;
+    }
+    if (!changed) return;
+    this.saveBots();
+    // Cursor invalidation must survive a restart in the roster debounce
+    // window — the next turn would otherwise resume the rejected thread.
+    this.flushBotsNow();
     this.emit({ type: "bot", botId });
   }
 

@@ -5,6 +5,7 @@
 // generateText (bot titles, thread names) — upstream's TextGeneration slot.
 import type {
   DriverCreateInput,
+  ModelCatalog,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
@@ -16,6 +17,11 @@ import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 import { splitChatPrompt } from "./prompt-split.ts";
 import { toolFields } from "../tool-fields.ts";
+import {
+  createModelDiscoveryProbe,
+  discoverModelCatalog,
+  fetchProviderModels,
+} from "./model-discovery.ts";
 
 import { runTurnLoop, type TurnLoopDeps, type TurnUsage } from "./chat-completions/loop.ts";
 import { toTurnUsage } from "./chat-completions/usage.ts";
@@ -36,6 +42,11 @@ const MODELS = {
     { id: "grok-4.5", label: "Grok 4.5" },
   ],
 };
+
+/** How long one `GET /models` answer is reused.  Matches the MiniMax driver's
+ *  60 s: short enough that a newly shipped model shows up in a picker refresh,
+ *  long enough that a burst of describes costs one round trip. */
+const MODEL_DISCOVERY_TTL_MS = 60_000;
 
 export interface GrokConfig {
   url: string;
@@ -311,6 +322,24 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       return { turnId };
     };
 
+    // Live catalog.  xAI publishes an OpenAI-compatible `GET {url}/models`,
+    // so the three hand-written rows above are a starting point rather than
+    // the only source of truth: a new Grok appears in the picker when xAI
+    // ships it, not when a human edits this file.  `models` is a per-instance
+    // binding so the merge preserves whatever this instance is currently
+    // showing, not the module-level constant.
+    let models: ModelCatalog = MODELS;
+    const probeModels = createModelDiscoveryProbe(MODEL_DISCOVERY_TTL_MS, () =>
+      fetchProviderModels({ baseUrl: config.url, apiKey }),
+    );
+    const refreshModels = async (): Promise<void> => {
+      if (!apiKey) return;
+      const catalog = await discoverModelCatalog(probeModels, () => models);
+      // null = a miss or an empty list; keep what we had rather than blanking
+      // the picker on a transient xAI hiccup.
+      if (catalog) models = catalog;
+    };
+
     const snapshot = async (): Promise<ProviderSnapshot> => {
       if (!apiKey) {
         return {
@@ -326,7 +355,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       driverKind: DRIVER_KIND,
       displayName: input.displayName,
       enabled: input.enabled,
-      models: MODELS,
+      // A getter, not a value: `refreshModels` reassigns `models`, and a
+      // captured binding would leave the picker showing the old rows forever.
+      // Same shape as minimax.ts and openai-compat.ts.
+      get models() {
+        return models;
+      },
+      refreshModels,
       snapshot,
       adapter: {
         provider: DRIVER_KIND,

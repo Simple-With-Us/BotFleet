@@ -1,4 +1,5 @@
 import type { Message } from "@/state/store";
+import { isDelegationMessage } from "../../shared/delegation-message";
 
 export function replySnippet(text: string, limit = 160): string {
   const clean = text
@@ -26,7 +27,12 @@ export function automationSourceLabel(source: string | undefined, body: string):
       return "Webhook";
     case "schedule":
       return "Scheduled Run";
+    case "delegation":
+      return "Delegated Task";
     default:
+      if (isDelegationMessage({ role: "system", text: body })) {
+        return "Delegated Task";
+      }
       return body.includes("[UNTRUSTED RESOURCE SAMPLE]") ? "Resource Alert" : "Scheduled Run";
   }
 }
