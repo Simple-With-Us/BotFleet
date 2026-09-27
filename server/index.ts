@@ -1466,6 +1466,81 @@ function cursorSeq(raw: string | string[] | undefined): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+
+// ── runtime-event redaction for the wire ─────────────────────────────────
+// Runtime events went to every SSE client and into the replay buffer whole,
+// while the transcript they fold into is scrubbed at append
+// (store.redactBotAuthored). Scrub the text-bearing fields on the broadcast
+// copy only: the server-side fold below and the HTTP tool executor still
+// read the raw event (the executor replays `arguments` verbatim).
+//
+// Deltas are provisional — the settled assistant_text item is what persists
+// — so a pattern that fires only ACROSS a delta boundary holds that
+// fragment back instead of shipping half a secret: the completed item still
+// delivers the full redacted text. The tail is raw context from the same
+// thread's recent deltas so such a split secret still matches a pattern.
+const DELTA_REDACT_TAIL_CHARS = 256;
+const deltaRedactTail = new Map<string, string>();
+
+function redactStreamDelta(threadId: string, delta: string): string {
+  const tail = deltaRedactTail.get(threadId) ?? "";
+  deltaRedactTail.set(threadId, (tail + delta).slice(-DELTA_REDACT_TAIL_CHARS));
+  const redactedTail = redactSecretsInText(tail);
+  const joined = redactSecretsInText(tail + delta);
+  // When redaction is prefix-stable (the common case: nothing secret-shaped
+  // near the boundary), the joined redaction is the redacted tail plus this
+  // delta's redacted text. When a pattern fired across the boundary the
+  // prefixes disagree — emit nothing and let the settled item carry the text.
+  return joined.startsWith(redactedTail) ? joined.slice(redactedTail.length) : "";
+}
+
+function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
+  switch (event.type) {
+    case "content.delta": {
+      const delta = redactStreamDelta(event.threadId, event.delta);
+      return delta === event.delta ? event : { ...event, delta };
+    }
+    case "item.started": {
+      const title = typeof event.title === "string" ? redactSecretsInText(event.title) : event.title;
+      const target = typeof event.target === "string" ? redactSecretsInText(event.target) : event.target;
+      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
+      if (title === event.title && target === event.target && args === event.arguments) return event;
+      return { ...event, title, target, arguments: args };
+    }
+    case "item.completed": {
+      if (event.itemType === "assistant_text") {
+        const text = redactSecretsInText(event.text);
+        return text === event.text ? event : { ...event, text };
+      }
+      const detail = typeof event.detail === "string" ? redactSecretsInText(event.detail) : event.detail;
+      const args = typeof event.arguments === "string" ? redactSecretsInText(event.arguments) : event.arguments;
+      if (detail === event.detail && args === event.arguments) return event;
+      return { ...event, detail, arguments: args };
+    }
+    case "request.opened": {
+      const summary = redactSecretsInText(event.summary);
+      const choices = event.choices?.map((choice) => redactSecretsInText(choice));
+      if (summary === event.summary && (!choices || choices.every((choice, i) => choice === event.choices?.[i]))) return event;
+      return { ...event, summary, choices };
+    }
+    case "turn.retrying": {
+      const reason = redactSecretsInText(event.reason);
+      return reason === event.reason ? event : { ...event, reason };
+    }
+    case "turn.completed": {
+      deltaRedactTail.delete(event.threadId);
+      const stopReason = typeof event.stopReason === "string" ? redactSecretsInText(event.stopReason) : event.stopReason;
+      return stopReason === event.stopReason ? event : { ...event, stopReason };
+    }
+    case "runtime.error": {
+      const message = redactSecretsInText(event.message);
+      return message === event.message ? event : { ...event, message };
+    }
+    default:
+      return event;
+  }
+}
+
 function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
@@ -2281,7 +2356,7 @@ bus.subscribe((event: RuntimeEvent) => {
       // thread keeps its own chat id so the first reply cannot retarget.
       releaseLinqChat(event.threadId, event.turnId);
   }
-  broadcast({ kind: "runtime", event });
+  broadcast({ kind: "runtime", event: redactRuntimeEventForWire(event) });
   const routineRun = routines?.handleRuntimeEvent(event) ?? null;
   const bot = store.botByThread(event.threadId);
   const group = bot ? undefined : store.groupByThread(event.threadId);
