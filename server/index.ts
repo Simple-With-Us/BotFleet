@@ -9409,13 +9409,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // A shell in disguise (Bash:bash, Bash:env, a bare Bash) is refused
         // when it is new; one stored before this rule existed is dropped
         // rather than failing every later save that carries it along.
+        // A single disposable mount is named exactly "computer"
+        // (server/computer-grants.ts), so an mcp__computer__ key can only
+        // ever run on that disposable machine — this context-free route
+        // treats those keys with their one possible scope instead of
+        // 400-ing a grant the approval card saved through here.
+        const patchScope = (key: string) =>
+          key.startsWith("mcp__computer__")
+            ? ({ scope: "disposable-computer" as const })
+            : undefined;
         const introduced = requested.find(
-          (key) => coarseAlwaysAllowRefused(key) && !existingBot?.alwaysAllow?.includes(key),
+          (key) => coarseAlwaysAllowRefused(key, patchScope(key)) && !existingBot?.alwaysAllow?.includes(key),
         );
         if (introduced) {
           return json(res, 400, { error: `${introduced} would cover every shell command — approve it once instead` });
         }
-        patch.alwaysAllow = requested.filter((key) => !coarseAlwaysAllowRefused(key)).slice(0, 200);
+        patch.alwaysAllow = requested.filter((key) => !coarseAlwaysAllowRefused(key, patchScope(key))).slice(0, 200);
       }
       if (existingBot && body.computers !== undefined) {
         await interruptIfHostRevoked(existingBot, body.computers);

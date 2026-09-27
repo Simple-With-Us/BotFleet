@@ -7356,6 +7356,30 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     }
   });
 
+  it("keeps single-mount disposable-computer grants through the generic PATCH route", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const disposableKey = "mcp__computer__bash:bash";
+      const saved = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: [disposableKey] });
+      expect(saved.status).toBe(200);
+      expect(saved.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // a later unrelated save carrying the same list must not filter it out
+      const carried = await api("PATCH", `/api/bots/${bot.id}`, {
+        alwaysAllow: [disposableKey],
+        hidden: true,
+      });
+      expect(carried.status).toBe(200);
+      expect(carried.body.bot.alwaysAllow).toEqual([disposableKey]);
+
+      // native and local-computer coarse keys stay refused
+      const refused = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:bash"] });
+      expect(refused.status).toBe(400);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("does not follow a symlink out of the packaged UI folder", async () => {
     const secret = join(home, "not-for-the-browser.txt");
     writeFileSync(secret, "top secret");
