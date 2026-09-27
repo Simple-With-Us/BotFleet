@@ -4,9 +4,11 @@
 // README + docs/installation.md (data-dir resolution, BYOK provider key,
 // `mcode acp` entry point) and packages/tui/src/acp/ (model config option
 // wire shape, terminal auth method).
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { parse as parseYaml } from "yaml";
 
 import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
@@ -15,9 +17,10 @@ export const STATIC_MCODE_MODELS: ModelCatalog = {
   default: "MiniMax-M3",
   options: [
     { id: "MiniMax-M3", label: "MiniMax M3" },
-    // Same M-series speed tier the direct minimax driver carries: plain
-    // M2.7 bills like M3 for a fifth of the context, so M3 dominates it.
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed" },
+    { id: "MiniMax-M3-thinking", label: "MiniMax M3 · thinking" },
+    { id: "MiniMax-M3.1-Flash-Preview-thinking", label: "MiniMax M3.1 Flash Preview · thinking" },
+    { id: "MiniMax-M2.7-highspeed-thinking", label: "MiniMax M2.7 Highspeed · thinking" },
+    { id: "MiniMax-M2.7-thinking", label: "MiniMax M2.7 · thinking" },
   ],
 };
 
@@ -42,10 +45,93 @@ export function mcodeAuthenticated(env: Record<string, string | undefined>): boo
   return existsSync(join(mcodeDataDir(env), "config.yaml"));
 }
 
+/** Strip the provider qualifier mcode writes on some model references
+ *  (`defaultModel: minimax/MiniMax-M3`) down to the bare id the picker uses.
+ *  A value with no `/` is already bare.  The variant-folding `mcodePickerId`
+ *  does for session-advertised values is NOT applied here: `model_order` in
+ *  config.yaml already carries the folded form (`MiniMax-M2.7-highspeed`). */
+function bareModelId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const slash = trimmed.lastIndexOf("/");
+  return slash === -1 ? trimmed : trimmed.slice(slash + 1);
+}
+
+/** The only slice of `config.yaml` this driver reads.  The file also carries
+ *  per-model generation settings, a per-provider `model_order`, and a
+ *  `whitelist`, none of which is needed: the shipped rows already are the set
+ *  a session advertises, so the only thing a config can usefully move is the
+ *  default. */
+interface McodeSettings {
+  defaultModel?: unknown;
+  defaultModelVariant?: unknown;
+  defaultModelContextWindow?: unknown;
+}
+
+function parseMcodeSettings(raw: string): McodeSettings {
+  const doc = parseYaml(raw);
+  return doc && typeof doc === "object" && !Array.isArray(doc) ? (doc as McodeSettings) : {};
+}
+
+/** Live catalog for the mcode engine: the shipped rows plus the default the
+ *  user's own config names.
+ *
+ *  Discovery here is deliberately narrow — it picks the **default**, and it
+ *  does not append rows.  The reason is that a pre-session id cannot be
+ *  verified: a row is only selectable if the running session advertises a
+ *  matching value, and an id the session does not advertise fails the turn
+ *  with an opaque "does not offer".  mcode 0.5.5 is the concrete proof — it
+ *  advertises `m:minimax:MiniMax-M3.1-Flash-Preview:v:` for the flash preview
+ *  and then fails that exact selection on a real turn, while the same
+ *  model's `v:thinking` sibling answers.  So the shipped rows are the
+ *  advertised set, and discovery only moves the default onto whichever
+ *  advertised row the owner's own config actually names.
+ *
+ *  `defaultModel` is provider-qualified and `defaultModelVariant` names the
+ *  mode, so both are folded into the picker id the same way `mcodePickerId`
+ *  folds an advertised value: a variant becomes `<modelId>-<variant>`. */
+export function readMcodeModelCatalog(
+  environment: Record<string, string | undefined> = process.env,
+): ModelCatalog {
+  const options = STATIC_MCODE_MODELS.options.map((option) => ({ ...option }));
+  const ids = new Set(options.map((option) => option.id));
+  let preferred: string | null = null;
+  let contextWindow: number | null = null;
+
+  try {
+    const settings = parseMcodeSettings(
+      readFileSync(join(mcodeDataDir(environment), "config.yaml"), "utf8"),
+    );
+    const configured = bareModelId(settings.defaultModel);
+    if (configured) {
+      const variant = settings.defaultModelVariant;
+      const folded =
+        typeof variant === "string" && variant.trim() ? `${configured}-${variant.trim()}` : configured;
+      // Only a default that is actually on offer is adopted; one that is not
+      // would send every turn to a row the picker never showed.
+      if (ids.has(folded)) preferred = folded;
+    }
+    const window = settings.defaultModelContextWindow;
+    if (typeof window === "number" && window > 0) contextWindow = window;
+  } catch {
+    // No config, unreadable, or unparseable: the shipped catalog stands.
+  }
+
+  const defaultModel = preferred ?? STATIC_MCODE_MODELS.default;
+  if (preferred && contextWindow) {
+    const row = options.find((option) => option.id === preferred);
+    // Only fill a gap — a row that already declares a window keeps it.
+    if (row && !row.contextWindow) row.contextWindow = contextWindow;
+  }
+  return { default: defaultModel, options };
+}
+
 const support: AcpSupport = {
   driverKind: "mcodeAgent",
   displayName: "MiniMax Code",
   models: STATIC_MCODE_MODELS,
+  resolveModels: (environment) => readMcodeModelCatalog(environment),
   images: true,
   defaultCli: "mcode",
   nativeSource: "mcode.acp",
@@ -102,11 +188,18 @@ export function parseMcodeModelValue(
   if (variantKind === "u" && variant === undefined) {
     return { providerId: decodeURIComponent(provider), modelId: decodeURIComponent(model) };
   }
-  if (variantKind === "v" && variant) {
+  if (variantKind === "v") {
     return {
       providerId: decodeURIComponent(provider),
       modelId: decodeURIComponent(model),
-      variant: decodeURIComponent(variant),
+      // The CLI advertises the no-variant selection as a bare `v:` with an
+      // EMPTY variant — `m:minimax:MiniMax-M3:v:` — not as the `u` suffix the
+      // source's own type suggests.  Rejecting it (as a truthiness test on
+      // `variant` does) made every non-thinking model unselectable, including
+      // the plain `MiniMax-M3` and the flash preview the CLI defaults to.
+      // Both spellings mean "no variant", so accept either and fold to the
+      // same picker id.
+      ...(variant ? { variant: decodeURIComponent(variant) } : {}),
     };
   }
   return null;
