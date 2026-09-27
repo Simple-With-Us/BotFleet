@@ -419,6 +419,7 @@ describe("Store", () => {
     store.clearResumeCursor(bot.id, "claude", "sess-older", bot.threadId);
     store.clearResumeCursor(bot.id, "codex", "thread-rejected", bot.threadId);
 
+    store.flushBotsNow();
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.resumeCursors).toEqual({ claude: "sess-keep" });
     expect(reloaded.taskByThread(bot.id, bot.threadId)?.resumeCursors).toEqual({ claude: "sess-keep" });

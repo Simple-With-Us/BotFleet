@@ -1885,6 +1885,9 @@ export class Store {
     }
     if (!changed) return;
     this.saveBots();
+    // Cursor invalidation must survive a restart in the roster debounce
+    // window — the next turn would otherwise resume the rejected thread.
+    this.flushBotsNow();
     this.emit({ type: "bot", botId });
   }
 
