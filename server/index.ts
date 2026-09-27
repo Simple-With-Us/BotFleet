@@ -239,7 +239,7 @@ import { flushNativeTee } from "./drivers/native.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { DEFAULT_MAX_DEAD_SHARE, pruneDeadThreads, searchMessages } from "./message-db.ts";
 import { exportMessageSpeaker, promptWithReply, transcriptText } from "./replies.ts";
-import { lastInterruptedChatStarter } from "./update-turn-starter.ts";
+import { lastInterruptedChatStarter, resumedDelegationChannel } from "./update-turn-starter.ts";
 import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
@@ -5116,16 +5116,28 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
   console.log(
     `boot recovery: ${replay ? "replaying" : "continuing"} in-flight thread ${threadId} for ${bot.name}`,
   );
-  return startTurn(bot.id, prompt, {
+  const channel = resumeUser?.comm?.groupId ? store.group(resumeUser.comm.groupId) : undefined;
+  const channelId = resumedDelegationChannel(resumeUser, bot.id, channel);
+  if (channelId) delegationWatch.set(threadId, { channelId, toBotId: bot.id });
+  const resumed = startTurn(bot.id, prompt, {
     threadId,
     userMessage: replay ? resumeUser : undefined,
     ...bootRecoveryTurnOpts(resumeUser, replay),
-  }).then(() => {}, (error) => {
+    ...(channelId ? {
+      commsDepth: 1,
+      from: resumeUser?.from,
+      comm: resumeUser?.comm,
+      onDispatchError: () => finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume"),
+    } : {}),
+  });
+  return resumed.then(() => {}, (error) => {
     if (isExternalCredentialPendingError(error)) {
+      if (channelId) delegationWatch.delete(threadId);
       releaseBootResume(bot.id, threadId);
       deferredBootRecoveries.add(bot.id);
       return;
     }
+    if (channelId) finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume");
     console.error(`boot recovery failed for ${bot.name} (${threadId}):`, error);
     // Terminal, and remembered: without this the next boot finds the same
     // marker, dispatches the same doomed turn, and fails the same way — 29
@@ -7315,12 +7327,9 @@ async function resumeInterruptedChatTurns(
       // interruption. A resumed delegated turn needs a fresh terminal
       // watch or its reply never reaches the bot-to-bot channel.
       if (resumePrompt.automationSource === "delegation") {
-        const channelId = resumePrompt.comm?.groupId;
-        const channel = channelId ? store.group(channelId) : undefined;
-        if (channel?.memberIds.includes(resumeBot.id) &&
-            resumePrompt.from?.botId && channel.memberIds.includes(resumePrompt.from.botId)) {
-          delegationWatch.set(resumeThreadId, { channelId: channel.id, toBotId: resumeBot.id });
-        }
+        const channel = resumePrompt.comm?.groupId ? store.group(resumePrompt.comm.groupId) : undefined;
+        const channelId = resumedDelegationChannel(resumePrompt, resumeBot.id, channel);
+        if (channelId) delegationWatch.set(resumeThreadId, { channelId, toBotId: resumeBot.id });
       }
       try {
         await startTurn(resumeBot.id, resumePrompt.text, {
