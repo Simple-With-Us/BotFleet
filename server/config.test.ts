@@ -1291,6 +1291,16 @@ describe("the secret-store section", () => {
     expect(infisicalEnabled(loadConfig())).toBe(false);
   });
 
+  it("persists call STT vocabulary and clears an explicit provider on Auto", () => {
+    const terms = Array.from({ length: 100 }, (_, index) => `term-${index}`);
+    const patch = parseConfigPatch({ callStt: { provider: "assemblyai", keyterms: terms } });
+    saveConfig(patch);
+    expect(loadConfig().callStt).toEqual({ provider: "assemblyai", keyterms: terms });
+    saveConfig(parseConfigPatch({ callStt: { provider: null } }));
+    expect(loadConfig().callStt).toEqual({ keyterms: terms });
+    expect(() => parseConfigPatch({ callStt: { keyterms: [...terms, "overflow"] } })).toThrow();
+  });
+
   it("persists a DeepSeek key, which the allowlist used to drop on the floor", () => {
     // The key is in the schema, in the API Keys panel and in the tombstone
     // list, so a save reported success while nothing reached disk.

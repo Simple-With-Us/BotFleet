@@ -1,5 +1,11 @@
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { acceptComposerTranscript } from "@/lib/composer-dictation";
+import { pickSTTProvider } from "@/lib/transcription-provider";
+import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
@@ -150,6 +156,13 @@ export function Composer({
 }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  const cloudConfigured = useTranscriptionAvailability();
+  const dictationAvailable = pickSTTProvider({
+    cloudSttConfigured: cloudConfigured,
+    appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
+    platform: window.ogb?.platform ?? "unknown",
+    explicitPreference: state.config?.callStt?.provider ?? undefined,
+  }).provider !== null;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
   // offers members plus @everyone; explicit mentions override the room's
   // configured default responder.
@@ -202,6 +215,12 @@ export function Composer({
     [text, setText, setAttachments],
   );
   const [recording, setRecording] = useState(false);
+  const onCall = useOnCall();
+  // Stop the independent composer microphone before the call overlay starts
+  // its own session. Keep the draft, but never resume capture implicitly.
+  useLayoutEffect(() => {
+    if (onCall && recording) setRecording(false);
+  }, [onCall, recording]);
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [caret, setCaret] = useState(0);
   const [highlight, setHighlight] = useState(0);
@@ -209,6 +228,11 @@ export function Composer({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // what was typed before the mic went on — partials append after it
   const baseText = useRef("");
+  // Long-lived STT session for push-to-talk dictation. Created lazily on
+  // first mic-on so the cloud-side assemblyai session only spins up when a
+  // user explicitly opts into dictation. Composer is much simpler than
+  // CallView: no queue, no approvals, just one ongoing capture turn at a time.
+  const sttSessionRef = useRef<STTSession | null>(null);
 
   // image paste is offered only when every bot that will actually answer
   // can open one. sendGroup routes to mentions, else the room default —
@@ -368,39 +392,121 @@ export function Composer({
   // native dictation: partials stream into the input while the Swift
   // helper runs; the final transcript stays in the box, ready to edit/send
   useEffect(() => {
-    if (!recording) return;
+    if (!recording || onCall) return;
+    let detached = false;
+    let finalizing = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
     const bridge = window.ogb;
     if (!bridge) {
       setRecording(false);
       return;
     }
     setSpeechError(null);
-    const offTranscript = bridge.onSpeechTranscript((line) => {
-      if (typeof line.text === "string") {
+    let session: STTSession | null = sttSessionRef.current;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
+      if (acceptComposerTranscript(detached, finalizing, Boolean(currentCall())) && typeof line.text === "string") {
         const base = baseText.current;
         setText(base ? `${base} ${line.text}` : line.text);
       }
-    });
-    const offEnd = bridge.onSpeechEnd(({ code }) => {
+    };
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       setRecording(false);
       if (code === 2) {
-        setSpeechError("Dictation is only available on macOS for now.");
+        setSpeechError(
+          reason === "no-provider"
+            ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+            : "Dictation needs a working provider.\u00A0 Add an AssemblyAI key or use BotFleet for macOS.",
+        );
       } else if (code === 1) {
         setSpeechError(
-          "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
+          session?.provider === "assemblyai"
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access — System Settings → Privacy & Security.",
         );
       }
-    });
-    void bridge.speechStart();
-    return () => {
-      offTranscript();
-      offEnd();
-      void bridge.speechStop();
     };
-  }, [recording]);
+
+    const wireExisting = async () => {
+      if (!session) {
+        const status = await bridge.transcription?.status?.().catch(() => undefined);
+        const hostPlatform = bridge.platform ?? "unknown";
+        const choice = pickSTTProvider({
+          cloudSttConfigured: Boolean(status?.configured),
+          appleSpeechAvailable: hostPlatform === "darwin" && capabilities.dictation.available,
+          platform: hostPlatform,
+          explicitPreference: state.config?.callStt?.provider ?? undefined,
+        });
+        if (choice.provider === null) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(
+              choice.missing === "cloud-stt-key"
+                ? "Add an AssemblyAI API key in Settings to use dictation on this computer."
+                : "Dictation isn't available in this app build.",
+            );
+          }
+          return;
+        }
+        if (detached) return;
+        try {
+          session = createSTTSession(choice.provider);
+          sttSessionRef.current = session;
+        } catch (error) {
+          if (!detached) {
+            setRecording(false);
+            setSpeechError(error instanceof Error ? error.message : String(error));
+          }
+          return;
+        }
+      }
+      if (detached || currentCall()) return;
+      offTranscript = session.onTranscript(handleTranscript);
+      offEnd = session.onEnd(handleEnd);
+      session.start({ keyterms: sessionKeyterms([...(bot ? [bot.name] : []), ...(members?.map((member) => member.name) ?? [])], state.config?.callStt?.keyterms ?? []) }).catch(() => {
+        if (!detached) {
+          setRecording(false);
+          setSpeechError(session?.provider === "assemblyai"
+            ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
+        }
+      });
+    };
+    void wireExisting();
+
+    return () => {
+      detached = true;
+      // A call takes the microphone, so drop the composer listener at once
+      // and close its cloud socket without a final hidden draft update.
+      const callStarted = Boolean(currentCall());
+      finalizing = !callStarted && session?.provider === "assemblyai";
+      if (callStarted) {
+        offTranscript();
+        offEnd();
+      }
+      // An ordinary mic-off still drains the last formatted cloud turn.
+      void (async () => {
+        try {
+          if (session?.provider === "assemblyai" && !callStarted) await session.finish();
+          else await session?.stop();
+        } catch {
+          // A provider can close during navigation; still detach listeners.
+        } finally {
+          finalizing = false;
+          offTranscript();
+          offEnd();
+          if (session?.provider === "apple") disposeAppleSTTSession(session);
+          if (sttSessionRef.current === session) sttSessionRef.current = null;
+        }
+      })();
+    };
+  }, [recording, onCall]);
 
   const toggleMic = () => {
-    if (!capabilities.dictation.available || !window.ogb) {
+    if (onCall || !dictationAvailable || !window.ogb) {
       setSpeechError("Dictation isn't available in this build.");
       return;
     }
@@ -752,7 +858,7 @@ export function Composer({
             <Square size={14} className="fill-current" />
           </button>
         )}
-        {!locked && !busy && !hasContent && capabilities.dictation.available && (
+        {!locked && !busy && !hasContent && !onCall && dictationAvailable && (
           <button
             onClick={toggleMic}
             aria-label={recording ? "Stop Dictation" : "Start Dictation"}

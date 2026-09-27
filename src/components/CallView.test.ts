@@ -43,8 +43,9 @@ describe("CallTargetButton visibility", () => {
 
   it("still explains the missing-voice case for the states it does render", () => {
     // Once a provider IS configured, the button stays visible and keeps its guidance for the
-    // remaining unavailable reasons (no macOS desktop app, capabilities loading, no voice picked).
+    // remaining unavailable reasons (no STT provider, capabilities loading, no voice picked).
     expect(SRC).toMatch(/Pick a voice in a bot profile to make calls/);
-    expect(SRC).toMatch(/Calls currently need the macOS desktop app/);
+    expect(SRC).toMatch(/Set up dictation to make calls/);
+    expect(SRC).toMatch(/Add an AssemblyAI API key in Settings to make calls on this computer/);
   });
 });

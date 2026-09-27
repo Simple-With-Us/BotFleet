@@ -26,6 +26,10 @@ import { speaker } from "@/lib/tts";
 import { spokenReply } from "../../shared/voice-summary";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
+import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
+import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
+import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
 import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
 import { cn } from "@/lib/cn";
@@ -74,7 +78,14 @@ export function CallTargetButton({
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
+  const cloudConfigured = useTranscriptionAvailability();
+  const provider = pickSTTProvider({
+    cloudSttConfigured: cloudConfigured,
+    appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
+    platform: window.ogb?.platform ?? "unknown",
+    explicitPreference: state.config?.callStt?.provider ?? undefined,
+  });
+  const supported = provider.provider !== null;
   const configured = Boolean(state.config?.tts?.configured);
   // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
   // rather than render disabled with an explanation.  `configured` is provider-scoped server-side
@@ -96,7 +107,7 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need the macOS desktop app"
+        ? "Set up dictation to make calls"
         : !configured
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
@@ -105,17 +116,17 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !capabilities.dictation.available
-      ? "Calls require BotFleet for macOS because speech recognition runs on-device."
-      : !window.ogb?.speechStart
-        ? "The speech service is unavailable in this app build. Restart or update BotFleet."
-        : !configured
-          ? "Add a MiniMax API key — or switch to the built-in Mac voices — so the bot can speak during calls."
-          : !voiceReady
-            ? voices.length > 1
-              ? "Give every channel member a voice before starting a channel call."
-              : "Choose a voice before starting a call."
-            : "";
+    : !supported
+      ? provider.provider === null && provider.missing === "cloud-stt-key"
+        ? "Add an AssemblyAI API key in Settings to make calls on this computer."
+        : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
+      : !configured
+        ? "Add an ElevenLabs API key or choose an available voice provider so the bot can speak during calls."
+        : !voiceReady
+          ? voices.length > 1
+            ? "Give every channel member a voice before starting a channel call."
+            : "Choose a voice before starting a call."
+          : "";
 
   useEffect(() => {
     if (!helpOpen) return;
@@ -206,14 +217,18 @@ export function CallOverlay({ bot }: { bot: Bot }) {
 }
 
 function Call({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
   const speech = useSpeech();
   const initialPhase: Phase = bot.busy ? "working" : "listening";
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [heard, setHeard] = useState("");
   const [note, setNote] = useState<string | null>(null);
-  const pushToTalk = usePushToTalk(bot.id, phase === "listening", () => {
-    setNote("Push to talk couldn't start. Check Microphone and Speech Recognition access.");
+  const sttSessionRef = useRef<STTSession | null>(null);
+  const pushToTalk = usePushToTalk(bot.id, phase === "listening", sttSessionRef, () => {
+    setNote(sttSessionRef.current?.provider === "assemblyai"
+      ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+      : "Push to talk couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
   });
 
   const messages = visibleMessages(bot);
@@ -243,6 +258,10 @@ function Call({ bot }: { bot: Bot }) {
   const phaseRef = useRef<Phase>(initialPhase);
   const alive = useRef(true);
   const sayGeneration = useRef(0);
+  // The STT provider session is chosen once per call and reused across every
+  // listen cycle. The provider picker decides apple (macOS, no cloud key) vs
+  // assemblyai (cross-platform, or macOS-with-key per the picker default).
+
 
   /** Change the rendered phase and the synchronous phase used by native
    * callbacks together. React state alone is too late: the helper can exit
@@ -253,7 +272,7 @@ function Call({ bot }: { bot: Bot }) {
   }, []);
 
   const hush = useCallback(() => {
-    void window.ogb?.speechStop();
+    void sttSessionRef.current?.stop();
   }, []);
 
   const listen = useCallback(() => {
@@ -261,12 +280,16 @@ function Call({ bot }: { bot: Bot }) {
     move("listening");
     setHeard("");
     setNote(null);
-    void window.ogb?.speechStart({ endpointMs: CALL_ENDPOINT_MS }).catch(() => {
+    if (!sttSessionRef.current) return;
+    const session = sttSessionRef.current;
+    session.start({ endpointMs: CALL_ENDPOINT_MS, keyterms: sessionKeyterms([bot.name], state.config?.callStt?.keyterms ?? []) }).catch(() => {
       if (alive.current && currentCall() === bot.id) {
-        setNote("The microphone couldn't start. Check Microphone and Speech Recognition access.");
+        setNote(session?.provider === "assemblyai"
+          ? "Cloud dictation couldn't start.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "The microphone couldn't start.\u00A0 Check Microphone and Speech Recognition access.");
       }
     });
-  }, [bot.id, move]);
+  }, [bot.id, bot.name, move, state.config?.callStt?.keyterms]);
 
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
@@ -309,19 +332,24 @@ function Call({ bot }: { bot: Bot }) {
 
   // ── the microphone ───────────────────────────────────────────────────
   useEffect(() => {
-    const bridge = window.ogb;
-    if (!bridge) return;
-    const offTranscript = bridge.onSpeechTranscript((line) => {
+    let detached = false;
+    let offTranscript: () => void = () => {};
+    let offEnd: () => void = () => {};
+    let session: STTSession | null = null;
+
+    const handleTranscript = (line: { text: string; partial: boolean; error?: string }) => {
       if (!alive.current || currentCall() !== bot.id || phaseRef.current !== "listening") return;
       if (speaker.state.status === "speaking" || speaker.state.status === "preparing") return;
       if (line.error) {
-        setNote("Dictation stopped unexpectedly. Check Microphone and Speech Recognition access.");
+        setNote(sttSessionRef.current?.provider === "assemblyai"
+          ? "Cloud dictation stopped unexpectedly.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+          : "Dictation stopped unexpectedly.\u00A0 Check Microphone and Speech Recognition access.");
         return;
       }
       if (typeof line.text !== "string") return;
       setHeard(line.text);
       if (line.partial !== false) return;
-      // final result — Apple's recognizer decided the turn ended
+      // final result — the recognizer decided the turn ended
       const said = line.text.trim();
       if (!said) return listen();
 
@@ -393,36 +421,78 @@ function Call({ bot }: { bot: Bot }) {
         askedQuestion.current = null;
         dispatch({ type: "answerCard", botId: bot.id, messageId: openQuestion.messageId, answer: said });
         move("working");
+        hush();
         return;
       }
 
       move("sending");
       dispatch({ type: "send", botId: bot.id, text: said });
-    });
-    const offEnd = bridge.onSpeechEnd(({ code, reason }) => {
+    };
+
+    const handleEnd = ({ code, reason }: { code: number; reason?: string }) => {
       if (!alive.current || currentCall() !== bot.id) return;
       if (code === 2) {
-        setNote("Calls need macOS dictation, which isn't available here yet.");
+        setNote("Calls need a working dictation provider.\u00A0 Add an AssemblyAI key in Settings, or use BotFleet for macOS.");
         return;
       }
       if (code === 1) {
         setNote(
-          reason === "helper-build-failed"
-            ? "The dictation helper couldn't be built. Install Apple's Command Line Tools and try again."
-            : "Dictation needs Microphone + Speech Recognition access in System Settings.",
+          session?.provider === "assemblyai"
+            ? "Cloud dictation stopped.\u00A0 Check the AssemblyAI key, connection, and microphone access."
+            : reason === "helper-build-failed"
+              ? "The dictation helper couldn't be built.\u00A0 Install Apple's Command Line Tools and try again."
+              : "Dictation needs Microphone + Speech Recognition access in System Settings.",
         );
         return;
       }
-      // the helper exits after every final result; if we are still meant
-      // to be listening, that means the user's turn ended — start the next
-      if (phaseRef.current === "listening") listen();
+      // The helper exits after every final result; if we are still meant
+      // to be listening, that means the user's turn ended — start the next.
+      if (phaseRef.current === "listening" && alive.current) listen();
+    };
+
+    (async () => {
+      const bridge = window.ogb;
+      if (!bridge || detached) return;
+      const status = await bridge.transcription?.status?.().catch(() => undefined);
+      const cloudSttConfigured = Boolean(status?.configured);
+      const platform = bridge.platform ?? "unknown";
+      const choice: ProviderChoice = pickSTTProvider({
+        cloudSttConfigured,
+        appleSpeechAvailable: capabilities.dictation.available,
+        platform,
+        explicitPreference: state.config?.callStt?.provider ?? undefined,
+      });
+      if (choice.provider === null) {
+        if (alive.current && currentCall() === bot.id) {
+          setNote(
+            choice.missing === "cloud-stt-key"
+              ? "Add an AssemblyAI API key in Settings to use voice on this computer."
+              : "Dictation isn't available in this app build.\u00A0 Restart or update BotFleet.",
+          );
+        }
+        return;
+      }
+      if (detached || !alive.current) return;
+      const created = createSTTSession(choice.provider);
+      sttSessionRef.current = created;
+      session = created;
+      offTranscript = created.onTranscript(handleTranscript);
+      offEnd = created.onEnd(handleEnd);
+      if (bot.busy && !approval && !question) move("working");
+      else listen();
+    })().catch((error) => {
+      if (alive.current && currentCall() === bot.id) {
+        setNote(error instanceof Error ? error.message : String(error));
+      }
     });
-    if (bot.busy && !approval && !question) move("working");
-    else listen();
+
     return () => {
+      detached = true;
       offTranscript();
       offEnd();
-      void window.ogb?.speechStop();
+      if (session?.provider === "apple") disposeAppleSTTSession(session);
+      void session?.stop().catch(() => {});
+      if (sttSessionRef.current === session) sttSessionRef.current = null;
     };
     // busy/approval are intentionally initial snapshots. Their live changes
     // are handled below without tearing down native event listeners.
@@ -613,7 +683,7 @@ function Call({ bot }: { bot: Bot }) {
       </div>
 
       <div className="text-[11.5px] text-ink-secondary/70">
-        Hold Control + Option to talk · Space interrupts · Esc hangs up
+        {sttSessionRef.current?.provider === "apple" ? "Hold Control + Option to talk · " : ""}Space interrupts · Esc hangs up
       </div>
     </div>
   );

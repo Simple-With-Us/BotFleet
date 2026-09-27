@@ -6545,6 +6545,7 @@ function configStatus() {
     // the chosen voice is a setting, not a secret; the key is reported the
     // same configured-or-not way as every other credential
     tts: tts.describeVoice(cfg),
+    callStt: { provider: cfg.callStt?.provider ?? undefined, keyterms: cfg.callStt?.keyterms ?? [] },
     imageGen: { configured: Boolean(cfg.imageGen?.key) },
     // Linq binding credentials live in env (BOTFLEET_LINQAPP_API_KEY or
     // legacy LINQ_API_TOKEN), so we never carry a token across this frame —
