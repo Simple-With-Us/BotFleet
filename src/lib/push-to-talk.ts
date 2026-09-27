@@ -14,8 +14,9 @@ export function isPushToTalkPress(event: ModifierEvent): boolean {
   return modifier && event.altKey && event.ctrlKey && !event.repeat;
 }
 
-/** Hold Control + Option to replace automatic endpointing with a manually
- * finalized utterance. The ordinary call listener remains the default. */
+/** Hold Control + Option for a manually finalized Apple utterance.
+ * AssemblyAI's server-side endpoint is fixed for the socket lifetime; do
+ * not advertise a manual hold while its ordinary 850 ms endpoint is active. */
 export function usePushToTalk(
   targetId: string,
   enabled: boolean,
@@ -65,25 +66,29 @@ export function usePushToTalk(
         return;
       }
       const session = sessionRef.current;
-      if (!session) return;
+      if (!session || session.provider !== "apple") return;
       event.preventDefault();
       held.current = true;
       heldSession.current = session;
       generation.current += 1;
       setActive(true);
-      // Apple needs a fresh un-endpointed recognition cycle. Cloud is
-      // already capturing; restarting it here would open a second mic.
-      if (session.provider === "apple") {
-        const cycle = session.stop().then(() => session.start({ endpointMs: 0 }));
-        starting.current = cycle;
-        void cycle.catch(() => {
-          held.current = false;
-          setActive(false);
-          onErrorRef.current();
-        }).finally(() => {
-          if (starting.current === cycle) starting.current = null;
-        });
-      }
+      // Apple needs a fresh no-endpoint recognition cycle for this hold.
+      const current = generation.current;
+      const cycle = session.stop().then(() => {
+        if (held.current && generation.current === current && sessionRef.current === session) {
+          return session.start({ endpointMs: 0 });
+        }
+      });
+      starting.current = cycle;
+      void cycle.catch(() => {
+        if (generation.current !== current) return;
+        held.current = false;
+        heldSession.current = null;
+        setActive(false);
+        onErrorRef.current();
+      }).finally(() => {
+        if (starting.current === cycle) starting.current = null;
+      });
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (!held.current || (event.altKey && event.ctrlKey)) return;
