@@ -3047,6 +3047,10 @@ bus.subscribe((event: RuntimeEvent) => {
             instanceId: actualSelection.instanceId,
             model: actualSelection.model,
           },
+          // The owning bot is what lets the walk skip a chain entry the
+          // doomed breaker is refusing; without it the gate is inert and the
+          // fail-over can hand the turn to a second dead engine.
+          botId: fallbackBot.id,
         });
         // Receipt now that the failover decision exists: while a fallback is
         // launching the run stays open and receipts on the fallback's own
