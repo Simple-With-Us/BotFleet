@@ -2426,7 +2426,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 options: ["Allow", "Deny"],
                 requestId,
                 tool,
-                allowKey: event.approvalScope
+                allowKey: event.approvalScope === "local-computer"
                   ? undefined
                   : approvalKey(tool, summary, event.approvalScope),
                 held: "Auto mode couldn't answer this one.",
@@ -2466,7 +2466,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // the exact grant "always allow" would remember, decided here so
           // client and server can never derive it differently
           allowKey:
-            permission && !event.approvalScope
+            permission && event.approvalScope !== "local-computer"
               ? approvalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
           // in auto mode a card can only mean the guard stopped it — say so

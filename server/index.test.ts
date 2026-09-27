@@ -7303,7 +7303,7 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
     }
   });
 
-  it("refuses coarse always-allow on the host but allows it for disposable computers", async () => {
+  it("refuses unscoped native shell grants and accepts a named disposable-computer grant", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
       const hostCoarse = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -7312,9 +7312,14 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       expect(hostCoarse.status).toBe(400);
       expect(hostCoarse.body.error).toMatch(/every shell command/);
 
-      const virtualCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
+      const nativeCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", "Bash:bash"] });
+      expect(nativeCoarse.status).toBe(400);
+      expect(nativeCoarse.body.error).toMatch(/every shell command/);
+
+      const remoteKey = "mcp__computer_shared_vm__bash:bash";
+      const virtualCoarse = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git", remoteKey] });
       expect(virtualCoarse.status).toBe(200);
-      expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", "Bash:bash"]);
+      expect(virtualCoarse.body.bot.alwaysAllow).toEqual(["Bash:git", remoteKey]);
 
       const direct = await api("POST", `/api/bots/${bot.id}/always-allow`, { allowKey: "Bash:sh" });
       expect(direct.status).toBe(409);

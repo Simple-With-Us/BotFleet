@@ -360,7 +360,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           typeof mcpTool === "string" && mcpTool.length > 0,
         );
         if (remoteComputerAsk) tool = `mcp__${params.serverName}__${mcpTool}`;
-        const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
+        const approvalScope = remoteComputerAsk && params.serverName === "computer" ? "disposable-computer"
+          : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
         const summary =
           remoteComputerAsk && typeof params._meta?.tool_params?.command === "string"
             ? params._meta.tool_params.command

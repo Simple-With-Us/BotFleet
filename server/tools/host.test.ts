@@ -72,12 +72,12 @@ const runtime = { signal: new AbortController().signal, requestApproval: async (
 
 /** A runtime that records what it was asked and answers with `verdict`. */
 function askingRuntime(verdict: RequestOutcome) {
-  const asks: Array<{ tool: string; summary: string; approvalScope?: "local-computer" }> = [];
+  const asks: Array<{ tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }> = [];
   return {
     asks,
     runtime: {
       signal: new AbortController().signal,
-      requestApproval: async (ask: { tool: string; summary: string; approvalScope?: "local-computer" }) => {
+      requestApproval: async (ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }) => {
         asks.push(ask);
         return verdict;
       },

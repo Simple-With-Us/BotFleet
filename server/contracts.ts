@@ -174,7 +174,7 @@ export type RuntimeEvent = RuntimeEventBase &
         tool: string;
         summary: string;
         choices?: string[];
-        approvalScope?: "local-computer";
+        approvalScope?: "local-computer" | "disposable-computer";
       }
     | {
         type: "request.resolved";
@@ -183,7 +183,7 @@ export type RuntimeEvent = RuntimeEventBase &
          * harness (turn ended / settings changed), or nobody — the answerer
          * was already gone and the action never ran */
         source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
-        approvalScope?: "local-computer";
+        approvalScope?: "local-computer" | "disposable-computer";
       }
     // Same invariant as turn.completed.usage: `cachedInput` is a subset of
     // `input`, and `output` is optional for the same reason (see there).
@@ -379,7 +379,7 @@ export interface TurnToolRuntime {
    *  deny.  The driver's loop supplies this: it pauses the per-tool clock
    *  for as long as the card is open, then delegates to the harness's
    *  permission broker (`TurnToolHost.requestApproval`). */
-  requestApproval(ask: { tool: string; summary: string; approvalScope?: "local-computer" }): Promise<RequestOutcome>;
+  requestApproval(ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }): Promise<RequestOutcome>;
 }
 
 /** The harness side of a driver-owned tool loop.  A driver that declares
@@ -404,7 +404,7 @@ export interface TurnToolHost {
   requestApproval?(ask: {
     tool: string;
     summary: string;
-    approvalScope?: "local-computer";
+    approvalScope?: "local-computer" | "disposable-computer";
     /** The tool call's own signal, so an interrupted turn settles the ask
      *  instead of leaving a card nobody can answer. */
     signal?: AbortSignal;

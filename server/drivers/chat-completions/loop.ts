@@ -521,7 +521,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     /** The host's channel to a person.  The loop owns the clock semantics;
      *  the broker owns the card.  No broker mounted is fail-closed: the
      *  host reads `"unavailable"` as a deny and the tool never runs. */
-    const requestApproval = async (ask: { tool: string; summary: string; approvalScope?: "local-computer" }): Promise<RequestOutcome> => {
+    const requestApproval = async (ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }): Promise<RequestOutcome> => {
       const broker = deps.requestApproval;
       if (!broker) return "unavailable";
       stopClock();

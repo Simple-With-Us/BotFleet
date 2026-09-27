@@ -70,16 +70,16 @@ export function looksDestructive(text: string): boolean {
  * client so the two sides can never disagree about what was granted. */
 const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
 
-export function approvalKey(tool: string, summary: string, scope?: "local-computer"): string {
+export function approvalKey(tool: string, summary: string, scope?: "local-computer" | "disposable-computer"): string {
   const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
-  if (!COMMAND_TOOLS.has(bare)) return scope ? `${scope}:${tool}` : tool;
+  if (!COMMAND_TOOLS.has(bare)) return scope === "local-computer" ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
   let i = 0;
   while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
   const program = (words[i] ?? "").split("/").pop()?.replace(/[^\w.-]/g, "") ?? "";
   const key = program ? `${tool}:${program}` : tool;
-  return scope ? `${scope}:${key}` : key;
+  return scope === "local-computer" ? `${scope}:${key}` : key;
 }
 
 /** Program names that run whatever follows them.  On the person's own
@@ -114,7 +114,7 @@ export function isCoarseApprovalKey(key: string): boolean {
  * remote-computer MCP calls can keep a coarse grant. */
 export function coarseAlwaysAllowRefused(
   key: string,
-  context?: { scope?: "local-computer" },
+  context?: { scope?: "local-computer" | "disposable-computer" },
 ): boolean {
   if (!isCoarseApprovalKey(key)) return false;
   if (key.startsWith("local-computer:")) return true;
@@ -124,7 +124,8 @@ export function coarseAlwaysAllowRefused(
   // of disposable execution. Only a named remote MCP computer can carry a
   // coarse key without becoming a remembered host-shell grant.
   const tool = key.split(":", 1)[0]!;
-  return !/^mcp__computer_(?:shared_vm|local_vm|box)__/.test(tool);
+  return !/^mcp__computer_(?:shared_vm|local_vm|box)__/.test(tool) &&
+    !(context?.scope === "disposable-computer" && /^mcp__computer__/.test(tool));
 }
 
 export interface AutoApprover {
@@ -168,7 +169,7 @@ export function autoVerdict(
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
     /** the request controls the user's active desktop */
-    scope?: "local-computer";
+    scope?: "local-computer" | "disposable-computer";
   },
 ): AutoVerdict {
   // the guards outrank the grants, so an "always allow" can never widen
@@ -225,7 +226,7 @@ export function autoDecision(
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
     /** the request controls the user's active desktop */
-    scope?: "local-computer";
+    scope?: "local-computer" | "disposable-computer";
   },
 ): string | null {
   return autoVerdict(bot, tool, summary, context).approve;

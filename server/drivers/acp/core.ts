@@ -942,7 +942,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             typeof toolCall.rawInput?.toolName === "string" && toolCall.rawInput.toolName.length > 0,
           );
           if (remoteComputerAsk) tool = `mcp__${toolCall.rawInput.serverName}__${toolCall.rawInput.toolName}`;
-          const approvalScope = controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
+          const approvalScope = remoteComputerAsk && toolCall.rawInput?.serverName === "computer" ? "disposable-computer"
+            : controlsHost && !remoteComputerAsk ? "local-computer" : undefined;
           const finish = (behavior: string, source: "user" | "timeout" | "system" = "user") => {
             if (!asks.delete(requestId)) return;
             clearTimeout(timer);
