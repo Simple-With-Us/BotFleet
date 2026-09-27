@@ -131,8 +131,12 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
         const providedName = entry.name?.trim() ? entry.name : "";
         const row: ModelCatalog["options"][number] = {
           id,
-          // Hand-written copy wins over the settings file's own name.
-          label: previous?.label ?? providedName ?? id,
+          // Hand-written copy wins over the settings file's own name.  `||`
+          // and not `??` on the fallback: `providedName` is "" when the entry
+          // has no name, and `??` does not fall through on falsy, so a model
+          // the static catalog has never heard of would render with a blank
+          // label.
+          label: previous?.label ?? (providedName || id),
         };
         // A live contextWindow is the one number a profile edit actually
         // changes, so it beats the static value; otherwise keep the static one.

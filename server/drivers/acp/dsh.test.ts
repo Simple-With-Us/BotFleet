@@ -529,6 +529,20 @@ describe("readDshModelCatalog", () => {
     expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).toContain("MiniMax-M6");
   });
 
+  it("falls back to the id when an entry has no name", () => {
+    // Regression: `??` does not fall through on an empty string, so a model
+    // the static catalog has never heard of rendered with a blank label.
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M8\n"));
+    const row = readDshModelCatalog({ HOME: home }).options.find((o) => o.id === "MiniMax-M8");
+    expect(row?.label).toBe("MiniMax-M8");
+  });
+
+  it("falls back to the id when an entry name is whitespace only", () => {
+    writeSettings(llmPiAi('    minimax:\n      models:\n        - id: MiniMax-M8\n          name: "   "\n'));
+    const row = readDshModelCatalog({ HOME: home }).options.find((o) => o.id === "MiniMax-M8");
+    expect(row?.label).toBe("MiniMax-M8");
+  });
+
   it("takes a live contextWindow for a known id", () => {
     const known = STATIC_DSH_MODELS.options[0].id;
     writeSettings(llmPiAi(`    minimax:\n      models:\n        - id: ${known}\n          contextWindow: 2000000\n`));
