@@ -20,7 +20,8 @@ describe("VpsModeToggle", () => {
 
   it("keeps the two-space sentence gap in the shared caption", () => {
     const html = renderToStaticMarkup(createElement(VpsModeToggle, { value: "shared", onChange: () => {} }));
-    expect(html).toContain("same container.\u00a0 Only one bot can use it at a time.");
+    expect(html).toContain("same time.");
+    expect(html).toContain("isolated desktop session");
     expect(html).not.toMatch(/\. [A-Z]/);
   });
 
