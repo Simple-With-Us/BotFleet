@@ -126,7 +126,15 @@ export function createWebhookIngressHandler(
   routes: Readonly<Record<string, WebhookIngressRoute | DeferredAdmissionRoute>> = {},
 ) {
   return async (req: IncomingMessage, res: ServerResponse) => {
-    const url = new URL(req.url ?? "/", "http://localhost");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://localhost");
+    } catch {
+      // A request target like `//host` is protocol-relative, so the WHATWG
+      // parser throws instead of yielding a pathname.  Answer 400 rather than
+      // letting the throw escape the receiver and hang the connection.
+      return json(res, 400, { error: "Malformed request URL" });
+    }
     const entry = Object.prototype.hasOwnProperty.call(routes, url.pathname) ? routes[url.pathname] : undefined;
     if (entry) {
       if (req.method !== "POST") return json(res, 405, { error: "Webhooks accept POST requests" });
