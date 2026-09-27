@@ -937,7 +937,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // only an exact granted remote mount; unknown/native calls stay
           // host-scoped so missing metadata cannot expose host shell grants.
           const remoteComputerAsk = computerMounts.some((mount) =>
-            kind !== "execute" && kind !== "edit" && mount.kind !== "local" &&
+            kind !== "edit" && mount.kind !== "local" &&
             toolCall.rawInput?.serverName === mount.name &&
             typeof toolCall.rawInput?.toolName === "string" && toolCall.rawInput.toolName.length > 0,
           );
