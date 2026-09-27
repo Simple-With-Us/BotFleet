@@ -169,7 +169,23 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(mcode.capabilities.connectedApps).toBe("yes");
     expect(mcode.capabilities.imageAttachments).toBe("yes");
     expect(minimaxEntry.capabilities.connectedApps).toBe("no");
-    expect(mcode.defaultModels.map((m) => m.id)).toEqual(["MiniMax-M3", "MiniMax-M2.7-highspeed"]);
+    // The matrix lists the ids a live mcode session actually advertises, so
+    // the engine's declared models and the picker's rows agree.
+    expect(mcode.defaultModels.map((m) => m.id)).toEqual([
+      "MiniMax-M3",
+      "MiniMax-M3-thinking",
+      "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M2.7-highspeed-thinking",
+      "MiniMax-M2.7-thinking",
+    ]);
+    // The flash preview tier is the one a current mcode install defaults to,
+    // so it must be reachable in the matrix too.  It is deliberately not the
+    // first row: a preview id is never what a fresh install hands someone who
+    // has not asked for it.
+    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3");
+    expect(
+      mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
+    ).toBe(1_000_000);
   });
 
   it("leaves MiniMax-M3 unmapped rather than crediting one of its two engines", () => {
