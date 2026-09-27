@@ -28,6 +28,7 @@ import { useSpeech } from "@/lib/tts/useSpeech";
 import { usePushToTalk } from "@/lib/push-to-talk";
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
+import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { pickSTTProvider, type ProviderChoice } from "@/lib/transcription-provider";
 import { BotMascot } from "./Avatar";
 import { isRoutineApproval, pendingApprovals, spokenApprovalPrompt } from "./PendingApproval";
@@ -77,7 +78,14 @@ export function CallTargetButton({
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const active = useOnCall() === targetId;
-  const supported = capabilities.dictation.available && Boolean(window.ogb?.speechStart);
+  const cloudConfigured = useTranscriptionAvailability();
+  const provider = pickSTTProvider({
+    cloudSttConfigured: cloudConfigured,
+    appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
+    platform: window.ogb?.platform ?? "unknown",
+    explicitPreference: state.config?.callStt?.provider ?? undefined,
+  });
+  const supported = provider.provider !== null;
   const configured = Boolean(state.config?.tts?.configured);
   // Owner 2026-09-03: with no voice provider configured the call button must not appear at all,
   // rather than render disabled with an explanation.  `configured` is provider-scoped server-side
@@ -99,7 +107,7 @@ export function CallTargetButton({
     : !capabilitiesReady
       ? "Checking call availability"
       : !supported
-        ? "Calls currently need the macOS desktop app"
+        ? "Set up dictation to make calls"
         : !configured
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
@@ -108,17 +116,17 @@ export function CallTargetButton({
 
   const reason = !capabilitiesReady
     ? "Checking whether this device can make calls."
-    : !capabilities.dictation.available
-      ? "Calls require BotFleet for macOS because speech recognition runs on-device."
-      : !window.ogb?.speechStart
-        ? "The speech service is unavailable in this app build. Restart or update BotFleet."
-        : !configured
-          ? "Add a MiniMax API key — or switch to the built-in Mac voices — so the bot can speak during calls."
-          : !voiceReady
-            ? voices.length > 1
-              ? "Give every channel member a voice before starting a channel call."
-              : "Choose a voice before starting a call."
-            : "";
+    : !supported
+      ? provider.provider === null && provider.missing === "cloud-stt-key"
+        ? "Add an AssemblyAI API key in Settings to make calls on this computer."
+        : "This dictation provider is unavailable. Check your choice in Settings or restart BotFleet."
+      : !configured
+        ? "Add an ElevenLabs API key or choose an available voice provider so the bot can speak during calls."
+        : !voiceReady
+          ? voices.length > 1
+            ? "Give every channel member a voice before starting a channel call."
+            : "Choose a voice before starting a call."
+          : "";
 
   useEffect(() => {
     if (!helpOpen) return;

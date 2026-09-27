@@ -7,6 +7,8 @@
 
 import {
   startAssemblyAITranscription,
+  mergeAssemblyAITurn,
+  type AssemblyAITranscript,
   type AssemblyAITranscriptionSession,
 } from "./assemblyai-transcription";
 
@@ -134,6 +136,7 @@ export function createAssemblyAISTTSession(): STTSession {
   let running = false;
   let generation = 0;
   let finalizingGeneration: number | null = null;
+  let transcript: AssemblyAITranscript = { turns: new Map(), finalText: "", partialText: "" };
 
   const releaseMedia = () => {
     if (!stream) return;
@@ -171,6 +174,7 @@ export function createAssemblyAISTTSession(): STTSession {
       if (running) return;
       running = true;
       const attempt = ++generation;
+      transcript = { turns: new Map(), finalText: "", partialText: "" };
       let media: MediaStream;
       try {
         media = await navigator.mediaDevices.getUserMedia({
@@ -205,8 +209,11 @@ export function createAssemblyAISTTSession(): STTSession {
             // stopped capture. Keep that one generation alive until stop ends.
             if (!(generation === attempt && running) &&
                 !(finalizingGeneration === attempt && generation === attempt + 1)) return;
+            transcript = mergeAssemblyAITurn(transcript, turn);
             const line: STTTranscriptLine = {
-              text: turn.text,
+              text: [...transcript.turns.entries()]
+                .sort(([left], [right]) => left - right)
+                .map(([, value]) => value.text).join(" "),
               partial: !turn.final,
             };
             for (const cb of transcriptListeners) cb(line);

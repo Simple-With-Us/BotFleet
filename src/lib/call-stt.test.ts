@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ start: vi.fn() }));
-vi.mock("./assemblyai-transcription", () => ({ startAssemblyAITranscription: mocks.start }));
+vi.mock("./assemblyai-transcription", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./assemblyai-transcription")>(),
+  startAssemblyAITranscription: mocks.start,
+}));
 import { createAppleSTTSession, createAssemblyAISTTSession, disposeAppleSTTSession } from "./call-stt";
 
 function deferred<T>() {
@@ -73,15 +76,37 @@ describe("STT teardown", () => {
     const transcript = vi.fn();
     session.onTranscript(transcript);
     await session.start();
-    const turn = mocks.start.mock.calls[0]![0].onTurn as (value: { text: string; final: boolean }) => void;
+    const turn = mocks.start.mock.calls[0]![0].onTurn as (value: { order: number; text: string; final: boolean }) => void;
     const finish = session.finish();
     expect(track.stop).toHaveBeenCalledOnce();
-    turn({ text: "last words", final: true });
+    turn({ order: 0, text: "last words", final: true });
     expect(transcript).toHaveBeenCalledWith({ text: "last words", partial: false });
     draining.resolve();
     await finish;
-    turn({ text: "too late", final: true });
+    turn({ order: 1, text: "too late", final: true });
     expect(transcript).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps earlier cloud turns and replaces a partial in its own turn", async () => {
+    setup();
+    mocks.start.mockResolvedValue({ stop: vi.fn().mockResolvedValue(undefined) });
+    const session = createAssemblyAISTTSession();
+    const transcript = vi.fn();
+    session.onTranscript(transcript);
+    await session.start();
+    const turn = mocks.start.mock.calls[0]![0].onTurn as (value: { order: number; text: string; final: boolean }) => void;
+    turn({ order: 0, text: "First sentence.", final: true });
+    turn({ order: 1, text: "Second", final: false });
+    turn({ order: 1, text: "Second sentence.", final: true });
+    expect(transcript.mock.calls.map(([line]) => line.text)).toEqual([
+      "First sentence.", "First sentence. Second", "First sentence. Second sentence.",
+    ]);
+    await session.stop();
+    await session.start();
+    const next = mocks.start.mock.calls[1]![0].onTurn as typeof turn;
+    next({ order: 0, text: "New recording.", final: true });
+    expect(transcript).toHaveBeenLastCalledWith({ text: "New recording.", partial: false });
+    await session.stop();
   });
 
   it("detaches raw Apple IPC listeners when a session is disposed", () => {

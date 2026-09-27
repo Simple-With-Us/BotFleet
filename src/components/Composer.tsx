@@ -1,6 +1,7 @@
 import { createSTTSession, disposeAppleSTTSession, type STTSession } from "@/lib/call-stt";
 import { sessionKeyterms } from "@/lib/stt-keyterms";
 import { pickSTTProvider } from "@/lib/transcription-provider";
+import { useTranscriptionAvailability } from "@/lib/use-transcription-availability";
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
@@ -153,6 +154,13 @@ export function Composer({
 }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  const cloudConfigured = useTranscriptionAvailability();
+  const dictationAvailable = pickSTTProvider({
+    cloudSttConfigured: cloudConfigured,
+    appleSpeechAvailable: capabilities.dictation.available && Boolean(window.ogb?.speechStart),
+    platform: window.ogb?.platform ?? "unknown",
+    explicitPreference: state.config?.callStt?.provider ?? undefined,
+  }).provider !== null;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
   // offers members plus @everyone; explicit mentions override the room's
   // configured default responder.
@@ -481,7 +489,7 @@ export function Composer({
   }, [recording]);
 
   const toggleMic = () => {
-    if (!capabilities.dictation.available || !window.ogb) {
+    if (!dictationAvailable || !window.ogb) {
       setSpeechError("Dictation isn't available in this build.");
       return;
     }
@@ -833,7 +841,7 @@ export function Composer({
             <Square size={14} className="fill-current" />
           </button>
         )}
-        {!locked && !busy && !hasContent && capabilities.dictation.available && (
+        {!locked && !busy && !hasContent && dictationAvailable && (
           <button
             onClick={toggleMic}
             aria-label={recording ? "Stop Dictation" : "Start Dictation"}
