@@ -48,27 +48,24 @@ export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
 export const STATIC_DSH_MODELS: ModelCatalog = {
-  default: "deepseek-v4-flash",
+  default: "DeepSeek-V4.1-Flash",
   options: [
     {
-      id: "deepseek-v4-flash",
-      label: "DeepSeek V4 Flash",
+      id: "DeepSeek-V4.1-Flash",
+      label: "DeepSeek-V4.1-Flash",
       contextWindow: 1_000_000,
-      // "Image + Video" is 13 chars; ModelCatalog.badge documents a ~10 char
-      // ceiling so a chip cannot push the label onto a second line in a narrow
-      // chat head.  The hover carries the specifics.
       badge: "Multimodal",
       badgeTitle:
         "Accepts image and video input at the same token rate as text — each image is capped at 1,024 tokens.",
     },
     {
-      id: "deepseek-v4-pro",
-      label: "DeepSeek V4 Pro",
+      id: "DeepSeek-V4.1-Pro",
+      label: "DeepSeek-V4.1-Pro",
       contextWindow: 1_000_000,
     },
     {
       id: "MiniMax-M3.1-Flash-Preview",
-      label: "MiniMax M3.1 Flash Preview",
+      label: "MiniMax-M3.1-Flash-Preview",
       contextWindow: 1_000_000,
       badge: "Preview",
       badgeTitle:
@@ -76,12 +73,12 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     },
     {
       id: "MiniMax-M3",
-      label: "MiniMax M3",
+      label: "MiniMax-M3",
       contextWindow: 1_000_000,
     },
     {
       id: "MiniMax-M2.7-highspeed",
-      label: "MiniMax M2.7 Highspeed",
+      label: "MiniMax-M2.7-highspeed",
       contextWindow: 204_800,
       badge: "2x Cost",
       badgeTitle:
@@ -316,7 +313,7 @@ export const dshSupport = {
     // compare, and failing on that refused every effort-pinned turn.
     if (confirmed !== undefined && confirmed !== requested) {
       throw new Error(
-        `DeepSeek Harness did not switch reasoning effort to ${requested} (still ${String(confirmed ?? "unknown")})`,
+        `Harness did not switch reasoning effort to ${requested} (still ${String(confirmed ?? "unknown")})`,
       );
     }
   },

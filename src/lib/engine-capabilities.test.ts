@@ -453,7 +453,7 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(pricingModeLabel(pricing).toLowerCase()).not.toContain("bundled");
   });
 
-  it("bills DeepSeek Harness as DeepSeek PAYG, not a Claude Max bundle", () => {
+  it("bills Harness as DeepSeek PAYG, not a Claude Max bundle", () => {
     const entry = ENGINE_CAPABILITIES["deepseek-harness"];
     expect(entry.pricing.kind).toBe("api");
     if (entry.pricing.kind !== "api") return;
@@ -463,14 +463,14 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
       cachedInputPer1k: 0.00007,
     });
     expect(entry.pricing.notes).toBe(
-      "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
+      "Harness runs models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.",
     );
     expect(entry.whyThisEngine).toEqual({
       headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
       prose: [
         "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on DeepSeek Harness yet.",
+        "BotFleet does not support image attachments on Harness yet.",
       ],
     });
     expect(entry.capabilities.imageAttachments).toBe("no");

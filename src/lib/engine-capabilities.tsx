@@ -146,7 +146,7 @@ const ANTIGRAVITY_ULTRA_NOTE =
   "Google AI Ultra subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const DEEPSEEK_HARNESS_NOTE =
-  "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
+  "Harness runs models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
 
 /** The registry's owner contract.  Named rather than spelled
  *  `Record<string, EngineCapabilityEntry>` at the binding so the string index
@@ -454,7 +454,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
 
   "deepseek-harness": {
     id: "deepseek-harness",
-    displayName: "DeepSeek Harness",
+    displayName: "Harness",
     capabilityBadgeColor: "bg-rose-600 text-white",
     group: "Cloud",
     pricing: {
@@ -503,7 +503,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       prose: [
         "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on DeepSeek Harness yet.",
+        "BotFleet does not support image attachments on Harness yet.",
       ],
     },
     defaultModels: [

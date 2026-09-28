@@ -39,8 +39,8 @@ describe("modelEffortLevels", () => {
     expect(modelEffortLevels(dsh, { id: "MiniMax-M3" })).toEqual([]);
     expect(modelSupportsEffort(dsh, { id: "MiniMax-M3" })).toBe(false);
 
-    expect(modelEffortLevels(dsh, { id: "deepseek-v4-flash" })).toEqual(["none", "high", "max"]);
-    expect(modelSupportsEffort(dsh, { id: "deepseek-v4-flash" })).toBe(true);
+    expect(modelEffortLevels(dsh, { id: "DeepSeek-V4.1-Flash" })).toEqual(["none", "high", "max"]);
+    expect(modelSupportsEffort(dsh, { id: "DeepSeek-V4.1-Flash" })).toBe(true);
   });
 
   it("gates Claude haiku models from effort", () => {

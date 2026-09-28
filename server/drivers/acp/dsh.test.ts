@@ -68,10 +68,10 @@ describe("DshAgentDriver config", () => {
     // IS the image/video model, and its image tokens bill at the same rate as
     // text, so there is deliberately no third DeepSeek row.  MiniMax-M2.7
     // (non-highspeed) stays out — M3 dominates it on context.
-    expect(STATIC_DSH_MODELS.default).toBe("deepseek-v4-flash");
+    expect(STATIC_DSH_MODELS.default).toBe("DeepSeek-V4.1-Flash");
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
-      "deepseek-v4-flash",
-      "deepseek-v4-pro",
+      "DeepSeek-V4.1-Flash",
+      "DeepSeek-V4.1-Pro",
       "MiniMax-M3.1-Flash-Preview",
       "MiniMax-M3",
       "MiniMax-M2.7-highspeed",
@@ -82,14 +82,14 @@ describe("DshAgentDriver config", () => {
     const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
     // Image + Video: same token rate as text, so the capability is the point,
     // not a price.
-    expect(byId.get("deepseek-v4-flash")?.badge).toBe("Multimodal");
+    expect(byId.get("DeepSeek-V4.1-Flash")?.badge).toBe("Multimodal");
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
     expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x Cost");
     // M3 is the base rate, so it carries no cost chip.
     expect(byId.get("MiniMax-M3")?.badge).toBeUndefined();
-    expect(byId.get("deepseek-v4-pro")?.badge).toBeUndefined();
+    expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBeUndefined();
   });
 
   it("gives every chip a hover explanation, since a bare chip is not a price", () => {
@@ -108,12 +108,12 @@ describe("DshAgentDriver config", () => {
   });
 
   it("encodes the ACP model option with its provider while preserving the picker id", () => {
-    expect(dshModelOptionValue("deepseek-v4-pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
-    expect(dshModelIdFromOptionValue('["deepseek-official","deepseek-v4-pro"]')).toBe("deepseek-v4-pro");
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro")).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
+    expect(dshModelIdFromOptionValue('["deepseek-official","DeepSeek-V4.1-Pro"]')).toBe("DeepSeek-V4.1-Pro");
     expect(dshModelOptionValue("MiniMax-M3")).toBe('["minimax","MiniMax-M3"]');
     expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3"]')).toBe("MiniMax-M3");
-    expect(dshModelIdFromOptionValue('["other-provider","deepseek-v4-pro"]')).toBeNull();
-    expect(dshModelIdFromOptionValue("deepseek-v4-pro")).toBeNull();
+    expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4.1-Pro"]')).toBeNull();
+    expect(dshModelIdFromOptionValue("DeepSeek-V4.1-Pro")).toBeNull();
   });
 
   it("round-trips every catalog row through the ACP model option encoding", () => {
@@ -199,7 +199,7 @@ describe("native DSH ACP turns", () => {
   const create = async () => {
     instance = await DshAgentDriver.create({
       instanceId: "dsh-native-test",
-      displayName: "DeepSeek Harness",
+      displayName: "Harness",
       environment: {},
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
@@ -209,8 +209,8 @@ describe("native DSH ACP turns", () => {
 
   it("mounts standard MCP servers and applies confirmed model and reasoning options", async () => {
     const dump = join(scratch, "dsh.json");
-    const flash = dshModelOptionValue("deepseek-v4-flash");
-    const pro = dshModelOptionValue("deepseek-v4-pro");
+    const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
+    const pro = dshModelOptionValue("DeepSeek-V4.1-Pro");
     process.env.FAKE_ACP_DUMP = dump;
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash, pro]);
     process.env.FAKE_ACP_REASONING_EFFORTS = "off,high,max";
@@ -219,7 +219,7 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-turn",
       text: "test the native ACP path",
-      model: "deepseek-v4-pro",
+      model: "DeepSeek-V4.1-Pro",
       effort: "max",
       integrations: {
         agents: { command: "/usr/bin/node", args: ["/tmp/agents-proxy.mjs"], env: {} },
@@ -229,7 +229,7 @@ describe("native DSH ACP turns", () => {
 
     expect(done).toMatchObject({ ok: true });
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "deepseek-v4-pro" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
     ]));
     expect(JSON.parse(readFileSync(dump, "utf8")).argv).toEqual(["--profile", "acp"]);
     expect(JSON.parse(readFileSync(`${dump}.mcp.json`, "utf8"))).toEqual([
@@ -266,13 +266,13 @@ describe("native DSH ACP turns", () => {
   it("uses session/resume because current DSH rejects session/load", async () => {
     const dump = join(scratch, "resume.json");
     process.env.FAKE_ACP_RPC_DUMP = dump;
-    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([dshModelOptionValue("deepseek-v4-flash")]);
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([dshModelOptionValue("DeepSeek-V4.1-Flash")]);
     await create();
 
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-resume",
       text: "continue",
-      model: "deepseek-v4-flash",
+      model: "DeepSeek-V4.1-Flash",
       resumeCursor: "persisted-dsh-session",
     });
     const done = await recorder!.until((event) => event.type === "turn.completed");
@@ -285,7 +285,7 @@ describe("native DSH ACP turns", () => {
   });
 
   it("reports the picker model id when a turn accepts the native session default", async () => {
-    const flash = dshModelOptionValue("deepseek-v4-flash");
+    const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash]);
     await create();
 
@@ -296,14 +296,14 @@ describe("native DSH ACP turns", () => {
     await recorder!.until((event) => event.type === "turn.completed");
 
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "deepseek-v4-flash" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Flash" }),
     ]));
   });
 
   it("fails before prompting if DSH acknowledges but does not apply reasoning effort", async () => {
     const rpcDump = join(scratch, "reasoning-stuck.json");
     process.env.FAKE_ACP_RPC_DUMP = rpcDump;
-    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([dshModelOptionValue("deepseek-v4-flash")]);
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([dshModelOptionValue("DeepSeek-V4.1-Flash")]);
     process.env.FAKE_ACP_REASONING_EFFORTS = "off,high,max";
     process.env.FAKE_ACP_REASONING_STICKS = "1";
     await create();
@@ -311,7 +311,7 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-reasoning-stuck",
       text: "do not spend this turn on the wrong setting",
-      model: "deepseek-v4-flash",
+      model: "DeepSeek-V4.1-Flash",
       effort: "max",
     });
     const done = await recorder!.until((event) => event.type === "turn.completed");
@@ -325,8 +325,8 @@ describe("native DSH ACP turns", () => {
   });
 
   it("accepts a bare set_config_option acknowledgement instead of failing the turn", async () => {
-    const flash = dshModelOptionValue("deepseek-v4-flash");
-    const pro = dshModelOptionValue("deepseek-v4-pro");
+    const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
+    const pro = dshModelOptionValue("DeepSeek-V4.1-Pro");
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash, pro]);
     process.env.FAKE_ACP_REASONING_EFFORTS = "off,high,max";
     process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
@@ -335,14 +335,14 @@ describe("native DSH ACP turns", () => {
     await instance!.adapter.sendTurn({
       threadId: "dsh-native-bare-config-reply",
       text: "run on the pinned model and effort",
-      model: "deepseek-v4-pro",
+      model: "DeepSeek-V4.1-Pro",
       effort: "max",
     });
     const done = await recorder!.until((event) => event.type === "turn.completed");
 
     expect(done).toMatchObject({ ok: true });
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "deepseek-v4-pro" }),
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
     ]));
   });
 });
@@ -459,7 +459,7 @@ describe("dsh capability honesty", () => {
   it("advertises only the controls implemented by the native ACP profile", async () => {
     const instance = await DshAgentDriver.create({
       instanceId: "dsh-capabilities",
-      displayName: "DeepSeek Harness",
+      displayName: "Harness",
       environment: {},
       enabled: true,
       config: DshAgentDriver.defaultConfig(),
@@ -623,7 +623,7 @@ describe("readDshModelCatalog", () => {
 
   it("still drops MiniMax-M2.7 when the settings file offers it", () => {
     writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M2.7\n        - id: MiniMax-M3\n"));
-    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).not.toContain("MiniMax-M2.7");
+    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).not.toContain("MiniMax-M2.7-highspeed");
   });
 
   it("merges several provider blocks into one catalog", () => {
@@ -631,7 +631,7 @@ describe("readDshModelCatalog", () => {
       "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
-    expect(ids).toContain("deepseek-v4-pro");
+    expect(ids).toContain("DeepSeek-V4.1-Pro");
     expect(ids).toContain("MiniMax-M3");
   });
 
