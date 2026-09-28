@@ -18,6 +18,7 @@ import {
   type BotAvatarCrop,
 } from "../../shared/bot-avatar";
 import { BotAvatar, BotMascot } from "./Avatar";
+import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 
 type AvatarPatch = Partial<
   Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
@@ -25,6 +26,7 @@ type AvatarPatch = Partial<
 
 const CROP_LABEL = {
   mascot: "Mascot",
+  tvface: "TV-Face",
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",
@@ -244,7 +246,7 @@ export function BotProfileAvatarCard({
           ))}
         </div>
 
-        {crop === "mascot" && (
+        {(crop === "mascot" || crop === "tvface") && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Expression
@@ -263,7 +265,11 @@ export function BotProfileAvatarCard({
                   title={expression}
                   aria-label={`Use ${expression} expression`}
                 >
-                  <BotMascot color={bot.color} state={expression} size={42} animated={false} />
+                  {crop === "tvface" ? (
+                    <TVFaceAvatar color={bot.color} state={expression} size={42} animated={false} />
+                  ) : (
+                    <BotMascot color={bot.color} state={expression} size={42} animated={false} />
+                  )}
                 </button>
               ))}
             </div>

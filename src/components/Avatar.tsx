@@ -14,6 +14,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { BOT_COLORS, type BotColor, type BotMotion, type BotState } from "@/lib/mascot";
+import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 import {
   CursorAvatar,
   DEFAULT_SILHOUETTE,
@@ -242,6 +243,18 @@ export function BotAvatar({ bot, size = 44, label, ...mascotProps }: BotAvatarPr
   const [imageFailed, setImageFailed] = useState(false);
 
   useEffect(() => setImageFailed(false), [profile.avatarUrl]);
+
+  if (profile.avatarCrop === "tvface") {
+    return (
+      <TVFaceAvatar
+        state={mascotProps.state}
+        color={bot.color}
+        size={size}
+        label={label ?? bot.name}
+        animated={mascotProps.animated}
+      />
+    );
+  }
 
   if (profile.avatarCrop === "mascot" || !profile.avatarUrl || imageFailed) {
     return (

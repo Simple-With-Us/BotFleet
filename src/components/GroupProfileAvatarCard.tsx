@@ -16,6 +16,7 @@ type AvatarPatch = Partial<Pick<Group, "avatarCrop" | "avatarUrl">>;
 
 const CROP_LABEL = {
   mascot: "Mascot", // We won't show mascot option for groups
+  tvface: "TV-Face",
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",

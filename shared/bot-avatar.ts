@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** The mascot is a first-class avatar choice; the other values crop an image. */
-export const BOT_AVATAR_CROPS = ["mascot", "circle", "rounded", "square"] as const;
+export const BOT_AVATAR_CROPS = ["mascot", "tvface", "circle", "rounded", "square"] as const;
 export const botAvatarCropSchema = z.enum(BOT_AVATAR_CROPS);
 export type BotAvatarCrop = z.infer<typeof botAvatarCropSchema>;
 
