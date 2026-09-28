@@ -434,8 +434,9 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
 
   it("uses two ASCII spaces after periods and colons in the shared capability notes", () => {
     for (const [key, note] of Object.entries(CAPABILITY_NOTES)) {
-      if (typeof note !== "string") throw new Error(`CAPABILITY_NOTES.${key} must be text`);
-      assertTwoAsciiSpaces(note, `CAPABILITY_NOTES.${key}`);
+      const parsed = registryText.safeParse(note);
+      if (!parsed.success) throw new Error(`CAPABILITY_NOTES.${key} must be text`);
+      assertTwoAsciiSpaces(parsed.data, `CAPABILITY_NOTES.${key}`);
     }
   });
 
