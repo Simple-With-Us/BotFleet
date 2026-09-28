@@ -798,7 +798,7 @@ export function shouldIgnoreWebhookEvent(
 
   // 3. GitHub Deployer / Merge Conflicts Pre-Filter (only applies to verified GitHub payloads)
   const isDeployerTrigger =
-    /\b(?:merge[\s-]*conflicts?|deployer|bf-deployer)\b/i.test(name) ||
+    /\b(?:merge[\s-]*conflicts?|bf-deployer)\b/i.test(name) ||
     /\b(?:bf-deployer|land merge-ready prs|merges ready prs)\b/i.test(prompt);
   if (isDeployerTrigger && isGithubWebhookPayload(payload)) {
     const eventName = event.eventName;
@@ -830,10 +830,13 @@ export function shouldIgnoreWebhookEvent(
         };
       }
       if (action === "closed") {
-        return {
-          ignore: true,
-          reason: `GitHub pull_request closed ignored: already closed or merged`,
-        };
+        const isMerged = pr?.merged === true || pickStr(pr, "merged_at") !== undefined;
+        if (!isMerged) {
+          return {
+            ignore: true,
+            reason: `GitHub pull_request closed unmerged ignored: Deployer waits for merge or open PR`,
+          };
+        }
       }
       if (
         action === "labeled" ||

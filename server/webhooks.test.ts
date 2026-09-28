@@ -1617,7 +1617,7 @@ describe("WebhookManager", () => {
     expect(deployerAssignResult).toMatchObject({ duplicate: false });
     expect(deployerAssignResult.runId).toBeDefined();
 
-    // 71. Deployer pre-filter ignores draft PRs, in-progress checks, and unmerged closed PRs
+    // 71. Deployer pre-filter ignores draft PRs, in-progress checks, and unmerged closed PRs, but accepts merged closed PRs
     const draftPr = {
       eventName: "pull_request",
       deliveryId: "pr-draft-1",
@@ -1628,6 +1628,30 @@ describe("WebhookManager", () => {
       },
     };
     expect(h.manager.receive(deployerHook.endpointId, deployerSecret, draftPr)).toMatchObject({ ignored: true });
+
+    const unmergedClosedPr = {
+      eventName: "pull_request",
+      deliveryId: "pr-unmerged-1",
+      payload: {
+        action: "closed",
+        pull_request: { number: 11, draft: false, state: "closed", merged: false },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    expect(h.manager.receive(deployerHook.endpointId, deployerSecret, unmergedClosedPr)).toMatchObject({ ignored: true });
+
+    const mergedClosedPr = {
+      eventName: "pull_request",
+      deliveryId: "pr-merged-1",
+      payload: {
+        action: "closed",
+        pull_request: { number: 12, draft: false, state: "closed", merged: true, merged_at: "2026-09-28T07:00:00Z" },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    const mergedResult = h.manager.receive(deployerHook.endpointId, deployerSecret, mergedClosedPr);
+    expect(mergedResult).toMatchObject({ duplicate: false });
+    expect(mergedResult.runId).toBeDefined();
 
     const inProgressCheck = {
       eventName: "check_run",
