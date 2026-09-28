@@ -1788,7 +1788,6 @@ export function BotListItem({
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const iconOnly = density === "icons";
-  const pointerDownPos = useRef<{ x: number; y: number } | null>(null);
   const isDragging = useRef(false);
 
   const selectBot = () => {
@@ -1993,13 +1992,11 @@ export function BotListItem({
       draggable
       onDragStart={(event) => {
         isDragging.current = true;
-        pointerDownPos.current = null;
         event.dataTransfer.setData(ROSTER_DRAG_TYPE, JSON.stringify({ kind: "bot", id: bot.id }));
         event.dataTransfer.effectAllowed = "move";
       }}
       onDragEnd={() => {
         isDragging.current = false;
-        pointerDownPos.current = null;
       }}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
@@ -2015,20 +2012,10 @@ export function BotListItem({
         role="button"
         tabIndex={0}
         aria-label={iconOnly ? bot.name : undefined}
-        onPointerDown={(event) => {
-          if (event.button !== 0) return;
-          pointerDownPos.current = { x: event.clientX, y: event.clientY };
-          isDragging.current = false;
-        }}
-        onPointerUp={(event) => {
-          if (event.button !== 0 || isDragging.current || !pointerDownPos.current) return;
-          const dx = Math.abs(event.clientX - pointerDownPos.current.x);
-          const dy = Math.abs(event.clientY - pointerDownPos.current.y);
-          pointerDownPos.current = null;
-          if (dx < 6 && dy < 6) {
-            selectBot();
-          }
-        }}
+        // One dispatch path: click.  #706 dispatched from both pointerup and
+        // click, so every row click selected twice (three times via the title
+        // before its stopPropagation).  A real HTML5 drag sets isDragging in
+        // onDragStart and never produces a click; a micro-move is just a click.
         onClick={() => {
           if (!isDragging.current) {
             selectBot();
