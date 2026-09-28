@@ -623,7 +623,9 @@ describe("readDshModelCatalog", () => {
 
   it("still drops MiniMax-M2.7 when the settings file offers it", () => {
     writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M2.7\n        - id: MiniMax-M3\n"));
-    expect(readDshModelCatalog({ HOME: home }).options.map((o) => o.id)).not.toContain("MiniMax-M2.7-highspeed");
+    const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
+    expect(ids).not.toContain("MiniMax-M2.7");
+    expect(ids).toContain("MiniMax-M2.7-highspeed");
   });
 
   it("merges several provider blocks into one catalog", () => {
@@ -633,6 +635,19 @@ describe("readDshModelCatalog", () => {
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).toContain("DeepSeek-V4.1-Pro");
     expect(ids).toContain("MiniMax-M3");
+    // The fixture's pre-rename id must not survive the union as a stale row.
+    expect(ids).not.toContain("deepseek-v4-pro");
+  });
+
+  it("drops every retired pre-rename DeepSeek id a stale profile still offers", () => {
+    writeSettings(llmPiAi(
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-flash\n        - id: deepseek-v4-pro\n",
+    ));
+    const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
+    expect(ids).not.toContain("deepseek-v4-flash");
+    expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids).toContain("DeepSeek-V4.1-Flash");
+    expect(ids).toContain("DeepSeek-V4.1-Pro");
   });
 
   it("falls back to the static catalog when there is no settings file", () => {

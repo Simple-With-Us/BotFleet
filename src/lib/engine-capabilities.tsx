@@ -501,7 +501,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
       prose: [
-        "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
         "BotFleet does not support image attachments on Harness yet.",
       ],

@@ -39,8 +39,9 @@ export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
  *  only two models — `deepseek-flash` IS the image+video model, billed at the
  *  same rate as text (its image tokens bill "together with your text tokens"),
  *  so there is deliberately no third DeepSeek row for the multimodal variant.
- *  DeepSeek also retired `deepseek-v4-flash`; the id is still accepted and
- *  routed to the latest Flash, so it is kept for existing threads.
+ *  The V4.1 rename retired the `deepseek-v4-flash` / `deepseek-v4-pro` ids;
+ *  both sit in `DSH_EXCLUDED_MODEL_IDS` so a profile written against the old
+ *  catalog cannot re-add them to the picker.
  *
  *  `MiniMax-M2.7` is dropped per the product decision (M3 dominates on context
  *  and is the canonical DSH-hosted MiniMax row).
@@ -90,7 +91,14 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
 /** Models the product keeps out of the picker even when the installed
  *  Harness offers them.  Same expression that builds STATIC_DSH_MODELS, so
  *  the live read below and the static fallback agree on what is excluded. */
-const DSH_EXCLUDED_MODEL_IDS: readonly string[] = ["MiniMax-M2.7"];
+const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
+  "MiniMax-M2.7",
+  // Retired by the V4.1 rename.  A settings file written against the old
+  // catalog still declares these, and the union below would otherwise
+  // re-add them as stale duplicates of the V4.1 rows.
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+];
 
 /** The Harness install declares the models it can actually serve in its own
  *  settings file, under a provider map at `llm-pi-ai.providers.<id>.models[]`
@@ -208,10 +216,11 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
  *  `readClaudeModelCatalog` makes.  The reason is concrete: a DSH profile that
  *  configures only the `minimax` provider still serves the DeepSeek rows, so
  *  treating the file as authoritative would silently drop
- *  `deepseek-v4-flash` / `deepseek-v4-pro` from the picker — and
- *  `deepseek-v4-flash` is the static default.  A partial source can add
+ *  `DeepSeek-V4.1-Flash` / `DeepSeek-V4.1-Pro` from the picker — and
+ *  `DeepSeek-V4.1-Flash` is the static default.  A partial source can add
  *  models; it cannot retire them.  Removals need an explicit exclusion in
- *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` is already handled. */
+ *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` and the retired
+ *  pre-rename DeepSeek ids are handled. */
 export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
