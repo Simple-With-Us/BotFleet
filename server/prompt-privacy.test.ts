@@ -1,5 +1,6 @@
 /// <reference types="vitest/config" />
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -7,7 +8,10 @@ import { describe, expect, it } from "vitest";
  *  `import.meta.glob` so the scan has no build-time magic in it: a guard that
  *  depends on the bundler is a guard that silently scans nothing. */
 function shippedSources(): Array<[string, string]> {
-  const root = new URL("..", import.meta.url).pathname;
+  // `fileURLToPath`, not `URL.pathname`: on Windows a pathname is
+  // "/D:/a/BotFleet/BotFleet", and joining onto that yields the doubled
+  // "D:\D:\a\..." that made this test fail on the Windows runner only.
+  const root = fileURLToPath(new URL("..", import.meta.url));
   const out: Array<[string, string]> = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir)) {

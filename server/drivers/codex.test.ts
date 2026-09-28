@@ -285,9 +285,12 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(seen.argv.join(" ")).toContain("mcp_servers.computer.command");
     expect(seen.argv.join(" ")).toContain("computer-proxy");
     expect(seen.argv.join(" ")).toContain("OGB_BOX_TOKEN");
-    expect(seen.argv.join(" ")).not.toContain("remote-secret");
+    expect(seen.argv.join(" ")).not.toContain("box-grant");
     expect(seen.env.OGB_BOX_ID).toBe("box-123");
-    expect(seen.env.OGB_BOX_TOKEN).toBe("remote-secret");
+    expect(seen.env.OGB_BOX_TOKEN).toBe("box-grant");
+    // The gateway base travels with the grant: a child that had only the
+    // token would fall back to the provider and present an account-wide key.
+    expect(seen.env.OGB_BOX_API).toBe("http://127.0.0.1:8799/api/local/box-gateway");
   });
 
   it("sends the local provider when the picker id is custom-encoded", async () => {

@@ -108,13 +108,25 @@ describe("buildMcpServers", () => {
       threadId: "t",
       text: "hi",
       integrations: {
-        computer: { kind: "box", boxId: "b1", token: "tok", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          token: "tok",
+          gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     expect(servers?.computer).toMatchObject({
       command: process.execPath,
       args: [expect.stringContaining("computer-proxy")],
-      env: expect.objectContaining({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "tok" }),
+      env: expect.objectContaining({
+        OGB_BOX_ID: "b1",
+        OGB_BOX_TOKEN: "tok",
+        // The gateway base travels with the grant: a child holding only the
+        // token would fall back to the provider and present an account key.
+        OGB_BOX_API: "http://127.0.0.1:8799/api/local/box-gateway",
+      }),
     });
   });
 
@@ -498,7 +510,13 @@ describe("PiDriver turns (fake CLI)", () => {
       text: "hi",
       integrations: {
         composio: { command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } },
-        computer: { kind: "box", boxId: "b1", token: "bt", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          token: "bt",
+          gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
