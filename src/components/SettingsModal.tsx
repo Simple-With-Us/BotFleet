@@ -1206,12 +1206,11 @@ export function SettingsModal() {
                   ) : null}
                   <TranscriptionSettings />
                   <ApiKeyRow section="box" />
-                  <VpsConnection />
                   <ApiKeyRow section="opencodeGo" />
                   <ApiKeyRow section="deepseek" />
                   <div>
                     <EngineKeyRow engine="minimax" />
-                    <p className="mt-1 text-[12px] text-ink-secondary">MiniMax API key runs models; voice synthesis uses the separate MiniMax voice key in each bot's Voice settings.</p>
+                    <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
                   </div>
                   <EngineKeyRow engine="openaiCompat" />
                   <QdrantRagConnection />
@@ -1253,6 +1252,12 @@ export function SettingsModal() {
             {section === "computers" && (
               <>
                 <LocalComputerSection />
+                <Card
+                  title="VPS Connection"
+                  subtitle="Configure SSH access for your Self-hosted VPS."
+                >
+                  <VpsConnection />
+                </Card>
                 <BotComputerDefaults />
                 <LocalVmRuntimeCard />
                 <SharedVpsRuntimeCard />
