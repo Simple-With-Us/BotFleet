@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { attachmentLabel, filesFromClipboard, intakeFiles, isImageFile, type Attachment, type ClipboardFileSource } from "./composer-attachments";
+import { attachmentLabel, filesFromClipboard, intakeFiles, isImageFile, type Attachment, type ClipboardFileSource, type DroppedFile } from "./composer-attachments";
 
-type Fake = { name: string; size: number; type: string; text: () => Promise<string>; arrayBuffer?: () => Promise<ArrayBuffer> };
+type Fake = DroppedFile;
 const file = (name: string, type: string, size = 10): Fake => ({
   name,
   size,
   type,
   text: async () => "contents",
+  arrayBuffer: async () => new ArrayBuffer(size),
 });
 const upload = async (f: Fake): Promise<Attachment> => ({
   kind: "image",
@@ -94,17 +95,15 @@ describe("intakeFiles", () => {
     // Reproduces the user-visible "Pasted Screenshot.png could not be attached" — before this fix the
     // upload error was swallowed by attachmentsFromDroppedFiles so the user had no way to tell what
     // actually went wrong.
-    const fakeFetch = async () =>
-      ({
-        ok: false,
-        statusText: "Bad Request",
-        json: async () => ({ error: "content-type must be a supported file type" }),
-      }) as unknown as Response;
+    const fakeResponse = {
+      ok: false,
+      statusText: "Bad Request",
+      json: async () => ({ error: "content-type must be a supported file type" }),
+    };
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = fakeFetch as unknown as typeof fetch;
+    globalThis.fetch = (() => Promise.resolve(fakeResponse)) as typeof fetch;
     try {
-      const fakeScreenshot = { ...file("", "image/png", 3), arrayBuffer: async () => new ArrayBuffer(3) };
-      const out = await intakeFiles([fakeScreenshot as unknown as Fake & { arrayBuffer: () => Promise<ArrayBuffer> }], {
+      const out = await intakeFiles([file("", "image/png", 3)], {
         allowImages: false,
         getPath: () => "",
         uploadImage: async () => null,
@@ -121,17 +120,15 @@ describe("intakeFiles", () => {
     // Electron drop or browser paste: no disk path, image-capable server endpoint.
     // allowImages: false because the engine/bot has no image capability — the image is still
     // uploaded as a file attachment so the user does not lose the paste.
-    const fakeFetch = async () =>
-      ({
-        ok: true,
-        statusText: "Created",
-        json: async () => ({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }),
-      }) as unknown as Response;
+    const fakeResponse = {
+      ok: true,
+      statusText: "Created",
+      json: async () => ({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }),
+    };
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = fakeFetch as unknown as typeof fetch;
+    globalThis.fetch = (() => Promise.resolve(fakeResponse)) as typeof fetch;
     try {
-      const fakeScreenshot = { ...file("", "image/png", 3), arrayBuffer: async () => new ArrayBuffer(3) };
-      const out = await intakeFiles([fakeScreenshot as unknown as Fake & { arrayBuffer: () => Promise<ArrayBuffer> }], {
+      const out = await intakeFiles([file("", "image/png", 3)], {
         allowImages: false,
         getPath: () => "",
         uploadImage: async () => null,
