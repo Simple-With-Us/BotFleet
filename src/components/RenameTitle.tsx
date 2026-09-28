@@ -119,7 +119,8 @@ export function RenameTitle({
       <span
         className={cn("cursor-pointer select-none", className)}
         title={`${value} · Double-click to rename`}
-        onClick={() => {
+        onClick={(e) => {
+          e.stopPropagation();
           onActivate?.();
         }}
         onDoubleClick={startRename}
