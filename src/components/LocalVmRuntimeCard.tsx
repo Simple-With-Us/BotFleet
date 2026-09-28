@@ -366,7 +366,7 @@ export function LocalVmRuntimeCard() {
             <div className="text-[13px]">
               <div className="font-medium text-ink">Share Host CLI Credentials with Local VM</div>
               <div className="text-[12px] text-ink-secondary">
-                Mounts read-only host CLI credentials (~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc) into the container so tools run inside the VM are signed into your accounts.
+                Mounts read-only host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the container so tools run inside the VM are signed into your accounts.
               </div>
             </div>
           </label>
