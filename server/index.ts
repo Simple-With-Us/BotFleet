@@ -123,6 +123,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
@@ -2499,14 +2500,10 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmActiveThreads.set(target.key, { threadId, botId });
   localVmIdleFor(target).touch();
   let localVm = await containerComputerStatus(undefined, undefined, target);
-  if (localVm.container === "stopped" && localVm.image && localVm.runtime && localVm.daemonUp) {
-    try {
-      await containerComputerAction("remove", undefined, undefined, target);
-      await containerComputerAction("run", undefined, undefined, target);
-      localVm = await containerComputerStatus(undefined, undefined, target);
-    } catch {
-      // Best-effort auto-wake; fall through to readiness check below
-    }
+  try {
+    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
   }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);

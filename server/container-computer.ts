@@ -1186,6 +1186,48 @@ export async function containerComputerAction(
   return containerComputerStatus(runner, platform, target);
 }
 
+/** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.
+ *
+ * Removal is destructive before recreation is constructive, so this runs
+ * only when `run` has everything it needs — image, runtime, daemon, and
+ * create support — and a partial failure reports what actually happened:
+ * after a successful remove the container is GONE, and the pre-wake
+ * "stopped" snapshot would misreport that as the current state. Returns
+ * the freshest status, so the caller's readiness check never judges a
+ * stale snapshot. A non-stopped or unsupported status passes through
+ * untouched. */
+export async function wakeContainerComputer(
+  status: ContainerComputerStatus,
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+): Promise<ContainerComputerStatus> {
+  if (
+    status.container !== "stopped" ||
+    !status.image ||
+    !status.runtime ||
+    !status.daemonUp ||
+    !status.create_supported
+  ) {
+    return status;
+  }
+  try {
+    await containerComputerAction("remove", runner, platform, target);
+    return await containerComputerAction("run", runner, platform, target);
+  } catch (error) {
+    let fresh = status;
+    try {
+      fresh = await containerComputerStatus(runner, platform, target);
+    } catch {
+      // Keep the last known status; the wake error is the truth either way.
+    }
+    if (fresh.container === "running") return fresh;
+    throw new Error(
+      `the Local VM could not be restarted: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 /** Cheap capacity probe used by the per-bot pool. It deliberately checks an
  * exact derived container name rather than parsing a broad daemon listing. */
 export async function containerComputerExists(
