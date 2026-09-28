@@ -7768,3 +7768,117 @@ describe("CSRF security hardening", () => {
     }
   });
 });
+
+describe("bot playbooks install API", () => {
+  /** A minimal valid `botfleet.package`.  The schema requires more than looks
+   *  obvious — license, outcomes, setupMinutes, requirements, and an agent
+   *  carrying `appearance` plus the playbook keys it uses — so this mirrors the
+   *  fixture the resolver's own tests use rather than approximating one. */
+  const packageDocument = (playbooks: unknown[]) => ({
+    format: "botfleet.package",
+    version: 1,
+    package: {
+      id: "signal-desk",
+      release: "1.0.0",
+      name: "Signal Desk",
+      tagline: "Find and explain the signal.",
+      summary: "A two-bot signal workflow.",
+      category: "Research",
+      author: { name: "BotFleet" },
+      license: "MIT",
+      outcomes: ["Produce a concise signal brief."],
+      setupMinutes: 4,
+      requirements: { apps: [], capabilities: [] },
+      agents: [
+        {
+          key: "scout",
+          name: "Package Scout",
+          appearance: { color: "cyan" },
+          playbooks: playbooks.map((playbook) => (playbook as { key: string }).key),
+        },
+      ],
+      playbooks,
+    },
+  });
+
+  const PLAYBOOK = {
+    key: "signal-check",
+    name: "Signal Check",
+    summary: "Confirm a source before believing it.",
+    triggers: ["release notes", "roadmap"],
+    instructions: "Open the primary source and quote it.",
+  };
+
+  const playbooksOf = async (botId: string) =>
+    (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === botId)?.playbooks;
+
+  it("installs a playbook from a package document, which was previously impossible", async () => {
+    // `playbooks` is rendered into every prompt but had no way to become
+    // non-empty: absent from the profile patch schema, and the only writer was
+    // a whole-team import that can only reach bots it just created. All twelve
+    // live bots carried an empty list for that reason.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      expect(bot.playbooks ?? []).toEqual([]);
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      expect(done.status).toBe(201);
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["signal-check"]);
+      expect(await playbooksOf(bot.id)).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("installs a named subset through the wrapped shape", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const other = { ...PLAYBOOK, key: "report", name: "Report", summary: "Then write it up." };
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK, other]),
+        keys: ["report"],
+      });
+      expect(done.status).toBe(201);
+      // Named subset only — `signal-check` was in the package but not asked for.
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["report"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("replaces a re-installed key in place rather than duplicating it", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      const updated = { ...PLAYBOOK, instructions: "Open the primary source, quote it, then date it." };
+      const again = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([updated]));
+      expect(again.status).toBe(201);
+      const stored = await playbooksOf(bot.id);
+      expect(stored).toHaveLength(1);
+      expect(stored[0].instructions).toBe("Open the primary source, quote it, then date it.");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("refuses a body that is not a package, and a key the package lacks", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const notAPackage = await api("POST", `/api/bots/${bot.id}/playbooks`, { nope: true });
+      expect(notAPackage.status).toBe(422);
+      expect(notAPackage.body.error).toMatch(/package/i);
+      // Asked for something by name that does not exist: an error, not a no-op.
+      const missingKey = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK]),
+        keys: ["not-declared"],
+      });
+      expect(missingKey.status).toBe(422);
+      expect(missingKey.body.error).toMatch(/not-declared/);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("404s for a bot that does not exist", async () => {
+    expect((await api("POST", "/api/bots/does-not-exist/playbooks", packageDocument([PLAYBOOK]))).status).toBe(404);
+  });
+});
