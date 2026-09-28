@@ -148,7 +148,16 @@ const ANTIGRAVITY_ULTRA_NOTE =
 const DEEPSEEK_HARNESS_NOTE =
   "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
 
-export const ENGINE_CAPABILITIES: Record<string, EngineCapabilityEntry> = {
+/** The registry's owner contract.  Named rather than spelled
+ *  `Record<string, EngineCapabilityEntry>` at the binding so the string index
+ *  signature stays open — custom engines add ids that are in no union this
+ *  module declares — while every value in it still has to be a real
+ *  `EngineCapabilityEntry`.  A named contract is what a reader has to keep
+ *  honest; a bare `Record` says nothing about who owns the map. */
+export interface EngineCapabilityRegistry
+  extends Record<string, EngineCapabilityEntry> {}
+
+export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
   grok: {
     id: "grok",
     displayName: "Grok",
@@ -672,7 +681,7 @@ export const CAPABILITY_KEYS: CapabilityKey[] = CAPABILITY_CATEGORIES.flatMap(
 
 /** Full display labels — the detail strip, the cell tooltip, and the
  *  accessible name all read these. */
-export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
+export const CAPABILITY_LABELS = {
   files: "Files",
   terminal: "Terminal",
   thisComputer: "This Computer",
@@ -685,13 +694,13 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   computerUse: "Computer Use",
   longContext: "Long Context",
   liveResearch: "Live Research",
-};
+} satisfies Record<CapabilityKey, string>;
 
 /** Column labels for the matrix header.  One or two words, sized to fit a
  *  single 54px column (they wrap onto a second line where they must).  The
  *  full label stays in `CAPABILITY_LABELS` for the tooltip and the detail
  *  strip, so shortening here costs the reader nothing. */
-export const CAPABILITY_SHORT_LABELS: Record<CapabilityKey, string> = {
+export const CAPABILITY_SHORT_LABELS = {
   files: "Files",
   terminal: "Terminal",
   thisComputer: "This Computer",
@@ -704,12 +713,17 @@ export const CAPABILITY_SHORT_LABELS: Record<CapabilityKey, string> = {
   computerUse: "Screen Use",
   longContext: "Long Context",
   liveResearch: "Research",
-};
+} satisfies Record<CapabilityKey, string>;
 
 /** What each capability actually means in BotFleet — which wiring stands
  *  behind it.  This is the copy the detail strip shows, so a reader learns
- *  what Connected Apps *is* instead of re-reading the engine's pitch. */
-export const CAPABILITY_NOTES: Partial<Record<CapabilityKey, string>> = {
+ *  what Connected Apps *is* instead of re-reading the engine's pitch.  A key
+ *  may be absent — `capabilityNoteFor` falls through to the engine headline
+ *  when it is — so this keeps the partial contract under a named owner rather
+ *  than a mapped type that would hide the fallthrough. */
+export interface CapabilityNotes extends Partial<Record<CapabilityKey, string>> {}
+
+export const CAPABILITY_NOTES: CapabilityNotes = {
   files:
     "Reading and writing files in the working folder.  Backed by the driver's own file tools, so the bot follows the same approval and permission rules as the rest of its turn.",
   terminal:
@@ -811,22 +825,26 @@ export function engineCapability(id: string): EngineCapabilityEntry {
 
 /** Pretty label for a pricing mode — used by both `<EngineCallout>` and
  *  `<EngineCapabilitiesMatrix>` so the wording is consistent everywhere. */
+/** The monthly-cost suffix a subscription tier adds to its label, or the
+ *  empty string when the tier has no billed monthly amount.  `costPerMonth`
+ *  is null exactly when the engine ships no separate rate for that
+ *  subscription, so a Cursor Ultra row states the plan name and nothing else
+ *  rather than inventing an amount. */
+function monthlyCost(tier: SubscriptionTier): string {
+  const { costPerMonth } = tier;
+  return costPerMonth === null ? "" : ` · $${costPerMonth.toFixed(2)}/mo`;
+}
+
 export function pricingModeLabel(pricing: PricingMode): string {
   switch (pricing.kind) {
     case "subscription": {
-      const cost =
-        typeof pricing.subscription.costPerMonth === "number"
-          ? ` · $${pricing.subscription.costPerMonth.toFixed(2)}/mo`
-          : "";
+      const cost = monthlyCost(pricing.subscription);
       return `Subscription${cost}`;
     }
     case "api":
       return `API · $${pricing.api.inputPer1k.toFixed(5)}/1k in`;
     case "subscription+api": {
-      const cost =
-        typeof pricing.subscription.costPerMonth === "number"
-          ? ` · $${pricing.subscription.costPerMonth.toFixed(2)}/mo`
-          : "";
+      const cost = monthlyCost(pricing.subscription);
       return `Subscription + API${cost}`;
     }
     case "free":

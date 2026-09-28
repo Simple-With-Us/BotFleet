@@ -81,13 +81,13 @@ export const MATRIX_CAPABILITY_COL_PX = 54;
 // treatment so an unaudited pair is never mistaken for a measured "no".
 // ---------------------------------------------------------------------------
 
-const CELL_TONE: Record<CapabilityState, string> = {
+const CELL_TONE = {
   yes: "text-emerald-700 dark:text-emerald-300 bg-emerald-500/10",
   no: "text-ink-secondary/70 bg-inset/30",
   limited: "text-amber-700 dark:text-amber-300 bg-amber-500/10",
   "yes-pro-only": "text-violet-700 dark:text-violet-300 bg-violet-500/10",
   unknown: "text-ink-secondary/50 border border-dashed border-hairline/50 bg-transparent",
-};
+} satisfies Record<CapabilityState, string>;
 
 /** What the matrix can say about an engine on this machine.  Derived only
  *  from fields the runtime actually provides — `snapshot.state`,
@@ -95,19 +95,19 @@ const CELL_TONE: Record<CapabilityState, string> = {
  *  never invents a reason string nobody reported. */
 export type EngineAvailability = "ready" | "signed-out" | "cli-missing" | "absent";
 
-const AVAILABILITY_TONE: Record<EngineAvailability, string> = {
+const AVAILABILITY_TONE = {
   ready: "bg-emerald-500",
   "signed-out": "bg-amber-500",
   "cli-missing": "bg-ink-secondary/50",
   absent: "border border-dashed border-hairline/60 bg-transparent",
-};
+} satisfies Record<EngineAvailability, string>;
 
-const AVAILABILITY_LABEL: Record<EngineAvailability, string> = {
+const AVAILABILITY_LABEL = {
   ready: "Ready",
   "signed-out": "Not signed in",
   "cli-missing": "Command-line app not found",
   absent: "Not on this computer",
-};
+} satisfies Record<EngineAvailability, string>;
 
 /** Resolve install status from the instances the settings panel already
  *  has.  An engine with no instance is "absent" — that is the whole point:

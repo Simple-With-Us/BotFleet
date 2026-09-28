@@ -8,8 +8,10 @@
 //
 // Compact by default (collapsed to the Title Case label) so ModelPicker
 // can keep the model list on screen.  Expand reveals the headline, full
-// prose, and pricing.  The capability matrix keeps using
-// `<EngineCalloutBody>` directly for the always-expanded hover panel.
+// prose, and pricing.  The capability matrix no longer reads the whole
+// prose block on hover — its detail strip shows a capability-specific
+// note instead, so hovering a cell does not re-read the sales pitch —
+// but `EngineCalloutBody` stays exported as the shared prose block.
 //
 // Props:
 //   - `engineId`  — registry key (e.g. "minimax", "claude", "grok").
