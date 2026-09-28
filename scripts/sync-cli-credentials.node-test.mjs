@@ -5,7 +5,7 @@
 // used.  The functional case runs the script with a credential-bearing
 // fake HOME and no reachable container, forcing the empty-targets JSON
 // path; the source assertion pins the guard so a refactor cannot drop it.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -16,7 +16,11 @@ import assert from "node:assert/strict";
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "sync-cli-credentials.sh");
 const SRC = readFileSync(SCRIPT, "utf8");
 
-test("script parses under bash", () => {
+// Windows CI does not ship bash.  Keep the static guard assertion on every
+// platform; run shell syntax and behavior checks only where bash exists.
+const bashAvailable = process.platform !== "win32" && !spawnSync("bash", ["-c", "exit 0"], { stdio: "ignore" }).error;
+
+test("script parses under bash", { skip: !bashAvailable }, () => {
   execFileSync("bash", ["-n", SCRIPT]);
 });
 
@@ -26,7 +30,7 @@ test("json no-targets path uses the bash 3.2-safe empty-array idiom", () => {
   assert.doesNotMatch(SRC, /(?<!\+)"\$\{SYNCED_TARGETS\[@\]\}"/);
 });
 
-test("--json with no synced target exits 0 and prints an empty targets list", () => {
+test("--json with no synced target exits 0 and prints an empty targets list", { skip: !bashAvailable }, () => {
   const home = mkdtempSync(join(tmpdir(), "cred-sync-"));
   try {
     // One credential candidate so the run reaches the sync stage.
