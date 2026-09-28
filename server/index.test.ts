@@ -7767,6 +7767,22 @@ describe("CSRF security hardening", () => {
     expect(result.status).toBe(201);
   });
 
+  it("accepts Origin from candidate desktop UI ports (18799, 28799)", async () => {
+    for (const port of [18799, 28799]) {
+      const result = await rawRequest({
+        method: "POST",
+        path: "/api/bots",
+        headers: {
+          "origin": `http://127.0.0.1:${port}`,
+          "content-type": "application/json",
+          "content-length": "2",
+        },
+        body: "{}",
+      });
+      expect(result.status).toBe(201);
+    }
+  });
+
   it("allows bodiless mutating POST (e.g. /api/runtime/quiesce)", async () => {
     const owner = JSON.parse(readFileSync(join(home, ".botfleet", "harness-owner.json"), "utf8"));
     const result = await rawRequest({
