@@ -7896,10 +7896,22 @@ function isLoopbackHost(host: string | undefined): boolean {
  *  next free port when 5199 is taken, so `pnpm dev` against a busy port
  *  needs `OMB_UI_PORT` set to the one it actually bound.
  *
+ *  When the desktop app attaches to an existing harness (e.g. the LaunchAgent
+ *  on 8799), `electron/main.mjs` runs `startUiShim` on candidate sibling ports
+ *  (18799, 28799) to serve the bundled UI.  These candidate UI origins are
+ *  legitimate first-party BotFleet surfaces and are accepted here alongside
+ *  PORT, WEBHOOK_PORT, and OMB_UI_PORT.
+ *
  *  This used to be "any loopback hostname", which made every dev server,
  *  every preview and every page a malicious npm package serves on this Mac
  *  a first-class caller of `PUT /api/config` and `POST /api/bots`. */
-const ALLOWED_ORIGIN_PORTS = new Set([String(PORT), String(WEBHOOK_PORT), String(process.env.OMB_UI_PORT || 5199)]);
+const CANDIDATE_UI_PORTS = ["8799", "18799", "28799"];
+const ALLOWED_ORIGIN_PORTS = new Set([
+  String(PORT),
+  String(WEBHOOK_PORT),
+  ...CANDIDATE_UI_PORTS,
+  String(process.env.OMB_UI_PORT || 5199),
+]);
 
 function isAllowedOrigin(origin: string | undefined | null): boolean {
   if (!origin) return true; // non-browser clients (CLIs, curl, tests) send none

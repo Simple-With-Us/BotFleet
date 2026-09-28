@@ -226,6 +226,19 @@ describe("harness trust boundary", () => {
       // all send no Origin at all, and must keep working.
       expect((await api("GET", "/api/bots")).status).toBe(200);
     });
+
+    it("allows candidate UI shim ports (18799, 28799) on loopback", async () => {
+      for (const origin of ["http://127.0.0.1:18799", "http://localhost:18799", "http://127.0.0.1:28799"]) {
+        const res = await api("GET", "/api/bots", undefined, { origin });
+        expect(res.status, origin).toBe(200);
+      }
+      // Mutating attachment upload from the UI shim origin succeeds
+      const upload = await raw("/api/attachments", "dummy-bytes", {
+        "content-type": "image/png",
+        origin: "http://127.0.0.1:18799",
+      });
+      expect(upload.status).toBe(201);
+    });
   });
 
   describe("content type", () => {
