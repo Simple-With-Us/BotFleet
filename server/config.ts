@@ -268,7 +268,7 @@ const appConfigSchema = z.object({
   /** Voice credentials and the selected voice id. `provider` picks the
    * engine: "minimax" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -440,7 +440,7 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, AssemblyAI on every other platform, and
@@ -994,7 +994,7 @@ export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
   // Trim because a stale env-overlay can leave a whitespace-only key that
   // would not match any provider's `verifyKey` probe; that case is "no key".
   if (!cfg.tts.key?.trim()) return false;
-  cfg.tts = { ...cfg.tts, provider: "elevenlabs" };
+  cfg.tts = { ...cfg.tts, provider: "minimax" };
   return true;
 }
 

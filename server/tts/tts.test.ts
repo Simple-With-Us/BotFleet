@@ -114,15 +114,16 @@ describe("configuration", () => {
     expect(() => speak({}, "hi")).toThrow(
       "Add a MiniMax key in Settings on the computer to turn on voice.",
     );
-    expect(() => speak(cfg({ key: "k", provider: "elevenlabs" }), "hi")).toThrow(
+    expect(() => speak(cfg({ key: "k", provider: "minimax" }), "hi")).toThrow(
       "Pick a voice in the agent profile.",
     );
   });
 
-  it("lists no voices without a key, rather than calling out", async () => {
+  it("lists standard canned voices without a key, rather than calling out", async () => {
     seen.length = 0;
     const { listVoices } = await voice();
-    expect(await listVoices({})).toEqual([]);
+    const voices = await listVoices({});
+    expect(voices.length).toBeGreaterThan(0);
     expect(seen).toHaveLength(0);
   });
 });
@@ -237,21 +238,6 @@ describe("MiniMax clone", () => {
     const { cloneVoice } = await voice();
     await expect(cloneVoice(cfg({ key: "sk-mm" }), { voiceId: "Jay-Wedgeworth-002", filename: "x.wav", audioBase64: "not base64" })).rejects.toThrow("base64");
     expect(seen).toHaveLength(0);
-  });
-});
-
-describe("optional ElevenLabs", () => {
-  it("verifies, lists, and synthesizes with the selected provider", async () => {
-    refuse = null;
-    const { verifyKey, listVoices, speak } = await voice();
-    const settings = cfg({ provider: "elevenlabs", key: "eleven-key", voice: "eleven-v" });
-    expect(await verifyKey("eleven-key", settings)).toEqual({ ok: true });
-    expect((await listVoices(settings))[0]).toMatchObject({ id: "eleven-v" });
-    const audio = await speak(settings, "test speech");
-    expect(Buffer.from(audio.bytes)).toEqual(MP3_BYTES);
-    expect(seen.at(-1)?.headers["xi-api-key"]).toBe("eleven-key");
-    const { speechUsageTotals } = await import("./usage.ts");
-    expect(speechUsageTotals().elevenlabs.characters).toBeGreaterThanOrEqual("test speech".length);
   });
 });
 

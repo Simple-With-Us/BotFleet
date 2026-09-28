@@ -121,7 +121,7 @@ export function CallTargetButton({
         ? "Add an AssemblyAI API key in Settings to make calls on this computer."
         : "This dictation provider is unavailable.\u00A0 Check your choice in Settings or restart BotFleet."
       : !configured
-        ? "Add an ElevenLabs API key or choose an available voice provider so the bot can speak during calls."
+        ? "Add a MiniMax API key in Settings so the bot can speak during calls."
         : !voiceReady
           ? voices.length > 1
             ? "Give every channel member a voice before starting a channel call."

@@ -40,11 +40,11 @@ const CLONED_VOICES_FILE = join(DATA_DIR, "tts-cloned-voices.json");
 // MiniMax's published T2A HTTP reference lists these English voice IDs.
 // The live catalog comes from POST /v1/get_voice for this account.
 export const CANNED_VOICES: Voice[] = [
-  { id: "English_Graceful_Lady", label: "Graceful Lady", description: "English" },
-  { id: "English_Insightful_Speaker", label: "Insightful Speaker", description: "English" },
-  { id: "English_Persuasive_Man", label: "Persuasive Man", description: "English" },
-  { id: "English_radiant_girl", label: "Radiant Girl", description: "English" },
-  { id: "English_Lucky_Robot", label: "Lucky Robot", description: "English" },
+  { id: "English_Graceful_Lady", label: "Graceful Lady", description: "Standard · Female" },
+  { id: "English_Insightful_Speaker", label: "Insightful Speaker", description: "Standard · Male" },
+  { id: "English_Persuasive_Man", label: "Persuasive Man", description: "Standard · Male" },
+  { id: "English_radiant_girl", label: "Radiant Girl", description: "Standard · Female" },
+  { id: "English_Lucky_Robot", label: "Lucky Robot", description: "Standard · Playful" },
 ];
 
 // ── Cloned voice persistence ──────────────────────────────────────────────────
@@ -78,7 +78,28 @@ function writeClonedVoices(records: ClonedVoiceRecord[]): void {
 export function listClonedVoices(): Voice[] {
   return readClonedVoices()
     .sort((a, b) => b.createdAt - a.createdAt)
-    .map((r) => ({ id: r.voiceId, label: r.label }));
+    .map((r) => ({ id: r.voiceId, label: r.label, description: "Custom" }));
+}
+
+/** Add a custom voice record by identifier/label. */
+export function addCustomVoice(voiceId: string, label?: string): Voice {
+  const trimmed = voiceId.trim();
+  if (!trimmed) throw new Error("Voice ID is required.");
+  const displayLabel = label?.trim() || trimmed;
+  const records = readClonedVoices().filter((r) => r.voiceId !== trimmed);
+  records.push({ voiceId: trimmed, label: displayLabel, createdAt: Date.now() });
+  writeClonedVoices(records);
+  return { id: trimmed, label: displayLabel, description: "Custom" };
+}
+
+/** Delete a custom voice record by identifier. */
+export function deleteCustomVoice(voiceId: string): boolean {
+  const trimmed = voiceId.trim();
+  const records = readClonedVoices();
+  const filtered = records.filter((r) => r.voiceId !== trimmed);
+  if (filtered.length === records.length) return false;
+  writeClonedVoices(filtered);
+  return true;
 }
 
 // ── Voice cloning ─────────────────────────────────────────────────────────────

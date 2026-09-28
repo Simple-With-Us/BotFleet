@@ -98,6 +98,8 @@ export interface Message {
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  /** The model that actually generated this reply; absent on legacy rows. */
+  modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
@@ -460,7 +462,7 @@ export interface ConfigStatus {
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean };
+  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary

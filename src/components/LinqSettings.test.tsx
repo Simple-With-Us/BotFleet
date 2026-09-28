@@ -42,7 +42,7 @@ const baseConfig: ConfigStatus = {
   ingress: { publicUrl: "", enabled: true },
   localVm: {},
   opencodeGo: { configured: false },
-  tts: { provider: "elevenlabs", configured: false, voice: "" },
+  tts: { provider: "minimax", configured: false, voice: "" },
   imageGen: { configured: false },
   profile: { name: "", email: "" },
   autoUpdate: { enabled: true },
