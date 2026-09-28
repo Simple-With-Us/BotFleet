@@ -1615,3 +1615,104 @@ describe("setup-class failures", () => {
     expect(finished.setupFailed).toBe(false);
   });
 });
+
+describe("acknowledge the whole failure backlog", () => {
+  /** One run per terminal status the badge can be counting, so the assertion
+   *  is about which runs get cleared and not just about the happy path. */
+  async function backlog() {
+    const h = harness();
+    const start = new Date(2026, 7, 17, 8, 0, 0).getTime();
+    let now = start;
+    const advance = (value: number) => { now = value; h.setNow(value); };
+    const soon = () => now + 60_000;
+
+    // Missed: a once-routine the computer slept through.
+    h.manager.create({ name: "Offline brief", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: start } });
+    advance(start + 20 * 3_600_000);
+    await h.manager.tick();
+
+    // Failed, and one already acknowledged by opening it in the calendar.
+    const failing = h.manager.create({ name: "Broken report", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: soon() } });
+    await h.manager.runNow(failing.id);
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({ eventId: "e1", provider: "fake", threadId: "thread-1", createdAt: new Date().toISOString(), type: "turn.completed", ok: false, stopReason: "provider crashed" });
+    const acknowledged = h.manager.create({ name: "Handled failure", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: soon() } });
+    await h.manager.runNow(acknowledged.id);
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({ eventId: "e2", provider: "fake", threadId: "thread-2", createdAt: new Date().toISOString(), type: "turn.completed", ok: false, stopReason: "provider crashed" });
+    h.manager.markSeen(h.manager.listRuns().find((run) => run.threadId === "thread-2")!.id);
+
+    // Completed, and one still in flight: neither is a failure.
+    const working = h.manager.create({ name: "Fine report", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: soon() } });
+    await h.manager.runNow(working.id);
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({ eventId: "e3", provider: "fake", threadId: "thread-3", createdAt: new Date().toISOString(), type: "turn.completed", ok: true, cost: 0.01 });
+    const inFlight = h.manager.create({ name: "Still going", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: soon() } });
+    await h.manager.runNow(inFlight.id);
+    await h.manager.tick();
+
+    return { h, soon };
+  }
+
+  it("clears every unseen failure and nothing else", async () => {
+    const { h } = await backlog();
+    const before = h.manager.listRuns().filter((run) => ["failed", "missed"].includes(run.status));
+    expect(before.filter((run) => !run.seenAt)).toHaveLength(2);
+
+    const result = h.manager.markAllSeen();
+    expect(result.acknowledged).toBe(2);
+    expect(result.runs.map((run) => run.status).sort()).toEqual(["failed", "missed"]);
+    expect(result.runs.every((run) => typeof run.seenAt === "number")).toBe(true);
+
+    const after = new Map(h.manager.listRuns().map((run) => [run.id, run]));
+    expect([...after.values()].filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt)).toHaveLength(0);
+    expect([...after.values()].filter((run) => run.status === "completed")).toHaveLength(1);
+    expect([...after.values()].filter((run) => ["running", "waiting"].includes(run.status))).toHaveLength(1);
+  });
+
+  it("keeps history: acknowledging stamps a time, it never deletes a run", async () => {
+    const { h } = await backlog();
+    const countBefore = h.manager.listRuns().length;
+    h.manager.markAllSeen();
+    expect(h.manager.listRuns()).toHaveLength(countBefore);
+    const missed = h.manager.listRuns().find((run) => run.status === "missed")!;
+    expect(missed.error).toContain("offline");
+    expect(missed.seenAt).toBeGreaterThan(0);
+  });
+
+  it("is idempotent and raises nothing the second time", async () => {
+    const { h } = await backlog();
+    h.manager.markAllSeen();
+    h.emitted.length = 0;
+    expect(h.manager.markAllSeen().acknowledged).toBe(0);
+    expect(h.emitted).toHaveLength(0);
+  });
+
+  it("leaves a later failure counting again", async () => {
+    const { h, soon } = await backlog();
+    h.manager.markAllSeen();
+    const later = h.manager.create({ name: "New breakage", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: soon() } });
+    await h.manager.runNow(later.id);
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({ eventId: "e4", provider: "fake", threadId: "thread-4", createdAt: new Date().toISOString(), type: "turn.completed", ok: false, stopReason: "provider crashed" });
+
+    expect(h.manager.listRuns().filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt)).toHaveLength(1);
+  });
+
+  it("persists the acknowledgement across a reload", async () => {
+    const { h } = await backlog();
+    h.manager.markAllSeen();
+    h.manager.flushNow();
+    const reloaded = new RoutineManager(h.options);
+    const acknowledged = reloaded.listRuns().filter((run) => ["failed", "missed"].includes(run.status) && run.seenAt);
+    expect(acknowledged).toHaveLength(3);
+    // The one run still in flight is a different story: boot recovery turns
+    // it into a fresh runtime_restart failure, which has never been
+    // acknowledged and must keep counting.  That is the "reappears on the
+    // next error" half of the contract, arriving from the server rather than
+    // from a trigger.
+    const fresh = reloaded.listRuns().filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt);
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]).toMatchObject({ routineName: "Still going", outcomeCode: "runtime_restart" });
+  });
+});
