@@ -81,7 +81,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
       contextWindow: 204_800,
-      badge: "2x Cost",
+      badge: "2x the $",
       badgeTitle:
         "Same 204,800 context as M2.7 at $0.60 / M input and $2.40 / M output — exactly twice MiniMax M3's $0.30 / $1.20.",
     },

@@ -119,6 +119,16 @@ export function TVFaceAvatar({
         alt={label || `Bot ${expression} face`}
         className="w-full h-full object-contain"
         draggable={false}
+        onError={(e) => {
+          const target = e.currentTarget;
+          const stillSrc = getAssetPath(expression, "hold", true);
+          const restSrc = getAssetPath("resting", "hold", true);
+          if (target.src.includes(".gif") && !target.src.endsWith(stillSrc)) {
+            target.src = stillSrc;
+          } else if (!target.src.endsWith(restSrc)) {
+            target.src = restSrc;
+          }
+        }}
       />
     </div>
   );
