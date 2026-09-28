@@ -546,7 +546,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
         httpBodies: [],
         httpHeaders: { request: false, response: false },
         cookies: false,
-        queryParams: false,
+        urlQueryParams: false,
       },
       profileSessionSampleRate: Number.isFinite(profileSessionSampleRate)
         ? Math.min(Math.max(profileSessionSampleRate, 0), 1)
