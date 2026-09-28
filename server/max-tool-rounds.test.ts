@@ -1,9 +1,15 @@
 // Part 1: bot.maxToolRounds → createTurnToolHost.maxRounds → loop exit.
-// Unset keeps DEFAULT_TURN_LOOP_BUDGET.maxRounds (12). Invalid/empty ignored.
+// Unset keeps DEFAULT_TURN_LOOP_BUDGET.maxRounds, which is the shared
+// DEFAULT_MAX_TOOL_ROUNDS. Invalid/empty ignored.
 import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
+import {
+  DEFAULT_MAX_TOOL_ROUNDS,
+  effectiveToolRounds,
+  toolBudgetPrompt,
+} from "../shared/bot-profile.ts";
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import {
@@ -82,16 +88,37 @@ async function exitAtRounds(maxRounds: number | undefined) {
 }
 
 describe("DEFAULT_TURN_LOOP_BUDGET", () => {
-  it("ships maxRounds === 12 as the single SoT for unset bots", () => {
-    expect(DEFAULT_TURN_LOOP_BUDGET.maxRounds).toBe(12);
+  it("stops an unset turn at the shared default", () => {
+    expect(DEFAULT_TURN_LOOP_BUDGET.maxRounds).toBe(DEFAULT_MAX_TOOL_ROUNDS);
+  });
+
+  it("stops a turn at exactly the number that turn's prompt promised it", () => {
+    // THE regression.  These were three literals — 12 here, 40 in
+    // shared/bot-profile.ts, and "Empty uses 12" in the desktop and iOS copy
+    // — and they disagreed.  An unset bot was told "This turn has a budget of
+    // 40 model→tool rounds", planned against 40, and was hard-stopped at 12
+    // mid-work: precisely the truncation toolBudgetPrompt exists to prevent.
+    // The prompt is what a model spends its round budget against, so if these
+    // two ever separate again the budget is a lie told at dispatch time.
+    const promised = toolBudgetPrompt(effectiveToolRounds(undefined));
+    expect(promised).toContain(`budget of ${DEFAULT_TURN_LOOP_BUDGET.maxRounds} model→tool rounds`);
+  });
+
+  it("states the owner's own number as explicit, and the default as not", () => {
+    expect(toolBudgetPrompt(effectiveToolRounds(undefined))).toContain("the default for this bot");
+    expect(toolBudgetPrompt(effectiveToolRounds(7))).toContain("set for this bot");
+  });
+
+  it("spends no prompt on a one-round budget, where there is nothing to plan", () => {
+    expect(toolBudgetPrompt(effectiveToolRounds(1))).toBe("");
   });
 });
 
 describe("maxToolRounds → host → exit", () => {
-  it("unset still exits at 12", async () => {
+  it("unset still exits at the shared default", async () => {
     const { exit, rounds } = await exitAtRounds(resolveMaxToolRounds(undefined));
     expect(exit).toBe("tool_round_limit");
-    expect(rounds).toBe(12);
+    expect(rounds).toBe(DEFAULT_MAX_TOOL_ROUNDS);
   });
 
   it("set to 2 exits at 2", async () => {
@@ -100,13 +127,13 @@ describe("maxToolRounds → host → exit", () => {
     expect(rounds).toBe(2);
   });
 
-  it("invalid/empty ignored — still exits at 12", async () => {
+  it("invalid/empty ignored — still exits at the shared default", async () => {
     for (const bad of [null, "", 0, -1, 201, 1.5, "2", NaN]) {
       expect(resolveMaxToolRounds(bad), String(bad)).toBeUndefined();
     }
     const { exit, rounds } = await exitAtRounds(resolveMaxToolRounds(0));
     expect(exit).toBe("tool_round_limit");
-    expect(rounds).toBe(12);
+    expect(rounds).toBe(DEFAULT_MAX_TOOL_ROUNDS);
   });
 });
 

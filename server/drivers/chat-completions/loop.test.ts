@@ -13,6 +13,7 @@ import type {
   TurnToolOutcome,
 } from "../../contracts.ts";
 import { ProviderError } from "../../contracts.ts";
+import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { RETRY_AFTER_CAP_MS, httpErrorFor } from "./errors.ts";
 import {
   DEFAULT_TURN_LOOP_BUDGET,
@@ -817,7 +818,13 @@ describe("runTurnLoop — rounds", () => {
 describe("the shipped budget", () => {
   it("is the one the design signed off on", () => {
     expect(DEFAULT_TURN_LOOP_BUDGET).toEqual({
-      maxRounds: 12,
+      // Not a literal.  The unset-bot round budget lives in
+      // shared/bot-profile.ts as DEFAULT_MAX_TOOL_ROUNDS because that is the
+      // same number the turn's prompt names and the settings copy shows; the
+      // hard stop is derived from it so the three cannot disagree.  Pinning a
+      // literal here is exactly what let the prompt say 40 while the loop
+      // stopped at 12.
+      maxRounds: DEFAULT_MAX_TOOL_ROUNDS,
       requestTimeoutMs: 600_000,
       requestIdleMs: 120_000,
       toolTimeoutMs: 90_000,
@@ -825,6 +832,12 @@ describe("the shipped budget", () => {
       toolConcurrency: 4,
       maxRequestAttempts: 3,
     });
+  });
+
+  it("spends a real budget on an unset turn, not a token twelve", () => {
+    // A turn that runs out of rounds dies with its work undone and nobody
+    // watching, so the floor has to leave room for a multi-step change.
+    expect(DEFAULT_TURN_LOOP_BUDGET.maxRounds).toBeGreaterThanOrEqual(20);
   });
 });
 

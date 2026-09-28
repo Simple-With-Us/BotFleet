@@ -4262,7 +4262,9 @@ async function startTurn(
               threadId,
               commsDepth,
               // HTTP toolLoop engines only (MiniMax / Grok HTTP / openai-compat).
-              // Unset/invalid → undefined → DEFAULT_TURN_LOOP_BUDGET.maxRounds (12).
+              // Unset/invalid → undefined → DEFAULT_TURN_LOOP_BUDGET.maxRounds, which is
+              // DEFAULT_MAX_TOOL_ROUNDS — the number toolBudgetPrompt just told
+              // this same turn it had.
               maxRounds: resolveMaxToolRounds(bot.maxToolRounds),
               localComputer: hasHostComputer,
               workspace: worksInWorkspace,

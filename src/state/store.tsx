@@ -311,7 +311,9 @@ export interface Bot {
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
-  /** Ceiling on HTTP toolLoop rounds (MiniMax / Grok HTTP / openai-compat). Unset or null uses 12. */
+  /** Ceiling on HTTP toolLoop rounds (MiniMax / Grok HTTP / openai-compat).
+   *  Unset or null uses DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts) — the
+   *  same number the turn's prompt names and the loop stops at. */
   maxToolRounds?: number | null;
   /** speak this bot's replies aloud as they settle */
   speakReplies?: boolean;

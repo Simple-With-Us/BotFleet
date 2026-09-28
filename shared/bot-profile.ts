@@ -21,6 +21,19 @@ export const MAX_TOOL_ROUNDS = 200;
  *  a different number set `maxToolRounds` per bot, up to MAX_TOOL_ROUNDS. */
 export const DEFAULT_MAX_TOOL_ROUNDS = 40;
 
+/** The owner-facing sentence for the Maximum Tool Rounds control, built from
+ *  the constants instead of typed out.
+ *
+ *  This copy used to be a literal "Per turn.  Empty uses 12.  Cap is 200." in
+ *  the desktop panel, the iOS profile view, AND the layout test that asserted
+ *  the literal string — so the test pinned the wrong number and the three
+ *  places agreed with each other while the bot was actually told a different
+ *  budget than the one it was stopped at.  Deriving the sentence means the
+ *  number a person reads is the number the loop enforces. */
+export function toolRoundsCaption(): string {
+  return `Per turn.  Empty uses ${DEFAULT_MAX_TOOL_ROUNDS}.  Cap is ${MAX_TOOL_ROUNDS}.`;
+}
+
 /** The budget a turn will actually run under, and whether the owner chose it.
  *
  *  Returns the effective number rather than `undefined` so callers stop
