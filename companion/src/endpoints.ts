@@ -1,3 +1,4 @@
+import { DEFAULT_LAN_POLICY, reachableCandidates, type LanPolicy } from "./lan-policy.ts";
 import { lanAddresses, tailnetName, tailscaleAddress } from "./listener.ts";
 import { defaultHostName } from "./mdns.ts";
 
@@ -57,13 +58,19 @@ const httpOrigin = (host: string, port: number): string => {
  * same order as the legacy host list so the app can fall back without an
  * account, relay, or Tailscale dependency. The final cap bounds both QR size
  * and connection-walk latency; Bonjour is retained as the last fallback even
- * on a machine with an unusually large interface table. */
+ * on a machine with an unusually large interface table.
+ *
+ * `policy` decides which of those routes exist at all. With the device port
+ * bound to loopback, every direct route is a route the sidecar cannot answer,
+ * so the list is filtered down to the hosted origin rather than handed to a
+ * phone as a list of things to try. */
 export function companionEndpointCandidates(
   port: number,
   addresses: string[] = lanAddresses(),
   magicDnsName: string | null = tailnetName(),
   hostedUrl: string | null = null,
   bonjourHost: string = defaultHostName(),
+  policy: LanPolicy = DEFAULT_LAN_POLICY,
 ): CompanionEndpoint[] {
   const tailscale = tailscaleAddress(addresses);
   const candidates: CompanionEndpoint[] = [];
@@ -79,8 +86,9 @@ export function companionEndpointCandidates(
   });
   candidates.push({ url: httpOrigin(bonjourHost, port), kind: "bonjour", priority: 300 });
 
+  const reachable = reachableCandidates(candidates, policy);
   const seen = new Set<string>();
-  const ordered = candidates
+  const ordered = reachable
     .sort((left, right) => left.priority - right.priority)
     .filter((endpoint) => {
       if (seen.has(endpoint.url)) return false;

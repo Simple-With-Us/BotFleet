@@ -165,13 +165,26 @@ function RecoveryButton({
   );
 }
 
-function ReportProblemButton({ message }: { message: string }) {
+/** The driver label that goes into a report's synthetic diagnostics block:
+ * display name where there is one, the driver kind otherwise, plus the
+ * engine's own version when it reported one.  All three are build metadata,
+ * so this is safe to attach to an issue filed against a public repository. */
+export function engineLabel(instance: InstanceInfo | undefined): string | undefined {
+  if (!instance) return undefined;
+  const name = instance.displayName?.trim() || instance.instanceId?.trim() || instance.driverKind?.trim();
+  if (!name) return undefined;
+  const version = instance.snapshot?.version?.trim();
+  return version ? `${name} ${version}` : name;
+}
+
+function ReportProblemButton({ message, engine }: { message: string; engine?: string }) {
   return (
     <button
       type="button"
       onClick={() => void openSentryFeedback({
         formTitle: "Report a Problem",
         defaultMessage: `Error encountered: ${message}\n\n`,
+        engine,
       })}
       className="flex items-center gap-1.5 rounded-full border border-danger/30 px-2.5 py-1 text-[12.5px] hover:bg-danger/15"
       title="Report this problem"
@@ -210,7 +223,7 @@ function ErrorRow({
           <div className="mt-2 flex flex-col gap-2">
             <EngineSetup instance={setupInstance} className="text-ink-secondary" />
             <div className="flex flex-wrap items-center gap-2">
-              <ReportProblemButton message={message} />
+              <ReportProblemButton message={message} engine={engineLabel(setupInstance)} />
             </div>
           </div>
         ) : message.includes("stall watchdog timeout") && onRetry ? (

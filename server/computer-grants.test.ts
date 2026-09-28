@@ -13,13 +13,23 @@ import {
   type ComputerMount,
   type TurnComputerDeps,
 } from "./computer-grants.ts";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import type { AppConfig } from "./config.ts";
 import { buildMcpServers } from "./drivers/pi.ts";
 import type { SendTurnInput } from "./contracts.ts";
 
 const stdio = (env: Record<string, string> = {}) => ({ command: "/bin/cua", args: ["mcp"], env });
 const hostStdio = () => ({ ...stdio(), scope: "local-computer" as const });
-const box = () => ({ kind: "box" as const, boxId: "b1", token: "t" });
+// A Box mount carries a per-box grant AND the loopback gateway that grant is
+// only good at.  `computerProxyEnv` refuses a token with no gateway, because
+// a child holding one would fall back to the provider and present a credential
+// that authorises every box in the account.
+const box = () => ({
+  kind: "box" as const,
+  boxId: "b1",
+  token: "t",
+  gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
+});
 
 const mount = (kind: ComputerMount["kind"], stdioOrBox: "stdio" | "box" = "stdio"): ComputerMount => ({
   name: "",
@@ -100,6 +110,18 @@ describe("computerSystemPrompt", () => {
     // no multi-computer machinery leaks into the single case
     expect(one).not.toContain("Default to");
     expect(one).not.toContain("mcp__computer_");
+  });
+
+  it("describes the Local VM as what it is: one mounted folder and real network access", () => {
+    // The prompt used to call the VM isolated and say no other host folder was
+    // mounted.  Both were false: the workspace is a host folder, and the
+    // container reaches the internet.  A bot that believes the second one will
+    // treat a reachable host service as out of bounds.
+    const prompt = computerSystemPrompt(nameMounts([mount("vm")]));
+    expect(prompt).not.toContain("isolated");
+    expect(prompt).not.toContain("No other host folder is mounted");
+    expect(prompt).toContain("That workspace is the only host folder mounted into the VM");
+    expect(prompt).toContain("the VM has outbound internet access like any other computer");
   });
 
   it("does not describe the box to the agent already running on it", () => {
@@ -461,6 +483,7 @@ describe("per-provider gates (computerProviders)", () => {
       },
       vpsLeases: { claim: () => ({}), release: () => {} },
       controlIntegration: () => ({ url: "http://localhost", token: "t" }),
+      boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
       broadcast: () => {},
       notice: () => {},
       checkpoint: async () => true,
@@ -556,6 +579,7 @@ describe("routine failure resiliency and unattended safety", () => {
       },
       vpsLeases: { claim: () => ({}), release: () => {} },
       controlIntegration: () => ({ url: "http://localhost", token: "t" }),
+      boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
       broadcast: () => {},
       notice: (msg: string) => {
         notices.push(msg);

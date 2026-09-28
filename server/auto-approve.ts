@@ -40,9 +40,20 @@ const SENSITIVE = [
   /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
   /security\s+find-(generic|internet)-password|\bkeychain\b/i,
   /\bcredentials?\.json\b|\bserviceaccount\b/i,
-  // BotFleet's own credential store: the app's config holds engine API keys
-  // and bot tokens, so reading it is exactly as sensitive as ~/.aws.
-  /\.botfleet\//i,
+  // BotFleet's own state is a credential store too, and it was the one
+  // place the list above missed: config.json holds every provider key, and
+  // a bot that can `cat` it has the whole fleet.  The data directory is
+  // `~/.botfleet` by default, or OMB_DATA_DIR on a test or soak rig — both
+  // named here rather than imported, because this file stays free of
+  // imports.  The app-owned workspaces live under that same directory
+  // (server/workspace.ts), so they are covered by it.
+  /(^|[\s/"'])\.botfleet([/\\]|$|["'\s])/i,
+  // The desktop's OS-encrypted credential document (safeStorage), which is
+  // where every packaged-app key actually lands.
+  /\bcredentials\.bin\b/i,
+  ...(process.env.OMB_DATA_DIR
+    ? [new RegExp(`(^|[\\s/"'])${process.env.OMB_DATA_DIR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([/\\\\]|$|["'\\s])`, "i")]
+    : []),
 ];
 
 /** First matching pattern's source, so a verdict can NAME the rule that
@@ -55,7 +66,12 @@ function matchFirst(rules: RegExp[], text: string): string | null {
 }
 
 export function looksSensitive(text: string): boolean {
-  return matchFirst(SENSITIVE, text) !== null;
+  // Every pattern above is written with `/`, because that is how the list
+  // reads and how it was written.  A path that came back from `path.resolve`
+  // on Windows is spelled with `\`, so `.ssh\config` matched nothing and a
+  // Windows turn could read a key without being asked.  Normalise once here
+  // rather than teaching each pattern about both separators.
+  return matchFirst(SENSITIVE, text.replace(/\\/g, "/")) !== null;
 }
 
 export function looksDestructive(text: string): boolean {

@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 
 import {
   applyComputerMounts,
@@ -103,6 +104,9 @@ function stubDeps(
     },
     vpsLeases: { claim: () => ({ id: "lease" }), release: () => {} },
     controlIntegration: () => ({ url: "http://127.0.0.1:1/", token: "fake-control-value" }),
+    // The real implementation, not a stub: this lane asserts what actually
+    // reaches a child, and a stub would let the production wiring be wrong.
+    boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
     broadcast: () => {},
     notice: (name) => notices.push(name),
     checkpoint: async () => true,

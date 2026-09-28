@@ -45,7 +45,6 @@ function userFacingStrings(text: string): string[] {
 /** Where "agent" is still the accurate word: it is not the app's concept. */
 const AGENT_ALLOWED = [
   "agents.botfleet.app", // a host name the user types back in
-  "agents.jays.services", // Cloudflare Access host named in Remote Access copy
   "agent-memory", // an example Qdrant collection id, not a label
   "fleet-agents", // the live recall collection id, not a product noun
   "SSH config and agent", // ssh-agent, a thing the operating system runs

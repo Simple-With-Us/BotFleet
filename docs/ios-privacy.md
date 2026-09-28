@@ -41,15 +41,37 @@ otherwise.
   how to opt out.
 - The app includes the Sentry crash-reporting SDK.  When a build is cut with a
   Sentry DSN, the app sends crash reports, app-hang reports, a sample of
-  performance traces, and failed-request diagnostics (HTTP 5xx responses and
-  their URL) to Sentry, together with the device model, OS version, app
-  version, and an anonymous installation identifier.  These reports never
-  include message content, transcripts, screenshots, the view hierarchy, or
-  pairing tokens; query parameters named token, key, secret, auth, or password
-  are redacted on the phone before anything is sent.  Sentry processes this
-  data as BotFleet's service provider under Sentry's privacy terms and may
-  see the connection's IP address in transit.  Crash and performance data is
-  used only to find and fix defects and is not used for tracking.
+  performance traces, a sample of **session replays**, and failed-request
+  diagnostics (HTTP 5xx responses and their URL) to Sentry, together with the
+  device model, OS version, app version, and an anonymous installation
+  identifier.  These reports never include message content, transcripts, or
+  pairing tokens, and query parameters named token, key, secret, auth, or
+  password are redacted on the phone before anything is sent.
+- **Session replay is on, and it does record the screen.**  The build samples
+  about 10% of sessions and about 10% of error sessions
+  (`sessionReplay.sessionSampleRate = 0.1`, `onErrorSampleRate = 0.1` in
+  `ios/App/SentryTelemetry.swift`).  A replay is a recording of the app's own
+  user interface, so it can include the text and layout the user saw.  All
+  text is masked (`maskAllText = true`) and all images are blocked
+  (`maskAllImages = true`), so values are replaced with blocks before the
+  recording leaves the device; what a replay carries is the shape of the
+  screen — where elements sit, what is on them, and what happened — not the
+  strings behind them.  A masked replay can still show a bot's display name, a
+  room's name, and the presence of message text, so it is User Content for
+  privacy purposes even though the text itself is unreadable.
+- **Profiling is on.**  `profilesSampleRate = 0.1` samples about 10% of
+  transactions for continuous profiling, which records call stacks and timing
+  for the app's own code.  It carries no message content and no user-entered
+  text, and it is used only to find and fix performance defects.
+- Two Sentry options are explicitly off: `attachScreenshot = false` and
+  `attachViewHierarchy = false`, so a crash report never carries a screenshot
+  or a view-hierarchy dump.  `sendDefaultPii = false` keeps headers, cookies,
+  and IP-derived user data out.  A request whose status matches a paired
+  computer that is simply offline is dropped before it is sent.  Sentry
+  processes this data as BotFleet's service provider under Sentry's privacy
+  terms and may see the connection's IP address in transit.  Crash,
+  performance, and replay data is used only to find and fix defects and is not
+  used for tracking.
 
 Local HTTP connections should only be used on a network the user trusts.
 Tailscale and hosted HTTPS access are encrypted alternatives for untrusted or

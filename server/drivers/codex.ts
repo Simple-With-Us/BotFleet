@@ -247,6 +247,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               env: {
                 ELECTRON_RUN_AS_NODE: "1",
                 OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
+                OGB_BOX_API: proxyEnv.OGB_BOX_API ?? "",
                 OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
                 // who-is-driving endpoint, so a person taking the wheel in the
                 // panel pauses this bot's hands mid-turn
@@ -622,13 +623,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       child.on("close", (code) => {
         if (abandoned) return;
         if (!state.settled) {
-          // A user stop kills the app-server (audit E6): that close is the
-          // interrupt landing, not a crash — no runtime.error, settle
-          // interrupted under the #647 convention.
-          if (stopRequested) {
-            settle(false, "interrupted");
-            return;
-          }
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",

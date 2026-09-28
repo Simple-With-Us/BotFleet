@@ -1,6 +1,7 @@
 {
   "git": {"deploymentEnabled": {"**": false, "main": true}},
-  "outputDirectory": ".",
+  "buildCommand": "node build.mjs",
+  "outputDirectory": "dist",
   "cleanUrls": true,
   "trailingSlash": false,
   "ignoreCommand": "bash vercel-ignore-hourly.sh",

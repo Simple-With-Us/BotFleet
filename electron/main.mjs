@@ -40,6 +40,7 @@ import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-lin
 import { windowChromeOptions } from "./window-chrome.mjs";
 import { parseExternalHttpUrl, windowOpenExternalUrl } from "./external-url.mjs";
 import { mayOpenBotFile, resolveOpenablePath } from "./open-file.mjs";
+import { installTrustedIpcGuard, isTrustedRendererUrl } from "./renderer-trust.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -1146,6 +1147,13 @@ function rendererOrigin() {
   return new URL(rendererBaseUrl()).origin;
 }
 
+// Every ipcMain.handle below — and the ones registerCuaIpc, registerUpdaterIpc,
+// and the Android controller add later — hands a privileged action to whoever
+// is calling: a device token, a credential write, a terminal.  Wrap the
+// registration itself so no handler can forget, and resolve the origin lazily
+// because the renderer port is not settled until the harness probe finishes.
+installTrustedIpcGuard(ipcMain, { origin: rendererOrigin });
+
 function respondToDisplayMediaRequest(callback, response) {
   const error = invokeDisplayMediaCallback(callback, response);
   // An empty response intentionally rejects the renderer request, and Electron
@@ -1385,6 +1393,21 @@ function createWindow() {
     if (external) void shell.openExternal(external);
     return { action: "deny" };
   });
+
+  // A same-frame link navigates this window in place, and a navigated page
+  // keeps the preload bridge — the whole privileged surface above would then
+  // answer for a page on the web.  ErrorRow's "Get It From The Website" is a
+  // live example.  Keep our own origin (every route, hash, and query is the
+  // same document) and hand anything else to the user's browser through the
+  // same allowlist the window-open handler above uses.
+  const guardNavigation = (event, target) => {
+    if (isTrustedRendererUrl(target, rendererOrigin())) return;
+    event.preventDefault();
+    const external = windowOpenExternalUrl(target);
+    if (external) void shell.openExternal(external);
+  };
+  win.webContents.on("will-navigate", guardNavigation);
+  win.webContents.on("will-redirect", guardNavigation);
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
 
   // Native context menu for text inputs — without this, right-click does
@@ -1864,7 +1887,15 @@ const CREDENTIAL_PATCH = {
   deepseekApiKey: (value) => ({ deepseek: { key: value } }),
   boxToken: (value) => ({ box: { token: value } }),
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
-  ttsKey: (value, provider = "minimax") => ({ tts: { key: value, provider } }),
+  // The provider is the card's, not a default this process invented: a key
+  // pasted into the ElevenLabs field must be verified as an ElevenLabs key,
+  // never relabelled as another engine's.  With no provider named at all the
+  // field still gets written explicitly, because the config reader must never
+  // have to guess which engine a stored key belongs to — that guess is what
+  // sent an ElevenLabs key to MiniMax in the first place.
+  ttsKey: (value, provider) => ({
+    tts: { key: value, provider: provider || "minimax" },
+  }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };

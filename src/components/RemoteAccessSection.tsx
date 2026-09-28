@@ -2,9 +2,10 @@ import { useState } from "react";
 import {
   COMPANION_GATEWAY_BLURB,
   COMPANION_GATEWAY_LABEL,
-  NAMED_REMOTE_URL,
+  normalizeRemoteUrl,
   REMOTE_ACCESS_BLURB,
   REMOTE_ACCESS_HEADING,
+  REMOTE_ACCESS_UNCONFIGURED_BLURB,
   REMOTE_URL_LABEL,
   sentenceGapHtml,
 } from "@/lib/remote-access";
@@ -127,22 +128,27 @@ export function TestConnectionControl({
   );
 }
 
-export function RemoteAccessSection() {
+export function RemoteAccessSection({ configuredUrl }: { configuredUrl?: string | null }) {
   const [test, setTest] = useState<RemoteAccessTestResult | null>(null);
+  // This install's own address, or null.  There is no fallback host: an
+  // install that has not configured remote access gets the setup sentence
+  // and no probe button, rather than a link into somebody else's tunnel.
+  const remoteUrl = normalizeRemoteUrl(configuredUrl);
 
   const runTest = async () => {
+    if (!remoteUrl) return;
     setTest({ kind: "running" });
     try {
-      // Probe /api/health, not the bare root: Cloudflare Access protects
-      // everything on this tunnel except that one path, so a bare-root
-      // probe would just follow the redirect to the Access login page and
-      // report HTTP 200 even when the tunnel or the BotFleet origin
-      // behind it is down. /api/health is public and probeIngressUrl
-      // requires its real BotFleet payload for this exact path.
+      // Probe /api/health, not the bare root: a tunnel commonly protects
+      // everything behind it except that one path, so a bare-root probe
+      // would just follow the redirect to the tunnel's login page and
+      // report HTTP 200 even when the tunnel or the BotFleet origin behind
+      // it is down.  /api/health is public and probeIngressUrl requires its
+      // real BotFleet payload for this exact path.
       const response = await fetch("/api/ingress/test", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ publicUrl: `${NAMED_REMOTE_URL}/api/health` }),
+        body: JSON.stringify({ publicUrl: `${remoteUrl}/api/health` }),
       });
       const body = await response.json().catch(() => null);
       setTest(describeIngressTestOutcome(response.ok, response.status, body));
@@ -151,10 +157,14 @@ export function RemoteAccessSection() {
     }
   };
 
+  if (!remoteUrl) {
+    return <Card title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_UNCONFIGURED_BLURB)} />;
+  }
+
   return (
     <Card title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_BLURB)}>
       <div className="flex flex-col gap-3">
-        <CopyableValue label={REMOTE_URL_LABEL} value={NAMED_REMOTE_URL} />
+        <CopyableValue label={REMOTE_URL_LABEL} value={remoteUrl} />
         <div className="flex flex-wrap items-center gap-3">
           <TestConnectionControl test={test} onRunTest={() => void runTest()} />
         </div>

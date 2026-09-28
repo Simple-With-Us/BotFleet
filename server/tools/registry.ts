@@ -96,11 +96,23 @@ export interface ToolApproval {
   policy: "never" | "ask";
   /** One line for the card, built from the model's arguments. */
   summary(args: Record<string, unknown>): string;
-  /** Optional gate: when present, the broker asks ONLY if this returns true
-   *  for the call's arguments (a read tool that is harmless on ordinary
-   *  inputs but not on sensitive ones).  A throw is treated as "ask" — the
-   *  gate fails closed, never open. */
-  when?(args: Record<string, unknown>): boolean;
+  /** A narrower ask: this tool needs a card ONLY when the condition holds.
+   *
+   *  A read tool is normally silent — that is the point of a read tool, and
+   *  `list_bots` must not put a card in front of anyone.  But reading the
+   *  one file that holds every provider key is not the same act as reading
+   *  `src/index.ts`, so `read_file` carries a condition rather than a
+   *  blanket ask.  A tool with a condition is still an `ask` tool: the
+   *  condition narrows WHEN, and the guards behind the broker (auto mode,
+   *  always-allow, the sensitive list, the unattended block) still decide
+   *  the answer.
+   *
+   *  The condition is a NAME rather than a predicate because this file
+   *  imports nothing (see the header: `agents-proxy` renders the catalog
+   *  from it inside a bare child process) — and because the host, not the
+   *  catalog, is the layer that knows the turn's working directory, which
+   *  is what resolving a relative path needs. */
+  condition?: "sensitive-file-path";
 }
 
 /** A wire shape one lane is pinned to and the other is not.
@@ -555,18 +567,6 @@ const BASH: HarnessTool = {
   },
 };
 
-// read_file's sensitive-path gate.  This module is import-free by test, so
-// the path shapes from server/auto-approve.ts's SENSITIVE list are restated
-// here in path form — registry.test.ts pins the two lists to the same
-// verdicts, which is what keeps this copy from drifting the way the
-// pre-parity-test diagnostics redactor did.
-const SENSITIVE_READ_PATHS: RegExp[] = [
-  /(^|\/)\.env(\.|$)/i,
-  /\.ssh\/|id_rsa|id_ed25519|authorized_keys/i,
-  /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
-  /\bcredentials?\.json\b|\bserviceaccount\b/i,
-  /\.botfleet\//i,
-];
 const READ_FILE: HarnessTool = {
   name: "read_file",
   description:
@@ -599,17 +599,18 @@ const READ_FILE: HarnessTool = {
   settles: "immediate",
   promptFragment:
     "Use read_file to inspect files in the workspace; it returns 400 lines at most by default, and a truncated result names the offset to pass next.",
+  // A read is silent — except when the file being read IS a credential store.
+  // `.ssh/id_ed25519` and BotFleet's own `~/.botfleet/config.json` were both
+  // readable with no card at all, in auto mode and out of it. The host
+  // resolves the path against this turn's working directory and asks only
+  // when the resolved absolute path hits the same sensitive list the
+  // destructive guard uses, so `read_file src/index.ts` stays free.
   approval: {
     policy: "ask",
-    // Ordinary source files stream by with no card; a path that names a
-    // credential store stops and asks first (S10).
-    when: (args) => {
-      const path = typeof args.path === "string" ? args.path : "";
-      return SENSITIVE_READ_PATHS.some((re) => re.test(path));
-    },
+    condition: "sensitive-file-path",
     summary: (args) => {
-      const path = typeof args.path === "string" ? args.path : "file";
-      return `read file ${path}`;
+      const p = typeof args.path === "string" ? args.path : "file";
+      return `read file ${p}`;
     },
   },
 };

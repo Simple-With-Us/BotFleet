@@ -2,13 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
+    <!--
+      The nested Electron Helper apps inherit only what V8 needs to run.
+      allow-dyld-environment-variables and disable-library-validation are
+      gone: the helpers load the same signed framework and preload this app
+      already has, so neither was ever needed, and on the helpers both widen
+      the blast radius of a compromised renderer for nothing.  Library
+      validation is still waived on the main app alone (see
+      entitlements.mac.plist) for the CUA SDK dylib it loads itself.
+    -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-    <true/>
-    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
   </dict>
 </plist>

@@ -4,7 +4,7 @@ export const FROM_IMESSAGE_TAG = "[from iMessage]";
 export const TO_IMESSAGE_TAG = "[to iMessage]";
 export const IMESSAGE_INBOUND_MARKER = "IMESSAGE INBOUND";
 
-/** Always in the bot persona so Simple-mode shared threads still know the gate. */
+/** In the persona only on threads that are actually iMessage tasks.  Simple-mode shared threads still need the gate; an install with no iMessage transport should not carry the rule at all. */
 export const IMESSAGE_PERSONA_RULE =
   "iMessage channel: Incoming iMessage turns begin with [from iMessage] (and may sit inside an IMESSAGE INBOUND block). They are not something the owner typed in BotFleet. When a reply should go back to iMessage, start that reply with [to iMessage] on the first line, then the message. Only those tagged replies are sent to iMessage, and the tag is stripped before sending. Replies that stay in BotFleet must not use that tag.";
 

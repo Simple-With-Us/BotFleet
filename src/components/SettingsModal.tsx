@@ -63,7 +63,7 @@ const SECTIONS: Array<{
 }> = [
   { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "simple", "projects", "threads", "workspace"] },
   { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps", "voice", "tts", "speech"] },
-  { id: "remote", label: "Remote Access", icon: Globe, keywords: ["remote", "url", "tunnel", "cloudflare", "access", "jay's tunnel", "health"] },
+  { id: "remote", label: "Remote Access", icon: Globe, keywords: ["remote", "url", "tunnel", "cloudflare", "access", "health"] },
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
   { id: "models", label: "Models", icon: Layers, keywords: ["model", "fallback", "primary", "engine", "per bot", "fleet"] },
   { id: "companion", label: "Phone", icon: Smartphone, keywords: ["companion", "phone", "pair", "mobile", "gateway", "sidecar"] },
@@ -1035,6 +1035,12 @@ export function SettingsModal() {
   const { state, dispatch } = useStore();
   const bots = state.bots ?? [];
   const section = state.appSettingsSection;
+  // Remote Access describes THIS install, so its address is the one this
+  // Mac saved under `ingress.publicUrl` — never a host compiled into the
+  // bundle.  A saved-but-disabled ingress publishes nothing, so the card
+  // gets no address and renders its setup sentence instead.
+  const ingress = state.config?.ingress;
+  const remoteAccessUrl = ingress?.enabled === false ? null : (ingress?.publicUrl ?? null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
@@ -1231,7 +1237,7 @@ export function SettingsModal() {
               </Card>
             )}
 
-            {section === "remote" && <RemoteAccessSection />}
+            {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
 
             {section === "engines" && (
               <Card title="Engine CLIs" subtitle="Which binary each engine runs. Saved as you go.">

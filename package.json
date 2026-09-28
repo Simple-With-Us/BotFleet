@@ -93,7 +93,7 @@
     "@sentry/react": "^10.73.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
-    "harness": "github:jaywedgeworth22/Harness#main",
+    "harness": "github:jaywedgeworth22/Harness#421fd5b74fbc7040742643848b64bbf3bd07107f",
     "lucide-react": "^0.539.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",
@@ -131,6 +131,7 @@
     "overrides": {
       "@xmldom/xmldom@0.8.13": "0.8.15",
       "js-yaml@4.3.1": "4.3.2",
+      "lodash-es": "4.18.1",
       "sharp@0.35.2": "0.35.4",
       "sharp@0.35.3": "0.35.4"
     },

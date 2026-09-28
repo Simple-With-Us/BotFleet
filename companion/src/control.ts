@@ -17,6 +17,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { PushSenderHealth } from "./apns.ts";
 import type { DeviceRegistry } from "./devices.ts";
 import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
+import { DEFAULT_LAN_POLICY, lanPolicyNote, reachableCandidates, type LanPolicy } from "./lan-policy.ts";
 import { lanAddresses, tailnetName, tailscaleAddress } from "./listener.ts";
 import { defaultHostName } from "./mdns.ts";
 
@@ -39,6 +40,11 @@ export interface ControlOptions {
   /** How closed-app phone wake is doing — configured, last send, last error,
    * tokens registered.  Never anything about the signing key. */
   pushHealth?: () => PushSenderHealth;
+  /** Whether the device port may be reached from the LAN in cleartext, and
+   * how that was decided.  Omitted means the default, which is loopback
+   * only — so a caller that forgets to pass it gets the safe answer rather
+   * than the exposed one. */
+  lanPolicy?: LanPolicy;
 }
 
 /** The host out of a `Host` header, port removed.
@@ -158,6 +164,7 @@ const currentHostedUrl = (options: ControlOptions): string | null =>
 export function hostCandidates(
   addresses: string[] = lanAddresses(),
   magicDnsName: string | null = tailnetName(),
+  policy: LanPolicy = DEFAULT_LAN_POLICY,
 ): string[] {
   const tailscale = tailscaleAddress(addresses);
   const out: string[] = [];
@@ -166,7 +173,14 @@ export function hostCandidates(
     if (address !== tailscale) out.push(address);
   }
   out.push(defaultHostName());
-  return out;
+  // Bare hosts, so the kinds have to be attached on the way through for the
+  // policy filter to recognise them.  Every one of them is a direct route, and
+  // with the device port bound to loopback none of them is a host a phone can
+  // reach — advertising them anyway costs a phone its whole connection walk.
+  return reachableCandidates(
+    out.map((host) => ({ url: host, kind: "lan" as const })),
+    policy,
+  ).map((entry) => entry.url);
 }
 
 /** Everything the page shows, in one object: where to connect, whether a
@@ -177,6 +191,9 @@ export function companionState(options: ControlOptions) {
   const tailscale = tailscaleAddress(addresses);
   const name = tailnetName();
   const pairing = options.devices.pairing();
+  // Resolved once so an absent option and an explicit default are the same
+  // value everywhere below, including the note the page renders.
+  const policy = options.lanPolicy ?? DEFAULT_LAN_POLICY;
   return {
     // Whoever starts this sidecar as a child process needs to be able to tell
     // it apart from an unrelated one that got to the control port first. An
@@ -189,7 +206,7 @@ export function companionState(options: ControlOptions) {
     lan: addresses.find((a) => a !== tailscale) ?? null,
     // The ordered fallback list the pairing QR hands the phone, so it can
     // walk to the next address when the first stops resolving.
-    hosts: hostCandidates(addresses, name),
+    hosts: hostCandidates(addresses, name, policy),
     // Complete URLs for new clients. Unlike `hosts`, this can represent an
     // HTTPS route on its natural port without teaching the client to guess.
     endpoints: companionEndpointCandidates(
@@ -197,7 +214,16 @@ export function companionState(options: ControlOptions) {
       addresses,
       name,
       currentHostedUrl(options),
+      undefined,
+      policy,
     ),
+    // Why the lists above are as short as they are, in words, on the page the
+    // person reads while holding the QR.  A pairing page that silently offers
+    // one route is a page that looks broken rather than one that looks closed.
+    lanPolicy: {
+      allowCleartextLan: policy.allowCleartextLan,
+      note: lanPolicyNote(policy),
+    },
     pairing: pairing ? { code: pairing.code, token: pairing.token, expiresAt: pairing.expiresAt } : null,
     devices: options.devices.list(),
     connectedDeviceIds: options.connectedDeviceIds?.() ?? [],

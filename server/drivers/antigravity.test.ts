@@ -715,7 +715,8 @@ describe("Antigravity computer MCP config", () => {
     computer: {
       kind: "box" as const,
       boxId: "bx_1",
-      token: "box-tok",
+      token: "box-grant",
+      gatewayUrl: "http://127.0.0.1:8799/api/local/box-gateway",
       control: { url: "http://127.0.0.1:9/control", token: "ctl-tok" },
     },
   };
@@ -727,8 +728,9 @@ describe("Antigravity computer MCP config", () => {
       args: [SPAWNED_PROXIES.computer],
       env: {
         ELECTRON_RUN_AS_NODE: "1",
+        OGB_BOX_API: "http://127.0.0.1:8799/api/local/box-gateway",
         OGB_BOX_ID: "bx_1",
-        OGB_BOX_TOKEN: "box-tok",
+        OGB_BOX_TOKEN: "box-grant",
         OMB_CONTROL_URL: "http://127.0.0.1:9/control",
         OMB_CONTROL_TOKEN: "ctl-tok",
       },

@@ -298,7 +298,14 @@ export interface SendTurnInput {
     computer?: {
       kind?: "box";
       boxId: string;
+      /** The mount's per-box gateway grant, NOT the account-wide Box API key.
+       *  It authenticates one box id at the harness's own loopback gateway and
+       *  nothing anywhere else. */
       token: string;
+      /** Loopback base for the Box calls, so a child never talks to the
+       *  provider directly.  Empty when the harness has no gateway to point
+       *  at. */
+      gatewayUrl?: string;
       control?: { url: string; token: string };
     };
     /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
@@ -350,12 +357,21 @@ export interface SendTurnInput {
   unattended?: boolean;
 }
 
+/** The decoded `arguments` object of one tool call.
+ *
+ *  Model-authored and therefore untrusted: the keys and value types come from
+ *  whatever the model emitted, and the executor is what narrows them.  Naming
+ *  it here means every layer that reasons about a call's arguments says the
+ *  same thing about what it is holding, instead of each one re-declaring an
+ *  open dictionary and drifting from the next. */
+export type ToolArguments = Record<string, unknown>;
+
 /** One tool call the model asked for, decoded.  `arguments` is always an
  *  object — every entry on the catalog is declared as a JSON-shape tool. */
 export interface TurnToolCall {
   id: string;
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: ToolArguments;
 }
 
 /** What the host made of a tool call.  The three variants are the only

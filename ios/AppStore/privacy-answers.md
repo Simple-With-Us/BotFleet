@@ -15,13 +15,23 @@ production hosted service still match this repository.
   when neither resolves.
 - Data used for **App Functionality** (diagnostics, not linked to the user):
   - Diagnostics: **Crash Data**, **Performance Data** (app hangs longer than
-    two seconds, a 20% sample of traces, and failed HTTP 5xx requests with
-    their URL), and **Other Diagnostic Data** (device model, OS version, app
-    version, an anonymous installation identifier).
-  - Sentry is configured with `sendDefaultPii = false`, no screenshots, and no
-    view hierarchy.  Query parameters named `token`, `key`, `secret`, `auth`,
-    or `password` are redacted on the phone before an event is sent.  Message
-    content, transcripts, and pairing tokens are never attached.
+    two seconds, a 20% sample of traces, a 10% sample of continuous
+    profiles, and failed HTTP 5xx requests with their URL), and **Other
+    Diagnostic Data** (device model, OS version, app version, an anonymous
+    installation identifier).
+  - Sentry is configured with `sendDefaultPii = false`,
+    `attachScreenshot = false`, and `attachViewHierarchy = false`, so a
+    crash report carries no screenshot and no view-hierarchy dump.  Query
+    parameters named `token`, `key`, `secret`, `auth`, or `password` are
+    redacted on the phone before an event is sent.  Message content,
+    transcripts, and pairing tokens are never attached to an event.
+  - **Session replay is enabled**: `sessionSampleRate = 0.1` and
+    `onErrorSampleRate = 0.1` (`ios/App/SentryTelemetry.swift`).  It
+    records the app's own user interface, with `maskAllText = true` and
+    `maskAllImages = true`, so the recording carries the shape of the
+    screen and not the values on it.  A masked replay can still expose a
+    bot display name, a room name, and the fact that message text was
+    present, so declare it rather than treating it as screenshot-free.
 - Data linked to the user, for **App Functionality**:
   - Contact Info: **Email Address** (the profile email exposed by the paired
     computer)
@@ -34,9 +44,12 @@ production hosted service still match this repository.
   categories during submission and do not mark these as tracking.
 - User Content: messages, approvals, transcripts, and screen frames are
   processed transiently when the optional hosted route is used, but are not
-  retained by the developer's control plane. Confirm the current App Store
-  Connect definition of ephemeral processing when answering the collection
-  question for the submitted build.
+  retained by the developer's control plane.  A sampled, text-masked session
+  replay is a further case: it is screen content, and it is retained by
+  Sentry rather than by BotFleet.  Confirm the current App Store Connect
+  definition of ephemeral processing when answering the collection question
+  for the submitted build, and treat the replay as collected screen content
+  rather than as diagnostics.
 - Privacy policy URL:
   `https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/ios-privacy.md`
 
@@ -51,3 +64,16 @@ persistent cloud copy.
 Re-evaluate these answers and `PrivacyInfo.xcprivacy` before every upload,
 especially if analytics, push delivery, or content retention is added, or if
 the Sentry configuration in `SentryTelemetry.swift` changes what it captures.
+
+## Known gap between this file and the shipping manifest
+
+`ios/App/PrivacyInfo.xcprivacy` declares only **Crash Data**,
+**Performance Data**, and **Other Diagnostic Data** under
+`NSPrivacyCollectedDataTypes`.  It does not declare the session replay that
+`SentryTelemetry.swift` enables, and it does not mention continuous
+profiling.  Before the next upload, add the collected data type that covers a
+text-masked replay of the app's own screens — Apple treats a screen recording
+as user content, not as a diagnostic — and confirm whether the existing
+`Performance Data` entry is the right home for profile samples or whether
+those need their own declaration.  Do not submit with this gap open: an
+undeclared data type is a review rejection.

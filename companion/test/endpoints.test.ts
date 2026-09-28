@@ -5,6 +5,7 @@ import {
   hostedCompanionUrl,
   MAX_COMPANION_ENDPOINTS,
 } from "../src/endpoints.ts";
+import { readLanPolicy } from "../src/lan-policy.ts";
 
 describe("hostedCompanionUrl", () => {
   it("normalizes one explicit HTTPS origin", () => {
@@ -27,7 +28,29 @@ describe("hostedCompanionUrl", () => {
   });
 });
 
+// The three ordering cases below are about ORDER, and order only exists once
+// the direct routes are reachable at all.  With the default policy — device
+// port bound to loopback since S11 — there is nothing to order, so they pass
+// the opt-in explicitly.  The expectations themselves are untouched; the
+// security default is covered in lan-policy.test.ts and pinned here too, at
+// the end of this block.
+const CLEARTEXT_ALLOWED = readLanPolicy("1");
+
 describe("companionEndpointCandidates", () => {
+  it("offers only the hosted origin under the default loopback-only policy", () => {
+    // S11: a direct route the sidecar cannot answer costs a phone its whole
+    // connection walk, so the default list is the hosted origin or nothing.
+    expect(
+      companionEndpointCandidates(
+        8810,
+        ["192.168.1.42", "10.0.0.7"],
+        "macbook.tail1234.ts.net",
+        "https://device-123.companion.example",
+        "botfleet-abcd1234.local",
+      ),
+    ).toEqual([{ url: "https://device-123.companion.example", kind: "hosted", priority: 0 }]);
+  });
+
   it("puts hosted HTTPS first, followed by tailnet, LAN, and Bonjour routes", () => {
     expect(
       companionEndpointCandidates(
@@ -36,6 +59,7 @@ describe("companionEndpointCandidates", () => {
         "macbook.tail1234.ts.net",
         "https://device-123.companion.example",
         "botfleet-abcd1234.local",
+        CLEARTEXT_ALLOWED,
       ),
     ).toEqual([
       { url: "https://device-123.companion.example", kind: "hosted", priority: 0 },
@@ -48,7 +72,14 @@ describe("companionEndpointCandidates", () => {
 
   it("keeps direct routes when no hosted route exists", () => {
     expect(
-      companionEndpointCandidates(8810, ["192.168.1.42"], null, null, "botfleet-abcd1234.local"),
+      companionEndpointCandidates(
+        8810,
+        ["192.168.1.42"],
+        null,
+        null,
+        "botfleet-abcd1234.local",
+        CLEARTEXT_ALLOWED,
+      ),
     ).toEqual([
       { url: "http://192.168.1.42:8810", kind: "lan", priority: 200 },
       { url: "http://botfleet-abcd1234.local:8810", kind: "bonjour", priority: 300 },
@@ -63,6 +94,7 @@ describe("companionEndpointCandidates", () => {
       null,
       "https://device-123.companion.example",
       "botfleet-abcd1234.local",
+      CLEARTEXT_ALLOWED,
     );
     expect(endpoints).toHaveLength(MAX_COMPANION_ENDPOINTS);
     expect(endpoints[0]).toMatchObject({ kind: "hosted", priority: 0 });

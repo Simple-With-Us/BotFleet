@@ -46,6 +46,70 @@ export function isApiPath(pathname) {
 }
 
 /**
+ * Split a `Host` header (or the host part of a URL) into its hostname and
+ * port.  Returns null for anything malformed so a caller can treat the value
+ * as "not our host" instead of guessing at it.
+ */
+export function parseHostAuthority(value) {
+  // This function is itself the shim's input boundary, and a rebound page is
+  // free to put anything at all in a `Host` header — so `value` is untrusted
+  // by contract and no narrower named type would be honest here.  The guard is
+  // the decode, and everything after it branches on the decoded string.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof
+  if (typeof value !== "string") return null;
+  const raw = value.trim().toLowerCase();
+  if (!raw) return null;
+  const portDigits = (digits) => (/^\d{1,5}$/.test(digits) ? Number(digits) : null);
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end < 0 || raw[end + 1] !== ":") return null;
+    return { hostname: raw.slice(0, end + 1), port: portDigits(raw.slice(end + 2)) };
+  }
+  const colon = raw.lastIndexOf(":");
+  if (colon < 0) return { hostname: raw, port: null };
+  // A colon that does not introduce a port is a malformed authority, not a
+  // host with a missing port.
+  const port = portDigits(raw.slice(colon + 1));
+  return port === null ? null : { hostname: raw.slice(0, colon), port };
+}
+
+/**
+ * The shim's own DNS-rebinding boundary.  It serves exactly one authority —
+ * the host it bound and the port it actually got — so a request whose `Host`
+ * is anything else came from a page that resolved its own name at us (the
+ * attacker's browser sends the attacker's hostname, not ours) and must not
+ * reach the UI bundle, the transcript, or the live event stream.
+ *
+ * `Origin` is checked the same way, and it is the only thing standing between
+ * a rebound page and a WebSocket: a rebound page opening `ws://127.0.0.1:8799`
+ * sends our address as `Host`, so `Host` alone would wave it through.  A
+ * same-origin GET carries no `Origin` at all, and a same-origin POST carries
+ * ours, so both legitimate shapes pass.
+ *
+ * @returns {(headers: { host?: string, origin?: string }) => string | null}
+ *   the rejected header ("host" / "origin"), or null when the request is ours.
+ */
+export function shimOriginGuard(host, port) {
+  // A wildcard bind still answers on the loopback literals the renderer uses.
+  const hostnames = new Set(host === "0.0.0.0" || host === "::" ? ["127.0.0.1", "[::1]"] : [host]);
+  const isOwnAuthority = (authority) =>
+    Boolean(authority) && authority.port === port && hostnames.has(authority.hostname);
+  return (headers = {}) => {
+    if (!isOwnAuthority(parseHostAuthority(headers.host))) return "host";
+    const origin = headers.origin;
+    if (origin === undefined || origin === null || origin === "") return null;
+    let url;
+    try {
+      url = new URL(origin);
+    } catch {
+      return "origin";
+    }
+    if (url.protocol !== "http:" || !isOwnAuthority(parseHostAuthority(url.host))) return "origin";
+    return null;
+  };
+}
+
+/**
  * Map a request path onto a file inside `uiDir`, refusing anything that
  * resolves outside it. Returns null for paths that escape the root.
  */
@@ -95,63 +159,23 @@ async function serveStatic(uiDir, pathname, req, res) {
 }
 
 /**
- * Returns true if `host` is a loopback address the shim might listen on.
+ * The headers to forward upstream: `Host` and a present `Origin` both become
+ * the harness's own authority, so the harness sees a same-origin request from
+ * the machine it serves.  Everything else passes through untouched.
  */
-function isLoopbackHost(host) {
-  return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
-}
-
-/**
- * Reject a request whose Host header does not point back at the shim itself.
- * The shim only ever proxies for a browser running on the same machine, so
- * only loopback addresses that match the shim's own port are acceptable.
- */
-function validateIncomingHost(shimHost, shimPort, req, res) {
-  const hostHeader = req.headers.host ?? "";
-  const colonIdx = hostHeader.lastIndexOf(":");
-  const receivedHost = colonIdx >= 0 ? hostHeader.slice(0, colonIdx) : hostHeader;
-  const receivedPort = colonIdx >= 0 ? hostHeader.slice(colonIdx + 1) : "";
-
-  if (!isLoopbackHost(receivedHost) || receivedPort !== String(shimPort)) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Forbidden" }));
-    return false;
-  }
-  return true;
-}
-
-/**
- * Reject a request whose Origin header does not point back at the shim.
- * An Origin is only present in browser requests; absent Origin is allowed
- * for non-browser clients.
- */
-function validateIncomingOrigin(shimHost, shimPort, req, res) {
+export function forwardedHeaders(req, harnessHost, harnessPort) {
+  const authority = `${harnessHost}:${harnessPort}`;
+  const headers = { ...req.headers, host: authority };
   const origin = req.headers.origin;
-  if (!origin) return true;
-
-  let originHost, originPort;
-  try {
-    const parsed = new URL(origin);
-    originHost = parsed.hostname;
-    originPort = String(parsed.port);
-  } catch {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Forbidden" }));
-    return false;
+  // A multi-valued header arrives from Node as an array, which is not a usable
+  // origin, and is dropped here exactly as an absent or empty one is.
+  if (!Array.isArray(origin) && origin !== undefined && origin !== "") {
+    headers.origin = `http://${authority}`;
   }
-
-  if (!isLoopbackHost(originHost) || originPort !== String(shimPort)) {
-    res.writeHead(403, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "Forbidden" }));
-    return false;
-  }
-  return true;
+  return headers;
 }
 
-function proxyHttp({ harnessHost, harnessPort, shimHost, shimPort, log }, req, res) {
-  if (!validateIncomingHost(shimHost, shimPort, req, res)) return;
-  if (!validateIncomingOrigin(shimHost, shimPort, req, res)) return;
-
+function proxyHttp({ harnessHost, harnessPort, log }, req, res) {
   let attempts = 0;
   let current = null;
   let retryTimer = null;
@@ -175,7 +199,18 @@ function proxyHttp({ harnessHost, harnessPort, shimHost, shimPort, log }, req, r
         port: harnessPort,
         method: req.method,
         path: req.url,
-        headers: { ...req.headers, host: `${harnessHost}:${harnessPort}` },
+        // `Host` is rewritten because the harness trusts only its own
+        // authority.  `Origin` is rewritten for the same reason and in the
+        // same breath: the renderer here is served on THIS shim's port, so
+        // its real origin is the shim's, and the harness's origin allowlist
+        // is built from the ports it serves UI from — not from the shim's
+        // port.  Forwarding ours verbatim would have the harness refuse the
+        // desktop's own mutating calls.  The shim guard above has already
+        // decided this request is ours, so by the time it reaches the
+        // harness it is genuinely same-origin; saying so is the accurate
+        // header, not a forged one.  A request that arrived with no `Origin`
+        // (a same-origin GET) keeps having none.
+        headers: forwardedHeaders(req, harnessHost, harnessPort),
       },
       (ures) => {
         res.writeHead(ures.statusCode ?? 502, ures.headers);
@@ -200,38 +235,25 @@ function proxyHttp({ harnessHost, harnessPort, shimHost, shimPort, log }, req, r
   send();
 }
 
-function proxyUpgrade({ harnessHost, harnessPort, shimHost, shimPort, log }, req, socket, head) {
-  // Host validation for upgrade path: reject foreign hosts before touching the harness.
-  const hostHeader = req.headers.host ?? "";
-  const colonIdx = hostHeader.lastIndexOf(":");
-  const receivedHost = colonIdx >= 0 ? hostHeader.slice(0, colonIdx) : hostHeader;
-  const receivedPort = colonIdx >= 0 ? hostHeader.slice(colonIdx + 1) : "";
-  if (!isLoopbackHost(receivedHost) || receivedPort !== String(shimPort)) {
-    log(`upgrade rejected: foreign Host ${hostHeader}`);
-    socket.destroy();
-    return;
+function proxyUpgrade({ harnessHost, harnessPort }, req, socket, head) {
+  const authority = `${harnessHost}:${harnessPort}`;
+  // Same rewriting as `proxyHttp`, applied to the raw header list this path
+  // replays: the browser sends this shim's origin on every upgrade, and the
+  // harness only trusts its own ports.
+  const rawHeaders = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    const name = req.rawHeaders[i].toLowerCase();
+    const value = name === "host"
+      ? authority
+      : name === "origin" && req.rawHeaders[i + 1] !== ""
+        ? `http://${authority}`
+        : req.rawHeaders[i + 1];
+    rawHeaders.push(req.rawHeaders[i], value);
   }
-
-  // Origin validation for upgrade path.
-  const origin = req.headers.origin;
-  if (origin) {
-    let parsed = null;
-    try {
-      parsed = new URL(origin);
-    } catch {
-      // malformed Origin: treat as mismatched
-    }
-    if (!parsed || !isLoopbackHost(parsed.hostname) || String(parsed.port) !== String(shimPort)) {
-      log(`upgrade rejected: mismatched Origin ${origin}`);
-      socket.destroy();
-      return;
-    }
-  }
-
   const upstream = net.connect(harnessPort, harnessHost, () => {
     const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
-    for (let i = 0; i < req.rawHeaders.length; i += 2) {
-      lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      lines.push(`${rawHeaders[i]}: ${rawHeaders[i + 1]}`);
     }
     upstream.write(`${lines.join("\r\n")}\r\n\r\n`);
     if (head?.length) upstream.write(head);
@@ -288,13 +310,38 @@ export async function startUiShim({
   listenPorts = [],
   log = () => {},
 }) {
-  const server = http.createServer((req, res) => {
+  const target = { harnessHost, harnessPort, log };
+  const server = http.createServer();
+  server.keepAliveTimeout = 5_000;
+  // A preferred port keeps the renderer origin (and its localStorage) stable
+  // across launches; 0 is the last resort.
+  await listenOnFirstFree(server, host, [...listenPorts, 0]);
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  // Only now is the served authority known: the check is against the port the
+  // shim really got, not the one it asked for.  The listeners attach after
+  // that so no request can be answered before the guard exists.
+  const guard = shimOriginGuard(host, port);
+
+  server.on("request", (req, res) => {
+    const rejected = guard(req.headers);
+    if (rejected) {
+      // A name that resolves at us is a rebound page reading transcripts.
+      // Say nothing about what is behind here.
+      log(`rejected ${req.method} ${req.url}: untrusted ${rejected}`);
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Forbidden" }));
+      return;
+    }
+    // A malformed request-target is the caller's error, not ours: parsing it
+    // unguarded raised inside the request handler and took the whole shim
+    // down.  Answer 400 and keep serving.
     let pathname;
     try {
       pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
     } catch {
-      res.writeHead(400, { "content-type": "text/plain" });
-      res.end("bad request");
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Bad request" }));
       return;
     }
     if (!isApiPath(pathname) && (req.method === "GET" || req.method === "HEAD")) {
@@ -306,14 +353,17 @@ export async function startUiShim({
     }
     proxyHttp(target, req, res);
   });
-  server.on("upgrade", (req, socket, head) => proxyUpgrade(target, req, socket, head));
-  server.keepAliveTimeout = 5_000;
-  // A preferred port keeps the renderer origin (and its localStorage) stable
-  // across launches; 0 is the last resort.
-  await listenOnFirstFree(server, host, [...listenPorts, 0]);
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  const target = { harnessHost, harnessPort, shimHost: host, shimPort: port, log };
+  server.on("upgrade", (req, socket, head) => {
+    const rejected = guard(req.headers);
+    if (rejected) {
+      // The browser sends the attacker's `Origin` on every WebSocket
+      // handshake, so the event stream stays theirs-free here too.
+      log(`rejected upgrade ${req.url}: untrusted ${rejected}`);
+      socket.end("HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\nconnection: close\r\n\r\nForbidden");
+      return;
+    }
+    proxyUpgrade(target, req, socket, head);
+  });
   return {
     port,
     close: () =>

@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
-type SentryNode = typeof import("@sentry/node");
+export type SentryNode = typeof import("@sentry/node");
 type SentryIntegration = Parameters<SentryNode["addIntegration"]>[0];
 
 /** How the harness got its DSN.  `env` means a CI runner or the LaunchAgent

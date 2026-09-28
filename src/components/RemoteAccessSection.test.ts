@@ -11,19 +11,22 @@ import {
 import {
   COMPANION_GATEWAY_BLURB,
   COMPANION_GATEWAY_LABEL,
-  NAMED_REMOTE_URL,
   REMOTE_ACCESS_BLURB,
   REMOTE_ACCESS_HEADING,
+  REMOTE_ACCESS_UNCONFIGURED_BLURB,
   REMOTE_URL_LABEL,
   sentenceGapHtml,
 } from "@/lib/remote-access";
 
+/** A host only this install would ever configure. */
+const CONFIGURED = "https://this-install.example.test";
+
 describe("RemoteAccessSection", () => {
-  it("renders Designer heading, Remote URL value, copy control, and Test Connection button", () => {
-    const html = renderToStaticMarkup(createElement(RemoteAccessSection));
+  it("renders the heading, this install's Remote URL, the copy control, and Test Connection", () => {
+    const html = renderToStaticMarkup(createElement(RemoteAccessSection, { configuredUrl: CONFIGURED }));
     expect(html).toContain(REMOTE_ACCESS_HEADING);
     expect(html).toContain(REMOTE_URL_LABEL);
-    expect(html).toContain(NAMED_REMOTE_URL);
+    expect(html).toContain(CONFIGURED);
     expect(html).toContain(sentenceGapHtml(REMOTE_ACCESS_BLURB).replaceAll("'", "&#x27;"));
     expect(html).toContain('aria-label="Copy Remote URL"');
     expect(html).toContain("Copy");
@@ -31,6 +34,23 @@ describe("RemoteAccessSection", () => {
     expect(html).toContain('aria-label="Test Connection"');
     expect(html).not.toContain("Test Remote Access");
     expect(html.toLowerCase()).not.toContain("trycloudflare");
+  });
+
+  it("renders the setup sentence and no URL or probe button when this install has no address", () => {
+    for (const configuredUrl of [undefined, null, "", "   ", "not-a-url"]) {
+      const html = renderToStaticMarkup(createElement(RemoteAccessSection, { configuredUrl }));
+      expect(html).toContain(REMOTE_ACCESS_HEADING);
+      expect(html).toContain(sentenceGapHtml(REMOTE_ACCESS_UNCONFIGURED_BLURB).replaceAll("'", "&#x27;"));
+      expect(html).not.toContain(REMOTE_URL_LABEL);
+      expect(html).not.toContain("Test Connection");
+      expect(html).not.toContain("<input");
+    }
+  });
+
+  it("names no host at all when unconfigured, and certainly not a fixed one", () => {
+    const html = renderToStaticMarkup(createElement(RemoteAccessSection, {}));
+    expect(html).not.toMatch(/https?:\/\//);
+    expect(html.toLowerCase()).not.toContain("jay");
   });
 });
 
@@ -190,11 +210,11 @@ describe("TestConnectionControl", () => {
 });
 
 describe("CompanionGatewayCard", () => {
-  it("renders the companion-path label and blurb without a fake tunnel URL", () => {
+  it("renders the companion-path label and blurb without naming any host", () => {
     const html = renderToStaticMarkup(createElement(CompanionGatewayCard));
     expect(html).toContain(COMPANION_GATEWAY_LABEL);
     expect(html).toContain(sentenceGapHtml(COMPANION_GATEWAY_BLURB));
-    expect(html).not.toContain(NAMED_REMOTE_URL);
+    expect(html).not.toMatch(/https?:\/\//);
     expect(html.toLowerCase()).not.toContain("trycloudflare");
   });
 });

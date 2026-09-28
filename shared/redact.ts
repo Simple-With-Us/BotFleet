@@ -58,13 +58,30 @@ const KEY_PREFIXES: RegExp[] = [
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, // github classic
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g, // github fine-grained
   /\bxox[abposr]-[A-Za-z0-9-]{20,}/g, // slack
+  // ── shapes BotFleet itself issues or stores ──
+  // The four above are all somebody else's format, recognised because the
+  // provider's own prefix is in the value. These are the same kind of thing
+  // with a prefix that is ITSELF the identifier, which is why their floors can
+  // sit lower than a length-tuned pattern's would: `whsec_` is a webhook
+  // signing secret this product mints for its own endpoints, and `ak_` is the
+  // generic access key it hands out. There is nothing for a long body to
+  // disambiguate — no prose spells a sentence starting `ya29.` — so the floor
+  // is only here to reject a bare mention of the prefix in a doc or a log line
+  // ("the whsec_ value from the dashboard"), not to be confident.
+  //
+  // `whsec_` and the underscore form of the Stripe keys are the two the
+  // hyphenated `sk-` pattern above cannot reach at all, and every underscore
+  // arm is written with `_` inside its character class for the same reason:
+  // a body that has been cut in half upstream, or a value whose tail is a
+  // separate underscore-delimited run, loses the class that a stricter one
+  // assumes.
   // Stripe's live/test keys use underscores, which the sk- pattern above
   // (hyphenated ant-/proj-/live-/test- variants) does not reach.
-  /\bsk_(?:live|test)_[A-Za-z0-9]{16,}/g, // stripe underscore form
-  /\bak_[A-Za-z0-9_-]{16,}/g, // generic issued api keys (botfleet-owned shape)
-  /\bwhsec_[A-Za-z0-9]{16,}/g, // stripe webhook signing secrets
-  /\bya29\.[A-Za-z0-9_-]{20,}/g, // google oauth access tokens
-  /\bglpat-[A-Za-z0-9_-]{15,}/g, // gitlab personal access tokens
+  /\bsk_(?:live|test)_[A-Za-z0-9]{8,}/g, // stripe underscore form
+  /\bak_[A-Za-z0-9_-]{16,}/g, // generic issued api key (botfleet-owned shape)
+  /\bwhsec_[A-Za-z0-9_-]{8,}/g, // stripe / botfleet webhook signing secret
+  /\bya29\.[A-Za-z0-9_-]{4,}/g, // google oauth access token
+  /\bglpat-[A-Za-z0-9_-]{8,}/g, // gitlab personal access token
   /\bAKIA[0-9A-Z]{16}\b/g, // aws access key id
   /\bAIza[0-9A-Za-z_-]{30,}/g, // google api key
   /\bnpm_[A-Za-z0-9]{20,}/g, // npm
@@ -74,6 +91,21 @@ const KEY_PREFIXES: RegExp[] = [
   // complete three-segment token is exactly what lets a cut one through.
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g,
 ];
+
+/** The credential-shape list, published so there is exactly ONE of them.
+ *
+ * `electron/diagnostics.mjs` has to recognise the same shapes — a bug report
+ * is pasted into a public issue — but the desktop shell runs plain `.mjs` on
+ * Electron's own Node and there is no transpile step for it, so it cannot
+ * import this file.  Two hand-maintained copies of a security list is exactly
+ * the drift that let four of these five shapes through in the first place, so
+ * the copy is now checked against this export rather than trusted:
+ * `electron/diagnostics.test.mjs` compares every pattern's `source`.  Adding
+ * a shape here without adding it there fails the desktop test.
+ *
+ * Exported as a `readonly` view so a consumer cannot push a pattern onto the
+ * list this module redacts with. */
+export const CREDENTIAL_TOKEN_PATTERNS: readonly RegExp[] = KEY_PREFIXES;
 /** `Bearer <token>` standing on its own, anywhere.  Case-insensitive: a
  * lowercase spelling is just as much a credential, and the 12-character
  * minimum is what keeps "Bearer tokens are sent in the …" out of it. */

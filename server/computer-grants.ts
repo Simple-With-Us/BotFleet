@@ -35,7 +35,15 @@ export interface ComputerMount {
   box?: {
     kind?: "box";
     boxId: string;
+    /** The mount's per-box gateway grant — NOT the account-wide Box API key.
+     *  It authenticates one box id at the harness's own loopback gateway and
+     *  nothing anywhere else, so the key that can reach every box in the
+     *  account never enters a bot's process. */
     token: string;
+    /** Loopback base for the Box calls.  Empty when the harness has no
+     *  gateway to point at, which leaves the proxy with a bearer the provider
+     *  will reject rather than one it will honour. */
+    gatewayUrl?: string;
     control?: { url: string; token: string };
   };
   stdio?: {
@@ -94,7 +102,7 @@ export function isHostMount(mount: ComputerMount): boolean {
 }
 
 const SINGLE_PROMPTS = {
-  vm: " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
+  vm: " You have a shared Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. That workspace is the only host folder mounted into the VM, and the VM has outbound internet access like any other computer, so treat it as your own machine rather than as a sealed sandbox. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
   box: " You have your own cloud computer. In Chrome, prefer browser_snapshot with browser_click/browser_fill for semantic, trusted actions; use screenshot/click/type_text for visual or non-browser UI, open_url for navigation, and computer_exec for Linux tasks. Every action already returns the resulting screen, so don't follow it with screenshot; batch predictable pixel actions with computer_batch.",
   vps: " You have your own self-hosted remote Linux computer through the official Cua tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
   local: " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully.",
@@ -125,7 +133,7 @@ function multiLine(mount: ComputerMount): string {
   const tools = `\`${mount.name}\` tools (prefixed \`mcp__${mount.name}__\`)`;
   switch (mount.kind) {
     case "vm":
-      return `${mount.label} — an isolated Linux desktop in a container on this machine, through the ${tools}. Only /home/cua/workspace survives a rebuild.`;
+      return `${mount.label} — a Linux desktop in a container on this machine, through the ${tools}. Only /home/cua/workspace survives a rebuild, and it is the only host folder mounted into it.`;
     case "box":
       return `${mount.label} — your own cloud Linux desktop, through the ${tools}. In Chrome prefer browser_snapshot with browser_click/browser_fill; use computer_exec for shell work.`;
     case "vps":
@@ -450,6 +458,14 @@ export interface TurnComputerDeps<Lease = unknown> {
   };
   /** The loopback control pair a computer bridge calls back on. */
   controlIntegration(botId: string): { url: string; token: string };
+  /** The Box gateway's own two calls, injected for the same reason
+   *  `controlIntegration` is: this module is reachable from the renderer
+   *  bundle, and the gateway needs `node:crypto`.  A value import here would
+   *  put it there and vite would refuse the build. */
+  boxGateway: {
+    url(control: { url: string } | undefined): string;
+    mint(botId: string, boxId: string, gatewayUrl: string): { url: string; token: string };
+  };
   broadcast(frame: ComputerStateFrame): void;
   /** One activity chip on the turn's own thread.  The caller shapes it,
    * because a room chip carries the speaking member and a 1:1 chip does not. */
@@ -774,6 +790,10 @@ async function resolveMounts<Lease>(
       const known = b;
       previewCapture = () => deps.box.screenshotBox(cfg, bot.id, known.id);
       if (mountsCloudComputer) {
+        // The account-wide Box API key is never read here: it stays in the
+        // harness, and the mount carries a grant that names this one box.
+        const control = deps.controlIntegration(bot.id);
+        const grant = deps.boxGateway.mint(bot.id, known.id, deps.boxGateway.url(control));
         mounts.push({
           name: "",
           label: computerLabel("box", hostPlatform),
@@ -781,8 +801,9 @@ async function resolveMounts<Lease>(
           box: {
             kind: "box",
             boxId: known.id,
-            token: cfg.box!.token!,
-            control: deps.controlIntegration(bot.id),
+            token: grant.token,
+            gatewayUrl: grant.url,
+            control,
           },
         });
       }

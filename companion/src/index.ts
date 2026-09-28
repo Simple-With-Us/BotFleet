@@ -6,7 +6,7 @@
 // Three public/runtime sockets, and one optional private managed origin. The
 // split between them is the whole security model:
 //
-//   :8810  0.0.0.0    devices     token required, allowlisted, scrubbed
+//   :8810  loopback  devices     token required, allowlisted, scrubbed
 //   :8811  127.0.0.1  you         pairing and revocation — never off-machine
 //   :8799  127.0.0.1  the harness spoken to as this machine, unmodified
 //   UDS/pipe            one Electron-owned sidecar generation, never TCP
@@ -16,9 +16,20 @@
 // app this is a sidecar to. Ten clear of the harness leaves it room to add
 // another adjacent listener without taking this one out again.
 //
-// Running this process *is* the opt-in. There is no toggle, because a toggle
-// inside a process you chose to start would be ceremony: stopping it is the
-// off switch, and it is a more honest one than a flag in a file.
+// :8810 is plain HTTP, which is the whole reason it binds loopback and not
+// 0.0.0.0.  A device port on the LAN hands every paired phone's bearer token
+// and every transcript frame to whoever is on the same wifi, and the
+// allowlist on the far side of that socket cannot help: it runs after the
+// first bytes are already on the wire.  A phone reaches a paired computer over
+// the hosted HTTPS route instead, whose connector lands on this very port.
+// Set OMB_COMPANION_ALLOW_CLEARTEXT_LAN=1 to reopen the port on a network
+// you control — see `lan-policy.ts` for the threat model and the honest
+// default.
+//
+// Running this process *is* the opt-in for the control plane: there is no
+// toggle for that surface, because a toggle inside a process you chose to
+// start would be ceremony.  Stopping the process is the off switch, and it is
+// a more honest one than a flag in a file.
 import { createServer } from "node:http";
 
 import { createAddressWatcher } from "./advertise-watch.ts";
@@ -26,6 +37,12 @@ import { createControlServer, hostCandidates } from "./control.ts";
 import { createConnectedDeviceTracker } from "./connected-devices.ts";
 import { DeviceRegistry } from "./devices.ts";
 import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
+import {
+  advertisesOnLan,
+  lanPolicyAdvice,
+  lanPolicySummary,
+  readLanPolicy,
+} from "./lan-policy.ts";
 import { lanAddresses, refreshTailnetName, tailnetName, tailscaleAddress } from "./listener.ts";
 import {
   advertisableAddresses,
@@ -58,6 +75,18 @@ const COMPANION_PORT = num(process.env.OMB_COMPANION_PORT, 8810);
 const CONTROL_PORT = num(process.env.OMB_CONTROL_PORT, 8811);
 let hostedUrl = hostedCompanionUrl(process.env.OMB_COMPANION_HOSTED_URL);
 const PRIVATE_ORIGIN = companionOriginSocket(process.env.OMB_COMPANION_INTERNAL_ORIGIN);
+
+/** Whether the device port may leave this machine at all, and in what form.
+ *
+ * The default is loopback, and that is the whole of S11: `:8810` is plain
+ * HTTP, so anything it serves crosses the network in the clear — the pairing
+ * credential on the way in, the device's bearer token and every transcript
+ * frame on the way out.  The device allowlist and the token check on the far
+ * side of that socket are real, and they do not help: they run after the
+ * conversation is already on the wire.  See `lan-policy.ts` for the threat
+ * model and for why a pinned self-signed certificate needs an iOS change
+ * before it can be the default. */
+const lanPolicy = readLanPolicy();
 
 /** Ports the harness takes for itself, and what it uses each for.
  *
@@ -166,8 +195,8 @@ const proxy = createProxyHandler({
     // Recomputed per pairing rather than cached: addresses change when the
     // machine joins another network, and a pairing is exactly the moment the
     // list has to be right.
-    hosts: () => hostCandidates(),
-    endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl),
+    hosts: () => hostCandidates(undefined, undefined, lanPolicy),
+    endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl, undefined, lanPolicy),
     connected: connectedDevices.open,
     setPushToken: (id, token) => devices.setPushToken(id, token),
     pushHealth: pushWatch.health,
@@ -186,6 +215,7 @@ const control = createControlServer({
   connectedDeviceIds: connectedDevices.ids,
   disconnectDevice: connectedDevices.disconnect,
   pushHealth: pushWatch.health,
+  lanPolicy,
 });
 
 /** Bind a server, turning a bind failure into a sentence rather than a stack
@@ -249,7 +279,7 @@ async function main(): Promise<void> {
   }
 
   await listen(control, CONTROL_PORT, "127.0.0.1");
-  await listen(companion, COMPANION_PORT, "0.0.0.0");
+  await listen(companion, COMPANION_PORT, lanPolicy.deviceBindHost);
   if (managedOrigin && PRIVATE_ORIGIN) {
     await listenCompanionOrigin(managedOrigin, PRIVATE_ORIGIN);
   }
@@ -273,15 +303,26 @@ async function main(): Promise<void> {
   // before wifi associates has no addresses yet, and addresses change under
   // a running sidecar. The first check advertises (or says why not), and the
   // interval re-advertises on every change after that.
-  await watcher.check();
-  watcher.start();
+  //
+  // Skipped entirely when the device port is bound to loopback. Multicast DNS
+  // is a LAN protocol with no way to say "only this interface", so a record
+  // published here would name a port that answers no connection a phone could
+  // make — and discovery that finds a computer and then cannot reach it is
+  // worse than a phone that never heard of it.
+  if (advertisesOnLan(lanPolicy)) {
+    await watcher.check();
+    watcher.start();
+  }
 
   const addresses = lanAddresses();
   const tailscale = tailscaleAddress(addresses);
   const reach = tailnetName() ?? tailscale ?? addresses[0];
-  console.log(`companion  http://0.0.0.0:${COMPANION_PORT}  →  harness 127.0.0.1:${HARNESS_PORT}`);
+  console.log(`companion  http://${lanPolicy.deviceBindHost}:${COMPANION_PORT}  →  harness 127.0.0.1:${HARNESS_PORT}`);
   console.log(`pair here  http://127.0.0.1:${CONTROL_PORT}`);
-  if (reach) console.log(`on your phone, enter  ${reach}:${COMPANION_PORT}`);
+  console.log(lanPolicySummary(lanPolicy, COMPANION_PORT));
+  for (const line of lanPolicyAdvice(lanPolicy, hostedUrl)) console.log(`  ${line}`);
+  if (hostedUrl) console.log(`on your phone, enter  ${hostedUrl}`);
+  else if (lanPolicy.allowCleartextLan && reach) console.log(`on your phone, enter  ${reach}:${COMPANION_PORT}`);
   if (tailscale && !tailnetName()) {
     // Do not tell someone to turn on MagicDNS when they may well have it on
     // already — say what was actually tried, so the difference between "off"

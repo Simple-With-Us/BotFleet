@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { request } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,11 +32,6 @@ beforeAll(async () => {
   secret = created.secret;
   ingress = await listenWebhookIngress(manager, {
     port: 0,
-    routes: {
-      "/hooks/boom": async () => {
-        throw new Error("boom");
-      },
-    },
     beginAdmission: () => {
       if (!admitting) return null;
       activeAdmissions += 1;
@@ -49,16 +45,32 @@ afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** A request line `fetch` would refuse to build, sent straight down the socket. */
+async function rawPost(url: string): Promise<{ status: number }> {
+  const { hostname, port, pathname } = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: hostname, port: Number(port), path: pathname, method: "POST" },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+      },
+    );
+    req.on("error", reject);
+    req.end("{}");
+  });
+}
+
+/** Rejected rows recorded against the endpoint this suite created. */
+function rejectedAttemptCount(): number {
+  const id = manager.list().find((webhook) => webhook.endpointId === endpointId)?.id;
+  return manager.listAttempts().filter((attempt) => attempt.webhookId === id && attempt.outcome === "rejected").length;
+}
+
 describe("webhook-only ingress", () => {
   it("returns 400 for a malformed doubled-slash URL without killing the receiver", async () => {
     const malformed = await fetch(`${ingress.baseUrl}//`);
     expect(malformed.status).toBe(400);
-    expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
-  });
-
-  it("answers 500 when a route throws, without killing the receiver", async () => {
-    const boom = await fetch(`${ingress.baseUrl}/hooks/boom`, { method: "POST" });
-    expect(boom.status).toBe(500);
     expect((await fetch(`${ingress.baseUrl}/health`)).status).toBe(200);
   });
 
@@ -227,6 +239,27 @@ describe("webhook-only ingress", () => {
     const prompt = queued.at(-1)?.prompt as string;
     expect(prompt).toContain(text);
     expect(prompt).not.toContain("\uFFFD");
+  });
+
+  it("answers malformed percent-encoding in the path as a 4xx and never raises", async () => {
+    // The raw path is what a real attacker sends; `fetch` would normalize a
+    // well-formed escape, so this has to go out as a literal request line.
+    const response = await rawPost(`${ingress.baseUrl}/hooks/${endpointId}/%E0%A4%A`);
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.status).toBeLessThan(500);
+    expect(response.status).not.toBe(500);
+  });
+
+  it("throttles unauthenticated rejection rows so a bad-secret flood cannot flush the log", async () => {
+    const before = rejectedAttemptCount();
+    // 25 bad secrets, well past the 10-per-minute cap.
+    for (let i = 0; i < 25; i += 1) {
+      const response = await fetch(`${ingress.baseUrl}/hooks/${endpointId}/wrong-secret-${i}`, { method: "POST", body: "{}" });
+      expect(response.status).toBe(401);
+    }
+    const recorded = rejectedAttemptCount() - before;
+    expect(recorded).toBeLessThanOrEqual(10);
+    expect(recorded).toBeGreaterThan(0);
   });
 });
 

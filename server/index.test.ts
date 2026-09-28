@@ -3135,7 +3135,7 @@ describe("harness HTTP API", () => {
     const unsupported = await api("POST", "/api/local-computer/interrupt");
     expect(unsupported).toEqual({
       status: 415,
-      body: { error: "content-type must be application/json" },
+      body: { error: "unsupported media type: mutating requests take application/json" },
     });
     const stopped = await api("POST", "/api/local-computer/interrupt", {});
     expect(stopped).toEqual({ status: 200, body: { ok: true } });
@@ -3885,15 +3885,43 @@ describe("harness HTTP API", () => {
         expect(selected.status).toBe(200);
       }
 
+      // The comms token is minted per turn and bound to the bot it was
+      // issued for, so the peer asking for a credential has to present its
+      // OWN token now — a request made under the lead's token, claiming the
+      // peer, is refused.  Run the peer's turn first to collect that token,
+      // then start the room turn whose hanging provider the continuation
+      // has to queue behind.
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${second.id}/messages`, { text: "start the peer" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      // SAFETY: `fakeClaudeDump` is the mcp.json this test's own fake CLI
+      // driver writes on start-up, so its shape is fixed by that writer — the
+      // harness only ever copies the file to the bot's home unchanged.
+      const peerDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8")) as {
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string; OMB_BOT_ID: string } } } };
+      };
+      const token = peerDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
+      expect(token).toMatch(/^[a-f0-9]{48}$/);
+      expect(peerDump.mcpConfig.mcpServers.agents.env.OMB_BOT_ID).toBe(second.id);
+      await api("POST", `/api/bots/${second.id}/interrupt`, {});
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((bot: { id: string }) => bot.id === second.id)
+          ?.busy, { timeout: 10_000 }).toBe(false);
+
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "start the lead" })).status).toBe(202);
       await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      // SAFETY: `fakeClaudeDump` is the mcp.json this test's own fake CLI
+      // driver writes on start-up, so its shape is fixed by that writer — the
+      // harness only ever copies the file to the bot's home unchanged.
       const firstDump = JSON.parse(readFileSync(fakeClaudeDump, "utf8")) as {
         pid: number;
-        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string } } } };
+        mcpConfig: { mcpServers: { agents: { env: { OMB_COMMS_TOKEN: string; OMB_BOT_ID: string } } } };
       };
-      const token = firstDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN;
-      expect(token).toMatch(/^[a-f0-9]{48}$/);
+      // the lead's own token is a different one, bound to the lead
+      expect(firstDump.mcpConfig.mcpServers.agents.env.OMB_BOT_ID).toBe(first.id);
+      expect(firstDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN).not.toBe(token);
+      const callerId = second.id;
 
       const requested = await fetch(`${BASE}/api/internal/request-credential`, {
         method: "POST",
@@ -3902,7 +3930,7 @@ describe("harness HTTP API", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          fromBotId: second.id,
+          fromBotId: callerId,
           fromThreadId: room.threadId,
           credentialId: "openaiImageApiKey",
           reason: "needed for the queued task",

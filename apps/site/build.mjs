@@ -1,10 +1,26 @@
 #!/usr/bin/env node
-// Renders index.html from template.html + features.json.
+// Renders index.html from template.html + features.json into dist/.
 // Rules encoded here: a section with zero features is hidden entirely
 // (owner rule: hide a section if it has zero features); descriptions are
 // trusted HTML (sentence gaps use a real U+00A0 per fleet copy rules —
 // never the &nbsp; entity, so the six characters can't leak as text).
-import { readFileSync, writeFileSync } from "node:fs";
+//
+// The output directory is `dist/`, and Vercel serves `dist/`, NOT this
+// directory.  It used to serve `.` — the same directory that holds README.md,
+// docs/EFFORT-LOG.md, vercel-ignore-hourly.sh, sync-status.mjs, this build
+// script, and package.json — so every one of those was readable at
+// https://botfleet.app/<name>.  Only the allowlist below crosses into dist/;
+// anything added to this folder is NOT published until it is listed there.
+// `verify-output.mjs` fails the build's own test if dist/ grows a file the
+// allowlist does not explain.
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { PUBLIC_ASSETS } from "./public-assets.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const OUT_DIR = join(here, "dist");
 
 const data = JSON.parse(readFileSync(new URL("./features.json", import.meta.url), "utf8"));
 const template = readFileSync(new URL("./template.html", import.meta.url), "utf8");
@@ -87,5 +103,18 @@ const html = template
   .replaceAll("{{SECTIONS}}", data.sections.map(sectionHtml).join("\n\n"))
   .replaceAll("{{SENTRY_SNIPPET}}", sentrySnippet(process.env.VITE_SENTRY_DSN));
 
-writeFileSync(new URL("./index.html", import.meta.url), html);
-console.log(`built index.html — ${data.sections.map((s) => `${s.id}:${s.features.length}`).join(" ")} — updated ${updated}`);
+// A clean dist/ every run: a file dropped here once and then deleted from
+// PUBLIC_ASSETS would otherwise stay published, because Vercel deploys
+// whatever is on disk rather than what this script wrote most recently.
+rmSync(OUT_DIR, { recursive: true, force: true });
+mkdirSync(OUT_DIR, { recursive: true });
+writeFileSync(join(OUT_DIR, "index.html"), html);
+for (const asset of PUBLIC_ASSETS) {
+  const target = join(OUT_DIR, asset);
+  mkdirSync(dirname(target), { recursive: true });
+  copyFileSync(join(here, asset), target);
+}
+console.log(
+  `built dist/index.html — ${data.sections.map((s) => `${s.id}:${s.features.length}`).join(" ")} — ` +
+  `${PUBLIC_ASSETS.length + 1} published files — updated ${updated}`,
+);

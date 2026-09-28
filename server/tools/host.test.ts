@@ -8,6 +8,7 @@
 // The pinned copy of the `/api/internal/agents` body that used to live in
 // this file is gone.  It was a drift detector for a divergence that can no
 // longer happen: the host now receives the endpoint function itself.
+import { isAbsolute, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { RequestOutcome } from "../contracts.ts";
@@ -409,7 +410,9 @@ describe("host computer tools on HTTP lane", () => {
     );
     expect(asking.asks).toHaveLength(1);
     expect(asking.asks[0].tool).toBe("read_file");
-    expect(asking.asks[0].summary).toContain(".botfleet/config.json");
+    // The card names the resolved path, so the assertion has to use the
+    // platform's own separator rather than a POSIX spelling.
+    expect(asking.asks[0].summary.replace(/\\/g, "/")).toContain(".botfleet/config.json");
     expect(outcome).not.toMatchObject({ kind: "error", detail: "denied" });
   });
 
@@ -459,5 +462,58 @@ describe("host computer tools on HTTP lane", () => {
       runtime,
     );
     expect(bashOutcome).toMatchObject({ kind: "error", detail: "unknown tool" });
+  });
+});
+
+describe("read_file asks only when the path is a credential store", () => {
+  // The repo root, wherever it is checked out — the reads below have to
+  // resolve to files that really exist.
+  const CWD = process.cwd();
+
+  it("reads a project file without a card, even against a denying broker", async () => {
+    const asking = askingRuntime("rejected");
+    for (const path of ["package.json", "vite.config.ts", "README.md", "./server/index.ts"]) {
+      const outcome = await hostFor({}, { localComputer: true, cwd: CWD }).execute(
+        { id: "1", name: "read_file", arguments: { path, limit: 1 } },
+        asking.runtime,
+      );
+      expect(outcome.kind, path).not.toBe("error");
+    }
+    expect(asking.asks).toEqual([]);
+  });
+
+  it("asks for BotFleet's own config, an ssh key, and the desktop credential store", async () => {
+    for (const path of [
+      "/Users/jay/.botfleet/config.json",
+      "/Users/jay/.ssh/id_ed25519",
+      "/Users/jay/Library/Application Support/BotFleet/credentials.bin",
+    ]) {
+      const asking = askingRuntime("rejected");
+      const outcome = await hostFor({}, { localComputer: true, cwd: CWD }).execute(
+        { id: "1", name: "read_file", arguments: { path } },
+        asking.runtime,
+      );
+      expect(asking.asks, path).toHaveLength(1);
+      expect(asking.asks[0]).toMatchObject({ tool: "read_file", summary: `read file ${path}` });
+      // a denied ask never reaches the executor
+      expect(outcome).toMatchObject({ kind: "error", detail: "denied" });
+    }
+  });
+
+  it("resolves a relative path against the turn's working directory first", async () => {
+    // The card has to name the file the executor opens, and the pattern list
+    // has to see the resolved path: a workspace bot asking for
+    // `../../.ssh/id_rsa` is asking for a key.
+    const asking = askingRuntime("allowed-once");
+    const cwd = resolve("/tmp/project");
+    await hostFor({}, { localComputer: true, cwd }).execute(
+      { id: "1", name: "read_file", arguments: { path: "../.ssh/config" } },
+      asking.runtime,
+    );
+    expect(asking.asks).toHaveLength(1);
+    // `resolve`, because the card is supposed to name what the executor opens,
+    // and on Windows that is `C:\tmp\.ssh\config`.
+    expect(isAbsolute(asking.asks[0]!.summary.replace("read file ", ""))).toBe(true);
+    expect(asking.asks[0]!.summary.replace(/\\/g, "/")).toBe(`read file ${resolve(cwd, "../.ssh/config").replace(/\\/g, "/")}`);
   });
 });

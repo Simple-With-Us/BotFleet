@@ -1,35 +1,53 @@
 import { describe, expect, it } from "vitest";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join, relative } from "node:path";
 
+import { DATA_DIR } from "./config.ts";
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
   BASE_IMAGE_LABEL,
+  BOX_GATEWAY_PATH,
   CONTAINER,
   CUA_DRIVER_VERSION,
   CUA_EXECUTABLE,
   CUA_SOCKET,
   DRIVER_LABEL,
+  HOST_GATEWAY_BLACKHOLE,
   IMAGE,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
+  LEGACY_VM_WORKSPACE_DIR,
   MANAGED_LABEL,
   TARGET_LABEL,
   VM_WORKSPACE_DIR,
   VM_WORKSPACE_GUEST,
+  VM_WORKSPACE_ROOT,
   WORKSPACE_LABEL,
+  authorizeBoxGateway,
+  boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  containerNetworkArgs,
   containerRuntimeStatus,
   containerRunArgs,
+  handleBoxGatewayRequest,
   managedImageDockerfile,
+  migrateVmWorkspace,
+  mintBoxGatewayGrant,
+  resetBoxGatewayGrants,
+  revokeBoxGatewayGrant,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
+  legacyVmWorkspaceDir,
   perBotLocalVmTarget,
   podmanSecurityIsHardened,
   setupCommands,
+  workspaceSources,
   type CommandRunner,
   type LocalVmTarget,
 } from "./container-computer.ts";
@@ -565,11 +583,94 @@ describe("containerComputerStatus", () => {
 });
 
 describe("Cua integration", () => {
-  it("hands cloud credentials only to the isolated remote adapter", () => {
-    expect(computerProxyEnv({ boxId: "bx_1", token: "t" })).toEqual({
+  it("points the box proxy at the harness gateway instead of the account's Box API", () => {
+    // Repinned: the proxy used to receive the account-wide API key and talk
+    // to ascii.dev itself.  It now receives a per-mount grant and the
+    // loopback base that grant is only good at.
+    expect(
+      computerProxyEnv({
+        boxId: "bx_1",
+        token: "grant-value",
+        gatewayUrl: `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
+        control: { url: "http://127.0.0.1:8799/api/internal/computer-control?botId=b1", token: "ctl" },
+      }),
+    ).toEqual({
+      OGB_BOX_API: `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
       OGB_BOX_ID: "bx_1",
-      OGB_BOX_TOKEN: "t",
+      OGB_BOX_TOKEN: "grant-value",
+      OMB_CONTROL_URL: "http://127.0.0.1:8799/api/internal/computer-control?botId=b1",
+      OMB_CONTROL_TOKEN: "ctl",
     });
+  });
+
+  it("derives the gateway base from the turn's own control endpoint", () => {
+    expect(boxGatewayUrl({ url: `http://127.0.0.1:8799/api/internal/computer-control?botId=b%201` })).toBe(
+      `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`,
+    );
+    expect(boxGatewayUrl(undefined)).toBe("");
+    expect(boxGatewayUrl({ url: "not a url" })).toBe("");
+  });
+
+  it("keeps the VM workspace out of the tree the desktop app can open", () => {
+    // `resolveOpenablePath` (electron/open-file.mjs) confines every
+    // renderer-supplied path to DATA_DIR and then calls shell.openPath, so a
+    // workspace inside that tree is one click from a user.  The check is a
+    // path-segment test, not a string prefix: the new root's name starts with
+    // the old one ("~/.botfleet-vm"), which a prefix test would call inside.
+    const inside = (root: string, candidate: string) => {
+      const rel = relative(root, candidate);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    };
+    expect(inside(DATA_DIR, VM_WORKSPACE_DIR)).toBe(false);
+    expect(inside(DATA_DIR, VM_WORKSPACE_ROOT)).toBe(false);
+    expect(inside(VM_WORKSPACE_ROOT, VM_WORKSPACE_DIR)).toBe(true);
+    expect(legacyVmWorkspaceDir(SHARED_LOCAL_VM_TARGET)).toBe(LEGACY_VM_WORKSPACE_DIR);
+    expect(legacyVmWorkspaceDir(perBotLocalVmTarget("bot-1"))).toBe(
+      join(DATA_DIR, "vm-homes", basename(perBotLocalVmTarget("bot-1").workspaceDir)),
+    );
+  });
+
+  it("accepts a running pre-move container as a correctly bound workspace", () => {
+    expect(workspaceSources(SHARED_LOCAL_VM_TARGET)).toEqual([VM_WORKSPACE_DIR, LEGACY_VM_WORKSPACE_DIR]);
+  });
+
+  it("names the host gateway blackhole per runtime instead of leaving the network implicit", () => {
+    // Podman on macOS and Windows: the only supported setups are `podman
+    // machine`, whose slirp4netns already denies host loopback — stated, not
+    // inherited.  Rootful Linux Podman has no slirp4netns, so the mode is
+    // left alone there.
+    expect(containerNetworkArgs("podman", "darwin")).toEqual([
+      "--network",
+      "slirp4netns:allow_host_loopback=false",
+      "--add-host",
+      `host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+      "--add-host",
+      `host.containers.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    ]);
+    expect(containerNetworkArgs("podman", "linux")).not.toContain("--network");
+    expect(containerNetworkArgs("podman", "linux").join(" ")).toContain(
+      `--add-host host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    );
+    // Docker and Colima share an engine: the bridge gateway is not removable
+    // by a run flag, so the names it answers to are pinned at a
+    // documentation-only address instead.
+    expect(containerNetworkArgs("docker", "darwin")).toEqual([
+      "--network",
+      "bridge",
+      "--add-host",
+      `host.docker.internal:${HOST_GATEWAY_BLACKHOLE}`,
+      "--add-host",
+      `host.containers.internal:${HOST_GATEWAY_BLACKHOLE}`,
+    ]);
+    // Apple's `container` CLI cannot be verified from this tree, so it is
+    // given no flag it might reject.
+    expect(containerNetworkArgs("container", "darwin")).toEqual([]);
+
+    const docker = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin");
+    expect(docker.join(" ")).toContain("--add-host host.docker.internal:203.0.113.1");
+    expect(containerRunArgs("podman", "pw", SHARED_LOCAL_VM_TARGET, "darwin").join(" ")).toContain(
+      "--network slirp4netns:allow_host_loopback=false",
+    );
   });
 
   it("mounts the official Cua MCP server for Local VM turns", () => {
@@ -807,5 +908,147 @@ describe("Local VM mode switch targets", () => {
 
   it("is just the shared target when the workspace has no bots", () => {
     expect(localVmModeSwitchTargets([])).toEqual([SHARED_LOCAL_VM_TARGET]);
+  });
+});
+
+describe("migrateVmWorkspace", () => {
+  const temp = () => mkdtempSync(join(tmpdir(), "omb-vm-migrate-"));
+
+  it("moves a pre-move workspace into the new root, keeping the files", async () => {
+    const dir = temp();
+    const from = join(dir, "vm-home");
+    const to = join(dir, "homes", "shared");
+    mkdirSync(from, { recursive: true });
+    writeFileSync(join(from, "keep-me.txt"), "workspace contents");
+
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from, to })).toBe(from);
+    expect(readFileSync(join(to, "keep-me.txt"), "utf8")).toBe("workspace contents");
+  });
+
+  it("does nothing when there is nothing to move, or the new root already exists", async () => {
+    const dir = temp();
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from: join(dir, "absent"), to: join(dir, "new") })).toBeNull();
+
+    const from = join(dir, "vm-home");
+    const to = join(dir, "new");
+    mkdirSync(from, { recursive: true });
+    mkdirSync(to, { recursive: true });
+    writeFileSync(join(to, "already-here.txt"), "new root");
+    expect(await migrateVmWorkspace(SHARED_LOCAL_VM_TARGET, { from, to })).toBeNull();
+    // A migration is never destructive: the pre-move directory stays put.
+    expect(existsSync(from)).toBe(true);
+    expect(readFileSync(join(to, "already-here.txt"), "utf8")).toBe("new root");
+  });
+});
+
+describe("Box gateway", () => {
+  const bearer = (token: string) => `Bearer ${token}`;
+
+  it("refuses a box the mount's grant does not name", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-allowed", `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`);
+    const call = (boxId: string) =>
+      handleBoxGatewayRequest(
+        { method: "POST", url: `${BOX_GATEWAY_PATH}/boxes/${boxId}/commands`, authorization: bearer(grant.token), remoteAddress: "127.0.0.1", body: "{}" },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    // The provider would have honoured both of these.  The gateway does not.
+    expect((await call("box-someone-else")).status).toBe(403);
+    expect((await call("box-allowed")).status).toBe(200);
+  });
+
+  it("forwards the granted call with the account key, which the child never sends", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", `http://127.0.0.1:8799${BOX_GATEWAY_PATH}`);
+    const seen: Array<{ url: string; init: RequestInit }> = [];
+    // SAFETY: the recorder answers the one Box command call this test makes and
+    // never reaches the network, so the narrowed `(string, RequestInit)` shape
+    // stands in for the overloaded global `fetch` without being one.
+    const recordingFetch = async (url: string, init: RequestInit) => {
+      seen.push({ url: String(url), init });
+      return new Response('{"exitCode":0}', { status: 200 });
+    };
+    const res = await handleBoxGatewayRequest(
+      {
+        method: "POST",
+        url: `${BOX_GATEWAY_PATH}/boxes/box-1/commands?x=1`,
+        authorization: bearer(grant.token),
+        remoteAddress: "::1",
+        body: '{"command":"ls"}',
+      },
+      {
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        cfg: { box: { token: "account-wide-key" } } as never,
+        // SAFETY: the recorder answers the one Box command call this test makes
+        // and never reaches the network, so the narrowed `(string, RequestInit)`
+        // shape stands in for the overloaded global `fetch` without being one.
+        fetchImpl: recordingFetch as typeof fetch,
+      },
+    );
+
+    expect(res).toEqual({ status: 200, body: '{"exitCode":0}' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toContain("/boxes/box-1/commands?x=1");
+    // The child's own bearer is replaced, never forwarded.
+    // SAFETY: `fetch` was handed a plain object literal for `headers`, so
+    // reading it back as a flat string map is exact rather than hopeful.
+    expect((seen[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer account-wide-key");
+    expect(seen[0]!.init.body).toBe('{"command":"ls"}');
+  });
+
+  it("answers only a loopback caller holding a live grant", () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    const call = (over: Partial<Parameters<typeof handleBoxGatewayRequest>[0]>) =>
+      handleBoxGatewayRequest(
+        { method: "GET", url: `${BOX_GATEWAY_PATH}/boxes/box-1/files?path=/tmp/a`, remoteAddress: "127.0.0.1", ...over },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    return Promise.all([
+      expect(call({ remoteAddress: "10.0.0.7" }).then((r) => r.status)).resolves.toBe(403),
+      expect(call({}).then((r) => r.status)).resolves.toBe(401),
+      expect(call({ authorization: bearer("not-a-grant") }).then((r) => r.status)).resolves.toBe(401),
+      expect(call({ authorization: bearer(grant.token) }).then((r) => r.status)).resolves.toBe(200),
+    ]);
+  });
+
+  it("refuses operations outside the proxy's surface, so the key is never a general pass-through", async () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    const call = (method: string, tail: string) =>
+      handleBoxGatewayRequest(
+        { method, url: `${BOX_GATEWAY_PATH}/boxes/box-1/${tail}`, authorization: bearer(grant.token), remoteAddress: "127.0.0.1" },
+        // SAFETY: the gateway reads `cfg.box.token` and nothing else, and this
+        // test hands it one literal; a full AppConfig would only add sections
+        // the gateway never looks at.
+        { cfg: { box: { token: "account-wide-key" } } as never, fetchImpl: async () => new Response("{}") },
+      );
+
+    // Deleting a box, renaming one, and reading its account-wide listing all
+    // used to be reachable with the key the child held.
+    expect((await call("DELETE", "")).status).toBe(405);
+    expect((await call("PATCH", "")).status).toBe(405);
+    expect((await call("POST", "stop")).status).toBe(405);
+    expect((await call("GET", "")).status).toBe(200);
+    expect((await call("GET", "commands")).status).toBe(405);
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1", Date.now() + 5 * 60 * 60 * 1000).ok).toBe(false);
+  });
+
+  it("forgets a grant when it is revoked", () => {
+    resetBoxGatewayGrants();
+    const grant = mintBoxGatewayGrant("bot-1", "box-1", "");
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(true);
+    revokeBoxGatewayGrant(grant.token);
+    expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(false);
   });
 });

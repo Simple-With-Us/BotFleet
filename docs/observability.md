@@ -207,16 +207,52 @@ This is a separate product from the Sentry reporting above: the desktop app
 (Electron renderer, `src/lib/analytics.ts`) bundles PostHog and initializes
 it unconditionally on mount (`src/App.tsx`), **on by default**.  It sends a
 write-only client token (`phc_…`, safe to ship — it cannot read data back)
-to `us.i.posthog.com` with autocapture and pageview capture both off, and
-captures only two named events today: `app_first_open` (once, on first
-launch) and `app_opened` (every launch), plus a `platform` property and the
-identity created by an email-gate submission.  It never captures clicked-
-element text, message content, or transcripts.  An install can opt out at
-**Settings → General**, which calls `posthog.opt_out_capturing()` and drops
-anything already queued; the choice persists in `localStorage` and is
-checked before `posthog.init()` ever runs, so an opted-out install makes no
-request to PostHog at all, not even to load the library.  The iOS app is a
-different product with no analytics SDK at all — see
+to `us.i.posthog.com` with autocapture and pageview capture both off, so
+PostHog never captures clicked-element text, a URL route, or a page view.  It
+never captures message content or transcripts either — every `track()` call
+site passes counts, a driver id, or a step name, and no call site passes a
+message body.
+
+Seventeen named events are captured today.  Two are lifecycle, one is the
+email gate, four are onboarding and phone setup, and ten are feature use.
+
+| Event | Properties | Sent when |
+| --- | --- | --- |
+| `app_first_open` | `platform` | Once per install, on the first launch after `omb-installed` is absent |
+| `app_opened` | `platform` | Every launch |
+| `email_submitted` | — | A profile email is submitted through the email gate, alongside `posthog.identify(email, { email })` |
+| `email_skipped` | — | The email gate is dismissed without an address |
+| `onboarding_step` | `step` | The user advances an onboarding step |
+| `onboarding_completed` | `engines_available`, `mic` | Onboarding finishes; `engines_available` is the count of engines whose snapshot is `available` (`-1` when unknown) and `mic` is the microphone permission state or `n/a` |
+| `phone_setup_completed` | — | The phone-pairing step finishes |
+| `phone_setup_skipped` | — | The phone-pairing step is skipped |
+| `bot_created` | — | A bot is created |
+| `message_sent` | `room`, or `driver`, `queued`, `steerNow` | A message is sent or queued; `room: true` for a room message, otherwise the `driver` instance id |
+| `room_created` | `members`, `context` | A room is created; `members` is the chosen count and `context` whether it was started from a section |
+| `room_members_changed` | `members`, `added`, `removed` | A room's member list is saved |
+| `call_started` | `driver` | A one-to-one call starts |
+| `group_call_started` | `memberCount` | A group call starts |
+| `team_imported` | `members`, `source`, `mode` | A team is imported, including from a scout |
+| `team_exported` | `members`, `scope` | A team is exported |
+| `team_scouted` | `signals` | A team scout runs |
+
+`platform` is `desktop` under Electron and `browser` otherwise.  Only
+`email_submitted` is paired with `posthog.identify(email, { email })`, so a
+PostHog person profile exists only for an install that supplied an address;
+`person_profiles` is `identified_only`, so an install that never supplied one
+is never given a profile at all.
+
+The counts above are counts — how many bots, how many members, how many
+signals.  `message_sent` carries the instance id of the driver that ran the
+turn, never the text it was given or the text it produced.
+
+An install can opt out at **Settings → General**, which calls
+`posthog.opt_out_capturing()` and drops anything already queued; the choice
+persists in `localStorage` and is checked before `posthog.init()` ever runs,
+so an opted-out install makes no request to PostHog at all, not even to load
+the library.  `identifyEmail()` re-checks the opt-out itself, because the
+email address is the one value on this list that identifies a person.  The
+iOS app is a different product with no analytics SDK at all — see
 [iOS privacy](ios-privacy.md).
 
 ## What is intentionally out of scope

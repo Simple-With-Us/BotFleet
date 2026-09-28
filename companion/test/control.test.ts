@@ -8,6 +8,7 @@ import { type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createControlServer, hostCandidates, originIsLoopback } from "../src/control.ts";
+import { readLanPolicy } from "../src/lan-policy.ts";
 import { DeviceRegistry } from "../src/devices.ts";
 
 let control: Server;
@@ -47,6 +48,11 @@ beforeAll(async () => {
       disconnectedDeviceIds.push(deviceId);
       connectedDeviceIds = connectedDeviceIds.filter((connectedId) => connectedId !== deviceId);
     },
+    // S11: the device port binds loopback unless an operator says otherwise,
+    // and this suite is about the ORDER of the host list rather than the
+    // default, so it runs with the port open.  The loopback-only default is
+    // pinned in lan-policy.test.ts.
+    lanPolicy: readLanPolicy("1"),
   });
   port = await new Promise<number>((resolve) =>
     control.listen(0, "127.0.0.1", () => resolve((control.address() as { port: number }).port)),
@@ -170,7 +176,11 @@ describe("hostCandidates", () => {
     // refuses plain HTTP to 100.64/10 and a candidate that can never succeed
     // only slows the walk down. The synthetic mDNS name is last — it resolves
     // only while the sidecar runs.
-    const hosts = hostCandidates(["100.121.5.6", "192.168.1.42", "10.0.0.7"], "macbook.tail1234.ts.net");
+    const hosts = hostCandidates(
+      ["100.121.5.6", "192.168.1.42", "10.0.0.7"],
+      "macbook.tail1234.ts.net",
+      readLanPolicy("1"),
+    );
     expect(hosts.slice(0, 3)).toEqual(["macbook.tail1234.ts.net", "192.168.1.42", "10.0.0.7"]);
     expect(hosts.at(-1)).toMatch(/^botfleet-[0-9a-f]{8}\.local$/);
     expect(hosts).not.toContain("100.121.5.6");
@@ -179,8 +189,9 @@ describe("hostCandidates", () => {
   it("skips the tailnet name when Tailscale is not part of the picture", () => {
     // A MagicDNS name left over from a cached read is only dialable while a
     // tailnet address exists; without one it would be a dead first candidate.
-    expect(hostCandidates(["192.168.1.42"], "stale.tail1234.ts.net")[0]).toBe("192.168.1.42");
-    expect(hostCandidates(["100.121.5.6", "192.168.1.42"], null)[0]).toBe("192.168.1.42");
+    const allowed = readLanPolicy("1");
+    expect(hostCandidates(["192.168.1.42"], "stale.tail1234.ts.net", allowed)[0]).toBe("192.168.1.42");
+    expect(hostCandidates(["100.121.5.6", "192.168.1.42"], null, allowed)[0]).toBe("192.168.1.42");
   });
 
   it("is what /state hands the pairing panel", async () => {

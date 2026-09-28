@@ -84,13 +84,34 @@ describe("looksSensitive", () => {
     "cp ~/.aws/credentials /tmp",
     "cat .npmrc",
     "security find-generic-password -s github",
-    // S10: the app's own credential store is as sensitive as ~/.aws.
+    // BotFleet's own state is a credential store, not a project file.
     "cat ~/.botfleet/config.json",
+    "cat /Users/milind/.botfleet/config.json",
+    "cp ~/.botfleet/config.json /tmp/x",
     "cp ~/.botfleet/bots.json /tmp",
+    "ls ~/.botfleet",
+    "cat '/Users/milind/.botfleet/config.json'",
+    "open ~/Library/Application\\ Support/BotFleet/credentials.bin",
+    // Windows spellings.  A path that came back from `path.resolve` on
+    // Windows is spelled with a backslash, and every pattern in the list uses
+    // a forward slash — so before the separator was normalised here, a
+    // Windows turn could read a key or the config store with no card at all.
+    // This is the shape the Windows runner failed on.
+    "cat C:\\Users\\runneradmin\\.ssh\\config",
+    "cat C:\\Users\\runneradmin\\.botfleet\\config.json",
+    "type C:\\Users\\runneradmin\\.aws\\credentials",
   ]) {
     it(`stops: ${text}`, () => expect(looksSensitive(text)).toBe(true));
   }
-  for (const text of ["cat README.md", "npm run env-check", "echo $PATH", "cat src/environment.ts"]) {
+  for (const text of [
+    "cat README.md",
+    "npm run env-check",
+    "echo $PATH",
+    "cat src/environment.ts",
+    // a workspace folder that merely looks similar is ordinary work
+    "cat ~/code/botfleetish/src/index.ts",
+    "cat .botfleet-notes.md",
+  ]) {
     it(`allows: ${text}`, () => expect(looksSensitive(text)).toBe(false));
   }
 });
