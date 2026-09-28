@@ -10914,6 +10914,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && path === "/api/local-computer") {
       return json(res, 200, await localVmPayload(SHARED_LOCAL_VM_TARGET));
     }
+    if (method === "GET" && path === "/api/vps-computer") {
+      return json(res, 200, await vps.vpsComputerStatus(cfg, "workspace"));
+    }
     m = path.match(/^\/api\/local-computer\/(pull|run|start|stop|remove)$/);
     if (m && method === "POST") {
       // Requiring JSON makes these localhost lifecycle mutations non-simple

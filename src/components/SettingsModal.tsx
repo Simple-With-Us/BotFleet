@@ -42,6 +42,7 @@ import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
+import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
 import { RemoteAccessSection } from "./RemoteAccessSection";
 import { Card } from "./SettingsPrimitives";
@@ -1248,6 +1249,7 @@ export function SettingsModal() {
                 <LocalComputerSection />
                 <BotComputerDefaults />
                 <LocalVmRuntimeCard />
+                <SharedVpsRuntimeCard />
               </>
             )}
 
