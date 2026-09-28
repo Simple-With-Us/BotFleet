@@ -3256,7 +3256,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           )}
           title="Drag to resize sidebar (double-click to reset)"
         >
-          <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
+          <div className="absolute inset-y-0 -left-2.5 -right-2.5" />
         </div>
       )}
     </aside>

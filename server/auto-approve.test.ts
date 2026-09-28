@@ -12,6 +12,7 @@ import {
   isCoarseApprovalKey,
   looksDestructive,
   looksSensitive,
+  offerableApprovalKey,
 } from "./auto-approve.ts";
 
 describe("looksDestructive", () => {
@@ -327,4 +328,44 @@ describe("isCoarseApprovalKey", () => {
     expect(verdict.source).toBe("destructive-guard");
     expect(verdict.rule).toContain("curl|wget");
   });
+
+  it("permits bot reading its own workspace memory files", () => {
+    expect(looksSensitive("read file /Users/jay/.botfleet/workspaces/d43849b8-5eeb-452b-ac4e-ed4724343838/MEMORY.md")).toBe(false);
+    expect(looksSensitive("cat ~/.botfleet/workspaces/bot-1/memory/topic.md")).toBe(false);
+    expect(looksSensitive("read file ~/.botfleet/config.json")).toBe(true);
+    expect(looksSensitive("cat /Users/jay/.botfleet/credentials.bin")).toBe(true);
+  });
+
+  describe("offerableApprovalKey", () => {
+    it("never offers Always allow for bare shell runners on the host", () => {
+      expect(offerableApprovalKey("Bash", "bash")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "bash -c 'ls'")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "sh script.sh")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "zsh")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "eval 'foo'")).toBeUndefined();
+    });
+
+    it("never offers Always allow for destructive commands", () => {
+      expect(offerableApprovalKey("Bash", "rm -rf /tmp/build")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "git push --force origin main")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "git reset --hard HEAD~1")).toBeUndefined();
+    });
+
+    it("never offers Always allow for sensitive access", () => {
+      expect(offerableApprovalKey("Bash", "cat .env")).toBeUndefined();
+      expect(offerableApprovalKey("read_file", "read file /Users/jay/.ssh/id_rsa")).toBeUndefined();
+    });
+
+    it("never offers Always allow for local-computer scope", () => {
+      expect(offerableApprovalKey("computer_click", "click button", "local-computer")).toBeUndefined();
+      expect(offerableApprovalKey("Bash", "git status", "local-computer")).toBeUndefined();
+    });
+
+    it("offers Always allow for safe, narrow, non-destructive tools", () => {
+      expect(offerableApprovalKey("Bash", "git status")).toBe("Bash:git");
+      expect(offerableApprovalKey("Bash", "npm test")).toBe("Bash:npm");
+      expect(offerableApprovalKey("Bash", "cargo check")).toBe("Bash:cargo");
+    });
+  });
 });
+

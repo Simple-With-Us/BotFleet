@@ -71,7 +71,21 @@ export function looksSensitive(text: string): boolean {
   // on Windows is spelled with `\`, so `.ssh\config` matched nothing and a
   // Windows turn could read a key without being asked.  Normalise once here
   // rather than teaching each pattern about both separators.
-  return matchFirst(SENSITIVE, text.replace(/\\/g, "/")) !== null;
+  const normalized = text.replace(/\\/g, "/");
+  // Bot workspaces live under ~/.botfleet/workspaces/<botId>/.
+  // Reading/writing files inside a bot's own workspace (such as MEMORY.md
+  // or memory/*.md) is standard bot desk work, not unauthorized access to
+  // the ~/.botfleet credentials store.
+  if (
+    /(^|[\s/"'])\.botfleet\/workspaces([/\\]|$|["'\s])/i.test(normalized) &&
+    !/(^|[\s/"'])\.botfleet\/(config\.json|credentials\.bin|backups|\.secrets|[a-z0-9_-]+\.once)/i.test(normalized)
+  ) {
+    const nonStoreRules = SENSITIVE.filter(
+      (r) => !r.source.includes("botfleet") && !r.source.includes("credentials\\.bin"),
+    );
+    return matchFirst(nonStoreRules, normalized) !== null;
+  }
+  return matchFirst(SENSITIVE, normalized) !== null;
 }
 
 export function looksDestructive(text: string): boolean {
@@ -159,6 +173,25 @@ export function coarseAlwaysAllowRefused(
     !(context?.scope === "disposable-computer" && /^mcp__computer__/.test(tool));
 }
 
+/** Decides whether an approval card should offer the user "Always allow".
+ *
+ * If an action is destructive, accesses sensitive credentials, or is a bare
+ * shell runner (`bash:bash`, `sh`, `zsh`, `eval`, `env`), "Always allow" is
+ * either refused server-side or dangerously wide. In those cases, we omit the
+ * option from the UI so users are never misled into attempting blanket grants. */
+export function offerableApprovalKey(
+  tool: string,
+  summary: string,
+  scope?: "local-computer" | "disposable-computer",
+): string | undefined {
+  if (scope === "local-computer") return undefined;
+  if (looksDestructive(summary) || looksDestructive(tool)) return undefined;
+  if (looksSensitive(summary)) return undefined;
+  const key = approvalKey(tool, summary, scope);
+  if (coarseAlwaysAllowRefused(key, { scope })) return undefined;
+  return key;
+}
+
 export interface AutoApprover {
   autoApprove?: boolean;
   alwaysAllow?: string[];
@@ -206,7 +239,7 @@ export function autoVerdict(
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
-  const sensitive = destructive ? null : matchFirst(SENSITIVE, summary);
+  const sensitive = destructive ? null : looksSensitive(summary) ? (matchFirst(SENSITIVE, summary) ?? "sensitive-file") : null;
   // The grant is computed even when a hard block will refuse it: the row
   // worth auditing is "this WOULD have auto-approved, and only the block
   // stood in the way", which cannot be told apart from an ordinary
