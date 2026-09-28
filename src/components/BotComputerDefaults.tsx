@@ -62,93 +62,8 @@ type ConsentRequest = {
   body: { botDefaults: DefaultsRequest };
 };
 
-const DESTINATION_LABEL: Record<Destination, string> = {
-  cloud: "ASCII.dev Box (VM)",
-  vm: "Local VM",
-  local: "This Computer",
-};
 
-const DESTINATIONS: Destination[] = ["cloud", "vm", "local"];
 
-/** Read-only view of the workspace allowlist in the legacy card.
- *
- * The Providers card (`<LocalComputerSection>`) owns this state and gates
- * every disable behind `<ComputerImpactConfirmModal>`, which lists the bots
- * that would lose a leg of their grant.  An editable copy here would let an
- * operator turn Cloud, Local VM or This Computer off with no such
- * confirmation, so this card only mirrors what the Providers card saved. */
-/** One row in the read-only summary. */
-type SummaryRow = { key: string; label: string; enabled: boolean };
-
-/** Rows for the read-only summary.  The per-provider shape splits the
- * legacy "cloud" destination into ASCII.dev Box and Self-hosted VPS, so
- * when the Providers card saved that shape each gets its own row: with
- * Box off and VPS on, the Box row must read "not allowed", matching the
- * Box toggle, instead of lighting up because the VPS keeps "cloud" open.
- * Installs that only have the legacy allowlist keep the three rows. */
-export function allowedSummaryRows(allowed: Destination[] | null, providers?: ComputerProviders | null): SummaryRow[] {
-  if (providers) {
-    return [
-      { key: "box", label: "ASCII.dev Box (VM)", enabled: providers.asciiBox === true },
-      { key: "vps", label: "Self-hosted VPS", enabled: providers.selfHostedVps === true },
-      { key: "vm", label: DESTINATION_LABEL.vm, enabled: providers.localVm === true },
-      { key: "local", label: DESTINATION_LABEL.local, enabled: providers.localMac === true },
-    ];
-  }
-  return DESTINATIONS.map((d) => ({
-    key: d,
-    label: DESTINATION_LABEL[d],
-    enabled: allowed === null || allowed.includes(d),
-  }));
-}
-
-/** Read-only view of the workspace allowlist in the legacy card.
- *
- * The Providers card (`<LocalComputerSection>`) owns this state and gates
- * every disable behind `<ComputerImpactConfirmModal>`, which lists the bots
- * that would lose a leg of their grant.  An editable copy here would let an
- * operator turn Cloud, Local VM or This Computer off with no such
- * confirmation, so this card only mirrors what the Providers card saved. */
-export function AllowedComputersSummary({
-  allowed,
-  providers,
-}: {
-  allowed: Destination[] | null;
-  providers?: ComputerProviders | null;
-}) {
-  const rows = allowedSummaryRows(allowed, providers);
-  const enabledCount = rows.filter((r) => r.enabled).length;
-  return (
-    <Card
-      title="Allowed Computers"
-      subtitle={"The destinations any bot in this workspace is allowed to use.\u00a0 This mirrors the Providers card above; change it there, where turning a provider off first shows which bots it affects."}
-    >
-      <div className="flex overflow-hidden rounded-lg border border-hairline/40" role="list">
-        {rows.map((row, i) => (
-          <div
-            key={row.key}
-            role="listitem"
-            aria-label={`${row.label}: ${row.enabled ? "allowed" : "not allowed"}`}
-            className={cn(
-              "flex-1 py-1.5 text-center text-[13px]",
-              i > 0 && "border-l border-hairline/40",
-              row.enabled ? "bg-control text-ink font-medium" : "text-ink-secondary",
-            )}
-          >
-            {row.label}
-          </div>
-        ))}
-      </div>
-      <div className="mt-2 text-[11.5px] text-ink-secondary">
-        {enabledCount === rows.length
-          ? "Every destination is allowed — the shipped default."
-          : enabledCount === 0
-            ? "No destination is allowed.\u00a0 Every bot is locked to its current choice (or auto) until you re-enable one."
-            : `${enabledCount} of ${rows.length} destinations allowed.\u00a0 A bot that picked a disabled destination keeps that choice, but the run is refused.`}
-      </div>
-    </Card>
-  );
-}
 
 export function BotComputerDefaults() {
   const { state, dispatch } = useStore();
@@ -250,7 +165,7 @@ export function BotComputerDefaults() {
     });
   };
 
-  const options: Array<[Destination, string]> = DESTINATIONS.map((d) => [d, DESTINATION_LABEL[d]]);
+
   // When the allowlist disables every destination, the workspace default
   // picker is showing the operator what would be applied if they ever
   // re-enabled a destination — and "Set all bots to default" will save it
@@ -259,58 +174,59 @@ export function BotComputerDefaults() {
   const allowedCount = allowed === null ? 3 : allowed.length;
   const applyDisabled = applying || saving || allowedCount === 0;
 
+  const activeBox = computers.includes("cloud") && backend === "box";
+  const activeVps = computers.includes("cloud") && backend === "vps";
+  const activeVm = computers.includes("vm");
+  const activeMac = computers.includes("local");
+
+  const toggleBox = () => {
+    if (activeBox) save({ computers: computers.filter((c) => c !== "cloud") });
+    else save({ computers: [...computers.filter((c) => c !== "cloud"), "cloud"], backend: "box" });
+  };
+
+  const toggleVps = () => {
+    if (activeVps) save({ computers: computers.filter((c) => c !== "cloud") });
+    else save({ computers: [...computers.filter((c) => c !== "cloud"), "cloud"], backend: "vps" });
+  };
+
+  const toggleVm = () => save({ computers: activeVm ? computers.filter((c) => c !== "vm") : [...computers, "vm"] });
+  const toggleMac = () => save({ computers: activeMac ? computers.filter((c) => c !== "local") : [...computers, "local"] });
+
+  const providersUI = [
+    { id: "asciiBox", label: "ASCII.dev Box (VM)", active: activeBox, toggle: toggleBox },
+    { id: "selfHostedVps", label: "Self-hosted VPS", active: activeVps, toggle: toggleVps, disabled: !vpsConfigured, title: !vpsConfigured ? "Add the VPS SSH alias under Connections first" : undefined },
+    { id: "localVm", label: "Local VM", active: activeVm, toggle: toggleVm },
+    { id: "localMac", label: "This Computer", active: activeMac, toggle: toggleMac },
+  ];
+
   return (
     <>
-      <AllowedComputersSummary allowed={allowed} providers={saved?.computerProviders ?? null} />
-
       <Card
         title="New Bots"
         subtitle={"Which computers a bot gets before anyone opens its settings.\u00a0 Pick more than one and it chooses per task.\u00a0 Leave all of them off to keep the shipped behavior: reuse whatever already exists, create nothing."}
       >
         <div className="flex overflow-hidden rounded-lg border border-hairline/40">
-          {options.map(([mode, label], i) => (
+          {providersUI.map((p, i) => (
             <button
-              key={mode}
-              disabled={saving}
-              onClick={() =>
-                save({ computers: computers.includes(mode) ? computers.filter((c) => c !== mode) : [...computers, mode] })
-              }
+              key={p.id}
+              disabled={saving || p.disabled}
+              title={p.title}
+              onClick={p.toggle}
               className={cn(
-                "flex-1 py-1.5 text-[13px]",
+                "flex-1 py-1.5 text-[12px]",
                 i > 0 && "border-l border-hairline/40",
-                saving && "opacity-60",
-                computers.includes(mode)
+                (saving || p.disabled) && "opacity-60",
+                p.disabled && "cursor-not-allowed",
+                p.active
                   ? "bg-control text-ink font-medium"
                   : "text-ink-secondary hover:bg-control/60 hover:text-ink",
               )}
             >
-              {label}
+              {p.label}
             </button>
           ))}
         </div>
-        {computers.includes("cloud") && (
-          <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
-            {(["box", "vps"] as const).map((option, i) => (
-              <button
-                key={option}
-                disabled={saving || (option === "vps" && !vpsConfigured)}
-                title={option === "vps" && !vpsConfigured ? "Add the VPS SSH alias under Connections first" : undefined}
-                onClick={() => save({ backend: option })}
-                className={cn(
-                  "flex-1 py-1.5 text-[12px]",
-                  i > 0 && "border-l border-hairline/40",
-                  option === "vps" && !vpsConfigured && "cursor-not-allowed opacity-40",
-                  backend === option
-                    ? "bg-control text-ink font-medium"
-                    : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-                )}
-              >
-                {option === "vps" ? "Self-hosted VPS" : "ASCII.dev Box (VM)"}
-              </button>
-            ))}
-          </div>
-        )}
-        {computers.includes("cloud") && !vpsConfigured && (
+        {!vpsConfigured && (
           <div className="mt-2 text-[11.5px] text-ink-secondary">
             To use Self-hosted VPS, add an SSH host alias in App Settings → Connections.
           </div>
