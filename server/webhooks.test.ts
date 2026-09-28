@@ -1653,6 +1653,17 @@ describe("WebhookManager", () => {
     expect(mergedResult).toMatchObject({ duplicate: false });
     expect(mergedResult.runId).toBeDefined();
 
+    // 71b. Deployer name matcher must not catch unrelated hooks containing the word "deployer"
+    const { webhook: unrelatedHook, secret: unrelatedSecret } = h.manager.create({
+      name: "S3 Deployer - Data Sync",
+      prompt: "Handle S3 sync completion events.",
+      botId: "maus-1",
+    });
+    const unrelatedResult = h.manager.receive(unrelatedHook.endpointId, unrelatedSecret, unmergedClosedPr);
+    expect(unrelatedResult).toMatchObject({ duplicate: false });
+    expect(unrelatedResult.runId).toBeDefined();
+
+
     const inProgressCheck = {
       eventName: "check_run",
       deliveryId: "check-1",
