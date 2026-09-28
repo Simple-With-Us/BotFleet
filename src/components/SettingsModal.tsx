@@ -116,6 +116,34 @@ function ProfileFields() {
   );
 }
 
+/** A finished Test Setup result.  `tunnel` is present only once the server
+ *  has actually paired a tunnel, which is why it is optional rather than
+ *  empty. */
+interface IngressTestResult {
+  kind: "ok" | "error";
+  reason: string;
+  tunnel?: string;
+}
+
+/** The two companion-sidecar calls this component makes.  `src/types/ogb.d.ts`
+ *  does not carry the `companion` member, so the contract is named here
+ *  instead of reaching for `window as any` at each of the three call sites. */
+interface CompanionTunnelBridge {
+  state(): Promise<{ url?: string }>;
+  /** The pairing result is not part of this component's contract: the caller
+   *  fires and forgets, and the poll below is what reports the outcome. */
+  tryCloudflare(enabled: boolean): Promise<void>;
+}
+
+/** The companion tunnel bridge, or undefined off the desktop. */
+function companionTunnel(): CompanionTunnelBridge | undefined {
+  // SAFETY: `companion` is declared unconditionally on the preload's `ogb`
+  // object (electron/preload.cjs), so in the packaged app the member and both
+  // methods are present; the browser build injects no `ogb` at all, which is
+  // exactly what the optional chain is for.
+  return (window.ogb as { companion?: CompanionTunnelBridge } | undefined)?.companion;
+}
+
 function CustomIngressFields() {
   const { state, dispatch } = useStore();
   // The persisted value drives the toggle and the input; the toggle defaults
@@ -136,8 +164,7 @@ function CustomIngressFields() {
   const [test, setTest] = useState<
     | null
     | { kind: "running" }
-    | { kind: "ok"; reason: string; tunnel?: string }
-    | { kind: "error"; reason: string; tunnel?: string }
+    | IngressTestResult
   >(null);
   // Save failures render next to the Save button, not into the Test Setup
   // slot above -- the two actions are independent, so a failed Save must
@@ -147,7 +174,7 @@ function CustomIngressFields() {
 
   useEffect(() => {
     let active = true;
-    const bridge = (window as any).ogb?.companion;
+    const bridge = companionTunnel();
     if (!bridge) return;
 
     // Poll the companion state
@@ -157,7 +184,7 @@ function CustomIngressFields() {
         if (active && state?.url) {
           setTunnelUrl(state.url);
         }
-      } catch (e) {}
+      } catch {}
       if (active) setTimeout(poll, 2000);
     };
     poll();
@@ -239,13 +266,24 @@ function CustomIngressFields() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ publicUrl: candidate }),
       });
+      // SAFETY: this endpoint is owned by the app and always answers with
+      // this shape: `ok` plus a `reason`, and `tunnel` only after a pairing
+      // actually succeeded.
       const body = (await response.json()) as {
         ok: boolean;
         reason: string;
         tunnel?: string;
       };
       const reason = usingSavedFallback ? `${body.reason} (testing the saved URL -- the field is empty)` : body.reason;
-      setTest(body.ok ? { kind: "ok", reason, ...(body.tunnel ? { tunnel: body.tunnel } : {}) } : { kind: "error", reason, ...(body.tunnel ? { tunnel: body.tunnel } : {}) });
+      // Build the result first and attach the tunnel only when the server
+      // actually paired one, so the omitted key is a real omission rather
+      // than a property that spreads in as `{}`.
+      const outcome: IngressTestResult = {
+        kind: body.ok ? "ok" : "error",
+        reason,
+      };
+      if (body.tunnel) outcome.tunnel = body.tunnel;
+      setTest(outcome);
     } catch (cause) {
       setTest({ kind: "error", reason: cause instanceof Error ? cause.message : String(cause) });
     }
@@ -262,8 +300,9 @@ function CustomIngressFields() {
   const toggleFreeUrl = () => {
     const next = !useFreeUrl;
     setUseFreeUrl(next);
-    if ((window as any).ogb?.companion?.tryCloudflare) {
-      (window as any).ogb.companion.tryCloudflare(next).catch(() => {});
+    const companion = companionTunnel();
+    if (companion) {
+      companion.tryCloudflare(next).catch(() => {});
     }
   };
 
@@ -567,9 +606,14 @@ function ConversationModeRow() {
     setSaving(true);
     setPendingSimple(false);
     try {
+      // `mergeThreads` is absent rather than false when the caller did not
+      // ask for it, so each payload stays one the route actually documents.
+      const payload = mergeThreads
+        ? { conversationMode, mergeThreads: true }
+        : { conversationMode };
       const config: ConfigStatus = await api("/api/conversation-mode", {
         method: "PATCH",
-        body: JSON.stringify({ conversationMode, ...(mergeThreads ? { mergeThreads: true } : {}) }),
+        body: JSON.stringify(payload),
       });
       dispatch({ type: "configStatus", config });
     } catch {
@@ -667,7 +711,11 @@ function TerminologyRow() {
     () => current === "custom" && Boolean(stored?.plural),
   );
 
-  const save = async (body: Record<string, unknown>) => {
+  // The three callers below send exactly this shape: a preset choice sends
+  // only `terminology`, and a custom one adds the label pair.  Naming the
+  // values keeps the payload checkable here instead of handing the server a
+  // bag of unknowns it has to re-guess the shape of.
+  const save = async (body: { terminology: RoomTerminology; terminologyCustom?: RoomLabels }) => {
     if (saving) return;
     setSaving(true);
     try {

@@ -512,9 +512,13 @@ function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdd
     }
     const reader = new FileReader();
     reader.onload = () => {
-      if (typeof reader.result === "string") {
-        setIconUrl(reader.result);
-      }
+      // `readAsDataURL` hands back a data-URL string, but FileReader's result
+      // is allowed to be a buffer or nothing at all.  Take the URL only when
+      // one really arrived rather than narrowing on the representation and
+      // storing whatever shape turned up as an <img> source.
+      const { result } = reader;
+      if (result === null || result instanceof ArrayBuffer) return;
+      setIconUrl(result);
     };
     reader.readAsDataURL(file);
   };

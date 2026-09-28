@@ -3,6 +3,7 @@
 // the schema tests catch additions before they ship with a missing key
 // or a half-filled pricing block.
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import {
   CAPABILITY_CATEGORIES,
@@ -18,6 +19,7 @@ import {
   pricingModeLabel,
   uniqueModelToEngineId,
   type CapabilityKey,
+  type CapabilityState,
   type PricingMode,
 } from "./engine-capabilities.tsx";
 
@@ -65,8 +67,13 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // the row rather than rendering nothing.
     const seen = new Set<CapabilityKey>();
     for (const entry of Object.values(ENGINE_CAPABILITIES)) {
-      for (const key of Object.keys(entry.capabilities) as CapabilityKey[]) {
-        seen.add(key);
+      // Walk the declared vocabulary rather than `Object.keys`, so the keys
+      // collected here are CapabilityKey by construction instead of strings
+      // laundered into them.  A key an engine declares outside the vocabulary
+      // cannot reach this set, and the stray-key case is pinned separately
+      // below.
+      for (const key of CAPABILITY_KEYS) {
+        if (entry.capabilities[key] !== undefined) seen.add(key);
       }
     }
     for (const key of CAPABILITY_KEYS) {
@@ -99,7 +106,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
 
   it("fills in subscription.tierLabel for every subscription engine", () => {
     for (const [id, entry] of Object.entries(ENGINE_CAPABILITIES)) {
-      const pricing = entry.pricing as PricingMode;
+      const pricing = entry.pricing;
       if (pricing.kind === "subscription" || pricing.kind === "subscription+api") {
         expect(pricing.subscription.tierLabel.length, `${id} subscription.tierLabel`).toBeGreaterThan(0);
       }
@@ -130,7 +137,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // "audited: this engine cannot do it" — an underclaim that is
     // indistinguishable, to a reader, from the truth.  Now a key must be
     // declared, and "I have not checked" is spelled "unknown".
-    const states = new Set<string>(CAPABILITY_STATES);
+    const states = new Set<CapabilityState>(CAPABILITY_STATES);
     for (const id of ENGINE_DISPLAY_ORDER) {
       const entry = ENGINE_CAPABILITIES[id];
       for (const key of CAPABILITY_KEYS) {
@@ -140,14 +147,15 @@ describe("ENGINE_CAPABILITIES registry", () => {
           `${id}.capabilities.${key} is missing — declare a real state or "unknown"`,
         ).toBeDefined();
         expect(
-          states.has(state as string),
+          state !== undefined && states.has(state),
           `${id}.capabilities.${key} is "${state}", which is not a CapabilityState`,
         ).toBe(true);
       }
       // And no stray keys outside the vocabulary.
+      const declaredKeys: readonly string[] = CAPABILITY_KEYS;
       for (const key of Object.keys(entry.capabilities)) {
         expect(
-          (CAPABILITY_KEYS as string[]).includes(key),
+          declaredKeys.includes(key),
           `${id}.capabilities.${key} is not a declared CapabilityKey`,
         ).toBe(true);
       }
@@ -327,14 +335,32 @@ describe("ENGINE_CAPABILITIES registry", () => {
   });
 });
 
+/** The registry as JSON, parsed at its boundary.  The registry is
+ *  `JSON.stringify`d on its way to the server, so JSON is the shape it has,
+ *  and parsing it here is what lets the walk below branch on real values
+ *  instead of on representations. */
+const registryJson = z.json();
+type RegistryValue = z.infer<typeof registryJson>;
+const registryText = z.string();
+const registryBranch = z.record(z.string(), z.json());
+
 function registryStrings(): string[] {
   const strings: string[] = [];
-  const walk = (value: unknown) => {
-    if (typeof value === "string") strings.push(value);
-    else if (Array.isArray(value)) value.forEach(walk);
-    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  const walk = (value: RegistryValue) => {
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (value === null) return;
+    const branch = registryBranch.safeParse(value);
+    if (branch.success) {
+      Object.values(branch.data).forEach(walk);
+      return;
+    }
+    const text = registryText.safeParse(value);
+    if (text.success) strings.push(text.data);
   };
-  walk(ENGINE_CAPABILITIES);
+  walk(registryJson.parse(ENGINE_CAPABILITIES));
   return strings;
 }
 
