@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   McodeAgentDriver,
@@ -10,6 +10,7 @@ import {
   mcodeModelOptionValue,
   mcodePickerId,
   parseMcodeModelValue,
+  readMcodeModelCatalog,
   STATIC_MCODE_MODELS,
 } from "./mcode.ts";
 
@@ -30,14 +31,137 @@ function scratchHome(withConfig: boolean): string {
 }
 
 describe("STATIC_MCODE_MODELS", () => {
-  it("defaults to MiniMax-M3 with the M2.7 speed tier alongside", () => {
-    expect(STATIC_MCODE_MODELS).toEqual({
-      default: "MiniMax-M3",
-      options: [
-        { id: "MiniMax-M3", label: "MiniMax M3" },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed" },
-      ],
+  it("offers exactly the ids a live session advertises", () => {
+    // Every row here was read off a real mcode 0.5.5 session's advertised
+    // model config option, folded through mcodePickerId.  A row the session
+    // does not advertise fails the turn with an opaque "does not offer", so
+    // the shipped list is the advertised set and not a hand-written guess.
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3");
+    expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
+      "MiniMax-M3",
+      "MiniMax-M3-thinking",
+      "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M2.7-highspeed-thinking",
+      "MiniMax-M2.7-thinking",
+    ]);
+  });
+
+  it("resolves every shipped id against that same advertised set", () => {
+    // The catalog and the selector must agree, or the picker offers rows that
+    // cannot run.
+    const advertised = [
+      { id: "permissionMode", options: [] },
+      {
+        id: "model",
+        options: [
+          { value: "m:minimax:MiniMax-M3:v:", name: "M3" },
+          { value: "m:minimax:MiniMax-M3:v:thinking", name: "M3 · thinking" },
+          { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:", name: "M3.1-Flash-Preview" },
+          { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking", name: "flash · thinking" },
+          { value: "m:minimax:MiniMax-M2.7-highspeed:v:thinking", name: "M2.7 highspeed" },
+          { value: "m:minimax:MiniMax-M2.7:v:thinking", name: "M2.7" },
+        ],
+      },
+    ];
+    for (const option of STATIC_MCODE_MODELS.options) {
+      expect(mcodeModelOptionValue(option.id, advertised)).toEqual(expect.any(String));
+    }
+  });
+});
+
+describe("readMcodeModelCatalog", () => {
+  const writeConfig = (dir: string, body: string): void => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.yaml"), body, "utf8");
+  };
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), "omb-mcode-catalog-"));
+    scratchDirs.push(dataDir);
+  });
+
+  it("adopts the default the user's own config names, variant folded in", () => {
+    // A current install's config names the provider-qualified model and the
+    // mode; both fold into the picker id the same way mcodePickerId folds an
+    // advertised value.
+    writeConfig(
+      dataDir,
+      [
+        "defaultModel: minimax/MiniMax-M3.1-Flash-Preview",
+        "defaultModelVariant: thinking",
+        "defaultModelContextWindow: 1000000",
+      ].join("\n"),
+    );
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+    expect(catalog.options.find((o) => o.id === catalog.default)?.contextWindow).toBe(1_000_000);
+  });
+
+  it("never adopts a default that is not on offer", () => {
+    // Adopting it would send every turn to a row the picker never showed.
+    writeConfig(dataDir, ["defaultModel: minimax/MiniMax-M9-Imaginary", "defaultModelVariant: thinking"].join("\n"));
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3");
+  });
+
+  it("keeps the shipped rows rather than appending unverified ids", () => {
+    // A pre-session id cannot be verified: only a running session can say
+    // whether it advertises a matching value.
+    writeConfig(
+      dataDir,
+      ["provider:", "  minimax:", "    model_order:", "      - MiniMax-M4-Next"].join("\n"),
+    );
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
+    expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
+  });
+
+  it("keeps the shipped catalog when there is no config at all", () => {
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dataDir, "missing") });
+    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
+  });
+
+  it("survives a config that is unparseable or the wrong shape", () => {
+    writeConfig(dataDir, "defaultModel: [not, a, string]\n\tdefaultModelVariant: : :\n");
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
+    expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
+    expect(catalog.default).toBe("MiniMax-M3");
+  });
+});
+
+describe("parseMcodeModelValue — the advertised no-variant form", () => {
+  it("parses the empty-variant `v:` the CLI actually advertises", () => {
+    // mcode 0.5.5 advertises the plain (non-thinking) selection as
+    // `m:minimax:MiniMax-M3:v:` — a bare `v:` with an EMPTY variant, not the
+    // `u` suffix its own type suggests.  Rejecting that spelling made every
+    // no-variant model unselectable, including plain MiniMax-M3.
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:v:")).toEqual({
+      providerId: "minimax",
+      modelId: "MiniMax-M3",
     });
+  });
+
+  it("folds an empty variant to the same picker id the `u` spelling gives", () => {
+    const emptyVariant = parseMcodeModelValue("m:minimax:MiniMax-M3:v:");
+    const uSuffix = parseMcodeModelValue("m:minimax:MiniMax-M3:u");
+    expect(mcodePickerId(emptyVariant!)).toBe("MiniMax-M3");
+    expect(mcodePickerId(uSuffix!)).toBe("MiniMax-M3");
+  });
+
+  it("still reads a real variant", () => {
+    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M3:v:thinking");
+    expect(parsed?.variant).toBe("thinking");
+    expect(mcodePickerId(parsed!)).toBe("MiniMax-M3-thinking");
+  });
+
+  it("decodes percent-encoded segments", () => {
+    const parsed = parseMcodeModelValue("m:mini%20max:MiniMax%2DM3:v:high%20speed");
+    expect(parsed).toEqual({ providerId: "mini max", modelId: "MiniMax-M3", variant: "high speed" });
+  });
+
+  it("still rejects a value that is not a model selection", () => {
+    expect(parseMcodeModelValue("not-a-value")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:x:y:z")).toBeNull();
+    expect(parseMcodeModelValue(undefined)).toBeNull();
   });
 });
 

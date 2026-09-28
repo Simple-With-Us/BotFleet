@@ -11,6 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
+import { hasEngineSpendActivity, unpricedTurnCount } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
   it("maps unique model ids and leaves shared ids unmapped", () => {
@@ -204,3 +205,34 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
 });
 
 
+
+describe("engine spend activity", () => {
+  it("counts an engine that spent but could not be priced as having activity", () => {
+    // The case that mattered on a live Mac: `dsh` settled every turn and
+    // reported `cost: null`, so both dollars were zero and its row was hidden.
+    // Six of twelve bots ran on that engine. A blank row reads as no activity.
+    expect(hasEngineSpendActivity({ spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 40, unpricedTurns7d: 300 })).toBe(true);
+  });
+
+  it("still shows an engine that has only priced spend", () => {
+    expect(hasEngineSpendActivity({ spend5hUsd: 0.42, spend7dUsd: 3 })).toBe(true);
+  });
+
+  it("hides an engine that genuinely did nothing", () => {
+    expect(hasEngineSpendActivity({ spend5hUsd: 0, spend7dUsd: 0 })).toBe(false);
+    expect(hasEngineSpendActivity({ spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 0, unpricedTurns7d: 0 })).toBe(false);
+    expect(hasEngineSpendActivity(undefined)).toBe(false);
+  });
+
+  it("tolerates a payload from a build that predates the counters", () => {
+    // The state is hydrated from an API response, so a missing key must not
+    // read as NaN or throw.
+    expect(hasEngineSpendActivity({ spend5hUsd: 0, spend7dUsd: 0 } as never)).toBe(false);
+    expect(unpricedTurnCount({ spend5hUsd: 1, spend7dUsd: 1 })).toBe(0);
+  });
+
+  it("sums both windows for the coverage note", () => {
+    expect(unpricedTurnCount({ spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 7, unpricedTurns7d: 31 })).toBe(38);
+    expect(unpricedTurnCount(undefined)).toBe(0);
+  });
+});

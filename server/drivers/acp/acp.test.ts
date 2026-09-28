@@ -283,6 +283,8 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_CACHE_READ;
+    delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
     delete process.env.FAKE_ACP_STATE;
@@ -543,6 +545,60 @@ describe("ACP turns (fake CLI)", () => {
 
     const usage = recorder.events.find((e) => e.type === "thread.token-usage.updated");
     expect(usage).toMatchObject({ input: 10, output: 5 });
+  });
+
+  it("carries a cost the agent reported instead of hardcoding null", async () => {
+    // Every ACP settle path used to emit `cost: null` unconditionally, and
+    // rolling-spend drops a non-positive cost — so dsh, claude, codex and
+    // antigravity contributed nothing at all to the fleet's spend figure while
+    // the HTTP engines did.  A number the AGENT reported is provider truth and
+    // must survive to turn.completed.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_COST = "0.42";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.42 });
+    // Provider-reported, so it is an actual charge rather than an estimate.
+    expect(done).not.toMatchObject({ billingMode: "estimated" });
+  });
+
+  it("still reports a null cost when the agent reports none", async () => {
+    // A blank is honest. Inventing a price from a table here would be a worse
+    // lie, because these are subscription logins: an API-equivalent figure is
+    // an estimate, and `billingMode` exists to mark one as such.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-no-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: null });
+  });
+
+  it("folds cache reads into input rather than reporting them beside it", async () => {
+    // cachedInput is a SUBSET of input by contract, so a provider that reports
+    // the two separately must have its cache figure counted inside input —
+    // otherwise the same tokens are billed as both fresh and cached.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "4";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 14, output: 5, cachedInput: 4 } });
+    const live = recorder.events.find((e) => e.type === "thread.token-usage.updated");
+    expect(live).toMatchObject({ input: 14, output: 5, cachedInput: 4 });
+  });
+
+  it("drops a cache figure larger than the input it must sit inside", async () => {
+    // The two numbers contradict each other, so neither supports a split.
+    // Clamping the cache down and adding it in would invent a total; the
+    // honest reading is the input on its own with no cache claim at all.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "99";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-over", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 10, output: 5 } });
+    expect((done as { usage?: { cachedInput?: number } }).usage?.cachedInput).toBeUndefined();
   });
 
   it("passes ACP stdio flags and strips foreign provider keys from the child env", async () => {

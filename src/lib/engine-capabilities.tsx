@@ -641,9 +641,12 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     },
     defaultModels: [
       { id: "MiniMax-M3", display: "MiniMax M3", ctxTokens: 1_000_000 },
-      // Context length for the M2.7 speed tier is not published in the CLI's
-      // own catalog, so no figure is claimed here.
-      { id: "MiniMax-M2.7-highspeed", display: "MiniMax M2.7 Highspeed" },
+      { id: "MiniMax-M3-thinking", display: "MiniMax M3 · thinking", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash-Preview-thinking", display: "MiniMax M3.1 Flash Preview · thinking", ctxTokens: 1_000_000 },
+      // Context length for the M2.7 tiers is not published in the CLI's own
+      // catalog, so no figure is claimed here.
+      { id: "MiniMax-M2.7-highspeed-thinking", display: "MiniMax M2.7 Highspeed · thinking" },
+      { id: "MiniMax-M2.7-thinking", display: "MiniMax M2.7 · thinking" },
     ],
   },
 };
@@ -717,13 +720,8 @@ export const CAPABILITY_SHORT_LABELS = {
 
 /** What each capability actually means in BotFleet — which wiring stands
  *  behind it.  This is the copy the detail strip shows, so a reader learns
- *  what Connected Apps *is* instead of re-reading the engine's pitch.  A key
- *  may be absent — `capabilityNoteFor` falls through to the engine headline
- *  when it is — so this keeps the partial contract under a named owner rather
- *  than a mapped type that would hide the fallthrough. */
-export interface CapabilityNotes extends Partial<Record<CapabilityKey, string>> {}
-
-export const CAPABILITY_NOTES: CapabilityNotes = {
+ *  what Connected Apps *is* instead of re-reading the engine's pitch. */
+export const CAPABILITY_NOTES = {
   files:
     "Reading and writing files in the working folder.  Backed by the driver's own file tools, so the bot follows the same approval and permission rules as the rest of its turn.",
   terminal:
@@ -748,7 +746,7 @@ export const CAPABILITY_NOTES: CapabilityNotes = {
     "Posting into a shared room and reading the conversation around it, so a bot holds its place in a channel.",
   voiceChat:
     "Speaking to the user and hearing them back inside one turn.",
-};
+} satisfies Partial<Record<CapabilityKey, string>>;
 
 /** Resolve the sentence the detail strip shows for one (engine, capability)
  *  pair: the engine's own note wins, then the shared capability note, then

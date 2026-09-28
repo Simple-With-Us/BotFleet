@@ -382,8 +382,21 @@ function applyCost(span: SpanLike, cost: number | null | undefined, billingMode?
 /** Stop reasons that are never a crash on their own.  `host_control_policy`
  * is Antigravity refusing, fail-closed, to run a host-control turn under an
  * always-proceed tool policy — a verdict the person is shown, not a fault.
+ * `tool_round_limit` is the turn spending a ceiling the owner configured
+ * (`maxToolRounds`), which is the budget working as designed rather than a
+ * defect: paging on it buries real failures under a number the owner can
+ * change in Settings.  It still reaches the transcript, the routine receipt
+ * (`budget_exhausted`) and the Sentry breadcrumb trail below, so the signal
+ * is not lost — it just stops arriving as a crash.
  * "timeout" is deliberately absent: see `modelTimeoutTurns`. */
-const EXPECTED_TURN_STOPS = new Set(["auth_required", "cancelled", "interrupted", "host_control_policy"]);
+const EXPECTED_TURN_STOPS = new Set([
+  "auth_required",
+  "cancelled",
+  "interrupted",
+  "host_control_policy",
+  "tool_round_limit",
+]);
+
 
 /** Stop reasons a request-timeout turn can end with: the chat-completions
  * loop maps its `request_timeout` exit to "timeout", and "request_timeout"

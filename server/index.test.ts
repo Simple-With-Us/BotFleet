@@ -18,6 +18,7 @@ import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
+import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -241,6 +242,10 @@ beforeAll(async () => {
         // adapter from bot.modelSelection stops the wrong engine.
         claude2: { driver: "claudeAgent", displayName: "Fixture Claude Two", config: { cli: FAKE_CLAUDE_CLI } },
         crasher: { driver: "claudeAgent", displayName: "Fixture Crasher", config: { cli: fakeCrashCli } },
+        // A binary that does not exist: every dispatch to it fails setup
+        // (spawn ENOENT surfaces as runtime.error with setup: true on an ACP
+        // driver), which is what opens the doomed-dispatch breaker for real.
+        deadCli: { driver: "grokAgent", displayName: "Fixture Dead CLI", config: { cli: join(home, "no-such-cli") } },
         quota: { driver: "claudeAgent", displayName: "Fixture Quota", enabled: false, config: { cli: fakeQuotaCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
         secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
@@ -2281,6 +2286,71 @@ describe("harness HTTP API", () => {
         );
         return state?.busy;
       }).toBe(false);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
+    // Regression: selectTurnFallback only skipped a doomed engine when its
+    // caller threaded botId, and the production mid-turn call did not - so a
+    // bot whose primary failed over cleanly was still handed a second dead
+    // engine.  The breaker state is built the way production builds it:
+    // deadCli's binary does not exist, every dispatch to it fails setup
+    // (spawn ENOENT), and the bus feeds three consecutive failures into the
+    // breaker for THIS bot only.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const deadCli = instances.find((instance: { instanceId: string }) => instance.instanceId === "deadCli");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "deadCli", model: deadCli.models.default },
+      })).status).toBe(200);
+      for (let i = 0; i < DOOMED_FAILURE_THRESHOLD; i++) {
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "go" })).status).toBe(202);
+        await expect.poll(async () => {
+          const doomed = (await api("GET", "/api/quotas")).body.doomed ?? [];
+          return (doomed.find((entry: { botId: string; instanceId: string; consecutiveFailures: number }) =>
+            entry.botId === bot.id && entry.instanceId === "deadCli",
+          )?.consecutiveFailures) ?? 0;
+        }, { timeout: 10_000 }).toBe(i + 1);
+      }
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "deadCli", model: deadCli.models.default },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail then hang" })).status).toBe(202);
+
+      // The fail-over must walk past the doomed deadCli and land on claude:
+      // the fallback's own selection is patched onto the bot, so the live
+      // winner is visible without parsing the chip text.
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 20_000 }).toBe("claude");
+      const state = (await api("GET", "/api/bots")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith("Fell over to"),
+      )).toBe(true);
+      // ...and the walk never touched the doomed entry: without the botId
+      // threading, the first chip names deadCli's model and the turn burns
+      // one guaranteed-dead dispatch before walking on.
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith(`Fell over to ${deadCli.models.default}`),
+      )).toBe(false);
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
@@ -6108,6 +6178,33 @@ describe("GET /api/quotas", () => {
     expect(data.ok).toBe(true);
     expect(Array.isArray(data.cooldowns)).toBe(true);
     expect(data.cooldowns.find((c) => c.instanceId === "codex")).toBeUndefined();
+  });
+
+  // A bot whose engine cannot start is refused by the dispatcher and its run
+  // stays QUEUED, which from the outside is indistinguishable from a bot that
+  // is merely busy — so "the queue is not draining" had no way to name the
+  // cause.  Pinned as a sibling of cooldowns rather than folded into it:
+  // quota says an engine is spent, doomed says it never came up, and telling
+  // those apart is the whole point of the field.
+  it("reports the doomed (bot, engine) pairs beside the quota cooldowns", async () => {
+    const res = await fetch(`${BASE}/api/quotas`);
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      ok: boolean;
+      doomed: Array<{ botId: string; instanceId: string; consecutiveFailures: number }>;
+    };
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.doomed)).toBe(true);
+    // The failover regression above deliberately opens the breaker for a bot
+    // it then deletes, and the registry keeps the count afterwards (that
+    // retention is the half-open design), so emptiness holds for LIVE bots.
+    // The assertion that matters is that the key EXISTS and holds the live
+    // registry's shape: a missing field would read as "nothing is doomed"
+    // rather than "this build does not say", and that is the failure the audit
+    // ran into.
+    const liveBots = (await (await fetch(`${BASE}/api/bots`)).json()) as { bots: Array<{ id: string }> };
+    const liveBotIds = new Set(liveBots.bots.map((bot) => bot.id));
+    expect(data.doomed.filter((entry) => liveBotIds.has(entry.botId))).toEqual([]);
   });
 });
 
