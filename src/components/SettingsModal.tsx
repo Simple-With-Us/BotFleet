@@ -1568,7 +1568,7 @@ export function SettingsModal() {
                 </Card>
               )}
 
-              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />}
+              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
 
               {section === "engines" && (
                 <Card
