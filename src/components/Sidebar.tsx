@@ -1770,7 +1770,7 @@ function BotContextMenu({
   );
 }
 
-function BotListItem({
+export function BotListItem({
   bot,
   density,
   onMenu,
@@ -1788,6 +1788,14 @@ function BotListItem({
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const iconOnly = density === "icons";
+  const pointerDownPos = useRef<{ x: number; y: number } | null>(null);
+  const isDragging = useRef(false);
+
+  const selectBot = () => {
+    dispatch({ type: "select", id: bot.id });
+    window.dispatchEvent(new CustomEvent("focus-composer"));
+  };
+
   useEffect(() => {
     if (iconOnly) setRenaming(false);
   }, [iconOnly]);
@@ -1803,7 +1811,7 @@ function BotListItem({
   // the fallback for plain busy work, nothing for idle.
   const StatusIcon = waitReason ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert) : bot.busy ? Loader2 : null;
   const rowClass = cn(
-    "flex w-full items-center rounded-xl border text-left",
+    "flex w-full items-center rounded-xl border text-left select-none cursor-pointer",
     iconOnly
       ? "justify-center px-1 py-1.5"
       : density === "compact"
@@ -1819,18 +1827,20 @@ function BotListItem({
   );
   const body = (
     <>
-      <BotAvatar
-        bot={bot}
-        state={stateForBot({ ...bot, messages: visible })}
-        size={avatarSize}
-        motion={mascotMotion?.kind ?? "none"}
-        motionKey={mascotMotion?.nonce ?? 0}
-        // Motion means something is happening. A resting bot holds a resting
-        // pose — N idle rows bobbing at display rate was most of the app's
-        // visible-idle CPU (states are keyword-derived, so "working" can be
-        // decorative; busy/unread/motion are the real signals).
-        animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
-      />
+      <div className="shrink-0 pointer-events-none">
+        <BotAvatar
+          bot={bot}
+          state={stateForBot({ ...bot, messages: visible })}
+          size={avatarSize}
+          motion={mascotMotion?.kind ?? "none"}
+          motionKey={mascotMotion?.nonce ?? 0}
+          // Motion means something is happening. A resting bot holds a resting
+          // pose — N idle rows bobbing at display rate was most of the app's
+          // visible-idle CPU (states are keyword-derived, so "working" can be
+          // decorative; busy/unread/motion are the real signals).
+          animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
+        />
+      </div>
       <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[15px] font-semibold text-ink">
@@ -1840,6 +1850,8 @@ function BotListItem({
               value={bot.name}
               onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
               onEditingChange={setRenaming}
+              onActivate={selectBot}
+              embedded
               className="truncate"
               inputClassName="w-full rounded bg-inset px-1 py-0.5 text-[15px] font-semibold"
             />
@@ -1863,8 +1875,8 @@ function BotListItem({
             </span>
           )}
         </div>
-        <div className="flex items-center justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary">
+        <div className="flex items-center justify-between gap-2 select-none">
+          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary select-none">
             {bot.chiefOfStaff && !bot.busy && !waitReason && (
               <span className="flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-accent">
                 <Crown size={11} /> Chief of Staff
@@ -1883,7 +1895,7 @@ function BotListItem({
                 className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
               />
             )}
-            <span className={cn("truncate", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
+            <span className={cn("truncate select-none", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
               {previewText}
             </span>
           </span>
@@ -1980,15 +1992,21 @@ function BotListItem({
     <div
       draggable
       onDragStart={(event) => {
+        isDragging.current = true;
+        pointerDownPos.current = null;
         event.dataTransfer.setData(ROSTER_DRAG_TYPE, JSON.stringify({ kind: "bot", id: bot.id }));
         event.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={() => {
+        isDragging.current = false;
+        pointerDownPos.current = null;
       }}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
       onDrop={onDrop}
       className={cn(
-        "group relative rounded-xl transition-all",
+        "group relative rounded-xl transition-all select-none",
         isDragTarget && THREAD_DROP_CLASS,
       )}
       title={iconOnly ? bot.name : undefined}
@@ -1997,14 +2015,29 @@ function BotListItem({
         role="button"
         tabIndex={0}
         aria-label={iconOnly ? bot.name : undefined}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          pointerDownPos.current = { x: event.clientX, y: event.clientY };
+          isDragging.current = false;
+        }}
+        onPointerUp={(event) => {
+          if (event.button !== 0 || isDragging.current || !pointerDownPos.current) return;
+          const dx = Math.abs(event.clientX - pointerDownPos.current.x);
+          const dy = Math.abs(event.clientY - pointerDownPos.current.y);
+          pointerDownPos.current = null;
+          if (dx < 6 && dy < 6) {
+            selectBot();
+          }
+        }}
         onClick={() => {
-        dispatch({ type: "select", id: bot.id });
-        window.dispatchEvent(new CustomEvent("focus-composer"));
-      }}
+          if (!isDragging.current) {
+            selectBot();
+          }
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            dispatch({ type: "select", id: bot.id });
+            selectBot();
           }
         }}
         onContextMenu={onContextMenu}
