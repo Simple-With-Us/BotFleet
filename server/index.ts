@@ -43,7 +43,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, offerableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -123,6 +123,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
@@ -2498,7 +2499,12 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   localVmActiveThreads.set(target.key, { threadId, botId });
   localVmIdleFor(target).touch();
-  const localVm = await containerComputerStatus(undefined, undefined, target);
+  let localVm = await containerComputerStatus(undefined, undefined, target);
+  try {
+    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
+  }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
   }
@@ -2807,15 +2813,21 @@ bus.subscribe((event: RuntimeEvent) => {
           requestId: event.requestId,
           tool: permission ? event.tool : undefined,
           // the exact grant "always allow" would remember, decided here so
-          // client and server can never derive it differently
+          // client and server can never derive it differently. Bare shell
+          // runners, destructive operations, and sensitive paths are never
+          // offered as "Always allow" grants.
           allowKey:
-            permission && event.approvalScope !== "local-computer"
-              ? approvalKey(event.tool, event.summary, event.approvalScope)
+            permission
+              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
-          // in auto mode a card can only mean the guard stopped it — say so
+          // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
             permission && asker?.autoApprove
-              ? "This looked destructive, so auto mode stopped to ask."
+              ? verdict?.source === "destructive-guard"
+                ? "This looked destructive, so auto mode stopped to ask."
+                : verdict?.source === "sensitive-guard"
+                  ? "This touched sensitive files or credentials, so auto mode stopped to ask."
+                  : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
         },
@@ -4179,7 +4191,17 @@ async function startTurn(
             botFleetStatusSystemPrompt(),
           )
         : integrations.agents && sectionPeers.length > 0
-          ? "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
+          ? [
+              "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply" +
+                (availableAgentTools.includes("delegate_bot")
+                  ? ", and delegate_bot assigns an asynchronous task to a specialist peer."
+                  : "."),
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using " +
+                (availableAgentTools.includes("delegate_bot")
+                  ? "delegate_bot (preferred) or ask_bot"
+                  : "ask_bot") +
+                " rather than stopping without action.",
+            ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools);
       const routinePrompt = routinePromptFor(availableAgentTools);
@@ -4279,6 +4301,7 @@ async function startTurn(
             // The room lane passes the same flag.  A driver-loop engine holds
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
+            hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -6204,6 +6227,7 @@ async function runGroupMemberTurn(
         boxAgent: instance.driverKind === "boxAgent",
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
+        hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the
@@ -8686,6 +8710,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return routines!.remove(routineMatch[1])
         ? json(res, 200, { ok: true })
         : json(res, 404, { error: "no such routine" });
+    }
+    // Acknowledge the whole unseen-failure backlog in one call.  A trigger
+    // that has been failing for a week leaves hundreds of old failures that
+    // cannot each be clicked in the calendar, and a badge that cannot be
+    // cleared stops being read.  Acknowledged runs keep their status and
+    // history; the next failure raises the count again.
+    if (path === "/api/routine-runs/seen" && method === "POST") {
+      const { acknowledged, runs } = routines!.markAllSeen();
+      return json(res, 200, { acknowledged, runs });
     }
     const runMatch = path.match(/^\/api\/routine-runs\/([\w-]+)\/(cancel|seen)$/);
     if (runMatch && method === "POST") {
@@ -11318,17 +11351,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.localVm} is turned off in Computer settings` });
       }
       const target = localVmTargetForBot(bot.id);
-      if (target.key === SHARED_LOCAL_VM_TARGET.key) {
-        return json(res, 409, { error: "Shared mode manages this desktop in App Settings → Local VM" });
-      }
       if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
-        return json(res, 409, { error: "this bot's Local VM setup action is still running" });
+        return json(res, 409, { error: "this Local VM setup action is still running" });
       }
       if (action === "run" && localVmProvisionBusy) {
-        return json(res, 409, { error: "another per-bot Local VM is being created — retry after it finishes" });
+        return json(res, 409, { error: "another Local VM is being created — retry after it finishes" });
       }
       const vmOwner = localVmLeaseFor(target).current(localVmOwnerBusy);
-      if (vmOwner) return json(res, 409, { error: "this bot is using its Local VM — stop the turn first" });
+      if (vmOwner) return json(res, 409, { error: "this Local VM is in use — stop the turn first" });
       // Fence this target, and the cross-target capacity decision for creates,
       // before the first await so two requests cannot both pass the limit.
       localVmLifecycleBusy.add(target.key);

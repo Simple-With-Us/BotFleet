@@ -16,6 +16,13 @@ interface VpsStatus {
   problem: string | null;
 }
 
+/** Which face of the card a workspace gets: the live shared-runtime
+ * panel, the per-bot caption, or nothing (VPS not configured). */
+export function sharedVpsCardMode(vpsConfigured: boolean, vpsMode: string | null | undefined): "shared" | "per-bot" | "hidden" {
+  if (!vpsConfigured) return "hidden";
+  return vpsMode === "shared" ? "shared" : "per-bot";
+}
+
 export function SharedVpsRuntimeCard() {
   const { state } = useStore();
   const [status, setStatus] = useState<VpsStatus | null>(null);
@@ -62,8 +69,26 @@ export function SharedVpsRuntimeCard() {
     };
   }, [refresh, vpsConfigured, vpsMode]);
 
-  if (!vpsConfigured || vpsMode !== "shared") {
+  if (!vpsConfigured) {
     return null;
+  }
+
+  // Per-bot is a live server mode with no settings control (the mode row
+  // was simplified away; enabling the provider here always picks shared).
+  // Say which mode the workspace is in instead of painting nothing, so an
+  // operator looking at a per-bot workspace is not left guessing.
+  if (vpsMode !== "shared") {
+    return (
+      <Card
+        title="Self-hosted VPS"
+        subtitle="This workspace runs bots on your own VPS."
+      >
+        <div className="text-[13px] text-ink-secondary">
+          Per-bot mode: each bot gets its own VPS container.{" "} The VPS mode is set in the server
+          config (<code>botDefaults.vpsMode</code>); there is no settings control for it.
+        </div>
+      </Card>
+    );
   }
 
   const unavailable = Boolean(error);

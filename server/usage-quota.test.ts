@@ -171,7 +171,7 @@ describe("usage quota mapping", () => {
       id: "dsh-window",
       provider: "dsh",
       sourceApp: "dsh",
-      label: "DeepSeek Harness",
+      label: "Harness",
     };
     expect(driverKindsForWindow(dshWindow)).toEqual(["dshAgent"]);
   });

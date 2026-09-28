@@ -457,7 +457,12 @@ export interface ConfigStatus {
     vpsMode?: "shared" | "per-bot" | null;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
-  localVm: { mode: "shared" | "per-bot"; maxInstances: number };
+  localVm: {
+    mode: "shared" | "per-bot";
+    maxInstances: number;
+    shareCliCredentials?: boolean;
+    allowHostTerminal?: boolean;
+  };
   opencodeGo?: { configured: boolean };
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
@@ -889,6 +894,7 @@ export type Action =
   | { type: "runRoutine"; routineId: string }
   | { type: "cancelRoutineRun"; runId: string }
   | { type: "markRoutineRunSeen"; runId: string }
+  | { type: "acknowledgeAllAttention" }
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
@@ -1872,6 +1878,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case "cancelRoutineRun":
     case "markRoutineRunSeen":
       return state;
+    case "acknowledgeAllAttention":
+      return state;
   }
 }
 
@@ -2219,6 +2227,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "markRoutineRunSeen":
           api(`/api/routine-runs/${action.runId}/seen`, { method: "POST" }).catch(showError);
+          break;
+        case "acknowledgeAllAttention":
+          // Apply the acknowledged runs from the response as well as from the
+          // server's own run frames: an upsert by id either way, and the badge
+          // clears immediately instead of waiting on the event stream.
+          void api("/api/routine-runs/seen", { method: "POST" })
+            .then((body) => {
+              for (const run of (body?.runs ?? []) as RoutineRun[]) rawDispatch({ type: "routineRunPatched", run });
+            })
+            .catch(showError);
           break;
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })

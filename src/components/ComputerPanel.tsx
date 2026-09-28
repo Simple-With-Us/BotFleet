@@ -218,13 +218,6 @@ export function ComputerPanel({
       setPhase("off");
       return;
     }
-    if ((bot.computers ?? []).includes("local")) {
-      if (!providerSupportsLocal) {
-        setError("This model engine has no approval channel for actions on this computer, so it cannot control it.  Choose another engine, or another destination.");
-      }
-      setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
-      return;
-    }
     if ((bot.computers ?? []).includes("vm")) {
       if (!vmSupported) {
         setError("This model engine cannot use the Local VM. Choose Claude or an ACP engine.");
@@ -260,8 +253,8 @@ export function ComputerPanel({
           }
           else {
             const canCreateHere =
-              status.mode === "per-bot" &&
-              status.container === "missing" &&
+              (status.mode === "per-bot" || status.mode === "shared") &&
+              (status.container === "missing" || status.container === "stopped") &&
               status.image &&
               status.create_supported;
             setError(canCreateHere ? null : `${status.problem ?? "The Local VM is not ready"}.  Open App Settings → Computers.`);
@@ -281,6 +274,13 @@ export function ComputerPanel({
     if ((bot.computers ?? []).includes("cloud") && !cloudSupported) {
       setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the Computer engine.");
       setPhase("error");
+      return;
+    }
+    if ((bot.computers ?? []).includes("local") && !(bot.computers ?? []).includes("cloud")) {
+      if (!providerSupportsLocal) {
+        setError("This model engine has no approval channel for actions on this computer, so it cannot control it.  Choose another engine, or another destination.");
+      }
+      setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
       return;
     }
     if (!(bot.computers ?? []).includes("cloud") && !capabilitiesReady) return;
@@ -659,11 +659,16 @@ export function ComputerPanel({
 
   const runVmAction = async (action: "vm-create" | "vm-recreate" | "vm-delete") => {
     if (
-      (action === "vm-recreate" || action === "vm-delete") &&
+      action === "vm-delete" &&
       !window.confirm(
-        action === "vm-delete"
-          ? `Delete ${bot.name}'s Local VM? Its private durable workspace will remain.`
-          : `Replace ${bot.name}'s Local VM? Its private durable workspace will remain.`,
+        `Delete ${bot.name}'s Local VM? Its private durable workspace will remain.`,
+      )
+    ) return;
+    if (
+      action === "vm-recreate" &&
+      vmStatus?.container === "running" &&
+      !window.confirm(
+        `Replace ${bot.name}'s Local VM? Its private durable workspace will remain.`,
       )
     ) return;
     setPending(action);
@@ -737,7 +742,7 @@ export function ComputerPanel({
     "vps-incompatible": "This VPS computer belongs to an earlier BotFleet version",
     "vps-stopped": "The managed VPS computer is stopped",
     "local-unavailable": localDisabledReason ?? "Local computer control isn't ready.",
-    "vm-unavailable": "The Local VM isn't available for this bot",
+    "vm-unavailable": vmStatus?.container === "stopped" ? "The Local VM is stopped" : "The Local VM isn't available for this bot",
     off: "This bot's computer is off",
     error: "Couldn't reach the computer",
   } satisfies Record<Exclude<Phase, "ready" | "local" | "vm">, string>;
@@ -859,7 +864,7 @@ export function ComputerPanel({
                 </button>
               )}
               {phase === "vm-unavailable" && (
-                vmStatus?.mode === "per-bot" && vmStatus.image && vmStatus.create_supported ? (
+                vmStatus?.image && vmStatus.create_supported ? (
                   <button
                     onClick={() => void runVmAction(vmStatus.container === "missing" ? "vm-create" : "vm-recreate")}
                     disabled={pending !== null}
@@ -868,7 +873,9 @@ export function ComputerPanel({
                     {(pending === "vm-create" || pending === "vm-recreate") && (
                       <Loader2 size={13} className="mr-1.5 inline animate-spin" />
                     )}
-                    {vmStatus.container === "missing" ? `Create ${bot.name}'s VM` : `Replace ${bot.name}'s VM`}
+                    {vmStatus.container === "missing"
+                      ? (vmStatus.mode === "shared" ? "Prepare Local VM" : `Create ${bot.name}'s VM`)
+                      : (vmStatus.container === "stopped" ? "Start Local VM" : `Replace ${bot.name}'s VM`)}
                   </button>
                 ) : (
                   <button

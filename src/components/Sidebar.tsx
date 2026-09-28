@@ -62,6 +62,8 @@ import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
+import { attentionWindowLabel, summarizeAttention } from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
@@ -1768,7 +1770,7 @@ function BotContextMenu({
   );
 }
 
-function BotListItem({
+export function BotListItem({
   bot,
   density,
   onMenu,
@@ -1786,6 +1788,13 @@ function BotListItem({
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const iconOnly = density === "icons";
+  const isDragging = useRef(false);
+
+  const selectBot = () => {
+    dispatch({ type: "select", id: bot.id });
+    window.dispatchEvent(new CustomEvent("focus-composer"));
+  };
+
   useEffect(() => {
     if (iconOnly) setRenaming(false);
   }, [iconOnly]);
@@ -1801,7 +1810,7 @@ function BotListItem({
   // the fallback for plain busy work, nothing for idle.
   const StatusIcon = waitReason ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert) : bot.busy ? Loader2 : null;
   const rowClass = cn(
-    "flex w-full items-center rounded-xl border text-left",
+    "flex w-full items-center rounded-xl border text-left select-none cursor-pointer",
     iconOnly
       ? "justify-center px-1 py-1.5"
       : density === "compact"
@@ -1817,18 +1826,20 @@ function BotListItem({
   );
   const body = (
     <>
-      <BotAvatar
-        bot={bot}
-        state={stateForBot({ ...bot, messages: visible })}
-        size={avatarSize}
-        motion={mascotMotion?.kind ?? "none"}
-        motionKey={mascotMotion?.nonce ?? 0}
-        // Motion means something is happening. A resting bot holds a resting
-        // pose — N idle rows bobbing at display rate was most of the app's
-        // visible-idle CPU (states are keyword-derived, so "working" can be
-        // decorative; busy/unread/motion are the real signals).
-        animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
-      />
+      <div className="shrink-0 pointer-events-none">
+        <BotAvatar
+          bot={bot}
+          state={stateForBot({ ...bot, messages: visible })}
+          size={avatarSize}
+          motion={mascotMotion?.kind ?? "none"}
+          motionKey={mascotMotion?.nonce ?? 0}
+          // Motion means something is happening. A resting bot holds a resting
+          // pose — N idle rows bobbing at display rate was most of the app's
+          // visible-idle CPU (states are keyword-derived, so "working" can be
+          // decorative; busy/unread/motion are the real signals).
+          animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
+        />
+      </div>
       <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[15px] font-semibold text-ink">
@@ -1838,6 +1849,8 @@ function BotListItem({
               value={bot.name}
               onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
               onEditingChange={setRenaming}
+              onActivate={selectBot}
+              embedded
               className="truncate"
               inputClassName="w-full rounded bg-inset px-1 py-0.5 text-[15px] font-semibold"
             />
@@ -1861,8 +1874,8 @@ function BotListItem({
             </span>
           )}
         </div>
-        <div className="flex items-center justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary">
+        <div className="flex items-center justify-between gap-2 select-none">
+          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary select-none">
             {bot.chiefOfStaff && !bot.busy && !waitReason && (
               <span className="flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-accent">
                 <Crown size={11} /> Chief of Staff
@@ -1881,7 +1894,7 @@ function BotListItem({
                 className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
               />
             )}
-            <span className={cn("truncate", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
+            <span className={cn("truncate select-none", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
               {previewText}
             </span>
           </span>
@@ -1977,16 +1990,24 @@ function BotListItem({
   return (
     <div
       draggable
+      // A cancelled HTML5 drag may never deliver dragend (Escape or lost
+      // focus). Reset before the next pointer gesture so its click works.
+      onPointerDown={() => { isDragging.current = false; }}
+      onPointerCancel={() => { isDragging.current = false; }}
       onDragStart={(event) => {
+        isDragging.current = true;
         event.dataTransfer.setData(ROSTER_DRAG_TYPE, JSON.stringify({ kind: "bot", id: bot.id }));
         event.dataTransfer.effectAllowed = "move";
+      }}
+      onDragEnd={() => {
+        isDragging.current = false;
       }}
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
       onDrop={onDrop}
       className={cn(
-        "group relative rounded-xl transition-all",
+        "group relative rounded-xl transition-all select-none",
         isDragTarget && THREAD_DROP_CLASS,
       )}
       title={iconOnly ? bot.name : undefined}
@@ -1995,14 +2016,20 @@ function BotListItem({
         role="button"
         tabIndex={0}
         aria-label={iconOnly ? bot.name : undefined}
+        onBlur={() => { isDragging.current = false; }}
+        // One dispatch path: click.  #706 dispatched from both pointerup and
+        // click, so every row click selected twice (three times via the title
+        // before its stopPropagation).  A real HTML5 drag sets isDragging in
+        // onDragStart and never produces a click; a micro-move is just a click.
         onClick={() => {
-        dispatch({ type: "select", id: bot.id });
-        window.dispatchEvent(new CustomEvent("focus-composer"));
-      }}
+          if (!isDragging.current) {
+            selectBot();
+          }
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            dispatch({ type: "select", id: bot.id });
+            selectBot();
           }
         }}
         onContextMenu={onContextMenu}
@@ -2178,6 +2205,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const [newRoom, setNewRoom] = useState(false);
+  // Summarizing walks and sorts the whole run history, and this component
+  // re-renders on every store change, so the count is memoized rather than
+  // recomputed per render.
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
   const [threadCount, setThreadCountState] = useState(() => loadSidebarThreadCount());
   const setThreadCount = (next: number) => {
     const clamped = parseSidebarThreadCount(String(next));
@@ -3016,8 +3050,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         >
           <CalendarDays size={20} className={state.activeView === "routines" ? "text-accent" : "text-ink-secondary"} />
           <span className={cn("flex-1 text-[14px]", density === "icons" && "hidden")}>Tasks &amp; Routines</span>
-          {state.routineRuns.some((run) => ["failed", "missed"].includes(run.status) && !run.seenAt) && (
-            <span className="size-2 rounded-full bg-danger" />
+          {attention.total > 0 && (
+            // The same backlog the Tasks & Routines badge counts.  An
+            // unlabelled red dot cannot be read at a glance, so the count and
+            // the recency travel with it.
+            <span
+              className="size-2 shrink-0 rounded-full bg-danger"
+              title={`${attention.total} need attention · ${attentionWindowLabel(attention)}`}
+            />
           )}
         </button>
         <button
@@ -3208,7 +3248,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           )}
           title="Drag to resize sidebar (double-click to reset)"
         >
-          <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
+          <div className="absolute inset-y-0 -left-2.5 -right-2.5" />
         </div>
       )}
     </aside>

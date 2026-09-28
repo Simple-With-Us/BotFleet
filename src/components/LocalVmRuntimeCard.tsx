@@ -248,6 +248,17 @@ export function LocalVmRuntimeCard() {
       .finally(() => setModePending(false));
   };
 
+  const updateVmConfig = (patch: { shareCliCredentials?: boolean; allowHostTerminal?: boolean }) => {
+    api("/api/config", {
+      method: "PUT",
+      body: JSON.stringify({ localVm: patch }),
+    })
+      .then((config: ConfigStatus) => {
+        dispatch({ type: "configStatus", config });
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  };
+
   return (
     <>
       <Card
@@ -338,6 +349,43 @@ export function LocalVmRuntimeCard() {
           Switching modes removes the existing desktop on the way out, so a shared workspace cannot be silently inherited by a per-bot one (or vice versa).
         </div>
         {modeError && <div className="mt-2 text-[11.5px] text-danger">{modeError}</div>}
+      </Card>
+
+      <Card
+        title="Host & CLI Integration"
+        subtitle="Manage CLI authentication and terminal access for bots using the Local VM."
+      >
+        <div className="flex flex-col gap-3">
+          <label className="flex cursor-pointer items-start gap-3">
+            <input
+              type="checkbox"
+              checked={Boolean(state.config?.localVm?.shareCliCredentials)}
+              onChange={(e) => updateVmConfig({ shareCliCredentials: e.target.checked })}
+              className="mt-0.5 rounded border-hairline/40 accent-accent"
+            />
+            <div className="text-[13px]">
+              <div className="font-medium text-ink">Share Host CLI Credentials with Local VM</div>
+              <div className="text-[12px] text-ink-secondary">
+                Mounts read-only host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the container so tools run inside the VM are signed into your accounts.
+              </div>
+            </div>
+          </label>
+
+          <label className="flex cursor-pointer items-start gap-3">
+            <input
+              type="checkbox"
+              checked={Boolean(state.config?.localVm?.allowHostTerminal)}
+              onChange={(e) => updateVmConfig({ allowHostTerminal: e.target.checked })}
+              className="mt-0.5 rounded border-hairline/40 accent-accent"
+            />
+            <div className="text-[13px]">
+              <div className="font-medium text-ink">Host Shell Execution with VM Screen (Hybrid Mode)</div>
+              <div className="text-[12px] text-ink-secondary">
+                Enables bots using the Local VM to execute shell commands and tests in your host Mac terminal environment, while keeping all mouse clicks, typing, and desktop viewing strictly inside the VM.
+              </div>
+            </div>
+          </label>
+        </div>
       </Card>
 
       <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares Cua and the VM for you.">
