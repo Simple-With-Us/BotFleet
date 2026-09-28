@@ -104,6 +104,7 @@ import {
   loadSidebarDensity,
   loadSidebarThreadCount,
   parseSidebarThreadCount,
+  densityAdjustedSidebarWidth,
   loadSidebarWidth,
   saveSidebarWidth,
   saveCollapsedRooms,
@@ -2238,11 +2239,13 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const isResizingRef = useRef(false);
 
   useEffect(() => {
-    if (density === "compact") {
-      setSidebarWidth((prev) => (prev === DEFAULT_SIDEBAR_WIDTH ? DEFAULT_SIDEBAR_COMPACT_WIDTH : prev));
-    } else if (density === "comfortable") {
-      setSidebarWidth((prev) => (prev === DEFAULT_SIDEBAR_COMPACT_WIDTH ? DEFAULT_SIDEBAR_WIDTH : prev));
-    }
+    setSidebarWidth((prev) => {
+      const next = densityAdjustedSidebarWidth(prev, density);
+      // Persist the swap: an in-memory-only change reads back as the other
+      // density's default on the next load.
+      if (next !== prev) saveSidebarWidth(next);
+      return next;
+    });
   }, [density]);
 
   const startResize = (e: React.MouseEvent) => {

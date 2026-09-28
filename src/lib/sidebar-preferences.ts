@@ -76,6 +76,17 @@ export function saveSidebarWidth(
   }
 }
 
+/** The width a density switch settles on. Only an untouched default follows
+ * the density (comfortable's 320 becomes compact's 272 and back); a width
+ * the person dragged to is their choice and survives the switch. The caller
+ * persists the result — a swap that stays in-memory reads back as the other
+ * density's default on the next load. */
+export function densityAdjustedSidebarWidth(width: number, density: SidebarDensity): number {
+  if (density === "compact" && width === DEFAULT_SIDEBAR_WIDTH) return DEFAULT_SIDEBAR_COMPACT_WIDTH;
+  if (density === "comfortable" && width === DEFAULT_SIDEBAR_COMPACT_WIDTH) return DEFAULT_SIDEBAR_WIDTH;
+  return width;
+}
+
 /** How many of a channel's conversations the sidebar shows before it offers
  * the rest.  A handful is enough to recognise the one you want; the number
  * is a preference because "a handful" differs per person and per screen. */
