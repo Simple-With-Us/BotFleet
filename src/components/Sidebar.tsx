@@ -63,6 +63,7 @@ import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
 import { attentionWindowLabel, summarizeAttention } from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
@@ -2182,7 +2183,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   // Summarizing walks and sorts the whole run history, and this component
   // re-renders on every store change, so the count is memoized rather than
   // recomputed per render.
-  const attention = useMemo(() => summarizeAttention(state.routineRuns), [state.routineRuns]);
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
   const [threadCount, setThreadCountState] = useState(() => loadSidebarThreadCount());
   const setThreadCount = (next: number) => {
     const clamped = parseSidebarThreadCount(String(next));

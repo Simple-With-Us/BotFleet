@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import type { RoutineRun } from "@/lib/routines";
 import {
   attentionRuns,
@@ -71,6 +74,24 @@ describe("summarizeAttention", () => {
     expect(summary.lastDay).toBe(2);
     expect(summary.oldestAt).toBe(NOW - 30 * HOUR);
     expect(summary.newestAt).toBe(NOW - 10 * 60_000);
+  });
+
+  it("updates lastHour when only the clock crosses the hour boundary, same runs array", () => {
+    // Regression: both surfaces memoized summarizeAttention on the runs array
+    // alone, so with no new run state the recency counts froze.  The clock is
+    // a real input: the SAME array must summarize differently an instant
+    // later when a run ages out of the window.
+    const runs = [run({ id: "a", finishedAt: NOW - HOUR + 1, createdAt: NOW - HOUR + 1 })];
+    expect(summarizeAttention(runs, NOW).lastHour).toBe(1);
+    expect(summarizeAttention(runs, NOW + 1).lastHour).toBe(0);
+  });
+
+  it("updates lastDay when only the clock crosses the day boundary, same runs array", () => {
+    const runs = [run({ id: "a", finishedAt: NOW - 24 * HOUR + 1, createdAt: NOW - 24 * HOUR + 1 })];
+    expect(summarizeAttention(runs, NOW).lastDay).toBe(1);
+    expect(summarizeAttention(runs, NOW + 1).lastDay).toBe(0);
+    // The backlog itself is not time-bound: only the recency windows move.
+    expect(summarizeAttention(runs, NOW + 1).total).toBe(1);
   });
 
   it("uses createdAt when a run never finished", () => {
@@ -158,4 +179,18 @@ describe("relativeRunTime", () => {
     expect(relativeRunTime(NOW - 5 * HOUR, NOW)).toBe("5h ago");
     expect(relativeRunTime(NOW - 50 * HOUR, NOW)).toBe(new Date(NOW - 50 * HOUR).toLocaleDateString([], { month: "short", day: "numeric" }));
   });
+});
+
+describe("attention clock wiring", () => {
+  const readComponent = (name: string) =>
+    readFileSync(join(__dirname, "..", "components", name), "utf8");
+
+  for (const component of ["RoutinesPage.tsx", "Sidebar.tsx"]) {
+    it(`${component} recomputes the attention summary when the clock ticks`, () => {
+      const source = readComponent(component);
+      expect(source).toContain('from "@/lib/use-now"');
+      expect(source).toMatch(/const attentionNow = useNow\(\);/);
+      expect(source).toContain("summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]");
+    });
+  }
 });

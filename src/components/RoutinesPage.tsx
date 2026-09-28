@@ -37,6 +37,7 @@ import {
   summarizeAttention,
   type AttentionSummary,
 } from "@/lib/routine-attention";
+import { useNow } from "@/lib/use-now";
 import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus, RoutineSchedule } from "@/lib/routines";
 import {
   CENTRAL_TIME_ZONE,
@@ -752,7 +753,10 @@ export function RoutinesPage() {
   const selectedBot = liveSelected
     ? state.bots.find((bot) => bot.id === (liveSelected.routine?.botId ?? liveSelected.run?.botId))
     : undefined;
-  const attention = useMemo(() => summarizeAttention(state.routineRuns), [state.routineRuns]);
+  const attentionNow = useNow();
+  // The recency windows derive from Date.now(), so the clock is a
+  // real dependency: without it the counts freeze until run state changes.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]);
   const pendingAttention = useMemo(() => attentionRuns(state.routineRuns), [state.routineRuns]);
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
   const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
