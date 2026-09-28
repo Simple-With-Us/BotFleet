@@ -221,6 +221,8 @@ const localVmConfigSchema = z.object({
     .min(MIN_LOCAL_VM_MAX_INSTANCES)
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
+  shareCliCredentials: z.boolean().optional(),
+  allowHostTerminal: z.boolean().optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -507,7 +509,12 @@ export interface AppConfig {
   ingress?: { publicUrl?: string; enabled?: boolean };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
-  localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
+  localVm?: {
+    mode?: "shared" | "per-bot";
+    maxInstances?: number;
+    shareCliCredentials?: boolean;
+    allowHostTerminal?: boolean;
+  };
   /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
    * `accessClientSecret` are a Cloudflare Access service token: a pair of
    * headers, needed when the recall service sits behind Access, where a

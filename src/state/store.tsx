@@ -455,7 +455,12 @@ export interface ConfigStatus {
     vpsMode?: "shared" | "per-bot" | null;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
-  localVm: { mode: "shared" | "per-bot"; maxInstances: number };
+  localVm: {
+    mode: "shared" | "per-bot";
+    maxInstances: number;
+    shareCliCredentials?: boolean;
+    allowHostTerminal?: boolean;
+  };
   opencodeGo?: { configured: boolean };
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is

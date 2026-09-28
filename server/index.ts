@@ -4281,6 +4281,7 @@ async function startTurn(
             // The room lane passes the same flag.  A driver-loop engine holds
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
+            hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -6206,6 +6207,7 @@ async function runGroupMemberTurn(
         boxAgent: instance.driverKind === "boxAgent",
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
+        hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the

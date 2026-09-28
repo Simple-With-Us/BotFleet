@@ -849,4 +849,22 @@ describe("routine failure resiliency and unattended safety", () => {
       }),
     ).rejects.toThrow("Box API returned 503");
   });
+
+  it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Local VM", async () => {
+    const deps = makeBaseDeps();
+    deps.acquireLocalVm = async () => ({ command: "vm-cua", args: [], env: {} });
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Worker", computers: ["vm"] },
+      cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.hasHostComputer).toBe(true);
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+  });
 });

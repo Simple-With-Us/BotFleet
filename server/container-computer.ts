@@ -7,13 +7,14 @@
 // typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { augmentedPath } from "./env-path.ts";
-import { DATA_DIR, type AppConfig } from "./config.ts";
+import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
 import {
   BOX_GATEWAY_PATH,
   boxGatewayGrants,
@@ -960,11 +961,42 @@ export function containerNetworkArgs(runtime: Runtime, platform: NodeJS.Platform
   return args;
 }
 
+/** Common host CLI credential mounts passed read-only into the guest.
+ *
+ * When enabled, mounts ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud,
+ * and ~/.npmrc into the guest /home/cua directory, so terminal commands
+ * run inside the Local VM container inherit the user's CLI authentication. */
+export function hostCliCredentialMounts(
+  platform: NodeJS.Platform = process.platform,
+  home = homedir(),
+): string[] {
+  if (platform === "win32") return [];
+  const mounts: string[] = [];
+  const candidates = [
+    { host: join(home, ".gitconfig"), guest: "/home/cua/.gitconfig" },
+    { host: join(home, ".config", "gh"), guest: "/home/cua/.config/gh" },
+    { host: join(home, ".aws"), guest: "/home/cua/.aws" },
+    { host: join(home, ".config", "gcloud"), guest: "/home/cua/.config/gcloud" },
+    { host: join(home, ".npmrc"), guest: "/home/cua/.npmrc" },
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate.host)) {
+        mounts.push("--mount", `type=bind,source=${candidate.host},target=${candidate.guest},readonly`);
+      }
+    } catch {
+      // Ignore if unreadable or inaccessible
+    }
+  }
+  return mounts;
+}
+
 export function containerRunArgs(
   runtime: Runtime,
   password = "CHANGE_ME",
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
   platform: NodeJS.Platform = process.platform,
+  options?: { shareCliCredentials?: boolean; homeDir?: string },
 ): string[] {
   if (runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key) {
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
@@ -1031,6 +1063,9 @@ export function containerRunArgs(
     );
   }
   common.push(...containerNetworkArgs(runtime, platform));
+  if (options?.shareCliCredentials) {
+    common.push(...hostCliCredentialMounts(platform, options?.homeDir));
+  }
   common.push(
     "--mount",
     runtime === "podman"
@@ -1134,9 +1169,15 @@ export async function containerComputerAction(
     await prepareManagedImage(runtime, runner);
   } else {
     if (action === "run") await ensureVmWorkspace(platform, target);
+    let shareCliCredentials = false;
+    try {
+      shareCliCredentials = Boolean(loadConfig()?.localVm?.shareCliCredentials);
+    } catch {
+      // Best-effort config read
+    }
     const args =
       action === "run"
-        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform)
+        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform, { shareCliCredentials })
         : action === "remove"
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
