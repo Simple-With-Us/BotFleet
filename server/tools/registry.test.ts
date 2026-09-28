@@ -77,10 +77,6 @@ describe("every record is complete", () => {
     // on the one read tool that can reach a credential store.
     const conditioned = new Set<string>();
     for (const tool of HARNESS_TOOLS) {
-      // read_file is the one exception: its approval is `when`-gated, so
-      // ordinary reads still never see a card and only credential-store
-      // paths ask (S10).  The gate is what makes the exception safe.
-      if (tool.name === "read_file") continue;
       if (tool.sideEffect === "read") {
         if (tool.approval?.policy === "ask") {
           expect(tool.approval.condition, `${tool.name} asks unconditionally`).toBeTruthy();

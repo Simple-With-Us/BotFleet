@@ -19,7 +19,6 @@
  */
 import { computerReach, type ComputerReach } from "./computer-capability.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
-import { boxGatewayUrl, mintBoxGatewayGrant } from "./container-computer.ts";
 
 
 import type { AppConfig } from "./config.ts";
@@ -459,6 +458,14 @@ export interface TurnComputerDeps<Lease = unknown> {
   };
   /** The loopback control pair a computer bridge calls back on. */
   controlIntegration(botId: string): { url: string; token: string };
+  /** The Box gateway's own two calls, injected for the same reason
+   *  `controlIntegration` is: this module is reachable from the renderer
+   *  bundle, and the gateway needs `node:crypto`.  A value import here would
+   *  put it there and vite would refuse the build. */
+  boxGateway: {
+    url(control: { url: string } | undefined): string;
+    mint(botId: string, boxId: string, gatewayUrl: string): { url: string; token: string };
+  };
   broadcast(frame: ComputerStateFrame): void;
   /** One activity chip on the turn's own thread.  The caller shapes it,
    * because a room chip carries the speaking member and a 1:1 chip does not. */
@@ -786,7 +793,7 @@ async function resolveMounts<Lease>(
         // The account-wide Box API key is never read here: it stays in the
         // harness, and the mount carries a grant that names this one box.
         const control = deps.controlIntegration(bot.id);
-        const grant = mintBoxGatewayGrant(bot.id, known.id, boxGatewayUrl(control));
+        const grant = deps.boxGateway.mint(bot.id, known.id, deps.boxGateway.url(control));
         mounts.push({
           name: "",
           label: computerLabel("box", hostPlatform),

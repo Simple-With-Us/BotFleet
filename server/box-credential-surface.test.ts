@@ -25,6 +25,7 @@ import {
   resolveTurnComputerMounts,
   type TurnComputerDeps,
 } from "./computer-grants.ts";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import type { AppConfig } from "./config.ts";
 
 /** Obviously fake, and the value this whole file exists to keep out of a bot. */
@@ -53,6 +54,7 @@ function deps(over: Partial<TurnComputerDeps<object>> = {}): TurnComputerDeps<ob
     },
     vpsLeases: { claim: () => ({}), release: () => {} },
     controlIntegration: () => ({ url: "http://127.0.0.1:8799/api/internal/computer-control?botId=bot-1", token: "ctl" }),
+    boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
     broadcast: () => {},
     notice: () => {},
     checkpoint: async () => true,

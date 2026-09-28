@@ -14,6 +14,11 @@ import { promisify } from "node:util";
 
 import { augmentedPath } from "./env-path.ts";
 import { DATA_DIR, type AppConfig } from "./config.ts";
+import {
+  BOX_GATEWAY_PATH,
+  boxGatewayGrants,
+  resolveBoxGatewayGrant,
+} from "./box-gateway-grant.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 const run = promisify(execFile);
@@ -1331,53 +1336,19 @@ export function setupCommands(
  *  under `/api/internal/`, whose routes are gated by the fleet-wide comms
  *  token: a per-mount grant has to be checked here, by this code, and not by
  *  a gate that every bot's proxy already passes. */
-export const BOX_GATEWAY_PATH = "/api/local/box-gateway";
+export { BOX_GATEWAY_PATH, BOX_GATEWAY_TTL_MS, MAX_BOX_GATEWAY_GRANTS, boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 /** The provider the gateway calls.  Read the harness-side override so a test
  *  rig and a self-hosted deployment address the same base as box.ts does. */
 const BOX_GATEWAY_API = process.env.OMB_BOX_API || "https://ascii.dev/api/box/v1";
-/** How long a grant stays usable.  A turn is minutes, not hours; the ceiling
- *  is what stops a grant read out of one turn's `mcp.json` from being a
- *  permanent account handle. */
-const BOX_GATEWAY_TTL_MS = 4 * 60 * 60 * 1000;
-const MAX_BOX_GATEWAY_GRANTS = 512;
 
+/** The identity a presented grant names.  How long it stays good for, and how
+ *  the token is stored, live in `box-gateway-grant.ts` — a leaf module, so
+ *  that `computer-grants.ts` can mint a grant by value without dragging this
+ *  file (and `node:path` with it) into the renderer bundle. */
 export interface BoxGatewayGrant {
   botId: string;
   boxId: string;
   expiresAt: number;
-}
-
-const boxGatewayGrants = new Map<string, BoxGatewayGrant>();
-
-/** The loopback base the child proxy sends its Box calls to, derived from the
- *  turn's existing control endpoint so the proxy needs no second port. */
-export function boxGatewayUrl(control: { url: string } | undefined): string {
-  if (!control?.url) return "";
-  try {
-    return `${new URL(control.url).origin}${BOX_GATEWAY_PATH}`;
-  } catch {
-    return "";
-  }
-}
-
-/** Issue one mount's grant.  The value returned is what reaches the bot's
- *  process: it authenticates nothing at ascii.dev, only here. */
-export function mintBoxGatewayGrant(
-  botId: string,
-  boxId: string,
-  gatewayUrl: string,
-  now = Date.now(),
-) {
-  const token = randomBytes(24).toString("hex");
-  boxGatewayGrants.set(token, { botId, boxId, expiresAt: now + BOX_GATEWAY_TTL_MS });
-  // Map iterates in insertion order, so this drops the oldest first — a
-  // long-lived harness with many turns cannot grow the table without bound.
-  while (boxGatewayGrants.size > MAX_BOX_GATEWAY_GRANTS) {
-    const oldest = boxGatewayGrants.keys().next();
-    if (oldest.done) break;
-    boxGatewayGrants.delete(oldest.value);
-  }
-  return { url: gatewayUrl, token };
 }
 
 export function revokeBoxGatewayGrant(token: string): void {
@@ -1400,12 +1371,8 @@ export function authorizeBoxGateway(
   now = Date.now(),
 ): { ok: true; grant: BoxGatewayGrant } | { ok: false; status: 401 | 403; error: string } {
   const presented = Array.isArray(authorization) ? "" : String(authorization ?? "").replace(/^Bearer /, "");
-  const grant = presented ? boxGatewayGrants.get(presented) : undefined;
+  const grant = resolveBoxGatewayGrant(presented, now);
   if (!grant) return { ok: false, status: 401, error: "no live Box grant for this computer" };
-  if (grant.expiresAt <= now) {
-    boxGatewayGrants.delete(presented);
-    return { ok: false, status: 401, error: "this Box grant has expired" };
-  }
   if (grant.boxId !== boxId) {
     return { ok: false, status: 403, error: "this Box grant does not cover that computer" };
   }

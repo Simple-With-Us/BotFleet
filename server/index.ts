@@ -130,6 +130,7 @@ import {
   setupCommands,
   type LocalVmTarget,
 } from "./container-computer.ts";
+import { boxGatewayUrl, mintBoxGatewayGrant } from "./box-gateway-grant.ts";
 import {
   applyComputerMounts,
   autoDestinations,
@@ -2336,6 +2337,7 @@ function turnComputerDeps(
       release(lease: ExactTurnLease) { activeVpsThreads.release(lease); },
     },
     controlIntegration,
+    boxGateway: { url: boxGatewayUrl, mint: mintBoxGatewayGrant },
     broadcast: (frame) => broadcast({ ...frame }),
     notice,
     checkpoint,
