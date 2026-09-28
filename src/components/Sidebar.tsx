@@ -62,6 +62,7 @@ import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
 import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
+import { attentionWindowLabel, summarizeAttention } from "@/lib/routine-attention";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
@@ -2178,6 +2179,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const [newRoom, setNewRoom] = useState(false);
+  // Summarizing walks and sorts the whole run history, and this component
+  // re-renders on every store change, so the count is memoized rather than
+  // recomputed per render.
+  const attention = useMemo(() => summarizeAttention(state.routineRuns), [state.routineRuns]);
   const [threadCount, setThreadCountState] = useState(() => loadSidebarThreadCount());
   const setThreadCount = (next: number) => {
     const clamped = parseSidebarThreadCount(String(next));
@@ -3016,8 +3021,14 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         >
           <CalendarDays size={20} className={state.activeView === "routines" ? "text-accent" : "text-ink-secondary"} />
           <span className={cn("flex-1 text-[14px]", density === "icons" && "hidden")}>Tasks &amp; Routines</span>
-          {state.routineRuns.some((run) => ["failed", "missed"].includes(run.status) && !run.seenAt) && (
-            <span className="size-2 rounded-full bg-danger" />
+          {attention.total > 0 && (
+            // The same backlog the Tasks & Routines badge counts.  An
+            // unlabelled red dot cannot be read at a glance, so the count and
+            // the recency travel with it.
+            <span
+              className="size-2 shrink-0 rounded-full bg-danger"
+              title={`${attention.total} need attention · ${attentionWindowLabel(attention)}`}
+            />
           )}
         </button>
         <button

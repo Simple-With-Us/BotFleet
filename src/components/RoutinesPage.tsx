@@ -27,7 +27,17 @@ import { WebhooksPanel } from "@/components/WebhooksPanel";
 import { ResourceTriggersPanel } from "@/components/ResourceTriggersPanel";
 import { cn } from "@/lib/cn";
 import { BOT_COLORS, type BotState } from "@/lib/mascot";
-import type { Routine, RoutineInput, RoutineRunOn, RoutineRunStatus, RoutineSchedule } from "@/lib/routines";
+import {
+  attentionRuns,
+  attentionSettledAt,
+  attentionSourcesTooltip,
+  attentionTriggerLabel,
+  attentionWindowLabel,
+  relativeRunTime,
+  summarizeAttention,
+  type AttentionSummary,
+} from "@/lib/routine-attention";
+import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus, RoutineSchedule } from "@/lib/routines";
 import {
   CENTRAL_TIME_ZONE,
   DAY_NAMES,
@@ -604,6 +614,117 @@ function PausedRoutines({ routines, bots, onClose, onEdit }: { routines: Routine
   );
 }
 
+/** Hover card for the badge: a bare count cannot be acted on, so the number
+ *  arrives with its recency and with the routines and triggers feeding it. */
+function AttentionTooltip({ summary }: { summary: AttentionSummary }) {
+  const sources = summary.sources.slice(0, 6);
+  return (
+    <span
+      role="tooltip"
+      title={attentionSourcesTooltip(summary)}
+      className="pointer-events-none absolute right-0 top-full z-40 mt-2 hidden w-[300px] rounded-xl border border-hairline/60 bg-panel p-3 text-left shadow-xl group-hover:block group-focus-within:block"
+    >
+      <div className="text-[11.5px] font-medium text-ink">{attentionWindowLabel(summary)}</div>
+      <div className="mt-2 space-y-1">
+        {sources.map((source) => (
+          <div key={`${source.label}:${source.name}`} className="flex items-baseline justify-between gap-2 text-[11px] text-ink-secondary">
+            <span className="min-w-0 truncate text-ink" title={source.name}>{source.name}</span>
+            <span className="shrink-0">{source.label} · {source.count}</span>
+          </div>
+        ))}
+      </div>
+      {summary.sources.length > sources.length && <div className="mt-1.5 text-[10.5px] text-ink-secondary">and {summary.sources.length - sources.length} more</div>}
+    </span>
+  );
+}
+
+/** Every failure that has not been looked at, newest first.
+ *
+ *  The badge was the only surface, and a count like 421 told the owner nothing
+ *  they could act on: it could not be selected, there was no way to clear a
+ *  historic backlog, and every trigger still looked healthy.  This is the step
+ *  that names the runs, shows how recent they are, and lets each one be
+ *  acknowledged on its own or all at once. */
+function AttentionPanel({ summary, runs, bots, onClose, onOpenRun }: {
+  summary: AttentionSummary;
+  runs: RoutineRun[];
+  bots: Bot[];
+  onClose: () => void;
+  onOpenRun: (run: RoutineRun) => void;
+}) {
+  const { dispatch } = useStore();
+  const [pendingDismiss, setPendingDismiss] = useState(false);
+  const now = Date.now();
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="flex max-h-[82vh] w-full max-w-[640px] flex-col overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+        <div className="flex items-start justify-between gap-3 border-b border-hairline/40 px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[17px] font-semibold text-ink">Needs Attention</div>
+            <div className="mt-0.5 text-[12px] text-ink-secondary">{attentionWindowLabel(summary)}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <button onClick={() => setPendingDismiss(true)} className="rounded-lg border border-hairline/50 bg-inset px-3 py-1.5 text-[12px] font-medium text-ink hover:bg-raised">Acknowledge All {summary.total}</button>
+            <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
+          {runs.length === 0 && (
+            // Reachable by acknowledging the last row one at a time, and the
+            // moment after Acknowledge All closes the panel.
+            <div className="flex flex-col items-center gap-2 px-6 py-10 text-center">
+              <CheckCircle2 size={26} className="text-accent" />
+              <div className="text-[14px] font-semibold text-ink">All Caught Up</div>
+              <div className="text-[12px] leading-relaxed text-ink-secondary">Nothing is waiting.  The next failure shows up here and raises the badge again.</div>
+            </div>
+          )}
+          {runs.map((run) => {
+            const bot = bots.find((candidate) => candidate.id === run.botId);
+            const code = routineOutcomeCode(run);
+            const detail = (run.error || run.output || "").replace(/\s+/g, " ").trim();
+            return (
+              <div key={run.id} className="rounded-xl border border-hairline/40 bg-inset p-3">
+                <div className="flex items-start gap-3">
+                  {bot ? <BotAvatar bot={bot} state="crash" size={40} animated={false} label={bot.name} /> : <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><CircleAlert size={18} /></div>}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="truncate text-[14px] font-semibold text-ink" title={run.routineName}>{run.routineName}</span>
+                      <span className="shrink-0 rounded-full bg-raised px-1.5 py-0.5 text-[10px] text-ink-secondary">{attentionTriggerLabel(run.triggerSource)}</span>
+                    </div>
+                    <div className="mt-0.5 truncate text-[11.5px] text-ink-secondary" title={`${bot?.name ?? "Deleted bot"} · ${relativeRunTime(attentionSettledAt(run), now)}`}>
+                      {bot?.name ?? "Deleted bot"} · {relativeRunTime(attentionSettledAt(run), now)}{code ? ` · ${ROUTINE_OUTCOME_LABELS[code]}` : ""}
+                    </div>
+                    {detail && <div className="mt-1 line-clamp-2 font-mono text-[10.5px] text-ink-secondary/85" title={detail}>{detail}</div>}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button onClick={() => onOpenRun(run)} className="rounded-lg px-2 py-1.5 text-[12px] text-ink-secondary hover:bg-raised hover:text-ink">View</button>
+                    <button onClick={() => dispatch({ type: "markRoutineRunSeen", runId: run.id })} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" title="Acknowledge This Run"><CheckCircle2 size={15} /></button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="border-t border-hairline/40 px-5 py-3 text-[11.5px] leading-relaxed text-ink-secondary">
+          Acknowledging keeps every run in the calendar with its error.  It only clears the badge, and the next failure brings it back.
+        </div>
+      </div>
+      <ConfirmDialog
+        open={pendingDismiss}
+        title={`Acknowledge ${summary.total} ${summary.total === 1 ? "Failure" : "Failures"}?`}
+        body="They stay in the calendar with their errors.  This only clears the badge, and the next failure brings it back."
+        confirmLabel="Acknowledge All"
+        onCancel={() => setPendingDismiss(false)}
+        onConfirm={() => {
+          dispatch({ type: "acknowledgeAllAttention" });
+          setPendingDismiss(false);
+          onClose();
+        }}
+      />
+    </div>
+  );
+}
+
 export function RoutinesPage() {
   const { state, dispatch } = useStore();
   const [section, setSection] = useState<"calendar" | "webhooks" | "resources">("calendar");
@@ -613,6 +734,7 @@ export function RoutinesPage() {
   const [editor, setEditor] = useState<Routine | "new" | null>(null);
   const [selected, setSelected] = useState<CalendarItem | null>(null);
   const [pausedOpen, setPausedOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
   const visibleBots = state.bots.filter((bot) => !bot.hidden);
   const rangeStart = viewDays === 7 ? startOfWeek(anchor) : startOfDay(anchor);
   const rangeEnd = addDays(rangeStart, viewDays);
@@ -630,7 +752,8 @@ export function RoutinesPage() {
   const selectedBot = liveSelected
     ? state.bots.find((bot) => bot.id === (liveSelected.routine?.botId ?? liveSelected.run?.botId))
     : undefined;
-  const unseenFailures = state.routineRuns.filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt).length;
+  const attention = useMemo(() => summarizeAttention(state.routineRuns), [state.routineRuns]);
+  const pendingAttention = useMemo(() => attentionRuns(state.routineRuns), [state.routineRuns]);
   const running = state.routineRuns.filter((run) => ["queued", "running", "waiting"].includes(run.status)).length;
   const paused = state.routines.filter((routine) => !routine.enabled && canToggleRoutine(routine));
   useEffect(() => {
@@ -660,6 +783,21 @@ export function RoutinesPage() {
     }
   };
 
+  /** Jump the calendar to a run from the attention list, so "View" lands on
+   *  the day it ran instead of an unrelated week. */
+  const openAttentionRun = (run: RoutineRun) => {
+    setAttentionOpen(false);
+    setViewDays(1);
+    setAnchor(startOfDay(run.scheduledFor));
+    setSelected({
+      id: run.id,
+      at: run.scheduledFor,
+      routine: state.routines.find((routine) => routine.id === run.routineId) ?? null,
+      run,
+    });
+    dispatch({ type: "markRoutineRunSeen", runId: run.id });
+  };
+
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-app">
       <header
@@ -676,7 +814,14 @@ export function RoutinesPage() {
           </div>
           <div className="flex items-center gap-2">
             {running > 0 && <span className="flex items-center gap-1.5 rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1.5 text-[11px] text-accent"><Loader2 size={12} className="animate-spin" />{running} active</span>}
-            {unseenFailures > 0 && <span className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger"><CircleAlert size={12} />{unseenFailures} need attention</span>}
+            {attention.total > 0 && (
+              <div className="group relative">
+                <button onClick={() => setAttentionOpen(true)} className="flex items-center gap-1.5 rounded-full border border-danger/25 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger hover:bg-danger/20">
+                  <CircleAlert size={12} />{attention.total} need attention
+                </button>
+                <AttentionTooltip summary={attention} />
+              </div>
+            )}
             {paused.length > 0 && <button onClick={() => setPausedOpen(true)} className="flex items-center gap-1.5 rounded-full border border-hairline/50 bg-panel px-2.5 py-1.5 text-[11px] text-ink-secondary hover:bg-raised hover:text-ink"><Pause size={12} />{paused.length} paused</button>}
             {section === "calendar" && <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white shadow-lg shadow-accent/10 hover:brightness-110 disabled:opacity-40"><Plus size={15} />New Routine</button>}
           </div>
@@ -739,6 +884,7 @@ export function RoutinesPage() {
       {editor && <RoutineEditor routine={editor === "new" ? undefined : editor} bots={visibleBots} onClose={() => setEditor(null)} />}
       {liveSelected && selectedBot && <RoutineDetails item={liveSelected} bot={selectedBot} onClose={() => setSelected(null)} onEdit={(routine) => { setSelected(null); setEditor(routine); }} />}
       {pausedOpen && <PausedRoutines routines={paused} bots={state.bots} onClose={() => setPausedOpen(false)} onEdit={(routine) => { setPausedOpen(false); setEditor(routine); }} />}
+      {attentionOpen && <AttentionPanel summary={attention} runs={pendingAttention} bots={state.bots} onClose={() => setAttentionOpen(false)} onOpenRun={openAttentionRun} />}
     </main>
   );
 }
