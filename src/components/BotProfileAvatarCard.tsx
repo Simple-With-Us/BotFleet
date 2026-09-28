@@ -1,7 +1,7 @@
 import { useRef, useState, type DragEvent } from "react";
-import { ImagePlus, Trash2 } from "lucide-react";
+import { ImagePlus, Loader2, Trash2 } from "lucide-react";
 
-import { useStore, type Bot } from "@/state/store";
+import { type Bot } from "@/state/store";
 import { guessImageMime, imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
@@ -44,7 +44,6 @@ export function BotProfileAvatarCard({
   mascotMotion: { kind: Exclude<BotMotion, "none">; nonce: number } | null;
   onPatch: (patch: AvatarPatch) => void;
 }) {
-  const { state, dispatch, flushBotPatches } = useStore();
   const fileRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -150,7 +149,7 @@ export function BotProfileAvatarCard({
           <button
             type="button"
             onClick={() => fileRef.current?.click()}
-            disabled={uploading || generating}
+            disabled={uploading}
             className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
           >
             {uploading ? <Loader2 size={14} className="animate-spin" /> : <ImagePlus size={14} />}
@@ -160,7 +159,7 @@ export function BotProfileAvatarCard({
             <button
               type="button"
               onClick={removeImage}
-              disabled={uploading || generating}
+              disabled={uploading}
               aria-label="Remove Custom Avatar Image"
               title="Remove Custom Image"
               className="flex size-10 items-center justify-center rounded-lg text-ink-secondary hover:bg-control hover:text-danger disabled:opacity-50"
