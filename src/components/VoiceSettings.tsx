@@ -206,7 +206,7 @@ export function VoiceSettings({
       ? `${tts.voice} (default)`
       : "Workspace default";
 
-  const customVoices = voices.filter((v) => v.description === "Custom" || v.description === "Workspace default" || v.id === tts.voice);
+  const customVoices = voices.filter((v) => v.description === "Custom");
 
   return (
     <div className="rounded-xl bg-card p-4">
@@ -296,7 +296,7 @@ export function VoiceSettings({
                 type="text"
                 value={customVoiceId}
                 onChange={(e) => setCustomVoiceId(e.target.value)}
-                placeholder="Voice ID (e.g. jay-wedgeworth-001)"
+                placeholder="Voice ID (e.g. my-custom-voice-001)"
                 aria-label="Custom Voice ID"
                 className="w-full rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[13px] text-ink placeholder:text-ink-secondary focus:border-hairline focus:outline-none"
               />

@@ -591,6 +591,15 @@ export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversat
 };
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
+  // Stored installs may still explicitly name the retired provider. Normalize
+  // that one legacy value before the strict schema runs, otherwise loadConfig
+  // catches the rejection as a first run and drops every setting in the file.
+  // API patches still use parseConfigPatch and cannot reintroduce ElevenLabs.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      value.tts.provider === "elevenlabs") {
+    value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
   return {

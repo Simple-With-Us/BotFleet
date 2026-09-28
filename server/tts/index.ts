@@ -88,8 +88,7 @@ export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Pro
   }
   if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
     const defaultVoiceId = cfg.tts.voice;
-    const label = defaultVoiceId === "jay-wedgeworth-001" ? "Jay Wedgeworth (jay-wedgeworth-001)" : defaultVoiceId;
-    voices.unshift({ id: defaultVoiceId, label, description: "Workspace default" });
+    voices.unshift({ id: defaultVoiceId, label: defaultVoiceId, description: "Workspace default" });
   }
   return voices;
 }

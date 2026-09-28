@@ -1655,6 +1655,15 @@ describe("migrateComputerProvidersConfig", () => {
 
 
 describe("legacy voice provider migration", () => {
+  it("loads an explicitly marked legacy provider before strict validation without losing other settings", () => {
+    const stored = { profile: { name: "Ada" }, tts: { provider: "elevenlabs", key: "legacy-key", voice: "legacy-voice" } };
+    expect(parseStoredConfig(stored)).toEqual({
+      profile: { name: "Ada" }, tts: { provider: "minimax", key: "legacy-key", voice: "legacy-voice" },
+    });
+    expect(stored.tts.provider).toBe("elevenlabs");
+    expect(() => parseConfigPatch({ tts: { provider: "elevenlabs" } })).toThrow("tts.provider");
+  });
+
   it("pins an unmarked key-only install, without persisting a keychain secret to config.json", () => {
     const cfg: AppConfig = { tts: { key: "old-eleven-key" } };
     expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
