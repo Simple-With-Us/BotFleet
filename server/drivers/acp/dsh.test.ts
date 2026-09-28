@@ -86,7 +86,7 @@ describe("DshAgentDriver config", () => {
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
-    expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x Cost");
+    expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x the $");
     // M3 is the base rate, so it carries no cost chip.
     expect(byId.get("MiniMax-M3")?.badge).toBeUndefined();
     expect(byId.get("deepseek-v4-pro")?.badge).toBeUndefined();
