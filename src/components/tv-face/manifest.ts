@@ -57,6 +57,19 @@ export const TVFACE_MANIFEST: Record<BotState, TVFaceExpression> = {
   dragging: "screen",
   bouncing: "excited",
   "powering-down": "powering_down",
+
+  // Grok Actions
+  fleet: "fleet",
+  crash: "crash",
+  memory: "memory",
+  tools: "tools",
+  routine: "routine",
+  screen: "screen",
+  git: "git",
+  webhook: "webhook",
+  computer: "computer",
+  typing: "typing",
+  speaking: "speaking",
 };
 
 export const TVFACE_HAS_ENTER_RETURN: Set<TVFaceExpression> = new Set([

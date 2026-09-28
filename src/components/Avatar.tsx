@@ -13,7 +13,13 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { BOT_COLORS, type BotColor, type BotMotion, type BotState } from "@/lib/mascot";
+import {
+  BOT_COLORS,
+  mapBotStateToCursorState,
+  type BotColor,
+  type BotMotion,
+  type BotState,
+} from "@/lib/mascot";
 import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 import {
   CursorAvatar,
@@ -203,7 +209,7 @@ function BotMascotComponent(
     >
       <CursorAvatar
         ref={inner}
-        state={motionState ?? state}
+        state={mapBotStateToCursorState(motionState ?? state)}
         expression={expression}
         size={size}
         silhouette={GRADIENT_SILHOUETTE}

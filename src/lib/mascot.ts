@@ -2,12 +2,26 @@ import { CURSOR_STATES, type CursorState } from "@/components/CursorAvatar";
 
 /** The mascot's behaviour vocabulary — CursorAvatar's 39 states, under the
  * app's historical names. */
-export type BotState = CursorState;
-export const BOT_STATES = CURSOR_STATES;
+export const GROK_ACTIONS = [
+  "fleet",
+  "crash",
+  "memory",
+  "tools",
+  "routine",
+  "screen",
+  "git",
+  "webhook",
+  "computer",
+  "typing",
+  "speaking",
+] as const;
+
+export type BotState = CursorState | typeof GROK_ACTIONS[number];
+export const BOT_STATES: BotState[] = [...CURSOR_STATES, ...GROK_ACTIONS];
 
 /** CursorAvatar ships French group labels; the app shows these instead. The
  * memberships mirror its STATE_GROUPS exactly. */
-export const STATE_GROUPS = {
+export const STATE_GROUPS: Record<string, BotState[]> = {
   Lifecycle: ["sleeping", "waking", "idle", "listening", "thinking", "searching", "working"],
   Reactions: [
     "excited",
@@ -43,7 +57,37 @@ export const STATE_GROUPS = {
     "bouncing",
     "powering-down",
   ],
-} satisfies Record<string, BotState[]>;
+  "Actions (Grok)": [
+    "fleet",
+    "crash",
+    "memory",
+    "tools",
+    "routine",
+    "screen",
+    "git",
+    "webhook",
+    "computer",
+    "typing",
+    "speaking",
+  ],
+};
+
+export function mapBotStateToCursorState(state: BotState): CursorState {
+  const map: Record<string, CursorState> = {
+    fleet: "orbit",
+    crash: "scared",
+    memory: "searching",
+    tools: "working",
+    routine: "progress",
+    screen: "searching",
+    git: "working",
+    webhook: "sending",
+    computer: "working",
+    typing: "writing",
+    speaking: "dictating",
+  };
+  return (map[state] as CursorState) || (state as CursorState);
+}
 
 export const BOT_COLOR_NAMES = [
   "green",
