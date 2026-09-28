@@ -103,7 +103,8 @@ describe("Settings Models layout", () => {
     const settings = FILES.find((entry) => entry.rel === "components/SettingsModal.tsx");
     expect(settings, "SettingsModal.tsx is missing").toBeDefined();
     expect(settings!.text).toContain("max-w-[1100px]");
-    expect(settings!.text).toContain("h-[min(720px,calc(100dvh-3rem))]");
+    expect(settings!.text).toContain("h-[min(880px,calc(100dvh-3rem))]");
+    expect(settings!.text).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings!.text).not.toContain("h-[560px]");
     expect(settings!.text).not.toContain("max-w-[860px]");
   });

@@ -38,6 +38,19 @@ function isEngineEnabled(instance: InstanceInfo): boolean {
   return instance.enabled !== false;
 }
 
+/** Why an engine is not in the active rail.  `snapshot.reason` is the
+ *  driver's own words whenever it supplies any; otherwise the three cases a
+ *  reader can actually act on are separated out.  Nothing here is
+ *  invented — a field the runtime does not set never produces a sentence. */
+function engineUnavailableReason(instance: InstanceInfo): string {
+  if (instance.snapshot.reason) return instance.snapshot.reason;
+  if (instance.snapshot.state !== "available") {
+    return "Command-line app not found on this computer.";
+  }
+  if (instance.snapshot.authenticated === false) return "Installed, but not signed in.";
+  return "Turned off in Settings.";
+}
+
 /** Real deps for createCustomEngine/deleteCustomEngine (src/lib/custom-engine.ts),
  * built fresh per call so a bridge that appears or disappears between
  * renders (should never happen in practice, but window.ogb is read live
@@ -248,12 +261,16 @@ function EngineRow({
   instance,
   busyInstanceId,
   onPatch,
+  reason,
 }: {
   instance: InstanceInfo;
   busyInstanceId: string | null;
   onPatch: (
     patch: { cli?: string; fullAuto?: boolean; enabled?: boolean },
   ) => Promise<{ ok: boolean; error?: string }>;
+  /** One line saying why this engine is not usable right now.  Rendered
+   *  only where the panel knows the answer. */
+  reason?: string;
 }) {
   const { refreshInstances } = useStore();
   const [open, setOpen] = useState(false);
@@ -417,6 +434,9 @@ function EngineRow({
           </button>
         )}
       </div>
+      {reason && (
+        <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary/70">{reason}</p>
+      )}
       {instance.driverKind === "antigravityAgent" && (
         <div className="mt-2 rounded bg-raised/40 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-hairline/40">
           Antigravity's print mode has no approval cards.  With the bypass off, file edits go through and shell
@@ -492,9 +512,13 @@ function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdd
     }
     const reader = new FileReader();
     reader.onload = () => {
-      if (typeof reader.result === "string") {
-        setIconUrl(reader.result);
-      }
+      // `readAsDataURL` hands back a data-URL string, but FileReader's result
+      // is allowed to be a buffer or nothing at all.  Take the URL only when
+      // one really arrived rather than narrowing on the representation and
+      // storing whatever shape turned up as an <img> source.
+      const { result } = reader;
+      if (result === null || result instanceof ArrayBuffer) return;
+      setIconUrl(result);
     };
     reader.readAsDataURL(file);
   };
@@ -771,20 +795,22 @@ export function EnginesSettings() {
     i.driverKind === "openai-compat" ||
     Boolean(i.isCustom),
   );
-  // Disabled rows are surfaced separately so the active rail is short and
-  // scannable; the show/hide toggle defaults to hidden to keep the everyday
-  // view focused.
-  const [showDisabled, setShowDisabled] = useState(false);
+  // Engines the user has turned off used to sit behind a "Show (N)" link
+  // that defaulted to hidden, so a newly added engine whose CLI is not
+  // installed yet was simply absent from Settings — the reader saw a count
+  // and no list.  Default to showing them; the toggle stays for anyone who
+  // wants the short rail.
+  const [showDisabled, setShowDisabled] = useState(true);
   const [addModalOpen, setAddModalOpen] = useState(false);
 
   return (
     <div className="flex flex-col gap-5">
       <div className="flex items-start justify-between gap-4">
         <div className="text-[12px] leading-relaxed text-ink-secondary flex-1">
-          <strong className="text-ink">Reset</strong> clears the binary override and goes back to the driver's default CLI.{" "}
-          <strong className="text-ink">Bypass permissions</strong> hands the engine full tool autonomy (no approval cards) — useful for headless runs, risky on a workstation.{" "}
-          <strong className="text-ink">Set CLI…</strong> points the engine at a specific binary — a versioned build, a wrapper script, or an absolute path.{" "}
-          Saving any of these reloads providers and interrupts any running turns.
+          <strong className="text-ink">Set CLI…</strong> points an engine at a specific binary,{"  "}
+          <strong className="text-ink">Reset</strong> goes back to the driver&apos;s default,{"  "}
+          <strong className="text-ink">Bypass permissions</strong> drops the approval cards and hands the engine full tool autonomy.{"  "}
+          Saving any of them reloads providers and interrupts running turns.
         </div>
         <button
           type="button"
@@ -810,7 +836,7 @@ export function EnginesSettings() {
       {rows.length === 0 && (
         <div className="text-[13px] text-ink-secondary">No engines detected yet.</div>
       )}
-      <EngineCapabilitiesMatrix />
+      <EngineCapabilitiesMatrix instances={rows} />
       {(() => {
         const enabled = rows.filter(isEngineEnabled);
         const disabled = rows.filter((row) => !isEngineEnabled(row));
@@ -839,7 +865,7 @@ export function EnginesSettings() {
             {disabled.length > 0 && (
               <>
                 <div className="mt-2 flex items-center gap-2">
-                  <EngineGroupLabel>Engine CLIs Not Enabled</EngineGroupLabel>
+                  <EngineGroupLabel>Not Enabled</EngineGroupLabel>
                   <button
                     type="button"
                     onClick={() => setShowDisabled((value) => !value)}
@@ -850,12 +876,13 @@ export function EnginesSettings() {
                   </button>
                 </div>
                 {showDisabled && (
-                  <div className="flex flex-col gap-3 opacity-80">
+                  <div className="flex flex-col gap-3">
                     {disabled.map((i) => (
                       <EngineRow
                         key={i.instanceId}
                         instance={i}
                         busyInstanceId={busyInstanceId}
+                        reason={engineUnavailableReason(i)}
                         onPatch={(patch) => handlePatch(i.instanceId, patch)}
                       />
                     ))}

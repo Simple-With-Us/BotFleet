@@ -3,16 +3,23 @@
 // the schema tests catch additions before they ship with a missing key
 // or a half-filled pricing block.
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import {
+  CAPABILITY_CATEGORIES,
   CAPABILITY_KEYS,
+  CAPABILITY_NOTES,
+  CAPABILITY_STATES,
   ENGINE_CAPABILITIES,
   ENGINE_DISPLAY_ORDER,
+  capabilityCellGlyph,
   capabilityCellLabel,
+  capabilityNoteFor,
   engineIdFromDriverKind,
   pricingModeLabel,
   uniqueModelToEngineId,
   type CapabilityKey,
+  type CapabilityState,
   type PricingMode,
 } from "./engine-capabilities.tsx";
 
@@ -60,8 +67,13 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // the row rather than rendering nothing.
     const seen = new Set<CapabilityKey>();
     for (const entry of Object.values(ENGINE_CAPABILITIES)) {
-      for (const key of Object.keys(entry.capabilities) as CapabilityKey[]) {
-        seen.add(key);
+      // Walk the declared vocabulary rather than `Object.keys`, so the keys
+      // collected here are CapabilityKey by construction instead of strings
+      // laundered into them.  A key an engine declares outside the vocabulary
+      // cannot reach this set, and the stray-key case is pinned separately
+      // below.
+      for (const key of CAPABILITY_KEYS) {
+        if (entry.capabilities[key] !== undefined) seen.add(key);
       }
     }
     for (const key of CAPABILITY_KEYS) {
@@ -94,7 +106,7 @@ describe("ENGINE_CAPABILITIES registry", () => {
 
   it("fills in subscription.tierLabel for every subscription engine", () => {
     for (const [id, entry] of Object.entries(ENGINE_CAPABILITIES)) {
-      const pricing = entry.pricing as PricingMode;
+      const pricing = entry.pricing;
       if (pricing.kind === "subscription" || pricing.kind === "subscription+api") {
         expect(pricing.subscription.tierLabel.length, `${id} subscription.tierLabel`).toBeGreaterThan(0);
       }
@@ -103,6 +115,87 @@ describe("ENGINE_CAPABILITIES registry", () => {
 
   it("lists every engine id in ENGINE_DISPLAY_ORDER", () => {
     expect(new Set(ENGINE_DISPLAY_ORDER)).toEqual(new Set(KNOWN_ENGINE_IDS));
+  });
+
+  it("resolves every display-ordered id to a real registry entry", () => {
+    // The matrix builds its rows by mapping ENGINE_DISPLAY_ORDER through
+    // ENGINE_CAPABILITIES and filtering out whatever is missing.  An id
+    // with no entry therefore vanishes from the table with no error at
+    // all — a new engine that someone added to the display order but not
+    // to the registry would just be absent.  That is the bug this pins.
+    for (const id of ENGINE_DISPLAY_ORDER) {
+      const entry = ENGINE_CAPABILITIES[id];
+      expect(entry, `ENGINE_DISPLAY_ORDER lists "${id}" with no registry entry`).toBeDefined();
+      expect(entry.id, `registry key "${id}" must match its own id field`).toBe(id);
+    }
+  });
+
+  it("has every registered engine declare every capability key explicitly", () => {
+    // This is the test that ends the "the registry omitted it" regression
+    // class, which had bitten four times before.  A missing key used to
+    // render as a dash wearing the "not available" tone, which reads as
+    // "audited: this engine cannot do it" — an underclaim that is
+    // indistinguishable, to a reader, from the truth.  Now a key must be
+    // declared, and "I have not checked" is spelled "unknown".
+    const states = new Set<CapabilityState>(CAPABILITY_STATES);
+    for (const id of ENGINE_DISPLAY_ORDER) {
+      const entry = ENGINE_CAPABILITIES[id];
+      for (const key of CAPABILITY_KEYS) {
+        const state = entry.capabilities[key];
+        expect(
+          state,
+          `${id}.capabilities.${key} is missing — declare a real state or "unknown"`,
+        ).toBeDefined();
+        expect(
+          state !== undefined && states.has(state),
+          `${id}.capabilities.${key} is "${state}", which is not a CapabilityState`,
+        ).toBe(true);
+      }
+      // And no stray keys outside the vocabulary.
+      const declaredKeys: readonly string[] = CAPABILITY_KEYS;
+      for (const key of Object.keys(entry.capabilities)) {
+        expect(
+          declaredKeys.includes(key),
+          `${id}.capabilities.${key} is not a declared CapabilityKey`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("groups every capability under exactly one named category", () => {
+    // CAPABILITY_KEYS is derived from the categories, so a column can
+    // never drift out of its group — but a duplicated or dropped key
+    // would still render a malformed spanning header.
+    const grouped = CAPABILITY_CATEGORIES.flatMap((category) => category.keys);
+    expect(new Set(grouped).size).toBe(grouped.length);
+    expect(new Set(grouped)).toEqual(new Set(CAPABILITY_KEYS));
+    for (const category of CAPABILITY_CATEGORIES) {
+      expect(category.label.length, `${category.id} needs a label`).toBeGreaterThan(0);
+    }
+  });
+
+  it("explains what every capability means, and prefers the engine's own note", () => {
+    for (const key of CAPABILITY_KEYS) {
+      const note = CAPABILITY_NOTES[key];
+      expect(note, `${key} has no capability note`).toBeTruthy();
+      expect(
+        (note ?? "").length,
+        `${key} note is too short to explain the capability`,
+      ).toBeGreaterThan(40);
+    }
+    // Resolution order: engine-specific note, then the shared capability
+    // note, then the engine headline — never an empty strip.
+    expect(ENGINE_CAPABILITIES.grok.capabilityNotes?.longContext).toBeTruthy();
+    expect(capabilityNoteFor(ENGINE_CAPABILITIES.grok, "longContext")).toBe(
+      ENGINE_CAPABILITIES.grok.capabilityNotes!.longContext,
+    );
+    // A pair with no engine override falls back to the shared note.
+    const fallback = capabilityNoteFor(ENGINE_CAPABILITIES.grok, "files");
+    expect(fallback).toBe(CAPABILITY_NOTES.files);
+    // And an engine with neither still gets its headline rather than blank.
+    expect(
+      capabilityNoteFor({ ...ENGINE_CAPABILITIES.grok, capabilityNotes: {} }, "files"),
+    ).toBe(CAPABILITY_NOTES.files);
   });
 
   it("engineIdFromDriverKind maps known driver kinds to registry ids", () => {
@@ -213,23 +306,61 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(pricingModeLabel(api)).toContain("API");
   });
 
-  it("capabilityCellLabel returns the legacy vocabulary", () => {
-    expect(capabilityCellLabel("yes")).toBe("✓");
-    expect(capabilityCellLabel("no")).toBe("✗");
-    expect(capabilityCellLabel("limited")).toBe("limited");
-    expect(capabilityCellLabel("yes-pro-only")).toBe("pro only");
-    expect(capabilityCellLabel(undefined)).toBe("—");
+  it("capabilityCellLabel states the verdict in words", () => {
+    // The glyph and the word are separate functions now.  The word is what
+    // the cell's `title`, its accessible name, and the detail strip read;
+    // conflating the two is what let a dash wear the "not available" tone.
+    expect(capabilityCellLabel("yes")).toBe("Available");
+    expect(capabilityCellLabel("no")).toBe("Not available");
+    expect(capabilityCellLabel("limited")).toBe("Limited");
+    expect(capabilityCellLabel("yes-pro-only")).toBe("Pro plan only");
+    // A missing key and an explicit "unknown" say the same thing, and
+    // neither of them says "not available".
+    expect(capabilityCellLabel("unknown")).toBe("Not audited");
+    expect(capabilityCellLabel(undefined)).toBe("Not audited");
+  });
+
+  it("capabilityCellGlyph is one compact character per state", () => {
+    for (const state of CAPABILITY_STATES) {
+      expect(capabilityCellGlyph(state).length, `${state} glyph`).toBe(1);
+    }
+    expect(capabilityCellGlyph("yes")).toBe("✓");
+    expect(capabilityCellGlyph("no")).toBe("✗");
+    // Unaudited and missing share the glyph, so "nobody checked" can
+    // never be mistaken for a measured "no".
+    expect(capabilityCellGlyph("unknown")).toBe("?");
+    expect(capabilityCellGlyph(undefined)).toBe("?");
+    // Every glyph is visually distinct from every other.
+    expect(new Set(CAPABILITY_STATES.map(capabilityCellGlyph)).size).toBe(CAPABILITY_STATES.length);
   });
 });
 
+/** The registry as JSON, parsed at its boundary.  The registry is
+ *  `JSON.stringify`d on its way to the server, so JSON is the shape it has,
+ *  and parsing it here is what lets the walk below branch on real values
+ *  instead of on representations. */
+const registryJson = z.json();
+type RegistryValue = z.infer<typeof registryJson>;
+const registryText = z.string();
+const registryBranch = z.record(z.string(), z.json());
+
 function registryStrings(): string[] {
   const strings: string[] = [];
-  const walk = (value: unknown) => {
-    if (typeof value === "string") strings.push(value);
-    else if (Array.isArray(value)) value.forEach(walk);
-    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  const walk = (value: RegistryValue) => {
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (value === null) return;
+    const branch = registryBranch.safeParse(value);
+    if (branch.success) {
+      Object.values(branch.data).forEach(walk);
+      return;
+    }
+    const text = registryText.safeParse(value);
+    if (text.success) strings.push(text.data);
   };
-  walk(ENGINE_CAPABILITIES);
+  walk(registryJson.parse(ENGINE_CAPABILITIES));
   return strings;
 }
 
@@ -293,6 +424,19 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
         assertTwoAsciiSpaces(entry.pricing.subscription.includedQuota ?? "", `${id} includedQuota`);
       }
       if ("api" in entry.pricing) assertTwoAsciiSpaces(entry.pricing.api.notes ?? "", `${id} api.notes`);
+      // Per-engine capability notes are shown verbatim in the matrix detail
+      // strip, so they carry the same sentence-gap rule as the prose above.
+      for (const [key, note] of Object.entries(entry.capabilityNotes ?? {})) {
+        assertTwoAsciiSpaces(note ?? "", `${id} capabilityNotes.${key}`);
+      }
+    }
+  });
+
+  it("uses two ASCII spaces after periods and colons in the shared capability notes", () => {
+    for (const [key, note] of Object.entries(CAPABILITY_NOTES)) {
+      const parsed = registryText.safeParse(note);
+      if (!parsed.success) throw new Error(`CAPABILITY_NOTES.${key} must be text`);
+      assertTwoAsciiSpaces(parsed.data, `CAPABILITY_NOTES.${key}`);
     }
   });
 
