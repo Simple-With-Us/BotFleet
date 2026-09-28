@@ -25,6 +25,15 @@ describe("Settings Search Engine", () => {
     }
   });
 
+  it("uses the labels people see on the destination cards", () => {
+    const label = (id: string) => SETTINGS_SEARCH_ITEMS.find((item) => item.id === id)?.title;
+    expect(label("general:skin")).toBe("Skin");
+    expect(label("computers:providers")).toBe("Providers");
+    expect(label("usage:quotas")).toBe("Engine Quotas");
+    expect(label("observability:sentry")).toBe("Diagnostics & Error Reporting");
+    expect(label("engines:matrix")).toBe("Engine Capabilities");
+  });
+
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
     const result = searchSettings("pricing mode");
     expect(result.matchingItemIds.has("usage:pricing")).toBe(true);

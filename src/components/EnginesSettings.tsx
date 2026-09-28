@@ -755,7 +755,7 @@ function AddCustomEngineModal({ onClose, onAdded }: { onClose: () => void; onAdd
   );
 }
 
-export function EnginesSettings() {
+export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: string) => string | undefined }) {
   const { state, dispatch, refreshInstances } = useStore();
   const [busyInstanceId, setBusyInstanceId] = useState<string | null>(null);
   const [globalError, setGlobalError] = useState<string | null>(null);
@@ -816,7 +816,7 @@ export function EnginesSettings() {
           id="setting-engines-add-custom"
           type="button"
           onClick={() => setAddModalOpen(true)}
-          className="flex shrink-0 items-center gap-1.5 rounded-xl border border-hairline/50 bg-raised px-3.5 py-2 text-[12.5px] font-medium text-ink hover:bg-raised-hover shadow-sm"
+          className={cn("flex shrink-0 items-center gap-1.5 rounded-xl border border-hairline/50 bg-raised px-3.5 py-2 text-[12.5px] font-medium text-ink hover:bg-raised-hover shadow-sm", highlightClass?.("setting-engines-add-custom"))}
         >
           <Plus size={14} />
           Add Engine
@@ -837,7 +837,7 @@ export function EnginesSettings() {
       {rows.length === 0 && (
         <div className="text-[13px] text-ink-secondary">No engines detected yet.</div>
       )}
-      <div id="setting-engines-matrix">
+      <div id="setting-engines-matrix" className={highlightClass?.("setting-engines-matrix")}>
         <EngineCapabilitiesMatrix instances={rows} />
       </div>
       <div className="flex flex-col gap-3">

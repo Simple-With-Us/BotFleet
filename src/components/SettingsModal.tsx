@@ -1568,7 +1568,7 @@ export function SettingsModal() {
                 </Card>
               )}
 
-              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
+              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />}
 
               {section === "engines" && (
                 <Card
@@ -1577,7 +1577,7 @@ export function SettingsModal() {
                   title="Engine CLIs"
                   subtitle="Which binary each engine runs. Saved as you go."
                 >
-                  <EnginesSettings />
+                  <EnginesSettings highlightClass={highlightClass} />
                 </Card>
               )}
 
@@ -1618,9 +1618,9 @@ export function SettingsModal() {
                 </>
               )}
 
-              {section === "usage" && <UsageSection />}
+              {section === "usage" && <UsageSection highlightClass={highlightClass} />}
 
-              {section === "observability" && <ObservabilitySection />}
+              {section === "observability" && <ObservabilitySection highlightClass={highlightClass} />}
 
               {section === "secrets" && (
                 <div id="setting-secrets-infisical" className={highlightClass("setting-secrets-infisical")}>
