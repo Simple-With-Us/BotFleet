@@ -3,8 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const SIDEBAR_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "Sidebar.tsx"), "utf8");
-const APP_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../App.tsx"), "utf8");
+const SIDEBAR_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "Sidebar.tsx"), "utf8").replace(/\r\n/g, "\n");
+const APP_SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../App.tsx"), "utf8").replace(/\r\n/g, "\n");
 
 describe("BotListItem click and selection reliability", () => {
   it("wraps the avatar in pointer-events-none so avatar clicks bubble cleanly", () => {
