@@ -104,7 +104,7 @@ const browserPort: SentryBrowserPort = {
             userInfo: false,
             cookies: false,
             httpHeaders: { request: false, response: false },
-            urlQueryParams: false,
+            queryParams: false,
             genAI: { inputs: false, outputs: false },
           },
           replaysSessionSampleRate: options.replaysSessionSampleRate,

@@ -2612,7 +2612,14 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.completed":
       if (event.itemType === "assistant_text") {
-        pushMessage({ role: "bot", kind: "text", text: event.text });
+        const activeOwner = activeTurnOwners.current(event.threadId);
+        const resolvedSelection = activeOwner?.selection ?? (bot?.modelSelection ? { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model } : undefined);
+        pushMessage({
+          role: "bot",
+          kind: "text",
+          text: event.text,
+          ...(resolvedSelection ? { modelSelection: { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model } } : {}),
+        });
         if (bot) {
           void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text, event.turnId).then((r) => {
             if (r.sent) console.log(`[linq-outbound] delivered thread=${event.threadId}`);
@@ -7772,7 +7779,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-const TTS_PROVIDERS = ["minimax", "elevenlabs", "system"] as const;
+const TTS_PROVIDERS = ["minimax", "system"] as const;
 // The same list as a domain value, so a save is judged against the names the
 // harness actually has rather than against a string comparison in the handler.
 const ttsProviderName = z.enum(TTS_PROVIDERS);
@@ -7807,7 +7814,7 @@ function ttsProviderClaim(body: Record<string, unknown>): TtsProviderClaim {
   // those.  Anything else has to name a provider the harness knows.
   if (provider === undefined || provider === null) return {};
   const known = ttsProviderName.safeParse(ttsProviderFold.safeParse(provider).data).success;
-  return known ? {} : { error: "tts.provider must be minimax, elevenlabs, or system" };
+  return known ? {} : { error: "tts.provider must be minimax or system" };
 }
 
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
@@ -13188,6 +13195,26 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       } catch (e) {
         return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
       }
+    }
+
+    // ── custom voice identifier management ────────────────────────────
+    if (method === "POST" && path === "/api/tts/custom-voice") {
+      const body = await readBody(req);
+      const voiceId = typeof body?.voiceId === "string" ? body.voiceId.trim() : "";
+      const label = typeof body?.label === "string" ? body.label.trim() : "";
+      if (!voiceId) return json(res, 400, { error: "voiceId required" });
+      try {
+        const added = tts.addCustomVoice(voiceId, label || undefined);
+        return json(res, 200, { ok: true, voice: added });
+      } catch (e) {
+        return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    m = path.match(/^\/api\/tts\/custom-voice\/([\w.-]+)$/);
+    if (m && method === "DELETE") {
+      const [, voiceId] = m;
+      const deleted = tts.deleteCustomVoice(voiceId);
+      return json(res, 200, { ok: true, deleted });
     }
 
     // ── connectors (Composio) ──

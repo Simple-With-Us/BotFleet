@@ -712,7 +712,7 @@ describe("credential env preference", () => {
     expect(cfg.xai).toEqual({ key: "env-xai", url: "https://api.example.test/v1" });
     expect(cfg.box).toEqual({ token: "env-box" });
     expect(cfg.opencodeGo).toEqual({ apiKey: "env-ocg" });
-    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator", provider: "elevenlabs" });
+    expect(cfg.tts).toEqual({ key: "env-tts", voice: "narrator", provider: "minimax" });
     expect(cfg.imageGen).toEqual({ key: "env-image" });
     expect(cfg.deepseek).toEqual({ key: "env-deepseek", url: "https://env.example.test" });
   });
@@ -730,7 +730,7 @@ describe("credential env preference", () => {
     const cfg = loadConfig();
     expect(cfg.xai?.key).toBe("file-xai");
     expect(cfg.tts?.key).toBe("file-tts");
-    expect(cfg.tts?.provider).toBe("elevenlabs");
+    expect(cfg.tts?.provider).toBe("minimax");
     expect(cfg.imageGen?.key).toBe("file-image");
     expect(cfg.deepseek?.key).toBe("file-deepseek");
   });
@@ -1655,15 +1655,24 @@ describe("migrateComputerProvidersConfig", () => {
 
 
 describe("legacy voice provider migration", () => {
+  it("loads an explicitly marked legacy provider before strict validation without losing other settings", () => {
+    const stored = { profile: { name: "Ada" }, tts: { provider: "elevenlabs", key: "legacy-key", voice: "legacy-voice" } };
+    expect(parseStoredConfig(stored)).toEqual({
+      profile: { name: "Ada" }, tts: { provider: "minimax", key: "legacy-key", voice: "legacy-voice" },
+    });
+    expect(stored.tts.provider).toBe("elevenlabs");
+    expect(() => parseConfigPatch({ tts: { provider: "elevenlabs" } })).toThrow("tts.provider");
+  });
+
   it("pins an unmarked key-only install, without persisting a keychain secret to config.json", () => {
     const cfg: AppConfig = { tts: { key: "old-eleven-key" } };
     expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
-    expect(cfg.tts?.provider).toBe("elevenlabs");
+    expect(cfg.tts?.provider).toBe("minimax");
     expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
   });
 
-  it("retains explicitly selected MiniMax, ElevenLabs and system providers", () => {
-    for (const provider of ["minimax", "elevenlabs", "system"] as const) {
+  it("retains explicitly selected MiniMax and system providers", () => {
+    for (const provider of ["minimax", "system"] as const) {
       const cfg: AppConfig = { tts: { key: "marked-key", provider } };
       expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
       expect(cfg.tts?.provider).toBe(provider);
@@ -1675,7 +1684,7 @@ describe("legacy voice provider migration", () => {
     expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(false);
     cfg.tts!.key = "from-keychain";
     expect(migrateLegacyElevenLabsTtsProvider(cfg)).toBe(true);
-    expect(cfg.tts?.provider).toBe("elevenlabs");
+    expect(cfg.tts?.provider).toBe("minimax");
   });
 
   it("does not infer an old provider from voice alone or an empty key", () => {

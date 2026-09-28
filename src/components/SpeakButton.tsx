@@ -1,16 +1,15 @@
-import { Loader2, Square, Volume2 } from "lucide-react";
+import { Loader2, Play, Square } from "lucide-react";
 
 import { speaker } from "@/lib/tts";
 import { useSpeech } from "@/lib/tts/useSpeech";
 import { useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
 
-/** Read one message aloud. Hover-revealed beside the copy control, and it
+/** Read one message aloud or replay existing audio. Hover-revealed beside the copy control, and it
  * becomes a stop button while this message is the one speaking — the same
- * button, because "speak" and "shut up" are the same intent twice.
+ * button, because "play" and "stop" are the same intent twice.
  *
- * Without a key it stays visible but disabled, saying what it needs: a
- * hidden button is a feature nobody discovers. */
+ * Without a key it stays visible on hover but disabled, saying what it needs. */
 export function SpeakButton({
   text,
   botId,
@@ -36,13 +35,15 @@ export function SpeakButton({
   const mine = speech.messageId === messageId && speech.status !== "idle";
   const preparing = mine && speech.status === "preparing";
 
-  const label = hasAudio ? (mine ? "Stop Speaking" : "Replay Voice") : !configured
-    ? "Add a voice engine key in a bot profile to read messages aloud"
-    : !ready
-      ? "Pick a voice in this bot's profile to read messages aloud"
-    : mine
-      ? "Stop Speaking"
-      : "Read This Aloud";
+  const label = hasAudio
+    ? (mine ? "Stop Audio" : "Play Audio")
+    : !configured
+      ? "Add a voice engine key in settings to play audio"
+      : !ready
+        ? "Pick a voice in settings to play audio"
+        : mine
+          ? "Stop Speaking"
+          : "Play (Speak Aloud)";
   return (
     <button
       onClick={() => {
@@ -54,13 +55,12 @@ export function SpeakButton({
       title={label}
       className={cn(
         "rounded-md p-1.5 text-ink-secondary transition-opacity hover:bg-raised hover:text-ink focus-visible:opacity-100 group-focus-within:opacity-100 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
-        // stays visible while speaking — a stop button you have to hunt for
-        // is not a stop button
+        // stays visible while speaking or when audio is already synthesized
         mine || hasAudio ? "text-accent opacity-100" : "opacity-0 group-hover:opacity-100",
         className,
       )}
     >
-      {preparing ? <Loader2 size={14} className="animate-spin" /> : mine ? <Square size={14} className="fill-current" /> : <Volume2 size={14} />}
+      {preparing ? <Loader2 size={16} className="animate-spin" /> : mine ? <Square size={16} className="fill-current" /> : <Play size={16} className="fill-current" />}
     </button>
   );
 }
