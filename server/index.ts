@@ -67,6 +67,7 @@ import {
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { doomedDispatches, enableDoomedDispatchPersist } from "./doomed-dispatch.ts";
+import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
 import { effectiveToolRounds, toolBudgetPrompt } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
@@ -9859,6 +9860,47 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const visible = wireBot(updated);
       broadcast({ kind: "bot", bot: visible });
       return json(res, 200, { bot: visible });
+    }
+    m = path.match(/^\/api\/bots\/([\w-]+)\/playbooks$/);
+    if (m && method === "POST") {
+      // The `playbooks` field has been on the bot record all along, rendered
+      // into every prompt, and unreachable: `bot-profile.ts` deliberately omits
+      // it from the profile patch schema, the only writer was the whole-team
+      // import (which can only reach bots it just created), and no tool writes
+      // it.  All twelve live bots carried `playbooks: []` for that reason, not
+      // because playbooks are a bad idea.  This is the door.
+      //
+      //  Package-authored by design, matching the wording the prompt already
+      //  uses: `installed-playbooks.ts` tells the model these are "reviewed,
+      //  package-authored" playbooks.  Accepting inline text or agent-written
+      //  guidance here would make that sentence false, so the body is a
+      //  `botfleet.package` document (or BotMRR Markdown) and nothing else.
+      const bot = m[1] ? store.bot(m[1]) : undefined;
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const body = await readBody(req);
+      // Two shapes, because the document is the payload: bare for a package
+      // with no key filter, wrapped to install a named subset.  `keys` is
+      // validated by resolvePlaybookInstall, which also treats a key the
+      // package does not declare as an error rather than a silent no-op.
+      const wrapped = z
+        .object({ document: z.any(), keys: z.array(z.string()).optional() })
+        .safeParse(body);
+      const document = wrapped.success ? wrapped.data.document : body;
+      const result = resolvePlaybookInstall({
+        document: document as never,
+        keys: wrapped.success ? wrapped.data.keys : undefined,
+        existing: bot.playbooks,
+      });
+      if (!result.ok) return json(res, 422, { error: result.error });
+      // Written with `store.patchBot` directly, not through the profile
+      // route: `parseBotProfilePatch` omits `playbooks` on purpose, because
+      // the value is package-derived and must not be settable as free text
+      // beside the fields a person types.
+      const updated = store.patchBot(bot.id, { playbooks: result.playbooks } as never);
+      if (!updated) return json(res, 404, { error: "no such bot" });
+      const visible = wireBot(updated);
+      broadcast({ kind: "bot", bot: visible });
+      return json(res, 201, { bot: visible, playbooks: result.playbooks, installed: result.installed });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "PATCH") {
