@@ -11214,6 +11214,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && path === "/api/vps-computer") {
       return json(res, 200, await vps.vpsComputerStatus(cfg, "workspace"));
     }
+    if (method === "POST" && path === "/api/vps-computer/sync-credentials") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      if (computerProviderOff(cfg, "selfHostedVps")) {
+        return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.selfHostedVps} is turned off in Computer settings` });
+      }
+      return json(res, 200, await vps.vpsSyncCliCredentials(cfg, vps.SHARED_VPS_TARGET));
+    }
     m = path.match(/^\/api\/local-computer\/(pull|run|start|stop|remove)$/);
     if (m && method === "POST") {
       // Requiring JSON makes these localhost lifecycle mutations non-simple
@@ -13412,7 +13421,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ? vps.closeVpsDesktopTunnel(cfg, bot.id)
         : { closed: false });
     }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot|remove)$/);
+    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot|remove|sync-credentials)$/);
     if (m && method === "POST") {
       const botId = m[1];
       const bot = store.bot(botId);
@@ -13484,12 +13493,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 200, await vps.vpsComputerJoin(cfg, botId));
         }
         if (m[2] === "screenshot") return json(res, 200, await vps.vpsComputerScreenshot(cfg, botId));
+        if (m[2] === "sync-credentials") return json(res, 200, await vps.vpsSyncCliCredentials(cfg, vps.vpsTargetFor(cfg, botId)));
         const action = m[2] === "provision" ? "provision" : m[2] === "remove" ? "remove" : "stop";
         return json(res, 200, await vps.vpsComputerAction(action, cfg, botId));
       }
       if (m[2] === "remove") {
         // Boxes sleep and wake; only the VPS backend has a container to remove.
         return json(res, 409, { error: "the cloud Box backend has no container to remove — use sleep instead" });
+      }
+      if (m[2] === "sync-credentials") {
+        return json(res, 409, { error: "the cloud Box backend does not support credential sync — only VPS containers do" });
       }
       switch (m[2]) {
         case "provision":

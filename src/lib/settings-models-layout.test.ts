@@ -19,11 +19,13 @@ describe("desktop Settings Models layout", () => {
   const settings = source("src/components/SettingsModal.tsx");
   const fleet = source("src/components/FleetModelsSection.tsx");
 
-  it("grows the Settings dialog about 25–30 percent so fleet rows fit", () => {
-    expect(settings).toContain("max-w-[1100px]");
-    // 880px, not 720px: the Engines section opens on the capability matrix
-    // and the reader must not have to scroll before the hover detail appears.
-    expect(settings).toContain("h-[min(880px,calc(100dvh-3rem))]");
+  it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
+    expect(settings).toContain("DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292");
+    // 976px (880 + 96, 1 inch taller) and 1292px (1100 + 192, 2 inches wider):
+    // the Engines section opens on the capability matrix and the reader
+    // sees the full table and hover details without cutoffs.
+    expect(settings).toContain("DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976");
+    expect(settings).toContain("saveSettingsModalSize");
     expect(settings).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings).not.toContain("max-w-[860px]");
     expect(settings).not.toContain("h-[560px]");
