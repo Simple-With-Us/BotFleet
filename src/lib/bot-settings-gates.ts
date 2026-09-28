@@ -47,13 +47,36 @@ export function configuredEngine(
   return instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
 }
 
+/** The engine that actually ran the most recent turn, and whether a fallback
+ *  moved it off the configured one.  A named contract, not an inline shape, so
+ *  a caller cannot quietly disagree about what it is reading. */
+export interface ActiveEngine {
+  engine: InstanceInfo | undefined;
+  rolledOver: boolean;
+}
+
+/** One read of the engine's capabilities, so no control re-derives it. */
+export interface CapabilityGates {
+  engine: InstanceInfo | undefined;
+  /** Can this bot reach other bots? */
+  canCoordinate: boolean;
+  /** Can this engine answer a bounded review prompt? */
+  canAutoReview: boolean;
+  /** Can this engine mount Composio? */
+  canUseConnectedApps: boolean;
+  /** Can this engine be given a VPS at all? */
+  canUseVps: boolean;
+  /** Runs the harness HTTP tool loop. */
+  toolLoop: boolean;
+}
+
 /** The engine that actually ran the most recent turn, when a fallback moved it
  *  off the configured one.  Used to tell the owner that a ceiling they can see
  *  is not the ceiling currently in force. */
 export function activeEngine(
   instances: InstanceInfo[],
   bot: Pick<Bot, "modelSelection" | "activeModelSelection">,
-): { engine: InstanceInfo | undefined; rolledOver: boolean } {
+): ActiveEngine {
   const active = bot.activeModelSelection;
   if (!active || active.instanceId === bot.modelSelection.instanceId) {
     return { engine: configuredEngine(instances, bot), rolledOver: false };
@@ -136,23 +159,11 @@ export function toolRoundsGate(
   };
 }
 
-/** One read of the engine's capabilities, so no control re-derives it. */
+/** One read of the engine's capabilities for the whole panel. */
 export function botCapabilityGates(
   instances: InstanceInfo[],
   bot: Pick<Bot, "modelSelection">,
-): {
-  engine: InstanceInfo | undefined;
-  /** Can this bot reach other bots? */
-  canCoordinate: boolean;
-  /** Can this engine answer a bounded review prompt? */
-  canAutoReview: boolean;
-  /** Can this engine mount Composio? */
-  canUseConnectedApps: boolean;
-  /** Can this engine be given a VPS at all? */
-  canUseVps: boolean;
-  /** Runs the harness HTTP tool loop. */
-  toolLoop: boolean;
-} {
+): CapabilityGates {
   const engine = configuredEngine(instances, bot);
   const capabilities = engine?.capabilities;
   return {
