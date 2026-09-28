@@ -53,7 +53,7 @@ struct NewGroupSheet: View {
                             if members.contains(bot.id) {
                                 members.remove(bot.id)
                                 if leadBotId == bot.id {
-                                    leadBotId = members.sorted().first ?? ""
+                                    leadBotId = bots.map(\.id).first(where: members.contains) ?? ""
                                 }
                             } else {
                                 members.insert(bot.id)

@@ -239,7 +239,7 @@ export function autoVerdict(
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
-  const sensitive = destructive ? null : matchFirst(SENSITIVE, summary);
+  const sensitive = destructive ? null : looksSensitive(summary) ? (matchFirst(SENSITIVE, summary) ?? "sensitive-file") : null;
   // The grant is computed even when a hard block will refuse it: the row
   // worth auditing is "this WOULD have auto-approved, and only the block
   // stood in the way", which cannot be told apart from an ordinary
