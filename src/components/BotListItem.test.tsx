@@ -45,6 +45,21 @@ describe("BotListItem click and selection reliability", () => {
     expect(rowHandlers).toContain("if (!isDragging.current)");
   });
 
+  it("clears a cancelled drag before the next pointer click or keyboard focus", () => {
+    // An HTML5 drag can end without dragend (Escape, window blur). The next
+    // gesture must clear the stale flag before the row's click guard runs.
+    const botStart = SIDEBAR_SRC.indexOf("const isDragging = useRef(false);");
+    const botEnd = SIDEBAR_SRC.indexOf("{body}", SIDEBAR_SRC.indexOf("draggable", botStart));
+    expect(botStart).toBeGreaterThan(-1);
+    expect(botEnd).toBeGreaterThan(botStart);
+    const botRow = SIDEBAR_SRC.slice(botStart, botEnd);
+    expect(botRow).toMatch(/onPointerDown=\{\(\) => \{ isDragging\.current = false; \}\}/);
+    expect(botRow).toContain("onPointerCancel={() => { isDragging.current = false; }}");
+    expect(botRow).toContain("onBlur={() => { isDragging.current = false; }}");
+    expect(botRow).toContain("onDragStart={(event) => {\n        isDragging.current = true;");
+    expect(botRow).toContain("if (!isDragging.current)");
+  });
+
   it("keeps the embedded RenameTitle click from bubbling into the row", () => {
     // The title activates the bot through its own onClick; if that click ever
     // bubbles, the row dispatches a second time on the same gesture.

@@ -1990,6 +1990,10 @@ export function BotListItem({
   return (
     <div
       draggable
+      // A cancelled HTML5 drag may never deliver dragend (Escape or lost
+      // focus). Reset before the next pointer gesture so its click works.
+      onPointerDown={() => { isDragging.current = false; }}
+      onPointerCancel={() => { isDragging.current = false; }}
       onDragStart={(event) => {
         isDragging.current = true;
         event.dataTransfer.setData(ROSTER_DRAG_TYPE, JSON.stringify({ kind: "bot", id: bot.id }));
@@ -2012,6 +2016,7 @@ export function BotListItem({
         role="button"
         tabIndex={0}
         aria-label={iconOnly ? bot.name : undefined}
+        onBlur={() => { isDragging.current = false; }}
         // One dispatch path: click.  #706 dispatched from both pointerup and
         // click, so every row click selected twice (three times via the title
         // before its stopPropagation).  A real HTML5 drag sets isDragging in
