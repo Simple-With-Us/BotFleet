@@ -768,6 +768,59 @@ function samePodmanWindowsWorkspaceSource(source: string | undefined, expectedWo
   return actual.toLowerCase() === expected.toLowerCase();
 }
 
+export interface HostCliCredentialCandidate {
+  relPath: string[];
+  guest: string;
+}
+
+export const CLI_CREDENTIAL_CANDIDATES: readonly HostCliCredentialCandidate[] = [
+  // Infisical CLI
+  { relPath: [".infisical"], guest: "/home/cua/.infisical" },
+  { relPath: [".config", "infisical"], guest: "/home/cua/.config/infisical" },
+
+  // SSH & Git
+  { relPath: [".ssh"], guest: "/home/cua/.ssh" },
+  { relPath: [".gitconfig"], guest: "/home/cua/.gitconfig" },
+  { relPath: [".config", "git"], guest: "/home/cua/.config/git" },
+  { relPath: [".config", "gh"], guest: "/home/cua/.config/gh" },
+  { relPath: [".netrc"], guest: "/home/cua/.netrc" },
+
+  // Cloud Providers
+  { relPath: [".aws"], guest: "/home/cua/.aws" },
+  { relPath: [".config", "gcloud"], guest: "/home/cua/.config/gcloud" },
+  { relPath: [".azure"], guest: "/home/cua/.azure" },
+  { relPath: [".oci"], guest: "/home/cua/.oci" },
+
+  // Container & Kubernetes
+  { relPath: [".docker", "config.json"], guest: "/home/cua/.docker/config.json" },
+  { relPath: [".kube"], guest: "/home/cua/.kube" },
+
+  // Package Managers & Toolchains
+  { relPath: [".npmrc"], guest: "/home/cua/.npmrc" },
+  { relPath: [".cargo", "credentials.toml"], guest: "/home/cua/.cargo/credentials.toml" },
+  { relPath: [".cargo", "credentials"], guest: "/home/cua/.cargo/credentials" },
+  { relPath: [".cargo", "config.toml"], guest: "/home/cua/.cargo/config.toml" },
+  { relPath: [".cargo", "config"], guest: "/home/cua/.cargo/config" },
+  { relPath: [".pypirc"], guest: "/home/cua/.pypirc" },
+
+  // Hosting & Platform CLIs
+  { relPath: [".vercel"], guest: "/home/cua/.vercel" },
+  { relPath: [".fly"], guest: "/home/cua/.fly" },
+  { relPath: [".config", "cloudflare"], guest: "/home/cua/.config/cloudflare" },
+  { relPath: [".wrangler"], guest: "/home/cua/.wrangler" },
+
+  // Developer APIs & Tools
+  { relPath: [".config", "stripe"], guest: "/home/cua/.config/stripe" },
+  { relPath: [".config", "supabase"], guest: "/home/cua/.config/supabase" },
+  { relPath: [".config", "huggingface"], guest: "/home/cua/.config/huggingface" },
+  { relPath: [".sentryclirc"], guest: "/home/cua/.sentryclirc" },
+  { relPath: [".terraform.d"], guest: "/home/cua/.terraform.d" },
+] as const;
+
+export const ALLOWED_CLI_GUEST_DESTINATIONS: ReadonlySet<string> = new Set(
+  CLI_CREDENTIAL_CANDIDATES.map((c) => c.guest),
+);
+
 function dockerWorkspaceMountIsSafe(
   mounts:
     | Array<{ Type?: string; Source?: string; Destination?: string; RW?: boolean }>
@@ -776,21 +829,25 @@ function dockerWorkspaceMountIsSafe(
   expectedWorkspace: string | readonly string[],
   runtime: Runtime = "docker",
 ): boolean {
+  if (!mounts || mounts.length === 0) return false;
   // Both the current path and the pre-move one count: a Local VM started
   // before the workspace moved out of the openable tree is still correctly
   // bound, it is just bound to where it was created.
   const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
-  const source = mounts?.[0]?.Source;
+  const workspaceMount = mounts.find((m) => m.Destination === VM_WORKSPACE_GUEST);
+  if (!workspaceMount || workspaceMount.Type !== "bind" || workspaceMount.RW === false) return false;
+
   const sourceMatches =
-    expected.some((candidate) => sameWorkspaceSource(source, platform, candidate)) ||
-    (runtime === "podman" && platform === "win32" && expected.some((candidate) => samePodmanWindowsWorkspaceSource(source, candidate)));
-  return Boolean(
-    mounts?.length === 1 &&
-      mounts[0]?.Type === "bind" &&
-      sourceMatches &&
-      mounts[0]?.Destination === VM_WORKSPACE_GUEST &&
-      mounts[0]?.RW !== false,
-  );
+    expected.some((candidate) => sameWorkspaceSource(workspaceMount.Source, platform, candidate)) ||
+    (runtime === "podman" && platform === "win32" && expected.some((candidate) => samePodmanWindowsWorkspaceSource(workspaceMount.Source, candidate)));
+  if (!sourceMatches) return false;
+
+  for (const mount of mounts) {
+    if (mount === workspaceMount) continue;
+    if (mount.Type !== "bind" || mount.RW !== false) return false;
+    if (!mount.Destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.Destination)) return false;
+  }
+  return true;
 }
 
 function appleWorkspaceMountIsSafe(
@@ -798,14 +855,22 @@ function appleWorkspaceMountIsSafe(
   platform: NodeJS.Platform,
   expectedWorkspace: string | readonly string[],
 ): boolean {
-  const options = mounts?.[0]?.options ?? [];
+  if (!mounts || mounts.length === 0) return false;
   const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
-  return Boolean(
-    mounts?.length === 1 &&
-      expected.some((candidate) => sameWorkspaceSource(mounts[0]?.source, platform, candidate)) &&
-      mounts[0]?.destination === VM_WORKSPACE_GUEST &&
-      !options.some((option) => option === "ro" || option === "readonly"),
-  );
+  const workspaceMount = mounts.find((m) => m.destination === VM_WORKSPACE_GUEST);
+  if (!workspaceMount) return false;
+  const wsOptions = workspaceMount.options ?? [];
+  if (wsOptions.some((option) => option === "ro" || option === "readonly")) return false;
+  if (!expected.some((candidate) => sameWorkspaceSource(workspaceMount.source, platform, candidate))) return false;
+
+  for (const mount of mounts) {
+    if (mount === workspaceMount) continue;
+    const options = mount.options ?? [];
+    const isReadOnly = options.some((opt) => opt === "ro" || opt === "readonly");
+    if (!isReadOnly) return false;
+    if (!mount.destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.destination)) return false;
+  }
+  return true;
 }
 
 /** The Docker/Podman HostConfig surface the hardening check reads. */
@@ -963,26 +1028,21 @@ export function containerNetworkArgs(runtime: Runtime, platform: NodeJS.Platform
 
 /** Common host CLI credential mounts passed read-only into the guest.
  *
- * When enabled, mounts ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud,
- * and ~/.npmrc into the guest /home/cua directory, so terminal commands
- * run inside the Local VM container inherit the user's CLI authentication. */
+ * When enabled, mounts ~/.infisical, ~/.config/infisical, ~/.ssh, ~/.gitconfig,
+ * ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.docker/config.json, ~/.npmrc, etc.
+ * into the guest /home/cua directory, so terminal commands run inside the
+ * Local VM container inherit the user's CLI authentication. */
 export function hostCliCredentialMounts(
   platform: NodeJS.Platform = process.platform,
   home = homedir(),
 ): string[] {
   if (platform === "win32") return [];
   const mounts: string[] = [];
-  const candidates = [
-    { host: join(home, ".gitconfig"), guest: "/home/cua/.gitconfig" },
-    { host: join(home, ".config", "gh"), guest: "/home/cua/.config/gh" },
-    { host: join(home, ".aws"), guest: "/home/cua/.aws" },
-    { host: join(home, ".config", "gcloud"), guest: "/home/cua/.config/gcloud" },
-    { host: join(home, ".npmrc"), guest: "/home/cua/.npmrc" },
-  ];
-  for (const candidate of candidates) {
+  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
+    const hostPath = join(home, ...candidate.relPath);
     try {
-      if (existsSync(candidate.host)) {
-        mounts.push("--mount", `type=bind,source=${candidate.host},target=${candidate.guest},readonly`);
+      if (existsSync(hostPath)) {
+        mounts.push("--mount", `type=bind,source=${hostPath},target=${candidate.guest},readonly`);
       }
     } catch {
       // Ignore if unreadable or inaccessible

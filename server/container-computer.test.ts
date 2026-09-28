@@ -678,18 +678,58 @@ describe("Cua integration", () => {
   it("mounts host CLI credentials into the guest when shareCliCredentials is enabled", () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "bf-cli-home-"));
     mkdirSync(join(fakeHome, ".config", "gh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".config", "infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".docker"), { recursive: true });
     writeFileSync(join(fakeHome, ".gitconfig"), "fake git config");
     writeFileSync(join(fakeHome, ".config", "gh", "hosts.yml"), "fake gh");
+    writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
+    writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
+    writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), "fake docker");
 
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".docker", "config.json")},target=/home/cua/.docker/config.json,readonly`);
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
       homeDir: fakeHome,
     });
     expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+  });
+
+  it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": "docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      "docker info --format {{.ServerVersion}}": "29\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+      [`docker inspect ${CONTAINER}`]: readyInspect({
+        Mounts: [
+          { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
+          { Type: "bind", Source: "/Users/test/.infisical", Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: "/Users/test/.ssh", Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: "/Users/test/.gitconfig", Destination: "/home/cua/.gitconfig", RW: false },
+        ],
+      }),
+      [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+      [statusProbe]: "running\n",
+      [healthProbe]: JSON.stringify({ schema_version: "1", overall: "ok", checks: [] }),
+      [readinessProbe]: "{}\n",
+      [readinessRead]: validPng.toString("base64"),
+    });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+    expect(status.persistence).toBe("durable");
+    expect(status.ready).toBe(true);
   });
 
   it("mounts the official Cua MCP server for Local VM turns", () => {
