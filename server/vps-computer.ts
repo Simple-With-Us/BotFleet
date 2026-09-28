@@ -2,11 +2,15 @@
 // transport reaches the user's daemon and the official Cua MCP server stays
 // inside one managed container per bot.
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type AddressInfo } from "node:net";
 
 import {
   BASE_IMAGE,
+  CLI_CREDENTIAL_CANDIDATES,
   CUA_DRIVER_VERSION,
   CUA_SOCKET,
   DISPLAY,
@@ -169,7 +173,7 @@ const desktopTunnels = new Map<
 >();
 
 export interface VpsCommandOptions {
-  input?: string;
+  input?: string | Buffer;
   timeoutMs?: number;
 }
 
@@ -1022,6 +1026,114 @@ export async function vpsComputerAction(
     await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
   }
   return after;
+}
+
+export interface VpsSyncCredentialsResult {
+  ok: boolean;
+  synced: string[];
+  containerName: string;
+}
+
+export async function vpsSyncCliCredentials(
+  cfg: AppConfig,
+  target: VpsTarget = SHARED_VPS_TARGET,
+  runner: VpsCommandRunner = defaultRunner,
+  homeDir = homedir(),
+): Promise<VpsSyncCredentialsResult> {
+  const alias = vpsSshAlias(cfg);
+  if (!alias) {
+    throw Object.assign(
+      new Error("VPS is not configured — add an SSH config alias in App Settings → Connections"),
+      { status: 409 },
+    );
+  }
+
+  const run = (args: string[], timeoutMs = 30_000, input?: string | Buffer) =>
+    runner(vpsDockerArgs(alias, args), { timeoutMs, input });
+
+  const inspectRaw = await run(["inspect", target.containerName]).catch(() => null);
+  if (!inspectRaw) {
+    throw Object.assign(new Error(`The VPS container ${target.containerName} does not exist`), { status: 404 });
+  }
+
+  let isRunning = false;
+  try {
+    const inspected = JSON.parse(inspectRaw.stdout) as Array<{ State?: { Running?: boolean } }>;
+    isRunning = Boolean(inspected[0]?.State?.Running);
+  } catch {
+    // Malformed inspect output
+  }
+
+  if (!isRunning) {
+    throw Object.assign(new Error(`The VPS container ${target.containerName} is not running`), { status: 409 });
+  }
+
+  const existingPaths: string[] = [];
+  const syncedLabels: string[] = [];
+  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
+    const fullPath = join(homeDir, ...candidate.relPath);
+    if (existsSync(fullPath)) {
+      existingPaths.push(candidate.relPath.join("/"));
+      syncedLabels.push(candidate.relPath[0]);
+    }
+  }
+
+  const uniqueSynced = Array.from(new Set(syncedLabels));
+  if (existingPaths.length === 0) {
+    return { ok: true, synced: [], containerName: target.containerName };
+  }
+
+  const tarArchive = await new Promise<Buffer>((resolve, reject) => {
+    const tar = spawn(
+      "tar",
+      [
+        "--format=ustar",
+        "-C",
+        homeDir,
+        "--no-xattrs",
+        "--exclude=*/virtenv*",
+        "--exclude=*/agent/*",
+        "--exclude=*.sock",
+        "--exclude=*cm-*",
+        "--exclude=*.DS_Store",
+        "-cf",
+        "-",
+        ...existingPaths,
+      ],
+      {
+        env: { ...process.env, COPYFILE_DISABLE: "1" },
+      },
+    );
+    const chunks: Buffer[] = [];
+    tar.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    tar.on("error", reject);
+    tar.on("close", (code) => {
+      if (code === 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`tar packaging failed with code ${code}`));
+    });
+  });
+
+  await run(
+    ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
+    60_000,
+    tarArchive,
+  );
+
+  await run([
+    "exec",
+    "-u",
+    "cua",
+    target.containerName,
+    "sh",
+    "-c",
+    'for d in .ssh .infisical .aws .config .azure .oci .kube .cargo; do [ -d "/home/cua/$d" ] && chmod 700 "/home/cua/$d" 2>/dev/null || true; done; [ -d "/home/cua/.ssh" ] && chmod 600 /home/cua/.ssh/id_* /home/cua/.ssh/known_hosts* /home/cua/.ssh/config 2>/dev/null || true',
+  ], 15_000).catch(() => {});
+
+  return {
+    ok: true,
+    synced: uniqueSynced,
+    containerName: target.containerName,
+  };
 }
 
 /** Auto is intentionally read-only: it can attach only to an existing ready
