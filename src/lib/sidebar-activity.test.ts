@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Bot, Message } from "@/state/store";
-import { botStatusText, botWaitReason } from "./sidebar-activity";
+import { botActivityLocation, botStatusText, botWaitReason } from "./sidebar-activity";
 
 const bot = (id: string, name: string, extra: Partial<Bot> = {}): Bot =>
   ({ id, name, threadId: `${id}0`, ...extra }) as unknown as Bot;
@@ -78,6 +78,48 @@ describe("botWaitReason", () => {
   });
 });
 
+describe("botActivityLocation", () => {
+  it("identifies active group when group.busyBotId matches the bot", () => {
+    const director = bot("director", "Director", { busy: true });
+    const groups = [
+      { id: "g1", name: "BotFleet.app", busyBotId: "director" },
+      { id: "g2", name: "general", busyBotId: null },
+    ];
+    expect(botActivityLocation(director, groups)).toEqual({
+      kind: "group",
+      id: "g1",
+      name: "BotFleet.app",
+    });
+  });
+
+  it("identifies active task when bot is busy on a named task", () => {
+    const director = bot("director", "Director", {
+      busy: true,
+      threadId: "t1",
+      tasks: [{ threadId: "t1", title: "Review PR #693", createdAt: 100 }],
+    });
+    expect(botActivityLocation(director, [])).toEqual({
+      kind: "task",
+      threadId: "t1",
+      title: "Review PR #693",
+    });
+  });
+
+  it("ignores Inbox and New Task as default task titles", () => {
+    const director = bot("director", "Director", {
+      busy: true,
+      threadId: "t1",
+      tasks: [{ threadId: "t1", title: "Inbox", createdAt: 100 }],
+    });
+    expect(botActivityLocation(director, [])).toBeNull();
+  });
+
+  it("returns null for idle bot without active channel turn", () => {
+    const director = bot("director", "Director", {});
+    expect(botActivityLocation(director, [{ id: "g1", name: "General", busyBotId: null }])).toBeNull();
+  });
+});
+
 describe("botStatusText", () => {
   it("renders each reason's copy and falls back to the pre-existing Working…/empty text", () => {
     const busy = bot("a", "Alpha", { busy: true });
@@ -87,5 +129,19 @@ describe("botStatusText", () => {
     expect(botStatusText(busy, { kind: "question" })).toBe("Waiting for you…");
     expect(botStatusText(busy, null)).toBe("Working…");
     expect(botStatusText(idle, null)).toBe("");
+  });
+
+  it("includes channel location in working and waiting statuses", () => {
+    const busy = bot("a", "Alpha", { busy: true });
+    const channelLoc = { kind: "group" as const, id: "g1", name: "BotFleet.app" };
+    expect(botStatusText(busy, null, channelLoc)).toBe("Working in #BotFleet.app…");
+    expect(botStatusText(busy, { kind: "approval" }, channelLoc)).toBe("Waiting for approval in #BotFleet.app…");
+    expect(botStatusText(busy, { kind: "question" }, channelLoc)).toBe("Waiting for you in #BotFleet.app…");
+  });
+
+  it("includes task location when busy on a task", () => {
+    const busy = bot("a", "Alpha", { busy: true });
+    const taskLoc = { kind: "task" as const, threadId: "t1", title: "Refactor" };
+    expect(botStatusText(busy, null, taskLoc)).toBe("Working on Refactor…");
   });
 });

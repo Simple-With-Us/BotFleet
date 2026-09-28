@@ -12,6 +12,7 @@ export function TurnPresence({
   answering = false,
   modelMark,
   modelName,
+  actorName,
   children,
 }: {
   avatar: ReactNode;
@@ -20,6 +21,7 @@ export function TurnPresence({
   answering?: boolean;
   modelMark?: ReactNode;
   modelName?: string;
+  actorName?: string;
   startedAt?: number;
   children?: ReactNode;
 }) {
@@ -75,6 +77,11 @@ export function TurnPresence({
         {avatar}
         {showWorking ? (
           <span className="flex items-center gap-2" aria-live="polite">
+            {actorName ? (
+              <span className="text-[13px] font-semibold text-ink">
+                {actorName}
+              </span>
+            ) : null}
             <span className="thinking-shimmer animate-shimmer text-[13px] leading-none">
               {label}{elapsed > 0 ? ` · ${elapsed}s` : ""}
             </span>

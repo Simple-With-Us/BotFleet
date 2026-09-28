@@ -22,12 +22,16 @@
 //     queueDelegation: "Delegated to @X…", prose-only) — while the bot is
 //     still busy and that chip is the last thing in its active thread, it
 //     is almost certainly still waiting on that reply.
-import type { Bot, Message, OptionCardData } from "@/state/store";
+import type { Bot, Group, Message, OptionCardData } from "@/state/store";
 
 export type BotWaitReason =
   | { kind: "teammate"; name: string }
   | { kind: "approval" }
   | { kind: "question" };
+
+export type BotLocation =
+  | { kind: "group"; id: string; name: string }
+  | { kind: "task"; threadId: string; title: string };
 
 const MESSAGED_PREFIX = "Messaged @";
 const DELEGATED_PREFIX = "Delegated to @";
@@ -82,13 +86,55 @@ export function botWaitReason(bot: Bot, last: Message | undefined, bots: Bot[]):
   return null;
 }
 
+/** Where a bot is currently active or speaking.
+ *
+ * Prioritizes active group/channel presence (`group.busyBotId === bot.id`)
+ * so channel members or Director working inside a room are immediately
+ * identified with that channel. For busy bots working on a distinct named
+ * task, identifies the task title.
+ */
+export function botActivityLocation(
+  bot: Bot,
+  groups?: Array<Pick<Group, "id" | "name" | "busyBotId">>,
+): BotLocation | null {
+  if (groups && groups.length > 0) {
+    const activeGroup = groups.find((g) => g.busyBotId === bot.id);
+    if (activeGroup) {
+      return { kind: "group", id: activeGroup.id, name: activeGroup.name };
+    }
+  }
+  if (bot.busy || bot.activity === "working" || bot.activity === "waiting-on-you") {
+    if (bot.tasks && bot.tasks.length > 0) {
+      const activeTask = bot.tasks.find((t) => t.threadId === bot.threadId);
+      if (activeTask && activeTask.title && activeTask.title !== "Inbox" && activeTask.title !== "New Task") {
+        return { kind: "task", threadId: activeTask.threadId, title: activeTask.title };
+      }
+    }
+  }
+  return null;
+}
+
 /** The roster row's status text — ported 1:1 from upstream's own copy
  * choices for "waiting" vs "working", split further for approval vs
- * question. Falls back to the pre-existing "Working…" for a plain busy
- * bot with nothing more specific to report, and "" when idle. */
-export function botStatusText(bot: Bot, wait: BotWaitReason | null): string {
+ * question. When a location is provided (e.g. channel or task), it clarifies
+ * where the bot is busy or waiting. Falls back to the pre-existing "Working…"
+ * for a plain busy bot with nothing more specific to report, and "" when idle. */
+export function botStatusText(
+  bot: Bot,
+  wait: BotWaitReason | null,
+  location?: BotLocation | null,
+): string {
   if (wait?.kind === "teammate") return `Waiting on @${wait.name}…`;
-  if (wait?.kind === "approval") return "Waiting for approval…";
-  if (wait?.kind === "question") return "Waiting for you…";
-  return bot.busy ? "Working…" : "";
+  if (wait?.kind === "approval") {
+    return location?.kind === "group" ? `Waiting for approval in #${location.name}…` : "Waiting for approval…";
+  }
+  if (wait?.kind === "question") {
+    return location?.kind === "group" ? `Waiting for you in #${location.name}…` : "Waiting for you…";
+  }
+  if (bot.busy) {
+    if (location?.kind === "group") return `Working in #${location.name}…`;
+    if (location?.kind === "task") return `Working on ${location.title}…`;
+    return "Working…";
+  }
+  return "";
 }

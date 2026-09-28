@@ -24,6 +24,14 @@ import {
   parseSidebarDensity,
   saveSidebarDensity,
   partitionSidebarGroups,
+  DEFAULT_SIDEBAR_WIDTH,
+  DEFAULT_SIDEBAR_COMPACT_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  SIDEBAR_WIDTH_KEY,
+  parseSidebarWidth,
+  loadSidebarWidth,
+  saveSidebarWidth,
 } from "./sidebar-preferences";
 
 describe("sidebar density preferences", () => {
@@ -161,5 +169,31 @@ describe("sidebar section order and Bot Chats", () => {
     expect(collapsed.has("Bot ↔ Bot")).toBe(false);
     expect(store[SIDEBAR_COLLAPSED_SECTIONS_KEY]).toContain("Bot Chats");
     expect(store[SIDEBAR_COLLAPSED_SECTIONS_KEY]).not.toContain("Bot ↔ Bot");
+  });
+});
+
+describe("sidebar width preferences", () => {
+  it("defaults to comfortable (320) or compact (272) based on density", () => {
+    expect(parseSidebarWidth(null, "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth(null, "compact")).toBe(DEFAULT_SIDEBAR_COMPACT_WIDTH);
+    expect(parseSidebarWidth("", "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth("invalid", "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+  });
+
+  it("clamps custom width between MIN_SIDEBAR_WIDTH and MAX_SIDEBAR_WIDTH", () => {
+    expect(parseSidebarWidth("100")).toBe(MIN_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth("250")).toBe(250);
+    expect(parseSidebarWidth("400")).toBe(400);
+    expect(parseSidebarWidth("1200")).toBe(MAX_SIDEBAR_WIDTH);
+  });
+
+  it("saves and loads the clamped width from storage", () => {
+    const setItem = vi.fn();
+    saveSidebarWidth(450, { setItem });
+    expect(setItem).toHaveBeenCalledWith(SIDEBAR_WIDTH_KEY, "450");
+    expect(loadSidebarWidth({ getItem: () => "380" })).toBe(380);
+    expect(loadSidebarWidth({ getItem: () => { throw new Error("blocked"); } }, "compact")).toBe(
+      DEFAULT_SIDEBAR_COMPACT_WIDTH,
+    );
   });
 });
