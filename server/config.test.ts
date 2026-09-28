@@ -1617,7 +1617,7 @@ describe("migrateComputerProvidersConfig", () => {
       localVm: true,
       localMac: true,
     });
-    expect(cfg.botDefaults?.vpsMode).toBe("per-bot");
+    expect(cfg.botDefaults?.vpsMode).toBe("shared");
   });
 
   it("maps an absent allowlist (legacy unrestricted) to every provider on", () => {

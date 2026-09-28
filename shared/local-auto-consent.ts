@@ -68,7 +68,7 @@ export const DEFAULT_COMPUTER_PROVIDERS: ComputerProviders = {
  * implemented: shared gives every bot one container with per-bot isolated
  * desktops, per-bot gives each bot its own container and durable workspace.
  * Shared turn leases are keyed per bot while lifecycle stays on one container. */
-export const DEFAULT_VPS_MODE: VpsMode = "per-bot";
+export const DEFAULT_VPS_MODE: VpsMode = "shared";
 
 /** All four keys as a stable iteration order so tests and UI code do not
  * depend on `Object.keys` (which is insertion-order in modern engines but

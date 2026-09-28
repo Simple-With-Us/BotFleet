@@ -25,7 +25,6 @@ import { useCallback, useMemo, useState } from "react";
 import { ApiError, api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { Card } from "./SettingsPrimitives";
 import { ComputerProviderToggle } from "./ComputerProviderToggle";
-import { VpsModeToggle } from "./VpsModeToggle";
 import { BotComputerMatrix } from "./BotComputerMatrix";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { engineReachKnown, instanceSupportsLocalComputer } from "@/lib/local-computer";
@@ -258,19 +257,7 @@ export function LocalComputerSection() {
     persist(nextProviders, nextVpsMode);
   };
 
-  // The mode control and the VPS toggle drive the same state, so neither
-  // may refuse on account of the other.  Picking a mode while the VPS is
-  // off turns it on with that mode in one save; picking "Not Used" while it
-  // is on goes through the same disable path as the toggle, impact confirm
-  // included.
-  const handleVpsModeChange = (next: VpsMode) => {
-    if (locked) return;
-    if (next === null) {
-      if (providers.selfHostedVps) handleProviderToggle("selfHostedVps", false);
-      return;
-    }
-    persist({ ...providers, selfHostedVps: true }, next);
-  };
+
 
   // Apply workspace defaults to every bot.  Mirrors the existing
   // `BotComputerDefaults.tsx` consent handshake: the server may refuse
@@ -362,10 +349,6 @@ export function LocalComputerSection() {
               onToggle={(next) => handleProviderToggle(id, next)}
             />
           ))}
-        </div>
-        <div className="mt-4 flex flex-col gap-1.5 border-t border-hairline/40 pt-4">
-          <div className="text-[12px] font-medium text-ink">Self-Hosted VPS Mode</div>
-          <VpsModeToggle value={vpsMode} busy={locked} onChange={handleVpsModeChange} />
         </div>
         {configReady && resolved.resolvedFromLegacy && (
           <div className="mt-3 rounded-lg bg-warning/10 px-3 py-2 text-[11.5px] text-warning">
