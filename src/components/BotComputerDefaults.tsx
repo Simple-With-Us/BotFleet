@@ -202,7 +202,7 @@ export function BotComputerDefaults() {
   return (
     <>
       <Card
-        title="New Bots"
+        title="Default Bot Settings"
         subtitle={"Which computers a bot gets before anyone opens its settings.\u00a0 Pick more than one and it chooses per task.\u00a0 Leave all of them off to keep the shipped behavior: reuse whatever already exists, create nothing."}
       >
         <div className="flex overflow-hidden rounded-lg border border-hairline/40">
