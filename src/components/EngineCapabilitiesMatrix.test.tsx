@@ -49,10 +49,10 @@ const source = readFileSync(new URL("./EngineCapabilitiesMatrix.tsx", import.met
 
 describe("EngineCapabilitiesMatrix layout budget", () => {
   it("derives the content budget from the real dialog geometry", () => {
-    // 1100px dialog - 164px section nav - 20px of px-5 on each side.
-    expect(MATRIX_CONTENT_BUDGET_PX).toBe(896);
+    // 1292px dialog - 164px section nav - 20px of px-5 on each side.
+    expect(MATRIX_CONTENT_BUDGET_PX).toBe(1088);
     expect(MATRIX_CARD_PADDING_PX).toBe(32);
-    expect(MATRIX_TABLE_BUDGET_PX).toBe(864);
+    expect(MATRIX_TABLE_BUDGET_PX).toBe(1056);
   });
 
   it("fits every capability column inside the pane without a horizontal scroll", () => {

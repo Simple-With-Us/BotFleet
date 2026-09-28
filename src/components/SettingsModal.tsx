@@ -57,6 +57,41 @@ import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
 
+export const DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292; // 1100px + 192px (2 inches wider)
+export const DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976; // 880px + 96px (1 inch taller)
+export const MIN_SETTINGS_MODAL_WIDTH_PX = 760;
+export const MIN_SETTINGS_MODAL_HEIGHT_PX = 520;
+export const SETTINGS_MODAL_SIZE_STORAGE_KEY = "botfleet.settingsModalSize";
+
+export function loadSettingsModalSize(): { width: number; height: number } {
+  if (typeof window === "undefined") {
+    return { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+  }
+  try {
+    const raw = localStorage.getItem(SETTINGS_MODAL_SIZE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.width === "number" && typeof parsed?.height === "number") {
+        return {
+          width: Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, parsed.width),
+          height: Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, parsed.height),
+        };
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+}
+
+export function saveSettingsModalSize(size: { width: number; height: number }): void {
+  try {
+    localStorage.setItem(SETTINGS_MODAL_SIZE_STORAGE_KEY, JSON.stringify(size));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 const SECTIONS: Array<{
   id: AppSettingsSection;
   label: string;
@@ -1101,6 +1136,95 @@ export function SettingsModal() {
     };
   }, [dispatch]);
 
+  const [modalSize, setModalSize] = useState(() => loadSettingsModalSize());
+  const isResizingRef = useRef(false);
+  const [isResizing, setIsResizing] = useState(false);
+
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    setIsResizing(true);
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startW = modalSize.width;
+    const startH = modalSize.height;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const maxW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, window.innerWidth - 32);
+      const maxH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, window.innerHeight - 32);
+      // Since the modal is centered with flexbox, moving mouse by deltaX moves the right edge by deltaX
+      // and requires the width to expand by deltaX * 2 so the edge stays right under the mouse.
+      const deltaX = (moveEvent.clientX - startX) * 2;
+      const deltaY = (moveEvent.clientY - startY) * 2;
+      const nextW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, Math.min(maxW, Math.round(startW + deltaX)));
+      const nextH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, Math.min(maxH, Math.round(startH + deltaY)));
+      setModalSize({ width: nextW, height: nextH });
+    };
+
+    const onMouseUp = (upEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      isResizingRef.current = false;
+      setIsResizing(false);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      const maxW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, window.innerWidth - 32);
+      const maxH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, window.innerHeight - 32);
+      const deltaX = (upEvent.clientX - startX) * 2;
+      const deltaY = (upEvent.clientY - startY) * 2;
+      const finalW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, Math.min(maxW, Math.round(startW + deltaX)));
+      const finalH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, Math.min(maxH, Math.round(startH + deltaY)));
+      const finalSize = { width: finalW, height: finalH };
+      setModalSize(finalSize);
+      saveSettingsModalSize(finalSize);
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  };
+
+  const resetSize = () => {
+    const def = { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+    setModalSize(def);
+    saveSettingsModalSize(def);
+  };
+
+  const handleResizeKey = (e: React.KeyboardEvent) => {
+    const step = 20;
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, width: Math.min(window.innerWidth - 32, prev.width + step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, width: Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, prev.width - step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, height: Math.min(window.innerHeight - 32, prev.height + step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, height: Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, prev.height - step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "Home" || e.key === "0") {
+      e.preventDefault();
+      resetSize();
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
@@ -1112,7 +1236,14 @@ export function SettingsModal() {
         aria-modal="true"
         aria-labelledby="app-settings-title"
         tabIndex={-1}
-        className="flex h-[min(880px,calc(100dvh-3rem))] w-full max-w-[1100px] overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none"
+        style={{
+          width: `min(${modalSize.width}px, calc(100vw - 2rem))`,
+          height: `min(${modalSize.height}px, calc(100dvh - 2rem))`,
+        }}
+        className={cn(
+          "relative flex overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none",
+          isResizing && "select-none",
+        )}
       >
         {/* section nav */}
         <nav className="flex w-[164px] shrink-0 flex-col gap-0.5 border-r border-hairline/40 p-3">
@@ -1334,6 +1465,25 @@ export function SettingsModal() {
 
             {section === "secrets" && isItemVisible("secrets:infisical") && <SecretsSection />}
           </div>
+        </div>
+
+        {/* Resize handle */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize settings dialog"
+          tabIndex={0}
+          title="Drag to resize, double-click to reset"
+          onMouseDown={startResize}
+          onDoubleClick={resetSize}
+          onKeyDown={handleResizeKey}
+          className="absolute bottom-1 right-1 z-50 flex size-4 cursor-nwse-resize items-center justify-center text-ink-secondary/40 hover:text-ink select-none"
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="stroke-current stroke-1">
+            <line x1="8" y1="2" x2="2" y2="8" />
+            <line x1="8" y1="5" x2="5" y2="8" />
+            <line x1="8" y1="8" x2="8" y2="8" />
+          </svg>
         </div>
       </div>
     </div>

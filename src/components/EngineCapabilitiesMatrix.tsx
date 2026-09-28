@@ -59,9 +59,9 @@ import type { InstanceInfo } from "@/state/store";
 // ---------------------------------------------------------------------------
 
 /** Usable width of the settings content pane, in CSS pixels:
- *  `max-w-[1100px]` on the dialog, minus the 164px section nav, minus the
+ *  `1292px` on the dialog, minus the 164px section nav, minus the
  *  20px `px-5` gutter on each side of the pane. */
-export const MATRIX_CONTENT_BUDGET_PX = 1100 - 164 - 20 * 2;
+export const MATRIX_CONTENT_BUDGET_PX = 1292 - 164 - 20 * 2;
 
 /** The card's own `p-4` on both sides. */
 export const MATRIX_CARD_PADDING_PX = 16 * 2;
@@ -72,9 +72,8 @@ export const MATRIX_TABLE_BUDGET_PX = MATRIX_CONTENT_BUDGET_PX - MATRIX_CARD_PAD
 /** The sticky engine column. */
 export const MATRIX_ROW_HEADER_PX = 188;
 
-/** One capability column.  Wide enough for the two-word column labels at
- *  10.5px once they wrap onto a second line. */
-export const MATRIX_CAPABILITY_COL_PX = 54;
+/** One capability column.  Comfortable width for column labels at 10.5px. */
+export const MATRIX_CAPABILITY_COL_PX = 68;
 
 // ---------------------------------------------------------------------------
 // Per-state presentation.  `unknown` gets its own dashed, low-contrast

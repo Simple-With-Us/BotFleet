@@ -52,7 +52,7 @@ export function ConfirmDialog({
         aria-modal="true"
         aria-labelledby="confirm-dialog-title"
         aria-describedby="confirm-dialog-body"
-        className="w-full max-w-[420px] rounded-2xl border border-hairline/50 bg-panel p-5 shadow-2xl"
+        className="w-full max-w-[420px] min-w-[320px] rounded-2xl border border-hairline/50 bg-panel p-5 shadow-2xl resize overflow-auto"
       >
         <div className="flex items-start gap-3">
           <AlertTriangle size={18} className={`mt-0.5 shrink-0 ${destructive ? "text-danger" : "text-warning"}`} />
