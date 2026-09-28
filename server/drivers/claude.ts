@@ -625,6 +625,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           emit({
             ...base(threadId, turnId), type: "runtime.error",
             message: preflightError instanceof Error ? preflightError.message : String(preflightError),
+            // A dead CLI binary is a setup problem, not an upgrade nudge:
+            // forward the flag so the doomed breaker counts it like the
+            // spawn paths' describeSpawnFailure failures.
+            ...(preflightError instanceof Error && (preflightError as { setup?: unknown }).setup === true
+              ? { setup: true }
+              : {}),
           });
         }
         emit({
@@ -1297,9 +1303,27 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     const requireStrictMcp = async (): Promise<void> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      if (!(await supportsStrictMcp(strictMcpProbe?.version ?? "unprobed", env))) {
-        throw new Error(CLAUDE_ISOLATION_REASON);
-      }
+      if (await supportsStrictMcp(strictMcpProbe?.version ?? "unprobed", env)) return;
+      // A failed probe conflates two very different causes: the CLI is too
+      // old for --strict-mcp-config (upgrade it), or the CLI cannot run at
+      // all (missing or not executable — a setup problem). Both surfaced as
+      // the generic isolation reason with no setup flag, so a dead claude
+      // binary never fed the doomed breaker the way spawn failures do.
+      // Distinguish the causes here, where the cause is knowable.
+      const spawnFailure = await new Promise<ReturnType<typeof describeSpawnFailure> | null>(
+        (resolve) => {
+          execCli(config.cli, ["--version"], { timeout: 3000, env }, (error) => {
+            if (!error) return resolve(null);
+            const failure = describeSpawnFailure(error as NodeJS.ErrnoException, config.cli);
+            resolve(failure.setup ? failure : null);
+          });
+        },
+      );
+      const reason = new Error(spawnFailure?.message ?? CLAUDE_ISOLATION_REASON) as Error & {
+        setup?: boolean;
+      };
+      if (spawnFailure) reason.setup = true;
+      throw reason;
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {

@@ -1102,6 +1102,15 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-missing", text: "go" });
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: false, stopReason: "spawn_error" });
+    // The real cause is a setup problem: name it and flag it so the doomed
+    // breaker counts the dead binary like any other driver's spawn failure.
+    expect(recorder.events).toContainEqual(
+      expect.objectContaining({
+        type: "runtime.error",
+        message: expect.stringContaining("isn't installed"),
+        setup: true,
+      }),
+    );
 
     expect(await instance.snapshot()).toMatchObject({ state: "unavailable" });
   });
@@ -1493,6 +1502,11 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     });
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "runtime.error", message: expect.stringContaining("Update Claude Code") }));
+    // Negative control: the CLI runs but is too old — not a setup failure,
+    // so the event must NOT carry the setup flag the breaker keys on.
+    expect(
+      recorder.events.filter((e) => e.type === "runtime.error").every((e) => (e as { setup?: unknown }).setup !== true),
+    ).toBe(true);
     expect(recorder.events).toContainEqual(expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "spawn_error" }));
     await expect(instance.generateText?.("title")).rejects.toThrow(/Update Claude Code/);
     await expect(instance.reviewPermission?.("review")).rejects.toThrow(/Update Claude Code/);

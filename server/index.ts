@@ -43,7 +43,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, offerableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -2806,15 +2806,21 @@ bus.subscribe((event: RuntimeEvent) => {
           requestId: event.requestId,
           tool: permission ? event.tool : undefined,
           // the exact grant "always allow" would remember, decided here so
-          // client and server can never derive it differently
+          // client and server can never derive it differently. Bare shell
+          // runners, destructive operations, and sensitive paths are never
+          // offered as "Always allow" grants.
           allowKey:
-            permission && event.approvalScope !== "local-computer"
-              ? approvalKey(event.tool, event.summary, event.approvalScope)
+            permission
+              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
-          // in auto mode a card can only mean the guard stopped it — say so
+          // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
             permission && asker?.autoApprove
-              ? "This looked destructive, so auto mode stopped to ask."
+              ? verdict?.source === "destructive-guard"
+                ? "This looked destructive, so auto mode stopped to ask."
+                : verdict?.source === "sensitive-guard"
+                  ? "This touched sensitive files or credentials, so auto mode stopped to ask."
+                  : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
         },
@@ -4178,7 +4184,17 @@ async function startTurn(
             botFleetStatusSystemPrompt(),
           )
         : integrations.agents && sectionPeers.length > 0
-          ? "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
+          ? [
+              "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply" +
+                (availableAgentTools.includes("delegate_bot")
+                  ? ", and delegate_bot assigns an asynchronous task to a specialist peer."
+                  : "."),
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using " +
+                (availableAgentTools.includes("delegate_bot")
+                  ? "delegate_bot (preferred) or ask_bot"
+                  : "ask_bot") +
+                " rather than stopping without action.",
+            ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools);
       const routinePrompt = routinePromptFor(availableAgentTools);
