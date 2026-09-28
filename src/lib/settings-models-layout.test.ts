@@ -21,9 +21,21 @@ describe("desktop Settings Models layout", () => {
 
   it("grows the Settings dialog about 25–30 percent so fleet rows fit", () => {
     expect(settings).toContain("max-w-[1100px]");
-    expect(settings).toContain("h-[min(720px,calc(100dvh-3rem))]");
+    // 880px, not 720px: the Engines section opens on the capability matrix
+    // and the reader must not have to scroll before the hover detail appears.
+    expect(settings).toContain("h-[min(880px,calc(100dvh-3rem))]");
+    expect(settings).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings).not.toContain("max-w-[860px]");
     expect(settings).not.toContain("h-[560px]");
+  });
+
+  it("keeps the section nav narrow so the Engines matrix fits the pane", () => {
+    // 164px, not 190px.  The content pane is 1100 - nav - 40, and
+    // EngineCapabilitiesMatrix.MATRIX_CONTENT_BUDGET_PX is derived from
+    // these two numbers; widening the nav back would reintroduce the
+    // horizontal scroll the transposed matrix was built to remove.
+    expect(settings).toContain("w-[164px]");
+    expect(settings).not.toContain("w-[190px]");
   });
 
   it("wraps Primary, fallbacks, and Add Fallback instead of a four-column grid", () => {

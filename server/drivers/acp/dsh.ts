@@ -7,7 +7,6 @@
  * core and the Node stdio bridge.  Edit engine shape in Harness, not here.
  */
 import {
-  STATIC_DSH_MODELS as harnessDshModels,
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
@@ -33,9 +32,62 @@ export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Harness package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3 dominates
  * on context and is the canonical DSH-hosted MiniMax row). */
+/** BotFleet DSH model catalog.
+ *
+ *  Owner-facing list (2026-09-27): DeepSeek V4 Pro, DeepSeek V4 Flash, then
+ *  MiniMax M3.1 Flash Preview, M3, and M2.7 Highspeed.  DeepSeek's catalog is
+ *  only two models — `deepseek-flash` IS the image+video model, billed at the
+ *  same rate as text (its image tokens bill "together with your text tokens"),
+ *  so there is deliberately no third DeepSeek row for the multimodal variant.
+ *  DeepSeek also retired `deepseek-v4-flash`; the id is still accepted and
+ *  routed to the latest Flash, so it is kept for existing threads.
+ *
+ *  `MiniMax-M2.7` is dropped per the product decision (M3 dominates on context
+ *  and is the canonical DSH-hosted MiniMax row).
+ *
+ *  Badges are price/speed facts the picker renders as chips, so the cost
+ *  tradeoff is visible before a model is picked. */
 export const STATIC_DSH_MODELS: ModelCatalog = {
-  ...harnessDshModels,
-  options: harnessDshModels.options.filter((option) => option.id !== "MiniMax-M2.7"),
+  default: "deepseek-v4-flash",
+  options: [
+    {
+      id: "deepseek-v4-flash",
+      label: "DeepSeek V4 Flash",
+      contextWindow: 1_000_000,
+      // "Image + Video" is 13 chars; ModelCatalog.badge documents a ~10 char
+      // ceiling so a chip cannot push the label onto a second line in a narrow
+      // chat head.  The hover carries the specifics.
+      badge: "Multimodal",
+      badgeTitle:
+        "Accepts image and video input at the same token rate as text — each image is capped at 1,024 tokens.",
+    },
+    {
+      id: "deepseek-v4-pro",
+      label: "DeepSeek V4 Pro",
+      contextWindow: 1_000_000,
+    },
+    {
+      id: "MiniMax-M3.1-Flash-Preview",
+      label: "MiniMax M3.1 Flash Preview",
+      contextWindow: 1_000_000,
+      badge: "Preview",
+      badgeTitle:
+        "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
+    },
+    {
+      id: "MiniMax-M3",
+      label: "MiniMax M3",
+      contextWindow: 1_000_000,
+    },
+    {
+      id: "MiniMax-M2.7-highspeed",
+      label: "MiniMax M2.7 Highspeed",
+      contextWindow: 204_800,
+      badge: "2x Cost",
+      badgeTitle:
+        "Same 204,800 context as M2.7 at $0.60 / M input and $2.40 / M output — exactly twice MiniMax M3's $0.30 / $1.20.",
+    },
+  ],
 };
 
 /** Models the product keeps out of the picker even when the installed

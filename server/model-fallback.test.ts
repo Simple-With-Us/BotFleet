@@ -26,6 +26,7 @@ import {
   unattendedModelDowngrade,
 } from "./model-fallback.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
+import { doomedDispatches } from "./doomed-dispatch.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -1175,5 +1176,290 @@ describe("unattendedModelDowngrade", () => {
         { unattended: true, effortLevels: ["low"] },
       ),
     ).toEqual({ instanceId: "claude", model: "claude-haiku-4-5", effort: "low" });
+  });
+});
+
+// A fail-over is the exact moment a SECOND dead engine gets picked: the
+// primary failed over cleanly, and the chain then handed the turn to an engine
+// whose CLI is missing, is not executable, or is waiting on an interactive
+// login.  216 of 2,001 runs on one Mac were `spawn_error` — the process never
+// came up at all — and two bots whose primary is `antigravity` had already
+// fallen back when this was written.
+describe("a setup-dead engine is not a fallback candidate", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "grok", model: "grok-4.7" },
+    { instanceId: "dsh", model: "MiniMax-M3" },
+    { instanceId: "claude", model: "claude-sonnet-5" },
+  ];
+  const doomed = (...instances: string[]) => (botId: string, instanceId: string) =>
+    botId === "bot1" && instances.includes(instanceId);
+
+  it("resolves to the third entry when the second is setup-dead", () => {
+    // used: 1 is the position the just-failed primary occupies, so the walk
+    // starts at chain index 1 (dsh).  That one is dead, so the next saved
+    // engine is the third.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: 1,
+        botId: "bot1",
+        isDoomed: doomed("dsh"),
+        now: T0,
+      }),
+    ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+  });
+
+  it("leaves a chain with nothing doomed exactly as it was", () => {
+    const input = {
+      ok: false,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: CHAIN,
+      used: 0,
+      botId: "bot1",
+      isDoomed: () => false,
+      now: T0,
+    };
+    expect(selectTurnFallback(input)).toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+    // …and with no bot id and no gate, which is every caller on today's
+    // wiring, nothing is excluded on the breaker's account.
+    expect(selectTurnFallback({ ...input, botId: undefined, isDoomed: undefined }))
+      .toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+  });
+
+  it("returns undefined for an entirely doomed chain — the whole-chain behaviour is unchanged", () => {
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: 0,
+        botId: "bot1",
+        isDoomed: doomed("grok", "dsh", "claude"),
+        now: T0,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("skips, never re-orders: a dead first entry leaves the rest in saved order", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: CHAIN,
+      used: 0,
+      botId: "bot1",
+      isDoomed: doomed("grok"),
+      now: T0,
+    });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+    // nextUsed still points past the entry that was chosen, so the second
+    // failure of the same turn walks on to the third rather than re-offering
+    // the dead first entry.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: false,
+        quotaOrCap: true,
+        fallbacks: CHAIN,
+        used: next!.nextUsed,
+        current: { instanceId: next!.instanceId, model: next!.model },
+        botId: "bot1",
+        isDoomed: doomed("grok"),
+        now: T0,
+      }),
+    ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+  });
+
+  it("reads the process-wide breaker by default, the one canStart already consults", () => {
+    doomedDispatches.clear();
+    try {
+      // Below the threshold the pair is only a counter, so the chain is
+      // untouched — one ENOENT can land mid-install and must not exclude an
+      // engine on its own.
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 0,
+          botId: "bot1",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "grok", model: "grok-4.7", nextUsed: 1 });
+
+      doomedDispatches.recordFailure("bot1", "dsh", "spawn ENOENT", T0);
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot1",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+
+      // The pair is keyed per bot: another bot's chain still offers dsh.
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot2",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("resolveModel skips a doomed fallback and returns the primary when none is left", () => {
+    const registry = new (quotaCooldowns.constructor as any)();
+    const primary: ModelSelection = {
+      instanceId: "antigravity",
+      model: "gemini-3.8-pro-high",
+      fallbacks: [
+        { instanceId: "grok", model: "grok-4.7" },
+        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ],
+    };
+    registry.record({
+      botId: "bot1",
+      instanceId: primary.instanceId,
+      model: primary.model,
+      resetsAt: T0 + 60_000,
+      error: "session limit",
+      recordedAt: T0,
+    });
+    // The first chain entry is cooling too, so the walk reaches dsh — which
+    // is exactly the entry this change is about.
+    registry.record({
+      botId: "bot1",
+      instanceId: "grok",
+      model: "grok-4.7",
+      resetsAt: T0 + 60_000,
+      error: "429",
+      recordedAt: T0,
+    });
+
+    // Nothing dead: the first usable entry, untouched.
+    expect(registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: () => false }).selection)
+      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3" });
+
+    // dsh cannot start for this bot, so the next saved engine is the third.
+    const skipped = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh") });
+    expect(skipped.isFallback).toBe(true);
+    expect(skipped.selection).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5" });
+
+    // Every remaining candidate is dead: the primary plus its cooldown, which
+    // is exactly what an all-cooling chain has always returned.
+    const none = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh", "claude") });
+    expect(none.selection).toMatchObject({ instanceId: primary.instanceId, model: primary.model });
+    expect(none.isFallback).toBe(false);
+    expect(none.cooldown?.error).toBe("session limit");
+  });
+});
+
+// The tests above inject `isDoomed` directly, which is a seam — not how the
+// product runs.  Production passes no gate at all and relies on
+// `doomedGate()` falling back to `defaultDoomedGate`, which reads the same
+// process-wide breaker `canStart` consults.  Nothing pinned that path: if
+// `defaultDoomedGate` were ever stubbed to a no-op, every test above would
+// still pass while the feature was dead in the only configuration that ships.
+//
+// This test therefore registers a real pair on the module-level registry and
+// resolves a chain with NO `isDoomed` argument, so the production wiring is
+// what is under test.  It exists because a Sentry review claimed this path was
+// inactive; the claim was wrong, and this is the proof that will keep proving
+// it — including if the claim later turns out to have been right.
+describe("the default doomed gate is live, not a stub", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "grok", model: "grok-4.7" },
+    { instanceId: "dsh", model: "MiniMax-M3" },
+    { instanceId: "claude", model: "claude-sonnet-5" },
+  ];
+
+  /** Drive a real pair to the threshold on the shared registry. */
+  function doomTheRealPair(botId: string, instanceId: string) {
+    for (let i = 0; i < 3; i++) doomedDispatches.recordFailure(botId, instanceId, "spawn ENOENT", T0);
+  }
+
+  it("excludes a setup-dead engine with no isDoomed argument passed", () => {
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("leaves a healthy chain untouched through the same default path", () => {
+    // Guards the other direction: the default gate must not exclude anything
+    // just because no gate was injected.
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate-clean",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("resolveModel's default path skips a doomed fallback too", () => {
+    const registry = new QuotaCooldownRegistry();
+    const primary: ModelSelection = {
+      instanceId: "antigravity",
+      model: "gemini-3.8-pro-high",
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3" }],
+    };
+    registry.record({
+      botId: "bot-default-gate",
+      instanceId: primary.instanceId,
+      model: primary.model,
+      resetsAt: T0 + 60_000,
+      error: "session limit",
+      recordedAt: T0,
+    });
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      const picked = registry.resolveModel("bot-default-gate", primary, T0);
+      expect(picked.isFallback).toBe(true);
+      expect(picked.selection.instanceId).toBe("grok");
+    } finally {
+      doomedDispatches.clear();
+    }
   });
 });

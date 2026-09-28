@@ -18,6 +18,7 @@ import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB } from "./config.ts";
 import { harnessReady } from "./testing/harness-ready.ts";
+import { DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -241,6 +242,10 @@ beforeAll(async () => {
         // adapter from bot.modelSelection stops the wrong engine.
         claude2: { driver: "claudeAgent", displayName: "Fixture Claude Two", config: { cli: FAKE_CLAUDE_CLI } },
         crasher: { driver: "claudeAgent", displayName: "Fixture Crasher", config: { cli: fakeCrashCli } },
+        // A binary that does not exist: every dispatch to it fails setup
+        // (spawn ENOENT surfaces as runtime.error with setup: true on an ACP
+        // driver), which is what opens the doomed-dispatch breaker for real.
+        deadCli: { driver: "grokAgent", displayName: "Fixture Dead CLI", config: { cli: join(home, "no-such-cli") } },
         quota: { driver: "claudeAgent", displayName: "Fixture Quota", enabled: false, config: { cli: fakeQuotaCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
         secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
@@ -2281,6 +2286,71 @@ describe("harness HTTP API", () => {
         );
         return state?.busy;
       }).toBe(false);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("the mid-turn fail-over skips a chain entry the doomed breaker is refusing", async () => {
+    // Regression: selectTurnFallback only skipped a doomed engine when its
+    // caller threaded botId, and the production mid-turn call did not - so a
+    // bot whose primary failed over cleanly was still handed a second dead
+    // engine.  The breaker state is built the way production builds it:
+    // deadCli's binary does not exist, every dispatch to it fails setup
+    // (spawn ENOENT), and the bus feeds three consecutive failures into the
+    // breaker for THIS bot only.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const deadCli = instances.find((instance: { instanceId: string }) => instance.instanceId === "deadCli");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "deadCli", model: deadCli.models.default },
+      })).status).toBe(200);
+      for (let i = 0; i < DOOMED_FAILURE_THRESHOLD; i++) {
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "go" })).status).toBe(202);
+        await expect.poll(async () => {
+          const doomed = (await api("GET", "/api/quotas")).body.doomed ?? [];
+          return (doomed.find((entry: { botId: string; instanceId: string; consecutiveFailures: number }) =>
+            entry.botId === bot.id && entry.instanceId === "deadCli",
+          )?.consecutiveFailures) ?? 0;
+        }, { timeout: 10_000 }).toBe(i + 1);
+      }
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "deadCli", model: deadCli.models.default },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail then hang" })).status).toBe(202);
+
+      // The fail-over must walk past the doomed deadCli and land on claude:
+      // the fallback's own selection is patched onto the bot, so the live
+      // winner is visible without parsing the chip text.
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 20_000 }).toBe("claude");
+      const state = (await api("GET", "/api/bots")).body.bots.find(
+        (candidate: { id: string }) => candidate.id === bot.id,
+      );
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith("Fell over to"),
+      )).toBe(true);
+      // ...and the walk never touched the doomed entry: without the botId
+      // threading, the first chip names deadCli's model and the turn burns
+      // one guaranteed-dead dispatch before walking on.
+      expect(state?.messages?.some((message: any) =>
+        typeof message?.tool?.name === "string" && message.tool.name.startsWith(`Fell over to ${deadCli.models.default}`),
+      )).toBe(false);
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
@@ -6125,12 +6195,16 @@ describe("GET /api/quotas", () => {
     };
     expect(data.ok).toBe(true);
     expect(Array.isArray(data.doomed)).toBe(true);
-    // Every engine in this fixture starts, so the list is legitimately empty.
+    // The failover regression above deliberately opens the breaker for a bot
+    // it then deletes, and the registry keeps the count afterwards (that
+    // retention is the half-open design), so emptiness holds for LIVE bots.
     // The assertion that matters is that the key EXISTS and holds the live
     // registry's shape: a missing field would read as "nothing is doomed"
     // rather than "this build does not say", and that is the failure the audit
     // ran into.
-    expect(data.doomed).toEqual([]);
+    const liveBots = (await (await fetch(`${BASE}/api/bots`)).json()) as { bots: Array<{ id: string }> };
+    const liveBotIds = new Set(liveBots.bots.map((bot) => bot.id));
+    expect(data.doomed.filter((entry) => liveBotIds.has(entry.botId))).toEqual([]);
   });
 });
 
@@ -7692,5 +7766,119 @@ describe("CSRF security hardening", () => {
         req.end();
       });
     }
+  });
+});
+
+describe("bot playbooks install API", () => {
+  /** A minimal valid `botfleet.package`.  The schema requires more than looks
+   *  obvious — license, outcomes, setupMinutes, requirements, and an agent
+   *  carrying `appearance` plus the playbook keys it uses — so this mirrors the
+   *  fixture the resolver's own tests use rather than approximating one. */
+  const packageDocument = (playbooks: unknown[]) => ({
+    format: "botfleet.package",
+    version: 1,
+    package: {
+      id: "signal-desk",
+      release: "1.0.0",
+      name: "Signal Desk",
+      tagline: "Find and explain the signal.",
+      summary: "A two-bot signal workflow.",
+      category: "Research",
+      author: { name: "BotFleet" },
+      license: "MIT",
+      outcomes: ["Produce a concise signal brief."],
+      setupMinutes: 4,
+      requirements: { apps: [], capabilities: [] },
+      agents: [
+        {
+          key: "scout",
+          name: "Package Scout",
+          appearance: { color: "cyan" },
+          playbooks: playbooks.map((playbook) => (playbook as { key: string }).key),
+        },
+      ],
+      playbooks,
+    },
+  });
+
+  const PLAYBOOK = {
+    key: "signal-check",
+    name: "Signal Check",
+    summary: "Confirm a source before believing it.",
+    triggers: ["release notes", "roadmap"],
+    instructions: "Open the primary source and quote it.",
+  };
+
+  const playbooksOf = async (botId: string) =>
+    (await api("GET", "/api/bots")).body.bots.find((b: { id: string }) => b.id === botId)?.playbooks;
+
+  it("installs a playbook from a package document, which was previously impossible", async () => {
+    // `playbooks` is rendered into every prompt but had no way to become
+    // non-empty: absent from the profile patch schema, and the only writer was
+    // a whole-team import that can only reach bots it just created. All twelve
+    // live bots carried an empty list for that reason.
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      expect(bot.playbooks ?? []).toEqual([]);
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      expect(done.status).toBe(201);
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["signal-check"]);
+      expect(await playbooksOf(bot.id)).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("installs a named subset through the wrapped shape", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const other = { ...PLAYBOOK, key: "report", name: "Report", summary: "Then write it up." };
+      const done = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK, other]),
+        keys: ["report"],
+      });
+      expect(done.status).toBe(201);
+      // Named subset only — `signal-check` was in the package but not asked for.
+      expect(done.body.installed.map((p: { key: string }) => p.key)).toEqual(["report"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("replaces a re-installed key in place rather than duplicating it", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([PLAYBOOK]));
+      const updated = { ...PLAYBOOK, instructions: "Open the primary source, quote it, then date it." };
+      const again = await api("POST", `/api/bots/${bot.id}/playbooks`, packageDocument([updated]));
+      expect(again.status).toBe(201);
+      const stored = await playbooksOf(bot.id);
+      expect(stored).toHaveLength(1);
+      expect(stored[0].instructions).toBe("Open the primary source, quote it, then date it.");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("refuses a body that is not a package, and a key the package lacks", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const notAPackage = await api("POST", `/api/bots/${bot.id}/playbooks`, { nope: true });
+      expect(notAPackage.status).toBe(422);
+      expect(notAPackage.body.error).toMatch(/package/i);
+      // Asked for something by name that does not exist: an error, not a no-op.
+      const missingKey = await api("POST", `/api/bots/${bot.id}/playbooks`, {
+        document: packageDocument([PLAYBOOK]),
+        keys: ["not-declared"],
+      });
+      expect(missingKey.status).toBe(422);
+      expect(missingKey.body.error).toMatch(/not-declared/);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("404s for a bot that does not exist", async () => {
+    expect((await api("POST", "/api/bots/does-not-exist/playbooks", packageDocument([PLAYBOOK]))).status).toBe(404);
   });
 });
