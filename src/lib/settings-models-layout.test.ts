@@ -91,6 +91,26 @@ describe("Maximum Tool Rounds", () => {
     expect(profile).toContain("runs its own tool loop");
   });
 
+  it("iOS does not call a ceiling inapplicable on a cold start", () => {
+    // Found by Seer review on #693, and the exact bug this whole change exists
+    // to kill: before the engine list loads, `toolRoundsEditable` is false for
+    // an engine that may well honor the setting, and the caption used to say it
+    // "does not apply" — a permanent-sounding claim from a lookup that simply
+    // had not answered.  The two claims must stay distinguishable on iOS the
+    // way toolRoundsGate() keeps them distinguishable on the desktop.
+    expect(profile).toContain("if toolRoundsEngine == nil {");
+    expect(profile).toContain("has not reported its capabilities yet");
+    const caption = profile.slice(
+      profile.indexOf("private var toolRoundsCaption"),
+      profile.indexOf("private var toolRoundsCaption") + 900,
+    );
+    const unknownBranch = caption.indexOf("has not reported its capabilities yet");
+    const knownBranch = caption.indexOf("runs its own tool loop");
+    expect(unknownBranch, "both caption branches must exist").toBeGreaterThan(-1);
+    expect(knownBranch, "both caption branches must exist").toBeGreaterThan(-1);
+    expect(knownBranch, "the unknown branch must be asked first").toBeGreaterThan(unknownBranch);
+  });
+
   it("the desktop control asks the shared gate, not a bare capability check", () => {
     expect(panel).toContain("toolRoundsGate(state.instances, bot)");
     expect(panel).toContain("roundsGate.visible");

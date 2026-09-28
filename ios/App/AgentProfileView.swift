@@ -520,8 +520,12 @@ struct AgentProfileView: View {
     /// True when this engine runs the harness HTTP tool loop, and so applies
     /// `maxToolRounds`.  An engine the companion has not heard of is NOT
     /// treated as "cannot": we do not know yet.
+    private var toolRoundsEngine: Instance? {
+        instances.first(where: { $0.id == instanceId })
+    }
+
     private var toolRoundsEditable: Bool {
-        instances.first(where: { $0.id == instanceId })?.capabilities?.toolLoop == true
+        toolRoundsEngine?.capabilities?.toolLoop == true
     }
 
     /// A saved ceiling stays visible even on an engine that ignores it, so it
@@ -534,6 +538,14 @@ struct AgentProfileView: View {
     private var toolRoundsCaption: String {
         let base = "Per turn.  Empty uses \(Self.defaultToolRounds).  Cap is \(Self.maximumToolRoundsCap)."
         guard !toolRoundsEditable else { return base }
+        // "Does not apply" and "we do not know yet" are different claims, and on
+        // a cold start this view renders before the engine list arrives.  Saying
+        // the ceiling is inapplicable then reads as permanent, when the very
+        // next load may make it editable.  Mirrors toolRoundsGate()'s
+        // engine-presence check on the desktop.
+        if toolRoundsEngine == nil {
+            return base + "  This engine has not reported its capabilities yet, so this ceiling may not apply to it."
+        }
         return base + "  This engine runs its own tool loop, so this ceiling does not apply to it."
     }
 
