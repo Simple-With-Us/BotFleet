@@ -6,7 +6,7 @@ import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
 import { productErrorHeadline } from "@/lib/product-error";
 import {
-  BOT_AVATAR_CROPS,
+  GROUP_AVATAR_CROPS,
   botAvatarUrlFromStoredPath,
   type BotAvatarCrop,
 } from "../../shared/bot-avatar";
@@ -61,7 +61,7 @@ export function GroupProfileAvatarCard({
   };
 
   // Group crops: exclude mascot
-  const availableCrops = BOT_AVATAR_CROPS.filter(c => c !== "mascot");
+  const availableCrops = GROUP_AVATAR_CROPS;
 
   return (
     <div className="overflow-hidden rounded-xl border border-hairline/40 bg-card">

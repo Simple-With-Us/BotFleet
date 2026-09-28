@@ -5,6 +5,20 @@ export const BOT_AVATAR_CROPS = ["mascot", "tvface", "circle", "rounded", "squar
 export const botAvatarCropSchema = z.enum(BOT_AVATAR_CROPS);
 export type BotAvatarCrop = z.infer<typeof botAvatarCropSchema>;
 
+/** Groups get image crops only: GroupAvatar has no mascot or TV-Face
+ * renderer (a group carries no expression or color to animate), so offering
+ * either would select a shape nothing can draw. */
+export const GROUP_AVATAR_CROPS = BOT_AVATAR_CROPS.filter(
+  (crop) => crop !== "mascot" && crop !== "tvface",
+);
+
+/** An uploaded image only shows if the current crop renders images at all.
+ * Mascot and TV-Face ignore avatarUrl, so an upload under either must flip
+ * to a plain circle — otherwise the new image saves but never displays. */
+export function avatarCropAfterUpload(crop: BotAvatarCrop): BotAvatarCrop {
+  return crop === "mascot" || crop === "tvface" ? "circle" : crop;
+}
+
 /**
  * Custom avatars are deliberately limited to this app's attachment server.
  * Besides making persisted profiles portable across desktop/browser clients,
