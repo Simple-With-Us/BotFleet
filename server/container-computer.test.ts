@@ -35,6 +35,7 @@ import {
   containerNetworkArgs,
   containerRuntimeStatus,
   containerRunArgs,
+  hostCliCredentialMounts,
   handleBoxGatewayRequest,
   managedImageDockerfile,
   migrateVmWorkspace,
@@ -671,6 +672,23 @@ describe("Cua integration", () => {
     expect(containerRunArgs("podman", "pw", SHARED_LOCAL_VM_TARGET, "darwin").join(" ")).toContain(
       "--network slirp4netns:allow_host_loopback=false",
     );
+  });
+
+  it("mounts host CLI credentials into the guest when shareCliCredentials is enabled", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "bf-cli-home-"));
+    mkdirSync(join(fakeHome, ".config", "gh"), { recursive: true });
+    writeFileSync(join(fakeHome, ".gitconfig"), "fake git config");
+    writeFileSync(join(fakeHome, ".config", "gh", "hosts.yml"), "fake gh");
+
+    const mounts = hostCliCredentialMounts("darwin", fakeHome);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
+
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
+      shareCliCredentials: true,
+      homeDir: fakeHome,
+    });
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
   });
 
   it("mounts the official Cua MCP server for Local VM turns", () => {
