@@ -348,18 +348,9 @@ export function Composer({
         dispatch({ type: "error", message: "The selected responder does not support image attachments." });
         return;
       }
-      if (bot && bot.modelSelection.instanceId === "dsh" && bot.modelSelection.model === "DeepSeek-V4.1-Pro") {
-        dispatch({
-          type: "updateBot",
-          botId: bot.id,
-          patch: {
-            modelSelection: {
-              ...bot.modelSelection,
-              model: "DeepSeek-V4.1-Flash",
-            },
-          },
-        });
-      }
+      // The server knows the active task's model override and updates that
+      // task (or the bot only when it inherits the default) before dispatch.
+      // A composer-side bot patch would overwrite an unrelated default.
     }
     const t = composeMessage(text, attachments);
     if (!t) return;

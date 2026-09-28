@@ -91,6 +91,7 @@ import {
   AUTO_FALLBACK_PRIORITY,
   enableQuotaCooldownPersist,
   inheritedUnattended,
+  dshVisionSelection,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
@@ -3771,7 +3772,7 @@ async function startTurn(
   const titleText = firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
   if (titleText) store.titleTaskFromFirstMessage(bot.id, titleText, threadId);
 
-  const fallbackPolicy = task.modelSelection ?? bot.modelSelection;
+  let fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
     ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
 
@@ -3879,14 +3880,13 @@ async function startTurn(
   // to DeepSeek-V4.1-Flash and updates the stored selection so the switch persists.
   if (instanceId === "dsh" && model === "DeepSeek-V4.1-Pro" && text.includes("<attached-image ")) {
     model = "DeepSeek-V4.1-Flash";
-    const updateModel = (chain: ModelSelection): ModelSelection => ({
-      ...chain,
-      model: chain.model === "DeepSeek-V4.1-Pro" ? "DeepSeek-V4.1-Flash" : chain.model,
-    });
+    // Persist against the selection that owns this thread, and keep the
+    // dispatch fallback policy aligned with the new primary and its chain.
+    fallbackPolicy = dshVisionSelection(fallbackPolicy);
     if (task.modelSelection) {
-      store.patchTask(bot.id, threadId, { modelSelection: updateModel(task.modelSelection) });
+      store.patchTask(bot.id, threadId, { modelSelection: fallbackPolicy });
     } else {
-      store.patchBot(bot.id, { modelSelection: updateModel(bot.modelSelection) });
+      store.patchBot(bot.id, { modelSelection: fallbackPolicy });
     }
   }
   // Auto-delivered instructions are stored as role=system so iOS/desktop
