@@ -1,7 +1,4 @@
-// Make a room from the phone: a name, and which bots are in it.
-//
-// The harness names it after the first member if the name is left blank,
-// which is what the desktop's dialog does too — one rule, two screens.
+// Make a room from the phone: a name, working directory, bulletin, responder, and members.
 import SwiftUI
 import CompanionCore
 
@@ -10,6 +7,10 @@ struct NewGroupSheet: View {
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
+    @State private var cwd = ""
+    @State private var bulletin = ""
+    @State private var responderKind = "everyone"
+    @State private var leadBotId = ""
     @State private var members = Set<String>()
     @State private var creating = false
 
@@ -19,14 +20,45 @@ struct NewGroupSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                Section {
+                Section("\(roomTerm) Details") {
                     TextField("\(roomTerm) name (optional)", text: $name)
                         .autocorrectionDisabled()
+                    TextField("Working directory path on host (optional)", text: $cwd)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    TextField("Bulletin (Shared Brief for the team)", text: $bulletin, axis: .vertical)
+                        .lineLimit(2...5)
                 }
+
+                Section("Default Responder") {
+                    Picker("Responder Mode", selection: $responderKind) {
+                        Text("Everyone responds").tag("everyone")
+                        Text("Lead bot").tag("member")
+                        Text("Only when mentioned").tag("mentions")
+                    }
+
+                    if responderKind == "member" {
+                        Picker("Lead Bot", selection: $leadBotId) {
+                            Text("Select lead bot").tag("")
+                            ForEach(bots.filter { members.contains($0.id) }) { bot in
+                                Text(bot.name).tag(bot.id)
+                            }
+                        }
+                    }
+                }
+
                 Section("Bots") {
                     ForEach(bots) { bot in
                         Button {
-                            if members.contains(bot.id) { members.remove(bot.id) } else { members.insert(bot.id) }
+                            if members.contains(bot.id) {
+                                members.remove(bot.id)
+                                if leadBotId == bot.id {
+                                    leadBotId = members.sorted().first ?? ""
+                                }
+                            } else {
+                                members.insert(bot.id)
+                                if leadBotId.isEmpty { leadBotId = bot.id }
+                            }
                         } label: {
                             HStack(spacing: 12) {
                                 BotAvatarView(bot: bot, size: 36, state: .idle, animated: false)
@@ -56,10 +88,27 @@ struct NewGroupSheet: View {
                     Button("Create") {
                         creating = true
                         Task {
-                            // members in roster order, so the room's name (if
-                            // it defaults) follows the first bot you picked
                             let ordered = bots.map(\.id).filter(members.contains)
-                            if let room = await session.createRoom(name: name, memberIds: ordered) {
+                            if var room = await session.createRoom(name: name, memberIds: ordered) {
+                                let trimmedCwd = cwd.trimmingCharacters(in: .whitespaces)
+                                let trimmedBulletin = bulletin.trimmingCharacters(in: .whitespaces)
+                                let responder = GroupResponder(kind: responderKind, botId: responderKind == "member" ? (leadBotId.isEmpty ? nil : leadBotId) : nil)
+                                if !trimmedCwd.isEmpty || !trimmedBulletin.isEmpty || responderKind != "everyone" {
+                                    if await session.updateRoom(
+                                        id: room.id,
+                                        name: name.isEmpty ? room.name : name,
+                                        bulletin: trimmedBulletin,
+                                        avatarCrop: nil,
+                                        cwd: trimmedCwd.isEmpty ? nil : trimmedCwd,
+                                        extraCwds: nil,
+                                        defaultResponder: responder,
+                                        memberIds: ordered
+                                    ) {
+                                        if let updated = session.state.rooms.first(where: { $0.id == room.id }) {
+                                            room = updated
+                                        }
+                                    }
+                                }
                                 created(room)
                             }
                             creating = false

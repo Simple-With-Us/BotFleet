@@ -35,6 +35,11 @@ struct AgentProfileView: View {
     @State private var config: ConfigStatus?
     @State private var busy = false
     @State private var player: AVAudioPlayer?
+    @State private var autoApprove: Bool
+    @State private var autoReview: String
+    @State private var approvePeerComms: Bool
+    @State private var computers: Set<String>
+    @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
 
     init(bot: Bot) {
@@ -51,6 +56,11 @@ struct AgentProfileView: View {
         _effort = State(initialValue: bot.modelSelection.effort)
         _fallbacks = State(initialValue: bot.modelSelection.fallbacks ?? [])
         _maxToolRoundsText = State(initialValue: Self.roundsText(bot.maxToolRounds))
+        _autoApprove = State(initialValue: bot.autoApprove ?? false)
+        _autoReview = State(initialValue: bot.autoReview ?? "off")
+        _approvePeerComms = State(initialValue: bot.approvePeerComms ?? false)
+        _computers = State(initialValue: Set(bot.computers ?? []))
+        _cwd = State(initialValue: bot.cwd ?? "")
         _baseline = State(initialValue: ProfileFormSnapshot(bot: bot))
     }
 
@@ -166,40 +176,7 @@ struct AgentProfileView: View {
                         }
                     }
                 } else {
-                    Section("Primary Model") {
-                        Picker("Provider", selection: $instanceId) {
-                            ForEach(availableInstances) { instance in
-                                Text(instance.displayName ?? instance.instanceId).tag(instance.id)
-                            }
-                        }
-                        .pickerStyle(.navigationLink)
-                        .onChange(of: instanceId) { _, newInstanceId in
-                            if let instance = instances.first(where: { $0.id == newInstanceId }) {
-                                if !instance.models.options.contains(where: { $0.id == modelId }) {
-                                    modelId = instance.models.default
-                                }
-                                if let effort, !instance.effortLevels(for: modelId).contains(effort) {
-                                    self.effort = nil
-                                }
-                            }
-                        }
-
-                        if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
-                            Picker("Model", selection: $modelId) {
-                                ForEach(selectedInstance.models.options) { option in
-                                    Text(option.label).tag(option.id)
-                                }
-                            }
-                            .pickerStyle(.navigationLink)
-                            .onChange(of: modelId) { _, newModelId in
-                                if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
-                                    self.effort = nil
-                                }
-                            }
-
-                            effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
-                        }
-                    }
+                    primaryModelSection
 
                     ForEach(fallbacks.indices, id: \.self) { index in
                         Section("Fallback \(index + 1)") {
@@ -282,6 +259,10 @@ struct AgentProfileView: View {
                         }
                     }
                 }
+
+                automationAndApprovalsSection
+                computersSection
+                workingDirectorySection
 
                 Section {
                     if voiceConfigured {
@@ -494,6 +475,12 @@ struct AgentProfileView: View {
             effort: effort,
             fallbacks: fallbacks.isEmpty ? nil : fallbacks
         )
+        let trimmedCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwdPatch: BotProfilePatch.CwdString? = {
+            guard cwd != baseline.cwd else { return nil }
+            return trimmedCwd.isEmpty ? .clear : .set(trimmedCwd)
+        }()
+        let computersArray = ["cloud", "vm", "local"].filter { computers.contains($0) }
         return BotProfilePatch(
             name: name == baseline.name ? nil : name.trimmingCharacters(in: .whitespacesAndNewlines),
             title: title == baseline.title ? nil : title.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -504,8 +491,112 @@ struct AgentProfileView: View {
             voice: voice == baseline.voice ? nil : voice,
             speechDevices: savedDevices == baseline.speechDevices ? nil : ["mac", "iphone"].filter { savedDevices.contains($0) },
             modelSelection: newModelSelection == baseline.modelSelection ? nil : newModelSelection,
-            maxToolRounds: maxToolRoundsPatch
+            maxToolRounds: maxToolRoundsPatch,
+            autoApprove: autoApprove == baseline.autoApprove ? nil : autoApprove,
+            autoReview: autoReview == baseline.autoReview ? nil : autoReview,
+            approvePeerComms: approvePeerComms == baseline.approvePeerComms ? nil : approvePeerComms,
+            computers: computers == baseline.computers ? nil : computersArray,
+            cwd: cwdPatch
         )
+    }
+
+    @ViewBuilder
+    private var primaryModelSection: some View {
+        Section("Primary Model") {
+            Picker("Provider", selection: $instanceId) {
+                ForEach(availableInstances) { instance in
+                    Text(instance.displayName ?? instance.instanceId).tag(instance.id)
+                }
+            }
+            .pickerStyle(.navigationLink)
+            .onChange(of: instanceId) { _, newInstanceId in
+                if let instance = instances.first(where: { $0.id == newInstanceId }) {
+                    if !instance.models.options.contains(where: { $0.id == modelId }) {
+                        modelId = instance.models.default
+                    }
+                    if let effort, !instance.effortLevels(for: modelId).contains(effort) {
+                        self.effort = nil
+                    }
+                }
+            }
+
+            if let selectedInstance = instances.first(where: { $0.id == instanceId }) {
+                Picker("Model", selection: $modelId) {
+                    ForEach(selectedInstance.models.options) { option in
+                        Text(option.label).tag(option.id)
+                    }
+                }
+                .pickerStyle(.navigationLink)
+                .onChange(of: modelId) { _, newModelId in
+                    if let effort, !selectedInstance.effortLevels(for: newModelId).contains(effort) {
+                        self.effort = nil
+                    }
+                }
+
+                effortPicker(selection: $effort, instance: selectedInstance, modelId: modelId)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var automationAndApprovalsSection: some View {
+        Section {
+            Toggle("Automatic approvals", isOn: $autoApprove)
+            Picker("Auto review", selection: $autoReview) {
+                Text("Off").tag("off")
+                Text("Shadow (advisory)").tag("shadow")
+                Text("Enforce (blocks unsafe)").tag("enforce")
+            }
+            Toggle("Ask before contacting other bots", isOn: $approvePeerComms)
+        } header: {
+            Text("Automation & Approvals")
+        } footer: {
+            Text("Automatic approvals run safe read-only and non-destructive tool operations without confirmation. Auto review inspects changes for syntax and safety.")
+        }
+    }
+
+    @ViewBuilder
+    private var computersSection: some View {
+        Section {
+            if computers.isEmpty {
+                HStack {
+                    Text("Assigned computers")
+                    Spacer()
+                    Text("(no computer)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Toggle("Local Mac desktop", isOn: Binding(
+                get: { computers.contains("local") },
+                set: { if $0 { computers.insert("local") } else { computers.remove("local") } }
+            ))
+            Toggle("Self-hosted VPS / Box", isOn: Binding(
+                get: { computers.contains("cloud") },
+                set: { if $0 { computers.insert("cloud") } else { computers.remove("cloud") } }
+            ))
+            Toggle("Local VM", isOn: Binding(
+                get: { computers.contains("vm") },
+                set: { if $0 { computers.insert("vm") } else { computers.remove("vm") } }
+            ))
+        } header: {
+            Text("Computers")
+        } footer: {
+            Text("Controls which execution environments this bot can mount for shell commands, browser tools, and desktop control.")
+        }
+    }
+
+    @ViewBuilder
+    private var workingDirectorySection: some View {
+        Section {
+            TextField("Folder path on host (optional)", text: $cwd)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+        } header: {
+            Text("Working Directory")
+        } footer: {
+            Text("Default repository or workspace folder path on the paired Mac.")
+        }
     }
 
     /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
@@ -705,6 +796,11 @@ struct AgentProfileView: View {
         effort = bot.modelSelection.effort
         fallbacks = bot.modelSelection.fallbacks ?? []
         maxToolRoundsText = Self.roundsText(bot.maxToolRounds)
+        autoApprove = bot.autoApprove ?? false
+        autoReview = bot.autoReview ?? "off"
+        approvePeerComms = bot.approvePeerComms ?? false
+        computers = Set(bot.computers ?? [])
+        cwd = bot.cwd ?? ""
         baseline = ProfileFormSnapshot(bot: bot)
     }
 }
@@ -719,6 +815,11 @@ private struct ProfileFormSnapshot {
     var speechDevices: Set<String>
     var modelSelection: ModelSelection
     var maxToolRoundsText: String
+    var autoApprove: Bool
+    var autoReview: String
+    var approvePeerComms: Bool
+    var computers: Set<String>
+    var cwd: String
 
     init(bot: Bot) {
         name = bot.name
@@ -730,6 +831,11 @@ private struct ProfileFormSnapshot {
         speechDevices = Set(bot.speechDevices ?? (bot.speakReplies == true ? ["mac"] : []))
         modelSelection = bot.modelSelection
         maxToolRoundsText = bot.maxToolRounds.map(String.init) ?? ""
+        autoApprove = bot.autoApprove ?? false
+        autoReview = bot.autoReview ?? "off"
+        approvePeerComms = bot.approvePeerComms ?? false
+        computers = Set(bot.computers ?? [])
+        cwd = bot.cwd ?? ""
     }
 }
 

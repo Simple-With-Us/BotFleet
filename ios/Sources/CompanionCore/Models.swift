@@ -106,6 +106,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var spoken: String?
     /// Marks an error fixed by installing something, not by retrying.
     public var setup: Bool?
+    public var target: String?
+    public var kind: String?
+    public var detail: String?
+    public var durationMs: Int?
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -872,6 +876,17 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
+    public var autoApprove: Bool?
+    public var autoReview: String?
+    public var approvePeerComms: Bool?
+    public var computers: [String]?
+    public var cwd: CwdString?
+
+    public enum CwdString: Equatable, Sendable {
+        case set(String)
+        case clear
+    }
+
     public init(
         name: String? = nil,
         title: String? = nil,
@@ -884,7 +899,12 @@ public struct BotProfilePatch: Encodable, Sendable {
         speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
-        maxToolRounds: MaxToolRounds? = nil
+        maxToolRounds: MaxToolRounds? = nil,
+        autoApprove: Bool? = nil,
+        autoReview: String? = nil,
+        approvePeerComms: Bool? = nil,
+        computers: [String]? = nil,
+        cwd: CwdString? = nil
     ) {
         self.name = name
         self.title = title
@@ -898,10 +918,15 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.modelSelection = modelSelection
         self.section = section
         self.maxToolRounds = maxToolRounds
+        self.autoApprove = autoApprove
+        self.autoReview = autoReview
+        self.approvePeerComms = approvePeerComms
+        self.computers = computers
+        self.cwd = cwd
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -931,6 +956,16 @@ public struct BotProfilePatch: Encodable, Sendable {
             switch maxToolRounds {
             case let .set(rounds): try values.encode(rounds, forKey: .maxToolRounds)
             case .clear: try values.encodeNil(forKey: .maxToolRounds)
+            }
+        }
+        try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
+        try values.encodeIfPresent(autoReview, forKey: .autoReview)
+        try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(computers, forKey: .computers)
+        if let cwd {
+            switch cwd {
+            case let .set(val): try values.encode(val, forKey: .cwd)
+            case .clear: try values.encodeNil(forKey: .cwd)
             }
         }
     }

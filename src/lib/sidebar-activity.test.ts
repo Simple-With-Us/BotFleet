@@ -134,9 +134,9 @@ describe("botStatusText", () => {
   it("includes channel location in working and waiting statuses", () => {
     const busy = bot("a", "Alpha", { busy: true });
     const channelLoc = { kind: "group" as const, id: "g1", name: "BotFleet.app" };
-    expect(botStatusText(busy, null, channelLoc)).toBe("Working in #BotFleet.app…");
-    expect(botStatusText(busy, { kind: "approval" }, channelLoc)).toBe("Waiting for approval in #BotFleet.app…");
-    expect(botStatusText(busy, { kind: "question" }, channelLoc)).toBe("Waiting for you in #BotFleet.app…");
+    expect(botStatusText(busy, null, channelLoc)).toBe("#BotFleet.app (working)");
+    expect(botStatusText(busy, { kind: "approval" }, channelLoc)).toBe("#BotFleet.app (needs approval)");
+    expect(botStatusText(busy, { kind: "question" }, channelLoc)).toBe("#BotFleet.app (waiting on you)");
   });
 
   it("includes task location when busy on a task", () => {

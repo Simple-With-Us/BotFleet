@@ -72,8 +72,10 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
   const named = verb !== tool.name ? tool.name : undefined;
   const line = failed ? (tool.detail ?? tool.target ?? named) : (tool.target ?? named);
   const duration = formatStepDuration(tool.durationMs);
-  // only a step with something more to say is worth a disclosure triangle
-  const expandable = Boolean(tool.detail && !failed) || Boolean(failed && tool.target);
+  // Expandable whenever there is detail OR a target (like a command or file path) to view
+  const hasTarget = Boolean(tool.target && tool.target !== tool.name);
+  const hasDetail = Boolean(tool.detail);
+  const expandable = hasDetail || hasTarget;
   const time = new Date(message.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   const title = `${actor ? `${actor} · ` : ""}${tool.name}${
     tool.target ? ` · ${tool.target}` : ""
@@ -116,7 +118,7 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
                 className={cn(
                   "min-w-0 truncate",
                   failed ? "text-danger" : "select-text text-ink-secondary",
-                  !failed && (kind === "read" || kind === "edit") && "font-mono text-[12px]",
+                  !failed && (kind === "read" || kind === "edit" || kind === "execute") && "font-mono text-[12px]",
                 )}
                 // A failed step clips its reason to one line, and one with
                 // no target has no disclosure triangle either — so the reason
@@ -130,7 +132,12 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
             </>
           )}
           {expandable && (
-            <span className="shrink-0 text-ink-secondary/40 opacity-0 transition-opacity group-hover/step:opacity-100">
+            <span
+              className={cn(
+                "shrink-0 text-ink-secondary/50 transition-opacity",
+                open ? "opacity-100" : "opacity-40 group-hover/step:opacity-100",
+              )}
+            >
               {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
             </span>
           )}
@@ -140,13 +147,29 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
         )}
       </div>
       {open && (
-        <div className="mb-1 ml-7 max-h-56 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 px-3 py-2">
-          {failed && tool.target && (
-            <div className="mb-1 truncate font-mono text-[11px] text-ink-secondary" title={tool.target}>{tool.target}</div>
+        <div className="mb-1 ml-7 flex flex-col gap-1.5 max-h-64 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 p-2.5">
+          {tool.target && (
+            <div className="flex flex-col gap-0.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-secondary/70">
+                {kind === "execute" ? "Command" : kind === "read" || kind === "edit" ? "File" : "Target"}
+              </span>
+              <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink font-medium select-text">
+                {tool.target}
+              </pre>
+            </div>
           )}
-          <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink-secondary select-text">
-            {tool.detail}
-          </pre>
+          {tool.detail && (
+            <div className="flex flex-col gap-0.5">
+              {tool.target && (
+                <span className={cn("text-[10px] font-semibold uppercase tracking-wider", failed ? "text-danger/90" : "text-ink-secondary/70")}>
+                  {failed ? "Error Details" : "Output"}
+                </span>
+              )}
+              <pre className={cn("whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed select-text", failed ? "text-danger" : "text-ink-secondary")}>
+                {tool.detail}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </div>

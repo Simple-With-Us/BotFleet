@@ -419,11 +419,13 @@ function statusProblem(status: ContainerComputerStatus): string | null {
 /** Shared with the BYO-VPS backend (vps-computer.ts): both containers are
  * built from the same pinned derivative, so image compatibility is one rule. */
 export function imageLabelsMatch(labels: Record<string, string> | undefined): boolean {
+  const layer = labels?.[IMAGE_LAYER_LABEL];
+  const layerMatches = layer === IMAGE_LAYER_VERSION || layer === `v${IMAGE_LAYER_VERSION}`;
   return (
     labels?.[MANAGED_LABEL] === "1" &&
     labels?.[DRIVER_LABEL] === CUA_DRIVER_VERSION &&
     labels?.[BASE_IMAGE_LABEL] === BASE_IMAGE_DIGEST &&
-    labels?.[IMAGE_LAYER_LABEL] === IMAGE_LAYER_VERSION
+    layerMatches
   );
 }
 
