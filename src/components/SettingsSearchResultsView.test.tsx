@@ -101,8 +101,8 @@ describe("SettingsSearchResultsView Component", () => {
     );
 
     expect(html).toContain("Filtered to");
-    expect(html).toContain("Fleet ");
     expect(html).toContain("Model</mark>");
+    expect(html).toContain("<span>s</span>");
     expect(html).toContain("Show all sections");
   });
 });

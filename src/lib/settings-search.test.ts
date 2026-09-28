@@ -32,6 +32,11 @@ describe("Settings Search Engine", () => {
     expect(label("usage:quotas")).toBe("Engine Quotas");
     expect(label("observability:sentry")).toBe("Diagnostics & Error Reporting");
     expect(label("engines:matrix")).toBe("Engine Capabilities");
+    expect(label("connections:composioManaged")).toBe("Connections");
+    expect(label("companion:pairing")).toBe("Phone");
+    expect(label("models:fleet")).toBe("Models");
+    expect(label("computers:defaults")).toBe("Default Bot Settings");
+    expect(label("secrets:infisical")).toBe("Secret Store");
   });
 
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
