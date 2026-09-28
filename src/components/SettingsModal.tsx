@@ -1148,17 +1148,17 @@ export function SettingsModal() {
                 onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
                 aria-current={section === id ? "page" : undefined}
                 className={cn(
-                  "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[14px]",
+                  "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
                   section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
                 )}
               >
-                <Icon size={15} className="shrink-0" />
-                <span className="truncate">{label}</span>
-                {trimmedQuery && matchCount > 0 && (
+                <Icon size={15} />
+                {label}
+                {trimmedQuery && matchCount > 0 ? (
                   <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
                     {matchCount}
                   </span>
-                )}
+                ) : null}
               </button>
             );
           })}
@@ -1179,7 +1179,7 @@ export function SettingsModal() {
           </div>
 
           <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
-            {trimmedQuery && (
+            {trimmedQuery ? (
               <div className="flex items-center justify-between rounded-lg border border-hairline/40 bg-control/40 px-3 py-2 text-[12.5px] text-ink">
                 <span>
                   Showing matches for &ldquo;{trimmedQuery}&rdquo; in {SECTIONS.find((s) => s.id === section)?.label}
@@ -1192,9 +1192,9 @@ export function SettingsModal() {
                   Clear Search
                 </button>
               </div>
-            )}
+            ) : null}
 
-            {trimmedQuery && searchResult.matchCountBySection[section] === 0 && (
+            {trimmedQuery && searchResult.matchCountBySection[section] === 0 ? (
               <div className="rounded-xl bg-card p-6 text-center text-ink-secondary">
                 <p className="text-[13px]">
                   No settings in {SECTIONS.find((s) => s.id === section)?.label} match &ldquo;{trimmedQuery}&rdquo;.
@@ -1207,7 +1207,7 @@ export function SettingsModal() {
                   Clear Search
                 </button>
               </div>
-            )}
+            ) : null}
 
             {section === "general" && (
               <>
