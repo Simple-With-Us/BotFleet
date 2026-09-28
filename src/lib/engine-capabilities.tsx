@@ -720,8 +720,13 @@ export const CAPABILITY_SHORT_LABELS = {
 
 /** What each capability actually means in BotFleet — which wiring stands
  *  behind it.  This is the copy the detail strip shows, so a reader learns
- *  what Connected Apps *is* instead of re-reading the engine's pitch. */
-export const CAPABILITY_NOTES = {
+ *  what Connected Apps *is* instead of re-reading the engine's pitch.  A key
+ *  may be absent — `capabilityNoteFor` falls through to the engine headline
+ *  when it is — so this keeps the partial contract under a named owner rather
+ *  than a mapped type that would hide the fallthrough. */
+export interface CapabilityNotes extends Partial<Record<CapabilityKey, string>> {}
+
+export const CAPABILITY_NOTES: CapabilityNotes = {
   files:
     "Reading and writing files in the working folder.  Backed by the driver's own file tools, so the bot follows the same approval and permission rules as the rest of its turn.",
   terminal:
@@ -746,7 +751,7 @@ export const CAPABILITY_NOTES = {
     "Posting into a shared room and reading the conversation around it, so a bot holds its place in a channel.",
   voiceChat:
     "Speaking to the user and hearing them back inside one turn.",
-} satisfies Partial<Record<CapabilityKey, string>>;
+};
 
 /** Resolve the sentence the detail strip shows for one (engine, capability)
  *  pair: the engine's own note wins, then the shared capability note, then
