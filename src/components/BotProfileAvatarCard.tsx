@@ -207,7 +207,7 @@ export function BotProfileAvatarCard({
                     "flex h-[58px] items-center justify-center rounded-xl bg-inset transition-colors hover:bg-control",
                     activeState === expression && "ring-2 ring-accent-border",
                   )}
-                  title={expression}
+                  title={expression.charAt(0).toUpperCase() + expression.slice(1)}
                   aria-label={`Use ${expression} expression`}
                 >
                   {crop === "tvface" ? (

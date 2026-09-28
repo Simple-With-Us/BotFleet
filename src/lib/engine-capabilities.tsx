@@ -128,25 +128,25 @@ const CURSOR_ULTRA_NOTE =
   "Cursor Ultra subscription.  BotFleet does not register a separate Cursor API rate.";
 
 const CLAUDE_MAX_NOTE =
-  "Claude Max 20× subscription.  BotFleet does not register an Anthropic API rate for this engine.";
+  "Claude subscription.  BotFleet does not register an Anthropic API rate for this engine.";
 
 const CODEX_PRO_LITE_NOTE =
-  "ChatGPT Pro Lite subscription.  BotFleet does not register a separate OpenAI API rate for this engine.";
+  "ChatGPT subscription.  BotFleet does not register a separate OpenAI API rate for this engine.";
 
 const MINIMAX_TOKEN_PLAN_NOTE =
-  "MiniMax Token Plan Max subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
+  "MiniMax Token Plan subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const MCODE_TOKEN_PLAN_NOTE =
   "MiniMax Code authenticates with the MiniMax Code CLI login and shares the MiniMax Token Plan with the MiniMax engine.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const GROK_SUPER_NOTE =
-  "xAI SuperGrok Heavy subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
+  "xAI subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const ANTIGRAVITY_ULTRA_NOTE =
-  "Google AI Ultra subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
+  "Google AI subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const DEEPSEEK_HARNESS_NOTE =
-  "DeepSeek Harness runs DeepSeek models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
+  "Harness runs models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
 
 /** The registry's owner contract.  Named rather than spelled
  *  `Record<string, EngineCapabilityEntry>` at the binding so the string index
@@ -454,7 +454,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
 
   "deepseek-harness": {
     id: "deepseek-harness",
-    displayName: "DeepSeek Harness",
+    displayName: "Harness",
     capabilityBadgeColor: "bg-rose-600 text-white",
     group: "Cloud",
     pricing: {
@@ -501,9 +501,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
       prose: [
-        "DeepSeek Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on DeepSeek Harness yet.",
+        "BotFleet does not support image attachments on Harness yet.",
       ],
     },
     defaultModels: [

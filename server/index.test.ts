@@ -6887,10 +6887,11 @@ describe("Local VM lifecycle routes honor the provider toggle", () => {
         botDefaults: { computerProviders: { asciiBox: true, selfHostedVps: true, localVm: true, localMac: true } },
       });
       expect(on.status).toBe(200);
-      // Shared mode answers the per-bot create with its own 409; the point is
-      // that the provider gate is not what stopped it.
+      // Shared mode allows the bot endpoint to run or create the shared container;
+      // it is not blocked by the provider gate or by a legacy App Settings referral.
       const perBot = await api("POST", `/api/bots/${bot.id}/local-computer/run`, {});
       expect(String(perBot.body.error ?? "")).not.toContain("turned off in Computer settings");
+      expect(String(perBot.body.error ?? "")).not.toContain("Shared mode manages this desktop in App Settings");
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

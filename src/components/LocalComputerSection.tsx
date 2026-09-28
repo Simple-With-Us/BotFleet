@@ -9,8 +9,6 @@
 // - `<ComputerProviderToggle>` row per provider (ASCII.dev Box, Self-
 //   Hosted VPS, Local VM, This Computer), each with a caption explaining
 //   the impact of turning it off.
-// - `<VpsModeToggle>` next to the VPS row so the operator can pick
-//   Shared, Per-Bot, or Not Used.
 // - `<BotComputerMatrix>` so every bot's grant is visible in one table,
 //   with a one-click "Apply new default to all" that opens a confirm
 //   dialog.

@@ -110,7 +110,10 @@ describe("describeTarget", () => {
 
   it("finds the file, pattern, query or url each engine names differently", () => {
     expect(describeTarget({ file_path: "/Users/jay/a.ts" }, { home: "/Users/jay" })).toBe("~/a.ts");
+    expect(describeTarget({ AbsolutePath: "/Users/jay/a.ts" }, { home: "/Users/jay" })).toBe("~/a.ts");
     expect(describeTarget({ target_file: "src/x.ts" })).toBe("src/x.ts");
+    expect(describeTarget({ TargetFile: "src/x.ts" })).toBe("src/x.ts");
+    expect(describeTarget({ CommandLine: "git status -s", Cwd: "/repo" })).toBe("git status -s");
     expect(describeTarget({ pattern: "**/*.ts" })).toBe("**/*.ts");
     expect(describeTarget({ url: "https://example.com" })).toBe("https://example.com");
   });

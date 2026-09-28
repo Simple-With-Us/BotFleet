@@ -126,13 +126,13 @@ export function botStatusText(
 ): string {
   if (wait?.kind === "teammate") return `Waiting on @${wait.name}…`;
   if (wait?.kind === "approval") {
-    return location?.kind === "group" ? `Waiting for approval in #${location.name}…` : "Waiting for approval…";
+    return location?.kind === "group" ? `#${location.name} (needs approval)` : "Waiting for approval…";
   }
   if (wait?.kind === "question") {
-    return location?.kind === "group" ? `Waiting for you in #${location.name}…` : "Waiting for you…";
+    return location?.kind === "group" ? `#${location.name} (waiting on you)` : "Waiting for you…";
   }
   if (bot.busy) {
-    if (location?.kind === "group") return `Working in #${location.name}…`;
+    if (location?.kind === "group") return `#${location.name} (working)`;
     if (location?.kind === "task") return `Working on ${location.title}…`;
     return "Working…";
   }
