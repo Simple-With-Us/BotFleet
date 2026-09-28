@@ -44,6 +44,8 @@ let fakeCrashCli: string;
 let fakeQuotaCli: string;
 /** wrapper CLI that returns ordinary prose containing former quota keywords */
 let fakeQuotaProseCli: string;
+/** happy CLI whose canned reply carries a fake API key - drives the SSE secret-redaction test */
+let fakeSecretEchoCli: string;
 /** successful subscription CLI that reports an API-equivalent cost */
 let fakePricedClaudeCli: string;
 /** quota CLI held behind a file gate so work can queue before completion */
@@ -153,6 +155,9 @@ beforeAll(async () => {
   fakeQuotaProseCli = writeFakeClaudeWrapper(join(home, "fake-claude-quota-prose"), "happy", {
     replyText: "The subscription accounting review is complete.",
   });
+  fakeSecretEchoCli = writeFakeClaudeWrapper(join(home, "fake-claude-secret-echo"), "happy", {
+    replyText: "the key is api_key=ak9999999999999999999999999999999 as requested",
+  });
   fakePricedClaudeCli = join(home, "fake-claude-priced");
   writeFileSync(
     fakePricedClaudeCli,
@@ -243,6 +248,7 @@ beforeAll(async () => {
         deadCli: { driver: "grokAgent", displayName: "Fixture Dead CLI", config: { cli: join(home, "no-such-cli") } },
         quota: { driver: "claudeAgent", displayName: "Fixture Quota", enabled: false, config: { cli: fakeQuotaCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
+        secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
         pricedClaude: { driver: "claudeAgent", displayName: "Fixture Priced Claude", enabled: false, config: { cli: fakePricedClaudeCli } },
         gatedQuota: { driver: "claudeAgent", displayName: "Fixture Gated Quota", enabled: false, config: { cli: fakeGatedQuotaCli } },
         slowProbe: { driver: "claudeAgent", displayName: "Fixture Slow Probe", enabled: false, config: { cli: fakeSlowProbeCli } },
@@ -598,6 +604,14 @@ describe("harness HTTP API", () => {
     expect(body.app).toBe("botfleet");
     expect(typeof body.pid).toBe("number");
     expect(body.static).toBe(true);
+  });
+
+  it("returns 400 for a doubled-slash request target without killing the harness", async () => {
+    // audit C1: `new URL("//", base)` throws; the parse must stay inside the
+    // request guard so a proxy that passes `//` cannot crash the API port.
+    const malformed = await api("GET", "//");
+    expect(malformed.status).toBe(400);
+    expect((await api("GET", "/api/health")).status).toBe(200);
   });
 
   it("authenticates a reversible runtime admission fence", async () => {
@@ -4752,6 +4766,7 @@ describe("bot memory API", () => {
       expect((await rawGet(`/api/bots/${bot.id}/memory/topics/%zz.md`)).status).toBe(400);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
 });
@@ -7591,6 +7606,52 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       expect(raw).not.toContain("\uFFFD");
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("redacts secrets from runtime events on the SSE stream and the replay buffer", async () => {
+    const secret = "ak9999999999999999999999999999999"; // matches the wrapper's canned reply
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      // Disabled instances stop dispatching after a mid-suite fleet rebuild;
+      // enable explicitly, the same pattern the failover tests use.
+      expect((await api("PATCH", "/api/instances/secretEcho", { enabled: true })).status).toBe(200);
+      const secretEcho = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "secretEcho");
+      const patch = await api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "secretEcho", model: secretEcho?.models?.default }, computers: [] });
+      expect(patch.status).toBe(200);
+      const sse = await openSse(`${BASE}/api/events`);
+      try {
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "tell me the key" })).status).toBe(202);
+        const wantsSecretFrame = (f: any) =>
+          f.kind === "runtime" && f.event?.type === "item.completed" && f.event?.itemType === "assistant_text" &&
+          typeof f.event?.text === "string" && f.event.text.includes("the key is");
+        const frame = await sse.until(wantsSecretFrame, 15_000);
+        expect(frame.event.text).toContain("redacted");
+        expect(JSON.stringify(frame)).not.toContain(secret);
+        // streamed deltas on the live stream are redacted too
+        const deltas = sse.frames.filter((f: any) => f.kind === "runtime" && f.event?.type === "content.delta");
+        expect(deltas.length).toBeGreaterThan(0);
+        expect(JSON.stringify(deltas)).not.toContain(secret);
+        expect(JSON.stringify(deltas)).toContain("redacted");
+        // the replay buffer must hold the redacted copy too
+        const hello = sse.frames.find((f: any) => f.kind === "hello");
+        const cursor = `${hello.cursor.split(":")[0]}:${frame.seq - 1}`;
+        const replayed = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
+        try {
+          const replay = await replayed.until(wantsSecretFrame, 15_000);
+          expect(replay.event.text).toContain("redacted");
+          expect(JSON.stringify(replay)).not.toContain(secret);
+        } finally {
+          replayed.close();
+        }
+      } finally {
+        sse.close();
+      }
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      // the test enabled this instance explicitly; leave the fleet as it
+      // was found so later suites rebuild from a disabled baseline
+      await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
 });
