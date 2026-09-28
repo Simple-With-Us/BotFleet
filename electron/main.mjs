@@ -1889,14 +1889,13 @@ const CREDENTIAL_PATCH = {
   opencodeGoApiKey: (value) => ({ opencodeGo: { apiKey: value } }),
   // The provider is the card's, not a default this process invented: a key
   // pasted into the ElevenLabs field must be verified as an ElevenLabs key,
-  // never relabelled as another engine's.  Without one the patch leaves the
-  // saved provider alone, which is what the harness's own legacy migration
-  // expects.
-  ttsKey: (value, provider) => {
-    const tts = { key: value };
-    if (provider) tts.provider = provider;
-    return { tts };
-  },
+  // never relabelled as another engine's.  With no provider named at all the
+  // field still gets written explicitly, because the config reader must never
+  // have to guess which engine a stored key belongs to — that guess is what
+  // sent an ElevenLabs key to MiniMax in the first place.
+  ttsKey: (value, provider) => ({
+    tts: { key: value, provider: provider || "minimax" },
+  }),
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
   infisicalClientSecret: (value) => ({ infisical: { clientSecret: value } }),
 };
