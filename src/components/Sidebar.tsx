@@ -61,7 +61,7 @@ import {
 import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { ProviderMark } from "./ProviderIcons";
 import { stateForBot } from "@/lib/mascot";
-import { botStatusText, botWaitReason } from "@/lib/sidebar-activity";
+import { botActivityLocation, botStatusText, botWaitReason } from "@/lib/sidebar-activity";
 import { useUpdaterState } from "@/lib/updater";
 import { cn } from "@/lib/cn";
 import { plainPreview } from "@/lib/plain-preview";
@@ -92,6 +92,10 @@ import { TeamLibraryPanel, type TeamImportResult } from "./TeamLibraryPanel";
 import { RenameTitle } from "./RenameTitle";
 import { BotPickerList } from "./BotPickerList";
 import {
+  DEFAULT_SIDEBAR_COMPACT_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
   MAX_SIDEBAR_THREAD_COUNT,
   MIN_SIDEBAR_THREAD_COUNT,
   loadCollapsedRooms,
@@ -100,6 +104,9 @@ import {
   loadSidebarDensity,
   loadSidebarThreadCount,
   parseSidebarThreadCount,
+  densityAdjustedSidebarWidth,
+  loadSidebarWidth,
+  saveSidebarWidth,
   saveCollapsedRooms,
   saveSidebarDensity,
   saveSidebarThreadCount,
@@ -285,11 +292,12 @@ function UpdateButton() {
   );
 }
 
-function preview(bot: Bot, last: Message | undefined, bots: Bot[]): string {
+function preview(bot: Bot, last: Message | undefined, bots: Bot[], groups?: Group[]): string {
   // waiting-on-you/busy get a status line more specific than a bare
   // spinner when it's known what the bot is waiting on — see
   // @/lib/sidebar-activity (ported from upstream's SidebarBotActivity).
-  const status = botStatusText(bot, botWaitReason(bot, last, bots));
+  const location = groups ? botActivityLocation(bot, groups) : null;
+  const status = botStatusText(bot, botWaitReason(bot, last, bots), location);
   if (status) return status;
   if (!last) return "";
   if (last.kind === "options" && last.card) return plainPreview(last.card.title);
@@ -320,7 +328,8 @@ interface MenuState {
 
 function groupPreview(group: Group, bots: Bot[]): string {
   if (group.busyBotId) {
-    return `${bots.find((b) => b.id === group.busyBotId)?.name ?? "A bot"} is working…`;
+    const workingBot = bots.find((b) => b.id === group.busyBotId);
+    return `${workingBot?.name ?? "A bot"} is working…`;
   }
   const last = group.messages.at(-1);
   if (!last) return "No messages yet";
@@ -343,7 +352,7 @@ function StackedBots({ group, members, density }: { group: Group; members: Bot[]
         ? "50%"
         : "22%";
     return (
-      <div className={cn("flex shrink-0 items-center justify-center", slotSize)}>
+      <div className={cn("relative flex shrink-0 items-center justify-center", slotSize)}>
         <img
           src={group.avatarUrl}
           alt={group.name}
@@ -351,14 +360,27 @@ function StackedBots({ group, members, density }: { group: Group; members: Bot[]
           style={{ width: singleSize, height: singleSize, borderRadius: radius }}
           draggable={false}
         />
+        {group.busyBotId && (
+          <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-panel bg-accent animate-pulse" />
+        )}
       </div>
     );
   }
   if (members.length <= 1) {
     const b = members[0];
+    const isWorking = b && group.busyBotId === b.id;
     return (
-      <div className={cn("flex shrink-0 items-center justify-center", slotSize)}>
-        {b ? <BotAvatar bot={b} state={stateForBot(b)} size={singleSize} animated={false} /> : <Users size={24} className="text-ink-secondary" />}
+      <div className={cn("relative flex shrink-0 items-center justify-center", slotSize)}>
+        {b ? (
+          <div className={cn("relative rounded-full", isWorking && "ring-2 ring-accent")}>
+            <BotAvatar bot={b} state={isWorking ? "working" : stateForBot(b)} size={singleSize} animated={isWorking} />
+            {isWorking && (
+              <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-panel bg-accent animate-pulse" />
+            )}
+          </div>
+        ) : (
+          <Users size={24} className="text-ink-secondary" />
+        )}
       </div>
     );
   }
@@ -367,9 +389,17 @@ function StackedBots({ group, members, density }: { group: Group; members: Bot[]
   return (
     <div className={cn("flex shrink-0 items-center justify-center", slotSize)}>
       <div className="flex items-center -space-x-3">
-        {shown.map((b) => (
-          <BotAvatar key={b.id} bot={b} state={stateForBot(b)} size={30} animated={false} />
-        ))}
+        {shown.map((b) => {
+          const isWorking = group.busyBotId === b.id;
+          return (
+            <div key={b.id} className={cn("relative rounded-full", isWorking && "ring-2 ring-accent")}>
+              <BotAvatar bot={b} state={isWorking ? "working" : stateForBot(b)} size={30} animated={isWorking} />
+              {isWorking && (
+                <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-panel bg-accent animate-pulse" />
+              )}
+            </div>
+          );
+        })}
         {extra > 0 && (
           <span className="z-10 flex size-[22px] items-center justify-center rounded-full border border-hairline/40 bg-raised text-[10px] font-medium text-ink-secondary">
             +{extra}
@@ -962,7 +992,14 @@ function GroupListItem({
           {selected && activityAt > 0 && <span className="shrink-0 text-xs text-ink-secondary">{formatTime(activityAt)}</span>}
         </div>
         <div className="flex items-center justify-between gap-2">
-          <span className="truncate text-[13px] text-ink-secondary" title={groupPreview(group, state.bots)}>{groupPreview(group, state.bots)}</span>
+          <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary">
+            {group.busyBotId && (
+              <Loader2 size={11} aria-hidden="true" className="shrink-0 animate-spin text-success" />
+            )}
+            <span className={cn("truncate", group.busyBotId && "font-medium text-ink")} title={groupPreview(group, state.bots)}>
+              {groupPreview(group, state.bots)}
+            </span>
+          </span>
           {group.unread && <span className="size-2 shrink-0 rounded-full bg-accent" />}
         </div>
       </div>
@@ -1758,7 +1795,7 @@ function BotListItem({
   const last = visible.at(-1);
   const activityAt = latestChatActivity(bot.tasks, last?.at, bot.createdAt ?? 0);
   const waitReason = botWaitReason(bot, last, state.bots);
-  const previewText = preview(bot, last, state.bots);
+  const previewText = preview(bot, last, state.bots, state.groups);
   // Icon shape ported from upstream's SidebarBotActivity: CircleAlert for
   // anything needing a person or naming a teammate, a spinning Loader2 as
   // the fallback for plain busy work, nothing for idle.
@@ -1826,12 +1863,17 @@ function BotListItem({
         </div>
         <div className="flex items-center justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary">
-            {bot.chiefOfStaff && (
+            {bot.chiefOfStaff && !bot.busy && !waitReason && (
               <span className="flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-accent">
                 <Crown size={11} /> Chief of Staff
               </span>
             )}
-            {bot.chiefOfStaff && previewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
+            {bot.chiefOfStaff && !bot.busy && !waitReason && previewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
+            {bot.chiefOfStaff && (bot.busy || waitReason) && (
+              <span title="Chief of Staff" className="flex shrink-0 items-center">
+                <Crown size={11} className="text-accent" />
+              </span>
+            )}
             {StatusIcon && (
               <StatusIcon
                 size={11}
@@ -1839,7 +1881,9 @@ function BotListItem({
                 className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
               />
             )}
-            <span className="truncate" title={previewText}>{previewText}</span>
+            <span className={cn("truncate", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
+              {previewText}
+            </span>
           </span>
           {bot.unread && (
             <span className="size-2 shrink-0 rounded-full bg-accent" />
@@ -2190,6 +2234,83 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     setDensityOpen(false);
   };
 
+  const [sidebarWidth, setSidebarWidth] = useState(() => loadSidebarWidth(undefined, density));
+  const [isResizing, setIsResizing] = useState(false);
+  const isResizingRef = useRef(false);
+
+  useEffect(() => {
+    setSidebarWidth((prev) => {
+      const next = densityAdjustedSidebarWidth(prev, density);
+      // Persist the swap: an in-memory-only change reads back as the other
+      // density's default on the next load.
+      if (next !== prev) saveSidebarWidth(next);
+      return next;
+    });
+  }, [density]);
+
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    setIsResizing(true);
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const maxWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.6));
+      const next = Math.max(MIN_SIDEBAR_WIDTH, Math.min(maxWidth, moveEvent.clientX));
+      setSidebarWidth(next);
+    };
+    const onMouseUp = (upEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      isResizingRef.current = false;
+      setIsResizing(false);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      const maxWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.6));
+      const finalWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(maxWidth, upEvent.clientX));
+      setSidebarWidth(finalWidth);
+      saveSidebarWidth(finalWidth);
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  };
+
+  const resetWidth = () => {
+    const defaultW = density === "compact" ? DEFAULT_SIDEBAR_COMPACT_WIDTH : DEFAULT_SIDEBAR_WIDTH;
+    setSidebarWidth(defaultW);
+    saveSidebarWidth(defaultW);
+  };
+
+  const handleResizeKey = (e: React.KeyboardEvent) => {
+    const step = 16;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setSidebarWidth((prev) => {
+        const next = Math.max(MIN_SIDEBAR_WIDTH, prev - step);
+        saveSidebarWidth(next);
+        return next;
+      });
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setSidebarWidth((prev) => {
+        const maxWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.6));
+        const next = Math.min(maxWidth, prev + step);
+        saveSidebarWidth(next);
+        return next;
+      });
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      setSidebarWidth(MIN_SIDEBAR_WIDTH);
+      saveSidebarWidth(MIN_SIDEBAR_WIDTH);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      const maxWidth = Math.min(MAX_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.6));
+      setSidebarWidth(maxWidth);
+      saveSidebarWidth(maxWidth);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      resetWidth();
+    }
+  };
+
   const toggleCollapsed = () => {
     if (density === "icons") setDensity(lastExpandedDensity);
     else {
@@ -2398,7 +2519,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           !q ||
           b.name.toLowerCase().includes(q) ||
           (b.title ?? "").toLowerCase().includes(q) ||
-          preview(b, visibleMessages(b).at(-1), state.bots).toLowerCase().includes(q),
+          preview(b, visibleMessages(b).at(-1), state.bots, state.groups).toLowerCase().includes(q),
       );
     const unsectionedChief = matchingBots.find((bot) => bot.chiefOfStaff && !bot.section);
     const sectionChiefs = matchingBots.filter((bot) => bot.chiefOfStaff && bot.section);
@@ -2457,8 +2578,9 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     <aside
       aria-label="Bots and Navigation"
       className={cn(
-        "flex h-full shrink-0 flex-col border-r border-hairline/40 bg-panel transition-[width] duration-200",
-        density === "icons" ? "w-[80px]" : density === "compact" ? "w-[272px]" : "w-[320px]",
+        "relative flex h-full shrink-0 flex-col border-r border-hairline/40 bg-panel",
+        isResizing ? "transition-none select-none" : "transition-[width] duration-200",
+        density === "icons" ? "w-[80px]" : undefined,
         // Below md only: the sidebar leaves the flow and slides in over the chat.
         // Scoped with max-md: rather than cancelled with md: on purpose — Tailwind
         // v4 emits the native `translate` property, and any value other than
@@ -2470,6 +2592,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         "max-md:transition-transform max-md:duration-200",
         open ? "max-md:translate-x-0" : "max-md:-translate-x-full",
       )}
+      style={density === "icons" ? undefined : { width: `${sidebarWidth}px` }}
     >
       {/* macOS owns inset traffic lights; Linux/Windows use native chrome. */}
       <div
@@ -3067,6 +3190,27 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           </div>,
           document.body,
         )}
+      {density !== "icons" && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize Sidebar"
+          aria-valuenow={sidebarWidth}
+          aria-valuemin={MIN_SIDEBAR_WIDTH}
+          aria-valuemax={MAX_SIDEBAR_WIDTH}
+          tabIndex={0}
+          onMouseDown={startResize}
+          onDoubleClick={resetWidth}
+          onKeyDown={handleResizeKey}
+          className={cn(
+            "absolute inset-y-0 right-0 z-30 w-1 cursor-col-resize hover:bg-accent/60 transition-colors max-md:hidden",
+            isResizing && "bg-accent w-1.5",
+          )}
+          title="Drag to resize sidebar (double-click to reset)"
+        >
+          <div className="absolute inset-y-0 -left-1.5 -right-1.5" />
+        </div>
+      )}
     </aside>
   );
 }

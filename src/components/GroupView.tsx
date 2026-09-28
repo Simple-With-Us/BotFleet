@@ -46,6 +46,7 @@ import { shortPath } from "@/lib/short-path";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
+import { botActivityLocation } from "@/lib/sidebar-activity";
 import { modelChip } from "@/lib/model-chip";
 import { splitAttachedImages } from "@/lib/composer-attachments";
 import {
@@ -1233,21 +1234,43 @@ export function GroupView({ group }: { group: Group }) {
 
   const memberBots = (
     <div className="flex items-center -space-x-1.5">
-      {visibleMembers.map((b) => (
-        <span
-          key={b.id}
-          title={`${b.name}${group.busyBotId === b.id ? " — working…" : ""}`}
-          className={cn(
-            "relative inline-flex rounded-full ring-2 ring-app",
-            group.busyBotId === b.id && "ring-accent/70",
-          )}
-        >
-          <BotMascot color={b.color} state={normalizeState(b.mascotExpression) ?? "happy"} size={22} animated={false} />
-          {group.busyBotId === b.id && (
-            <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent" />
-          )}
-        </span>
-      ))}
+      {visibleMembers.map((b) => {
+        const isWorkingHere = group.busyBotId === b.id;
+        const busyLocation = !isWorkingHere && b.busy ? botActivityLocation(b, state.groups) : null;
+        const isBusyElsewhere = Boolean(busyLocation);
+        return (
+          <span
+            key={b.id}
+            title={
+              isWorkingHere
+                ? `${b.name} — working in this channel…`
+                : isBusyElsewhere
+                ? `${b.name} — ${busyLocation?.kind === "group" ? `busy in #${busyLocation.name}` : `busy on ${busyLocation?.title}`}…`
+                : b.busy
+                ? `${b.name} — busy…`
+                : b.name
+            }
+            className={cn(
+              "relative inline-flex rounded-full ring-2 ring-app",
+              isWorkingHere && "ring-accent",
+              isBusyElsewhere && "ring-amber-500/70",
+            )}
+          >
+            <BotMascot
+              color={b.color}
+              state={isWorkingHere ? "working" : normalizeState(b.mascotExpression) ?? "happy"}
+              size={22}
+              animated={isWorkingHere}
+            />
+            {isWorkingHere && (
+              <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-accent animate-pulse" />
+            )}
+            {isBusyElsewhere && (
+              <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full border border-app bg-amber-500" />
+            )}
+          </span>
+        );
+      })}
       {hiddenMemberCount > 0 && (
         <span className="relative flex size-[22px] items-center justify-center rounded-full border border-hairline/60 bg-raised text-[10px] font-semibold text-ink-secondary ring-2 ring-app">
           +{hiddenMemberCount}
@@ -1298,6 +1321,15 @@ export function GroupView({ group }: { group: Group }) {
             )}
             <span className="truncate min-w-[80px] text-[15px] font-semibold text-ink" title={group.name}>{group.name}</span>
           </button>
+          {speaker && (
+            <div
+              className="flex shrink-0 items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[12px] font-medium text-accent"
+              title={`${speaker.name} is working in ${group.name}`}
+            >
+              <span className="size-2 rounded-full bg-accent animate-pulse" />
+              <span className="truncate max-w-[160px]">{speaker.name} is working…</span>
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
@@ -1535,6 +1567,7 @@ export function GroupView({ group }: { group: Group }) {
           )}
           {(speaker || presenceVisible) && (
             <TurnPresence
+              actorName={presenceSpeaker?.name}
               avatar={
                 <BotMascot
                   color={presenceSpeaker?.color ?? "green"}

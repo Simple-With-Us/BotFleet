@@ -24,6 +24,15 @@ import {
   parseSidebarDensity,
   saveSidebarDensity,
   partitionSidebarGroups,
+  DEFAULT_SIDEBAR_WIDTH,
+  DEFAULT_SIDEBAR_COMPACT_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  MAX_SIDEBAR_WIDTH,
+  SIDEBAR_WIDTH_KEY,
+  parseSidebarWidth,
+  loadSidebarWidth,
+  saveSidebarWidth,
+  densityAdjustedSidebarWidth,
 } from "./sidebar-preferences";
 
 describe("sidebar density preferences", () => {
@@ -41,6 +50,39 @@ describe("sidebar density preferences", () => {
     expect(setItem).toHaveBeenCalledWith(SIDEBAR_DENSITY_KEY, "icons");
     expect(loadSidebarDensity({ getItem: () => "compact" })).toBe("compact");
     expect(loadSidebarDensity({ getItem: () => { throw new Error("blocked"); } })).toBe("comfortable");
+  });
+});
+
+describe("the sidebar width following a density switch", () => {
+  it("swaps only an untouched default, never a dragged width", () => {
+    expect(densityAdjustedSidebarWidth(DEFAULT_SIDEBAR_WIDTH, "compact")).toBe(DEFAULT_SIDEBAR_COMPACT_WIDTH);
+    expect(densityAdjustedSidebarWidth(DEFAULT_SIDEBAR_COMPACT_WIDTH, "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+    // A width the person chose survives the switch in both directions.
+    expect(densityAdjustedSidebarWidth(300, "compact")).toBe(300);
+    expect(densityAdjustedSidebarWidth(300, "comfortable")).toBe(300);
+    // Avatar-only mode has no width of its own to swap to.
+    expect(densityAdjustedSidebarWidth(DEFAULT_SIDEBAR_WIDTH, "icons")).toBe(DEFAULT_SIDEBAR_WIDTH);
+  });
+
+  it("reads back the swapped width after a reload once the swap is persisted", () => {
+    // Regression pin for the Sentry finding on #694: the density effect
+    // changed state without saving, so loadSidebarWidth served the other
+    // density's default after a reload. The effect now saves the swap;
+    // this is the round trip it must satisfy.
+    const map = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => void map.set(key, value),
+    };
+    saveSidebarWidth(DEFAULT_SIDEBAR_WIDTH, storage); // comfortable default on record
+    const swapped = densityAdjustedSidebarWidth(loadSidebarWidth(storage, "comfortable"), "compact");
+    saveSidebarWidth(swapped, storage);
+    expect(loadSidebarWidth(storage, "compact")).toBe(DEFAULT_SIDEBAR_COMPACT_WIDTH);
+
+    // And back again: compact's default follows a return to comfortable.
+    const back = densityAdjustedSidebarWidth(loadSidebarWidth(storage, "compact"), "comfortable");
+    saveSidebarWidth(back, storage);
+    expect(loadSidebarWidth(storage, "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
   });
 });
 
@@ -161,5 +203,31 @@ describe("sidebar section order and Bot Chats", () => {
     expect(collapsed.has("Bot ↔ Bot")).toBe(false);
     expect(store[SIDEBAR_COLLAPSED_SECTIONS_KEY]).toContain("Bot Chats");
     expect(store[SIDEBAR_COLLAPSED_SECTIONS_KEY]).not.toContain("Bot ↔ Bot");
+  });
+});
+
+describe("sidebar width preferences", () => {
+  it("defaults to comfortable (320) or compact (272) based on density", () => {
+    expect(parseSidebarWidth(null, "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth(null, "compact")).toBe(DEFAULT_SIDEBAR_COMPACT_WIDTH);
+    expect(parseSidebarWidth("", "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth("invalid", "comfortable")).toBe(DEFAULT_SIDEBAR_WIDTH);
+  });
+
+  it("clamps custom width between MIN_SIDEBAR_WIDTH and MAX_SIDEBAR_WIDTH", () => {
+    expect(parseSidebarWidth("100")).toBe(MIN_SIDEBAR_WIDTH);
+    expect(parseSidebarWidth("250")).toBe(250);
+    expect(parseSidebarWidth("400")).toBe(400);
+    expect(parseSidebarWidth("1200")).toBe(MAX_SIDEBAR_WIDTH);
+  });
+
+  it("saves and loads the clamped width from storage", () => {
+    const setItem = vi.fn();
+    saveSidebarWidth(450, { setItem });
+    expect(setItem).toHaveBeenCalledWith(SIDEBAR_WIDTH_KEY, "450");
+    expect(loadSidebarWidth({ getItem: () => "380" })).toBe(380);
+    expect(loadSidebarWidth({ getItem: () => { throw new Error("blocked"); } }, "compact")).toBe(
+      DEFAULT_SIDEBAR_COMPACT_WIDTH,
+    );
   });
 });
