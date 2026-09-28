@@ -94,9 +94,10 @@ Every pack must include a `manifest.json` that maps BotFleet's internal states t
 
 When generating assets for a BotFleet avatar, strictly adhere to these constraints:
 
-1. **Transparency**: All GIFs and PNGs MUST have fully transparent backgrounds (`rgba(0,0,0,0)`). They will be composited over various UI themes (Light/Dark mode, gradients).
-2. **Dimensions**: Standardize at `480x480` square format. Do not crop tightly; leave padding for the avatar to move slightly if needed.
-3. **Animation Timing & Length Specs**: 
+1. **Artistic Freedom & Subject**: Avatars can be *anything* (a bird, an orb, a 3D robot, a photorealistic face, pixel art). There is absolutely no strict "face template" or layout requirement, as long as the design fits inside the square canvas.
+2. **Transparency**: All GIFs and PNGs MUST have fully transparent backgrounds (`rgba(0,0,0,0)`). They will be composited over various UI themes (Light/Dark mode, gradients).
+3. **Dimensions**: Standardize at `480x480` square format (or a similar 1:1 aspect ratio). Center your character and do not crop too tightly; leave padding for the avatar to bounce/breathe if needed.
+4. **Animation Timing & Length Specs**:
    Because these avatars react to real-time events, timing is critical.
    - **Enter / Return Transitions**: 
      - *Must be:* Under 1.5 seconds.
