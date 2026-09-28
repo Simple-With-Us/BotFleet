@@ -262,6 +262,7 @@ export function LocalVmRuntimeCard() {
   return (
     <>
       <Card
+        id="setting-computers-local-vm"
         title="Local VM"
         subtitle={perBot
           ? `Private Cua Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
@@ -352,6 +353,7 @@ export function LocalVmRuntimeCard() {
       </Card>
 
       <Card
+        id="setting-computers-cli-credentials"
         title="Host & CLI Integration"
         subtitle="Manage CLI authentication and terminal access for bots using the Local VM."
       >

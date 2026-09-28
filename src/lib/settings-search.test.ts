@@ -1,17 +1,40 @@
 import { describe, expect, it } from "vitest";
-import { searchSettings, sectionBodyHasVisibleItem, SETTINGS_SEARCH_ITEMS } from "./settings-search";
+import {
+  searchSettings,
+  sectionBodyHasVisibleItem,
+  segmentMatchText,
+  SETTINGS_SEARCH_ITEMS,
+} from "./settings-search";
 
 describe("Settings Search Engine", () => {
   it("returns all items when query is empty", () => {
     const result = searchSettings("");
     expect(result.matchingSectionIds.size).toBe(10);
     expect(result.matchingItemIds.size).toBe(SETTINGS_SEARCH_ITEMS.length);
+    expect(result.matchingItems.length).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.totalMatches).toBe(SETTINGS_SEARCH_ITEMS.length);
   });
 
+  it("every search item has a valid domId, title, and sectionLabel", () => {
+    for (const item of SETTINGS_SEARCH_ITEMS) {
+      expect(item.domId).toBeTruthy();
+      expect(item.domId).toMatch(/^setting-/);
+      expect(item.title).toBeTruthy();
+      expect(item.sectionLabel).toBeTruthy();
+      expect(item.keywords.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("uses the labels people see on the destination cards", () => {
+    const label = (id: string) => SETTINGS_SEARCH_ITEMS.find((item) => item.id === id)?.title;
+    expect(label("general:skin")).toBe("Skin");
+    expect(label("computers:providers")).toBe("Providers");
+    expect(label("usage:quotas")).toBe("Engine Quotas");
+    expect(label("observability:sentry")).toBe("Diagnostics & Error Reporting");
+    expect(label("engines:matrix")).toBe("Engine Capabilities");
+  });
+
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
-    // Regression: SettingsModal gated the whole Usage body on usage:summary,
-    // so a query matching only usage:pricing rendered a blank section.
     const result = searchSettings("pricing mode");
     expect(result.matchingItemIds.has("usage:pricing")).toBe(true);
     expect(result.matchingItemIds.has("usage:summary")).toBe(false);
@@ -66,6 +89,33 @@ describe("Settings Search Engine", () => {
     expect(result.matchingSectionIds.has("computers")).toBe(true);
     expect(result.matchingItemIds.has("computers:localVm")).toBe(true);
     expect(result.matchingItemIds.has("computers:sharedVpsVm")).toBe(true);
+  });
+
+  it("finds mcode / MiniMax Code across engine clis and capability matrix", () => {
+    const result = searchSettings("mcode");
+    expect(result.matchingSectionIds.has("engines")).toBe(true);
+    expect(result.matchingItemIds.has("engines:clis")).toBe(true);
+    expect(result.matchingItemIds.has("engines:matrix")).toBe(true);
+  });
+
+  it("finds host cli credentials sync across computers", () => {
+    const result = searchSettings("credentials sync");
+    expect(result.matchingSectionIds.has("computers")).toBe(true);
+    expect(result.matchingItemIds.has("computers:cliCredentials")).toBe(true);
+  });
+
+  it("ranks exact title match higher than keyword match", () => {
+    const result = searchSettings("Profile");
+    expect(result.matchingItems[0].id).toBe("general:profile");
+  });
+
+  it("segments text into matched and non-matched tokens for UI highlighting", () => {
+    const segments = segmentMatchText("Shared VPS VM on Linux", "vps");
+    expect(segments).toEqual([
+      { text: "Shared ", matched: false },
+      { text: "VPS", matched: true },
+      { text: " VM on Linux", matched: false },
+    ]);
   });
 
   it("finds diagnostics by logs or debug", () => {

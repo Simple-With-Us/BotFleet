@@ -127,6 +127,7 @@ export function SharedVpsRuntimeCard() {
 
   return (
     <Card
+      id="setting-computers-shared-vps"
       title="Shared VPS VM"
       subtitle="The shared Cua Linux sandbox running on your VPS. Bots take turns using it one at a time."
     >
