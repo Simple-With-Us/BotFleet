@@ -2498,7 +2498,16 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   localVmActiveThreads.set(target.key, { threadId, botId });
   localVmIdleFor(target).touch();
-  const localVm = await containerComputerStatus(undefined, undefined, target);
+  let localVm = await containerComputerStatus(undefined, undefined, target);
+  if (localVm.container === "stopped" && localVm.image && localVm.runtime && localVm.daemonUp) {
+    try {
+      await containerComputerAction("remove", undefined, undefined, target);
+      await containerComputerAction("run", undefined, undefined, target);
+      localVm = await containerComputerStatus(undefined, undefined, target);
+    } catch {
+      // Best-effort auto-wake; fall through to readiness check below
+    }
+  }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
   }
@@ -11311,17 +11320,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.localVm} is turned off in Computer settings` });
       }
       const target = localVmTargetForBot(bot.id);
-      if (target.key === SHARED_LOCAL_VM_TARGET.key) {
-        return json(res, 409, { error: "Shared mode manages this desktop in App Settings → Local VM" });
-      }
       if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
-        return json(res, 409, { error: "this bot's Local VM setup action is still running" });
+        return json(res, 409, { error: "this Local VM setup action is still running" });
       }
       if (action === "run" && localVmProvisionBusy) {
-        return json(res, 409, { error: "another per-bot Local VM is being created — retry after it finishes" });
+        return json(res, 409, { error: "another Local VM is being created — retry after it finishes" });
       }
       const vmOwner = localVmLeaseFor(target).current(localVmOwnerBusy);
-      if (vmOwner) return json(res, 409, { error: "this bot is using its Local VM — stop the turn first" });
+      if (vmOwner) return json(res, 409, { error: "this Local VM is in use — stop the turn first" });
       // Fence this target, and the cross-target capacity decision for creates,
       // before the first await so two requests cannot both pass the limit.
       localVmLifecycleBusy.add(target.key);
