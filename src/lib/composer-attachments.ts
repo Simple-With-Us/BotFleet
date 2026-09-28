@@ -344,9 +344,10 @@ export type DroppedFile = Pick<File, "name" | "size" | "type" | "text"> & {
 export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
   files: readonly T[],
   getPath: (file: T) => string,
-  opts: { allowImages?: boolean } = {},
+  opts: { allowImages?: boolean; onUploadError?: (err: unknown) => void } = {},
 ): Promise<{ attachments: Attachment[]; rejectedNames: string[] }> {
   const allowImages = opts.allowImages !== false;
+  const onUploadError = opts.onUploadError;
   const results = await Promise.all(
     files.map(async (file) => {
       let path = "";
@@ -365,8 +366,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             arrayBuffer: file.arrayBuffer,
           });
           if (image) return { attachment: image };
-        } catch {
-          // Fall through to generic upload or reject.
+        } catch (err) {
+          onUploadError?.(err);
         }
       }
       if (isInlineText(file) && file.size <= INLINE_DROP_LIMIT) {
@@ -390,8 +391,8 @@ export async function attachmentsFromDroppedFiles<T extends DroppedFile>(
             }
             return { attachment: uploaded };
           }
-        } catch {
-          // Named below as rejected.
+        } catch (err) {
+          onUploadError?.(err);
         }
       }
       return { rejectedName: attachmentLabel(file) };
@@ -534,6 +535,7 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
   const attachments: Attachment[] = [];
   const rejectedNames: string[] = [];
   const imageErrors: string[] = [];
+  const uploadErrors: string[] = [];
   // Finish each selected file in sequence so the chips retain the order in
   // which the user chose or dropped them.
   for (const file of files) {
@@ -546,7 +548,11 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
       }
       continue;
     }
-    const result = await attachmentsFromDroppedFiles([file], getPath, { allowImages });
+    const result = await attachmentsFromDroppedFiles(
+      [file],
+      getPath,
+      { allowImages, onUploadError: (err) => uploadErrors.push(`${attachmentLabel(file)}: ${err instanceof Error ? err.message : "upload failed"}`) },
+    );
     attachments.push(...result.attachments);
     rejectedNames.push(...result.rejectedNames);
   }
@@ -554,8 +560,10 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     ? `${rejectedNames.join(", ")} could not be attached.  Paste, drop, or pick a supported file (images, PDF, Office, zip, audio, video, or text).`
     : null;
   const failed = imageErrors.length ? imageErrors.join("; ") : null;
+  const uploaded = uploadErrors.length ? uploadErrors.join("; ") : null;
+  const detail = [failed, uploaded].filter(Boolean).join("; ") || null;
   return {
     attachments,
-    notice: pathless && failed ? `${pathless} (${failed})` : (pathless ?? failed),
+    notice: pathless && detail ? `${pathless} (${detail})` : (pathless ?? detail),
   };
 }

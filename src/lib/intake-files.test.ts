@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { attachmentLabel, filesFromClipboard, intakeFiles, isImageFile, type Attachment, type ClipboardFileSource } from "./composer-attachments";
 
-type Fake = { name: string; size: number; type: string; text: () => Promise<string> };
+type Fake = { name: string; size: number; type: string; text: () => Promise<string>; arrayBuffer?: () => Promise<ArrayBuffer> };
 const file = (name: string, type: string, size = 10): Fake => ({
   name,
   size,
@@ -88,5 +88,59 @@ describe("intakeFiles", () => {
     });
     expect(out.attachments).toHaveLength(1);
     expect(out.notice).toMatch(/bad\.png: too large/);
+  });
+
+  it("surfaces the underlying error when a pathless image upload to a non-image engine fails", async () => {
+    // Reproduces the user-visible "Pasted Screenshot.png could not be attached" — before this fix the
+    // upload error was swallowed by attachmentsFromDroppedFiles so the user had no way to tell what
+    // actually went wrong.
+    const fakeFetch = async () =>
+      ({
+        ok: false,
+        statusText: "Bad Request",
+        json: async () => ({ error: "content-type must be a supported file type" }),
+      }) as unknown as Response;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetch as unknown as typeof fetch;
+    try {
+      const fakeScreenshot = { ...file("", "image/png", 3), arrayBuffer: async () => new ArrayBuffer(3) };
+      const out = await intakeFiles([fakeScreenshot as unknown as Fake & { arrayBuffer: () => Promise<ArrayBuffer> }], {
+        allowImages: false,
+        getPath: () => "",
+        uploadImage: async () => null,
+      });
+      expect(out.attachments).toHaveLength(0);
+      expect(out.notice).toMatch(/Pasted Screenshot\.png could not be attached/);
+      expect(out.notice).toMatch(/Pasted Screenshot\.png: content-type must be a supported file type/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("attaches a pathless screenshot as a file when the engine cannot read images", async () => {
+    // Electron drop or browser paste: no disk path, image-capable server endpoint.
+    // allowImages: false because the engine/bot has no image capability — the image is still
+    // uploaded as a file attachment so the user does not lose the paste.
+    const fakeFetch = async () =>
+      ({
+        ok: true,
+        statusText: "Created",
+        json: async () => ({ path: "/api/attachments/abc.png", mime: "image/png", bytes: 3 }),
+      }) as unknown as Response;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetch as unknown as typeof fetch;
+    try {
+      const fakeScreenshot = { ...file("", "image/png", 3), arrayBuffer: async () => new ArrayBuffer(3) };
+      const out = await intakeFiles([fakeScreenshot as unknown as Fake & { arrayBuffer: () => Promise<ArrayBuffer> }], {
+        allowImages: false,
+        getPath: () => "",
+        uploadImage: async () => null,
+      });
+      expect(out.attachments).toHaveLength(1);
+      expect(out.attachments[0].kind).toBe("file");
+      expect(out.notice).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
