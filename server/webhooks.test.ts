@@ -1564,6 +1564,129 @@ describe("WebhookManager", () => {
     expect(negAllExceptWarningResult.runId).toBeDefined();
 
     expect(dropNounResult.runId).toBeDefined();
+
+    // 68. Deployer pre-filter ignores automated bot issue edits (e.g. github-actions[bot] syncing effort board)
+    const { webhook: deployerHook, secret: deployerSecret } = h.manager.create({
+      name: "GitHub Merge Conflicts & Issues",
+      prompt: "A GitHub webhook event was received. Analyze the payload. Land merge-ready PRs.",
+      botId: "maus-1",
+    });
+    const botIssueEdit = {
+      eventName: "issues",
+      deliveryId: "bot-issue-1",
+      payload: {
+        action: "edited",
+        sender: { login: "github-actions[bot]" },
+        issue: { number: 171, title: "Align analytics endpoint schemas", state: "closed" },
+        repository: { full_name: "jaywedgeworth22/congress-trading-shared" },
+      },
+    };
+    const botIssueResult = h.manager.receive(deployerHook.endpointId, deployerSecret, botIssueEdit);
+    expect(botIssueResult).toMatchObject({ ignored: true });
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: expect.stringContaining("routine issue metadata churn"),
+    });
+
+    // 69. Universal guard ignores bot-edited issue events across generic webhooks
+    const { webhook: genericHook, secret: genericSecret } = h.manager.create({
+      name: "Generic Webhook",
+      prompt: "Handle generic repo events.",
+      botId: "maus-1",
+    });
+    const genericBotIssueResult = h.manager.receive(genericHook.endpointId, genericSecret, botIssueEdit);
+    expect(genericBotIssueResult).toMatchObject({ ignored: true });
+    expect(h.manager.listAttempts().at(-1)).toMatchObject({
+      outcome: "ignored",
+      reason: expect.stringContaining("automated metadata rollup"),
+    });
+
+    // 70. Deployer pre-filter accepts human issue assignment
+    const humanIssueAssign = {
+      eventName: "issues",
+      deliveryId: "human-issue-1",
+      payload: {
+        action: "assigned",
+        sender: { login: "jaywedgeworth22" },
+        assignee: { login: "BF-Deployer" },
+        issue: { number: 172, title: "Please help deploy this", state: "open" },
+        repository: { full_name: "jaywedgeworth22/Socratic.Trade" },
+      },
+    };
+    const deployerAssignResult = h.manager.receive(deployerHook.endpointId, deployerSecret, humanIssueAssign);
+    expect(deployerAssignResult).toMatchObject({ duplicate: false });
+    expect(deployerAssignResult.runId).toBeDefined();
+
+    // 71. Deployer pre-filter ignores draft PRs, in-progress checks, and unmerged closed PRs, but accepts merged closed PRs
+    const draftPr = {
+      eventName: "pull_request",
+      deliveryId: "pr-draft-1",
+      payload: {
+        action: "opened",
+        pull_request: { number: 10, draft: true, state: "open" },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    expect(h.manager.receive(deployerHook.endpointId, deployerSecret, draftPr)).toMatchObject({ ignored: true });
+
+    const unmergedClosedPr = {
+      eventName: "pull_request",
+      deliveryId: "pr-unmerged-1",
+      payload: {
+        action: "closed",
+        pull_request: { number: 11, draft: false, state: "closed", merged: false },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    expect(h.manager.receive(deployerHook.endpointId, deployerSecret, unmergedClosedPr)).toMatchObject({ ignored: true });
+
+    const mergedClosedPr = {
+      eventName: "pull_request",
+      deliveryId: "pr-merged-1",
+      payload: {
+        action: "closed",
+        pull_request: { number: 12, draft: false, state: "closed", merged: true, merged_at: "2026-09-28T07:00:00Z" },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    const mergedResult = h.manager.receive(deployerHook.endpointId, deployerSecret, mergedClosedPr);
+    expect(mergedResult).toMatchObject({ duplicate: false });
+    expect(mergedResult.runId).toBeDefined();
+
+    // 71b. Deployer name matcher must not catch unrelated hooks containing the word "deployer"
+    const { webhook: unrelatedHook, secret: unrelatedSecret } = h.manager.create({
+      name: "S3 Deployer - Data Sync",
+      prompt: "Handle S3 sync completion events.",
+      botId: "maus-1",
+    });
+    const unrelatedResult = h.manager.receive(unrelatedHook.endpointId, unrelatedSecret, unmergedClosedPr);
+    expect(unrelatedResult).toMatchObject({ duplicate: false });
+    expect(unrelatedResult.runId).toBeDefined();
+
+
+    const inProgressCheck = {
+      eventName: "check_run",
+      deliveryId: "check-1",
+      payload: {
+        action: "created",
+        check_run: { id: 100, status: "in_progress", conclusion: null },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    expect(h.manager.receive(deployerHook.endpointId, deployerSecret, inProgressCheck)).toMatchObject({ ignored: true });
+
+    const completedCheck = {
+      eventName: "check_run",
+      deliveryId: "check-2",
+      payload: {
+        action: "completed",
+        check_run: { id: 101, status: "completed", conclusion: "success" },
+        repository: { full_name: "jaywedgeworth22/BotFleet" },
+      },
+    };
+    const deployerCompletedCheckResult = h.manager.receive(deployerHook.endpointId, deployerSecret, completedCheck);
+    expect(deployerCompletedCheckResult).toMatchObject({ duplicate: false });
+    expect(deployerCompletedCheckResult.runId).toBeDefined();
   });
 });
 

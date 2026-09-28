@@ -796,6 +796,116 @@ export function shouldIgnoreWebhookEvent(
     }
   }
 
+  // 3. GitHub Deployer / Merge Conflicts Pre-Filter (only applies to verified GitHub payloads)
+  const isDeployerTrigger =
+    /\b(?:merge[\s-]*conflicts?|bf-deployer)\b/i.test(name) ||
+    /\b(?:bf-deployer|land merge-ready prs|merges ready prs)\b/i.test(prompt);
+  if (isDeployerTrigger && isGithubWebhookPayload(payload)) {
+    const eventName = event.eventName;
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+
+    // Issues: Deployer only handles direct user assignments, never routine bot churn or unassigned edits/closures
+    if (eventName === "issues") {
+      const isBotSender = /\[bot\]$/i.test(senderLogin) || senderLogin === "github-actions";
+      const isAssigned = action === "assigned";
+      if (isBotSender || !isAssigned) {
+        return {
+          ignore: true,
+          reason: `GitHub issues action '${action ?? "unknown"}' from '${senderLogin || "unknown"}' ignored: Deployer only handles direct issue assignments, not routine issue metadata churn`,
+        };
+      }
+    }
+
+    // Pull requests: ignore draft PRs, closed unmerged PRs, or routine label/review metadata
+    if (eventName === "pull_request") {
+      const pr = asRecord(root?.pull_request);
+      const isDraft = pr?.draft === true;
+      if (isDraft && action !== "ready_for_review") {
+        return {
+          ignore: true,
+          reason: `GitHub draft pull_request action '${action ?? "unknown"}' ignored: Deployer waits for ready_for_review`,
+        };
+      }
+      if (action === "closed") {
+        const isMerged = pr?.merged === true || pickStr(pr, "merged_at") !== undefined;
+        if (!isMerged) {
+          return {
+            ignore: true,
+            reason: `GitHub pull_request closed unmerged ignored: Deployer waits for merge or open PR`,
+          };
+        }
+      }
+      if (
+        action === "labeled" ||
+        action === "unlabeled" ||
+        action === "review_requested" ||
+        action === "review_request_removed"
+      ) {
+        return {
+          ignore: true,
+          reason: `GitHub pull_request metadata action '${action}' ignored: Deployer acts on lifecycle changes and check conclusions`,
+        };
+      }
+    }
+
+    // Workflow & Check runs: ignore in-progress or queued runs; wait for terminal completion
+    if (eventName === "workflow_run") {
+      const workflowRun = asRecord(root?.workflow_run);
+      const runStatus = pickStr(workflowRun, "status");
+      if (runStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub workflow_run status '${runStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "check_run") {
+      const checkRun = asRecord(root?.check_run);
+      const checkStatus = pickStr(checkRun, "status");
+      if (checkStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub check_run status '${checkStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "check_suite") {
+      const checkSuite = asRecord(root?.check_suite);
+      const suiteStatus = pickStr(checkSuite, "status");
+      if (suiteStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub check_suite status '${suiteStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    } else if (eventName === "workflow_job") {
+      const workflowJob = asRecord(root?.workflow_job);
+      const jobStatus = pickStr(workflowJob, "status");
+      if (jobStatus !== "completed") {
+        return {
+          ignore: true,
+          reason: `GitHub workflow_job status '${jobStatus ?? "unknown"}' ignored: Deployer waits for completed conclusion`,
+        };
+      }
+    }
+  }
+
+  // 4. Universal GitHub Ingress Guard: automated bot issue edits across any trigger
+  if (isGithubWebhookPayload(payload) && event.eventName === "issues") {
+    const root = asRecord(payload);
+    const action = pickStr(root, "action");
+    const sender = asRecord(root?.sender);
+    const senderLogin = pickStr(sender, "login") ?? "";
+    const isBotSender = /\[bot\]$/i.test(senderLogin) || senderLogin === "github-actions";
+    if (isBotSender && (action === "edited" || action === "closed") && !/\bgithub-actions\b/i.test(prompt)) {
+      return {
+        ignore: true,
+        reason: `GitHub issues action '${action}' by bot '${senderLogin}' ignored: automated metadata rollup`,
+      };
+    }
+  }
+
   return { ignore: false };
 }
 
