@@ -343,9 +343,14 @@ export function Composer({
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
   const send = (opts?: { steerNow?: boolean }) => {
     if (locked) return;
-    if (attachments.some((attachment) => attachment.kind === "image") && !imageTargetsSupport(text)) {
-      dispatch({ type: "error", message: "The selected responder does not support image attachments." });
-      return;
+    if (attachments.some((attachment) => attachment.kind === "image")) {
+      if (!imageTargetsSupport(text)) {
+        dispatch({ type: "error", message: "The selected responder does not support image attachments." });
+        return;
+      }
+      // The server knows the active task's model override and updates that
+      // task (or the bot only when it inherits the default) before dispatch.
+      // A composer-side bot patch would overwrite an unrelated default.
     }
     const t = composeMessage(text, attachments);
     if (!t) return;

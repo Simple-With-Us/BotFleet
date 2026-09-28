@@ -63,6 +63,9 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
       id: "DeepSeek-V4.1-Pro",
       label: "DeepSeek-V4.1-Pro",
       contextWindow: 1_000_000,
+      badge: "No Vision",
+      badgeTitle:
+        "Text and reasoning only — lacks vision. Attaching an image automatically switches to DeepSeek-V4.1-Flash.",
     },
     {
       id: "MiniMax-M3.1-Flash-Preview",

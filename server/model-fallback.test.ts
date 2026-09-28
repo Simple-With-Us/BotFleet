@@ -22,6 +22,7 @@ import {
   turnQuotaOrCapEvidence,
   turnProducedAssistantOutput,
   inheritedUnattended,
+  dshVisionSelection,
   type FallbackScanMessage,
   unattendedModelDowngrade,
 } from "./model-fallback.ts";
@@ -53,6 +54,29 @@ function decide(messagesAfterUser: FallbackScanMessage[], opts: {
     current: opts.current,
   });
 }
+
+describe("DSH vision route migration", () => {
+  it("updates the Pro primary and matching fallback without changing unrelated routes", () => {
+    const original: ModelSelection = {
+      instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "high",
+      fallbacks: [
+        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "none" },
+        { instanceId: "dsh", model: "MiniMax-M3" },
+      ],
+    };
+    expect(dshVisionSelection(original)).toEqual({
+      instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "high",
+      fallbacks: [
+        { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
+        { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
+        { instanceId: "dsh", model: "MiniMax-M3" },
+      ],
+    });
+    expect(original.model).toBe("DeepSeek-V4.1-Pro");
+    expect(original.fallbacks?.[1]?.model).toBe("DeepSeek-V4.1-Pro");
+  });
+});
 
 describe("turnProducedAssistantOutput", () => {
   it("does not count a tool-start chip (ok undefined) as produced, so 1:1 failover starts the next instance", () => {
