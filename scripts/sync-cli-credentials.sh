@@ -282,6 +282,9 @@ fi
 
 if [ "$JSON_OUTPUT" -eq 1 ]; then
   ITEMS_JSON=$(printf '%s\n' "${FOUND[@]}" | python3 -c 'import sys, json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-  TARGETS_JSON=$(printf '%s\n' "${SYNCED_TARGETS[@]}" | python3 -c 'import sys, json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+  # bash 3.2 (macOS) crashes on "${EMPTY[@]}" under set -u; the + guard
+  # expands to nothing when no target synced, and printf then emits one
+  # blank line that the python filter drops -> "targets":[].
+  TARGETS_JSON=$(printf '%s\n' ${SYNCED_TARGETS[@]+"${SYNCED_TARGETS[@]}"} | python3 -c 'import sys, json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
   echo "{\"ok\":true,\"synced\":$ITEMS_JSON,\"targets\":$TARGETS_JSON}"
 fi
