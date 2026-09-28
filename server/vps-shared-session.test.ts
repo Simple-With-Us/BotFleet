@@ -62,6 +62,11 @@ describe("vps shared session identity", () => {
     expect(args.join("\n")).toContain(session.display);
     expect(args.join("\n")).toContain(session.socket);
     expect(args.join("\n")).toContain("Xvfb");
+    expect(args.join("\n")).toContain("Xtigervnc");
+    expect(args.join("\n")).toContain("/tmp/cua-driver-");
+    const displayNum = Number(session.display.replace(":", ""));
+    expect(displayNum).toBeGreaterThanOrEqual(10);
+    expect(displayNum).toBeLessThan(60000);
   });
 });
 
