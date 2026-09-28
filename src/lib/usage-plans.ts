@@ -208,3 +208,104 @@ export function getInitialEnginePlans(
   return initial;
 }
 
+export interface QuotaWindowLike {
+  provider?: string | null;
+  providerKey?: string | null;
+  planName?: string | null;
+  label?: string | null;
+}
+
+/**
+ * Detect an engine's subscription plan from live quota windows read from
+ * CodeCaps or Usage Monitor.
+ */
+export function detectEnginePlanFromWindows(
+  engineId: string,
+  windows?: QuotaWindowLike[] | null,
+): EnginePlanOption | null {
+  if (!windows || windows.length === 0) return null;
+  const options = ENGINE_PLAN_OPTIONS[engineId] ?? [];
+  if (options.length === 0) return null;
+
+  const PROVIDER_ALIASES: Record<string, string[]> = {
+    claude: ["anthropic", "claude"],
+    codex: ["openai", "codex", "chatgpt"],
+    cursor: ["cursor"],
+    minimax: ["minimax"],
+    mcode: ["minimax", "mcode"],
+    grok: ["xai", "grok"],
+    antigravity: ["google", "antigravity", "gemini"],
+    "deepseek-harness": ["deepseek"],
+  };
+
+  const aliases = PROVIDER_ALIASES[engineId] ?? [engineId];
+  const matchingWindows = windows.filter((w) => {
+    const p = (w.providerKey ?? w.provider ?? "").toLowerCase();
+    return aliases.some((a) => p.includes(a));
+  });
+
+  if (matchingWindows.length === 0) return null;
+
+  for (const w of matchingWindows) {
+    const raw = `${w.planName ?? ""} ${w.label ?? ""}`.toLowerCase();
+    if (!raw.trim()) continue;
+
+    if (engineId === "cursor") {
+      if (/\bultra\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("ultra")) ?? null;
+      if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
+    }
+    if (engineId === "claude") {
+      if (/20x|20×|max_20|\b20\b/i.test(raw)) {
+        return options.find((o) => o.planName.toLowerCase().includes("20")) ?? null;
+      }
+      if (/5x|5×|max_5|\b5\b/i.test(raw)) {
+        return options.find((o) => o.planName.toLowerCase().includes("5")) ?? null;
+      }
+      if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
+      if (/\bteam\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("team")) ?? null;
+    }
+    if (engineId === "codex") {
+      if (/lite|pro_lite/i.test(raw)) {
+        return options.find((o) => o.planName.toLowerCase().includes("lite")) ?? null;
+      }
+      if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName === "ChatGPT Pro") ?? null;
+      if (/\bplus\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("plus")) ?? null;
+    }
+    if (engineId === "minimax" || engineId === "mcode") {
+      if (/\bstarter\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("starter")) ?? null;
+      if (/\bpro\b/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("pro")) ?? null;
+      if (/\bplan max\b|\bmax\b/i.test(raw.replace(/minimax/gi, ""))) {
+        return options.find((o) => o.planName.toLowerCase().includes("max")) ?? null;
+      }
+    }
+    if (engineId === "grok") {
+      if (/heavy/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("heavy")) ?? null;
+      if (/super/i.test(raw)) return options.find((o) => o.planName === "xAI SuperGrok") ?? null;
+      if (/premium/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("premium")) ?? null;
+    }
+    if (engineId === "antigravity") {
+      if (/ultra/i.test(raw)) return options.find((o) => o.planName.toLowerCase().includes("ultra")) ?? null;
+      if (/premium|one/i.test(raw)) {
+        return options.find((o) => o.planName.toLowerCase().includes("premium")) ?? null;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Scan all windows from CodeCaps / Usage Monitor and auto-detect plans across all engines.
+ */
+export function autoDetectAllEnginePlans(
+  windows?: QuotaWindowLike[] | null,
+): Record<string, EnginePlanOption> {
+  const result: Record<string, EnginePlanOption> = {};
+  if (!windows || windows.length === 0) return result;
+  for (const engineId of Object.keys(ENGINE_PLAN_OPTIONS)) {
+    const detected = detectEnginePlanFromWindows(engineId, windows);
+    if (detected) result[engineId] = detected;
+  }
+  return result;
+}
+

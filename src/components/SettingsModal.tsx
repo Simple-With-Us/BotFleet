@@ -2,9 +2,10 @@
 // Per-bot settings (persona, model, computer) stay in SettingsPanel — this
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
+import { searchSettings } from "@/lib/settings-search";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   ROOM_LABEL_MAX_LENGTH,
@@ -73,11 +74,6 @@ const SECTIONS: Array<{
   { id: "observability", label: "Observability", icon: Activity, keywords: ["sentry", "errors", "crashes", "traces", "logs", "diagnostics"] },
   { id: "secrets", label: "Secrets", icon: KeyRound, keywords: ["infisical", "vault", "credentials", "secret", "provenance"] },
 ];
-
-function sectionMatches(section: (typeof SECTIONS)[number], query: string): boolean {
-  if (!query) return true;
-  return [section.label, ...section.keywords].some((part) => part.toLowerCase().includes(query));
-}
 
 /** Name + email, persisted to /api/config {profile} on blur. */
 function ProfileFields() {
@@ -1044,15 +1040,23 @@ export function SettingsModal() {
   const remoteAccessUrl = ingress?.enabled === false ? null : (ingress?.publicUrl ?? null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
-  const q = query.trim().toLowerCase();
-  const visibleSections = SECTIONS.filter((entry) => sectionMatches(entry, q));
+  const trimmedQuery = query.trim();
+  const searchResult = useMemo(() => searchSettings(trimmedQuery), [trimmedQuery]);
+  const visibleSections = useMemo(
+    () => SECTIONS.filter((entry) => searchResult.matchingSectionIds.has(entry.id)),
+    [searchResult.matchingSectionIds],
+  );
+
+  const isItemVisible = (itemId: string): boolean => {
+    if (!trimmedQuery) return true;
+    return searchResult.matchingItemIds.has(itemId);
+  };
 
   useEffect(() => {
-    const visible = SECTIONS.filter((entry) => sectionMatches(entry, q));
-    if (visible.some((entry) => entry.id === section)) return;
-    const first = visible[0];
+    if (visibleSections.some((entry) => entry.id === section)) return;
+    const first = visibleSections[0];
     if (first) dispatch({ type: "toggleAppSettings", open: true, section: first.id });
-  }, [dispatch, q, section]);
+  }, [dispatch, visibleSections, section]);
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1133,23 +1137,31 @@ export function SettingsModal() {
           </div>
           {visibleSections.length === 0 && (
             <div className="px-2.5 py-4 text-[12.5px] leading-relaxed text-ink-secondary">
-              Nothing matches “{query.trim()}”
+              Nothing matches “{trimmedQuery}”
             </div>
           )}
-          {visibleSections.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
-              aria-current={section === id ? "page" : undefined}
-              className={cn(
-                "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
-              )}
-            >
-              <Icon size={15} />
-              {label}
-            </button>
-          ))}
+          {visibleSections.map(({ id, label, icon: Icon }) => {
+            const matchCount = searchResult.matchCountBySection[id] ?? 0;
+            return (
+              <button
+                key={id}
+                onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
+                aria-current={section === id ? "page" : undefined}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[14px]",
+                  section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                )}
+              >
+                <Icon size={15} className="shrink-0" />
+                <span className="truncate">{label}</span>
+                {trimmedQuery && matchCount > 0 && (
+                  <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
+                    {matchCount}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </nav>
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -1167,25 +1179,61 @@ export function SettingsModal() {
           </div>
 
           <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
+            {trimmedQuery && (
+              <div className="flex items-center justify-between rounded-lg border border-hairline/40 bg-control/40 px-3 py-2 text-[12.5px] text-ink">
+                <span>
+                  Showing matches for &ldquo;{trimmedQuery}&rdquo; in {SECTIONS.find((s) => s.id === section)?.label}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  className="font-medium text-accent hover:underline text-[12px]"
+                >
+                  Clear Search
+                </button>
+              </div>
+            )}
+
+            {trimmedQuery && searchResult.matchCountBySection[section] === 0 && (
+              <div className="rounded-xl bg-card p-6 text-center text-ink-secondary">
+                <p className="text-[13px]">
+                  No settings in {SECTIONS.find((s) => s.id === section)?.label} match &ldquo;{trimmedQuery}&rdquo;.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12.5px] text-ink hover:bg-control"
+                >
+                  Clear Search
+                </button>
+              </div>
+            )}
+
             {section === "general" && (
               <>
-                <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
-                  <ProfileFields />
-                </Card>
-                <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light.">
-                  <SkinPicker />
-                </Card>
-                <ConversationModeRow />
-                <TerminologyRow />
-                <Card title="Channel Turns" subtitle="Set one maximum duration for every bot turn in a channel.">
-                  <RoomTurnTimeoutSettings />
-                </Card>
-                <ToolCallsRow />
-                <ExperimentalFeaturesRow />
-                <UpdatesRow />
-                <UpdateNotificationsRow />
-                <DiagnosticsRow />
-                <AnalyticsRow />
+                {isItemVisible("general:profile") && (
+                  <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
+                    <ProfileFields />
+                  </Card>
+                )}
+                {isItemVisible("general:skin") && (
+                  <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light.">
+                    <SkinPicker />
+                  </Card>
+                )}
+                {isItemVisible("general:conversationMode") && <ConversationModeRow />}
+                {isItemVisible("general:terminology") && <TerminologyRow />}
+                {isItemVisible("general:roomTurnTimeout") && (
+                  <Card title="Channel Turns" subtitle="Set one maximum duration for every bot turn in a channel.">
+                    <RoomTurnTimeoutSettings />
+                  </Card>
+                )}
+                {isItemVisible("general:toolCalls") && <ToolCallsRow />}
+                {isItemVisible("general:experimentalFeatures") && <ExperimentalFeaturesRow />}
+                {isItemVisible("general:updates") && <UpdatesRow />}
+                {isItemVisible("general:updateNotifications") && <UpdateNotificationsRow />}
+                {isItemVisible("general:diagnostics") && <DiagnosticsRow />}
+                {isItemVisible("general:analytics") && <AnalyticsRow />}
               </>
             )}
 
@@ -1195,80 +1243,96 @@ export function SettingsModal() {
                 subtitle={"Connected apps use a connected-apps service when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
               >
                 <div className="flex flex-col gap-4">
-                  {state.config?.composio.mode === "managed" ? (
-                    <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
-                      Connected apps service is ready
-                    </div>
-                  ) : state.config?.composio.managedSetup?.status === "failed" ? (
-                    <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
-                      {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
-                    </div>
-                  ) : null}
-                  <TranscriptionSettings />
-                  <ApiKeyRow section="box" />
-                  <ApiKeyRow section="opencodeGo" />
-                  <ApiKeyRow section="deepseek" />
-                  <div>
-                    <EngineKeyRow engine="minimax" />
-                    <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
-                  </div>
-                  <EngineKeyRow engine="openaiCompat" />
-                  <QdrantRagConnection />
-                  <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                    <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
-                    <div className="mt-3">
-                      <CustomIngressFields />
-                    </div>
-                  </details>
-                  <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                    <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
-                    <div className="mt-3">
-                      <ApiKeyRow section="composio" />
-                    </div>
-                  </details>
-                  <LinqSettings
-                    bots={bots}
-                    config={state.config ?? undefined}
-                    onPatch={async (patch) => {
-                      await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
-                    }}
-                  />
+                  {isItemVisible("connections:composioManaged") && (
+                    state.config?.composio.mode === "managed" ? (
+                      <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
+                        Connected apps service is ready
+                      </div>
+                    ) : state.config?.composio.managedSetup?.status === "failed" ? (
+                      <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
+                        {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
+                      </div>
+                    ) : null
+                  )}
+                  {isItemVisible("connections:transcription") && <TranscriptionSettings />}
+                  {isItemVisible("connections:apiKeys") && (
+                    <>
+                      <ApiKeyRow section="box" />
+                      <ApiKeyRow section="opencodeGo" />
+                      <ApiKeyRow section="deepseek" />
+                      <div>
+                        <EngineKeyRow engine="minimax" />
+                        <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
+                      </div>
+                      <EngineKeyRow engine="openaiCompat" />
+                    </>
+                  )}
+                  {isItemVisible("connections:qdrant") && <QdrantRagConnection />}
+                  {isItemVisible("connections:customIngress") && (
+                    <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                      <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
+                      <div className="mt-3">
+                        <CustomIngressFields />
+                      </div>
+                    </details>
+                  )}
+                  {isItemVisible("connections:selfHostComposio") && (
+                    <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                      <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
+                      <div className="mt-3">
+                        <ApiKeyRow section="composio" />
+                      </div>
+                    </details>
+                  )}
+                  {isItemVisible("connections:linq") && (
+                    <LinqSettings
+                      bots={bots}
+                      config={state.config ?? undefined}
+                      onPatch={async (patch) => {
+                        await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+                      }}
+                    />
+                  )}
                 </div>
               </Card>
             )}
 
             {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
 
-            {section === "engines" && (
+            {section === "engines" && isItemVisible("engines:clis") && (
               <Card title="Engine CLIs" subtitle="Which binary each engine runs. Saved as you go.">
                 <EnginesSettings />
               </Card>
             )}
 
-            {section === "models" && <FleetModelsSection />}
+            {section === "models" && isItemVisible("models:fleet") && <FleetModelsSection />}
 
-            {section === "companion" && <CompanionSection profileEmail={state.config?.profile?.email} />}
+            {section === "companion" && isItemVisible("companion:pairing") && (
+              <CompanionSection profileEmail={state.config?.profile?.email} />
+            )}
 
             {section === "computers" && (
               <>
-                <LocalComputerSection />
-                <Card
-                  title="VPS Connection"
-                  subtitle="Configure SSH access for your Self-hosted VPS."
-                >
-                  <VpsConnection />
-                </Card>
-                <BotComputerDefaults />
-                <LocalVmRuntimeCard />
-                <SharedVpsRuntimeCard />
+                {isItemVisible("computers:providers") && <LocalComputerSection />}
+                {isItemVisible("computers:localVm") && <LocalVmRuntimeCard />}
+                {isItemVisible("computers:sharedVpsVm") && <SharedVpsRuntimeCard />}
+                {isItemVisible("computers:vpsConnection") && (
+                  <Card
+                    title="VPS Connection"
+                    subtitle="Configure SSH access for your Self-hosted VPS."
+                  >
+                    <VpsConnection />
+                  </Card>
+                )}
+                {isItemVisible("computers:defaults") && <BotComputerDefaults />}
               </>
             )}
 
-            {section === "usage" && <UsageSection />}
+            {section === "usage" && isItemVisible("usage:summary") && <UsageSection />}
 
-            {section === "observability" && <ObservabilitySection />}
+            {section === "observability" && isItemVisible("observability:sentry") && <ObservabilitySection />}
 
-            {section === "secrets" && <SecretsSection />}
+            {section === "secrets" && isItemVisible("secrets:infisical") && <SecretsSection />}
           </div>
         </div>
       </div>
