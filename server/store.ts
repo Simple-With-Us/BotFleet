@@ -539,7 +539,8 @@ export interface BotRecord {
    * (set by "Always allow" on an approval card). */
   alwaysAllow?: string[];
   /** Ceiling on model→tool rounds for HTTP toolLoop engines (MiniMax / Grok
-   * HTTP / openai-compat). Unset = DEFAULT_TURN_LOOP_BUDGET.maxRounds (12).
+   * HTTP / openai-compat). Unset = DEFAULT_MAX_TOOL_ROUNDS (shared/bot-profile.ts),
+   * which DEFAULT_TURN_LOOP_BUDGET.maxRounds is derived from.
    * Integer 1..200; invalid values are treated as absent at dispatch. */
   maxToolRounds?: number;
   /** Speak this bot's replies aloud as they settle, without being asked.

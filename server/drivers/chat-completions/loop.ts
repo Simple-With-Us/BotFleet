@@ -55,6 +55,7 @@ import type {
   TurnToolOutcome,
 } from "../../contracts.ts";
 import { ProviderError } from "../../contracts.ts";
+import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { parseToolArguments, toolFields } from "../../tool-fields.ts";
 import { RETRY_MAX_ATTEMPTS, classifyError, computeBackoff, interruptibleDelay } from "../retry.ts";
 import { UNHINTED_RATE_LIMIT_ATTEMPTS, httpFailureOf, httpRetryPolicy, isPrematureCloseError } from "./errors.ts";
@@ -136,8 +137,20 @@ export interface TurnLoopBudget {
   maxRequestAttempts: number;
 }
 
+/** The unset-bot round budget.  `maxRounds` is NOT a second opinion: it is
+ *  the same `DEFAULT_MAX_TOOL_ROUNDS` the turn's system prompt names and the
+ *  same number `toolRoundsCaption()` shows the owner.
+ *
+ *  These were three separate literals — 12 here, 40 in shared/bot-profile.ts,
+ *  and "Empty uses 12" in the desktop and iOS copy — and they disagreed.  An
+ *  unset bot was told "This turn has a budget of 40 model→tool rounds" and
+ *  then hard-stopped at 12, which is exactly the mid-work truncation
+ *  `toolBudgetPrompt` exists to prevent: the model planned against 40 because
+ *  we told it to, spent accordingly, and got cut off with nobody watching.
+ *  Deriving the hard stop from the shared constant makes that split
+ *  unrepresentable rather than merely fixed today. */
 export const DEFAULT_TURN_LOOP_BUDGET: TurnLoopBudget = {
-  maxRounds: 12,
+  maxRounds: DEFAULT_MAX_TOOL_ROUNDS,
   requestTimeoutMs: 600_000,
   requestIdleMs: 120_000,
   toolTimeoutMs: 90_000,

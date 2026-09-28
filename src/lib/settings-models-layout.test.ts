@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { DEFAULT_MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS } from "../../shared/bot-profile";
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
 function source(rel: string): string {
@@ -49,27 +51,58 @@ describe("desktop Settings Models layout", () => {
 });
 
 describe("Maximum Tool Rounds", () => {
-  it("shows a capped desktop control only for a toolLoop engine", () => {
-    const panel = source("src/components/SettingsPanel.tsx");
-    expect(panel).toContain("Maximum Tool Rounds");
-    expect(panel).toContain("Per turn.  Empty uses 12.  Cap is 200.");
-    expect(panel).toContain("engine?.capabilities?.toolLoop === true");
-    expect(panel).toContain("MAX_TOOL_ROUNDS");
-    expect(panel).toContain('from "../../shared/bot-profile"');
-    expect(panel).toContain("onChange(null)");
-    expect(panel).toContain('| "maxToolRounds"');
+  // These used to assert that the desktop panel and the iOS profile view both
+  // CONTAINED the literal string "Per turn.  Empty uses 12.  Cap is 200."  A
+  // string-presence test passes as happily on a wrong number as a right one,
+  // so all three surfaces agreed with each other while disagreeing with the
+  // harness: the copy said 12, the prompt said 40, and the loop stopped at 12.
+  // What is pinned now is AGREEMENT — every surface derives its numbers from
+  // the shared constants, and a hardcoded default fails the build.
+  const panel = source("src/components/SettingsPanel.tsx");
+  const profile = source("ios/App/AgentProfileView.swift");
+
+  it("renders the shared caption rather than a typed-out sentence", () => {
+    const field = source("src/components/MaxToolRoundsField.tsx");
+    // The component renders the caption it is handed, so the NUMBER is derived
+    // in exactly one place (toolRoundsGate) and the field cannot drift from it.
+    expect(field).toContain("{gate.caption}");
+    expect(field).toContain("DEFAULT_MAX_TOOL_ROUNDS");
+    expect(field).not.toContain("Empty uses");
+    expect(source("src/lib/bot-settings-gates.ts")).toContain("toolRoundsCaption()");
   });
 
-  it("shows the same capped control on iOS only when the engine reports toolLoop", () => {
-    const profile = source("ios/App/AgentProfileView.swift");
-    const models = source("ios/Sources/CompanionCore/Models.swift");
-    expect(profile).toContain("Maximum Tool Rounds");
-    expect(profile).toContain("Per turn.  Empty uses 12.  Cap is 200.");
-    expect(profile).toContain("capabilities?.toolLoop == true");
-    expect(profile).toContain("maximumToolRoundsCap = 200");
-    expect(profile).toContain("return .clear");
-    expect(models).toContain("var toolLoop: Bool?");
-    expect(models).toContain("var maxToolRounds: Int?");
+  it("no surface hardcodes a default round count any more", () => {
+    for (const [name, text] of [
+      ["SettingsPanel.tsx", panel],
+      ["MaxToolRoundsField.tsx", source("src/components/MaxToolRoundsField.tsx")],
+      ["AgentProfileView.swift", profile],
+    ] as const) {
+      expect(text, `${name} hardcodes a round default`).not.toMatch(/Empty uses \d/);
+    }
+  });
+
+  it("iOS mirrors the shared default and cap as named constants", () => {
+    expect(profile).toContain(`private static let defaultToolRounds = ${DEFAULT_MAX_TOOL_ROUNDS}`);
+    expect(profile).toContain(`private static let maximumToolRoundsCap = ${MAX_TOOL_ROUNDS}`);
+  });
+
+  it("iOS keeps a saved ceiling visible on an engine that ignores it", () => {
+    expect(profile).toContain("toolRoundsEditable || !maxToolRoundsText.isEmpty");
+    expect(profile).toContain("runs its own tool loop");
+  });
+
+  it("the desktop control asks the shared gate, not a bare capability check", () => {
+    expect(panel).toContain("toolRoundsGate(state.instances, bot)");
+    expect(panel).toContain("roundsGate.visible");
+    // The old gate, which read an unanswered lookup as a "no".
+    expect(panel).not.toContain("engine?.capabilities?.toolLoop === true &&");
+  });
+
+  it("the panel reads every engine capability through one call", () => {
+    expect(panel).toContain("botCapabilityGates(state.instances, bot)");
+    expect(panel).not.toContain("engine?.capabilities?.agentsMcp === true");
+    expect(panel).not.toContain("engine?.capabilities?.composioMcp === true");
+    expect(panel).not.toContain("engine?.capabilities?.approvalReview === true");
   });
 });
 

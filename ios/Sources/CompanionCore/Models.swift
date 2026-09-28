@@ -312,7 +312,8 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var unread: Bool
     public var modelSelection: ModelSelection
     public var activeModelSelection: ModelSelection?
-    /// HTTP tool-loop ceiling. Nil uses 12. Only a toolLoop engine honors it.
+    /// HTTP tool-loop ceiling. Nil uses `DEFAULT_MAX_TOOL_ROUNDS` (shared/bot-profile.ts).
+    /// Only a toolLoop engine honors it.
     public var maxToolRounds: Int? = nil
     public var createdAt: Double
     public var busy: Bool?
@@ -850,7 +851,7 @@ public struct BotProfilePatch: Encodable, Sendable {
     public var modelSelection: ModelSelection?
     public var section: SectionString?
     /// `nil` leaves the stored ceiling alone. `.clear` sends JSON null so the
-    /// harness drops it and the turn uses 12.
+    /// harness drops it and the turn uses the shared default.
     public var maxToolRounds: MaxToolRounds?
 
     public enum MaxToolRounds: Equatable, Sendable {

@@ -268,16 +268,17 @@ struct AgentProfileView: View {
                         }
                     }
 
-                    if instances.first(where: { $0.id == instanceId })?.capabilities?.toolLoop == true {
+                    if toolRoundsVisible {
                         Section {
-                            TextField("12", text: maxToolRoundsBinding)
+                            TextField(String(Self.defaultToolRounds), text: maxToolRoundsBinding)
                                 .keyboardType(.numberPad)
                                 .multilineTextAlignment(.trailing)
+                                .disabled(!toolRoundsEditable)
                                 .accessibilityLabel("Maximum Tool Rounds")
                         } header: {
                             Text("Maximum Tool Rounds")
                         } footer: {
-                            Text("Per turn.  Empty uses 12.  Cap is 200.")
+                            Text(toolRoundsCaption)
                         }
                     }
                 }
@@ -509,6 +510,32 @@ struct AgentProfileView: View {
 
     /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
     private static let maximumToolRoundsCap = 200
+
+    /// Shared with `shared/bot-profile.ts` `DEFAULT_MAX_TOOL_ROUNDS`.  This is
+    /// the number the harness actually stops an unset turn at, and the number
+    /// the turn's own prompt names — the two used to disagree (12 versus 40),
+    /// so a bot was told it had 40 rounds and was cut off at 12.
+    private static let defaultToolRounds = 40
+
+    /// True when this engine runs the harness HTTP tool loop, and so applies
+    /// `maxToolRounds`.  An engine the companion has not heard of is NOT
+    /// treated as "cannot": we do not know yet.
+    private var toolRoundsEditable: Bool {
+        instances.first(where: { $0.id == instanceId })?.capabilities?.toolLoop == true
+    }
+
+    /// A saved ceiling stays visible even on an engine that ignores it, so it
+    /// can be read and cleared instead of being stranded on the record.  See
+    /// `src/lib/bot-settings-gates.ts` for the same rule on the desktop.
+    private var toolRoundsVisible: Bool {
+        toolRoundsEditable || !maxToolRoundsText.isEmpty
+    }
+
+    private var toolRoundsCaption: String {
+        let base = "Per turn.  Empty uses \(Self.defaultToolRounds).  Cap is \(Self.maximumToolRoundsCap)."
+        guard !toolRoundsEditable else { return base }
+        return base + "  This engine runs its own tool loop, so this ceiling does not apply to it."
+    }
 
     private static func roundsText(_ rounds: Int?) -> String {
         guard let rounds else { return "" }
