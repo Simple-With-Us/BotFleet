@@ -158,11 +158,11 @@ export function RemoteAccessSection({ configuredUrl }: { configuredUrl?: string 
   };
 
   if (!remoteUrl) {
-    return <Card title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_UNCONFIGURED_BLURB)} />;
+    return <Card id="setting-remote-access" title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_UNCONFIGURED_BLURB)} />;
   }
 
   return (
-    <Card title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_BLURB)}>
+    <Card id="setting-remote-access" title={REMOTE_ACCESS_HEADING} subtitle={sentenceGapHtml(REMOTE_ACCESS_BLURB)}>
       <div className="flex flex-col gap-3">
         <CopyableValue label={REMOTE_URL_LABEL} value={remoteUrl} />
         <div className="flex flex-wrap items-center gap-3">

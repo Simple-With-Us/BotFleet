@@ -1298,7 +1298,7 @@ export function SettingsModal() {
           <div id="app-settings-title" className="px-2 pb-2 pt-1 text-[15px] font-semibold text-ink">
             Settings
           </div>
-          <div className="mb-1.5 flex items-center gap-1.5 rounded-lg bg-control/70 px-2 py-1.5">
+          <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-control/70 px-2.5 py-1.5">
             <Search size={14} className="shrink-0 text-ink-secondary" />
             <input
               value={query}
@@ -1392,18 +1392,18 @@ export function SettingsModal() {
                 aria-current={section === id ? "page" : undefined}
                 className={cn(
                   "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                  section === id ? "bg-control text-ink font-medium" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                  section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
                 )}
               >
                 <Icon size={15} />
-                <span className="truncate">{label}</span>
+                {label}
               </button>
             ))
           )}
         </nav>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center justify-between px-5 py-3 border-b border-hairline/20">
+          <div className="flex items-center justify-between px-5 py-3">
             <span className="text-[15px] font-semibold text-ink">
               {trimmedQuery ? "Settings Search" : SECTIONS.find((s) => s.id === section)?.label}
             </span>
@@ -1431,7 +1431,7 @@ export function SettingsModal() {
               sectionIcons={SECTION_ICONS}
             />
           ) : (
-            <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5 pt-3">
+            <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
               {section === "general" && (
                 <>
                   <Card
@@ -1547,11 +1547,7 @@ export function SettingsModal() {
                 </Card>
               )}
 
-              {section === "remote" && (
-                <div id="setting-remote-access" className={highlightClass("setting-remote-access")}>
-                  <RemoteAccessSection configuredUrl={remoteAccessUrl} />
-                </div>
-              )}
+              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
 
               {section === "engines" && (
                 <Card

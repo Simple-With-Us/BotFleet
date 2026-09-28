@@ -22,7 +22,7 @@ export function Card({
   className?: string;
 }) {
   return (
-    <div id={id} className={cn("rounded-xl bg-card p-4 transition-all duration-300", className)}>
+    <div id={id} className={className ? cn("rounded-xl bg-card p-4", className) : "rounded-xl bg-card p-4"}>
       {(title || actions) && (
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
