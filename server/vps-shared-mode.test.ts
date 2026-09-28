@@ -56,9 +56,9 @@ describe("VPS targeting", () => {
     expect(target.containerName).toBe(vpsContainerName("bot-1"));
   });
 
-  it("vpsTargetFor returns a shared target when vpsMode is null (default)", () => {
+  it("vpsTargetFor returns a per-bot target when vpsMode is null (default)", () => {
     const target = vpsTargetFor(cfgWithVpsMode(null), "bot-1");
-    expect(target).toBe(SHARED_VPS_TARGET);
+    expect(target.key).toMatch(/^bot:/);
   });
 
   it("two different bots in per-bot mode get distinct targets", () => {

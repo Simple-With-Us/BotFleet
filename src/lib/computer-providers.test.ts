@@ -123,7 +123,7 @@ describe("computerProviders migrateAllowedComputersToProviders", () => {
   it("respects an explicit vpsMode argument when given a legacy value that does not imply one", () => {
     const result = migrateAllowedComputersToProviders(["local"], "per-bot");
     expect(result.providers.localMac).toBe(true);
-    expect(result.vpsMode).toBe("shared");
+    expect(result.vpsMode).toBe("per-bot");
   });
 
   it("throws when selfHostedVps is on but vpsMode is null (schema cross-field invariant)", () => {
