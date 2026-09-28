@@ -86,6 +86,7 @@ describe("DshAgentDriver config", () => {
     // DeepSeek-V4.1-Pro lacks vision and warns of auto-switch to Flash on visual input.
     expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBe("No Vision");
     expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("lacks vision");
+    expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("Attaching an image");
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
