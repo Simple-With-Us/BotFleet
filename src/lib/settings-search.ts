@@ -282,6 +282,21 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
   },
 ];
 
+/** SettingsModal renders some section bodies (Usage, Observability) as one
+ *  monolithic component instead of per-item blocks.  Gating that body on a
+ *  single item id blanks the page whenever a query matches only a sibling
+ *  item — e.g. "pricing mode" matches `usage:pricing` but not
+ *  `usage:summary`, so the Usage section showed nothing.  A monolithic body
+ *  must render when ANY of its section's items is visible. */
+export function sectionBodyHasVisibleItem(
+  sectionId: AppSettingsSection,
+  matchingItemIds: ReadonlySet<string>,
+): boolean {
+  return SETTINGS_SEARCH_ITEMS.some(
+    (item) => item.sectionId === sectionId && matchingItemIds.has(item.id),
+  );
+}
+
 export interface SettingsSearchResult {
   matchingSectionIds: Set<AppSettingsSection>;
   matchingItemIds: Set<string>;

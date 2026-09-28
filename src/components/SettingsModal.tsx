@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
-import { searchSettings } from "@/lib/settings-search";
+import { searchSettings, sectionBodyHasVisibleItem } from "@/lib/settings-search";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   ROOM_LABEL_MAX_LENGTH,
@@ -1328,9 +1328,9 @@ export function SettingsModal() {
               </>
             )}
 
-            {section === "usage" && isItemVisible("usage:summary") && <UsageSection />}
+            {section === "usage" && (!trimmedQuery || sectionBodyHasVisibleItem("usage", searchResult.matchingItemIds)) && <UsageSection />}
 
-            {section === "observability" && isItemVisible("observability:sentry") && <ObservabilitySection />}
+            {section === "observability" && (!trimmedQuery || sectionBodyHasVisibleItem("observability", searchResult.matchingItemIds)) && <ObservabilitySection />}
 
             {section === "secrets" && isItemVisible("secrets:infisical") && <SecretsSection />}
           </div>

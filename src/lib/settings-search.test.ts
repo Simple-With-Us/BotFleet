@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { searchSettings, SETTINGS_SEARCH_ITEMS } from "./settings-search";
+import { searchSettings, sectionBodyHasVisibleItem, SETTINGS_SEARCH_ITEMS } from "./settings-search";
 
 describe("Settings Search Engine", () => {
   it("returns all items when query is empty", () => {
@@ -7,6 +7,27 @@ describe("Settings Search Engine", () => {
     expect(result.matchingSectionIds.size).toBe(10);
     expect(result.matchingItemIds.size).toBe(SETTINGS_SEARCH_ITEMS.length);
     expect(result.totalMatches).toBe(SETTINGS_SEARCH_ITEMS.length);
+  });
+
+  it("keeps the Usage body visible when a query matches only a sub-item", () => {
+    // Regression: SettingsModal gated the whole Usage body on usage:summary,
+    // so a query matching only usage:pricing rendered a blank section.
+    const result = searchSettings("pricing mode");
+    expect(result.matchingItemIds.has("usage:pricing")).toBe(true);
+    expect(result.matchingItemIds.has("usage:summary")).toBe(false);
+    expect(sectionBodyHasVisibleItem("usage", result.matchingItemIds)).toBe(true);
+  });
+
+  it("keeps the Observability body visible when a query matches only trace sampling", () => {
+    const result = searchSettings("sample rate");
+    expect(result.matchingItemIds.has("observability:traces")).toBe(true);
+    expect(result.matchingItemIds.has("observability:sentry")).toBe(false);
+    expect(sectionBodyHasVisibleItem("observability", result.matchingItemIds)).toBe(true);
+  });
+
+  it("reports no visible body items for a query outside the section", () => {
+    const result = searchSettings("pricing mode");
+    expect(sectionBodyHasVisibleItem("observability", result.matchingItemIds)).toBe(false);
   });
 
   it("finds subheadings by title (e.g. Channel Turns)", () => {
