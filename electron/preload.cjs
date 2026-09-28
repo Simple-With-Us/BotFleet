@@ -51,7 +51,7 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Arms exactly one display-media request from the current renderer frame. */
   beginScreenPreviewIntent: () => ipcRenderer.sendSync("screen:preview-intent"),
   /** One frame of this computer's screen as a data: URL when supported. */
-  screenFrame: () => ipcRenderer.invoke("screen:frame"),
+  screenFrame: (options) => ipcRenderer.invoke("screen:frame", options),
   /** Physical USB Android devices. Network ADB is deliberately excluded. */
   androidDevice: {
     status: () => ipcRenderer.invoke("android-device:status"),

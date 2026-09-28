@@ -123,6 +123,14 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+    expect(
+      autoSelectsLocalComputer({
+        platform: "darwin",
+        computers: ["vm"],
+        capabilitiesReady: true,
+        localSelectable: true,
+      }),
+    ).toBe(false);
   });
 });
 

@@ -1563,13 +1563,19 @@ function createWindow() {
 
 // Local-control screen preview — served from the main process so the Screen
 // Recording permission prompt attributes to the app, never the server
-ipcMain.handle("screen:frame", async () => {
+ipcMain.handle("screen:frame", async (_event, options) => {
   if (process.platform !== "darwin") return null;
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
     thumbnailSize: { width: 1280, height: 800 },
   });
-  return sources[0]?.thumbnail.toDataURL() ?? null;
+  const target =
+    typeof options?.displayIndex === "number" && sources[options.displayIndex]
+      ? sources[options.displayIndex]
+      : sources.length > 1
+        ? sources[1]
+        : sources[0];
+  return target?.thumbnail.toDataURL() ?? null;
 });
 
 // Onboarding permission checks. Status reads are free; the mic request

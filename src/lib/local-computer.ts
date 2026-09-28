@@ -91,7 +91,13 @@ export function autoSelectsLocalComputer({
   capabilitiesReady: boolean;
   localSelectable: boolean;
 }): boolean {
-  return platform !== "linux" && !(computers ?? []).includes("cloud") && capabilitiesReady && localSelectable;
+  return (
+    platform !== "linux" &&
+    !(computers ?? []).includes("cloud") &&
+    !(computers ?? []).includes("vm") &&
+    capabilitiesReady &&
+    localSelectable
+  );
 }
 
 /** Can this bot's engine drive a Local VM?
