@@ -21,6 +21,7 @@ import { DshAgentDriver } from "./dsh.ts";
 import { KimiAgentDriver } from "./kimi.ts";
 import { DroidAgentDriver } from "./droid.ts";
 import { CursorAgentDriver } from "./cursor.ts";
+import { McodeAgentDriver } from "./mcode.ts";
 import { removeTempDir } from "../../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
@@ -282,6 +283,8 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
+    delete process.env.FAKE_ACP_CACHE_READ;
+    delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
     delete process.env.FAKE_ACP_STATE;
@@ -542,6 +545,60 @@ describe("ACP turns (fake CLI)", () => {
 
     const usage = recorder.events.find((e) => e.type === "thread.token-usage.updated");
     expect(usage).toMatchObject({ input: 10, output: 5 });
+  });
+
+  it("carries a cost the agent reported instead of hardcoding null", async () => {
+    // Every ACP settle path used to emit `cost: null` unconditionally, and
+    // rolling-spend drops a non-positive cost — so dsh, claude, codex and
+    // antigravity contributed nothing at all to the fleet's spend figure while
+    // the HTTP engines did.  A number the AGENT reported is provider truth and
+    // must survive to turn.completed.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_COST = "0.42";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: 0.42 });
+    // Provider-reported, so it is an actual charge rather than an estimate.
+    expect(done).not.toMatchObject({ billingMode: "estimated" });
+  });
+
+  it("still reports a null cost when the agent reports none", async () => {
+    // A blank is honest. Inventing a price from a table here would be a worse
+    // lie, because these are subscription logins: an API-equivalent figure is
+    // an estimate, and `billingMode` exists to mark one as such.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-no-cost", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ type: "turn.completed", ok: true, cost: null });
+  });
+
+  it("folds cache reads into input rather than reporting them beside it", async () => {
+    // cachedInput is a SUBSET of input by contract, so a provider that reports
+    // the two separately must have its cache figure counted inside input —
+    // otherwise the same tokens are billed as both fresh and cached.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "4";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 14, output: 5, cachedInput: 4 } });
+    const live = recorder.events.find((e) => e.type === "thread.token-usage.updated");
+    expect(live).toMatchObject({ input: 14, output: 5, cachedInput: 4 });
+  });
+
+  it("drops a cache figure larger than the input it must sit inside", async () => {
+    // The two numbers contradict each other, so neither supports a split.
+    // Clamping the cache down and adding it in would invent a total; the
+    // honest reading is the input on its own with no cache claim at all.
+    process.env.FAKE_ACP_USAGE_ROOT = "1";
+    process.env.FAKE_ACP_CACHE_READ = "99";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-cache-over", text: "go" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ usage: { input: 10, output: 5 } });
+    expect((done as { usage?: { cachedInput?: number } }).usage?.cachedInput).toBeUndefined();
   });
 
   it("passes ACP stdio flags and strips foreign provider keys from the child env", async () => {
@@ -937,13 +994,14 @@ describe("ACP turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
   });
 
-  it("interrupt settles a hung turn as cancelled", async () => {
+  it("interrupt settles a hung turn interrupted, not as a success and not a crash", async () => {
     await create(GrokAgentDriver, "hang");
     await instance.adapter.sendTurn({ threadId: "t-int", text: "go" });
     await recorder.until((e) => e.type === "session.started");
     await instance.adapter.interruptTurn("t-int");
     const done = await recorder.until((e) => e.type === "turn.completed");
-    expect(done).toMatchObject({ type: "turn.completed" });
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it("an exit before result becomes runtime.error + failed turn", async () => {
@@ -1111,6 +1169,51 @@ describe("ACP turns (fake CLI)", () => {
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true });
     expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+  });
+
+  // mcode rides the same hook, but its wire values embed the user's login
+  // provider (m:<providerId>:<modelId>[:v:<variant>]): the driver matches the
+  // picker id against the advertised options and sends the advertised value
+  // back verbatim rather than constructing one.
+  it("mcode switches to a picker model via the advertised option value", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u,m:minimax:MiniMax-M2.7:v:highspeed";
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-model", text: "go", model: "MiniMax-M2.7-highspeed" });
+
+    const started = await recorder.until((e) => e.type === "session.started");
+    expect(started).toMatchObject({ model: "MiniMax-M2.7-highspeed" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).toContain("session/set_config_option");
+  });
+
+  // An older mcode advertises no model option: the switch must be skipped,
+  // not attempted - the session keeps its login default, exactly the behavior
+  // the picker had before this hook existed.
+  it("mcode keeps the session default when no model option is advertised", async () => {
+    const rpcDump = join(scratch, "rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-default", text: "go", model: "MiniMax-M3" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(true);
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).not.toContain("session/set_config_option");
+  });
+
+  it("mcode fails the turn clearly when the model is not advertised", async () => {
+    process.env.FAKE_ACP_MODELS = "m:minimax:MiniMax-M3:u";
+    await create(McodeAgentDriver);
+    await instance.adapter.sendTurn({ threadId: "t-mcode-bad", text: "go", model: "MiniMax-M9" });
+
+    const done = await recorder.until((e) => e.type === "turn.completed");
+    expect(done).toMatchObject({ ok: false });
+    const err = recorder.events.find((e) => e.type === "runtime.error")!;
+    expect(err.message).toMatch(/does not offer MiniMax-M9/);
+    expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
   });
 
   it("selects the model on a resumed session too, not just a new one", async () => {
@@ -1386,7 +1489,7 @@ describe("ACP snapshot", () => {
       expect(instance.adapter.hasSession("version-race")).toBe(false);
       expect(existsSync(rpcDump)).toBe(false);
       expect(recorder.events).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: "turn.completed", ok: true, stopReason: "cancelled" }),
+        expect.objectContaining({ type: "turn.completed", ok: false, stopReason: "interrupted" }),
       ]));
     } finally {
       recorder.stop();

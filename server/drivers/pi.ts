@@ -691,7 +691,9 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         } catch {
           /* ignore */
         }
-        settle(true, "cancelled");
+        // A person stopped this turn: interrupted, not a success (audit
+        // E6, #647 convention).
+        settle(false, "interrupted");
       };
       active.set(threadId, { stop, turnId, pending, child });
 

@@ -159,6 +159,21 @@ export interface RecallStatus {
   backendOk?: boolean;
   embedderHealthy?: boolean;
   accessGated?: boolean;
+  /** Whether this is the corpus the OWNER chose, or the local CLI answering
+   *  from its own defaults.
+   *
+   *  `configured` above only says a transport resolved, and with no Service
+   *  URL set the local `recall` CLI satisfies that: the probe goes green, the
+   *  panel says configured, and the recall tools reach a corpus the owner
+   *  never pointed the app at.  That is the state this repo was found in —
+   *  `url` and `collection` both empty, `configured: true`, tools live, and
+   *  nothing anywhere saying the corpus was not the intended one.
+   *
+   *  `configuredTarget` is false whenever a Service URL or collection is
+   *  missing and the CLI is therefore supplying them, so the panel can say
+   *  which corpus it is actually talking to instead of showing one confident
+   *  green for two very different setups. */
+  configuredTarget?: boolean;
   /** Whether the Cloudflare Access service token is whole.  Reported even on
    * a healthy probe, because half a pair sends no Access headers at all and
    * the panel needs to say so before the operator meets a login page. */
@@ -180,6 +195,15 @@ export function recallStatus(settings: RecallSettings, timeoutMs = RECALL_STATUS
   const run = async (): Promise<RecallStatus> => {
     const base = { source, configured: source !== "unconfigured", url: settings.url || null,
       collection: settings.collection || null, checkedAt: Date.now(), lastSuccessAt: lastSuccesses.get(key) ?? null,
+      // A resolved transport is not the same as the intended corpus.  With no
+      // URL the CLI supplies its own endpoint, and with no collection it
+      // supplies its own name — so say so rather than reporting one green for
+      // "working as configured" and "working by accident".
+      configuredTarget: source === "recall-service"
+        ? Boolean(settings.url && settings.collection)
+        : source === "recall-cli"
+          ? Boolean(settings.url || settings.collection)
+          : false,
       accessTokenState: accessTokenState(settings.accessClientId, settings.accessClientSecret) };
     if (source === "unconfigured") return { ...base, ready: false, state: "unconfigured",
       error: "Bot RAG is not configured — set a Service URL in Settings" };

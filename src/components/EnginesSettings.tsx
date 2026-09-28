@@ -444,7 +444,7 @@ function EngineRow({
           permission guards do not apply.
         </div>
       )}
-      {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent"].includes(instance.driverKind) && (
+      {["minimax", "claude", "grok", "codex", "antigravity", "cursorAgent", "deepseekAgent", "dshAgent", "antigravityAgent", "grokAgent", "claudeAgent", "mcodeAgent"].includes(instance.driverKind) && (
         <EngineCallout driverKind={instance.driverKind} instanceId={instance.instanceId} />
       )}
       {instance.driverKind === "boxAgent" && (
