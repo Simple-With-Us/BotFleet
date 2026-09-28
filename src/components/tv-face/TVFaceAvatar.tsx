@@ -12,7 +12,19 @@ export interface TVFaceAvatarProps {
   animated?: boolean;
 }
 
-const AVAILABLE_SKINS = new Set(["orange", "blue", "green", "purple", "pink", "red", "yellow"]);
+/** Skins whose art actually ships under public/tv-face/skins. Blue, green,
+ * purple, pink, red, and yellow are PLANNED skins with no assets yet:
+ * mapping them to their own directories 404s every GIF and still. Until
+ * the art lands, every color renders the default skin — and the profile
+ * picker's preview shows exactly what the bot will get. */
+const SHIPPED_SKINS = new Set(["orange"]);
+
+/** The skins directory a color renders from. `orange` IS the default skin
+ * (public/tv-face/skins/default); every unshipped color falls back to it
+ * rather than 404ing. */
+export function tvFaceSkinDir(color: TVFaceSkin): string {
+  return SHIPPED_SKINS.has(color) && color !== "orange" ? color : "default";
+}
 
 export interface TVFaceFrame {
   expression: TVFaceExpression;
@@ -36,9 +48,7 @@ export function TVFaceAvatar({
   animated = true,
 }: TVFaceAvatarProps) {
   const expression = TVFACE_MANIFEST[state] || "resting";
-  // fallback to orange if the color isn't one of the known skins
-  const mappedColor = AVAILABLE_SKINS.has(color) ? color : "orange";
-  const skinDir = mappedColor === "orange" ? "default" : mappedColor;
+  const skinDir = tvFaceSkinDir(color);
   
   const [currentGif, setCurrentGif] = useState<string>("");
   const previousFrame = useRef<TVFaceFrame>({ expression: "resting", skin: skinDir });

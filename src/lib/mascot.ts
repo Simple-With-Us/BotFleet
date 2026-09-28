@@ -57,7 +57,7 @@ export const STATE_GROUPS: Record<string, BotState[]> = {
     "bouncing",
     "powering-down",
   ],
-  "Actions (Grok)": [
+  "Actions": [
     "fleet",
     "crash",
     "memory",
