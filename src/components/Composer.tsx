@@ -343,9 +343,23 @@ export function Composer({
   const hasContent = Boolean(text.trim()) || attachments.length > 0;
   const send = (opts?: { steerNow?: boolean }) => {
     if (locked) return;
-    if (attachments.some((attachment) => attachment.kind === "image") && !imageTargetsSupport(text)) {
-      dispatch({ type: "error", message: "The selected responder does not support image attachments." });
-      return;
+    if (attachments.some((attachment) => attachment.kind === "image")) {
+      if (!imageTargetsSupport(text)) {
+        dispatch({ type: "error", message: "The selected responder does not support image attachments." });
+        return;
+      }
+      if (bot && bot.modelSelection.instanceId === "dsh" && bot.modelSelection.model === "DeepSeek-V4.1-Pro") {
+        dispatch({
+          type: "updateBot",
+          botId: bot.id,
+          patch: {
+            modelSelection: {
+              ...bot.modelSelection,
+              model: "DeepSeek-V4.1-Flash",
+            },
+          },
+        });
+      }
     }
     const t = composeMessage(text, attachments);
     if (!t) return;

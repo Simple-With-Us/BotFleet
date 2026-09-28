@@ -78,18 +78,20 @@ describe("DshAgentDriver config", () => {
     ]);
   });
 
-  it("badges the two rows where the choice has a cost or availability consequence", () => {
+  it("badges rows where the choice has a capability, cost, or availability consequence", () => {
     const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
     // Image + Video: same token rate as text, so the capability is the point,
     // not a price.
     expect(byId.get("DeepSeek-V4.1-Flash")?.badge).toBe("Multimodal");
+    // DeepSeek-V4.1-Pro lacks vision and warns of auto-switch to Flash on visual input.
+    expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBe("No Vision");
+    expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("lacks vision");
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
     expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x the $");
     // M3 is the base rate, so it carries no cost chip.
     expect(byId.get("MiniMax-M3")?.badge).toBeUndefined();
-    expect(byId.get("DeepSeek-V4.1-Pro")?.badge).toBeUndefined();
   });
 
   it("gives every chip a hover explanation, since a bare chip is not a price", () => {

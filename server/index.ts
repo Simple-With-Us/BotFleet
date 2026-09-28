@@ -3827,7 +3827,7 @@ async function startTurn(
   // Box-backed cloud borrows the boxAgent default model (and no per-bot effort).
   // VPS-backed cloud keeps the bot's modelSelection — that is the engine that
   // actually runs on the VPS.
-  const model = boxCloud ? instance.models.default : selection.model;
+  let model = boxCloud ? instance.models.default : selection.model;
   let effort = boxCloud ? undefined : selection.effort;
   // A selection can be persisted while its engine is offline. Re-check when
   // the engine returns so an old or unsupported value never reaches a CLI.
@@ -3875,7 +3875,20 @@ async function startTurn(
     }
   }
 
-  // an edit hands us its already-branched user message; a plain send appends.
+  // DeepSeek-V4.1-Pro lacks vision; visual data sharing automatically routes
+  // to DeepSeek-V4.1-Flash and updates the stored selection so the switch persists.
+  if (instanceId === "dsh" && model === "DeepSeek-V4.1-Pro" && text.includes("<attached-image ")) {
+    model = "DeepSeek-V4.1-Flash";
+    const updateModel = (chain: ModelSelection): ModelSelection => ({
+      ...chain,
+      model: chain.model === "DeepSeek-V4.1-Pro" ? "DeepSeek-V4.1-Flash" : chain.model,
+    });
+    if (task.modelSelection) {
+      store.patchTask(bot.id, threadId, { modelSelection: updateModel(task.modelSelection) });
+    } else {
+      store.patchBot(bot.id, { modelSelection: updateModel(bot.modelSelection) });
+    }
+  }
   // Auto-delivered instructions are stored as role=system so iOS/desktop
   // never paint a blue user bubble.  The model still receives them as the
   // turn prompt via transcriptPromptRole.
