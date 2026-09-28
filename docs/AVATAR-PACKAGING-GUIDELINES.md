@@ -61,6 +61,10 @@ AvatarName/
 │   ├── resting.png
 │   ├── thinking.png
 │   └── ... (All transparent PNGs)
+├── speech/
+│   ├── amp_0.png (Mouth closed / quiet)
+│   ├── amp_1.png (Mouth slightly open / medium volume)
+│   └── amp_2.png (Mouth wide open / loud volume)
 └── gifs/
     ├── idle_loop.gif (Optional ambient idle)
     ├── thinking_enter.gif
@@ -122,3 +126,17 @@ If handing this to an AI to generate *more* TV-Face assets:
 - **Style Prompt**: "Flat cartoon orange TV-head robot, transparent background, cyan neon face icons, head completely still."
 - **Consistency**: Keep the head box exactly in the same pixel position. Only the inner cyan neon face icons should morph/animate.
 - **Skins**: Output everything in grayscale/white for the TV casing if you want to apply CSS-based recoloring later, or provide the exact Hue-shift batch scripts to generate the Blue/Green/Purple skins.
+
+## 6. Dynamic Lip-Sync (Audio Amplitude Extension)
+
+BotFleet uses a lightweight, client-side volume mapping (Amplitude) approach for lip-syncing TTS engines (like MiniMax T2A) that do not output native visemes. 
+
+The React engine reads the real-time audio volume (0-255 frequency data) via the Web Audio API and maps it to specific animation frames or PNGs dynamically. 
+
+To support real-time speaking, an avatar designer must provide a **3-frame amplitude sequence** in a `speech/` folder:
+
+1. **`amp_0.png` (Volume 0-10%):** The avatar's mouth is completely closed (silent / pauses).
+2. **`amp_1.png` (Volume 11-50%):** The avatar's mouth is slightly open (quiet speaking / consonants).
+3. **`amp_2.png` (Volume 51-100%):** The avatar's mouth is wide open (loud speaking / strong vowels).
+
+*Alternative for complex animated bodies:* If static PNGs look unnatural on a heavily breathing/moving character, designers can instead provide three looping GIFs (`speaking_amp_0_hold.gif`, `speaking_amp_1_hold.gif`, `speaking_amp_2_hold.gif`). The engine will crossfade or hot-swap between these loops as the volume changes.
