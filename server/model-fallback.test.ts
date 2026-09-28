@@ -1373,3 +1373,93 @@ describe("a setup-dead engine is not a fallback candidate", () => {
     expect(none.cooldown?.error).toBe("session limit");
   });
 });
+
+// The tests above inject `isDoomed` directly, which is a seam — not how the
+// product runs.  Production passes no gate at all and relies on
+// `doomedGate()` falling back to `defaultDoomedGate`, which reads the same
+// process-wide breaker `canStart` consults.  Nothing pinned that path: if
+// `defaultDoomedGate` were ever stubbed to a no-op, every test above would
+// still pass while the feature was dead in the only configuration that ships.
+//
+// This test therefore registers a real pair on the module-level registry and
+// resolves a chain with NO `isDoomed` argument, so the production wiring is
+// what is under test.  It exists because a Sentry review claimed this path was
+// inactive; the claim was wrong, and this is the proof that will keep proving
+// it — including if the claim later turns out to have been right.
+describe("the default doomed gate is live, not a stub", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "grok", model: "grok-4.7" },
+    { instanceId: "dsh", model: "MiniMax-M3" },
+    { instanceId: "claude", model: "claude-sonnet-5" },
+  ];
+
+  /** Drive a real pair to the threshold on the shared registry. */
+  function doomTheRealPair(botId: string, instanceId: string) {
+    for (let i = 0; i < 3; i++) doomedDispatches.recordFailure(botId, instanceId, "spawn ENOENT", T0);
+  }
+
+  it("excludes a setup-dead engine with no isDoomed argument passed", () => {
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 3 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("leaves a healthy chain untouched through the same default path", () => {
+    // Guards the other direction: the default gate must not exclude anything
+    // just because no gate was injected.
+    try {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          quotaOrCap: true,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-default-gate-clean",
+          now: T0,
+        }),
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+
+  it("resolveModel's default path skips a doomed fallback too", () => {
+    const registry = new QuotaCooldownRegistry();
+    const primary: ModelSelection = {
+      instanceId: "antigravity",
+      model: "gemini-3.8-pro-high",
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3" }],
+    };
+    registry.record({
+      botId: "bot-default-gate",
+      instanceId: primary.instanceId,
+      model: primary.model,
+      resetsAt: T0 + 60_000,
+      error: "session limit",
+      recordedAt: T0,
+    });
+    doomTheRealPair("bot-default-gate", "dsh");
+    try {
+      const picked = registry.resolveModel("bot-default-gate", primary, T0);
+      expect(picked.isFallback).toBe(true);
+      expect(picked.selection.instanceId).toBe("grok");
+    } finally {
+      doomedDispatches.clear();
+    }
+  });
+});
