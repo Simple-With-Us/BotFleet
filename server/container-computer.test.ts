@@ -32,9 +32,11 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  wakeContainerComputer,
   containerNetworkArgs,
   containerRuntimeStatus,
   containerRunArgs,
+  hostCliCredentialMounts,
   handleBoxGatewayRequest,
   managedImageDockerfile,
   migrateVmWorkspace,
@@ -673,6 +675,63 @@ describe("Cua integration", () => {
     );
   });
 
+  it("mounts host CLI credentials into the guest when shareCliCredentials is enabled", () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "bf-cli-home-"));
+    mkdirSync(join(fakeHome, ".config", "gh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".config", "infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".infisical"), { recursive: true });
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    mkdirSync(join(fakeHome, ".docker"), { recursive: true });
+    writeFileSync(join(fakeHome, ".gitconfig"), "fake git config");
+    writeFileSync(join(fakeHome, ".config", "gh", "hosts.yml"), "fake gh");
+    writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
+    writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
+    writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), "fake docker");
+
+    const mounts = hostCliCredentialMounts("darwin", fakeHome);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".docker", "config.json")},target=/home/cua/.docker/config.json,readonly`);
+
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
+      shareCliCredentials: true,
+      homeDir: fakeHome,
+    });
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
+    expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+  });
+
+  it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const fake = runner({
+      "/usr/bin/which docker": "docker\n",
+      "/usr/bin/which podman": new Error("missing"),
+      "docker info --format {{.ServerVersion}}": "29\n",
+      [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+      [`docker inspect ${CONTAINER}`]: readyInspect({
+        Mounts: [
+          { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
+          { Type: "bind", Source: "/Users/test/.infisical", Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: "/Users/test/.ssh", Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: "/Users/test/.gitconfig", Destination: "/home/cua/.gitconfig", RW: false },
+        ],
+      }),
+      [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
+      [statusProbe]: "running\n",
+      [healthProbe]: JSON.stringify({ schema_version: "1", overall: "ok", checks: [] }),
+      [readinessProbe]: "{}\n",
+      [readinessRead]: validPng.toString("base64"),
+    });
+
+    const status = await containerComputerStatus(fake.run, "linux");
+    expect(status.persistence).toBe("durable");
+    expect(status.ready).toBe(true);
+  });
+
   it("mounts the official Cua MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
@@ -792,6 +851,110 @@ describe("containerComputerAction", () => {
 
     await expect(containerComputerAction("start", fake.run, "linux")).rejects.toThrow("cannot safely resume");
     expect(fake.calls).not.toContain(`docker start ${CONTAINER}`);
+  });
+});
+
+describe("wakeContainerComputer", () => {
+  // A stateful fake daemon: the container starts STOPPED, `rm` moves it to
+  // missing, `run` moves it to running (unless scripted to fail). Every
+  // status probe answers from the current phase.
+  function wakeFake(opts: { removeResult?: Error; runResult?: Error; initialPhase?: "stopped" | "running" } = {}) {
+    let phase: "stopped" | "missing" | "running" = opts.initialPhase ?? "stopped";
+    const calls: string[] = [];
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      calls.push(key);
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (key === `docker inspect ${CONTAINER}`) {
+        if (phase === "running") return { stdout: readyInspect() };
+        if (phase === "stopped") return { stdout: readyInspect({ State: { Running: false } }) };
+        throw new Error("No such container");
+      }
+      if (key === `docker rm -f ${CONTAINER}`) {
+        if (opts.removeResult) throw opts.removeResult;
+        phase = "missing";
+        return { stdout: `${CONTAINER}\n` };
+      }
+      if (key.startsWith("docker run ")) {
+        if (opts.runResult) throw opts.runResult;
+        phase = "running";
+        return { stdout: "new-container-id\n" };
+      }
+      if (key === versionProbe) return { stdout: `cua-driver ${CUA_DRIVER_VERSION}\n` };
+      if (key === statusProbe) return { stdout: "running\n" };
+      if (key === healthProbe) return { stdout: JSON.stringify({ schema_version: "1", overall: "ok", checks: [] }) };
+      if (key === readinessProbe) return { stdout: "{}\n" };
+      if (key === readinessRead) return { stdout: validPng.toString("base64") };
+      throw new Error(`unexpected command: ${key}`);
+    };
+    return { calls, run };
+  }
+
+  it("recreates a stopped container and returns the fresh running status", async () => {
+    const fake = wakeFake();
+    const stopped = await containerComputerStatus(fake.run, "linux");
+    expect(stopped.container).toBe("stopped");
+
+    const woken = await wakeContainerComputer(stopped, fake.run, "linux");
+
+    expect(woken.container).toBe("running");
+    expect(woken.ready).toBe(true);
+    expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
+  });
+
+  it("never removes a stopped container its runtime cannot recreate", async () => {
+    const probe = wakeFake();
+    const stopped = await containerComputerStatus(probe.run, "linux");
+    expect(stopped.container).toBe("stopped");
+
+    // create_supported:false (e.g. a runtime that cannot create this
+    // target): removal would destroy the VM with no way back.
+    const fake = wakeFake();
+    const result = await wakeContainerComputer({ ...stopped, create_supported: false }, fake.run, "linux");
+
+    expect(result.container).toBe("stopped");
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("leaves a running container alone", async () => {
+    const fake = wakeFake({ initialPhase: "running" });
+    const running = await containerComputerStatus(fake.run, "linux");
+    expect(running.container).toBe("running");
+
+    const callsBefore = fake.calls.length;
+    const result = await wakeContainerComputer(running, fake.run, "linux");
+
+    expect(result.container).toBe("running");
+    expect(fake.calls.slice(callsBefore).some((call) => call.includes(" rm ") || call.startsWith("docker run "))).toBe(false);
+  });
+
+  it("reports the real failure when remove succeeds but run cannot recreate", async () => {
+    // The regression from the #696 review thread: the old code suppressed
+    // this and the readiness check judged the stale pre-wake snapshot,
+    // misreporting a REMOVED container as merely stopped.
+    const fake = wakeFake({ runResult: new Error("daemon exploded") });
+    const stopped = await containerComputerStatus(fake.run, "linux");
+
+    await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
+      /could not be restarted: daemon exploded/,
+    );
+    // The removal really happened (no silent skip), and no stale "stopped"
+    // verdict was reused.
+    expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+  });
+
+  it("reports a remove failure without attempting a run", async () => {
+    const fake = wakeFake({ removeResult: new Error("rm refused") });
+    const stopped = await containerComputerStatus(fake.run, "linux");
+
+    await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
+      /could not be restarted: rm refused/,
+    );
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });
 });
 

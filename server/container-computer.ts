@@ -7,13 +7,14 @@
 // typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { augmentedPath } from "./env-path.ts";
-import { DATA_DIR, type AppConfig } from "./config.ts";
+import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
 import {
   BOX_GATEWAY_PATH,
   boxGatewayGrants,
@@ -767,6 +768,59 @@ function samePodmanWindowsWorkspaceSource(source: string | undefined, expectedWo
   return actual.toLowerCase() === expected.toLowerCase();
 }
 
+export interface HostCliCredentialCandidate {
+  relPath: string[];
+  guest: string;
+}
+
+export const CLI_CREDENTIAL_CANDIDATES: readonly HostCliCredentialCandidate[] = [
+  // Infisical CLI
+  { relPath: [".infisical"], guest: "/home/cua/.infisical" },
+  { relPath: [".config", "infisical"], guest: "/home/cua/.config/infisical" },
+
+  // SSH & Git
+  { relPath: [".ssh"], guest: "/home/cua/.ssh" },
+  { relPath: [".gitconfig"], guest: "/home/cua/.gitconfig" },
+  { relPath: [".config", "git"], guest: "/home/cua/.config/git" },
+  { relPath: [".config", "gh"], guest: "/home/cua/.config/gh" },
+  { relPath: [".netrc"], guest: "/home/cua/.netrc" },
+
+  // Cloud Providers
+  { relPath: [".aws"], guest: "/home/cua/.aws" },
+  { relPath: [".config", "gcloud"], guest: "/home/cua/.config/gcloud" },
+  { relPath: [".azure"], guest: "/home/cua/.azure" },
+  { relPath: [".oci"], guest: "/home/cua/.oci" },
+
+  // Container & Kubernetes
+  { relPath: [".docker", "config.json"], guest: "/home/cua/.docker/config.json" },
+  { relPath: [".kube"], guest: "/home/cua/.kube" },
+
+  // Package Managers & Toolchains
+  { relPath: [".npmrc"], guest: "/home/cua/.npmrc" },
+  { relPath: [".cargo", "credentials.toml"], guest: "/home/cua/.cargo/credentials.toml" },
+  { relPath: [".cargo", "credentials"], guest: "/home/cua/.cargo/credentials" },
+  { relPath: [".cargo", "config.toml"], guest: "/home/cua/.cargo/config.toml" },
+  { relPath: [".cargo", "config"], guest: "/home/cua/.cargo/config" },
+  { relPath: [".pypirc"], guest: "/home/cua/.pypirc" },
+
+  // Hosting & Platform CLIs
+  { relPath: [".vercel"], guest: "/home/cua/.vercel" },
+  { relPath: [".fly"], guest: "/home/cua/.fly" },
+  { relPath: [".config", "cloudflare"], guest: "/home/cua/.config/cloudflare" },
+  { relPath: [".wrangler"], guest: "/home/cua/.wrangler" },
+
+  // Developer APIs & Tools
+  { relPath: [".config", "stripe"], guest: "/home/cua/.config/stripe" },
+  { relPath: [".config", "supabase"], guest: "/home/cua/.config/supabase" },
+  { relPath: [".config", "huggingface"], guest: "/home/cua/.config/huggingface" },
+  { relPath: [".sentryclirc"], guest: "/home/cua/.sentryclirc" },
+  { relPath: [".terraform.d"], guest: "/home/cua/.terraform.d" },
+] as const;
+
+export const ALLOWED_CLI_GUEST_DESTINATIONS: ReadonlySet<string> = new Set(
+  CLI_CREDENTIAL_CANDIDATES.map((c) => c.guest),
+);
+
 function dockerWorkspaceMountIsSafe(
   mounts:
     | Array<{ Type?: string; Source?: string; Destination?: string; RW?: boolean }>
@@ -775,21 +829,25 @@ function dockerWorkspaceMountIsSafe(
   expectedWorkspace: string | readonly string[],
   runtime: Runtime = "docker",
 ): boolean {
+  if (!mounts || mounts.length === 0) return false;
   // Both the current path and the pre-move one count: a Local VM started
   // before the workspace moved out of the openable tree is still correctly
   // bound, it is just bound to where it was created.
   const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
-  const source = mounts?.[0]?.Source;
+  const workspaceMount = mounts.find((m) => m.Destination === VM_WORKSPACE_GUEST);
+  if (!workspaceMount || workspaceMount.Type !== "bind" || workspaceMount.RW === false) return false;
+
   const sourceMatches =
-    expected.some((candidate) => sameWorkspaceSource(source, platform, candidate)) ||
-    (runtime === "podman" && platform === "win32" && expected.some((candidate) => samePodmanWindowsWorkspaceSource(source, candidate)));
-  return Boolean(
-    mounts?.length === 1 &&
-      mounts[0]?.Type === "bind" &&
-      sourceMatches &&
-      mounts[0]?.Destination === VM_WORKSPACE_GUEST &&
-      mounts[0]?.RW !== false,
-  );
+    expected.some((candidate) => sameWorkspaceSource(workspaceMount.Source, platform, candidate)) ||
+    (runtime === "podman" && platform === "win32" && expected.some((candidate) => samePodmanWindowsWorkspaceSource(workspaceMount.Source, candidate)));
+  if (!sourceMatches) return false;
+
+  for (const mount of mounts) {
+    if (mount === workspaceMount) continue;
+    if (mount.Type !== "bind" || mount.RW !== false) return false;
+    if (!mount.Destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.Destination)) return false;
+  }
+  return true;
 }
 
 function appleWorkspaceMountIsSafe(
@@ -797,14 +855,22 @@ function appleWorkspaceMountIsSafe(
   platform: NodeJS.Platform,
   expectedWorkspace: string | readonly string[],
 ): boolean {
-  const options = mounts?.[0]?.options ?? [];
+  if (!mounts || mounts.length === 0) return false;
   const expected = Array.isArray(expectedWorkspace) ? expectedWorkspace : [expectedWorkspace];
-  return Boolean(
-    mounts?.length === 1 &&
-      expected.some((candidate) => sameWorkspaceSource(mounts[0]?.source, platform, candidate)) &&
-      mounts[0]?.destination === VM_WORKSPACE_GUEST &&
-      !options.some((option) => option === "ro" || option === "readonly"),
-  );
+  const workspaceMount = mounts.find((m) => m.destination === VM_WORKSPACE_GUEST);
+  if (!workspaceMount) return false;
+  const wsOptions = workspaceMount.options ?? [];
+  if (wsOptions.some((option) => option === "ro" || option === "readonly")) return false;
+  if (!expected.some((candidate) => sameWorkspaceSource(workspaceMount.source, platform, candidate))) return false;
+
+  for (const mount of mounts) {
+    if (mount === workspaceMount) continue;
+    const options = mount.options ?? [];
+    const isReadOnly = options.some((opt) => opt === "ro" || opt === "readonly");
+    if (!isReadOnly) return false;
+    if (!mount.destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.destination)) return false;
+  }
+  return true;
 }
 
 /** The Docker/Podman HostConfig surface the hardening check reads. */
@@ -960,11 +1026,37 @@ export function containerNetworkArgs(runtime: Runtime, platform: NodeJS.Platform
   return args;
 }
 
+/** Common host CLI credential mounts passed read-only into the guest.
+ *
+ * When enabled, mounts ~/.infisical, ~/.config/infisical, ~/.ssh, ~/.gitconfig,
+ * ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.docker/config.json, ~/.npmrc, etc.
+ * into the guest /home/cua directory, so terminal commands run inside the
+ * Local VM container inherit the user's CLI authentication. */
+export function hostCliCredentialMounts(
+  platform: NodeJS.Platform = process.platform,
+  home = homedir(),
+): string[] {
+  if (platform === "win32") return [];
+  const mounts: string[] = [];
+  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
+    const hostPath = join(home, ...candidate.relPath);
+    try {
+      if (existsSync(hostPath)) {
+        mounts.push("--mount", `type=bind,source=${hostPath},target=${candidate.guest},readonly`);
+      }
+    } catch {
+      // Ignore if unreadable or inaccessible
+    }
+  }
+  return mounts;
+}
+
 export function containerRunArgs(
   runtime: Runtime,
   password = "CHANGE_ME",
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
   platform: NodeJS.Platform = process.platform,
+  options?: { shareCliCredentials?: boolean; homeDir?: string },
 ): string[] {
   if (runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key) {
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
@@ -1031,6 +1123,9 @@ export function containerRunArgs(
     );
   }
   common.push(...containerNetworkArgs(runtime, platform));
+  if (options?.shareCliCredentials) {
+    common.push(...hostCliCredentialMounts(platform, options?.homeDir));
+  }
   common.push(
     "--mount",
     runtime === "podman"
@@ -1134,15 +1229,63 @@ export async function containerComputerAction(
     await prepareManagedImage(runtime, runner);
   } else {
     if (action === "run") await ensureVmWorkspace(platform, target);
+    let shareCliCredentials = false;
+    try {
+      shareCliCredentials = Boolean(loadConfig()?.localVm?.shareCliCredentials);
+    } catch {
+      // Best-effort config read
+    }
     const args =
       action === "run"
-        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform)
+        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform, { shareCliCredentials })
         : action === "remove"
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
     await runner(runtime, args, 2 * 60_000);
   }
   return containerComputerStatus(runner, platform, target);
+}
+
+/** Recreate a stopped Local VM container (the auto-wake), or fail truthfully.
+ *
+ * Removal is destructive before recreation is constructive, so this runs
+ * only when `run` has everything it needs — image, runtime, daemon, and
+ * create support — and a partial failure reports what actually happened:
+ * after a successful remove the container is GONE, and the pre-wake
+ * "stopped" snapshot would misreport that as the current state. Returns
+ * the freshest status, so the caller's readiness check never judges a
+ * stale snapshot. A non-stopped or unsupported status passes through
+ * untouched. */
+export async function wakeContainerComputer(
+  status: ContainerComputerStatus,
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+): Promise<ContainerComputerStatus> {
+  if (
+    status.container !== "stopped" ||
+    !status.image ||
+    !status.runtime ||
+    !status.daemonUp ||
+    !status.create_supported
+  ) {
+    return status;
+  }
+  try {
+    await containerComputerAction("remove", runner, platform, target);
+    return await containerComputerAction("run", runner, platform, target);
+  } catch (error) {
+    let fresh = status;
+    try {
+      fresh = await containerComputerStatus(runner, platform, target);
+    } catch {
+      // Keep the last known status; the wake error is the truth either way.
+    }
+    if (fresh.container === "running") return fresh;
+    throw new Error(
+      `the Local VM could not be restarted: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /** Cheap capacity probe used by the per-bot pool. It deliberately checks an

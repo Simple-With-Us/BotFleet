@@ -123,6 +123,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
@@ -2498,7 +2499,12 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   localVmActiveThreads.set(target.key, { threadId, botId });
   localVmIdleFor(target).touch();
-  const localVm = await containerComputerStatus(undefined, undefined, target);
+  let localVm = await containerComputerStatus(undefined, undefined, target);
+  try {
+    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
+  }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
   }
@@ -4272,6 +4278,7 @@ async function startTurn(
             // The room lane passes the same flag.  A driver-loop engine holds
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
+            hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -6197,6 +6204,7 @@ async function runGroupMemberTurn(
         boxAgent: instance.driverKind === "boxAgent",
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
+        hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the
@@ -11311,17 +11319,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.localVm} is turned off in Computer settings` });
       }
       const target = localVmTargetForBot(bot.id);
-      if (target.key === SHARED_LOCAL_VM_TARGET.key) {
-        return json(res, 409, { error: "Shared mode manages this desktop in App Settings → Local VM" });
-      }
       if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
-        return json(res, 409, { error: "this bot's Local VM setup action is still running" });
+        return json(res, 409, { error: "this Local VM setup action is still running" });
       }
       if (action === "run" && localVmProvisionBusy) {
-        return json(res, 409, { error: "another per-bot Local VM is being created — retry after it finishes" });
+        return json(res, 409, { error: "another Local VM is being created — retry after it finishes" });
       }
       const vmOwner = localVmLeaseFor(target).current(localVmOwnerBusy);
-      if (vmOwner) return json(res, 409, { error: "this bot is using its Local VM — stop the turn first" });
+      if (vmOwner) return json(res, 409, { error: "this Local VM is in use — stop the turn first" });
       // Fence this target, and the cross-target capacity decision for creates,
       // before the first await so two requests cannot both pass the limit.
       localVmLifecycleBusy.add(target.key);
