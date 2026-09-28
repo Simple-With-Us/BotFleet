@@ -92,6 +92,14 @@ describe("looksSensitive", () => {
     "ls ~/.botfleet",
     "cat '/Users/milind/.botfleet/config.json'",
     "open ~/Library/Application\\ Support/BotFleet/credentials.bin",
+    // Windows spellings.  A path that came back from `path.resolve` on
+    // Windows is spelled with a backslash, and every pattern in the list uses
+    // a forward slash — so before the separator was normalised here, a
+    // Windows turn could read a key or the config store with no card at all.
+    // This is the shape the Windows runner failed on.
+    "cat C:\\Users\\runneradmin\\.ssh\\config",
+    "cat C:\\Users\\runneradmin\\.botfleet\\config.json",
+    "type C:\\Users\\runneradmin\\.aws\\credentials",
   ]) {
     it(`stops: ${text}`, () => expect(looksSensitive(text)).toBe(true));
   }

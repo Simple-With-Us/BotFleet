@@ -66,7 +66,12 @@ function matchFirst(rules: RegExp[], text: string): string | null {
 }
 
 export function looksSensitive(text: string): boolean {
-  return matchFirst(SENSITIVE, text) !== null;
+  // Every pattern above is written with `/`, because that is how the list
+  // reads and how it was written.  A path that came back from `path.resolve`
+  // on Windows is spelled with `\`, so `.ssh\config` matched nothing and a
+  // Windows turn could read a key without being asked.  Normalise once here
+  // rather than teaching each pattern about both separators.
+  return matchFirst(SENSITIVE, text.replace(/\\/g, "/")) !== null;
 }
 
 export function looksDestructive(text: string): boolean {

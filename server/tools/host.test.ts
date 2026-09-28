@@ -8,6 +8,7 @@
 // The pinned copy of the `/api/internal/agents` body that used to live in
 // this file is gone.  It was a drift detector for a divergence that can no
 // longer happen: the host now receives the endpoint function itself.
+import { isAbsolute, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { RequestOutcome } from "../contracts.ts";
@@ -409,7 +410,9 @@ describe("host computer tools on HTTP lane", () => {
     );
     expect(asking.asks).toHaveLength(1);
     expect(asking.asks[0].tool).toBe("read_file");
-    expect(asking.asks[0].summary).toContain(".botfleet/config.json");
+    // The card names the resolved path, so the assertion has to use the
+    // platform's own separator rather than a POSIX spelling.
+    expect(asking.asks[0].summary.replace(/\\/g, "/")).toContain(".botfleet/config.json");
     expect(outcome).not.toMatchObject({ kind: "error", detail: "denied" });
   });
 
@@ -502,11 +505,15 @@ describe("read_file asks only when the path is a credential store", () => {
     // has to see the resolved path: a workspace bot asking for
     // `../../.ssh/id_rsa` is asking for a key.
     const asking = askingRuntime("allowed-once");
-    await hostFor({}, { localComputer: true, cwd: "/tmp/project" }).execute(
+    const cwd = resolve("/tmp/project");
+    await hostFor({}, { localComputer: true, cwd }).execute(
       { id: "1", name: "read_file", arguments: { path: "../.ssh/config" } },
       asking.runtime,
     );
     expect(asking.asks).toHaveLength(1);
-    expect(asking.asks[0]!.summary).toBe("read file /tmp/.ssh/config");
+    // `resolve`, because the card is supposed to name what the executor opens,
+    // and on Windows that is `C:\tmp\.ssh\config`.
+    expect(isAbsolute(asking.asks[0]!.summary.replace("read file ", ""))).toBe(true);
+    expect(asking.asks[0]!.summary.replace(/\\/g, "/")).toBe(`read file ${resolve(cwd, "../.ssh/config").replace(/\\/g, "/")}`);
   });
 });
