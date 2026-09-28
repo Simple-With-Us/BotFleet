@@ -334,6 +334,7 @@ export function LocalComputerSection() {
   return (
     <>
       <Card
+        id="setting-computers-providers"
         title="Providers"
         subtitle="The computer providers any bot in this workspace is allowed to use.  Disabling a provider here keeps every bot off it, no matter what a bot's own settings say.  Leave the shipped set on to keep the current behavior."
       >
@@ -356,6 +357,7 @@ export function LocalComputerSection() {
       </Card>
 
       <Card
+        id="setting-computers-matrix"
         title="Bots"
         subtitle="Which providers every bot in this workspace has.  Per-bot edits live in each bot's settings; the matrix is the master view."
       >

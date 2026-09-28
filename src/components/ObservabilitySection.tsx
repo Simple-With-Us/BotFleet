@@ -205,6 +205,7 @@ export function ObservabilitySection() {
   return (
     <div className="flex flex-col gap-4">
       <Card
+        id="setting-observability-sentry"
         title="Diagnostics & Error Reporting"
         subtitle={"An optional Sentry stream that reports failed bot turns, console warnings and errors, and performance traces so problems surface without you tailing a log.\u00A0 Prompts, transcripts, and tool arguments are never sent."}
       >
@@ -308,7 +309,7 @@ export function ObservabilitySection() {
                 className={observabilityInputClass}
               />
             </div>
-            <div className="flex flex-col gap-2 border-t border-hairline/30 pt-3">
+            <div id="setting-observability-traces" className="flex flex-col gap-2 border-t border-hairline/30 pt-3">
               <div>
                 <div className="text-[13px] font-medium text-ink">Trace Sampling Rates</div>
                 <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">
@@ -410,7 +411,7 @@ export function ObservabilitySection() {
               </button>
             </div>
 
-            <div className="flex items-center justify-between gap-4 border-t border-hairline/30 pt-3">
+            <div id="setting-observability-logs" className="flex items-center justify-between gap-4 border-t border-hairline/30 pt-3">
               <div className="min-w-0">
                 <div className="text-[13px] text-ink">Forward warnings and errors</div>
                 <div className="mt-0.5 text-[11.5px] leading-relaxed text-ink-secondary">

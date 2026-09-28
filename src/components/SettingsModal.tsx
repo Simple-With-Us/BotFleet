@@ -5,7 +5,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
-import { searchSettings, sectionBodyHasVisibleItem } from "@/lib/settings-search";
+import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
+import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   ROOM_LABEL_MAX_LENGTH,
@@ -109,6 +110,19 @@ const SECTIONS: Array<{
   { id: "observability", label: "Observability", icon: Activity, keywords: ["sentry", "errors", "crashes", "traces", "logs", "diagnostics"] },
   { id: "secrets", label: "Secrets", icon: KeyRound, keywords: ["infisical", "vault", "credentials", "secret", "provenance"] },
 ];
+
+const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
+  general: User,
+  connections: KeyRound,
+  remote: Globe,
+  engines: Terminal,
+  models: Layers,
+  companion: Smartphone,
+  computers: Monitor,
+  usage: Coins,
+  observability: Activity,
+  secrets: KeyRound,
+};
 
 /** Name + email, persisted to /api/config {profile} on blur. */
 function ProfileFields() {
@@ -1077,21 +1091,55 @@ export function SettingsModal() {
   const [query, setQuery] = useState("");
   const trimmedQuery = query.trim();
   const searchResult = useMemo(() => searchSettings(trimmedQuery), [trimmedQuery]);
+  const [selectedSectionFilter, setSelectedSectionFilter] = useState<AppSettingsSection | null>(null);
+  const [highlightedDomId, setHighlightedDomId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+
   const visibleSections = useMemo(
     () => SECTIONS.filter((entry) => searchResult.matchingSectionIds.has(entry.id)),
     [searchResult.matchingSectionIds],
   );
 
-  const isItemVisible = (itemId: string): boolean => {
-    if (!trimmedQuery) return true;
-    return searchResult.matchingItemIds.has(itemId);
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleNavigateToSetting = (item: SettingsSearchItem) => {
+    setQuery("");
+    setSelectedSectionFilter(null);
+    dispatch({ type: "toggleAppSettings", open: true, section: item.sectionId });
+    setHighlightedDomId(item.domId);
+
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedDomId(null);
+    }, 2600);
+
+    setTimeout(() => {
+      const el = document.getElementById(item.domId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }, 60);
   };
 
+  const highlightClass = (domId: string) =>
+    highlightedDomId === domId
+      ? "ring-2 ring-accent ring-offset-2 ring-offset-panel shadow-[0_0_20px_rgba(33,139,255,0.4)] animate-pulse rounded-xl transition-all duration-500"
+      : undefined;
+
   useEffect(() => {
+    if (trimmedQuery) return;
     if (visibleSections.some((entry) => entry.id === section)) return;
     const first = visibleSections[0];
     if (first) dispatch({ type: "toggleAppSettings", open: true, section: first.id });
-  }, [dispatch, visibleSections, section]);
+  }, [dispatch, visibleSections, section, trimmedQuery]);
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1250,7 +1298,7 @@ export function SettingsModal() {
           <div id="app-settings-title" className="px-2 pb-2 pt-1 text-[15px] font-semibold text-ink">
             Settings
           </div>
-          <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-control/70 px-2.5 py-1.5">
+          <div className="mb-1.5 flex items-center gap-1.5 rounded-lg bg-control/70 px-2 py-1.5">
             <Search size={14} className="shrink-0 text-ink-secondary" />
             <input
               value={query}
@@ -1258,47 +1306,106 @@ export function SettingsModal() {
               onKeyDown={(e) => {
                 if (e.key !== "Escape") return;
                 e.stopPropagation();
-                if (query) setQuery("");
-                else dispatch({ type: "toggleAppSettings", open: false });
+                if (query) {
+                  setQuery("");
+                  setSelectedSectionFilter(null);
+                } else {
+                  dispatch({ type: "toggleAppSettings", open: false });
+                }
               }}
               placeholder="Search"
               aria-label="Search Settings"
               className="w-full bg-transparent text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
             />
+            {query ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery("");
+                  setSelectedSectionFilter(null);
+                }}
+                aria-label="Clear search"
+                className="shrink-0 rounded p-0.5 text-ink-secondary hover:text-ink"
+              >
+                <X size={13} />
+              </button>
+            ) : null}
           </div>
-          {visibleSections.length === 0 && (
-            <div className="px-2.5 py-4 text-[12.5px] leading-relaxed text-ink-secondary">
-              Nothing matches “{trimmedQuery}”
-            </div>
-          )}
-          {visibleSections.map(({ id, label, icon: Icon }) => {
-            const matchCount = searchResult.matchCountBySection[id] ?? 0;
-            return (
+
+          {trimmedQuery ? (
+            <>
+              {searchResult.totalMatches === 0 ? (
+                <div className="px-2.5 py-4 text-[12px] leading-relaxed text-ink-secondary">
+                  No matches for &ldquo;{trimmedQuery}&rdquo;
+                </div>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setSelectedSectionFilter(null)}
+                    aria-current={selectedSectionFilter === null ? "page" : undefined}
+                    className={cn(
+                      "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
+                      selectedSectionFilter === null
+                        ? "bg-control text-ink font-medium"
+                        : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                    )}
+                  >
+                    <Search size={14} className="shrink-0 text-accent" />
+                    <span className="truncate">All Results</span>
+                    <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
+                      {searchResult.totalMatches}
+                    </span>
+                  </button>
+                  {visibleSections.map(({ id, label, icon: Icon }) => {
+                    const matchCount = searchResult.matchCountBySection[id] ?? 0;
+                    const isSelected = selectedSectionFilter === id;
+                    return (
+                      <button
+                        key={id}
+                        onClick={() => setSelectedSectionFilter(isSelected ? null : id)}
+                        aria-current={isSelected ? "page" : undefined}
+                        className={cn(
+                          "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
+                          isSelected
+                            ? "bg-control text-ink font-medium"
+                            : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                        )}
+                      >
+                        <Icon size={14} className="shrink-0" />
+                        <span className="truncate">{label}</span>
+                        {matchCount > 0 ? (
+                          <span className="ml-auto shrink-0 rounded-full bg-hairline/60 px-1.5 py-0.5 text-[11px] font-medium text-ink-secondary">
+                            {matchCount}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+            </>
+          ) : (
+            SECTIONS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
                 onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
                 aria-current={section === id ? "page" : undefined}
                 className={cn(
                   "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                  section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                  section === id ? "bg-control text-ink font-medium" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
                 )}
               >
                 <Icon size={15} />
-                {label}
-                {trimmedQuery && matchCount > 0 ? (
-                  <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
-                    {matchCount}
-                  </span>
-                ) : null}
+                <span className="truncate">{label}</span>
               </button>
-            );
-          })}
+            ))
+          )}
         </nav>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center justify-between px-5 py-3">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-hairline/20">
             <span className="text-[15px] font-semibold text-ink">
-              {SECTIONS.find((s) => s.id === section)?.label}
+              {trimmedQuery ? "Settings Search" : SECTIONS.find((s) => s.id === section)?.label}
             </span>
             <button
               onClick={() => dispatch({ type: "toggleAppSettings", open: false })}
@@ -1309,73 +1416,84 @@ export function SettingsModal() {
             </button>
           </div>
 
-          <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
-            {trimmedQuery ? (
-              <div className="flex items-center justify-between rounded-lg border border-hairline/40 bg-control/40 px-3 py-2 text-[12.5px] text-ink">
-                <span>
-                  Showing matches for &ldquo;{trimmedQuery}&rdquo; in {SECTIONS.find((s) => s.id === section)?.label}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setQuery("")}
-                  className="font-medium text-accent hover:underline text-[12px]"
-                >
-                  Clear Search
-                </button>
-              </div>
-            ) : null}
-
-            {trimmedQuery && searchResult.matchCountBySection[section] === 0 ? (
-              <div className="rounded-xl bg-card p-6 text-center text-ink-secondary">
-                <p className="text-[13px]">
-                  No settings in {SECTIONS.find((s) => s.id === section)?.label} match &ldquo;{trimmedQuery}&rdquo;.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setQuery("")}
-                  className="mt-3 rounded-lg border border-hairline/40 px-3 py-1.5 text-[12.5px] text-ink hover:bg-control"
-                >
-                  Clear Search
-                </button>
-              </div>
-            ) : null}
-
-            {section === "general" && (
-              <>
-                {isItemVisible("general:profile") && (
-                  <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
+          {trimmedQuery ? (
+            <SettingsSearchResultsView
+              query={trimmedQuery}
+              searchResult={searchResult}
+              selectedSectionFilter={selectedSectionFilter}
+              onSelectSectionFilter={setSelectedSectionFilter}
+              onNavigateToSetting={handleNavigateToSetting}
+              onClearSearch={() => {
+                setQuery("");
+                setSelectedSectionFilter(null);
+              }}
+              onSelectChipQuery={(chip) => setQuery(chip)}
+              sectionIcons={SECTION_ICONS}
+            />
+          ) : (
+            <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5 pt-3">
+              {section === "general" && (
+                <>
+                  <Card
+                    id="setting-general-profile"
+                    className={highlightClass("setting-general-profile")}
+                    title="Profile"
+                    subtitle="Shown in the sidebar. Saved as you go."
+                  >
                     <ProfileFields />
                   </Card>
-                )}
-                {isItemVisible("general:skin") && (
-                  <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light.">
+                  <Card
+                    id="setting-general-skin"
+                    className={highlightClass("setting-general-skin")}
+                    title="Skin"
+                    subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light."
+                  >
                     <SkinPicker />
                   </Card>
-                )}
-                {isItemVisible("general:conversationMode") && <ConversationModeRow />}
-                {isItemVisible("general:terminology") && <TerminologyRow />}
-                {isItemVisible("general:roomTurnTimeout") && (
-                  <Card title="Channel Turns" subtitle="Set one maximum duration for every bot turn in a channel.">
+                  <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
+                    <ConversationModeRow />
+                  </div>
+                  <div id="setting-general-terminology" className={highlightClass("setting-general-terminology")}>
+                    <TerminologyRow />
+                  </div>
+                  <Card
+                    id="setting-general-room-turn-timeout"
+                    className={highlightClass("setting-general-room-turn-timeout")}
+                    title="Channel Turns"
+                    subtitle="Set one maximum duration for every bot turn in a channel."
+                  >
                     <RoomTurnTimeoutSettings />
                   </Card>
-                )}
-                {isItemVisible("general:toolCalls") && <ToolCallsRow />}
-                {isItemVisible("general:experimentalFeatures") && <ExperimentalFeaturesRow />}
-                {isItemVisible("general:updates") && <UpdatesRow />}
-                {isItemVisible("general:updateNotifications") && <UpdateNotificationsRow />}
-                {isItemVisible("general:diagnostics") && <DiagnosticsRow />}
-                {isItemVisible("general:analytics") && <AnalyticsRow />}
-              </>
-            )}
+                  <div id="setting-general-tool-calls" className={highlightClass("setting-general-tool-calls")}>
+                    <ToolCallsRow />
+                  </div>
+                  <div id="setting-general-experimental" className={highlightClass("setting-general-experimental")}>
+                    <ExperimentalFeaturesRow />
+                  </div>
+                  <div id="setting-general-updates" className={highlightClass("setting-general-updates")}>
+                    <UpdatesRow />
+                  </div>
+                  <div id="setting-general-update-notifications" className={highlightClass("setting-general-update-notifications")}>
+                    <UpdateNotificationsRow />
+                  </div>
+                  <div id="setting-general-diagnostics" className={highlightClass("setting-general-diagnostics")}>
+                    <DiagnosticsRow />
+                  </div>
+                  <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
+                    <AnalyticsRow />
+                  </div>
+                </>
+              )}
 
-            {section === "connections" && (
-              <Card
-                title="Connections"
-                subtitle={"Connected apps use a connected-apps service when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
-              >
-                <div className="flex flex-col gap-4">
-                  {isItemVisible("connections:composioManaged") && (
-                    state.config?.composio.mode === "managed" ? (
+              {section === "connections" && (
+                <Card
+                  id="setting-connections-composio"
+                  className={highlightClass("setting-connections-composio")}
+                  title="Connections"
+                  subtitle={"Connected apps use a connected-apps service when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
+                >
+                  <div className="flex flex-col gap-4">
+                    {state.config?.composio.mode === "managed" ? (
                       <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
                         Connected apps service is ready
                       </div>
@@ -1383,11 +1501,11 @@ export function SettingsModal() {
                       <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
                         {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
                       </div>
-                    ) : null
-                  )}
-                  {isItemVisible("connections:transcription") && <TranscriptionSettings />}
-                  {isItemVisible("connections:apiKeys") && (
-                    <>
+                    ) : null}
+                    <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
+                      <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
                       <ApiKeyRow section="box" />
                       <ApiKeyRow section="opencodeGo" />
                       <ApiKeyRow section="deepseek" />
@@ -1396,75 +1514,104 @@ export function SettingsModal() {
                         <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
                       </div>
                       <EngineKeyRow engine="openaiCompat" />
-                    </>
-                  )}
-                  {isItemVisible("connections:qdrant") && <QdrantRagConnection />}
-                  {isItemVisible("connections:customIngress") && (
-                    <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                      <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
-                      <div className="mt-3">
-                        <CustomIngressFields />
-                      </div>
-                    </details>
-                  )}
-                  {isItemVisible("connections:selfHostComposio") && (
-                    <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                      <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
-                      <div className="mt-3">
-                        <ApiKeyRow section="composio" />
-                      </div>
-                    </details>
-                  )}
-                  {isItemVisible("connections:linq") && (
-                    <LinqSettings
-                      bots={bots}
-                      config={state.config ?? undefined}
-                      onPatch={async (patch) => {
-                        await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
-                      }}
-                    />
-                  )}
+                    </div>
+                    <div id="setting-connections-qdrant" className={highlightClass("setting-connections-qdrant")}>
+                      <QdrantRagConnection />
+                    </div>
+                    <div id="setting-connections-ingress" className={highlightClass("setting-connections-ingress")}>
+                      <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
+                        <div className="mt-3">
+                          <CustomIngressFields />
+                        </div>
+                      </details>
+                    </div>
+                    <div id="setting-connections-selfhost-composio" className={highlightClass("setting-connections-selfhost-composio")}>
+                      <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
+                        <div className="mt-3">
+                          <ApiKeyRow section="composio" />
+                        </div>
+                      </details>
+                    </div>
+                    <div id="setting-connections-linq" className={highlightClass("setting-connections-linq")}>
+                      <LinqSettings
+                        bots={bots}
+                        config={state.config ?? undefined}
+                        onPatch={async (patch) => {
+                          await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+                        }}
+                      />
+                    </div>
+                  </div>
+                </Card>
+              )}
+
+              {section === "remote" && (
+                <div id="setting-remote-access" className={highlightClass("setting-remote-access")}>
+                  <RemoteAccessSection configuredUrl={remoteAccessUrl} />
                 </div>
-              </Card>
-            )}
+              )}
 
-            {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
+              {section === "engines" && (
+                <Card
+                  id="setting-engines-clis"
+                  className={highlightClass("setting-engines-clis")}
+                  title="Engine CLIs"
+                  subtitle="Which binary each engine runs. Saved as you go."
+                >
+                  <EnginesSettings />
+                </Card>
+              )}
 
-            {section === "engines" && isItemVisible("engines:clis") && (
-              <Card title="Engine CLIs" subtitle="Which binary each engine runs. Saved as you go.">
-                <EnginesSettings />
-              </Card>
-            )}
+              {section === "models" && (
+                <div id="setting-models-fleet" className={highlightClass("setting-models-fleet")}>
+                  <FleetModelsSection />
+                </div>
+              )}
 
-            {section === "models" && isItemVisible("models:fleet") && <FleetModelsSection />}
+              {section === "companion" && (
+                <div id="setting-companion-pairing" className={highlightClass("setting-companion-pairing")}>
+                  <CompanionSection profileEmail={state.config?.profile?.email} />
+                </div>
+              )}
 
-            {section === "companion" && isItemVisible("companion:pairing") && (
-              <CompanionSection profileEmail={state.config?.profile?.email} />
-            )}
-
-            {section === "computers" && (
-              <>
-                {isItemVisible("computers:providers") && <LocalComputerSection />}
-                {isItemVisible("computers:localVm") && <LocalVmRuntimeCard />}
-                {isItemVisible("computers:sharedVpsVm") && <SharedVpsRuntimeCard />}
-                {isItemVisible("computers:vpsConnection") && (
+              {section === "computers" && (
+                <>
+                  <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
+                    <LocalComputerSection />
+                  </div>
+                  <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
+                    <LocalVmRuntimeCard />
+                  </div>
+                  <div id="setting-computers-shared-vps" className={highlightClass("setting-computers-shared-vps")}>
+                    <SharedVpsRuntimeCard />
+                  </div>
                   <Card
+                    id="setting-computers-vps-connection"
+                    className={highlightClass("setting-computers-vps-connection")}
                     title="VPS Connection"
                     subtitle="Configure SSH access for your Self-hosted VPS."
                   >
                     <VpsConnection />
                   </Card>
-                )}
-                {isItemVisible("computers:defaults") && <BotComputerDefaults />}
-              </>
-            )}
+                  <div id="setting-computers-defaults" className={highlightClass("setting-computers-defaults")}>
+                    <BotComputerDefaults />
+                  </div>
+                </>
+              )}
 
-            {section === "usage" && (!trimmedQuery || sectionBodyHasVisibleItem("usage", searchResult.matchingItemIds)) && <UsageSection />}
+              {section === "usage" && <UsageSection />}
 
-            {section === "observability" && (!trimmedQuery || sectionBodyHasVisibleItem("observability", searchResult.matchingItemIds)) && <ObservabilitySection />}
+              {section === "observability" && <ObservabilitySection />}
 
-            {section === "secrets" && isItemVisible("secrets:infisical") && <SecretsSection />}
-          </div>
+              {section === "secrets" && (
+                <div id="setting-secrets-infisical" className={highlightClass("setting-secrets-infisical")}>
+                  <SecretsSection />
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Resize handle */}

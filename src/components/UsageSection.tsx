@@ -593,13 +593,18 @@ export function UsageSection() {
 
   return (
     <>
-      <Card title="Speech synthesis" subtitle="Speech is measured in characters, not model tokens. Counts include successful requests on this computer only.">
+      <Card
+        id="setting-usage-speech"
+        title="Speech synthesis"
+        subtitle="Speech is measured in characters, not model tokens. Counts include successful requests on this computer only."
+      >
         <div className="text-[13px] text-ink-secondary">
           {speechUsage ? <>MiniMax: {speechUsage.minimax.characters.toLocaleString()} characters ({speechUsage.minimax.requests} requests)</> : "Speech usage unavailable"}
         </div>
       </Card>
     <div className="flex flex-col gap-4">
       <Card
+        id="setting-usage-summary"
         title="Usage"
         subtitle={`Tokens and cost per bot, added up from every settled turn.\u00A0  Click a bot to expand its sessions and see model, tokens in/out, $/turn, and the per-session cumulative.\u00A0  A turn that ran on a fallback is billed as that fallback reported it, not as the bot's current model.\u00A0  Only engines that report a price show one.`}
         actions={
@@ -663,6 +668,7 @@ export function UsageSection() {
       </Card>
 
       <Card
+        id="setting-usage-quotas"
         title="Engine Quotas"
         subtitle="Live remaining usage for each engine.  Hover or click a row for the full remaining breakdown."
       >
@@ -1096,6 +1102,7 @@ export function UsageSection() {
       </Card>
 
       <Card
+        id="setting-usage-pricing"
         title="Pricing Mode by Engine"
         subtitle={'What you actually pay on each engine.\u00A0 Select your plan or enter a custom monthly cost so the estimate below matches what you pay.'}
         actions={
@@ -1280,7 +1287,8 @@ export function UsageSection() {
         </div>
       </Card>
 
-      <UsageWhatIfProjection
+      <div id="setting-usage-projection">
+        <UsageWhatIfProjection
         periodLabel="Last 30 days"
         unattributedTokens={unattributedTokens30d}
         byEngine={[
@@ -1443,8 +1451,10 @@ export function UsageSection() {
           }),
         ]}
       />
+      </div>
 
       <Card
+        id="setting-usage-monitor"
         title="Usage Monitor & Central Accounting"
         subtitle="An optional, lightweight telemetry stream reporting token consumption classified by model, project, and repository to a usage monitor you run.  Nothing is sent until you set an endpoint and a token."
       >
