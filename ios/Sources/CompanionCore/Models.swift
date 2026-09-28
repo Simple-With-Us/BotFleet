@@ -663,6 +663,29 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
 
     public var isEnabled: Bool { enabled != false }
 
+    /// A user-facing engine name: the Mac-side display name when set,
+    /// otherwise the provider name for its driver — never the raw instance id.
+    public var settingsDisplayName: String {
+        if let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
+        switch driverKind {
+        case "dsh", "dshAgent": return "DeepSeek Harness"
+        case "mcode", "mcodeAgent": return "MiniMax Code"
+        case "deepseek", "deepseekAgent": return "DeepSeek"
+        case "claude", "claudeAgent": return "Claude"
+        case "grok", "grokAgent": return "Grok"
+        case "codex": return "Codex"
+        case "antigravity", "antigravityAgent": return "Antigravity"
+        case "cursor", "cursorAgent": return "Cursor"
+        case "minimax", "minimaxAgent": return "MiniMax"
+        case "boxAgent": return "Computer"
+        case "openai-compat", "openai": return "OpenAI"
+        case "gemini", "geminiAgent": return "Gemini"
+        default: return displayName ?? instanceId
+        }
+    }
+
     public func effortLevels(for modelId: String) -> [String] {
         guard let engineLevels = capabilities?.effortLevels, !engineLevels.isEmpty else {
             return []

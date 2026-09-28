@@ -465,7 +465,13 @@ struct SettingsView: View {
             settingsLoadFailed = true
         }
         let fetched = await session.instances()
-        engines = fetched.filter(\.isEnabled)
+        engines = fetched.filter { inst in
+            // DeepSeek is Harness only: filter out standalone/legacy direct deepseek driver
+            if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || inst.id == "deepseek" {
+                return false
+            }
+            return inst.isEnabled
+        }
         loadingEngines = false
     }
 
@@ -984,16 +990,5 @@ private struct EngineSetupSheet: View {
             }
         }
         .presentationDetents([.medium])
-    }
-}
-
-private extension Instance {
-    /// A user-facing engine name: the Mac-side display name when set,
-    /// otherwise the provider name for its driver — never the raw instance id.
-    var settingsDisplayName: String {
-        if let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-            return name
-        }
-        return ProviderMarkView.displayName(for: driverKind)
     }
 }
