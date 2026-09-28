@@ -13,11 +13,13 @@ import {
   type BotState,
 } from "@/lib/mascot";
 import {
+  avatarCropAfterUpload,
   BOT_AVATAR_CROPS,
   botAvatarUrlFromStoredPath,
   type BotAvatarCrop,
 } from "../../shared/bot-avatar";
 import { BotAvatar, BotMascot } from "./Avatar";
+import { TVFaceAvatar } from "./tv-face/TVFaceAvatar";
 
 type AvatarPatch = Partial<
   Pick<Bot, "avatarCrop" | "avatarUrl" | "color" | "mascotExpression">
@@ -25,6 +27,7 @@ type AvatarPatch = Partial<
 
 const CROP_LABEL = {
   mascot: "Mascot",
+  tvface: "TV-Face",
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",
@@ -71,7 +74,7 @@ export function BotProfileAvatarCard({
       const avatarUrl = botAvatarUrlFromStoredPath(saved.path);
       if (!avatarUrl) throw new Error("The uploaded image could not be used as an avatar");
       const latestCrop = cropRef.current;
-      onPatch({ avatarUrl, avatarCrop: latestCrop === "mascot" ? "circle" : latestCrop });
+      onPatch({ avatarUrl, avatarCrop: avatarCropAfterUpload(latestCrop) });
     } catch (uploadError) {
       setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
     } finally {
@@ -226,7 +229,7 @@ export function BotProfileAvatarCard({
         <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
           Shape
         </div>
-        <div className="grid grid-cols-4 overflow-hidden rounded-lg border border-hairline/40">
+        <div className="grid grid-cols-5 overflow-hidden rounded-lg border border-hairline/40">
           {BOT_AVATAR_CROPS.map((candidate, index) => (
             <button
               key={candidate}
@@ -244,7 +247,7 @@ export function BotProfileAvatarCard({
           ))}
         </div>
 
-        {crop === "mascot" && (
+        {(crop === "mascot" || crop === "tvface") && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Expression
@@ -263,7 +266,11 @@ export function BotProfileAvatarCard({
                   title={expression}
                   aria-label={`Use ${expression} expression`}
                 >
-                  <BotMascot color={bot.color} state={expression} size={42} animated={false} />
+                  {crop === "tvface" ? (
+                    <TVFaceAvatar color={bot.color} state={expression} size={42} animated={false} />
+                  ) : (
+                    <BotMascot color={bot.color} state={expression} size={42} animated={false} />
+                  )}
                 </button>
               ))}
             </div>

@@ -168,7 +168,7 @@ export interface Group {
   threadId: string;
   name: string;
   avatarUrl?: string | null;
-  avatarCrop?: "circle" | "rounded" | "square" | "mascot" | null;
+  avatarCrop?: BotAvatarCrop | null;
   memberIds: string[];
   defaultResponder: GroupDefaultResponder;
   bulletin: string;
