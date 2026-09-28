@@ -211,7 +211,7 @@ export function SettingsSearchResultsView({
                   </div>
 
                   <div className="flex items-center gap-1 text-[12px] font-medium text-accent opacity-80 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all">
-                    <span>Jump to setting</span>
+                    <span>Jump to Setting</span>
                     <ArrowRight size={13} />
                   </div>
                 </div>

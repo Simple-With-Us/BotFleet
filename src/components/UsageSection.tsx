@@ -595,8 +595,8 @@ export function UsageSection() {
     <>
       <Card
         id="setting-usage-speech"
-        title="Speech synthesis"
-        subtitle="Speech is measured in characters, not model tokens. Counts include successful requests on this computer only."
+        title="Speech Synthesis"
+        subtitle="Speech is measured in characters, not model tokens.  Counts include successful requests on this computer only."
       >
         <div className="text-[13px] text-ink-secondary">
           {speechUsage ? <>MiniMax: {speechUsage.minimax.characters.toLocaleString()} characters ({speechUsage.minimax.requests} requests)</> : "Speech usage unavailable"}

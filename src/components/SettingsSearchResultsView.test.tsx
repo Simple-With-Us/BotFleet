@@ -39,7 +39,7 @@ describe("SettingsSearchResultsView Component", () => {
     expect(html).toContain("Shared ");
     expect(html).toContain("VPS</mark>");
     expect(html).toContain("Connection");
-    expect(html).toContain("Jump to setting");
+    expect(html).toContain("Jump to Setting");
     expect(html).toContain("Computers");
   });
 

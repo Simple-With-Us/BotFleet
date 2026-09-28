@@ -840,7 +840,7 @@ export function EnginesSettings() {
       <div id="setting-engines-matrix">
         <EngineCapabilitiesMatrix instances={rows} />
       </div>
-      <div id="setting-engines-clis" className="flex flex-col gap-3">
+      <div className="flex flex-col gap-3">
       {(() => {
         const enabled = rows.filter(isEngineEnabled);
         const disabled = rows.filter((row) => !isEngineEnabled(row));

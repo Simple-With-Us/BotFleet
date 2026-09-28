@@ -1108,6 +1108,17 @@ export function SettingsModal() {
     };
   }, []);
 
+  const HIGHLIGHT_CLASSES = [
+    "ring-2",
+    "ring-accent",
+    "ring-offset-2",
+    "ring-offset-panel",
+    "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
+    "rounded-xl",
+    "transition-all",
+    "duration-300",
+  ];
+
   const handleNavigateToSetting = (item: SettingsSearchItem) => {
     setQuery("");
     setSelectedSectionFilter(null);
@@ -1125,13 +1136,23 @@ export function SettingsModal() {
       const el = document.getElementById(item.domId);
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add(...HIGHLIGHT_CLASSES);
+        setTimeout(() => {
+          el.classList.remove(
+            "ring-2",
+            "ring-accent",
+            "ring-offset-2",
+            "ring-offset-panel",
+            "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
+          );
+        }, 2600);
       }
-    }, 60);
+    }, 80);
   };
 
   const highlightClass = (domId: string) =>
     highlightedDomId === domId
-      ? "ring-2 ring-accent ring-offset-2 ring-offset-panel shadow-[0_0_20px_rgba(33,139,255,0.4)] animate-pulse rounded-xl transition-all duration-500"
+      ? "ring-2 ring-accent ring-offset-2 ring-offset-panel shadow-[0_0_20px_rgba(33,139,255,0.35)] rounded-xl transition-all duration-300"
       : undefined;
 
   useEffect(() => {
