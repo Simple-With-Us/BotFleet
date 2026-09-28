@@ -87,7 +87,7 @@ When the owner gives you a secret, read it from `chmod 600` files under `/Users/
 
 ## Observability
 
-Sentry org `jays-services`, project `botfleet` (web client, harness spans, iOS Cocoa).  Do not stand up a second project.  CI reports deploys through the fleet Sentry reporter workflows.  Canonical: `AGENT-SYNC.md` § Observability.
+Sentry org `simple-with-us`, project `botfleet` (web client, harness spans, iOS Cocoa).  Do not stand up a second project.  CI reports deploys through the fleet Sentry reporter workflows.  Canonical: `AGENT-SYNC.md` § Observability.
 
 ## Bundle Identifiers (2026-09-22 — `[MM]` migration)
 
