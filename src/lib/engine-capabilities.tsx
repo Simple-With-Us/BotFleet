@@ -128,22 +128,22 @@ const CURSOR_ULTRA_NOTE =
   "Cursor Ultra subscription.  BotFleet does not register a separate Cursor API rate.";
 
 const CLAUDE_MAX_NOTE =
-  "Claude Max 20× subscription.  BotFleet does not register an Anthropic API rate for this engine.";
+  "Claude subscription.  BotFleet does not register an Anthropic API rate for this engine.";
 
 const CODEX_PRO_LITE_NOTE =
-  "ChatGPT Pro Lite subscription.  BotFleet does not register a separate OpenAI API rate for this engine.";
+  "ChatGPT subscription.  BotFleet does not register a separate OpenAI API rate for this engine.";
 
 const MINIMAX_TOKEN_PLAN_NOTE =
-  "MiniMax Token Plan Max subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
+  "MiniMax Token Plan subscription.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const MCODE_TOKEN_PLAN_NOTE =
   "MiniMax Code authenticates with the MiniMax Code CLI login and shares the MiniMax Token Plan with the MiniMax engine.  PAYG API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const GROK_SUPER_NOTE =
-  "xAI SuperGrok Heavy subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
+  "xAI subscription.  API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const ANTIGRAVITY_ULTRA_NOTE =
-  "Google AI Ultra subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
+  "Google AI subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const DEEPSEEK_HARNESS_NOTE =
   "Harness runs models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
