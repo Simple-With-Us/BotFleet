@@ -42,6 +42,12 @@ import { useDesktopCapabilities } from "./DesktopCapabilities";
 const YES = /^(yes|yeah|yep|yup|sure|ok|okay|go ahead|do it|allow|approve|approved|fine|please do)\b/i;
 const NO = /^(no|nope|don'?t|do not|stop|deny|denied|cancel|never|skip it)\b/i;
 
+/** Apple Personal Voices speak on-device on iOS, not through the desktop
+ * call path - server-side voiceReady refuses them, so a desktop call
+ * started with one connects and stays silent. */
+const isPersonalVoiceId = (voice?: string): boolean =>
+  typeof voice === "string" && (voice.startsWith("personal:") || voice.startsWith("apple-personal:"));
+
 type Phase = "listening" | "sending" | "working" | "speaking";
 const CALL_ENDPOINT_MS = 850;
 
@@ -94,8 +100,13 @@ export function CallTargetButton({
   // while leaving it working for anyone who deliberately picked the built-in voices.
   const voiceProviderConfigured = configured;
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
+  // A Personal Voice id is non-empty, but it speaks on-device on iOS,
+  // not here - on the desktop call path it counts as no usable voice.
+  const everyTargetSpeakable = everyTargetHasVoice && voices.every((voice) => !isPersonalVoiceId(voice));
+  const fallbackSpeakable = Boolean(state.config?.tts?.ready) && !isPersonalVoiceId(state.config?.tts?.voice);
+  const personalVoiceChosen = isPersonalVoiceId(state.config?.tts?.voice) || voices.some((voice) => isPersonalVoiceId(voice));
   const voiceReady =
-    configured && (requireExplicitVoices ? everyTargetHasVoice : Boolean(state.config?.tts?.ready || everyTargetHasVoice));
+    configured && (requireExplicitVoices ? everyTargetSpeakable : Boolean(fallbackSpeakable || everyTargetSpeakable));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);
@@ -111,7 +122,9 @@ export function CallTargetButton({
         : !configured
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
-            ? "Pick a voice in a bot profile to make calls"
+            ? personalVoiceChosen
+              ? "Personal Voice is iPhone-only"
+              : "Pick a voice in a bot profile to make calls"
             : `Call ${targetName}`;
 
   const reason = !capabilitiesReady
@@ -123,9 +136,11 @@ export function CallTargetButton({
       : !configured
         ? "Add a MiniMax API key in Settings so the bot can speak during calls."
         : !voiceReady
-          ? voices.length > 1
-            ? "Give every channel member a voice before starting a channel call."
-            : "Choose a voice before starting a call."
+          ? personalVoiceChosen
+            ? "Apple Personal Voice speaks on iPhone only.\u00A0 Pick another voice to make calls on this computer."
+            : voices.length > 1
+              ? "Give every channel member a voice before starting a channel call."
+              : "Choose a voice before starting a call."
           : "";
 
   useEffect(() => {
