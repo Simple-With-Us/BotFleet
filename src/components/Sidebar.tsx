@@ -49,6 +49,8 @@ import {
   X,
 } from "lucide-react";
 import { api, useStore, formatTime, visibleMessages, getRoomTerminology, getConversationMode, latestChatActivity, compareBotsByRecentActivity, compareGroupsByRecentActivity, type Bot, type Group, type Message } from "@/state/store";
+import { botSupportsImageAttachments } from "@/lib/model-images";
+import { roomRespondersForComposer } from "@/lib/group-routing";
 import { allowsMultipleBotThreads, rosterPrimaryLabel } from "../../shared/conversation-mode";
 import {
   THREAD_DRAG_TYPE,
@@ -936,8 +938,13 @@ function GroupListItem({
     const files = Array.from(e.dataTransfer?.files ?? []);
     if (!files.length) return;
     dispatch({ type: "select", id: group.id });
+    // A drop becomes a room draft. Use the same default responders as the
+    // composer; mentioning another bot later rechecks the gate at send time.
+    const responders = roomRespondersForComposer("", members, group);
+    const allowImages = responders.length > 0 &&
+      responders.every((member) => botSupportsImageAttachments(state.instances, member));
     const { attachments } = await intakeFiles(files, {
-      allowImages: true,
+      allowImages,
       getPath: pathForFile,
       uploadImage: imageAttachmentFromFile,
     });
@@ -1960,8 +1967,7 @@ export function BotListItem({
     const files = Array.from(e.dataTransfer?.files ?? []);
     if (!files.length) return;
     dispatch({ type: "select", id: bot.id });
-    const instance = state.instances.find((i) => i.instanceId === bot.modelSelection?.instanceId);
-    const allowImages = Boolean(instance?.capabilities?.images);
+    const allowImages = botSupportsImageAttachments(state.instances, bot);
     const { attachments } = await intakeFiles(files, {
       allowImages,
       getPath: pathForFile,

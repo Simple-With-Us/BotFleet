@@ -54,6 +54,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     {
       id: "DeepSeek-V4.1-Flash",
       label: "DeepSeek-V4.1-Flash",
+      images: true,
       contextWindow: 1_000_000,
       badge: "Multimodal",
       badgeTitle:
@@ -62,14 +63,16 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     {
       id: "DeepSeek-V4.1-Pro",
       label: "DeepSeek-V4.1-Pro",
+      images: false,
       contextWindow: 1_000_000,
       badge: "No Vision",
       badgeTitle:
-        "Text and reasoning only — lacks vision. Attaching an image automatically switches to DeepSeek-V4.1-Flash.",
+        "Text and reasoning only — lacks vision. Switch to DeepSeek-V4.1-Flash to attach an image.",
     },
     {
       id: "MiniMax-M3.1-Flash-Preview",
       label: "MiniMax-M3.1-Flash-Preview",
+      images: true,
       contextWindow: 1_000_000,
       badge: "Preview",
       badgeTitle:
@@ -78,11 +81,13 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
     {
       id: "MiniMax-M3",
       label: "MiniMax-M3",
+      images: true,
       contextWindow: 1_000_000,
     },
     {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
+      images: true,
       contextWindow: 204_800,
       badge: "2x the $",
       badgeTitle:
@@ -205,6 +210,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
         if (contextWindow) row.contextWindow = contextWindow;
         if (previous?.badge) row.badge = previous.badge;
         if (previous?.badgeTitle) row.badgeTitle = previous.badgeTitle;
+        if (previous?.images !== undefined) row.images = previous.images;
         rows.push(row);
       }
     }

@@ -705,6 +705,8 @@ export interface InstanceInfo {
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
       supportsEffort?: boolean;
+      /** Absent inherits the instance-wide image capability. */
+      images?: boolean;
     }>;
   };
   capabilities?: {

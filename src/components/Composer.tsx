@@ -8,6 +8,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { currentCall, useOnCall } from "@/lib/call";
 import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X, Zap, Hash, AppWindow } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
+import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
 import { useComposerDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
@@ -237,11 +238,7 @@ export function Composer({
   // image paste is offered only when every bot that will actually answer
   // can open one. sendGroup routes to mentions, else the room default —
   // `members.some` would let a mixed room send <attached-image> to Grok.
-  const botSupportsImages = (candidate?: Bot) =>
-    Boolean(
-      candidate &&
-        state.instances.find((i) => i.instanceId === candidate.modelSelection.instanceId)?.capabilities?.images,
-    );
+  const botSupportsImages = (candidate?: Bot) => botSupportsImageAttachments(state.instances, candidate);
   const imageTargetsSupport = (message: string) => {
     if (!group) return botSupportsImages(bot);
     const responders = roomRespondersForComposer(message, members ?? [], group);

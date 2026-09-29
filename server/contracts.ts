@@ -623,6 +623,8 @@ export interface ModelCatalog {
      * When defined, only models with non-empty effortLevels support effort. */
     effortLevels?: readonly EffortLevel[];
     supportsEffort?: boolean;
+    /** Whether this model can interpret an attached image. Absent inherits the engine gate. */
+    images?: boolean;
   }>;
 }
 
