@@ -358,8 +358,8 @@ export class ProviderRegistry {
                 prev &&
                 prev.snapshot?.state === "available" &&
                 curr.snapshot?.state === "unavailable" &&
-                ((curr.cliCandidates && curr.cliCandidates.length > 0) ||
-                 (prev.cliCandidates && prev.cliCandidates.length > 0))
+                curr.cliCandidates &&
+                curr.cliCandidates.length > 0
               ) {
                 return {
                   ...curr,
@@ -442,8 +442,8 @@ export class ProviderRegistry {
         prev &&
         prev.snapshot?.state === "available" &&
         curr.snapshot?.state === "unavailable" &&
-        ((curr.cliCandidates && curr.cliCandidates.length > 0) ||
-         (prev.cliCandidates && prev.cliCandidates.length > 0))
+        curr.cliCandidates &&
+        curr.cliCandidates.length > 0
       ) {
         return {
           ...curr,
