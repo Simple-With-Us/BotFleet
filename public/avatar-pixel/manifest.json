@@ -1,0 +1,31 @@
+{
+  "packName": "Pixel-Familiar",
+  "version": "1.0.0",
+  "author": "Antigravity",
+  "defaultSkin": "orange",
+  "skins": ["orange"],
+  "format": "gif",
+  "resolution": "480x480",
+  "mapping": {
+    "idle": "resting",
+    "resting": "resting",
+    "sleeping": "sleeping",
+    "waking": "sleeping",
+    "listening": "listening",
+    "thinking": "thinking",
+    "searching": "searching",
+    "working": "working",
+    "loading": "loading",
+    "typing": "typing",
+    "speaking": "speaking",
+    "sending": "sending",
+    "receiving": "sending",
+    "uploading": "sending",
+    "alerting": "alerting",
+    "notifying": "alerting",
+    "crash": "crash",
+    "memory": "memory",
+    "tools": "tools",
+    "happy": "happy"
+  }
+}
