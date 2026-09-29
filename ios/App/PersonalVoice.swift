@@ -22,6 +22,7 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
     private let synthesizer = AVSpeechSynthesizer()
     private var finishContinuation: CheckedContinuation<Void, Never>?
+    private var turnGuard = SpeechTurnGuard()
     private var cancellables = Set<AnyCancellable>()
 
     override init() {
@@ -121,6 +122,7 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.finishContinuation = continuation
+            self.turnGuard.begin(utterance: utterance)
             self.synthesizer.speak(utterance)
         }
     }
@@ -130,6 +132,7 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
         if synthesizer.isSpeaking {
             synthesizer.stopSpeaking(at: .immediate)
         }
+        turnGuard.stop()
         isSpeaking = false
         currentUtteranceText = nil
         finishContinuation?.resume()
@@ -140,19 +143,24 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
-            self?.isSpeaking = false
-            self?.currentUtteranceText = nil
-            self?.finishContinuation?.resume()
-            self?.finishContinuation = nil
+            self?.utteranceFinished(utterance)
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
         Task { @MainActor [weak self] in
-            self?.isSpeaking = false
-            self?.currentUtteranceText = nil
-            self?.finishContinuation?.resume()
-            self?.finishContinuation = nil
+            self?.utteranceFinished(utterance)
         }
+    }
+
+    /// Complete the current turn, ignoring callbacks for superseded
+    /// utterances: a delayed didCancel from a stopped utterance must not
+    /// finish the next speak() early.
+    private func utteranceFinished(_ utterance: AVSpeechUtterance) {
+        guard turnGuard.finish(utterance: utterance) else { return }
+        isSpeaking = false
+        currentUtteranceText = nil
+        finishContinuation?.resume()
+        finishContinuation = nil
     }
 }
