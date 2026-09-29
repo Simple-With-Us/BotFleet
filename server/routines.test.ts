@@ -1716,3 +1716,85 @@ describe("acknowledge the whole failure backlog", () => {
     expect(fresh[0]).toMatchObject({ routineName: "Still going", outcomeCode: "runtime_restart" });
   });
 });
+
+describe("acknowledge one trigger without touching another", () => {
+  /** Fail one delivery and return its run.  A webhook and a resource firing
+   *  both carry their trigger's id in `webhookId`, so the sweep is only
+   *  trustworthy if it is keyed on the same field the client groups by. */
+  async function failDelivery(h: ReturnType<typeof harness>, deliveryId: string) {
+    await h.manager.tick();
+    const run = h.manager.listRuns().find((r) => r.deliveryId === deliveryId)!;
+    expect(run.status).toBe("running");
+    h.manager.handleRuntimeEvent({
+      eventId: `e-${deliveryId}`, provider: "fake", threadId: run.threadId!,
+      createdAt: new Date().toISOString(), type: "turn.completed", ok: false, stopReason: "provider crashed",
+    });
+    return run;
+  }
+
+  const unseenFor = (h: ReturnType<typeof harness>) =>
+    h.manager.listRuns().filter((run) => ["failed", "missed"].includes(run.status) && !run.seenAt);
+
+  it("clears only the named trigger", async () => {
+    const h = harness();
+    const hook = (id: string, name: string, deliveryId: string) => h.manager.enqueueWebhook({
+      webhookId: id, webhookName: name, prompt: "Fixture", botId: "bot", runOn: "bot", deliveryId, receivedAt: 1,
+    });
+
+    hook("hook-a", "Hook A", "a1");
+    await failDelivery(h, "a1");
+    hook("hook-a", "Hook A", "a2");
+    await failDelivery(h, "a2");
+    hook("hook-b", "Hook B", "b1");
+    await failDelivery(h, "b1");
+    expect(unseenFor(h)).toHaveLength(3);
+
+    const result = h.manager.markAllSeen({ triggerId: "hook-a" });
+    expect(result.acknowledged).toBe(2);
+    expect(result.runs.every((run) => run.webhookId === "hook-a")).toBe(true);
+    expect(unseenFor(h).map((run) => run.deliveryId)).toEqual(["b1"]);
+  });
+
+  it("does not sweep a resource trigger with a webhook id", async () => {
+    const h = harness();
+    h.manager.enqueueWebhook({ webhookId: "shared-id", webhookName: "Hook", prompt: "Fixture", botId: "bot", runOn: "bot", deliveryId: "w1", receivedAt: 1 });
+    await failDelivery(h, "w1");
+    h.manager.enqueueResource({ triggerId: "shared-id", triggerName: "Disk Watch", prompt: "Fixture", botId: "bot", runOn: "bot", deliveryId: "r1", receivedAt: 1 });
+    await failDelivery(h, "r1");
+    expect(unseenFor(h)).toHaveLength(2);
+
+    // Both kinds of run carry the trigger id in `webhookId`, so the badge the
+    // Webhooks panel clears sends the source too.  Without it, acknowledging
+    // one badge would silently clear the other's failures.
+    const webhookSweep = h.manager.markAllSeen({ triggerId: "shared-id", triggerSource: "webhook" });
+    expect(webhookSweep.acknowledged).toBe(1);
+    expect(webhookSweep.runs[0]).toMatchObject({ deliveryId: "w1", triggerSource: "webhook" });
+    expect(unseenFor(h).map((run) => run.deliveryId)).toEqual(["r1"]);
+
+    expect(h.manager.markAllSeen({ triggerId: "shared-id", triggerSource: "resource" }).acknowledged).toBe(1);
+    expect(unseenFor(h)).toHaveLength(0);
+  });
+
+  it("leaves a scheduled routine's failure alone", async () => {
+    const h = harness();
+    const routine = h.manager.create({ name: "Nightly", prompt: "Fixture", botId: "bot", schedule: { type: "once", at: 1 } });
+    h.setNow(new Date(2026, 7, 17, 8, 0, 0).getTime() + 20 * 3_600_000);
+    await h.manager.tick();
+    const missed = h.manager.listRuns().find((run) => run.routineId === routine.id)!;
+    expect(missed.status).toBe("missed");
+    expect(missed.webhookId).toBeUndefined();
+
+    h.manager.markAllSeen({ triggerId: "hook-a" });
+    expect(unseenFor(h).map((run) => run.id)).toEqual([missed.id]);
+  });
+
+  it("is idempotent per trigger", async () => {
+    const h = harness();
+    h.manager.enqueueWebhook({ webhookId: "hook-a", webhookName: "Hook A", prompt: "Fixture", botId: "bot", runOn: "bot", deliveryId: "a1", receivedAt: 1 });
+    await failDelivery(h, "a1");
+    expect(h.manager.markAllSeen({ triggerId: "hook-a" }).acknowledged).toBe(1);
+    h.emitted.length = 0;
+    expect(h.manager.markAllSeen({ triggerId: "hook-a" }).acknowledged).toBe(0);
+    expect(h.emitted).toHaveLength(0);
+  });
+});

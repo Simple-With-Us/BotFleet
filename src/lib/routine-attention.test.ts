@@ -11,6 +11,11 @@ import {
   needsAttention,
   relativeRunTime,
   summarizeAttention,
+  summarizeTriggerAttention,
+  triggerAcknowledgeTitle,
+  triggerAttentionKey,
+  triggerAttentionKeyFor,
+  triggerErrorBadgeLabel,
 } from "./routine-attention";
 
 const HOUR = 3_600_000;
@@ -193,4 +198,94 @@ describe("attention clock wiring", () => {
       expect(source).toContain("summarizeAttention(state.routineRuns, attentionNow), [state.routineRuns, attentionNow]");
     });
   }
+});
+
+describe("trigger attention", () => {
+  const WEBHOOK = "wh-1";
+  const RESOURCE = "tr-1";
+
+  const triggerRun = (over: Partial<RoutineRun> & { id: string }): RoutineRun =>
+    run({ triggerSource: "webhook", webhookId: WEBHOOK, ...over });
+
+  it("attributes a webhook run by its webhookId", () => {
+    expect(triggerAttentionKey(triggerRun({ id: "a" }))).toBe(triggerAttentionKeyFor("webhook", WEBHOOK));
+  });
+
+  it("attributes a resource run by the triggerId it carries in webhookId", () => {
+    const resource = run({ id: "a", triggerSource: "resource", webhookId: RESOURCE });
+    expect(triggerAttentionKey(resource)).toBe(triggerAttentionKeyFor("resource", RESOURCE));
+  });
+
+  it("gives a scheduled routine no trigger badge", () => {
+    expect(triggerAttentionKey(run({ id: "a", triggerSource: "schedule" }))).toBeNull();
+  });
+
+  it("keeps a webhook and a resource trigger apart even on a shared id", () => {
+    const byId = summarizeTriggerAttention(
+      [
+        run({ id: "a", triggerSource: "webhook", webhookId: "shared", finishedAt: NOW - HOUR }),
+        run({ id: "b", triggerSource: "resource", webhookId: "shared", finishedAt: NOW - 2 * HOUR }),
+      ],
+      NOW,
+    );
+    expect(byId.size).toBe(2);
+  });
+
+  it("counts each trigger's own backlog and its recency", () => {
+    const byId = summarizeTriggerAttention(
+      [
+        triggerRun({ id: "a", finishedAt: NOW - 10 * 60_000, createdAt: NOW - 10 * 60_000 }),
+        triggerRun({ id: "b", finishedAt: NOW - 5 * HOUR, createdAt: NOW - 5 * HOUR }),
+        triggerRun({ id: "c", finishedAt: NOW - 40 * HOUR, createdAt: NOW - 40 * HOUR }),
+        run({ id: "d", triggerSource: "webhook", webhookId: "wh-2", finishedAt: NOW - HOUR, createdAt: NOW - HOUR }),
+      ],
+      NOW,
+    );
+    expect(byId.get(triggerAttentionKeyFor("webhook", WEBHOOK))).toEqual({ total: 3, lastHour: 1, lastDay: 2, newestAt: NOW - 10 * 60_000 });
+    expect(byId.get(triggerAttentionKeyFor("webhook", "wh-2"))?.total).toBe(1);
+  });
+
+  it("omits acknowledged runs, so clearing one trigger leaves the others", () => {
+    const byId = summarizeTriggerAttention(
+      [
+        triggerRun({ id: "a", finishedAt: NOW - HOUR }),
+        run({ id: "b", triggerSource: "webhook", webhookId: "wh-2", finishedAt: NOW - HOUR, seenAt: NOW }),
+      ],
+      NOW,
+    );
+    expect([...byId.keys()]).toEqual([triggerAttentionKeyFor("webhook", WEBHOOK)]);
+  });
+
+  it("skips a completed or cancelled run for the same trigger", () => {
+    const byId = summarizeTriggerAttention(
+      [
+        triggerRun({ id: "a", status: "completed", finishedAt: NOW - HOUR }),
+        triggerRun({ id: "b", status: "cancelled", finishedAt: NOW - HOUR }),
+      ],
+      NOW,
+    );
+    expect(byId.size).toBe(0);
+  });
+});
+
+describe("trigger badge copy", () => {
+  const attention = { total: 3, lastHour: 1, lastDay: 2, newestAt: NOW };
+
+  it("says how many errors, singular or not", () => {
+    expect(triggerErrorBadgeLabel(attention)).toBe("3 Errors");
+    expect(triggerErrorBadgeLabel({ ...attention, total: 1 })).toBe("1 Error");
+  });
+
+  it("states the windows, what a click does, and that nothing is lost", () => {
+    const title = triggerAcknowledgeTitle("GitHub UI Pass", attention);
+    expect(title).toContain("1 in the past hour");
+    expect(title).toContain("2 in the past 24 hours");
+    expect(title).toContain("GitHub UI Pass");
+    expect(title).toContain("The runs stay in history");
+  });
+
+  it("does not claim recent errors when the backlog is older than a day", () => {
+    const title = triggerAcknowledgeTitle("Disk Watch", { total: 2, lastHour: 0, lastDay: 0, newestAt: NOW - 48 * 3_600_000 });
+    expect(title).toContain("nothing new in the past 24 hours");
+  });
 });

@@ -895,6 +895,7 @@ export type Action =
   | { type: "cancelRoutineRun"; runId: string }
   | { type: "markRoutineRunSeen"; runId: string }
   | { type: "acknowledgeAllAttention" }
+  | { type: "acknowledgeTriggerAttention"; triggerId: string; triggerSource: "webhook" | "resource" }
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
@@ -1880,6 +1881,8 @@ export function reducer(state: AppState, action: Action): AppState {
       return state;
     case "acknowledgeAllAttention":
       return state;
+    case "acknowledgeTriggerAttention":
+      return state;
   }
 }
 
@@ -2233,6 +2236,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // server's own run frames: an upsert by id either way, and the badge
           // clears immediately instead of waiting on the event stream.
           void api("/api/routine-runs/seen", { method: "POST" })
+            .then((body) => {
+              for (const run of (body?.runs ?? []) as RoutineRun[]) rawDispatch({ type: "routineRunPatched", run });
+            })
+            .catch(showError);
+          break;
+        case "acknowledgeTriggerAttention":
+          // Scoped to one webhook or resource trigger, so clearing that badge
+          // never sweeps another trigger's backlog.  Applied from the response
+          // for the same reason as above: the badge clears immediately.
+          void api("/api/routine-runs/seen", { method: "POST", body: JSON.stringify({ triggerId: action.triggerId, triggerSource: action.triggerSource }) })
             .then((body) => {
               for (const run of (body?.runs ?? []) as RoutineRun[]) rawDispatch({ type: "routineRunPatched", run });
             })
