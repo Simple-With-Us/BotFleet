@@ -88,6 +88,8 @@ targets:
           to a bot.
         NSSpeechRecognitionUsageDescription: BotFleet converts your speech into text
           so you can send it to a bot. Recognition runs on this phone when it can.
+        NSSpeechSynthesisUsageDescription: BotFleet uses your Personal Voice to speak
+          bot responses aloud.
         NSBonjourServices:
         - _botfleet._tcp
         NSAppTransportSecurity:

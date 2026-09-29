@@ -41,6 +41,7 @@ struct AgentProfileView: View {
     @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
+    @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
     init(bot: Bot) {
         self.bot = bot
@@ -68,7 +69,9 @@ struct AgentProfileView: View {
     private var imageGenerationReady: Bool { config?.imageGen?.configured == true }
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
-    private var selectedVoiceCanSpeak: Bool { config?.canSpeak(agentVoice: voice) == true }
+    private var isPersonalVoiceSelected: Bool { PersonalVoiceContract.isPersonalVoice(voice) }
+    private var hasAvailableVoices: Bool { voiceConfigured || !personalVoice.personalVoices.isEmpty || isPersonalVoiceSelected }
+    private var selectedVoiceCanSpeak: Bool { isPersonalVoiceSelected || config?.canSpeak(agentVoice: voice) == true }
     private var voiceProvider: VoiceProvider { config?.voiceProvider ?? .minimax }
 
     private var unavailableVoiceLabel: String {
@@ -265,29 +268,60 @@ struct AgentProfileView: View {
                 workingDirectorySection
 
                 Section {
-                    if voiceConfigured {
+                    if hasAvailableVoices {
                         Picker("Voice", selection: $voice) {
                             if hasWorkspaceDefaultVoice {
                                 Text("Workspace default").tag("")
                             } else {
                                 Text("Choose an agent voice").tag("").disabled(true)
                             }
-                            if !voice.isEmpty, !voices.contains(where: { $0.id == voice }) {
-                                Text("Current agent voice").tag(voice)
+                            if !voice.isEmpty,
+                               !voices.contains(where: { $0.id == voice }),
+                               !personalVoice.personalVoiceOptions.contains(where: { $0.id == voice }) {
+                                Text(isPersonalVoiceSelected ? "Personal Voice (\(PersonalVoiceContract.rawIdentifier(voice)))" : "Current agent voice").tag(voice)
                             }
-                            ForEach(voices) { option in
-                                VStack(alignment: .leading) {
-                                    Text(option.label)
-                                    if let detail = option.description { Text(detail) }
+                            if !personalVoice.personalVoiceOptions.isEmpty {
+                                Section("Apple Personal Voice") {
+                                    ForEach(personalVoice.personalVoiceOptions) { pv in
+                                        VStack(alignment: .leading) {
+                                            Text(pv.label)
+                                            if let detail = pv.description { Text(detail) }
+                                        }
+                                        .tag(pv.id)
+                                    }
                                 }
-                                .tag(option.id)
                             }
+                            if !voices.isEmpty {
+                                Section(personalVoice.personalVoiceOptions.isEmpty ? "Voices" : "Server & System Voices") {
+                                    ForEach(voices) { option in
+                                        VStack(alignment: .leading) {
+                                            Text(option.label)
+                                            if let detail = option.description { Text(detail) }
+                                        }
+                                        .tag(option.id)
+                                    }
+                                }
+                            }
+                        }
+                        if personalVoice.authorizationStatus == .notDetermined {
+                            Button {
+                                Task {
+                                    _ = await personalVoice.requestAuthorization()
+                                }
+                            } label: {
+                                Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                            }
+                        }
+                        if personalVoice.authorizationStatus == .denied || personalVoice.authorizationStatus == .restricted {
+                            Text("Personal Voice access is disabled.  You can allow BotFleet in iOS Settings > Accessibility > Personal Voice.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
                         Toggle("Play on Mac", isOn: Binding(
                             get: { speechDevices.contains("mac") },
                             set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
                         ))
-                        .disabled(!selectedVoiceCanSpeak)
+                        .disabled(!selectedVoiceCanSpeak || isPersonalVoiceSelected)
                         Toggle("Play on iPhone (while app is open)", isOn: Binding(
                             get: { speechDevices.contains("iphone") },
                             set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
@@ -306,11 +340,22 @@ struct AgentProfileView: View {
                     } else {
                         Label(unavailableVoiceLabel, systemImage: "speaker.slash")
                             .foregroundStyle(.secondary)
+                        if personalVoice.authorizationStatus == .notDetermined {
+                            Button {
+                                Task {
+                                    _ = await personalVoice.requestAuthorization()
+                                }
+                            } label: {
+                                Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                            }
+                        }
                     }
                 } header: {
                     Text("Voice")
                 } footer: {
-                    if !voiceConfigured {
+                    if isPersonalVoiceSelected {
+                        Text("This agent speaks aloud using Apple Personal Voice directly on this device.  No audio or voice data is sent over the network.")
+                    } else if !voiceConfigured {
                         Text(unavailableVoiceGuidance)
                     } else if !hasWorkspaceDefaultVoice {
                         Text(missingDefaultVoiceGuidance)
@@ -414,6 +459,14 @@ struct AgentProfileView: View {
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
+            }
+            .onChange(of: voice) { _, newVoice in
+                if PersonalVoiceContract.isPersonalVoice(newVoice) {
+                    if !speechDevices.contains("iphone") {
+                        speechDevices.insert("iphone")
+                    }
+                    speechDevices.remove("mac")
+                }
             }
         }
     }
@@ -746,6 +799,15 @@ struct AgentProfileView: View {
         }
         busy = true
         defer { busy = false }
+        if PersonalVoiceContract.isPersonalVoice(voice) {
+            let sampleText = "Hello! This is a preview of your Personal Voice with BotFleet."
+            do {
+                try await PersonalVoiceService.shared.speak(text: sampleText, voiceId: voice)
+            } catch {
+                session.actionError = error.localizedDescription
+            }
+            return
+        }
         guard let data = await session.previewVoice(voice, for: current) else { return }
         do {
             let audioSession = AVAudioSession.sharedInstance()

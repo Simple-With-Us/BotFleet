@@ -731,6 +731,7 @@ public enum VoiceProvider: Hashable, Sendable {
     case minimax
     case elevenlabs
     case system
+    case personal
     /// A provider this phone build does not know yet. Keep its setup copy
     /// generic rather than sending the person toward the wrong credential.
     case unknown
@@ -849,6 +850,9 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     public func canSpeak(agentVoice: String?) -> Bool {
+        if PersonalVoiceContract.isPersonalVoice(agentVoice) {
+            return true
+        }
         let hasAgentVoice = !(agentVoice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
     }
@@ -862,6 +866,7 @@ public struct ConfigStatus: Codable, Sendable {
         case nil, "minimax": return .minimax
         case "elevenlabs": return .elevenlabs
         case "system": return .system
+        case "personal", "apple-personal": return .personal
         default: return .unknown
         }
     }
@@ -1005,6 +1010,14 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
     public var description: String?
+    public var isPersonalVoice: Bool?
+
+    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil) {
+        self.id = id
+        self.label = label
+        self.description = description
+        self.isPersonalVoice = isPersonalVoice
+    }
 }
 
 public struct RoutineSchedule: Codable, Hashable, Sendable {

@@ -48,9 +48,18 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
+export function isPersonalVoice(voiceId?: string): boolean {
+  if (!voiceId) return false;
+  return voiceId.startsWith("personal:") || voiceId.startsWith("apple-personal:");
+}
+
 /** A per-bot voice is a complete choice too; it should not be blocked just
  * because the app-wide fallback has not been selected yet. */
 export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
+  if (isPersonalVoice(voiceId)) {
+    // Apple Personal Voices speak on-device on iOS, not on the server.
+    return false;
+  }
   if (voiceProvider(cfg) === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
   }
@@ -108,6 +117,9 @@ export function listCustomVoices() {
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
  * to speak with, which the route turns into a 409 the client can explain. */
 export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
+  if (isPersonalVoice(voiceId)) {
+    throw new Error("Apple Personal Voices speak on-device on authorized iOS companion devices and cannot be synthesized on the server.");
+  }
   if (voiceProvider(cfg) === "system") {
     const voice = voiceId || cfg.tts?.voice;
     // An injected runner is the cross-platform test seam for `/usr/bin/say`;

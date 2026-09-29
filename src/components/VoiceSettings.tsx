@@ -197,6 +197,8 @@ export function VoiceSettings({
   if (!tts) return null;
 
   const selectedVoice = bot.voice ?? "";
+  const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
+  const isSelectedPersonal = isPersonalVoice(selectedVoice);
   const ready = configured && Boolean(selectedVoice || tts.voice);
 
   const defaultVoiceRecord = tts.voice ? voices.find((v) => v.id === tts.voice) : null;
@@ -400,7 +402,11 @@ export function VoiceSettings({
                 : defaultVoiceDisplay}
             </option>
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
-              <option value={selectedVoice}>{selectedVoice} (Current)</option>
+              <option value={selectedVoice}>
+                {isSelectedPersonal
+                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device iOS)`
+                  : `${selectedVoice} (Current)`}
+              </option>
             )}
             {voices.map((v) => (
               <option key={v.id} value={v.id}>
@@ -411,14 +417,19 @@ export function VoiceSettings({
           </select>
           <button
             onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts.voice, botId: bot.id })}
-            disabled={!ready}
-            title={ready ? "Hear this voice" : "Pick a voice first"}
+            disabled={!ready || isSelectedPersonal}
+            title={isSelectedPersonal ? "Personal Voices play on-device on iOS" : ready ? "Hear this voice" : "Pick a voice first"}
             aria-label="Hear this voice"
             className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Volume2 size={14} /> Try
           </button>
         </div>
+        {isSelectedPersonal && (
+          <div className="mt-2 text-[12px] text-ink-secondary">
+            This bot uses an Apple Personal Voice on iOS.  Synthesis runs on-device on your authorized iPhone.
+          </div>
+        )}
       </div>
 
       {/* ── Custom Voices List with Delete Option ── */}
