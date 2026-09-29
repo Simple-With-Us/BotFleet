@@ -2077,6 +2077,11 @@ configureTurnIdentity((threadId) => {
 // into the task's tally when the turn settles.
 const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
 
+// Where each 1:1 turn in flight is spending its wall time (model, tools, or
+// waiting on a person).  Folded into the task's `stats` aggregate at
+// turn.completed; dropped on every path that ends a turn without one.
+const turnStats = new TurnStatsTracker();
+
 // UTF-8 bytes of the system prompt each in-flight turn was handed, split at
 // the volatile boundary (server/system-prompt.ts).  Booked at dispatch and
 // forwarded to Usage Monitor beside the turn's token figures at
@@ -2139,6 +2144,7 @@ function releaseStalledTurnIfUnowned(
   stoppedTurns.delete(`${turn.botId}:${turn.threadId}`);
   activeTurnOwners.clearThread(turn.threadId);
   turnUsage.delete(turn.threadId);
+  turnStats.discard(turn.threadId);
   turnPromptBytes.delete(turn.threadId);
   // The watchdog knows exactly whose turn stalled, so both releases can name
   // the bot — the room lease included, since a stalled room dispatch returns
@@ -2600,6 +2606,15 @@ bus.subscribe((event: RuntimeEvent) => {
     return message;
   };
 
+  // Timing for 1:1 turns only — a room's shared thread has no task to bank
+  // it on.  Each hook is a no-op unless a turn was dispatched on this thread.
+  if (bot) {
+    if (event.type === "turn.started") turnStats.started(event.threadId);
+    else if (event.type === "content.delta") turnStats.firstToken(event.threadId);
+    else if (event.type === "request.opened") turnStats.requestOpened(event.threadId);
+    else if (event.type === "request.resolved") turnStats.requestResolved(event.threadId);
+  }
+
   switch (event.type) {
     case "session.started":
       if (bot && event.sessionId && event.providerInstanceId) {
@@ -2658,6 +2673,7 @@ bus.subscribe((event: RuntimeEvent) => {
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
+          if (bot) turnStats.toolEnded(event.threadId);
         }
         // the bot just acted ON ITS SCREEN — refresh the preview now. Only
         // computer tools can change the screen, and each capture competes
@@ -2691,6 +2707,7 @@ bus.subscribe((event: RuntimeEvent) => {
           const key = `${event.threadId}:${event.itemId}`;
           toolMessageByItem.set(key, message.id);
           toolStartedAt.set(key, Date.now());
+          if (bot) turnStats.toolStarted(event.threadId);
         }
       }
       break;
@@ -3004,6 +3021,8 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
+      // Closes the turn's clock now, before any await below stretches it.
+      const turnTiming = bot ? turnStats.settle(event.threadId, tokens?.output) : undefined;
       // The turn that ended owns its failover: resolve the member from the
       // settled owner (this thread, this provider instance) before the
       // thread's speaker entry, which a crossed room can leave naming the
@@ -3225,6 +3244,7 @@ bus.subscribe((event: RuntimeEvent) => {
           cachedInput: tokens?.cachedInput,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
+          stats: turnTiming ?? { steps: 0, modelMs: 0, toolMs: 0 },
           // actualSelection, not the configured selection: a turn that
           // fell over to another engine is that engine's spend.
         }, actualSelection.instanceId, actualUsageMeta);
@@ -4001,6 +4021,7 @@ async function startTurn(
     computerInputs: turnComputerInputs(bot, opts?.runOn),
   });
   turnUsage.delete(threadId);
+  turnStats.begin(threadId);
   turnPromptBytes.delete(threadId);
 
   void (async () => {
@@ -4526,6 +4547,7 @@ async function startTurn(
       if (vpsLease) activeVpsThreads.release(vpsLease);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
+      turnStats.discard(threadId);
       turnPromptBytes.delete(threadId);
       const message = e instanceof Error ? e.message : String(e);
       store.appendMessage(threadId, {
