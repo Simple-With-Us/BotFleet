@@ -104,9 +104,11 @@ export function CallTargetButton({
   // not here - on the desktop call path it counts as no usable voice.
   const everyTargetSpeakable = everyTargetHasVoice && voices.every((voice) => !isPersonalVoiceId(voice));
   const fallbackSpeakable = Boolean(state.config?.tts?.ready) && !isPersonalVoiceId(state.config?.tts?.voice);
-  const personalVoiceChosen = isPersonalVoiceId(state.config?.tts?.voice) || voices.some((voice) => isPersonalVoiceId(voice));
+  const personalVoiceChosen = voices.some((voice) => isPersonalVoiceId(voice)) ||
+    (!everyTargetSpeakable && isPersonalVoiceId(state.config?.tts?.voice));
   const voiceReady =
-    configured && (requireExplicitVoices ? everyTargetSpeakable : Boolean(fallbackSpeakable || everyTargetSpeakable));
+    configured && !voices.some((voice) => isPersonalVoiceId(voice)) &&
+    (requireExplicitVoices ? everyTargetSpeakable : Boolean(fallbackSpeakable || everyTargetSpeakable));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
   const [helpOpen, setHelpOpen] = useState(false);

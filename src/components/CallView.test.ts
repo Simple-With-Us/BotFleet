@@ -58,6 +58,8 @@ describe("Personal Voice cannot start a desktop call", () => {
     expect(SRC).toMatch(/voice\.startsWith\("apple-personal:"\)/);
     expect(SRC).toMatch(/voices\.every\(\(voice\) => !isPersonalVoiceId\(voice\)\)/);
     expect(SRC).toMatch(/!isPersonalVoiceId\(state\.config\?\.tts\?\.voice\)/);
+    // An explicit Personal Voice must not pass via an otherwise ready workspace fallback.
+    expect(SRC).toMatch(/configured && !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)/);
   });
 
   it("says Personal Voice is iPhone-only instead of a generic pick-a-voice", () => {
