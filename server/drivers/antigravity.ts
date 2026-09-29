@@ -1491,13 +1491,28 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
+    let lastKnownVersion: string | null = null;
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      let version = await new Promise<string | null>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          const trimmed = err ? null : stdout.trim();
+          if (trimmed) {
+            lastKnownVersion = trimmed;
+            resolve(trimmed);
+          } else if (lastKnownVersion) {
+            resolve(lastKnownVersion);
+          } else {
+            resolve(null);
+          }
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      if (!version) {
+        if (lastKnownVersion) {
+          version = lastKnownVersion;
+        } else {
+          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        }
+      }
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
       // out), so any file heuristic would overstate "signed in". Leave undefined.

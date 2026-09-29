@@ -570,11 +570,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
       };
+      let lastKnownVersion: string | null = null;
       const cliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
         new Promise<string | null>((resolve) => {
-          execCli(effective.cli, ["--version"], { timeout: 8000, env: cliProbeEnvironment(env) }, (err, stdout) =>
-            resolve(err ? null : stdout.trim()),
-          );
+          execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
+            const trimmed = err ? null : stdout.trim();
+            if (trimmed) {
+              lastKnownVersion = trimmed;
+              resolve(trimmed);
+            } else if (lastKnownVersion) {
+              resolve(lastKnownVersion);
+            } else {
+              resolve(null);
+            }
+          });
         });
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
@@ -1607,8 +1616,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
       const snapshot = async (): Promise<ProviderSnapshot> => {
         const env = childEnv();
-        const version = await cliVersion(config, env);
-        if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        let version = await cliVersion(config, env);
+        if (!version) {
+          if (lastKnownVersion) {
+            version = lastKnownVersion;
+          } else {
+            return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+          }
+        }
         const incompatible = support.versionCompatibilityReason?.(version, config);
         if (incompatible) return { state: "unavailable", reason: incompatible, version };
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
