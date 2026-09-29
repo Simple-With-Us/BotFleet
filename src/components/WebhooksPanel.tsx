@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { TriggerErrorBadge } from "@/components/TriggerErrorBadge";
 import { stateForBot } from "@/lib/mascot";
 import { cn } from "@/lib/cn";
 import type { RoutineRun, RoutineRunOn } from "@/lib/routines";
@@ -281,13 +282,17 @@ export function WebhooksPanel({ bots }: { bots: Bot[] }) {
                   const bot = bots.find((candidate) => candidate.id === webhook.botId);
                   const status = statusFor(webhook);
                   return (
-                    <button key={webhook.id} onClick={() => { setSelectedId(webhook.id); setTab("setup"); setError(""); }} className={cn("flex min-w-[210px] items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors md:w-full md:min-w-0", webhook.id === selected.id ? "bg-raised text-ink shadow-sm" : "text-ink-secondary hover:bg-raised/55 hover:text-ink")}>
-                      {bot ? <BotAvatar bot={bot} state={webhook.enabled ? stateForBot(bot) : "sleeping"} size={36} animated={false} label={bot.name} /> : <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><Webhook size={16} /></div>}
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[12.5px] font-medium" title={webhook.name}>{webhook.name}</span>
-                        <span className="mt-0.5 flex items-center gap-1.5 text-[10px]"><span className={cn("size-1.5 rounded-full", status.dot)} /><span className={status.tone}>{status.label}</span></span>
-                      </span>
-                    </button>
+                    <div key={webhook.id} className="flex min-w-[210px] items-center gap-1 md:w-full md:min-w-0">
+                      <button onClick={() => { setSelectedId(webhook.id); setTab("setup"); setError(""); }} className={cn("flex min-w-0 flex-1 items-center gap-2.5 rounded-xl px-2.5 py-2.5 text-left transition-colors", webhook.id === selected.id ? "bg-raised text-ink shadow-sm" : "text-ink-secondary hover:bg-raised/55 hover:text-ink")}>
+                        {bot ? <BotAvatar bot={bot} state={webhook.enabled ? stateForBot(bot) : "sleeping"} size={36} animated={false} label={bot.name} /> : <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-raised text-ink-secondary"><Webhook size={16} /></div>}
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[12.5px] font-medium" title={webhook.name}>{webhook.name}</span>
+                          <span className="mt-0.5 flex items-center gap-1.5 text-[10px]"><span className={cn("size-1.5 rounded-full", status.dot)} /><span className={status.tone}>{status.label}</span></span>
+                        </span>
+                      </button>
+                      {/* A sibling rather than a child: the row above is a button, and a button inside a button is not a button. */}
+                      <TriggerErrorBadge triggerId={webhook.id} name={webhook.name} source="webhook" />
+                    </div>
                   );
                 })}
               </nav>

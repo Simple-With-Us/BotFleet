@@ -8724,13 +8724,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ? json(res, 200, { ok: true })
         : json(res, 404, { error: "no such routine" });
     }
-    // Acknowledge the whole unseen-failure backlog in one call.  A trigger
-    // that has been failing for a week leaves hundreds of old failures that
-    // cannot each be clicked in the calendar, and a badge that cannot be
-    // cleared stops being read.  Acknowledged runs keep their status and
-    // history; the next failure raises the count again.
+    // Acknowledge the unseen-failure backlog, or just one trigger's share of
+    // it when a per-trigger badge is cleared.  A trigger that has been failing
+    // for a week leaves hundreds of old failures that cannot each be clicked
+    // in the calendar, and a badge that cannot be cleared stops being read.
+    // Acknowledged runs keep their status and history; the next failure raises
+    // the count again.
     if (path === "/api/routine-runs/seen" && method === "POST") {
-      const { acknowledged, runs } = routines!.markAllSeen();
+      const body = await readBody(req);
+      const triggerId = typeof body?.triggerId === "string" ? body.triggerId : undefined;
+      const triggerSource = body?.triggerSource === "webhook" || body?.triggerSource === "resource" ? body.triggerSource : undefined;
+      const { acknowledged, runs } = routines!.markAllSeen({ ...(triggerId ? { triggerId } : {}), ...(triggerSource ? { triggerSource } : {}) });
       return json(res, 200, { acknowledged, runs });
     }
     const runMatch = path.match(/^\/api\/routine-runs\/([\w-]+)\/(cancel|seen)$/);

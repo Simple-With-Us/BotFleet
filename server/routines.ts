@@ -904,7 +904,7 @@ export class RoutineManager {
     return { ...run };
   }
 
-  /** Acknowledge the whole unseen-failure backlog in one call.
+  /** Acknowledge the unseen-failure backlog, optionally for one trigger.
    *
    *  Clearing the badge one run at a time does not scale: a webhook that has
    *  been failing for a week leaves hundreds of old failures that no longer
@@ -912,12 +912,22 @@ export class RoutineManager {
    *  them today is to click every one in the calendar.  Acknowledging is not
    *  deleting — every run keeps its status, error, and history, it just stops
    *  being unread.  A failure that happens after this call arrives with no
-   *  `seenAt` of its own, so the next real error still raises the badge. */
-  markAllSeen(): { acknowledged: number; runs: RoutineRun[] } {
+   *  `seenAt` of its own, so the next real error still raises the badge.
+   *
+   *  `triggerId` narrows the sweep to one webhook or resource trigger so a
+   *  per-trigger badge clears only its own failures.  It matches the same
+   *  `webhookId` field the client's `triggerAttentionKey` groups on, and
+   *  `triggerSource` disambiguates: both kinds of run carry the trigger id in
+   *  `webhookId`, so without the source a webhook and a resource trigger
+   *  sharing an id would each clear the other's badge.  A scheduled routine
+   *  has no `webhookId`, so a trigger sweep never touches one by accident. */
+  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): { acknowledged: number; runs: RoutineRun[] } {
     const seenAt = this.now();
     const acknowledged: RoutineRun[] = [];
     for (const run of this.runs) {
       if (!ATTENTION_STATUSES.has(run.status) || run.seenAt) continue;
+      if (filter.triggerId && run.webhookId !== filter.triggerId) continue;
+      if (filter.triggerSource && run.triggerSource !== filter.triggerSource) continue;
       run.seenAt = seenAt;
       acknowledged.push({ ...run });
     }
