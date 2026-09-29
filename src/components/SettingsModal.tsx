@@ -1511,16 +1511,16 @@ export function SettingsModal() {
                   id="setting-connections-composio"
                   className={highlightClass("setting-connections-composio")}
                   title="Connections"
-                  subtitle={"Connected apps use a connected-apps service when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
+                  subtitle={"Connected apps use a connected-apps service via Composio when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
                 >
                   <div className="flex flex-col gap-4">
                     {state.config?.composio.mode === "managed" ? (
                       <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
-                        Connected apps service is ready
+                        Connected apps service via Composio is ready
                       </div>
                     ) : state.config?.composio.managedSetup?.status === "failed" ? (
                       <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
-                        {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
+                        {state.config.composio.managedSetup.message ?? "Connected apps via Composio could not be set up."}
                       </div>
                     ) : null}
                     <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
@@ -1549,7 +1549,7 @@ export function SettingsModal() {
                     </div>
                     <div id="setting-connections-selfhost-composio" className={highlightClass("setting-connections-selfhost-composio")}>
                       <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
+                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps via Composio</summary>
                         <div className="mt-3">
                           <ApiKeyRow section="composio" />
                         </div>

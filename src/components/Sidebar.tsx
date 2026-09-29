@@ -3069,11 +3069,11 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         <button
           onClick={() => dispatch({ type: "togglePlugins", open: true })}
           className={cn("flex min-h-10 w-full items-center rounded-xl py-2 text-left hover:bg-raised/50", density === "icons" ? "justify-center px-2" : "gap-3 px-3")}
-          aria-label={density === "icons" ? "Connected Apps" : undefined}
-          title={density === "icons" ? "Connected Apps" : undefined}
+          aria-label={density === "icons" ? "Connected Apps via Composio" : undefined}
+          title={density === "icons" ? "Connected Apps via Composio" : undefined}
         >
           <Puzzle size={20} className="text-ink-secondary" />
-          <span className={cn("text-[14px] text-ink", density === "icons" && "hidden")}>Connected Apps</span>
+          <span className={cn("text-[14px] text-ink truncate", density === "icons" && "hidden")} title="Connected Apps via Composio">Connected Apps via Composio</span>
         </button>
         {density === "icons" && (
           <SidebarPhoneButton

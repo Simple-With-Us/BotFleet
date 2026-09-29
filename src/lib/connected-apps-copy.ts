@@ -12,7 +12,7 @@
 //      direction it runs, because the sibling restriction switch below it is
 //      lit in the *narrower* state.
 
-export const CONNECTED_APPS_HEADING = "Composio Connected Apps";
+export const CONNECTED_APPS_HEADING = "Connected Apps via Composio";
 
 export interface ConnectedAppsBlurbInput {
   /** App Settings → Connections has a working Composio service. */
