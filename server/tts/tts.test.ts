@@ -319,3 +319,26 @@ describe("built-in macOS voices", () => {
     );
   });
 });
+
+describe("Apple Personal Voice", () => {
+  it("identifies personal voice identifiers correctly", async () => {
+    const { isPersonalVoice } = await voice();
+    expect(isPersonalVoice("personal:com.apple.speech.voice.Jay")).toBe(true);
+    expect(isPersonalVoice("apple-personal:JayVoice")).toBe(true);
+    expect(isPersonalVoice("English_Graceful_Lady")).toBe(false);
+    expect(isPersonalVoice(undefined)).toBe(false);
+  });
+
+  it("reports voiceReady as false for server synthesis", async () => {
+    const { voiceReady } = await voice();
+    expect(voiceReady(cfg({ key: "k" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
+    expect(voiceReady(cfg({ provider: "system" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
+  });
+
+  it("throws clear error when server speak is attempted with personal voice", async () => {
+    const { speak } = await voice();
+    expect(() => speak(cfg({ key: "k" }), "Hello", "personal:com.apple.speech.voice.Jay")).toThrow(
+      "Apple Personal Voices speak on-device on authorized iOS companion devices and cannot be synthesized on the server.",
+    );
+  });
+});

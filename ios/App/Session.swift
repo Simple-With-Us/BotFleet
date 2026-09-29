@@ -1778,12 +1778,13 @@ final class Session: ObservableObject {
     }
 
     func stopVoice() {
-        let wasPlaying = voiceTask != nil || voicePlayer != nil
+        let wasPlaying = voiceTask != nil || voicePlayer != nil || PersonalVoiceService.shared.isSpeaking
         voiceGeneration = UUID()
         voiceTask?.cancel()
         voiceTask = nil
         voicePlayer?.stop()
         voicePlayer = nil
+        PersonalVoiceService.shared.stop()
         speakingMessageId = nil
         if wasPlaying { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
     }
@@ -1791,6 +1792,24 @@ final class Session: ObservableObject {
     func playVoice(_ message: Message, threadId: String) {
         if speakingMessageId == message.id { stopVoice(); return }
         stopVoice()
+        let botVoice = state.bot(forThread: threadId)?.voice
+        if let botVoice, PersonalVoiceContract.isPersonalVoice(botVoice) {
+            guard let text = message.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                speakingMessageId = nil
+                return
+            }
+            speakingMessageId = message.id
+            let generation = voiceGeneration
+            voiceTask = Task { [weak self] in
+                do {
+                    try await PersonalVoiceService.shared.speak(text: text, voiceId: botVoice)
+                } catch {
+                    if !Task.isCancelled { self?.recordActionError(error) }
+                }
+                if self?.voiceGeneration == generation { self?.stopVoice() }
+            }
+            return
+        }
         guard let client else { return }
         speakingMessageId = message.id
         let generation = voiceGeneration

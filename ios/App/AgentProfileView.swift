@@ -41,6 +41,7 @@ struct AgentProfileView: View {
     @State private var computers: Set<String>
     @State private var cwd: String
     @State private var baseline: ProfileFormSnapshot
+    @ObservedObject private var personalVoice = PersonalVoiceService.shared
 
     init(bot: Bot) {
         self.bot = bot
@@ -68,7 +69,9 @@ struct AgentProfileView: View {
     private var imageGenerationReady: Bool { config?.imageGen?.configured == true }
     private var voiceConfigured: Bool { config?.isTTSConfigured == true }
     private var hasWorkspaceDefaultVoice: Bool { config?.hasWorkspaceDefaultVoice == true }
-    private var selectedVoiceCanSpeak: Bool { config?.canSpeak(agentVoice: voice) == true }
+    private var isPersonalVoiceSelected: Bool { PersonalVoiceContract.isPersonalVoice(voice) }
+    private var hasAvailableVoices: Bool { voiceConfigured || !personalVoice.personalVoices.isEmpty || isPersonalVoiceSelected }
+    private var selectedVoiceCanSpeak: Bool { isPersonalVoiceSelected || config?.canSpeak(agentVoice: voice) == true }
     private var voiceProvider: VoiceProvider { config?.voiceProvider ?? .minimax }
 
     private var unavailableVoiceLabel: String {
@@ -76,6 +79,7 @@ struct AgentProfileView: View {
         case .minimax: return "MiniMax voice is not configured"
         case .elevenlabs: return "ElevenLabs is not configured"
         case .system: return "Built-in Mac voices are unavailable"
+        case .personal: return "Apple Personal Voice is not configured"
         case .unknown: return "Voice is not configured"
         }
     }
@@ -88,6 +92,8 @@ struct AgentProfileView: View {
             return "Add the shared ElevenLabs key in this agent's profile on the computer. The key is never returned to iOS."
         case .system:
             return "Built-in Mac voices need no key, and this computer has none available. Switch the voice engine in this agent's profile on the computer to keep using voice."
+        case .personal:
+            return "Apple Personal Voice speaks directly on this iOS device and requires authorization."
         case .unknown:
             return "Configure the selected voice engine in this agent's profile on the computer. Provider keys are never returned to iOS."
         }
@@ -101,6 +107,8 @@ struct AgentProfileView: View {
             return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the shared ElevenLabs key on your computer."
         case .system:
             return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the built-in Mac voices on your computer."
+        case .personal:
+            return "No workspace default voice is selected. Choose an Apple Personal Voice above to synthesize on this device."
         case .unknown:
             return "No workspace default voice is selected. Choose an agent-specific voice above; synthesis still uses the selected voice engine on your computer."
         }
@@ -264,60 +272,7 @@ struct AgentProfileView: View {
                 computersSection
                 workingDirectorySection
 
-                Section {
-                    if voiceConfigured {
-                        Picker("Voice", selection: $voice) {
-                            if hasWorkspaceDefaultVoice {
-                                Text("Workspace default").tag("")
-                            } else {
-                                Text("Choose an agent voice").tag("").disabled(true)
-                            }
-                            if !voice.isEmpty, !voices.contains(where: { $0.id == voice }) {
-                                Text("Current agent voice").tag(voice)
-                            }
-                            ForEach(voices) { option in
-                                VStack(alignment: .leading) {
-                                    Text(option.label)
-                                    if let detail = option.description { Text(detail) }
-                                }
-                                .tag(option.id)
-                            }
-                        }
-                        Toggle("Play on Mac", isOn: Binding(
-                            get: { speechDevices.contains("mac") },
-                            set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
-                        ))
-                        .disabled(!selectedVoiceCanSpeak)
-                        Toggle("Play on iPhone (while app is open)", isOn: Binding(
-                            get: { speechDevices.contains("iphone") },
-                            set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
-                        ))
-                        .disabled(!selectedVoiceCanSpeak)
-                        Button("Preview Voice", systemImage: "speaker.wave.2") {
-                            Task { await previewVoice() }
-                        }
-                        .disabled(busy || !selectedVoiceCanSpeak)
-
-                        if !hasWorkspaceDefaultVoice, voice.isEmpty {
-                            Label("Pick a voice for this agent before enabling speech.", systemImage: "info.circle")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Label(unavailableVoiceLabel, systemImage: "speaker.slash")
-                            .foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("Voice")
-                } footer: {
-                    if !voiceConfigured {
-                        Text(unavailableVoiceGuidance)
-                    } else if !hasWorkspaceDefaultVoice {
-                        Text(missingDefaultVoiceGuidance)
-                    } else {
-                        Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
-                    }
-                }
+                voiceSection
 
                 Section("Speech to text") {
                     Label("Apple on-device dictation", systemImage: "waveform")
@@ -414,6 +369,14 @@ struct AgentProfileView: View {
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
+            }
+            .onChange(of: voice) { _, newVoice in
+                if PersonalVoiceContract.isPersonalVoice(newVoice) {
+                    if !speechDevices.contains("iphone") {
+                        speechDevices.insert("iphone")
+                    }
+                    speechDevices.remove("mac")
+                }
             }
         }
     }
@@ -599,6 +562,103 @@ struct AgentProfileView: View {
         }
     }
 
+    @ViewBuilder
+    private var voiceSection: some View {
+        Section {
+            if hasAvailableVoices {
+                Picker("Voice", selection: $voice) {
+                    voicePickerOptions
+                }
+                if personalVoice.authorizationStatus == .notDetermined {
+                    Button {
+                        Task {
+                            _ = await personalVoice.requestAuthorization()
+                        }
+                    } label: {
+                        Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                    }
+                }
+                if personalVoice.authorizationStatus == .denied || personalVoice.authorizationStatus == .unsupported {
+                    Text("Personal Voice access is disabled.  You can allow BotFleet in iOS Settings > Accessibility > Personal Voice.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Toggle("Play on Mac", isOn: Binding(
+                    get: { speechDevices.contains("mac") },
+                    set: { if $0 { speechDevices.insert("mac") } else { speechDevices.remove("mac") } }
+                ))
+                .disabled(!selectedVoiceCanSpeak || isPersonalVoiceSelected)
+                Toggle("Play on iPhone (while app is open)", isOn: Binding(
+                    get: { speechDevices.contains("iphone") },
+                    set: { if $0 { speechDevices.insert("iphone") } else { speechDevices.remove("iphone") } }
+                ))
+                .disabled(!selectedVoiceCanSpeak)
+                Button("Preview Voice", systemImage: "speaker.wave.2") {
+                    Task { await previewVoice() }
+                }
+                .disabled(busy || !selectedVoiceCanSpeak)
+
+                if !hasWorkspaceDefaultVoice, voice.isEmpty {
+                    Label("Pick a voice for this agent before enabling speech.", systemImage: "info.circle")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Label(unavailableVoiceLabel, systemImage: "speaker.slash")
+                    .foregroundStyle(.secondary)
+                if personalVoice.authorizationStatus == .notDetermined {
+                    Button {
+                        Task {
+                            _ = await personalVoice.requestAuthorization()
+                        }
+                    } label: {
+                        Label("Use Apple Personal Voice…", systemImage: "person.wave.2")
+                    }
+                }
+            }
+        } header: {
+            Text("Voice")
+        } footer: {
+            if isPersonalVoiceSelected {
+                Text("This agent speaks aloud using Apple Personal Voice directly on this device.  No audio or voice data is sent over the network.")
+            } else if !voiceConfigured {
+                Text(unavailableVoiceGuidance)
+            } else if !hasWorkspaceDefaultVoice {
+                Text(missingDefaultVoiceGuidance)
+            } else {
+                Text("The voice choice belongs to this agent. Workspace default uses the shared voice selected on your computer.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var voicePickerOptions: some View {
+        if hasWorkspaceDefaultVoice {
+            Text("Workspace default").tag("")
+        } else {
+            Text("Choose an agent voice").tag("").disabled(true)
+        }
+        if !voice.isEmpty,
+           !voices.contains(where: { $0.id == voice }),
+           !personalVoice.personalVoiceOptions.contains(where: { $0.id == voice }) {
+            Text(isPersonalVoiceSelected ? "Personal Voice (\(PersonalVoiceContract.rawIdentifier(voice)))" : "Current agent voice").tag(voice)
+        }
+        if !personalVoice.personalVoiceOptions.isEmpty {
+            Section("Apple Personal Voice") {
+                ForEach(personalVoice.personalVoiceOptions) { pv in
+                    Text(pv.label).tag(pv.id)
+                }
+            }
+        }
+        if !voices.isEmpty {
+            Section(personalVoice.personalVoiceOptions.isEmpty ? "Voices" : "Server & System Voices") {
+                ForEach(voices) { option in
+                    Text(option.label).tag(option.id)
+                }
+            }
+        }
+    }
+
     /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
     private static let maximumToolRoundsCap = 200
 
@@ -746,6 +806,15 @@ struct AgentProfileView: View {
         }
         busy = true
         defer { busy = false }
+        if PersonalVoiceContract.isPersonalVoice(voice) {
+            let sampleText = "Hello! This is a preview of your Personal Voice with BotFleet."
+            do {
+                try await PersonalVoiceService.shared.speak(text: sampleText, voiceId: voice)
+            } catch {
+                session.actionError = error.localizedDescription
+            }
+            return
+        }
         guard let data = await session.previewVoice(voice, for: current) else { return }
         do {
             let audioSession = AVAudioSession.sharedInstance()

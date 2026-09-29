@@ -1243,7 +1243,7 @@ struct MessageRow: View {
             }
 
             if message.role == .bot, message.kind == .text, senderBot != nil,
-               (message.audio?.isEmpty == false || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
+               (message.audio?.isEmpty == false || PersonalVoiceContract.isPersonalVoice(senderBot?.voice) || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
                 Button {
                     session.playVoice(message, threadId: chat.threadId)
                 } label: {
