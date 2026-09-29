@@ -1289,7 +1289,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         version,
         expiresAt: Date.now() + 30_000,
         result: new Promise<boolean>((resolve) => {
-          execCli(config.cli, ["--help"], { timeout: 3000, env }, (error, stdout) => {
+          execCli(config.cli, ["--help"], { timeout: 10000, env }, (error, stdout) => {
             resolve(!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout));
           });
         }),
@@ -1312,7 +1312,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Distinguish the causes here, where the cause is knowable.
       const spawnFailure = await new Promise<ReturnType<typeof describeSpawnFailure> | null>(
         (resolve) => {
-          execCli(config.cli, ["--version"], { timeout: 3000, env }, (error) => {
+          execCli(config.cli, ["--version"], { timeout: 10000, env }, (error) => {
             if (!error) return resolve(null);
             const failure = describeSpawnFailure(error as NodeJS.ErrnoException, config.cli);
             resolve(failure.setup ? failure : null);
@@ -1326,14 +1326,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       throw reason;
     };
 
+    let lastKnownVersion: string | null = null;
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      let version = await new Promise<string | null>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          const trimmed = err ? null : stdout.trim();
+          if (trimmed) {
+            lastKnownVersion = trimmed;
+            resolve(trimmed);
+          } else if (lastKnownVersion) {
+            resolve(lastKnownVersion);
+          } else {
+            resolve(null);
+          }
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      if (!version) {
+        if (lastKnownVersion) {
+          version = lastKnownVersion;
+        } else {
+          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        }
+      }
       if (!(await supportsStrictMcp(version, env))) {
         return {
           state: "unavailable",

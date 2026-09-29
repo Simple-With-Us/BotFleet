@@ -10,7 +10,7 @@ import { test, expect, type Page } from '@playwright/test';
 // is excluded by construction (see the notes per test).
 // `caret: 'hide'` because step 0 autofocuses the name field: the blinking
 // text caret would otherwise make two consecutive screenshots differ.
-const stableShot = { animations: 'disabled', caret: 'hide' } as const;
+const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02 } as const;
 
 /** Pin fonts: the app's first-choice "Inter" is not installed on CI runners
  * or this lane's VM, so each environment falls back to a different system

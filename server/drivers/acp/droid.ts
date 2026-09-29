@@ -213,6 +213,7 @@ const MODELS = {
     { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro" },
     { id: "glm-5.2", label: "GLM 5.2" },
     { id: "kimi-k3", label: "Kimi K3" },
+    { id: "grok-4.7", label: "Grok 4.7" },
     { id: "grok-4.6", label: "Grok 4.6" },
   ],
 };

@@ -370,7 +370,11 @@ export function ModelPicker({
             {(() => {
               const availableInstances = state.instances.filter((i) => {
                 if (i.enabled === false) return false;
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId) return false;
+                const isInstalledOrSubscription =
+                  i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
+                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId && !isInstalledOrSubscription) {
+                  return false;
+                }
                 if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
                 return true;
               });
