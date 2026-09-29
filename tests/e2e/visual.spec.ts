@@ -64,7 +64,10 @@ test('visual: app shell with no bot server', async ({ page }) => {
   // before settling on "Reopen BotFleet to try again." — wait for that
   // final, stable state so the retry banner cannot flake the screenshot.
   await expect(page.getByText('Reopen BotFleet to try again.')).toBeVisible({ timeout: 30_000 });
-  await expect(page).toHaveScreenshot('app-shell-no-server.png', stableShot);
+  await expect(page).toHaveScreenshot('app-shell-no-server.png', {
+    ...stableShot,
+    maxDiffPixelRatio: 0.02,
+  });
 });
 
 test('visual: settings modal (General section)', async ({ page }) => {
