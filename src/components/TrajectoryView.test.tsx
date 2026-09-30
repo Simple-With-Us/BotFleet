@@ -4,6 +4,9 @@
 // states.  Effects (fetching, the live tail, focus movement) do not run under
 // SSR; their logic lives in pure modules with their own tests
 // (trajectory.test.ts, runtime-feed.test.ts, thread-view.test.ts).
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -472,5 +475,32 @@ describe("re-rendering", () => {
     // no fetch under SSR: the first paint is the loading state
     expect(html).toContain("Loading steps");
     expect(renderToStaticMarkup(createElement(TrajectoryTimeline, { trajectory: build() }))).toContain('aria-label="Timeline"');
+  });
+});
+
+// ── the live tail (effects do not run under SSR, so pinned by source) ─
+describe("the live tail's wiring", () => {
+  const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "TrajectoryView.tsx"), "utf8").replace(/\r\n/g, "\n");
+
+  // The bot's busy flag flips right behind the turn's last events; a view that
+  // has heard "not busy" but not "turn.completed" draws the turn as interrupted.
+  it("delivers a turn starting or settling at once, not on the batch timer", () => {
+    expect(SRC).toContain('const settles = event.type === "turn.completed" || event.type === "runtime.error";');
+    expect(SRC).toContain('if (settles || event.type === "turn.started") batcher.flushNow();');
+  });
+
+  it("reads the log again when a turn settles, when the live tail overflows, and after a stream gap", () => {
+    expect(SRC).toContain("if (settles) reloadSoon(SETTLE_RELOAD_MS);");
+    expect(SRC).toContain("if (overflow) reloadSoon(BURST_RELOAD_MS);");
+    expect(SRC).toContain("subscribeRuntimeGap(() => reloadSoon(BURST_RELOAD_MS))");
+  });
+
+  it("reads the log again when the bot stops running without this tab having heard the turn end", () => {
+    expect(SRC).toContain("if (wasRunning.current && !running) reloadSoon(SETTLE_RELOAD_MS);");
+  });
+
+  it("answers the header's search request by focusing its own search box", () => {
+    expect(SRC).toContain("onTrajectorySearchRequest(() => {");
+    expect(SRC).toContain("ref={searchRef}");
   });
 });

@@ -65,6 +65,28 @@ describe("Popover markup", () => {
     );
   });
 
+  // a group of triggers (the Trajectory timeline's spans) makes ONE of them the
+  // tab stop and moves between the rest with the arrow keys
+  it("takes a tab order and data attributes for its trigger, so a group can rove", () => {
+    const html = renderToStaticMarkup(
+      createElement(Popover, {
+        title: "Read",
+        trigger: "x",
+        tabIndex: -1,
+        triggerData: { "data-span": "" },
+        children: createElement("p", null, "Body"),
+      }),
+    );
+    expect(html).toMatch(/<button[^>]*tabindex="-1"/);
+    expect(html).toMatch(/<button[^>]*data-span=""/);
+    // and leaves the trigger in the natural tab order when not asked
+    expect(render()).not.toContain("tabindex");
+  });
+
+  it("tells its owner when the trigger takes focus, so the owner can keep the tab stop there", () => {
+    expect(SRC).toContain("onTriggerFocus?.();");
+  });
+
   it("starts hidden until it has been measured, so it never flashes at 0,0", () => {
     expect(render({ defaultOpen: true })).toContain("visibility:hidden");
   });
