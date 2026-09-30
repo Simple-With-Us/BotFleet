@@ -7,6 +7,8 @@
 
 import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { ContextSource } from "../shared/context-injection.ts";
+import type { ItemIoCapture } from "../shared/item-io.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -84,6 +86,12 @@ export interface RuntimeEventBase {
   itemId?: string;
   requestId?: string;
   raw?: { source: string; payload: unknown };
+  /** The full input or output of this step, for the side store
+   * (`server/item-io-store.ts`).  Capture-only: `EventBus.publish` moves it
+   * into the store and strips it, so no subscriber, no wire frame and no
+   * event-log line ever carries it.  Already bounded by the driver
+   * (`shared/item-io.ts`); never redacted here — the store redacts. */
+  io?: ItemIoCapture;
 }
 
 export type TurnBillingMode = "actual" | "estimated";
@@ -195,6 +203,10 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    /** The harness put content in front of the model that the person did not
+     * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
+     * side store; `preview` is one redacted, clipped line. */
+    | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;

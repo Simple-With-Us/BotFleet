@@ -23,6 +23,7 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ContextInjectionRef } from "../../shared/context-injection";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -128,7 +129,19 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */

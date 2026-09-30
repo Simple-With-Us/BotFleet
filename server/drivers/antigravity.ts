@@ -52,6 +52,7 @@ import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -1158,6 +1159,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   itemId,
                   title: payload.tool_name,
                   ...toolFields(payload.tool_name, rawInput, { cwd: turn.cwd }),
+                  ...captureInput(rawInput),
                 });
               } else {
                 // Any state other than ACTIVE means the step is no longer
@@ -1173,6 +1175,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   payload.error ??
                   payload.content;
                 const detail = describeResult(rawDetail);
+                const outputIo = captureOutput(rawDetail);
                 const durationMs =
                   typeof payload.duration_seconds === "number" && Number.isFinite(payload.duration_seconds)
                     ? Math.round(payload.duration_seconds * 1000)
@@ -1186,6 +1189,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                     ok: true,
                     ...(detail ? { detail } : {}),
                     ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
                   });
                 } else if (payload.state === "ERROR") {
                   emit({
@@ -1196,6 +1200,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                     ok: false,
                     ...(detail ? { detail } : {}),
                     ...(durationMs ? { durationMs } : {}),
+                    ...outputIo,
                   });
                 }
               }

@@ -22,6 +22,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../../shared/item-io.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -1150,6 +1151,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   locations: u.locations,
                   cwd: turn.cwd,
                 }),
+                ...captureInput(u.rawInput),
               });
               break;
             }
@@ -1163,6 +1165,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   itemId: u.toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
+                  ...captureOutput(u.content ?? u.rawOutput),
                 });
               }
               break;

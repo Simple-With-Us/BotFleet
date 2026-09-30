@@ -19,6 +19,7 @@ import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 import type {
@@ -1083,6 +1084,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.id,
                   title: b.name,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
+                  ...captureInput(b.input),
                 });
               }
             }
@@ -1110,6 +1112,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemId: b.tool_use_id,
                   ok: !b.is_error,
                   detail: describeResult(b.content),
+                  ...captureOutput(b.content),
                 });
               }
             }

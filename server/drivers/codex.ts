@@ -40,6 +40,7 @@ import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { classifyResumeFailure, mayReplay, recoveryPromptFor } from "../resume-recovery.ts";
 import { appendNative } from "./native.ts";
@@ -51,6 +52,29 @@ const codexNonemptyString = z.string().min(1);
 
 // A resumed thread keeps the model it was started with, so changing the bot's
 // model cannot fix a retired one there — only a fresh thread or a rewind can.
+/** The part of a Codex item that is the step's INPUT: the command, the files
+ * it changes, the tool and its arguments, the search.  The item also carries
+ * its own outcome (status, output, exit code), which belongs to OUT, and its
+ * id, which is the key. */
+const CODEX_ITEM_OUTCOME_FIELDS = new Set([
+  "id",
+  "status",
+  "aggregatedOutput",
+  "output",
+  "result",
+  "error",
+  "exitCode",
+  "durationMs",
+]);
+
+function codexItemInput(item: Record<string, unknown>): Record<string, unknown> {
+  const input: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(item)) {
+    if (!CODEX_ITEM_OUTCOME_FIELDS.has(key)) input[key] = value;
+  }
+  return input;
+}
+
 function unknownModelMessage(resumed: boolean): string {
   return resumed
     ? "This conversation's Codex model isn't available.  Start a new thread or rewind."
@@ -524,6 +548,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 itemId: item.id,
                 title,
                 ...toolFields(title, item, { cwd: turn.cwd }),
+                ...captureInput(codexItemInput(item)),
               });
             }
             break;
@@ -547,6 +572,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 itemId: item.id,
                 ok: item.status !== "failed" && item.status !== "declined",
                 detail: describeResult(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
+                ...captureOutput(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
               });
             } else if (item.type === "reasoning") {
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: null });

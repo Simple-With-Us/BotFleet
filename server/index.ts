@@ -194,6 +194,7 @@ import {
   autoUpdateDue,
   DATA_DIR,
   EVENTS_DIR,
+  ITEM_IO_DIR,
   NATIVE_DIR,
 } from "./config.ts";
 import {
@@ -262,6 +263,16 @@ import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSn
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
+import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
+import { MAX_CONTEXT_INJECTIONS_PER_TURN } from "../shared/context-injection.ts";
+import {
+  draftFromReplay,
+  draftFromReply,
+  draftsFromPromptSections,
+  MemoryChangeGate,
+  recordContextInjections,
+  type InjectionDraft,
+} from "./context-injection.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
 import { formatListenInUse, isListenInUse, listenErrorDisposition } from "./harness-ports.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
@@ -514,7 +525,16 @@ const updateControl = createUpdateControl({
 // reads the newest few hundred lines.  Synchronous, behind the ownership
 // fence and long before `server.listen`, so no request ever waits on it, and
 // a stat-only no-op on every boot after the first.
-const transcriptDirs = { eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR };
+const transcriptDirs = { eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, ioDir: ITEM_IO_DIR };
+// Every per-thread log directory, for the places that delete a thread's logs.
+const TRANSCRIPT_LOG_DIRS = [EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR] as const;
+// What a step actually took and returned, and what the harness injected into
+// a prompt.  Bounded and fetched lazily (server/item-io-store.ts); the bus
+// files each driver's `io` capture here instead of forwarding it.
+const itemIoStore = new ItemIoStore({ dir: ITEM_IO_DIR });
+// MEMORY.md rides every turn; it is recorded as an injection when it first
+// appears and when it changes (server/context-injection.ts).
+const memoryChangeGate = new MemoryChangeGate();
 // HS7: errors.log's own cap, matching decision-log.ts's rotation so this
 // append-only audit file cannot grow forever like it used to.
 const ERRORS_LOG_MAX_BYTES = 4 * 1024 * 1024;
@@ -629,7 +649,7 @@ utilityParentPort?.on("message", (event) => {
   }
 });
 
-const bus = new EventBus();
+const bus = new EventBus(undefined, { itemIo: itemIoStore });
 export { bus };
 bus.attach(registry.instances());
 // The in-process permission broker.  A CLI engine asks for permission over
@@ -1728,6 +1748,15 @@ function redactStreamDelta(threadId: string, delta: string): string {
   return joined.startsWith(redactedTail) ? joined.slice(redactedTail.length) : "";
 }
 
+/** A thread this harness knows: a task of some bot, or a room's thread.  The
+ * inspector and the per-step input/output routes answer for nothing else. */
+function threadIsKnown(threadId: string): boolean {
+  return (
+    store.bots.some((b) => store.tasks(b.id).some((t) => t.threadId === threadId)) ||
+    Boolean(store.groupByThread(threadId))
+  );
+}
+
 function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
   switch (event.type) {
     case "content.delta": {
@@ -1769,6 +1798,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
     case "runtime.error": {
       const message = redactSecretsInText(event.message);
       return message === event.message ? event : { ...event, message };
+    }
+    case "context.injected": {
+      // built redacted already; the wire never has to trust that
+      const preview = redactSecretsInText(event.preview);
+      return preview === event.preview ? event : { ...event, preview };
     }
     default:
       return event;
@@ -2814,6 +2848,8 @@ bus.subscribe((event: RuntimeEvent) => {
               spoken: existing?.spoken,
               target: existing?.target,
               kind: existing?.kind,
+              itemId: existing?.itemId,
+              turnId: existing?.turnId,
               // a step's own words about what came back; only worth the row
               // when it failed, or when nothing named the target
               detail: event.detail ?? existing?.detail,
@@ -2857,6 +2893,11 @@ bus.subscribe((event: RuntimeEvent) => {
             spoken: narrateTool(name) ?? undefined,
             target: event.target,
             kind: event.toolKind,
+            // the keys that find this step's full input and output in the
+            // side store when its row is opened (server/item-io-store.ts);
+            // short ids, never the payload
+            ...(event.itemId ? { itemId: event.itemId } : {}),
+            ...(event.turnId ? { turnId: event.turnId } : {}),
           },
         });
         if (event.itemId) {
@@ -4669,6 +4710,47 @@ async function startTurn(
         autoApprove: bot.autoApprove === true,
         unattended: isUnattended(bot.id),
       };
+      // What the harness put in front of the model that the person did not
+      // type: the bot's memory, the skills and playbooks this message
+      // selected, the automation note, a teammate nudge, a quoted reply, and
+      // a replayed conversation when the engine joined mid-thread.  Recorded
+      // BEFORE the turn starts so the transcript row lands under the message
+      // that caused it, ahead of anything the bot does.
+      //
+      // Deliberately not recorded: the standing sections (identity, computer,
+      // connected apps, recall, tool budget, team, credentials, routines,
+      // section context, owner notes, skills index) are the bot's definition
+      // and identical every turn, so a row per turn would bury the ones that
+      // explain a change.  Recall is a TOOL the model calls — its results are
+      // tool output, already a step with its own input and output.  Attached
+      // files are tags in the message the person typed.  Webhook and resource
+      // payloads are the stored `system` message.  Steering lines are typed by
+      // the person.  Compaction is the provider CLI's own and never passes
+      // through the harness.
+      {
+        const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
+        const drafts: InjectionDraft[] = draftsFromPromptSections(prompt.sections).filter(
+          (draft) => draft.source !== "memory" || memoryChangeGate.changed(threadId, draft.text),
+        );
+        const replay = draftFromReplay(turnText, replyBase, rewound ? "rewind" : "handoff");
+        if (replay) drafts.push(replay);
+        const quoted = draftFromReply(replyBase, text);
+        if (quoted) drafts.push(quoted);
+        recordContextInjections(
+          {
+            publish: (event) => bus.publish(event),
+            attach: (refs) => {
+              // accumulate: a model fallback dispatches the same message
+              // again, and what the first engine was given still happened
+              const earlier = store.messagesFor(threadId).find((m) => m.id === userMessage.id)?.contextInjections ?? [];
+              store.patchMessage(threadId, userMessage.id, {
+                contextInjections: [...earlier, ...refs].slice(-MAX_CONTEXT_INJECTIONS_PER_TURN),
+              });
+            },
+          },
+          { threadId, provider: instance.driverKind, providerInstanceId: instance.instanceId, drafts },
+        );
+      }
       // Bind before sendTurn so assistant_text emitted during the launch
       // still has a chat id.  The pending key is migrated onto the
       // provider turnId once sendTurn returns.
@@ -9894,7 +9976,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // The thread is gone from the store, so its logs have nothing left to
       // name them (server/transcript-retention.ts).  A task that MOVED keeps
       // its thread id and never reaches this branch.
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
       const fresh = groupWithThread(updated);
       broadcast({ kind: "group", group: fresh });
       return json(res, 200, { group: fresh });
@@ -10074,7 +10156,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Both generations and any temp file, for every task this room had: a
       // `.ndjson.1` or a killed trim's `.tmp` left behind would outlive the
       // room it belonged to (server/transcript-retention.ts).
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, threadIds);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, threadIds);
       return json(res, 200, { ok: true });
     }
     m = path.match(/^\/api\/groups\/([\w-]+)\/messages$/);
@@ -10673,7 +10755,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // every other task's transcript on disk forever, which was already true
       // on `main` for the single generation it knew about.  Same set
       // `store.deleteBot` uses to drop the message records.
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, botThreadIds);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, botThreadIds);
       return json(res, 200, { ok: true });
     }
 
@@ -11326,7 +11408,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // their thread id — the source thread id names nothing afterwards and
         // its logs would sit on disk forever.  The target keeps its own
         // (server/transcript-retention.ts).
-        for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+        for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
         broadcast({ kind: "bot", bot: botWithThread(merged) });
         return json(res, 200, { bot: botWithThread(merged) });
       }
@@ -11406,7 +11488,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 400, { error: "a bot keeps at least one task" });
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
       const fresh = botWithThread(updated);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 200, { bot: fresh });
@@ -11880,10 +11962,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/threads\/([\w-]+)\/events$/);
     if (m && method === "GET") {
       const threadId = m[1];
-      const known =
-        store.bots.some((b) => store.tasks(b.id).some((t) => t.threadId === threadId)) ||
-        Boolean(store.groupByThread(threadId));
-      if (!known) return json(res, 404, { error: "no such thread" });
+      if (!threadIsKnown(threadId)) return json(res, 404, { error: "no such thread" });
       const rawLimit = url.searchParams.get("limit");
       const parsedLimit = rawLimit === null ? undefined : Number(rawLimit);
       if (parsedLimit !== undefined && (!Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
@@ -11900,6 +11979,31 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         200,
         readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit, runtimeOnly: view === "trajectory" }),
       );
+    }
+
+    // ── one step's full input and output, fetched when its row is opened ──
+    // The transcript keeps a headline per step; the whole payload lives in a
+    // bounded per-thread side store (server/item-io-store.ts).  Same gate as
+    // the events route above: the thread must be one this harness knows.  The
+    // answer is already redacted with the wire's pass, cut to 32 KB a field,
+    // and says when it was cut.  A step recorded before the store existed, or
+    // one that rotated out, is a 404 — the row says so rather than guessing.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/items\/([^/]+)\/io$/);
+    if (m && method === "GET") {
+      const threadId = m[1]!;
+      if (!threadIsKnown(threadId)) return json(res, 404, { error: "no such thread" });
+      let itemId: string;
+      try {
+        itemId = decodeURIComponent(m[2]!);
+      } catch {
+        return json(res, 400, { error: "item id is not valid" });
+      }
+      if (!itemId || itemId.length > ITEM_ID_MAX_LENGTH) return json(res, 400, { error: "item id is not valid" });
+      const turnId = url.searchParams.get("turnId");
+      if (turnId !== null && !/^[\w.:-]{1,200}$/.test(turnId)) return json(res, 400, { error: "turnId is not valid" });
+      const io = await itemIoStore.read(threadId, itemId, turnId ?? undefined);
+      if (!io) return json(res, 404, { error: "no input or output was recorded for this step" });
+      return json(res, 200, io);
     }
 
     // ── the fleet-wide authorization decision log ──
@@ -14044,7 +14148,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // The native protocol tee (server/drivers/native.ts) is queued the same
     // way, so it is drained here too.
     const graceExpired = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref?.());
-    const drainedAndSettled = Promise.all([cancelled, telemetry.dispose(), bus.flush(), flushNativeTee()])
+    const drainedAndSettled = Promise.all([cancelled, telemetry.dispose(), bus.flush(), itemIoStore.flush(), flushNativeTee()])
       // The interrupts can queue their closing records after the first drain
       // began; drain once more so the reading below sees the whole turn.
       .then(() => bus.flush())
