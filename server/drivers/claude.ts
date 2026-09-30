@@ -458,6 +458,39 @@ function firstText(content: unknown): string {
   return "";
 }
 
+// ── model rejection ─────────────────────────────────────────────────────
+// When the CLI cannot use the requested model id it does not fail the process.
+// It answers with a synthetic assistant frame (`model: "<synthetic>"`, zero
+// usage) whose top-level `error` is "model_not_found" and whose text reads
+// "There's an issue with the selected model (...)", then a result frame with
+// `is_error: true`, `terminal_reason: "api_error"` and `api_error_status: 404`.
+// Forwarded as an ordinary assistant reply, that text counted as real output:
+// the fallback walk stopped on the dead entry and the transcript filled with
+// the CLI's own apology (see selectTurnFallback in model-fallback.ts).
+//
+// The structural markers decide.  The text only backs them up for a CLI that
+// drops the `error` field, and only for a short, synthetic, zero-output frame,
+// so a real answer that happens to open with these words is not swallowed.
+const MODEL_REJECTION_ERROR = "model_not_found";
+const MODEL_REJECTION_TEXT = /^There's an issue with the selected model\b/;
+const MODEL_REJECTION_TEXT_MAX = 400;
+
+export function isModelRejectionFrame(frame: any, text: string): boolean {
+  if (frame?.error === MODEL_REJECTION_ERROR || frame?.message?.error === MODEL_REJECTION_ERROR) return true;
+  const message = frame?.message;
+  const synthetic = message?.model === "<synthetic>" || !(Number(message?.usage?.output_tokens) > 0);
+  const trimmed = text.trim();
+  return synthetic && trimmed.length > 0 && trimmed.length < MODEL_REJECTION_TEXT_MAX && MODEL_REJECTION_TEXT.test(trimmed);
+}
+
+function modelRejectionMessage(cliText: string, requested: string | null | undefined): string {
+  // The CLI names the id it rejected in parentheses; the request is the
+  // fallback for a frame that carried no text.
+  const named = /\(([^()\s]{1,120})\)/.exec(cliText)?.[1] ?? requested ?? null;
+  const subject = named ? `the model ${named}` : "the selected model";
+  return `Claude can't use ${subject}.  It may not exist, or this account may not have access to it.  Pick another model in Settings.`;
+}
+
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "Claude", supportsMultipleInstances: true },
@@ -528,6 +561,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
          *  tools the turn already ran (E2).  Unlike sawStreamDelta, which is
          *  a per-frame dedup hint and resets after each assistant frame. */
         producedOutput: boolean;
+        /** Set when the CLI answered with a model-rejection frame: the
+         *  message already surfaced as an error, and the result frame that
+         *  follows settles the turn `unknown_model`. */
+        modelRejection?: string;
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -1013,6 +1050,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            if (session.turn && isModelRejectionFrame(o, text)) {
+              // Not an assistant reply: an error the turn failed on.  It must
+              // reach the transcript as an error row, never as bot text, so
+              // the failover reads "nothing produced" and walks on, and the
+              // next engine does not inherit the apology as history.
+              const message = modelRejectionMessage(text, session.turn.input.model);
+              session.turn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+              break;
+            }
             if (text.trim()) {
               if (session.turn) session.turn.producedOutput = true;
               // fallback delta for CLIs/paths that never streamed the block
@@ -1087,11 +1134,29 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // (the Messages API's own field: end_turn, tool_use, ...) is the
             // right label for a normal completion and stays primary there.
             const isError = o.is_error === true;
-            const stopReason = isError
-              ? (o.terminal_reason ?? o.stop_reason ?? null)
-              : (o.stop_reason ?? o.terminal_reason ?? null);
+            // A rejected model id: the frame above named it, or the result
+            // alone reports a 404 before any output.  `unknown_model` is what
+            // retry.ts already classifies as terminal, and what the failover
+            // reads to mark this (bot, model) pair as rejected.
+            const liveTurn = session.turn;
+            const modelRejected =
+              Boolean(liveTurn?.modelRejection) ||
+              (isError && o.api_error_status === 404 && !liveTurn?.producedOutput);
+            if (modelRejected && liveTurn && !liveTurn.modelRejection) {
+              const message = modelRejectionMessage(
+                typeof o.result === "string" && o.result.length < MODEL_REJECTION_TEXT_MAX ? o.result : "",
+                liveTurn.input.model,
+              );
+              liveTurn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+            }
+            const stopReason = modelRejected
+              ? "unknown_model"
+              : isError
+                ? (o.terminal_reason ?? o.stop_reason ?? null)
+                : (o.stop_reason ?? o.terminal_reason ?? null);
             settle(
-              !isError,
+              !isError && !modelRejected,
               stopReason,
               o.total_cost_usd ?? null,
               o.usage

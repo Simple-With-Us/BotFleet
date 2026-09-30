@@ -101,11 +101,14 @@ import {
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
   sliceIsShortProviderError,
+  turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
   BOOT_RECOVERY_NOTICE,
   turnProducedAssistantOutput,
   unattendedModelDowngrade,
+  type TurnFallbackPick,
 } from "./model-fallback.ts";
+import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -2564,6 +2567,121 @@ const localVmStartupProbe = (async () => {
   }
 })();
 
+/** Start the fail-over turn the completion fold picked, and keep walking the
+ *  saved chain when that turn cannot even start.
+ *
+ *  A turn that starts and then fails settles through `turn.completed`, which
+ *  the fold reads to pick the next entry.  A turn that never starts does not:
+ *  `startTurn` throws before dispatch (the instance is gone, the effort is not
+ *  offered) or reports a dispatch failure through `onDispatchError`, and in
+ *  both cases no `turn.completed` follows.  That used to end the walk in
+ *  silence, on a "Fell over to X" notice and an idle bot, with only a
+ *  `console.error` to say why.  Here each such failure is shown in the
+ *  transcript and the walk moves to the next usable entry; a chain with
+ *  nothing left says so and fails the routine run that was waiting on it.
+ *
+ *  The retried turn is a continuation of whatever dispatched the one that just
+ *  fell over: a webhook or resource turn stays unattended, and its
+ *  automationSource travels with it, so a retry never re-titles the task and
+ *  never lets startTurn's default branch call clearUnattended and open the door
+ *  for an autoApprove or always-allow grant mid-fallback. */
+async function launchFallbackTurn(input: {
+  botId: string;
+  threadId: string;
+  userMessage: Message;
+  pick: TurnFallbackPick;
+  chain: ModelSelection[] | undefined;
+  runOn: RoutineRunOn | undefined;
+}): Promise<void> {
+  const { botId, threadId, userMessage, chain, runOn } = input;
+  const key = `${botId}:${threadId}`;
+  const text = userMessage.text || "";
+  const note = (name: string) =>
+    store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name, ok: true, kind: "notice" } });
+
+  const launch = async (pick: TurnFallbackPick): Promise<void> => {
+    const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.model, effort: pick.effort };
+    // Both failure shapes arrive here once.  Whichever reports first wins, so a
+    // dispatch error that also throws cannot advance the walk twice.
+    let advanced = false;
+    const advance = (reason: string, shownAlready = false): void => {
+      if (advanced) return;
+      advanced = true;
+      const why = redactSecretsInText(reason).slice(0, 300);
+      console.error(`fallback startTurn failed for ${botId} on ${pick.instanceId}/${pick.model}: ${why}`);
+      // A dispatch failure already put its own error row in the transcript;
+      // a throw before dispatch did not, so it is told here.
+      if (!shownAlready) note(`Couldn't start ${pick.model} \u2014 ${why}`);
+      const following = stoppedTurns.delete(key)
+        ? undefined
+        : selectTurnFallback({
+            ok: false,
+            stopReason: null,
+            produced: false,
+            quotaOrCap: false,
+            fallbacks: chain,
+            used: pick.nextUsed,
+            current: selection,
+            botId,
+          });
+      if (!following) {
+        fallbackAttemptByTurn.delete(key);
+        note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
+        routines?.failThread(threadId, `Could not start ${pick.model}: ${why}`, "dispatch_failed");
+        return;
+      }
+      const nextSelection: ModelSelection = {
+        instanceId: following.instanceId,
+        model: following.model,
+        effort: following.effort,
+      };
+      fallbackAttemptByTurn.set(key, following.nextUsed);
+      store.patchBot(botId, { activeModelSelection: nextSelection });
+      store.patchTask(botId, threadId, { activeModelSelection: nextSelection });
+      const fresh = store.bot(botId);
+      if (fresh) broadcast({ kind: "bot", bot: wireBot(fresh) });
+      note(`Fell over to ${following.model}`);
+      void launch(following);
+    };
+    try {
+      await startTurn(botId, text, {
+        userMessage,
+        threadId,
+        modelSelection: selection,
+        automationSource: userMessage.automationSource,
+        unattended: isUnattended(botId),
+        runOn,
+        onDispatchError: (message) => advance(message, true),
+      });
+    } catch (error) {
+      if (isExternalCredentialPendingError(error)) {
+        pendingCredentialFallback.set(key, { botId, threadId, text, userMessage, selection });
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      // A newer turn (a queued send that drained first) owns the bot now, so
+      // replaying the failed one on another engine would talk over it.
+      if (store.bot(botId)?.busy) {
+        console.error(`fallback skipped for ${botId}: a newer turn owns the bot \u2014 ${message}`);
+        return;
+      }
+      if ((error as { pickUnusable?: unknown } | null)?.pickUnusable === true) {
+        advance(message);
+        return;
+      }
+      // Not about this engine (an update is quiescing, providers are
+      // reloading): every other entry would be refused the same way, so show
+      // why the turn ended instead of walking the whole chain into it.
+      const why = redactSecretsInText(message).slice(0, 300);
+      console.error(`fallback startTurn failed for ${botId}: ${why}`);
+      fallbackAttemptByTurn.delete(key);
+      note(`Couldn't retry this turn on ${pick.model} \u2014 ${why}`);
+      routines?.failThread(threadId, `Could not retry on ${pick.model}: ${why}`, "dispatch_failed");
+    }
+  };
+  await launch(input.pick);
+}
+
 bus.subscribe((event: RuntimeEvent) => {
   const localVmTarget = localVmThreadTargets.anyOnThread(event.threadId);
   if (localVmTarget) {
@@ -3055,6 +3173,8 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       let fallbackUserMessage: Message | undefined;
       let fallbackSelection: ModelSelection | undefined;
+      let fallbackPick: TurnFallbackPick | undefined;
+      let fallbackChain: ModelSelection[] | undefined;
       let deferredAutoFallback = false;
       let waitedForProviderReload = false;
       const fallbackHealthReloadGeneration = providerReloadGeneration;
@@ -3079,12 +3199,23 @@ bus.subscribe((event: RuntimeEvent) => {
         const quotaText = (quotaEvidence?.text ?? reply) || lastMsgText;
         const quotaInfo = parseQuotaResetTime(quotaText, Date.now(), quotaOrCap);
         const textIsCandidateForQuota = !event.ok || Boolean(quotaEvidence);
-        const isTextError = structuredQuotaOrCap === true || Boolean(quotaEvidence) || sliceIsShortProviderError(afterUser);
+        // A provider that rejected the model id answered with nothing the
+        // person asked for: it is a failure to walk past, never a reply that
+        // ends the walk on the dead entry.  The driver reports it structurally
+        // (`unknown_model`); the anchored text check is the backstop.  Only a
+        // turn that already failed is ever read this way.
+        const modelRejection = turnModelRejectionEvidence(afterUser, Boolean(event.ok), event.stopReason);
+        const isTextError =
+          structuredQuotaOrCap === true ||
+          Boolean(quotaEvidence) ||
+          sliceIsShortProviderError(afterUser) ||
+          Boolean(modelRejection);
         const isOk = Boolean(event.ok) && !isTextError;
         if (isOk) {
           fallbackAttemptByTurn.delete(fallbackKey);
           pendingMemberFallback.delete(event.threadId);
           quotaCooldowns.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
+          modelRejections.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         } else if (
           actualSelection.instanceId &&
           // A hard-ceiling timeout and an idle stall are both a forcibly
@@ -3104,6 +3235,17 @@ bus.subscribe((event: RuntimeEvent) => {
             error: quotaText || "quota exceeded",
             recordedAt: Date.now(),
             source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+          });
+        }
+        // Remember the rejection so the next turn, and the next fail-over,
+        // skip this entry instead of spending a spawn to hear it again.  Not
+        // a quota cooldown: that would show as a quota hit in Usage settings.
+        if (modelRejection && actualSelection.instanceId && actualSelection.model) {
+          modelRejections.record({
+            botId: fallbackBot.id,
+            instanceId: actualSelection.instanceId,
+            model: actualSelection.model,
+            reason: redactSecretsInText(modelRejection.text),
           });
         }
         const used = fallbackAttemptByTurn.get(fallbackKey) ?? 0;
@@ -3145,6 +3287,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // next engine.  Consume the latch BEFORE selectTurnFallback, because
         // the driver reports this settle as `exit_before_result` and that
         // gate would otherwise wave the failover straight through.
+        fallbackChain = chain;
         const userStopped = stoppedTurns.delete(fallbackKey);
         const next = userStopped ? undefined : selectTurnFallback({
           ok: isOk,
@@ -3170,6 +3313,7 @@ bus.subscribe((event: RuntimeEvent) => {
         }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
           const { nextUsed, instanceId, model, effort } = next;
+          fallbackPick = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
           fallbackSelection = { instanceId, model, effort };
           store.patchBot(fallbackBot.id, { activeModelSelection: fallbackSelection });
@@ -3266,37 +3410,14 @@ bus.subscribe((event: RuntimeEvent) => {
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
         store.patchBot(bot.id, { unread: true, inflightThreadId: undefined });
-        if (!group && fallbackSelection && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
-          const userMsg = fallbackUserMessage;
-          const fallbackBotId = bot.id;
-          // The retried turn is a continuation of whatever dispatched the
-          // one that just fell over — a webhook/resource turn stays
-          // unattended, and its automationSource travels with it so a
-          // retry never re-titles the task or, more importantly, never
-          // lets startTurn's default branch call clearUnattended and open
-          // the door for an autoApprove/always-allow grant mid-fallback.
-          void startTurn(fallbackBotId, userMsg.text || "", {
-            userMessage: userMsg,
+        if (!group && fallbackPick && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
+          void launchFallbackTurn({
+            botId: bot.id,
             threadId: event.threadId,
-            modelSelection: fallbackSelection,
-            automationSource: userMsg.automationSource,
-            unattended: isUnattended(fallbackBotId),
-            // the destination travels with the turn: a cloud routine or
-            // webhook falls over to another engine in the same cloud, never
-            // silently back to the local bot (E5)
+            userMessage: fallbackUserMessage,
+            pick: fallbackPick,
+            chain: fallbackChain,
             runOn: settledOwner?.computerInputs?.runOn,
-          }).catch((error) => {
-            if (isExternalCredentialPendingError(error)) {
-              pendingCredentialFallback.set(`${fallbackBotId}:${event.threadId}`, {
-                botId: fallbackBotId,
-                threadId: event.threadId,
-                text: userMsg.text || "",
-                userMessage: userMsg,
-                selection: fallbackSelection!,
-              });
-              return;
-            }
-            console.error(`fallback startTurn failed for ${fallbackBotId}:`, error);
           });
         } else if (routineRun?.status !== "failed") {
           // the frame carries the bot's avatar so every desktop client can
@@ -3451,7 +3572,8 @@ async function autoFallbackChain(
       // codex and ahead of openaiCompat, per the PR 10 owner decision.
       priority: AUTO_FALLBACK_PRIORITY,
       isCooling: (candidateBotId, instanceId, model) =>
-        Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)),
+        Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)) ||
+        modelRejections.isRejected(candidateBotId, instanceId, model),
     });
   } catch (error) {
     console.error("automatic fallback health probe failed:", error);
@@ -3821,7 +3943,9 @@ async function startTurn(
           ? "the Cloud VM runner is unavailable — configure Box in App Settings"
           : `provider instance "${selection.instanceId}" is unavailable — pick another model in settings`,
       ),
-      { status: 409 },
+      // `pickUnusable`: this engine cannot take the turn, but another may.
+      // The fail-over walk reads it to move on rather than give up.
+      { status: 409, pickUnusable: true },
     );
   }
   const instanceId = instance.instanceId;
@@ -3871,7 +3995,7 @@ async function startTurn(
     } else {
       throw Object.assign(
         new Error(`effort "${effort}" is not offered by model "${model}" — choose another level in settings`),
-        { status: 409 },
+        { status: 409, pickUnusable: true },
       );
     }
   }
@@ -7483,6 +7607,9 @@ async function runProviderReload() {
   bus.detachAll();
   await registry.disposeAll();
   await registry.load(withInstanceKeyOverrides(instanceConfigs(cfg)));
+  // New credentials, a new CLI or an edited catalog may have made a rejected
+  // model available again; a mark from before the rebuild proves nothing.
+  modelRejections.clearWhere(() => true);
   // The fleet now exists on exactly these credentials — record that, so the
   // next comparison is against what was built rather than against whatever
   // `cfg` happened to hold when the comparison ran.
@@ -7520,6 +7647,7 @@ async function runInstanceProviderReload(
   settleInterruptedBots(affectedTurns);
   bus.detach(instanceId);
   const newLive = targetEntry ? await registry.reloadInstance(instanceId, targetEntry) : null;
+  modelRejections.clearInstance(instanceId);
   if (newLive) bus.attach([newLive]);
 }
 
@@ -12188,6 +12316,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // outlive the engine it was recorded against and immediately cap a
         // same-named replacement.
         quotaCooldowns.clearWhere((cooldown) => cooldown.instanceId === instanceId);
+        modelRejections.clearInstance(instanceId);
         resetPathCache();
         return json(res, 200, {
           ok: true,
@@ -13573,6 +13702,7 @@ routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
   enableQuotaCooldownPersist(join(DATA_DIR, "quota-cooldowns.json"));
+  enableModelRejectionPersist(join(DATA_DIR, "model-rejections.json"));
   enableDoomedDispatchPersist(join(DATA_DIR, "doomed-dispatches.json"));
   // OP3 / HS13: only spawn the CLI while at least one Antigravity instance
   // is actually in the fleet.  `instanceConfigs(cfg)` reads the SAME live,

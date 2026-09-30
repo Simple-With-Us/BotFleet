@@ -29,7 +29,13 @@ import type {
   SendTurnInput,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
+import {
+  decodeCodexSelection,
+  readCodexModelCatalogDetailed,
+  STATIC_CODEX_MODELS,
+  type CodexCatalogMemory,
+  type CodexProbeFailure,
+} from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
@@ -152,10 +158,29 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     };
     const catalogEnv = childEnv();
     let models = STATIC_CODEX_MODELS;
+    // Whether `models` ever held rows Codex itself answered with.  Once it
+    // has, a failed probe must not swap those for BotFleet's own fallback.
+    let modelsConfirmed = false;
+    const catalogMemory: CodexCatalogMemory = {};
+    let lastProbeFailure: CodexProbeFailure | null = null;
     const refreshModels = async () => {
       try {
-        const resolved = await readCodexModelCatalog(catalogEnv, fetch, config.cli);
-        if (resolved.options.length) models = resolved;
+        const { catalog, source } = await readCodexModelCatalogDetailed(catalogEnv, fetch, config.cli, {
+          memory: catalogMemory,
+          // The probe used to fail silently, so a timeout under host load
+          // looked the same as a CLI that answered with nothing.  Logged on a
+          // change only: describe runs often and one line per pass is noise.
+          onProbeFailure: (reason) => {
+            if (reason === lastProbeFailure) return;
+            lastProbeFailure = reason;
+            console.warn(`[codex:${instanceId}] model catalog probe failed (${reason}); serving the last known list`);
+          },
+        });
+        if (!catalog.options.length) return;
+        if (source === "static" && modelsConfirmed) return;
+        if (source === "live") lastProbeFailure = null;
+        models = catalog;
+        modelsConfirmed = source !== "static";
       } catch {
         // Keep the last usable catalog when a local provider is down.
       }

@@ -11,20 +11,48 @@ import { isEffortLevel, type EffortLevel, type ModelCatalog } from "../contracts
 import { killCliTree, spawnCli } from "../procs.ts";
 import { mergeLocalInject } from "./local-inject.ts";
 
+/** Chip shown on every row of the built-in fallback.  A list BotFleet wrote
+ *  down is not a list Codex confirmed, so the picker says so instead of
+ *  presenting the rows as current. */
+const UNVERIFIED_BADGE = "Unverified";
+const UNVERIFIED_BADGE_TITLE =
+  "Codex could not confirm its model list just now.\u00A0 This row comes from BotFleet's built-in fallback, so the model may not be available on your account.";
+
+const UNVERIFIED_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+
+function unverifiedRow(id: string, label: string): ModelCatalog["options"][number] {
+  return {
+    id,
+    label,
+    effortLevels: [...UNVERIFIED_LEVELS],
+    supportsEffort: true,
+    badge: UNVERIFIED_BADGE,
+    badgeTitle: UNVERIFIED_BADGE_TITLE,
+  };
+}
+
 /**
- * Compatibility rows used only when the installed Codex app-server cannot
- * provide its live catalog.  This list is a source fallback, not proof that
- * every row is available for the current account or transport.
+ * Compatibility rows used only when Codex cannot provide its catalog and no
+ * earlier answer is on hand (neither a live probe this run nor the CLI's own
+ * `models_cache.json`).  This list is a source fallback, not proof that every
+ * row is available for the current account or transport, so every row carries
+ * the "Unverified" chip.
+ *
+ * The ids are the ones the installed Codex reported as visible on
+ * 2026-09-30 (CLI 0.154.0).  `gpt-6-sol`, `gpt-6-luna` and
+ * `gpt-5.3-codex-spark` were listed here earlier but no Codex catalog
+ * offered them, so a turn dispatched to one of them would be rejected.  When
+ * a newer Codex serves them, the live catalog carries them without a BotFleet
+ * release; do not add them back on a guess.
  */
 export const STATIC_CODEX_MODELS: ModelCatalog = {
-  default: "gpt-6-luna",
+  default: "gpt-6-astra",
   options: [
-    { id: "gpt-6-astra", label: "GPT-6 Astra", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-6-sol", label: "GPT-6 Sol", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-6-luna", label: "GPT-6 Luna", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-5.5", label: "GPT-5.5", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
-    { id: "gpt-5.3-codex-spark", label: "GPT-5.3 Codex Spark", effortLevels: ["low", "medium", "high", "xhigh"], supportsEffort: true },
+    unverifiedRow("gpt-6-astra", "GPT-6 Astra"),
+    unverifiedRow("gpt-5.6-sol", "GPT-5.6 Sol"),
+    unverifiedRow("gpt-5.6-terra", "GPT-5.6 Terra"),
+    unverifiedRow("gpt-5.6-luna", "GPT-5.6 Luna"),
+    unverifiedRow("gpt-5.5", "GPT-5.5"),
   ],
 };
 
@@ -67,10 +95,15 @@ interface CodexAppServerModel {
  * use. This is the authoritative subscription catalog and changes more often
  * than BotFleet releases, so consume every page instead of hard-coding the
  * current set forever. */
+export type CodexProbeFailure = "timeout" | "rpc-error" | "write-failed" | "spawn-error" | "closed" | "empty";
+
 export function readCodexAppServerModelCatalog(
   cli: string,
   env: Record<string, string | undefined>,
   timeoutMs = 8_000,
+  /** Why the probe returned null.  The failure used to be silent, so a timeout
+   *  under host load could not be told from a CLI that answered with nothing. */
+  onFailure?: (reason: CodexProbeFailure) => void,
 ): Promise<ModelCatalog | null> {
   return new Promise((resolve) => {
     const child = spawnCli(cli, ["app-server"], {
@@ -85,11 +118,18 @@ export function readCodexAppServerModelCatalog(
     const cursors = new Set<string>();
     const pending = new Map<number, "initialize" | "models">();
 
-    const finish = (catalog: ModelCatalog | null) => {
+    const finish = (catalog: ModelCatalog | null, failure: CodexProbeFailure = "closed") => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       killCliTree(child);
+      if (!catalog) {
+        try {
+          onFailure?.(failure);
+        } catch {
+          /* a diagnostics hook must never break the probe */
+        }
+      }
       resolve(catalog);
     };
     const request = (method: string, params: unknown, kind: "initialize" | "models") => {
@@ -98,13 +138,13 @@ export function readCodexAppServerModelCatalog(
       try {
         child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
       } catch {
-        finish(null);
+        finish(null, "write-failed");
       }
     };
     const requestModels = (cursor: string | null) => {
       request("model/list", { cursor, limit: 100 }, "models");
     };
-    const timer = setTimeout(() => finish(null), timeoutMs);
+    const timer = setTimeout(() => finish(null, "timeout"), timeoutMs);
     timer.unref?.();
 
     child.stdout.setEncoding("utf8");
@@ -125,14 +165,14 @@ export function readCodexAppServerModelCatalog(
         if (!kind) continue;
         pending.delete(message.id);
         if (message.error) {
-          finish(null);
+          finish(null, "rpc-error");
           return;
         }
         if (kind === "initialize") {
           try {
             child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
           } catch {
-            finish(null);
+            finish(null, "write-failed");
             return;
           }
           requestModels(null);
@@ -177,7 +217,7 @@ export function readCodexAppServerModelCatalog(
           if (row.isDefault === true) defaultModel = row.id;
         }
         if (!options.length) {
-          finish(null);
+          finish(null, "empty");
           return;
         }
         finish({
@@ -186,8 +226,8 @@ export function readCodexAppServerModelCatalog(
         });
       }
     });
-    child.on("error", () => finish(null));
-    child.on("close", () => finish(null));
+    child.on("error", () => finish(null, "spawn-error"));
+    child.on("close", () => finish(null, "closed"));
     request("initialize", { clientInfo: { name: "botfleet", version: "1" } }, "initialize");
   });
 }
@@ -195,6 +235,68 @@ export function readCodexAppServerModelCatalog(
 export function codexHome(env: Record<string, string | undefined>): string {
   if (env.CODEX_HOME) return env.CODEX_HOME;
   return join(env.HOME || env.USERPROFILE || homedir(), ".codex");
+}
+
+/** Where an official catalog came from, best first.  Only `static` is
+ *  something BotFleet wrote down itself; the rest are answers Codex gave. */
+export type CodexCatalogSource = "live" | "last-good" | "codex-cache" | "static";
+
+/** Per-instance memory of the last catalog Codex itself answered with.  The
+ *  caller owns it, so two instances (or two tests) never share a list. */
+export interface CodexCatalogMemory {
+  lastGood?: ModelCatalog;
+}
+
+/** Visible rows from Codex's own `models_cache.json`: slug, display name and
+ *  reasoning efforts only, read-only.  The CLI refreshes this file itself
+ *  whenever it talks to the server, so it survives a harness restart and
+ *  answers when the app-server probe is too slow under host load.  Anything
+ *  that is not an explicit `visibility: "list"` row is left out, which drops
+ *  the hidden review and reserve rows. */
+export function readCodexModelsCache(env: Record<string, string | undefined>): ModelCatalog | null {
+  const raw = readText(join(codexHome(env), "models_cache.json"));
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const records = parsed && typeof parsed === "object" ? (parsed as { models?: unknown }).models : undefined;
+  if (!Array.isArray(records)) return null;
+  const options: ModelCatalog["options"] = [];
+  const seen = new Set<string>();
+  let defaultModel: string | null = null;
+  for (const record of records) {
+    if (!record || typeof record !== "object") continue;
+    const row = record as {
+      slug?: unknown;
+      display_name?: unknown;
+      visibility?: unknown;
+      supported_reasoning_levels?: unknown;
+    };
+    if (row.visibility !== "list" || typeof row.slug !== "string" || !MODEL_ID.test(row.slug) || seen.has(row.slug)) continue;
+    seen.add(row.slug);
+    let effortLevels: EffortLevel[] | undefined;
+    if (Array.isArray(row.supported_reasoning_levels)) {
+      effortLevels = row.supported_reasoning_levels
+        .map((level) =>
+          typeof level === "string"
+            ? level
+            : level && typeof level === "object"
+              ? ((level as { effort?: unknown }).effort as string)
+              : null,
+        )
+        .filter(isEffortLevel);
+    }
+    options.push({
+      id: row.slug,
+      label: typeof row.display_name === "string" && row.display_name.trim() ? row.display_name : row.slug,
+      ...(effortLevels !== undefined ? { effortLevels, supportsEffort: effortLevels.length > 0 } : {}),
+    });
+    defaultModel ??= row.slug;
+  }
+  return options.length ? { default: defaultModel ?? options[0].id, options } : null;
 }
 
 function unquote(raw: string): string {
@@ -374,13 +476,69 @@ async function probeProviderModels(
   }
 }
 
-/** Local slugs Codex already knows, plus the available official cloud rows. */
+export interface CodexCatalogRead {
+  catalog: ModelCatalog;
+  /** Where the OFFICIAL rows came from.  Local providers and injects are
+   *  merged on top whatever this says. */
+  source: CodexCatalogSource;
+}
+
+export interface CodexCatalogReadOptions {
+  /** Last good answer to fall back on; updated on every live answer. */
+  memory?: CodexCatalogMemory;
+  probeTimeoutMs?: number;
+  onProbeFailure?: (reason: CodexProbeFailure) => void;
+}
+
+/** Local slugs Codex already knows, plus the available official cloud rows.
+ *
+ *  The official rows come from the first of these that answers:
+ *    1. the installed app-server's `model/list` (live),
+ *    2. the last live answer this instance saw (`memory`),
+ *    3. Codex's own `models_cache.json`,
+ *    4. BotFleet's static rows, each marked Unverified.
+ *  A probe that fails under host load therefore never swaps a list Codex
+ *  confirmed for one BotFleet wrote down. */
+export async function readCodexModelCatalogDetailed(
+  env: Record<string, string | undefined> = process.env,
+  fetchImpl: typeof fetch = fetch,
+  cli?: string,
+  opts: CodexCatalogReadOptions = {},
+): Promise<CodexCatalogRead> {
+  let official: ModelCatalog | null = cli
+    ? await readCodexAppServerModelCatalog(cli, env, opts.probeTimeoutMs, opts.onProbeFailure)
+    : null;
+  let source: CodexCatalogSource = "live";
+  if (official) {
+    if (opts.memory) opts.memory.lastGood = official;
+  } else if (opts.memory?.lastGood) {
+    official = opts.memory.lastGood;
+    source = "last-good";
+  } else {
+    official = readCodexModelsCache(env);
+    source = "codex-cache";
+  }
+  if (!official) {
+    official = STATIC_CODEX_MODELS;
+    source = "static";
+  }
+  return { catalog: await mergeOfficialCatalog(official, env, fetchImpl), source };
+}
+
 export async function readCodexModelCatalog(
   env: Record<string, string | undefined> = process.env,
   fetchImpl: typeof fetch = fetch,
   cli?: string,
+  opts: CodexCatalogReadOptions = {},
 ): Promise<ModelCatalog> {
-  const official = (cli ? await readCodexAppServerModelCatalog(cli, env) : null) ?? STATIC_CODEX_MODELS;
+  return (await readCodexModelCatalogDetailed(env, fetchImpl, cli, opts)).catalog;
+}
+
+async function mergeOfficialCatalog(
+  official: ModelCatalog,
+  env: Record<string, string | undefined>,
+  fetchImpl: typeof fetch,
+): Promise<ModelCatalog> {
   const home = codexHome(env);
   const mainText = readText(join(home, "config.toml"));
   if (!mainText) return mergeLocalInject(official, env, fetchImpl);
