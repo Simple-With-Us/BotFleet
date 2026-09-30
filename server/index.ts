@@ -1660,11 +1660,6 @@ setInterval(() => {
   }
 }, SNOOZE_SWEEP_MS).unref?.();
 
-// One-time owner-directed move (every Sonnet and Luna becomes Latest) plus
-// the regular lineage pass, now that the registry has every engine's
-// catalog.  Later catalog refreshes and every dispatch run the regular pass.
-reconcileModelLineage({ ownerDirective: true });
-
 // ── message pages ──────────────────────────────────────────────────────
 // GET /api/bots hands back every bot with its entire transcript, which is
 // the right answer over loopback and the wrong one over a phone network:
@@ -2317,6 +2312,12 @@ const watchdog = new TurnWatchdog({
   },
 });
 watchdog.start();
+
+// One-time owner-directed move (every Sonnet and Luna becomes Latest) plus
+// the regular lineage pass, now that the registry has every engine's catalog
+// and the SSE broadcaster exists.  Later catalog refreshes and every
+// dispatch run the regular pass.
+reconcileModelLineage({ ownerDirective: true });
 
 async function reviewPermissionCard(args: {
   instance: ProviderInstance;
