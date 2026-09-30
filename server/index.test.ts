@@ -7674,16 +7674,56 @@ describe("POST /api/bots/apply-model-defaults (fixed fallback places)", () => {
     }
   });
 
-  it("appends a place past the end of a short chain instead of leaving a hole", async () => {
+  it("extends a short chain by one, and fills several places in turn", async () => {
     const id = await botWithChain("Place Short", "a");
     try {
-      const apply = await api("POST", "/api/bots/apply-model-defaults", {
-        slots: { fallbacks: [null, null, fallback("z")] },
+      // Fallback 2 on a bot with one fallback IS its Fallback 2.
+      const next = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y"), null] },
       });
-      expect(apply.status).toBe(200);
-      expect(await fallbacksOf(id)).toEqual(["a", "z"]);
+      expect(next.status).toBe(200);
+      expect(next.body.skipped.map((entry: { id: string }) => entry.id)).not.toContain(id);
+      expect(await fallbacksOf(id)).toEqual(["a", "y"]);
+
+      // Fallback 2 and 3 together leave nothing empty between them.
+      const both = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y2"), fallback("z")] },
+      });
+      expect(both.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y2", "z"]);
     } finally {
       await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("skips a bot whose chain would be left with a gap, names the empty place, and changes nothing on it", async () => {
+    // The Sentry finding on #737: a lone Fallback 3 on a bot with one fallback
+    // used to be pushed to the end, landing on Fallback 2.  The bot that can
+    // take it gets it; the bot that cannot keeps everything — its primary
+    // included — and is named with the reason.
+    const short = await botWithChain("Gap Short", "a");
+    const full = await botWithChain("Gap Full", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: {
+          primary: { instanceId: "fake", model: "new-primary" },
+          fallbacks: [null, null, fallback("z")],
+        },
+      });
+      expect(apply.status).toBe(200);
+      const skipped = apply.body.skipped.find((entry: { id: string }) => entry.id === short);
+      expect(skipped?.reason).toBe("Fallback 2 is empty, so Fallback 3 cannot be set");
+      expect(apply.body.skipped.map((entry: { id: string }) => entry.id)).not.toContain(full);
+
+      expect(await fallbacksOf(short)).toEqual(["a"]);
+      expect(await fallbacksOf(full)).toEqual(["a", "b", "z"]);
+      const bots = (await api("GET", "/api/bots?messages=0")).body.bots;
+      const modelOf = (id: string) => bots.find((b: { id: string }) => b.id === id).modelSelection.model;
+      expect(modelOf(short)).toBe("p");
+      expect(modelOf(full)).toBe("new-primary");
+    } finally {
+      await api("DELETE", `/api/bots/${short}`);
+      await api("DELETE", `/api/bots/${full}`);
     }
   });
 
