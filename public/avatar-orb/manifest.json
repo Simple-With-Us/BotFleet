@@ -1,0 +1,29 @@
+{
+  "packName": "avatar-orb",
+  "version": "1.0.0",
+  "author": "BotFleet",
+  "defaultSkin": "default",
+  "skins": [
+    "default"
+  ],
+  "format": "gif",
+  "resolution": "480x480",
+  "mapping": {
+    "resting": "resting",
+    "working": "working",
+    "thinking": "thinking",
+    "speaking": "speaking",
+    "listening": "listening",
+    "computer": "computer",
+    "error": "error",
+    "success": "success",
+    "confused": "confused",
+    "alerting": "alerting",
+    "searching": "searching",
+    "sending": "sending",
+    "receiving": "receiving",
+    "fleet": "fleet",
+    "tools": "tools",
+    "idle": "resting"
+  }
+}
