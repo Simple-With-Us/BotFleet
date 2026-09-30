@@ -11,6 +11,7 @@ import { Store, type BotRecord } from "./store.ts";
 import { lineageContextFor, modelNameFor } from "./model-lineage.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { STATIC_GROK_MODELS } from "./drivers/acp/grok.ts";
+import { STATIC_CODEX_MODELS } from "./drivers/codex-catalog.ts";
 import { OWNER_DIRECTED_LATEST } from "../shared/model-lineage.ts";
 
 const CODEX_LIVE = {
@@ -144,11 +145,9 @@ describe("Store.reconcileModelLineage", () => {
     seedBots([{ id: "b", modelSelection: { instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" } }]);
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
 
-    // The static fallback lists GPT-6 Luna, which this account cannot use.
-    codexModels = {
-      default: "gpt-6-luna",
-      options: ["gpt-6-astra", "gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.5", "gpt-5.3-codex-spark"].map((id) => ({ id, label: id })),
-    };
+    // BotFleet's built-in fallback is not the account's answer, so nothing
+    // resolves against it.
+    codexModels = STATIC_CODEX_MODELS;
     expect(reconcile(store)).toEqual([]);
     expect(store.bot("b")!.modelSelection.model).toBe("gpt-5.6-luna");
 
