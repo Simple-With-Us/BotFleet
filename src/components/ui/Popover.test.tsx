@@ -17,7 +17,13 @@ const G = POPOVER_ANCHOR_GAP;
 
 const render = (props: { defaultOpen?: boolean; titleAside?: string } = {}) =>
   renderToStaticMarkup(
-    createElement(Popover, { title: "Session Statistics", trigger: "2 turns", className: "chip", ...props }, createElement("p", null, "Body")),
+    createElement(Popover, {
+      title: "Session Statistics",
+      trigger: "2 turns",
+      className: "chip",
+      children: createElement("p", null, "Body"),
+      ...props,
+    }),
   );
 
 describe("Popover markup", () => {
