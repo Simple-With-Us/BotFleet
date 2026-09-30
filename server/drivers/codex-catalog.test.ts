@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import type { ModelCatalog } from "../contracts.ts";
 import { CodexDriver } from "./codex.ts";
 import {
   decodeCodexSelection,
@@ -344,7 +345,7 @@ describe("readCodexModelsCache", () => {
 });
 
 describe("readCodexModelCatalogDetailed: a failed probe never swaps a confirmed list for the static one", () => {
-  const LIVE = {
+  const LIVE: ModelCatalog = {
     default: "gpt-fake-default",
     options: [
       { id: "gpt-fake-default", label: "GPT Fake Default" },

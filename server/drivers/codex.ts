@@ -177,7 +177,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           onProbeFailure: (reason) => {
             if (reason === lastProbeFailure) return;
             lastProbeFailure = reason;
-            console.warn(`[codex:${instanceId}] model catalog probe failed (${reason}); serving the last known list`);
+            console.warn(`[codex:${instanceId}] model catalog probe failed (${reason})`);
           },
         });
         if (!catalog.options.length) return;
