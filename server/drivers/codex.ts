@@ -866,10 +866,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     } else {
       const elapsed = Date.now() - startedAt;
       logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
-      if (lastKnownVersion) {
+      const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+      if (failure.kind === "transient" && lastKnownVersion) {
+        // Only a probe that gave no answer may stand on the last good
+        // version.  A missing or crashing binary is a verdict.
         version = lastKnownVersion;
       } else {
-        const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+        if (failure.kind !== "transient") lastKnownVersion = null;
         return failure.kind === "transient"
           ? { state: "unavailable", transient: true, reason: failure.reason }
           : { state: "unavailable", reason: failure.reason };

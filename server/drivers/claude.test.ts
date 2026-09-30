@@ -1729,3 +1729,52 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
     expect(snapshot.authenticated).toBeUndefined();
   }, 60_000);
 });
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash), so a test can take an engine
+ *  from working to broken between two snapshots. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    `#!/bin/sh\nif [ -f "${dir}/ok" ]; then echo "9.9.9"; exit 0; fi\nif [ "$(cat "${dir}/mode")" = crash ]; then kill -SEGV $$; fi\nexit 3\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("Claude version reuse", () => {
+  for (const mode of ["exit", "crash"] as const) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await ClaudeDriver.create({
+        instanceId: `switch-${mode}`,
+        displayName: undefined,
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, permissionMode: "acceptEdits" },
+      });
+      cli.setWorking(true);
+      await instance.snapshot();
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      // The verdict is the failed version probe itself, not a later step run on a stale version.
+      expect(second.reason).toMatch(/--version/);
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
+});
