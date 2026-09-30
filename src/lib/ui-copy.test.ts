@@ -121,10 +121,12 @@ describe("Settings Models layout", () => {
     expect(models!.text).not.toContain("&nbsp;");
     expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
     // picking a new primary keeps the bot's fallback chain: the picker builds the
-    // selection with selectionForPick, which copies the fallbacks across
+    // selection with pickedSelection, which builds on selectionForPick, which
+    // copies the fallbacks across
     const pick = FILES.find((entry) => entry.rel === "lib/model-pick.ts");
     expect(pick, "model-pick.ts is missing").toBeDefined();
-    expect(picker!.text).toContain("selectionForPick(selection, instance, model)");
+    expect(picker!.text).toContain("pickedSelection(selection, instance, model, latest)");
+    expect(pick!.text).toContain("...selectionForPick(current, instance, model)");
     expect(pick!.text).toContain("if (current.fallbacks?.length) next.fallbacks = current.fallbacks");
   });
 
