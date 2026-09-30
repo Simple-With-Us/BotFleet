@@ -2185,15 +2185,19 @@ export class Store {
     const driverKindFor = (instanceId: string) => opts.contextFor(instanceId)?.driverKind;
     const markerFile = join(DATA_DIR, MODEL_LINEAGE_MARKER);
     let applied: string[] = [];
-    try {
-      const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown };
-      if (Array.isArray(parsed.applied)) applied = parsed.applied.filter((id): id is string => typeof id === "string");
-    } catch {
-      applied = [];
+    // Only the boot pass asks for the one-time move, so the per-dispatch and
+    // per-refresh passes never touch the marker file.  A roster that failed
+    // to parse is not a roster to migrate.
+    const wantDirective = Boolean(opts.ownerDirective) && !this.botsLoadFailed;
+    if (wantDirective) {
+      try {
+        const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown };
+        if (Array.isArray(parsed.applied)) applied = parsed.applied.filter((id): id is string => typeof id === "string");
+      } catch {
+        applied = [];
+      }
     }
-    // A roster that failed to parse is not a roster to migrate.
-    const runDirective =
-      Boolean(opts.ownerDirective) && !this.botsLoadFailed && !applied.includes(OWNER_DIRECTED_LATEST.id);
+    const runDirective = wantDirective && !applied.includes(OWNER_DIRECTED_LATEST.id);
     const wanted = opts.botIds ? new Set(opts.botIds) : null;
     const results: Array<{ botId: string; notice: string | null }> = [];
     let dirty = false;

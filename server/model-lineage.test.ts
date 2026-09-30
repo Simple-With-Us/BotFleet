@@ -7,6 +7,7 @@ import {
   catalogIsLive,
   checkLineageWrite,
   lineageContextFor,
+  matchesStaticFallback,
   presentDescribedInstances,
 } from "./model-lineage.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
@@ -44,6 +45,28 @@ describe("catalog authority", () => {
   it("ignores local rows when deciding whether Codex is on its fallback", () => {
     const withLocal = { ...STATIC_CODEX_MODELS, options: [...STATIC_CODEX_MODELS.options, { id: "omlx::qwen", label: "q", custom: true }] };
     expect(catalogIsAuthoritative("codex", withLocal)).toBe(false);
+  });
+
+  it("tells a marked static fallback from a live listing that names the same ids", () => {
+    // Once the fallback is kept in step with what Codex serves, its ids and
+    // the live ids are the same set; only the fallback's row badge differs.
+    const ids = CODEX_LIVE.options.map((option) => option.id);
+    const marked = {
+      default: "gpt-5.6-luna",
+      options: ids.map((id) => ({ id, label: id, badge: "Unverified" })),
+    };
+    expect(matchesStaticFallback(marked, marked)).toBe(true);
+    expect(matchesStaticFallback(CODEX_LIVE, marked)).toBe(false);
+    expect(
+      matchesStaticFallback(
+        { ...marked, options: [...marked.options, { id: "omlx::qwen", label: "q", custom: true }] },
+        marked,
+      ),
+    ).toBe(true);
+    // An unmarked fallback is recognised by its ids alone.
+    const unmarked = { default: "gpt-5.6-luna", options: ids.map((id) => ({ id, label: id })) };
+    expect(matchesStaticFallback(CODEX_LIVE, unmarked)).toBe(true);
+    expect(matchesStaticFallback({ ...CODEX_LIVE, options: CODEX_LIVE.options.slice(1) }, unmarked)).toBe(false);
   });
 
   it("treats the Claude static list as authoritative but not live", () => {

@@ -17,7 +17,7 @@ import {
 
 interface CatalogLike {
   default: string;
-  options: Array<{ id: string; custom?: unknown; label?: string }>;
+  options: Array<{ id: string; custom?: unknown; label?: string; badge?: string }>;
 }
 
 function officialIds(models: CatalogLike): string[] {
@@ -30,19 +30,33 @@ function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
   return b.every((id) => set.has(id));
 }
 
+/** Whether `models` is the built-in `fallback` catalog rather than a list
+ *  the provider answered with.  The official ids must be exactly the
+ *  fallback's.  When the fallback marks its rows (the Codex fallback carries
+ *  an "Unverified" chip on every row), every row must carry that same mark
+ *  too: that is what tells the fallback apart from a live listing that
+ *  happens to name the same ids, which is the normal case once the fallback
+ *  is kept in step with what Codex serves. */
+export function matchesStaticFallback(models: CatalogLike, fallback: CatalogLike): boolean {
+  const official = models.options.filter((option) => !option.custom);
+  const rows = fallback.options.filter((option) => !option.custom);
+  if (!sameIdSet(official.map((option) => option.id), rows.map((option) => option.id))) return false;
+  const badgeById = new Map(rows.map((row) => [row.id, row.badge]));
+  if (!rows.some((row) => row.badge)) return true;
+  return official.every((option) => option.badge === badgeById.get(option.id));
+}
+
 /** Whether an instance's catalog is the engine's authoritative answer.
  *
  * Codex lists what the signed-in account can use through `codex
  * app-server`, and falls back to STATIC_CODEX_MODELS when that listing is
  * unavailable (codex-catalog.ts).  The static rows are not proof of access —
- * on this Mac they offer GPT-6 Luna while the account's live catalog has
- * GPT-5.6 Luna — so a catalog that is exactly the static set is treated as
- * the fallback and nothing is resolved or moved against it.  Every other
- * lineage engine's catalog is its product source of truth. */
+ * on this Mac they have offered GPT-6 Luna while the account's live catalog
+ * had GPT-5.6 Luna — so the static fallback is not authoritative and nothing
+ * is resolved or moved against it.  Every other lineage engine's catalog is
+ * its product source of truth. */
 export function catalogIsAuthoritative(driverKind: string, models: CatalogLike): boolean {
-  if (driverKind === "codex") {
-    return !sameIdSet(officialIds(models), STATIC_CODEX_MODELS.options.map((option) => option.id));
-  }
+  if (driverKind === "codex") return !matchesStaticFallback(models, STATIC_CODEX_MODELS);
   return true;
 }
 

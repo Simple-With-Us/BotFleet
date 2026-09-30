@@ -22,7 +22,7 @@ A floating selection is stored as `{ "model": "claude-sonnet-5-5", "latest": "so
 - on every catalog refresh (`GET /api/instances`), skipping working bots,
 - at boot.
 
-Codex's static fallback catalog is not trusted for this: a catalog that is exactly `STATIC_CODEX_MODELS` means the live `app-server` listing was unavailable, and nothing is resolved against it (the static rows offer GPT-6 Luna, which this account's live catalog does not).
+Codex's static fallback catalog is not trusted for this: a catalog that is exactly `STATIC_CODEX_MODELS` means the live `app-server` listing was unavailable, and nothing is resolved against it (the static rows have offered GPT-6 Luna, which this account's live catalog does not).  When the fallback rows carry a marker badge (the "Unverified" chip), that badge is what identifies the fallback, so a live listing that names the same ids is still trusted.
 
 An older client that re-sends a floating entry without `latest` keeps it floating when the engine and model are unchanged.  The desktop picker sends `latest: null` when a person picks a pinned model.
 
