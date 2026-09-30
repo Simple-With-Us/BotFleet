@@ -478,7 +478,7 @@ describe("dsh capability honesty", () => {
         phoneMcp: true,
         qdrantMcp: true,
         localComputerMcp: true,
-        images: false,
+        images: true,
         effortLevels: ["none", "high", "max"],
       });
     } finally {
