@@ -640,14 +640,19 @@ export function lineageStatus(
     };
   }
   const hit = classifyModel(driverKind, id);
-  if (hit) {
-    const newest = newestInClass(driverKind, hit.classKey, offered);
-    const newestHit = newest ? classifyModel(driverKind, newest) : null;
-    if (newest && newestHit && compareRank(newestHit.rank, hit.rank) > 0) {
-      return { kind: "superseded", successor: { model: newest, latest: hit.classKey } };
-    }
+  const newest = hit ? newestInClass(driverKind, hit.classKey, offered) : undefined;
+  const newestHit = newest ? classifyModel(driverKind, newest) : null;
+  if (hit && newest && newestHit && compareRank(newestHit.rank, hit.rank) > 0) {
+    return { kind: "superseded", successor: { model: newest, latest: hit.classKey } };
   }
-  if (live && offered.length > 0) return { kind: "not-in-catalog" };
+  if (live && offered.length > 0) {
+    // A class member the live catalog does not offer (a static-fallback
+    // GPT-6 Luna on an account whose live catalog has GPT-5.6 Luna) can
+    // still float on the class the account does have.
+    return hit && newest
+      ? { kind: "not-in-catalog", successor: { model: newest, latest: hit.classKey } }
+      : { kind: "not-in-catalog" };
+  }
   return { kind: "ok" };
 }
 

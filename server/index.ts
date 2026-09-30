@@ -1076,10 +1076,15 @@ async function defaultSelection(excludeInstanceId?: string) {
 // What a lineage pass knows about one live instance: its driver, the ids its
 // full (unhidden) catalog offers, whether that catalog is authoritative, and
 // which efforts each model takes.  An instance that is not registered has no
-// context, so nothing on it is moved.
+// context, so nothing on it is moved.  An engine that failed to start is
+// still known by its driver kind: the owner-directed Latest flags can land on
+// it, but nothing is resolved until its catalog is back.
 function lineageContextForInstance(instanceId: string): LineageContext | undefined {
   const instance = registry.get(instanceId);
-  if (!instance) return undefined;
+  if (!instance) {
+    const shadow = registry.entries().find((entry) => entry.instanceId === instanceId)?.shadow;
+    return shadow ? { driverKind: shadow.driverKind, offeredIds: [], authoritative: false } : undefined;
+  }
   return lineageContextFor(instance, (model) =>
     modelEffortLevels(
       { driverKind: instance.driverKind, capabilities: instance.adapter.capabilities },

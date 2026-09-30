@@ -350,4 +350,13 @@ describe("lineageStatus", () => {
     expect(lineageStatus("codex", "omlx::qwen", codex, true)).toEqual({ kind: "ok" });
     expect(lineageStatus("codex", "gpt-5.6-luna", codex, true)).toEqual({ kind: "ok" });
   });
+
+  it("offers the class the live catalog does have for a member it does not list", () => {
+    const codex = CODEX_LIVE.map((id) => ({ id }));
+    expect(lineageStatus("codex", "gpt-6-luna", codex, true)).toEqual({
+      kind: "not-in-catalog",
+      successor: { model: "gpt-5.6-luna", latest: "luna" },
+    });
+    expect(lineageStatus("codex", "gpt-6-luna", codex, false)).toEqual({ kind: "ok" });
+  });
 });
