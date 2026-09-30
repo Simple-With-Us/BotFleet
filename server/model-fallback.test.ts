@@ -1822,10 +1822,8 @@ describe("ModelRejectionRegistry", () => {
 // Stop against a fallback that has not started yet.
 describe("launchFallbackTurn and a stopped turn", () => {
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
-  const launcher = source.slice(
-    source.indexOf("async function launchFallbackTurn("),
-    source.indexOf("bus.subscribe((event: RuntimeEvent)"),
-  );
+  const start = source.indexOf("async function launchFallbackTurn(");
+  const launcher = source.slice(start, source.indexOf("\nbus.subscribe(", start));
 
   it("files a failed routine run only for a turn nobody stopped", () => {
     expect(launcher.length).toBeGreaterThan(0);
