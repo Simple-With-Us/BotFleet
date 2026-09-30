@@ -63,6 +63,9 @@ import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
 import { ThreadStatsBar } from "./ThreadStatsBar";
 import { ThreadTabs } from "./ThreadTabs";
+import { ThreadViewSwitch } from "./ThreadViewSwitch";
+import { TrajectoryView } from "./TrajectoryView";
+import { useThreadView } from "@/lib/thread-view";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
 import { SpeakButton } from "./SpeakButton";
@@ -1102,6 +1105,11 @@ export function ChatView({ bot }: { bot: Bot }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  // Chat or Trajectory, remembered per thread.  The chat pane below stays
+  // mounted (just not shown) in Trajectory, so its scroll position, draft and
+  // streaming state are exactly where they were when the person switches back.
+  const [threadView, setThreadView] = useThreadView(bot.threadId);
+  const trajectoryOpen = threadView === "trajectory";
 
   const stream = useStreaming();
   const streaming = stream.streaming[bot.threadId];
@@ -1475,18 +1483,21 @@ export function ChatView({ bot }: { bot: Bot }) {
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
         <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
-          <button
-            onClick={() => setFindOpen((open) => !open)}
-            aria-label="Find in Conversation"
-            aria-pressed={findOpen}
-            className={cn(
-              "rounded-md p-1.5 hover:bg-raised",
-              findOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
-            )}
-            title="Find in Conversation (⌘F)"
-          >
-            <Search size={18} />
-          </button>
+          <ThreadViewSwitch view={threadView} onChange={setThreadView} />
+          {!trajectoryOpen && (
+            <button
+              onClick={() => setFindOpen((open) => !open)}
+              aria-label="Find in Conversation"
+              aria-pressed={findOpen}
+              className={cn(
+                "rounded-md p-1.5 hover:bg-raised",
+                findOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
+              )}
+              title="Find in Conversation (⌘F)"
+            >
+              <Search size={18} />
+            </button>
+          )}
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
@@ -1548,23 +1559,37 @@ export function ChatView({ bot }: { bot: Bot }) {
 
       <ThreadTabs bot={bot} />
 
-      {findOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
+      {findOpen && !trajectoryOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 
       
       {/* Pinned message banner */}
-      <PinnedBanner
-        bot={bot}
-        pinnedId={bot.pinnedMessageId}
-        messages={messages}
-        onJump={(messageId) =>
-          dispatch({ type: "focusMessage", threadId: bot.threadId, messageId })
-        }
-        onUnpin={() =>
-          dispatch({ type: "updateBot", botId: bot.id, patch: { pinnedMessageId: "" } })
-        }
-      />
+      {!trajectoryOpen && (
+        <PinnedBanner
+          bot={bot}
+          pinnedId={bot.pinnedMessageId}
+          messages={messages}
+          onJump={(messageId) =>
+            dispatch({ type: "focusMessage", threadId: bot.threadId, messageId })
+          }
+          onUnpin={() =>
+            dispatch({ type: "updateBot", botId: bot.id, patch: { pinnedMessageId: "" } })
+          }
+        />
+      )}
 
-      {showToolCallsEnabled(state.config) && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
+      {showToolCallsEnabled(state.config) && !trajectoryOpen && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
+
+      {/* Trajectory: what the bot did and where the time went.  Keyed by
+          thread so its search, expanded steps and live tail never carry over. */}
+      {trajectoryOpen && (
+        <TrajectoryView
+          key={bot.threadId}
+          threadId={bot.threadId}
+          messages={serverMessages}
+          running={Boolean(bot.busy)}
+          knownTurns={activeTask?.usage?.turns}
+        />
+      )}
 
       {/* Messages + composer share one pane so bubbles scroll into the pill
           instead of dying on a rectangular clip above a black dock.
@@ -1574,7 +1599,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           this the containing block for any `fixed`-positioned descendant —
           today that's only ChatMarkdown's file-link menu backdrop, which
           still covers the whole transcript, just not the sidebar/header. */}
-      <div className="relative min-h-0 flex-1 @container/chat">
+      <div className={cn("relative min-h-0 flex-1 @container/chat", trajectoryOpen && "hidden")}>
       <TurnErrorAnnouncement
         key={`${bot.threadId}:${errorBranchKey}`}
         latestMessage={latestServerError}

@@ -647,6 +647,27 @@ describe("groupByTurn", () => {
     expect(new Set(groups.map((g) => g.key)).size).toBe(groups.length);
   });
 
+  it("gives a turn that recorded no steps a group of its own, in place, when asked", () => {
+    const t = buildTrajectory([
+      turnStarted(0, "t1"),
+      said(1, "Hello", "t1"),
+      turnDone(2, {}, "t1"),
+      turnStarted(100, "t2"),
+      turnDone(105, {}, "t2"),
+      turnStarted(200, "t3"),
+      said(201, "Again", "t3"),
+      turnDone(202, {}, "t3"),
+    ]);
+    expect(groupByTurn(t.rows, t.turns).map((g) => g.turn?.id)).toEqual(["t1", "t3"]);
+    const groups = groupByTurn(t.rows, t.turns, { emptyTurnsFrom: 0 });
+    expect(groups.map((g) => [g.turn?.id, g.rows.length])).toEqual([["t1", 1], ["t2", 0], ["t3", 1]]);
+    expect(new Set(groups.map((g) => g.key)).size).toBe(3);
+    // an empty turn from before the window is left out, and one after the last step goes last
+    expect(groupByTurn(t.rows, t.turns, { emptyTurnsFrom: ms(150) }).map((g) => g.turn?.id)).toEqual(["t1", "t3"]);
+    const tail = buildTrajectory([turnStarted(0, "a"), said(1, "x", "a"), turnDone(2, {}, "a"), turnStarted(50, "b"), turnDone(51, {}, "b")]);
+    expect(groupByTurn(tail.rows, tail.turns, { emptyTurnsFrom: 0 }).map((g) => g.turn?.id)).toEqual(["a", "b"]);
+  });
+
   it("puts rows outside any turn in their own group instead of dropping them", () => {
     const t = buildTrajectory([{ ...base(0, undefined), type: "session.started", sessionId: "s" }, turnStarted(1), turnDone(2)], {
       inputs: [{ id: "u", at: ms(0.5), role: "user", text: "hi" }],

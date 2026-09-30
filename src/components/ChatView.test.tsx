@@ -54,3 +54,27 @@ describe("ChatView footer chips", () => {
     expect(SRC).toContain("const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);");
   });
 });
+
+describe("ChatView Trajectory switch", () => {
+  it("puts the Chat | Trajectory switch in the header, remembered per thread", () => {
+    expect(SRC).toContain("const [threadView, setThreadView] = useThreadView(bot.threadId);");
+    expect(SRC).toContain("<ThreadViewSwitch view={threadView} onChange={setThreadView} />");
+    // in the header's right-hand cluster, ahead of the find button, and not among the thread tabs
+    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf('aria-label="Find in Conversation"'));
+    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={bot} />"));
+  });
+
+  it("keeps the chat pane mounted but hidden in Trajectory, so its scroll, draft and stream survive", () => {
+    expect(SRC).toContain('cn("relative min-h-0 flex-1 @container/chat", trajectoryOpen && "hidden")');
+  });
+
+  it("mounts the Trajectory view keyed by thread, fed the thread's own state", () => {
+    expect(SRC).toMatch(/\{trajectoryOpen && \(\s*<TrajectoryView\s+key=\{bot\.threadId\}\s+threadId=\{bot\.threadId\}\s+messages=\{serverMessages\}\s+running=\{Boolean\(bot\.busy\)\}\s+knownTurns=\{activeTask\?\.usage\?\.turns\}\s*\/>\s*\)\}/);
+  });
+
+  it("hides the chat-only chrome (find, pinned banner, execution timeline) while in Trajectory", () => {
+    expect(SRC).toContain("{findOpen && !trajectoryOpen && <ChatFindBar");
+    expect(SRC).toContain("{!trajectoryOpen && (\n        <PinnedBanner");
+    expect(SRC).toContain("showToolCallsEnabled(state.config) && !trajectoryOpen && <TaskTimeline");
+  });
+});

@@ -1,0 +1,379 @@
+// SSR tests for the Trajectory tab.  This repo's component tests render with
+// react-dom/server (no jsdom), so they pin the markup a first paint produces:
+// the lanes and their labels, each step's line, the modes, the empty and error
+// states.  Effects (fetching, the live tail, focus movement) do not run under
+// SSR; their logic lives in pure modules with their own tests
+// (trajectory.test.ts, runtime-feed.test.ts, thread-view.test.ts).
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
+
+import type { RuntimeEvent } from "../../server/contracts.ts";
+import { buildTrajectory, type Trajectory, type TrajectoryInput } from "@/lib/trajectory";
+import { ThreadViewSwitch } from "./ThreadViewSwitch.tsx";
+import { STEP_WINDOW, TrajectoryPanel, type TrajectoryMode, type TrajectoryPanelProps } from "./TrajectoryView.tsx";
+import { stepKeyDown, tabStop } from "./TrajectoryRows.tsx";
+
+// ── fixture ───────────────────────────────────────────────────────────
+const T0 = Date.parse("2026-09-29T14:00:00.000Z");
+let n = 0;
+const at = (sec: number) => new Date(T0 + sec * 1000).toISOString();
+const base = (sec: number, turnId = "t1") => ({ eventId: `e${++n}`, provider: "claude" as const, threadId: "th", createdAt: at(sec), turnId });
+const ev = (sec: number, rest: Record<string, unknown>, turnId?: string) => ({ ...base(sec, turnId), ...rest }) as RuntimeEvent;
+
+const events = (): RuntimeEvent[] => [
+  ev(0, { type: "turn.started" }),
+  ev(1, { type: "item.completed", itemType: "assistant_text", text: "Let me look at the config." }),
+  ev(2, { type: "item.started", itemType: "tool", itemId: "a", title: "Read", target: "src/config.ts" }),
+  ev(4, { type: "item.completed", itemType: "tool", itemId: "a", ok: true, detail: "42 lines" }),
+  ev(5, { type: "item.started", itemType: "tool", itemId: "b", title: "Bash", target: "pnpm test" }),
+  ev(15, { type: "item.completed", itemType: "tool", itemId: "b", ok: false, detail: "exit 1" }),
+  ev(16, { type: "item.updated", itemType: "reasoning", tokens: 300 }),
+  ev(18, { type: "item.completed", itemType: "assistant_text", text: "Two tests fail." }),
+  ev(20, { type: "turn.completed", ok: true, usage: { input: 12_000, output: 800 }, cost: 0.03 }),
+  ev(3600, { type: "turn.started" }, "t2"),
+  ev(3605, { type: "turn.completed", ok: true }, "t2"),
+];
+const inputs: TrajectoryInput[] = [{ id: "u1", at: T0 - 500, role: "user", text: "Please run the suite" }];
+
+const build = (over: Parameters<typeof buildTrajectory>[1] = {}): Trajectory => buildTrajectory(events(), { inputs, ...over });
+
+const noop = () => {};
+function render(over: Partial<TrajectoryPanelProps> & { trajectory?: Trajectory } = {}, mode: TrajectoryMode = "duration") {
+  return renderToStaticMarkup(
+    createElement(TrajectoryPanel, {
+      trajectory: build(),
+      mode,
+      onMode: noop,
+      query: "",
+      onQuery: noop,
+      expanded: new Set<string>(),
+      onToggle: noop,
+      ...over,
+    }),
+  );
+}
+const text = (html: string) =>
+  html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+
+// ── duration ──────────────────────────────────────────────────────────
+describe("TrajectoryPanel: Duration", () => {
+  const html = render();
+
+  it("draws the three labelled lanes", () => {
+    for (const lane of ["Input", "Model", "Tools"]) {
+      expect(html).toContain(`>${lane}</span>`);
+      expect(html).toContain(`aria-label="${lane} lane,`);
+    }
+    expect(html).toContain('aria-label="Timeline"');
+  });
+
+  it("gives every span a button that names its outcome", () => {
+    expect(html).toContain('aria-label="Read, 2s, started ');
+    expect(html).toMatch(/aria-label="Bash, 10s, started [\d:]+, failed"/);
+    expect(html).toMatch(/aria-label="Read, 2s, started [\d:]+, succeeded"/);
+    expect(html.match(/aria-haspopup="dialog"/g)!.length).toBeGreaterThan(5);
+  });
+
+  it("marks the idle hour between the turns as a gap, with its length", () => {
+    expect(html).toContain(">1h later<");
+    expect(html).toMatch(/title="1h later"/);
+  });
+
+  it("lists each step as one line with its kind badge", () => {
+    const t = text(html);
+    expect(t).toContain("USER Please run the suite");
+    expect(t).toContain("ASSISTANT Let me look at the config.");
+    expect(t).toContain("TOOL Read src/config.ts");
+    expect(t).toContain("→ returned 42 lines");
+    expect(t).toContain("TOOL Bash pnpm test");
+    expect(t).toContain("REASONING about 300 tokens");
+    expect(t).toContain("ASSISTANT Two tests fail.");
+  });
+
+  it("names an assistant step that only called a tool", () => {
+    expect(text(html)).toContain("(tool call only)");
+  });
+
+  it("summarises the thread and offers no older-steps note for a whole log", () => {
+    expect(text(html)).toMatch(/\d+ steps · 2 turns · /);
+    expect(html).not.toContain("Older steps were trimmed");
+  });
+
+  it("makes exactly one step the tab stop", () => {
+    const listHtml = html.slice(html.indexOf('aria-label="Steps"'));
+    expect(listHtml.match(/tabindex="0"/g)).toHaveLength(1);
+    expect(listHtml.match(/data-step/g)!.length).toBeGreaterThan(5);
+    // the first step is the one
+    expect(listHtml.indexOf('tabindex="0"')).toBeLessThan(listHtml.indexOf('tabindex="-1"'));
+  });
+
+  it("shows the mode toggle with Duration pressed, and a labelled search", () => {
+    expect(html).toContain('aria-label="Trajectory View"');
+    expect(html).toMatch(/aria-pressed="true"[^>]*>Duration</);
+    expect(html).toMatch(/aria-pressed="false"[^>]*>Turns</);
+    expect(html).toMatch(/aria-pressed="false"[^>]*>Calls</);
+    expect(html).toContain("Search Steps");
+    expect(html).toContain('type="search"');
+  });
+
+  it("says a turn is running while one is", () => {
+    const running = buildTrajectory(events().slice(0, 4), { inputs, running: true, now: T0 + 30_000 });
+    const runningHtml = render({ trajectory: running });
+    expect(runningHtml).toContain("Running");
+    expect(html).not.toMatch(/>Running</);
+  });
+});
+
+// ── turns ─────────────────────────────────────────────────────────────
+describe("TrajectoryPanel: Turns", () => {
+  const html = render({}, "turns");
+
+  it("groups steps under a heading per turn, with duration and tokens", () => {
+    expect(html.match(/<h3/g)).toHaveLength(3);
+    const t = text(html);
+    expect(t).toContain("Turn 1");
+    expect(t).toContain("Turn 2");
+    expect(t).toMatch(/Turn 1 [\d:]+ · 20s · 2 tool calls · model 8s · tools 12s · 12k in · 800 out · \$0\.03/);
+    // the Duration timeline is not part of this view
+    expect(html).not.toContain('aria-label="Timeline"');
+  });
+
+  it("puts the message that started the thread outside any turn, rather than dropping it", () => {
+    expect(text(html)).toContain("Outside a Turn");
+    expect(text(html)).toContain("Please run the suite");
+  });
+
+  it("marks an unfinished or failed turn", () => {
+    const cut = buildTrajectory([ev(0, { type: "turn.started" }), ev(1, { type: "item.started", itemType: "tool", itemId: "x", title: "Bash" })]);
+    expect(render({ trajectory: cut }, "turns")).toContain("Never finished");
+    const failed = buildTrajectory([ev(0, { type: "turn.started" }), ev(1, { type: "turn.completed", ok: false, stopReason: "error" })]);
+    expect(render({ trajectory: failed }, "turns")).toContain(">Failed<");
+  });
+});
+
+// ── calls ─────────────────────────────────────────────────────────────
+describe("TrajectoryPanel: Calls", () => {
+  const html = render({}, "calls");
+
+  it("is a table of tool calls with sortable columns", () => {
+    expect(html).toContain("<table");
+    expect(html).toContain('<caption class="sr-only">Tool calls</caption>');
+    const t = text(html);
+    expect(t).toMatch(/Tool Started ↑ Duration Outcome Arguments/);
+    expect(t).toContain("Read");
+    expect(t).toContain("Bash");
+    expect(t).toContain("Succeeded");
+    expect(t).toContain("Failed");
+    expect(t).toContain("pnpm test");
+    // started is the active sort, ascending
+    expect(html).toContain('aria-sort="ascending"');
+    // only the tool rows: no assistant text, no user message
+    expect(t).not.toContain("Two tests fail");
+    expect(t).not.toContain("Please run the suite");
+  });
+
+  it("says so when the thread has no tool calls", () => {
+    const quiet = buildTrajectory([ev(0, { type: "turn.started" }), ev(1, { type: "item.completed", itemType: "assistant_text", text: "hi" }), ev(2, { type: "turn.completed", ok: true })]);
+    expect(text(render({ trajectory: quiet }, "calls"))).toContain("No tool calls in this thread yet.");
+  });
+});
+
+// ── search ────────────────────────────────────────────────────────────
+describe("TrajectoryPanel: search", () => {
+  it("filters the list to matching steps and says how many", () => {
+    const html = render({ query: "pnpm" });
+    const t = text(html);
+    expect(t).toContain("TOOL Bash pnpm test");
+    expect(t).not.toContain("Let me look");
+    expect(t).toMatch(/1 of \d+ steps/);
+    expect(html).toContain('aria-label="Clear Search"');
+    expect(html).toContain('value="pnpm"');
+  });
+
+  it("matches results and assistant text, case-insensitively", () => {
+    expect(text(render({ query: "EXIT 1" }))).toContain("TOOL Bash");
+    expect(text(render({ query: "TWO TESTS" }))).toContain("Two tests fail.");
+  });
+
+  it("filters the calls table and the turn groups too", () => {
+    expect(text(render({ query: "config" }, "calls"))).toContain("Read");
+    expect(text(render({ query: "config" }, "calls"))).not.toContain("Bash");
+    const turns = render({ query: "two tests" }, "turns");
+    expect(turns.match(/<h3/g)).toHaveLength(1);
+  });
+
+  it("says nothing matched, without dropping the controls", () => {
+    const html = render({ query: "zzzz" });
+    expect(text(html)).toContain("No steps match “zzzz”.");
+    expect(html).toContain('type="search"');
+  });
+
+  it("keeps the timeline in view while searching (it shows the thread, not the matches)", () => {
+    expect(render({ query: "pnpm" })).toContain('aria-label="Timeline"');
+  });
+});
+
+// ── expanding a step ──────────────────────────────────────────────────
+describe("TrajectoryPanel: an opened step", () => {
+  it("expands in place with its full detail", () => {
+    const trajectory = build();
+    const tool = trajectory.rows.find((r) => r.title === "Bash")!;
+    const html = render({ trajectory, expanded: new Set([tool.id]) });
+    expect(html).toContain(`id="${tool.id}::detail"`);
+    expect(html).toContain(`aria-controls="${tool.id}::detail"`);
+    const detail = text(html.slice(html.indexOf(`id="${tool.id}::detail"`)));
+    expect(detail).toContain("Duration 10s");
+    expect(detail).toContain("Outcome Failed");
+    expect(detail).toContain("Target pnpm test");
+    expect(detail).toContain("Result exit 1");
+  });
+
+  it("leaves every other step closed", () => {
+    const trajectory = build();
+    const html = render({ trajectory, expanded: new Set([trajectory.rows[1]!.id]) });
+    expect(html.match(/aria-expanded="true"/g)).toHaveLength(1);
+    expect(html.match(/::detail"/g)!.length).toBe(2); // aria-controls + the detail's own id
+  });
+
+  it("opens a call in the table too", () => {
+    const trajectory = build();
+    const tool = trajectory.rows.find((r) => r.title === "Read")!;
+    const html = render({ trajectory, expanded: new Set([tool.id]) }, "calls");
+    expect(text(html.slice(html.indexOf(`id="${tool.id}::detail"`)))).toContain("Result 42 lines");
+  });
+});
+
+// ── the states around it ──────────────────────────────────────────────
+describe("TrajectoryPanel: states", () => {
+  const empty = buildTrajectory([]);
+
+  it("shows an empty state for a thread with no events", () => {
+    const t = text(render({ trajectory: empty }));
+    expect(t).toContain("No steps yet");
+    expect(t).toContain("Steps appear here as this thread's bot works.");
+    expect(t).not.toContain("Timeline");
+  });
+
+  it("does not show the empty state while it is still loading", () => {
+    const t = text(render({ trajectory: empty, loading: true }));
+    expect(t).toContain("Loading steps…");
+    expect(t).not.toContain("No steps yet");
+  });
+
+  it("says why it could not load, and offers another try", () => {
+    const html = render({ trajectory: empty, error: "500", onRetry: noop });
+    expect(html).toContain('role="alert"');
+    expect(text(html)).toContain("Couldn't load this thread's steps: 500");
+    expect(text(html)).toContain("Try Again");
+    expect(text(html)).not.toContain("No steps yet");
+  });
+
+  it("says older steps were trimmed — quietly, as a note, not an alert", () => {
+    const html = render({ trajectory: build({ olderOnDisk: true }) });
+    expect(html).toContain('role="note"');
+    expect(text(html)).toContain("Older steps were trimmed.");
+    expect(html).not.toContain('role="alert"');
+  });
+
+  it("says it too when the task banked more turns than the log shows", () => {
+    expect(text(render({ trajectory: build({ knownTurns: 9 }) }))).toContain("Older steps were trimmed.");
+  });
+
+  it("windows a long thread and offers the earlier steps", () => {
+    const many: RuntimeEvent[] = [ev(0, { type: "turn.started" })];
+    for (let i = 0; i < STEP_WINDOW + 40; i++) many.push(ev(1 + i, { type: "item.completed", itemType: "assistant_text", text: `step number ${i}` }));
+    many.push(ev(9999, { type: "turn.completed", ok: true }));
+    const html = render({ trajectory: buildTrajectory(many) });
+    expect(text(html)).toContain("Show Earlier Steps (40 more)");
+    // the newest are the ones shown
+    expect(html).toContain(`step number ${STEP_WINDOW + 39}`);
+    expect(html).not.toContain("step number 0<");
+  });
+});
+
+// ── the switch and the keyboard ───────────────────────────────────────
+describe("ThreadViewSwitch", () => {
+  const render2 = (view: "chat" | "trajectory") => renderToStaticMarkup(createElement(ThreadViewSwitch, { view, onChange: noop }));
+
+  it("offers Chat and Trajectory as a pressed pair, not as tabs", () => {
+    const chat = render2("chat");
+    expect(chat).toContain('aria-label="Thread View"');
+    expect(chat).toMatch(/aria-pressed="true"[^>]*aria-label="Chat"/);
+    expect(chat).toMatch(/aria-pressed="false"[^>]*aria-label="Trajectory"/);
+    expect(chat).not.toContain('role="tab');
+    expect(render2("trajectory")).toMatch(/aria-pressed="true"[^>]*aria-label="Trajectory"/);
+  });
+
+  it("keeps the names when the labels fold away on a narrow header", () => {
+    const html = render2("chat");
+    expect(html).toContain("@max-4xl/chathead:hidden");
+    expect(html).toContain('aria-label="Chat"');
+  });
+});
+
+describe("keyboard navigation", () => {
+  it("makes the last-used step the tab stop, else the first", () => {
+    expect(tabStop(["a", "b", "c"], null)).toBe("a");
+    expect(tabStop(["a", "b", "c"], "b")).toBe("b");
+    // a step that scrolled out of the window or was filtered away
+    expect(tabStop(["a", "b", "c"], "gone")).toBe("a");
+    expect(tabStop([], "a")).toBeUndefined();
+  });
+
+  function steps(count: number) {
+    const focused: number[] = [];
+    const nodes = Array.from({ length: count }, (_, i) => ({ closest: () => nodes[i], focus: () => focused.push(i) }));
+    const currentTarget = { querySelectorAll: () => nodes };
+    const press = (key: string, from: number, extra: Record<string, unknown> = {}) => {
+      const preventDefault = vi.fn();
+      stepKeyDown({ key, altKey: false, ctrlKey: false, metaKey: false, ...extra, target: nodes[from], currentTarget, preventDefault } as never);
+      return preventDefault;
+    };
+    return { focused, press };
+  }
+
+  it("moves down and up between steps, stopping at the ends", () => {
+    const { focused, press } = steps(3);
+    press("ArrowDown", 0);
+    press("ArrowDown", 2);
+    press("ArrowUp", 2);
+    press("ArrowUp", 0);
+    expect(focused).toEqual([1, 2, 1, 0]);
+  });
+
+  it("jumps to the first and last with Home and End, and stops the page scrolling", () => {
+    const { focused, press } = steps(5);
+    expect(press("End", 1)).toHaveBeenCalled();
+    press("Home", 3);
+    expect(focused).toEqual([4, 0]);
+  });
+
+  it("leaves other keys and modified keys alone", () => {
+    const { focused, press } = steps(3);
+    expect(press("Enter", 0)).not.toHaveBeenCalled();
+    expect(press("ArrowDown", 0, { metaKey: true })).not.toHaveBeenCalled();
+    expect(press("ArrowDown", 0, { altKey: true })).not.toHaveBeenCalled();
+    expect(focused).toEqual([]);
+  });
+
+  it("ignores a key pressed outside any step (the search box)", () => {
+    const preventDefault = vi.fn();
+    stepKeyDown({
+      key: "ArrowDown",
+      altKey: false,
+      ctrlKey: false,
+      metaKey: false,
+      target: { closest: () => null },
+      currentTarget: { querySelectorAll: () => [] },
+      preventDefault,
+    } as never);
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+});

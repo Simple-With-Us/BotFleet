@@ -1137,8 +1137,15 @@ export interface TurnGroup {
 
 /** Consecutive rows of one turn, each group headed by that turn's summary.
  *  Rows outside any turn (a session starting, a message between turns) form
- *  their own groups, so nothing is dropped and order is preserved. */
-export function groupByTurn(rows: readonly TrajectoryRow[], turns: readonly TurnSummary[]): TurnGroup[] {
+ *  their own groups, so nothing is dropped and order is preserved.  A turn
+ *  that recorded no steps at all still has a duration and a state worth
+ *  showing: with `emptyTurnsFrom`, those that began at or after that time get a
+ *  group of their own, in place. */
+export function groupByTurn(
+  rows: readonly TrajectoryRow[],
+  turns: readonly TurnSummary[],
+  options: { emptyTurnsFrom?: number } = {},
+): TurnGroup[] {
   const byId = new Map(turns.map((turn) => [turn.id, turn]));
   const groups: TurnGroup[] = [];
   for (const row of rows) {
@@ -1149,6 +1156,16 @@ export function groupByTurn(rows: readonly TrajectoryRow[], turns: readonly Turn
       continue;
     }
     groups.push({ key: `${key || "outside"}:${groups.length}`, turn: row.turnId ? byId.get(row.turnId) : undefined, rows: [row] });
+  }
+  if (options.emptyTurnsFrom !== undefined) {
+    const withRows = new Set(rows.map((row) => row.turnId));
+    for (const turn of turns) {
+      if (withRows.has(turn.id) || turn.start < options.emptyTurnsFrom) continue;
+      const position = groups.findIndex((group) => (group.rows[0]?.at ?? Infinity) > turn.start);
+      const empty: TurnGroup = { key: `${turn.id}:empty`, turn, rows: [] };
+      if (position === -1) groups.push(empty);
+      else groups.splice(position, 0, empty);
+    }
   }
   return groups;
 }
