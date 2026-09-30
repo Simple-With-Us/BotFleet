@@ -20,7 +20,12 @@ function sh(cmd, args) {
 }
 
 function changedFiles() {
-  sh("git", ["fetch", "origin", baseBranch, "--depth=1"]);
+  // Fetch the full base history.  A depth-limited fetch drops the ancestry the
+  // triple-dot diff needs to find a merge-base (stacked PRs lose it first), and
+  // the failure must stay loud rather than fall back to a two-dot diff.
+  const fetchArgs = ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`];
+  if (sh("git", ["rev-parse", "--is-shallow-repository"]) === "true") fetchArgs.push("--unshallow");
+  sh("git", fetchArgs);
   const raw = sh("git", ["diff", "--name-only", "--diff-filter=ACMRT", `${baseRef}...HEAD`]);
   return raw
     .split("\n")

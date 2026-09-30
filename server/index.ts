@@ -246,6 +246,7 @@ import {
   type StalledReleaseDecision,
   type TurnComputerInputs,
 } from "./turn-safety.ts";
+import { TurnStatsTracker } from "./turn-stats.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
@@ -2104,6 +2105,11 @@ configureTurnIdentity((threadId) => {
 // into the task's tally when the turn settles.
 const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
 
+// Where each 1:1 turn in flight is spending its wall time (model, tools, or
+// waiting on a person).  Folded into the task's `stats` aggregate at
+// turn.completed; dropped on every path that ends a turn without one.
+const turnStats = new TurnStatsTracker();
+
 // UTF-8 bytes of the system prompt each in-flight turn was handed, split at
 // the volatile boundary (server/system-prompt.ts).  Booked at dispatch and
 // forwarded to Usage Monitor beside the turn's token figures at
@@ -2166,6 +2172,7 @@ function releaseStalledTurnIfUnowned(
   stoppedTurns.delete(`${turn.botId}:${turn.threadId}`);
   activeTurnOwners.clearThread(turn.threadId);
   turnUsage.delete(turn.threadId);
+  turnStats.discard(turn.threadId);
   turnPromptBytes.delete(turn.threadId);
   // The watchdog knows exactly whose turn stalled, so both releases can name
   // the bot — the room lease included, since a stalled room dispatch returns
@@ -2755,6 +2762,15 @@ bus.subscribe((event: RuntimeEvent) => {
     return message;
   };
 
+  // Timing for 1:1 turns only — a room's shared thread has no task to bank
+  // it on.  Each hook is a no-op unless a turn was dispatched on this thread.
+  if (bot) {
+    if (event.type === "turn.started") turnStats.started(event.threadId);
+    else if (event.type === "content.delta") turnStats.firstToken(event.threadId);
+    else if (event.type === "request.opened") turnStats.requestOpened(event.threadId);
+    else if (event.type === "request.resolved") turnStats.requestResolved(event.threadId);
+  }
+
   switch (event.type) {
     case "session.started":
       if (bot && event.sessionId && event.providerInstanceId) {
@@ -2814,6 +2830,10 @@ bus.subscribe((event: RuntimeEvent) => {
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
         }
+        // Outside the message check: a tool with no transcript row (ask_bot,
+        // whose own chip is appended by the internal endpoint) still held the
+        // turn for as long as it ran, and must stop the tool clock when it ends.
+        if (bot && event.itemId) turnStats.toolEnded(event.threadId, event.itemId);
         // the bot just acted ON ITS SCREEN — refresh the preview now. Only
         // computer tools can change the screen, and each capture competes
         // with the agent for the box's command endpoint, so a bot grinding
@@ -2825,6 +2845,10 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.started":
       if (event.itemType === "tool") {
+        // Timed before the ask_bot early exit below: that call blocks until
+        // the other bot replies (minutes, or a person's approval), and left
+        // unclocked it would all be billed to the model.
+        if (bot && event.itemId) turnStats.toolStarted(event.threadId, event.itemId);
         // ask_bot's raw tool chip is redundant — the internal endpoint
         // appends a richer "Messaged @X" chip linking to the channel
         if (event.title?.endsWith("__ask_bot")) break;
@@ -3159,6 +3183,8 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
+      // Closes the turn's clock now, before any await below stretches it.
+      const turnTiming = bot ? turnStats.settle(event.threadId, tokens?.output) : undefined;
       // The turn that ended owns its failover: resolve the member from the
       // settled owner (this thread, this provider instance) before the
       // thread's speaker entry, which a crossed room can leave naming the
@@ -3406,6 +3432,9 @@ bus.subscribe((event: RuntimeEvent) => {
           cachedInput: tokens?.cachedInput,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
+          // No live entry (a repeated completion, a turn from before a
+          // restart) banks no timing rather than a fake zero-length turn.
+          stats: turnTiming,
           // actualSelection, not the configured selection: a turn that
           // fell over to another engine is that engine's spend.
         }, actualSelection.instanceId, actualUsageMeta);
@@ -4162,6 +4191,7 @@ async function startTurn(
     computerInputs: turnComputerInputs(bot, opts?.runOn),
   });
   turnUsage.delete(threadId);
+  turnStats.begin(threadId);
   turnPromptBytes.delete(threadId);
 
   void (async () => {
@@ -4687,6 +4717,7 @@ async function startTurn(
       if (vpsLease) activeVpsThreads.release(vpsLease);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
+      turnStats.discard(threadId);
       turnPromptBytes.delete(threadId);
       const message = e instanceof Error ? e.message : String(e);
       store.appendMessage(threadId, {
@@ -11866,7 +11897,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: "limit must be a positive whole number" });
       }
       const limit = parsedLimit;
-      return json(res, 200, readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit }));
+      // `view=trajectory` is the Trajectory tab's read: runtime log only, no
+      // streamed deltas, long fields clipped (see readThreadEvents).  Any
+      // other value is a mistake rather than a fallback.
+      const view = url.searchParams.get("view");
+      if (view !== null && view !== "trajectory") return json(res, 400, { error: "view must be trajectory" });
+      return json(
+        res,
+        200,
+        readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit, runtimeOnly: view === "trajectory" }),
+      );
     }
 
     // ── the fleet-wide authorization decision log ──
