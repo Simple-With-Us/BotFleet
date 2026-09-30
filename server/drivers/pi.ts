@@ -30,7 +30,14 @@ import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { KNOWN_VERSION_MAX_AGE_MS, classifyVersionProbeFailure, describeSpawnFailure, killCliTree, logProbeFailure, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  killCliTree,
+  LastKnownVersion,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
 import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
@@ -924,8 +931,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     // Last good `--version`, so one probe that runs out of time on a busy
     // Mac does not flip a working pi to "not installed".
-    let lastKnownVersion: string | null = null;
-    let lastKnownAt = 0;
+    const lastKnownVersion = new LastKnownVersion();
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
@@ -972,18 +978,18 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       });
       let version = probed.version;
       if (version) {
-        lastKnownVersion = version;
-        lastKnownAt = Date.now();
+        lastKnownVersion.record(version);
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
         const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "pi", elapsed, 20000);
-        if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
           // Only a probe that gave no answer may stand on the last good
           // version.  A missing or broken binary is a verdict.
-          version = lastKnownVersion;
+          version = remembered;
         } else {
-          if (failure.kind !== "transient") lastKnownVersion = null;
+          if (failure.kind !== "transient") lastKnownVersion.forget();
           return failure.kind === "transient"
             ? { state: "unavailable", transient: true, reason: failure.reason }
             : { state: "unavailable", reason: failure.reason };

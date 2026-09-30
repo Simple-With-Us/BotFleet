@@ -91,9 +91,12 @@ export function pickerBlocked(instance: InstanceInfo, pane: "main" | "custom"): 
 /** Whether an unusable engine's CLI is actually absent.  One that is on this
  *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
  *  own check failed) is unavailable, not "not installed" — the reason says
- *  what to do. */
+ *  what to do.  So is an engine that has no CLI at all (MiniMax,
+ *  OpenAI-compatible and other API-key engines): a missing key is not a
+ *  missing install. */
 function isCliMissing(instance: InstanceInfo): boolean {
   if (/CLI not found/i.test(instance.snapshot.reason ?? "")) return true;
+  if (instance.cliDefault === undefined && instance.cli === undefined) return false;
   return (instance.cliCandidates?.length ?? 0) === 0;
 }
 

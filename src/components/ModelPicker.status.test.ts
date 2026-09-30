@@ -39,6 +39,25 @@ describe("engineStatus", () => {
     expect(engineStatus(engine("kimi", { state: "unavailable", reason: "Disabled in settings" }))).toBe("Disabled");
   });
 
+  it("does not call an API-key engine that is missing its key Not installed", () => {
+    // MiniMax declares no CLI, so it has no CLI candidates either.
+    const minimax = engine(
+      "minimax",
+      { state: "unavailable", reason: "no MiniMax API key — set MINIMAX_API_KEY or run `mmx auth login`" },
+      { driverKind: "minimax", cliCandidates: [] },
+    );
+    expect(engineStatus(minimax)).toBe("Unavailable");
+    // A CLI engine with no copy anywhere on this Mac still is.
+    expect(
+      engineStatus(
+        engine("codex", { state: "unavailable", reason: "`codex --version` failed (exit 1)" }, {
+          cliDefault: "codex",
+          cliCandidates: [],
+        }),
+      ),
+    ).toBe("Not installed");
+  });
+
   it("does not call a CLI that is on this Mac but cannot run bots yet Not installed", () => {
     const onDisk = { cliCandidates: ["/opt/homebrew/bin/claude"] };
     expect(

@@ -1598,4 +1598,88 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     const memo = await registry.describe({ maxAgeMs: 60_000 });
     expect(memo[0].snapshot.version).not.toBe("old-config");
   });
+
+  it("never probes an engine reloaded before that engine's turn in an older sweep", async () => {
+    // Probes start a few at a time, so an older sweep reaches some engines
+    // only after a Settings change reloaded them.  Probing the disposed
+    // instance then, under the new generation, let the old config's answer
+    // be shared with the user's own fresh request and become the baseline.
+    const aGates: Array<Promise<void>> = [];
+    const probed: string[] = [];
+    let bTransient = false;
+    const fake = makeFakeDriver({
+      snapshotImpl: async (input) => {
+        const tag = String((input.config as { tag?: string }).tag);
+        probed.push(`${input.instanceId}:${tag}`);
+        if (input.instanceId === "a" && aGates.length > 0) await aGates.shift();
+        if (input.instanceId === "b" && bTransient) {
+          return { state: "unavailable", transient: true, reason: "Fake did not answer in time" };
+        }
+        return { state: "available", version: `${input.instanceId}:${tag}` };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], { probeConcurrency: 1, transientRecheckMs: 0 });
+    await registry.load({
+      a: { driver: "fake", config: { tag: "old" } },
+      b: { driver: "fake", config: { tag: "old" } },
+    });
+    await registry.describe();
+    await tick();
+
+    // A background sweep is stuck on a; it has not reached b yet.
+    const firstA = deferred<void>();
+    aGates.push(firstA.promise);
+    void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+    await tick();
+    await registry.reloadInstance("b", { driver: "fake", config: { tag: "new" } });
+    const reloadedAt = probed.length;
+    const patched = await registry.describeWithFreshInstance("b");
+    expect(patched.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b:new");
+
+    // The user's own "Check again", whose sweep is also held up on a...
+    const secondA = deferred<void>();
+    aGates.push(secondA.promise);
+    const fresh = registry.describe();
+    await tick();
+    // ...while the older sweep moves on to b.
+    firstA.resolve();
+    await tick(20);
+    secondA.resolve();
+    const answer = await fresh;
+    expect(answer.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b:new");
+    expect(probed.slice(reloadedAt)).not.toContain("b:old");
+    const memo = await registry.describe({ maxAgeMs: 60_000 });
+    expect(memo.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b:new");
+
+    // The baseline an inconclusive probe falls back on is the new config's.
+    bTransient = true;
+    const again = await registry.describeWithFreshInstance("b");
+    expect(again.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b:new");
+  });
+
+  it("looks again on its own at an engine it could only report as checking", async () => {
+    const fake = makeFakeDriver({
+      snapshotImpl: (_input, call) =>
+        call === 1
+          ? { state: "unavailable", transient: true, reason: "Fake did not answer in time" }
+          : { state: "available", version: "1.0.0" },
+    });
+    const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 30 });
+    await registry.load({ a: { driver: "fake" } });
+    const pushed: Array<boolean | undefined> = [];
+    registry.onDescribed((instances) => pushed.push(instances[0].snapshot.transient));
+    const first = await registry.describe();
+    expect(first[0].snapshot.transient).toBe(true);
+    // Nobody asks again; the registry does, and pushes the answer.
+    for (let i = 0; i < 100 && fake.snapshotCalls < 2; i++) await tick(10);
+    await tick(20);
+    expect(fake.snapshotCalls).toBe(2);
+    expect(pushed.at(-1)).toBeUndefined();
+    const memo = await registry.describe({ maxAgeMs: 60_000 });
+    expect(memo[0].snapshot.state).toBe("available");
+    // Everything answered: no further looks.
+    await tick(100);
+    expect(fake.snapshotCalls).toBe(2);
+    await registry.disposeAll();
+  });
 });

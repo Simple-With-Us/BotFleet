@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
-import { isCheckingEngine, isHiddenEngine, noEngineCanRun } from "./engine-status";
+import { isCheckingEngine, isHiddenEngine, listedInEnginesSettings, noEngineCanRun } from "./engine-status";
 
 const snap = (snapshot: InstanceInfo["snapshot"]) => ({ snapshot });
 
@@ -48,5 +48,21 @@ describe("noEngineCanRun", () => {
         snap({ state: "unavailable", reason: "`codex` CLI not found" }),
       ]),
     ).toBe(false);
+  });
+});
+
+describe("listedInEnginesSettings", () => {
+  it("lists CLI, MiniMax, OpenAI-compatible and custom engines", () => {
+    expect(listedInEnginesSettings({ driverKind: "claudeAgent", cliDefault: "claude", snapshot: { state: "available" } })).toBe(true);
+    expect(listedInEnginesSettings({ driverKind: "minimax", snapshot: { state: "available" } })).toBe(true);
+    expect(listedInEnginesSettings({ driverKind: "openai-compat", snapshot: { state: "available" } })).toBe(true);
+    expect(listedInEnginesSettings({ driverKind: "acpAgent", isCustom: true, snapshot: { state: "available" } })).toBe(true);
+    expect(listedInEnginesSettings({ driverKind: "grok", snapshot: { state: "available" } })).toBe(false);
+  });
+
+  it("leaves out the ASCII.dev Box engine until a Box token is set up", () => {
+    const box = { driverKind: "boxAgent", cliDefault: "box", snapshot: { state: "unavailable", hidden: true, reason: "no Box token" } } as const;
+    expect(listedInEnginesSettings(box)).toBe(false);
+    expect(listedInEnginesSettings({ ...box, snapshot: { state: "available" } })).toBe(true);
   });
 });

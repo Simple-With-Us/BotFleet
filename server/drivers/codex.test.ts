@@ -820,6 +820,24 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
   });
 
+  it("keeps the last known sign-in when `login status` gives no answer it can read", async () => {
+    await create();
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: true });
+    // No answer (a probe that ran out of time prints nothing): not a sign-out.
+    process.env.FAKE_CODEX_MODE = "login-silent";
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: true });
+    // A definitive answer still wins over the remembered one.
+    process.env.FAKE_CODEX_MODE = "logged-out";
+    await expect(instance.snapshot()).resolves.toMatchObject({ state: "available", authenticated: false });
+  });
+
+  it("reports sign-in as unknown, never false, when the first `login status` gives no answer", async () => {
+    await create({ mode: "login-silent" });
+    const snapshot = await instance.snapshot();
+    expect(snapshot.state).toBe("available");
+    expect(snapshot.authenticated).toBeUndefined();
+  });
+
   it("also accepts login status from older Codex versions that used stdout", async () => {
     await create({ mode: "logged-in-stdout" });
     await expect(instance.snapshot()).resolves.toMatchObject({

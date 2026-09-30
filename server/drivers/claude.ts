@@ -20,13 +20,13 @@ import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import {
-  KNOWN_VERSION_MAX_AGE_MS,
   brokerSocketPath,
   classifyVersionProbeFailure,
   describeSpawnFailure,
   execCli,
   isProbeTimeout,
   killCliTree,
+  LastKnownVersion,
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
@@ -104,6 +104,15 @@ function claudeAuthTimeoutMs(): number {
   // not twenty.
   const override = Number(process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS);
   return Number.isFinite(override) && override > 0 ? override : CLAUDE_AUTH_TIMEOUT_MS;
+}
+
+/** How long `claude --help` may take when checking for --strict-mcp-config. */
+const CLAUDE_HELP_TIMEOUT_MS = 10_000;
+
+function claudeHelpTimeoutMs(): number {
+  // Test fixtures shorten this too, for the same reason.
+  const override = Number(process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_HELP_TIMEOUT_MS;
 }
 
 /** `loggedIn` from `claude auth status --json`, or undefined when stdout is
@@ -1398,14 +1407,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         return strictMcpProbe.result;
       }
       const startedAt = Date.now();
+      const helpTimeout = claudeHelpTimeoutMs();
       const probe = {
         version,
         expiresAt: Date.now() + 30_000,
         result: new Promise<StrictMcpAnswer>((resolve) => {
-          execCli(config.cli, ["--help"], { timeout: 10000, env }, (error, stdout) => {
+          execCli(config.cli, ["--help"], { timeout: helpTimeout, env }, (error, stdout) => {
             if (!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout)) return resolve("yes");
             const elapsed = Date.now() - startedAt;
-            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= 10000)) {
+            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= helpTimeout)) {
               logProbeFailure(instanceId, `${config.cli} --help`, error, elapsed);
               return resolve("unknown");
             }
@@ -1422,12 +1432,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
       return probe.result;
     };
-    const supportsStrictMcp = async (version: string, env: NodeJS.ProcessEnv): Promise<boolean> =>
-      (await probeStrictMcp(version, env)) === "yes";
-
     const requireStrictMcp = async (): Promise<void> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      if (await supportsStrictMcp(strictMcpProbe?.version ?? "unprobed", env)) return;
+      const strict = await probeStrictMcp(strictMcpProbe?.version ?? "unprobed", env);
+      if (strict === "yes") return;
+      // `--help` gave no answer in time: nothing says this CLI is too old, so
+      // the turn must not tell the user to update it.  It still cannot run
+      // unverified, so it fails as a slow check the next turn retries.
+      if (strict === "unknown") {
+        throw new Error(`${input.displayName || "Claude"} did not answer in time; try again in a moment`);
+      }
       // A failed probe conflates two very different causes: the CLI is too
       // old for --strict-mcp-config (upgrade it), or the CLI cannot run at
       // all (missing or not executable — a setup problem). Both surfaced as
@@ -1453,8 +1467,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     // Last definitive answers, so one probe that runs out of time on a busy
     // Mac does not flip a working, signed-in Claude to "not installed" or
     // "sign-in required".
-    let lastKnownVersion: string | null = null;
-    let lastKnownAt = 0;
+    const lastKnownVersion = new LastKnownVersion();
     let lastKnownAuth: boolean | undefined;
     const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -1467,18 +1480,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
       let version = probed.version;
       if (version) {
-        lastKnownVersion = version;
-        lastKnownAt = Date.now();
+        lastKnownVersion.record(version);
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
         const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
-        if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
           // Only a probe that gave no answer may stand on the last good
           // version.  A missing or crashing binary is a verdict.
-          version = lastKnownVersion;
+          version = remembered;
         } else {
-          if (failure.kind !== "transient") lastKnownVersion = null;
+          if (failure.kind !== "transient") lastKnownVersion.forget();
           return failure.kind === "transient"
             ? { state: "unavailable", transient: true, reason: failure.reason }
             : { state: "unavailable", reason: failure.reason };

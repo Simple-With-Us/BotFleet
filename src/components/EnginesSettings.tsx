@@ -8,7 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Loader2, Plus, TriangleAlert, Upload, X } from "lucide-react";
 
 import { api, useStore, type InstanceInfo } from "@/state/store";
-import { isHiddenEngine } from "@/lib/engine-status";
+import { listedInEnginesSettings } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
@@ -788,17 +788,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
     [dispatch],
   );
 
-  // Include CLI engines, MiniMax, OpenAI-compat, and custom engines — but
-  // not an optional integration nobody has set up (the ASCII.dev Box engine with no Box token).
-  const rows = state.instances.filter((i) =>
-    !isHiddenEngine(i) && (
-      i.cli !== undefined ||
-      i.cliDefault !== undefined ||
-      i.driverKind === "minimax" ||
-      i.driverKind === "openai-compat" ||
-      Boolean(i.isCustom)
-    ),
-  );
+  const rows = state.instances.filter(listedInEnginesSettings);
   // Engines the user has turned off used to sit behind a "Show (N)" link
   // that defaulted to hidden, so a newly added engine whose CLI is not
   // installed yet was simply absent from Settings — the reader saw a count

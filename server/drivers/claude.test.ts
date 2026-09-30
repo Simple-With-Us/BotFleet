@@ -1575,6 +1575,29 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
 
+  // C2: a `--help` that only ran out of time on a busy Mac says nothing about
+  // the CLI's age, so the turn must not tell the user to update Claude Code.
+  it("fails a turn whose capability check timed out as a slow check, not as an outdated CLI", async () => {
+    process.env.FAKE_CLAUDE_HELP = "hang";
+    process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS = "1500";
+    const dump = join(scratch, "unverified-must-not-dispatch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    try {
+      await create();
+      await expect(instance.adapter.sendTurn({ threadId: "t-help-timeout", text: "go" })).resolves.toMatchObject({
+        dispatched: false,
+      });
+      const errors = recorder.events.filter((e) => e.type === "runtime.error") as Array<{ message?: string; setup?: unknown }>;
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toMatch(/did not answer in time/);
+      expect(errors[0].message).not.toMatch(/Update Claude Code/);
+      expect(errors[0].setup).not.toBe(true);
+      expect(existsSync(dump)).toBe(false);
+    } finally {
+      delete process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS;
+    }
+  }, 60_000);
+
   it("reuses a successful capability probe across turns and helpers", async () => {
     const probes = join(scratch, "supported-help-probes");
     process.env.FAKE_CLAUDE_HELP_PROBES = probes;

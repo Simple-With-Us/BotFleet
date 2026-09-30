@@ -78,6 +78,11 @@ if (argv[0] === "--version") {
 
 if (argv[0] === "--help") {
   if (process.env.FAKE_CLAUDE_HELP_PROBES) appendFileSync(process.env.FAKE_CLAUDE_HELP_PROBES, "probe\n");
+  if (process.env.FAKE_CLAUDE_HELP === "hang") {
+    // A busy Mac: no answer before the driver's deadline kills this.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+    process.exit(0);
+  }
   process.stdout.write(process.env.FAKE_CLAUDE_HELP === "unsupported" ? "Usage: claude\n" : "  --strict-mcp-config  Only load explicit MCP servers\n");
   process.exit(0);
 }

@@ -12,6 +12,7 @@ import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-
 import { lastAntigravityQuotaSnapshot, quotaModelsFromSnapshot } from "../antigravity-quota.ts";
 import { decodeMinimaxConfig, resolveMinimaxCredentials, type MinimaxConfig } from "../drivers/minimax.ts";
 import { findCliCandidates } from "../env-path.ts";
+import { KNOWN_VERSION_MAX_AGE_MS } from "../procs.ts";
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
 import { computerReach, type ComputerReach } from "../computer-capability.ts";
@@ -64,13 +65,24 @@ const DEFAULT_PROBE_CONCURRENCY = 6;
  * from its last definitive snapshot.  The probe keeps running; its answer is
  * folded in (and pushed to clients) when it lands. */
 const DEFAULT_ENTRY_DEADLINE_MS = 30_000;
-/** How long a definitive snapshot may stand in for inconclusive probes.  An
- * engine that never answers again settles as "did not answer in time". */
-const DEFINITIVE_MAX_AGE_MS = 30 * 60_000;
+/** How long a definitive snapshot may stand in for inconclusive probes.  A
+ * driver's remembered `--version` ages out after the same span (procs.ts
+ * LastKnownVersion), so an engine that never answers again settles as "did
+ * not answer in time" once both have lapsed: at most twice this after the
+ * CLI last really answered. */
+const DEFINITIVE_MAX_AGE_MS = KNOWN_VERSION_MAX_AGE_MS;
+/** First look again at engines a describe left as "Checking" (their probe
+ * gave no answer and nothing definitive stood in).  Doubles on each look
+ * that still gets no answer, up to the max, so a wedged CLI costs one probe
+ * every few minutes rather than one per sweep. */
+const DEFAULT_TRANSIENT_RECHECK_MS = 20_000;
+const TRANSIENT_RECHECK_MAX_MS = 5 * 60_000;
 
 export interface ProviderRegistryOptions {
   probeConcurrency?: number;
   entryDeadlineMs?: number;
+  /** First re-check delay for "Checking" engines; 0 turns re-checks off. */
+  transientRecheckMs?: number;
 }
 
 /** Called when a completed describe changes what clients were last told. */
@@ -222,11 +234,14 @@ export class ProviderRegistry {
   private driversByKind: Map<string, AnyProviderDriver>;
   private readonly probeConcurrency: number;
   private readonly entryDeadlineMs: number;
+  private readonly transientRecheckMs: number;
 
   constructor(drivers: readonly AnyProviderDriver[], options: ProviderRegistryOptions = {}) {
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
     this.probeConcurrency = Math.max(1, options.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY);
     this.entryDeadlineMs = options.entryDeadlineMs ?? DEFAULT_ENTRY_DEADLINE_MS;
+    this.transientRecheckMs = Math.max(0, options.transientRecheckMs ?? DEFAULT_TRANSIENT_RECHECK_MS);
+    this.recheckDelayMs = this.transientRecheckMs;
   }
 
   private async loadEntry(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
@@ -430,6 +445,10 @@ export class ProviderRegistry {
   private thrownSnapshots = new WeakSet<ProviderSnapshot>();
   private describeListeners = new Set<DescribeListener>();
   private diskCachePath: string | null = null;
+  /** The pending re-check of "Checking" engines, and the delay the next one
+   *  will wait (see DEFAULT_TRANSIENT_RECHECK_MS). */
+  private recheckTimer: ReturnType<typeof setTimeout> | null = null;
+  private recheckDelayMs = 0;
 
   /** Subscribe to completed describes that changed the answer — a finished
    * background sweep, a single-engine refresh, a slow probe landing late. */
@@ -615,6 +634,7 @@ export class ProviderRegistry {
     this.lastDone = { at, result };
     this.describedAtByResult.set(result, at);
     if (persist) this.saveDiskCache(result, at);
+    this.scheduleRecheck(result);
     if (this.describeListeners.size === 0) return;
     if (previous && JSON.stringify(previous.result) === JSON.stringify(result)) return;
     for (const listener of [...this.describeListeners]) {
@@ -626,6 +646,46 @@ export class ProviderRegistry {
     }
   }
 
+  /** An engine left as "Checking" (its probe gave no answer and nothing
+   * definitive stood in) is looked at again on its own, so the UI's promise
+   * to update it holds without anyone reopening a menu.  One timer at a
+   * time; the delay doubles while engines stay unanswered and resets once
+   * every engine has answered. */
+  private scheduleRecheck(result: DescribedInstance[]): void {
+    if (this.transientRecheckMs <= 0) return;
+    const waiting = result.some((info) => info.snapshot.transient && !info.snapshot.hidden);
+    if (!waiting) {
+      this.recheckDelayMs = this.transientRecheckMs;
+      if (this.recheckTimer) clearTimeout(this.recheckTimer);
+      this.recheckTimer = null;
+      return;
+    }
+    if (this.recheckTimer) return;
+    const delay = this.recheckDelayMs;
+    this.recheckDelayMs = Math.min(delay * 2, Math.max(TRANSIENT_RECHECK_MAX_MS, this.transientRecheckMs));
+    this.recheckTimer = setTimeout(() => {
+      this.recheckTimer = null;
+      void this.recheckTransient().catch(() => {});
+    }, delay);
+    this.recheckTimer.unref?.();
+  }
+
+  /** Probe only the engines the last describe left as "Checking", one at a
+   * time — a busy Mac is why they did not answer. */
+  private async recheckTransient(): Promise<void> {
+    const done = this.lastDone;
+    if (!done) return;
+    for (const info of done.result) {
+      if (!info.snapshot.transient || info.snapshot.hidden) continue;
+      // A probe still running (one that missed its sweep's deadline) lands
+      // on its own; a second one beside it would only add load.
+      if (this.entryProbes.has(info.instanceId) || !this.byId.has(info.instanceId)) continue;
+      await this.describeWithFreshInstance(info.instanceId).catch(() => undefined);
+    }
+    // Nothing committed (every engine was skipped): keep looking.
+    if (this.lastDone) this.scheduleRecheck(this.lastDone.result);
+  }
+
   /** Probe every engine (a few at a time), merge each answer against that
    * engine's last definitive snapshot, persist, and return the list.  Public
    * for tests; callers go through describe(). */
@@ -635,9 +695,22 @@ export class ProviderRegistry {
     // Multiple instances may share a driver. Scan each default binary once
     // per response instead of repeating filesystem work for every row.
     const candidatesByName = new Map<string, string[]>();
-    const probed = await mapWithConcurrency(this.entries(), this.probeConcurrency, (entry) =>
-      this.probeEntryWithDeadline(entry, candidatesByName, notBefore),
-    );
+    // The fleet as it is NOW.  Probes start a few at a time, so most start
+    // later; each is bound to its engine's generation from this moment, never
+    // the one current when its turn comes.  An engine reloaded meanwhile has
+    // a disposed instance in `entries`, and probing that under the NEW
+    // generation would let the old config's answer pass as the replacement's.
+    const entries = this.entries();
+    const gens = new Map(entries.map((entry) => [entry.instanceId, this.genOf(entry.instanceId)] as const));
+    const probed = await mapWithConcurrency(entries, this.probeConcurrency, (entry) => {
+      const gen = gens.get(entry.instanceId)!;
+      // The fleet changed since this sweep began: its answer is thrown away
+      // (startSweep), so it starts no more probes beside its replacement's.
+      if (this.sweepKey() !== sweepKeyAtStart || this.genOf(entry.instanceId) !== gen || this.byId.get(entry.instanceId) !== entry) {
+        return Promise.resolve(this.supersededEntry(entry, candidatesByName, gen));
+      }
+      return this.probeEntryWithDeadline(entry, candidatesByName, notBefore, gen);
+    });
     const merged = probed.map((info) => this.newestFor(info));
     const at = Date.now();
     // An obsolete sweep (the fleet was reloaded meanwhile) never persists.
@@ -663,9 +736,9 @@ export class ProviderRegistry {
     entry: RegistryEntry,
     candidatesByName: Map<string, string[]>,
     notBefore: number,
+    gen: string,
   ): Promise<DescribedInstance> {
     const id = entry.instanceId;
-    const gen = this.genOf(id);
     const running = this.entryProbes.get(id);
     if (running && running.gen === gen && running.startedAt >= notBefore) return running.promise;
     const startedAt = Date.now();
@@ -687,9 +760,12 @@ export class ProviderRegistry {
     entry: RegistryEntry,
     candidatesByName: Map<string, string[]>,
     notBefore: number,
+    gen: string = this.genOf(entry.instanceId),
   ): Promise<DescribedInstance> {
-    const probe = this.probeEntry(entry, candidatesByName, notBefore);
+    const probe = this.probeEntry(entry, candidatesByName, notBefore, gen);
     if (!(this.entryDeadlineMs > 0) || entry.shadow) return probe;
+    // The probe just started or joined: its own order, for the stand-in.
+    const probeSeq = this.entryProbes.get(entry.instanceId)?.seq ?? this.probeSeq;
     return new Promise<DescribedInstance>((resolve) => {
       let answered = false;
       const timer = setTimeout(() => {
@@ -697,7 +773,7 @@ export class ProviderRegistry {
         console.warn(
           `[engines] ${entry.instanceId} took longer than ${this.entryDeadlineMs}ms to describe; answering from its last known state`,
         );
-        resolve(this.deadlineFallback(entry, candidatesByName));
+        resolve(this.deadlineFallback(entry, candidatesByName, gen, probeSeq));
         void probe.then((late) => this.applyLateEntry(late)).catch(() => {});
       }, this.entryDeadlineMs);
       timer.unref?.();
@@ -710,25 +786,45 @@ export class ProviderRegistry {
         () => {
           if (answered) return;
           clearTimeout(timer);
-          resolve(this.deadlineFallback(entry, candidatesByName));
+          resolve(this.deadlineFallback(entry, candidatesByName, gen, probeSeq));
         },
       );
     });
   }
 
-  private deadlineFallback(entry: RegistryEntry, candidatesByName: Map<string, string[]>): DescribedInstance {
+  private deadlineFallback(
+    entry: RegistryEntry,
+    candidatesByName: Map<string, string[]>,
+    gen: string,
+    probeSeq: number,
+  ): DescribedInstance {
     const shell = this.entryShell(entry, candidatesByName, {
       state: "unavailable",
       transient: true,
       reason: `${entry.live?.displayName || entry.instanceId} did not answer in time`,
     });
     // No quota was computed for this engine this time: keep what the last
-    // definitive answer knew rather than dropping a cap.
-    const info = this.mergeWithDefinitive(shell, { keepPreviousQuota: true });
+    // definitive answer knew rather than dropping a cap.  Only for the
+    // engine as it still is: a reloaded one's baseline is not this entry's.
+    const info = gen === this.genOf(entry.instanceId) ? this.mergeWithDefinitive(shell, { keepPreviousQuota: true }) : shell;
     // Ordered just before the probe it fell back on, so that probe's real
     // answer replaces this stand-in when it lands.
-    const seq = (this.entryProbes.get(entry.instanceId)?.seq ?? this.probeSeq) - 0.5;
-    this.entryMeta.set(info, { at: Date.now(), seq, gen: this.genOf(entry.instanceId) });
+    this.entryMeta.set(info, { at: Date.now(), seq: probeSeq - 0.5, gen });
+    return info;
+  }
+
+  /** A row for an engine this sweep no longer describes: the fleet changed
+   * before its probe started.  Never probed, settled or shared.  newestFor
+   * swaps in the engine's current answer when there is one, and startSweep
+   * discards the obsolete sweep anyway. */
+  private supersededEntry(entry: RegistryEntry, candidatesByName: Map<string, string[]>, gen: string): DescribedInstance {
+    const name = entry.live?.displayName || entry.shadow?.displayName || entry.instanceId;
+    const info = this.entryShell(entry, candidatesByName, {
+      state: "unavailable",
+      transient: true,
+      reason: `${name} is being checked again after a settings change`,
+    });
+    this.entryMeta.set(info, { at: Date.now(), seq: 0, gen });
     return info;
   }
 
@@ -1156,6 +1252,8 @@ export class ProviderRegistry {
   }
 
   async disposeAll() {
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
+    this.recheckTimer = null;
     await Promise.allSettled(this.instances().map((i) => i.dispose()));
     this.byId.clear();
     this.cliByInstance.clear();

@@ -38,7 +38,15 @@
 // box / Local VM / VPS / local computer) is mounted by upserting keys into the
 // global `~/.gemini/config/mcp_config.json` before each spawn — see
 // ensureAntigravityMcp below.
-import { KNOWN_VERSION_MAX_AGE_MS, classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownVersion,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1491,8 +1499,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
-    let lastKnownVersion: string | null = null;
-    let lastKnownAt = 0;
+    const lastKnownVersion = new LastKnownVersion();
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
@@ -1502,18 +1509,18 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
       let version = probed.version;
       if (version) {
-        lastKnownVersion = version;
-        lastKnownAt = Date.now();
+        lastKnownVersion.record(version);
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
         const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "Antigravity", elapsed, 20000);
-        if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
           // Only a probe that gave no answer may stand on the last good
           // version.  A missing or crashing binary is a verdict.
-          version = lastKnownVersion;
+          version = remembered;
         } else {
-          if (failure.kind !== "transient") lastKnownVersion = null;
+          if (failure.kind !== "transient") lastKnownVersion.forget();
           return failure.kind === "transient"
             ? { state: "unavailable", transient: true, reason: failure.reason }
             : { state: "unavailable", reason: failure.reason };

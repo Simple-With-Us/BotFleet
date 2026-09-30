@@ -215,6 +215,42 @@ export function isProbeTimeout(err: unknown): boolean {
   );
 }
 
+/** A CLI's last good `--version`, for a later probe that gets no answer (a
+ * busy Mac, not a verdict).  It is only good for KNOWN_VERSION_MAX_AGE_MS
+ * after the CLI last actually answered: past that, the probe's own "did not
+ * answer in time" stands, so a CLI that has wedged for good stops reading as
+ * available instead of living on its last answer for ever. */
+export class LastKnownVersion {
+  private value: string | null = null;
+  private confirmedAt = 0;
+  // Plain fields, not parameter properties: the harness runs this file under
+  // Node's type stripping, which rejects those.
+  private readonly maxAgeMs: number;
+  private readonly now: () => number;
+
+  constructor(maxAgeMs: number = KNOWN_VERSION_MAX_AGE_MS, now: () => number = () => Date.now()) {
+    this.maxAgeMs = maxAgeMs;
+    this.now = now;
+  }
+
+  /** The CLI answered with this version. */
+  record(version: string): void {
+    this.value = version;
+    this.confirmedAt = this.now();
+  }
+
+  /** The CLI gave a definitive failure: nothing to stand on any more. */
+  forget(): void {
+    this.value = null;
+  }
+
+  /** The remembered version while it may still stand in, else null. */
+  get(): string | null {
+    if (this.value !== null && this.now() - this.confirmedAt > this.maxAgeMs) this.value = null;
+    return this.value;
+  }
+}
+
 /** Spawn errno codes that mean "the Mac could not start a process right
  * now" — out of process slots, file descriptors or memory.  Transient. */
 const TRANSIENT_SPAWN_CODES = new Set(["EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "EBUSY", "EINTR"]);

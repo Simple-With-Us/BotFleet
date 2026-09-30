@@ -16,7 +16,15 @@ import { z } from "zod";
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { KNOWN_VERSION_MAX_AGE_MS, classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownVersion,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -849,8 +857,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
   // Last definitive answers: one probe that runs out of time on a busy Mac
   // must not flip a working, signed-in Codex to "not installed" or
   // "sign-in required".
-  let lastKnownVersion: string | null = null;
-    let lastKnownAt = 0;
+  const lastKnownVersion = new LastKnownVersion();
   let lastKnownAuth: boolean | undefined;
   const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -863,18 +870,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
     let version = probed.version;
     if (version) {
-      lastKnownVersion = version;
-      lastKnownAt = Date.now();
+      lastKnownVersion.record(version);
     } else {
       const elapsed = Date.now() - startedAt;
       logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
       const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
-      if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
+      const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+      if (remembered) {
         // Only a probe that gave no answer may stand on the last good
         // version.  A missing or crashing binary is a verdict.
-        version = lastKnownVersion;
+        version = remembered;
       } else {
-        if (failure.kind !== "transient") lastKnownVersion = null;
+        if (failure.kind !== "transient") lastKnownVersion.forget();
         return failure.kind === "transient"
           ? { state: "unavailable", transient: true, reason: failure.reason }
           : { state: "unavailable", reason: failure.reason };
