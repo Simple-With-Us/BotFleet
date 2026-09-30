@@ -5,7 +5,7 @@ This document provides the definitive framework, rules, and filesystem structure
 ## 1. The State Machine (How it works)
 
 BotFleet avatars are not just static images; they are reactive, state-driven animated characters. 
-The avatar player uses a 3-part animation lifecycle to transition smoothly between actions:
+The avatar player uses a 3-part animation lifecycle to transition smoothly between actions - but only for the 13 transition expressions listed in section 2. The other 27 expressions render as transparent stills with no transition GIFs.
 
 1. **Enter** (`[action]_enter.gif`): A smooth transition *from* the idle/resting state *into* the action.
 2. **Hold** (`[action]_hold.gif`): A looping animation that plays continuously while the action is happening.
@@ -14,31 +14,23 @@ The avatar player uses a 3-part animation lifecycle to transition smoothly betwe
 
 *Flow:* `Resting` → (Trigger: Bot starts thinking) → `thinking_enter.gif` → `thinking_hold.gif` (loops) → (Trigger: Bot finishes) → `thinking_return.gif` → `Resting`.
 
-## 2. Core Actions & Expressions (The 17-State Matrix)
+## 2. Core Actions & Expressions (The 40-Expression Contract)
 
-To be fully compatible with BotFleet, an avatar pack must cover these exact **17 core expressions**. 
-Each expression requires an `_enter` (intro), `_hold` (loop), and `_return` (outro) animation, resulting in exactly **51 animations** per skin. 
+The runtime source of truth is `src/components/tv-face/manifest.ts`: `TVFACE_MANIFEST` maps 50 bot states onto **40 unique expressions**, and `TVFACE_HAS_ENTER_RETURN` names the **13 expressions that ship transition GIFs**. This doc reflects that manifest; verify against it before generating assets.
 
-If a specific state isn't provided, BotFleet gracefully falls back to the `resting` face.
+### The 13 transition expressions (enter + hold + return GIFs, plus a still)
+`listening`, `thinking`, `typing`, `speaking`, `computer`, `fleet`, `crash`, `memory`, `tools`, `routine`, `screen`, `git`, `webhook`
 
-### The 17 Core States
-1. `resting` (Default idle state / anchor)
-2. `working` (General task execution)
-3. `thinking` (Processing / reasoning)
-4. `speaking` (TTS / Dictating)
-5. `listening` (Waiting for user input)
-6. `computer` (Using a computer terminal or code)
-7. `crash` (Crash / error state)
-8. `happy` (Happy / positive result)
-9. `celebrate` (Celebration / milestone)
-10. `proud` (Proud / accomplishment)
-11. `confused` (Suspicious / not understanding)
-12. `alerting` (Notifying / waking)
-13. `searching` (Looking up data)
-14. `sending` (Uploading / transmitting)
-15. `receiving` (Downloading / reading)
-16. `fleet` (Multi-agent coordination)
-17. `tools` (Using an MCP tool / routine)
+Each of these requires `_enter.gif`, `_hold.gif`, and `_return.gif` plus a transparent still: **39 GIFs + 13 stills per skin**.
+
+### The 27 stills-driven expressions (still PNG only)
+`resting`, `sleeping`, `waking`, `searching`, `working`, `happy`, `excited`, `celebrate`, `confused`, `curious`, `sad`, `alerting`, `angry`, `scared`, `surprised`, `suspicious`, `shy`, `bored`, `drowsy`, `proud`, `playful`, `laughing`, `loading`, `sending`, `receiving`, `notifying`, `powering_down`
+
+The player renders `[expression].png` directly for these - no `_enter`/`_hold`/`_return` GIFs exist, and shipping them changes nothing at runtime. Per skin: **27 stills**.
+
+**Per-skin totals: 39 GIFs (13 expressions x enter/hold/return) + 40 stills (one per expression).**
+
+If a specific state's asset isn't provided, BotFleet gracefully falls back to the `resting` face.
 
 ## 3. Filesystem Structure (The `.botface` / `.zip` format)
 
