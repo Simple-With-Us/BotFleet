@@ -218,8 +218,13 @@ export interface GroupTask {
 
 export interface ModelSelection {
   instanceId: string;
+  /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
+   *  shared/model-lineage.ts.  The picker sends `null` when a person picks
+   *  a pinned model, so the harness does not carry an older float forward. */
+  latest?: string | null;
   fallbacks?: ModelSelection[];
 }
 
@@ -689,6 +694,9 @@ export interface InstanceInfo {
   };
   models: {
     default: string;
+    /** Set when the provider itself just listed this catalog, so a saved id
+     *  missing from it can honestly be called "Not in catalog". */
+    live?: boolean;
     options: Array<{
       id: string;
       label: string;

@@ -28,7 +28,15 @@ import { EngineCallout } from "./EngineCallout";
 import { formatDualQuotaBadge } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
-import { readableModelLabel } from "@/lib/model-label";
+import {
+  latestRows,
+  modelOptionLabel,
+  offeredOptions,
+  savedModelStatus,
+  selectionChipLabel,
+  type LatestRow,
+  type SavedModelStatus,
+} from "@/lib/model-lineage-view";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
 const COMPACT_MODEL_COUNT = 5;
@@ -36,7 +44,95 @@ const COMPACT_MODEL_COUNT = 5;
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   // A saved selection the latest-only picker no longer lists still gets a
   // readable chip instead of its raw id.
-  return instance?.models.options.find((option) => option.id === model)?.label ?? readableModelLabel(model);
+  return modelOptionLabel(instance, model);
+}
+
+/** "Latest Sonnet" rows: the choice that keeps a bot on the newest member
+ *  of a model class.  Each row names the model it runs right now. */
+export function LatestModelRows({
+  rows,
+  currentClass,
+  onPick,
+}: {
+  rows: LatestRow[];
+  /** The class the saved selection floats on for this engine, if any. */
+  currentClass?: string | null;
+  onPick: (row: LatestRow) => void;
+}) {
+  if (!rows.length) return null;
+  return (
+    <>
+      <EngineGroupLabel className="px-2 pb-1 pt-0.5">Latest</EngineGroupLabel>
+      {rows.map((row) => {
+        const current = currentClass === row.classKey;
+        return (
+          <button
+            key={row.classKey}
+            type="button"
+            onClick={() => onPick(row)}
+            title={`${row.label} runs ${row.resolvedLabel} now and moves to each newer version.`}
+            className={cn(
+              "flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-control/60",
+              current && "bg-control",
+            )}
+          >
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="min-w-0 break-words">{row.label}</span>
+              <span className="min-w-0 truncate text-[11.5px] text-ink-secondary">{row.resolvedLabel}</span>
+            </span>
+            {current && <Check size={14} className="shrink-0 text-accent" />}
+          </button>
+        );
+      })}
+      <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
+    </>
+  );
+}
+
+/** Badge for a saved model the catalog no longer offers. */
+function StatusBadge({ status }: { status: SavedModelStatus }) {
+  if (!status.badge) return null;
+  return (
+    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">
+      {status.badge}
+    </span>
+  );
+}
+
+/** One-click move off a retired or superseded saved model. */
+export function SavedModelNotice({
+  status,
+  modelName,
+  onSwitch,
+  className,
+}: {
+  status: SavedModelStatus;
+  modelName: string;
+  onSwitch: (selection: ModelSelection) => void;
+  className?: string;
+}) {
+  if (!status.badge) return null;
+  const what =
+    status.kind === "retired"
+      ? `${modelName} is retired.`
+      : status.kind === "superseded"
+        ? `${modelName} has a newer version.`
+        : `${modelName} is not in this engine's catalog.`;
+  return (
+    <div className={cn("flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-ink-secondary", className)}>
+      <StatusBadge status={status} />
+      <span>{what}</span>
+      {status.successor && status.successorLabel && (
+        <button
+          type="button"
+          onClick={() => onSwitch(status.successor!)}
+          className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-control/60"
+        >
+          {`Switch To ${status.successorLabel}`}
+        </button>
+      )}
+    </div>
+  );
 }
 
 const CALLOUT_DRIVER_KINDS = new Set([
@@ -324,9 +420,16 @@ export function ModelPicker({
     resetList();
   };
 
-  const pick = (instance: InstanceInfo, model: string) => {
-    const nextSelection = selectionForPick(selection, instance, model);
+  /** `latest` picks a "Latest <Class>" row; a pinned pick sends `null` so
+   *  the harness does not carry an older float forward onto it. */
+  const pick = (instance: InstanceInfo, model: string, latest?: string) => {
+    const nextSelection: ModelSelection = { ...selectionForPick(selection, instance, model), latest: latest ?? null };
 
+    commit(nextSelection);
+    setOpen(false);
+  };
+
+  function commit(nextSelection: ModelSelection) {
     if (onChange) {
        onChange(nextSelection);
     } else {
@@ -337,10 +440,21 @@ export function ModelPicker({
          patch: { modelSelection: nextSelection },
        });
     }
+  }
+
+  /** "Switch To …": the saved entry's replacement, keeping the chain. */
+  const switchSaved = (successor: ModelSelection) => {
+    const next: ModelSelection = { ...successor };
+    if (selection.fallbacks?.length) next.fallbacks = selection.fallbacks;
+    commit(next);
     setOpen(false);
   };
 
-  const official = railInstance?.models.options.filter((option) => !option.custom) ?? [];
+  // Superseded rows are hidden: within a model class only the newest member
+  // is offered, beside the "Latest <Class>" rows.
+  const official = offeredOptions(railInstance).filter((option) => !option.custom);
+  const latest = latestRows(railInstance);
+  const savedStatus = savedModelStatus(active, selection);
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
@@ -368,7 +482,7 @@ export function ModelPicker({
     <ModelRow
       key={option.id}
       option={option}
-      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
+      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id && !selection.latest}
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
@@ -407,12 +521,23 @@ export function ModelPicker({
         // resolved engine keeps its label — the mark is what would hide it)
         !contained && active && COMPACT_SQUARE,
       )}
-      title={active ? `${active.displayName} · ${modelLabel(active, selection.model)}` : selection.model}
+      title={
+        active
+          ? `${active.displayName} · ${selectionChipLabel(active, selection, { showLatest: true })} (${selection.model})`
+          : selection.model
+      }
     >
       {active && <ProviderMark driverKind={activeDriverKind!} model={selection.model} size={14} />}
       <span className={cn("min-w-0 truncate", !contained && "max-w-[160px]", !contained && active && "@max-4xl/chathead:hidden")}>
-        {modelLabel(active, selection.model)}
+        {/* The chat header names the model that actually runs; settings
+            chips also say when it floats on "Latest <Class>". */}
+        {selectionChipLabel(active, selection, { showLatest: contained })}
       </span>
+      {savedStatus.badge && (
+        <span className={cn(!contained && active && "@max-4xl/chathead:hidden")}>
+          <StatusBadge status={savedStatus} />
+        </span>
+      )}
       <ChevronDown
         size={14}
         className={cn(
@@ -433,6 +558,14 @@ export function ModelPicker({
         </div>
       ) : (
         trigger
+      )}
+      {contained && !open && (
+        <SavedModelNotice
+          status={savedStatus}
+          modelName={modelLabel(active, selection.model)}
+          onSwitch={switchSaved}
+          className="mt-1.5"
+        />
       )}
 
       {open && (
@@ -556,6 +689,15 @@ export function ModelPicker({
                     </div>
                   )}
 
+                  {railInstance.instanceId === selection.instanceId && (
+                    <SavedModelNotice
+                      status={savedStatus}
+                      modelName={modelLabel(active, selection.model)}
+                      onSwitch={switchSaved}
+                      className="mt-2"
+                    />
+                  )}
+
                   {railInstance.driverKind === "boxAgent" && (
                     <div className="mt-2 rounded bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-warning-dark border border-warning/20">
                       <strong>Works Alone:</strong>
@@ -597,6 +739,13 @@ export function ModelPicker({
                       </div>
                       {pane === "main" ? (
                         <>
+                          {!query && (
+                            <LatestModelRows
+                              rows={latest}
+                              currentClass={selection.instanceId === railInstance.instanceId ? selection.latest : null}
+                              onPick={(row) => pick(railInstance, row.resolvedId, row.classKey)}
+                            />
+                          )}
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">
                             {query ? `${filteredOfficial.length} results` : showAll ? `All models · ${official.length}` : "Suggested"}
                           </EngineGroupLabel>

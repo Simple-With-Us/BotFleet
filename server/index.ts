@@ -210,6 +210,8 @@ import { cliProbeEnvironment } from "./cli-probe-env.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
+import { reconcileEntry, type LineageContext } from "../shared/model-lineage.ts";
+import { checkLineageWrite, lineageContextFor, modelNameFor, presentDescribedInstances } from "./model-lineage.ts";
 import {
   isEffortLevel,
   type CloudBackend,
@@ -1070,22 +1072,56 @@ async function defaultSelection(excludeInstanceId?: string) {
   return { instanceId: "", model: "" };
 }
 
+// ── model lineage (shared/model-lineage.ts) ─────────────────────────────
+// What a lineage pass knows about one live instance: its driver, the ids its
+// full (unhidden) catalog offers, whether that catalog is authoritative, and
+// which efforts each model takes.  An instance that is not registered has no
+// context, so nothing on it is moved.
+function lineageContextForInstance(instanceId: string): LineageContext | undefined {
+  const instance = registry.get(instanceId);
+  if (!instance) return undefined;
+  return lineageContextFor(instance, (model) =>
+    modelEffortLevels(
+      { driverKind: instance.driverKind, capabilities: instance.adapter.capabilities },
+      instance.models.options.find((option) => option.id === model),
+      model,
+    ),
+  );
+}
+
+/** Reconcile saved selections against the engines' current catalogs.  The
+ *  store posts one notice per bot it moved and emits the bot frames. */
+function reconcileModelLineage(opts: { botIds?: readonly string[]; ownerDirective?: boolean; skipBusy?: boolean } = {}) {
+  try {
+    store.reconcileModelLineage({
+      contextFor: lineageContextForInstance,
+      nameFor: (instanceId, model) => modelNameFor(registry.get(instanceId)?.models, model),
+      ...opts,
+    });
+  } catch (error) {
+    console.error("model-lineage: reconcile failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
 function checkedModelSelection(
   raw: unknown,
   current?: { selection: ModelSelection; busy: boolean },
   requireAvailableModel = false,
+  /** A fallback entry parsed by the recursion below; the chain-level
+   *  lineage check runs once, on the whole chain. */
+  nested = false,
 ): { ok: true; selection: ModelSelection } | { ok: false; status: number; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown };
+  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; latest?: unknown };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
   if (typeof value.model !== "string" || !value.model.trim()) {
     return { ok: false, status: 400, error: "modelSelection.model is required" };
   }
-  const selection: ModelSelection = {
+  let selection: ModelSelection = {
     instanceId: value.instanceId.trim(),
     model: value.model.trim(),
   };
@@ -1094,6 +1130,13 @@ function checkedModelSelection(
       return { ok: false, status: 400, error: `effort "${String(value.effort)}" is not recognized` };
     }
     selection.effort = value.effort;
+  }
+  // "Latest <Class>": `null` means pinned (see checkLineageWrite).
+  if (value.latest !== undefined && value.latest !== null) {
+    if (typeof value.latest !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(value.latest)) {
+      return { ok: false, status: 400, error: "modelSelection.latest must be a model class such as \"sonnet\"" };
+    }
+    selection.latest = value.latest;
   }
   
   if ("fallbacks" in value && Array.isArray(value.fallbacks)) {
@@ -1109,13 +1152,22 @@ function checkedModelSelection(
     }
     const parsedFallbacks: ModelSelection[] = [];
     for (const f of value.fallbacks) {
-       const res = checkedModelSelection(f, undefined, requireAvailableModel);
+       const res = checkedModelSelection(f, undefined, requireAvailableModel, true);
        if (!res.ok) return res;
        parsedFallbacks.push(res.selection);
     }
     if (parsedFallbacks.length > 0) {
       selection.fallbacks = parsedFallbacks;
     }
+  }
+  if (!nested) {
+    // Retired and superseded ids move forward, Latest entries resolve to
+    // the slug they will run, and the saved chain is reconciled the same way
+    // so the busy check below compares like with like.
+    const lineage = checkLineageWrite(selection, raw, current?.selection, lineageContextForInstance);
+    if (!lineage.ok) return { ok: false, status: 400, error: lineage.error };
+    selection = lineage.selection;
+    if (current && lineage.current) current = { ...current, selection: lineage.current };
   }
   const changed = current && (
     selection.instanceId !== current.selection.instanceId ||
@@ -1602,6 +1654,11 @@ setInterval(() => {
     console.error("[snooze] sweep failed", error instanceof Error ? error.message : String(error));
   }
 }, SNOOZE_SWEEP_MS).unref?.();
+
+// One-time owner-directed move (every Sonnet and Luna becomes Latest) plus
+// the regular lineage pass, now that the registry has every engine's
+// catalog.  Later catalog refreshes and every dispatch run the regular pass.
+reconcileModelLineage({ ownerDirective: true });
 
 // ── message pages ──────────────────────────────────────────────────────
 // GET /api/bots hands back every bot with its entire transcript, which is
@@ -3915,6 +3972,10 @@ async function startTurn(
   }
   // a person typing into this bot ends the unattended window immediately
   else if (opts?.automationSource === undefined && !opts?.commsDepth && !opts?.cardContinuation) clearUnattended(bot.id);
+  // Point "Latest <Class>" entries at the newest member the engine offers
+  // right now and move retired ids forward before anything reads the chain,
+  // so the model dispatched and recorded below is the real slug.
+  reconcileModelLineage({ botIds: [bot.id] });
   const task = store.taskByThread(bot.id, threadId);
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
   const commsDepth = opts?.commsDepth ?? 0;
@@ -3927,6 +3988,9 @@ async function startTurn(
   let fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
     ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
+  if (opts?.modelSelection) {
+    selection = reconcileEntry(selection, lineageContextForInstance(selection.instanceId)).entry;
+  }
 
   const downgradeInstance = registry.get(selection.instanceId);
   selection = unattendedModelDowngrade(selection, {
@@ -5986,6 +6050,7 @@ async function runGroupMemberTurn(
     queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
     return true;
   }
+  if (!turnSelection) reconcileModelLineage({ botIds: [bot.id] });
   const selection = turnSelection ?? bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
@@ -11902,11 +11967,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // ?fresh=1 — sent by the client's explicit "Check again"/"Refresh"
       // actions and right after a CLI/fullAuto override is saved — bypasses
       // it so the user's own action is never served a stale answer.
-      return json(res, 200, {
-        instances: await registry.describe(
-          fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
-        ),
-      });
+      const described = await registry.describe(
+        fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
+      );
+      // A describe is the catalog refresh: move saved selections forward
+      // against what the engines offer now.  Working bots wait for their
+      // next dispatch, which reconciles them first.
+      reconcileModelLineage({ skipBusy: true });
+      return json(res, 200, { instances: presentDescribedInstances(described) });
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -12053,7 +12121,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, { instances });
+        return json(res, 200, { instances: presentDescribedInstances(instances) });
       } finally {
         providerConfigBusy = false;
       }
@@ -12228,7 +12296,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances: await registry.describe(),
+          instances: presentDescribedInstances(await registry.describe()),
         });
       } finally {
         providerConfigBusy = false;
@@ -12350,7 +12418,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         resetPathCache();
         return json(res, 200, {
           ok: true,
-          instances: await registry.describe(),
+          instances: presentDescribedInstances(await registry.describe()),
         });
       } finally {
         providerConfigBusy = false;

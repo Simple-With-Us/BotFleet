@@ -50,6 +50,13 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional: a model class this entry floats on ("Latest Sonnet" is
+   *  `latest: "sonnet"`).  `model` is still the real slug that runs — the
+   *  harness keeps it pointed at the newest member of the class the
+   *  instance's catalog offers (shared/model-lineage.ts), so drivers,
+   *  recorded usage, and clients that ignore this field all see the actual
+   *  model. */
+  latest?: string;
   /** Optional: engines to try if this one fails (e.g. quota/rate limit) */
   fallbacks?: ModelSelection[];
 }

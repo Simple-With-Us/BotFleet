@@ -2,6 +2,7 @@
 // Extracted to a pure library module to isolate plan resolution and model name
 // formatting from React component rendering and UI asset resolution.
 import { ENGINE_CAPABILITIES } from "@/lib/engine-capabilities";
+import { readableModelLabel } from "@/lib/model-label";
 
 export interface EnginePlanOption {
   label: string;
@@ -55,25 +56,20 @@ export const ENGINE_PLAN_OPTIONS: Record<string, EnginePlanOption[]> = {
   ],
 };
 
+/** Labels for usage rows whose model no catalog lists any more and whose id
+ *  the generic formatter cannot read.  Claude, GPT, and Grok ids are not
+ *  listed here: readableModelLabel (src/lib/model-label.ts) labels them from
+ *  their model class, so this table cannot drift from the picker again.
+ *  Display only — usage stays attributed to the raw id it was recorded
+ *  under. */
 export const FALLBACK_MODEL_NAMES: Record<string, string> = {
   "minimax-m3": "MiniMax M3",
   "minimax-h3": "MiniMax H3",
   "minimax-m2.7-highspeed": "MiniMax M2.7 Highspeed",
   "minimax-m2.7": "MiniMax M2.7",
-  "grok-4.7-build-fast": "Grok 4.7 Build Fast",
-  "grok-4.7": "Grok 4.7",
-  "grok-4.6": "Grok 4.6",
   "grok-3-mini": "Grok 3 mini",
-  "grok-4": "Grok 4",
   "deepseek-chat": "DeepSeek Chat",
   "deepseek-reasoner": "DeepSeek Reasoner",
-  "claude-opus-4": "Claude Opus 4",
-  "claude-sonnet-4.5": "Claude Sonnet 4.5",
-  "claude-haiku-4": "Claude Haiku 4",
-  "claude-3-7-sonnet": "Claude 3.7 Sonnet",
-  "claude-3-5-sonnet": "Claude 3.5 Sonnet",
-  "gpt-5-codex": "GPT-5 Codex",
-  "gpt-5": "GPT-5",
   "gpt-4o": "GPT-4o",
   "gpt-4o-mini": "GPT-4o mini",
   "gemini-2.5-pro": "Gemini 2.5 Pro",
@@ -108,7 +104,7 @@ export function modelDisplayName(
   }
   const fallback = FALLBACK_MODEL_NAMES[modelId.toLowerCase()];
   if (fallback) return fallback;
-  return modelId;
+  return readableModelLabel(modelId);
 }
 
 export function defaultEnginePlan(id: string): { planName: string; costPerMonth: number | null } {

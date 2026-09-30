@@ -650,3 +650,42 @@ export function lineageStatus(
   if (live && offered.length > 0) return { kind: "not-in-catalog" };
   return { kind: "ok" };
 }
+
+/** One-line transcript notice for a bot whose saved models moved, or null
+ *  when nothing a person would notice changed.  `changes` are the reconcile
+ *  records for this chain; the only thing read from them is which fallback
+ *  slots were dropped, so the saved and rewritten chains can be paired. */
+export function lineageNotice(
+  before: LineageSelection,
+  after: LineageSelection,
+  changes: readonly LineageChange[],
+  driverKindFor: (instanceId: string) => string | undefined,
+  nameFor: (instanceId: string, model: string) => string,
+): string | null {
+  const describe = (entry: LineageSelection): string => {
+    const name = nameFor(entry.instanceId, entry.model);
+    if (!entry.latest) return name;
+    const noun = classLabel(driverKindFor(entry.instanceId), entry.latest) ?? entry.latest;
+    return `Latest ${noun} (${name})`;
+  };
+  const dropped = new Set(changes.filter((change) => change.to === "").map((change) => change.slot));
+  const parts: string[] = [];
+  const note = (slot: string, from: LineageSelection, to: LineageSelection) => {
+    if (from.instanceId === to.instanceId && from.model === to.model && (from.latest ?? "") === (to.latest ?? "")) return;
+    parts.push(`${slot} ${describe(from)} → ${describe(to)}`);
+  };
+  note("primary", before, after);
+  const survivors = after.fallbacks ?? [];
+  let next = 0;
+  (before.fallbacks ?? []).forEach((fallback, index) => {
+    const slot = slotName(index);
+    if (dropped.has(slot)) {
+      parts.push(`${slot} ${nameFor(fallback.instanceId, fallback.model)} removed (now the same as the primary)`);
+      return;
+    }
+    const survivor = survivors[next++];
+    if (survivor) note(slot, fallback, survivor);
+  });
+  if (!parts.length) return null;
+  return `Model update: ${parts.join(" · ")}`;
+}

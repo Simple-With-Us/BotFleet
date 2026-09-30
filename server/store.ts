@@ -19,6 +19,14 @@ import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import {
+  applyOwnerDirective,
+  lineageNotice,
+  OWNER_DIRECTED_LATEST,
+  reconcileChain,
+  type LineageChange,
+  type LineageContext,
+} from "../shared/model-lineage.ts";
 
 export type BotColor =
   | "green"
@@ -625,6 +633,8 @@ export interface InstalledPackageMetadata {
 }
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
+/** Which one-time model-lineage migrations this data dir has had. */
+const MODEL_LINEAGE_MARKER = "model-lineage.json";
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
 /** How long a burst of saveBots() calls coalesces into one atomic write. */
 const BOTS_SAVE_DEBOUNCE_MS = 250;
@@ -2147,6 +2157,114 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Move saved model selections forward (shared/model-lineage.ts).
+   *
+   * Rewrites each bot's primary and fallbacks, its activeModelSelection, and
+   * every task's modelSelection and activeModelSelection: retired ids onto
+   * the newest member of their successor class, "Latest <Class>" entries
+   * onto the newest member the instance offers, and pinned older members
+   * forward when the price band allows.  Only saved SELECTIONS move.
+   * Message rows, usage buckets, and per-model stats keep the slug that
+   * actually ran — the owner's no-aliasing rule.
+   *
+   * `ownerDirective` also applies the one-time owner-directed flags (every
+   * Sonnet and every Luna becomes Latest), gated on a marker file so a
+   * later explicit pin is never re-floated.  Idempotent: a second pass with
+   * the same catalogs changes nothing.  Each bot whose chain moved gets one
+   * notice in its active thread, and every move is logged. */
+  reconcileModelLineage(opts: {
+    contextFor: (instanceId: string) => LineageContext | undefined;
+    nameFor: (instanceId: string, model: string) => string;
+    botIds?: readonly string[];
+    ownerDirective?: boolean;
+    /** Leave working bots alone; their next turn reconciles them. */
+    skipBusy?: boolean;
+  }): Array<{ botId: string; notice: string | null }> {
+    const driverKindFor = (instanceId: string) => opts.contextFor(instanceId)?.driverKind;
+    const markerFile = join(DATA_DIR, MODEL_LINEAGE_MARKER);
+    let applied: string[] = [];
+    try {
+      const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown };
+      if (Array.isArray(parsed.applied)) applied = parsed.applied.filter((id): id is string => typeof id === "string");
+    } catch {
+      applied = [];
+    }
+    // A roster that failed to parse is not a roster to migrate.
+    const runDirective =
+      Boolean(opts.ownerDirective) && !this.botsLoadFailed && !applied.includes(OWNER_DIRECTED_LATEST.id);
+    const wanted = opts.botIds ? new Set(opts.botIds) : null;
+    const results: Array<{ botId: string; notice: string | null }> = [];
+    let dirty = false;
+    const log = (bot: BotRecord, where: string, changes: readonly LineageChange[]) => {
+      for (const change of changes) {
+        const target = change.to ? `${change.to}${change.latest ? ` [latest ${change.latest}]` : ""}` : "(dropped)";
+        console.log(
+          `model-lineage: ${bot.name} (${bot.id}) ${where} ${change.slot} ${change.from} -> ${target} (${change.reason})`,
+        );
+      }
+    };
+    const pass = (selection: ModelSelection, directive: boolean) => {
+      const flagged = directive ? applyOwnerDirective(selection, driverKindFor) : { selection, flagged: [] };
+      const reconciled = reconcileChain(flagged.selection, opts.contextFor);
+      return { selection: reconciled.selection, flagged: flagged.flagged, changes: reconciled.changes };
+    };
+    for (const bot of this.bots) {
+      if (wanted && !wanted.has(bot.id)) continue;
+      if (opts.skipBusy && bot.busy) continue;
+      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]);
+      const notices: string[] = [];
+      if (bot.modelSelection?.instanceId) {
+        const saved = bot.modelSelection;
+        const next = pass(saved, runDirective);
+        log(bot, "bot", [...next.flagged, ...next.changes]);
+        const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
+        if (notice) notices.push(notice);
+        bot.modelSelection = next.selection;
+      }
+      if (bot.activeModelSelection?.instanceId) {
+        bot.activeModelSelection = pass(bot.activeModelSelection, false).selection;
+      }
+      for (const task of bot.tasks ?? []) {
+        if (task.modelSelection?.instanceId) {
+          const saved = task.modelSelection;
+          const next = pass(saved, runDirective);
+          log(bot, `task ${task.threadId}`, [...next.flagged, ...next.changes]);
+          const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
+          if (notice) notices.push(`${notice} (task “${task.title}”)`);
+          task.modelSelection = next.selection;
+        }
+        if (task.activeModelSelection?.instanceId) {
+          task.activeModelSelection = pass(task.activeModelSelection, false).selection;
+        }
+      }
+      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]) === before) continue;
+      dirty = true;
+      const notice = notices.length ? notices.join(" · ") : null;
+      if (notice) {
+        this.appendMessage(bot.threadId, {
+          role: "bot",
+          kind: "activity",
+          // A notice, not a step: `ok` settles it so the row never spins.
+          tool: { name: notice, ok: true, kind: "notice" },
+        });
+      }
+      this.emit({ type: "bot", botId: bot.id });
+      results.push({ botId: bot.id, notice });
+    }
+    if (dirty) {
+      this.saveBots();
+      this.flushBotsNow();
+    }
+    if (runDirective) {
+      try {
+        writeFileAtomic(markerFile, `${JSON.stringify({ applied: [...applied, OWNER_DIRECTED_LATEST.id] }, null, 2)}\n`);
+      } catch (error) {
+        console.error("model-lineage: could not record the owner-directed migration", error);
+      }
+    }
+    return results;
   }
 
   /** End an until-activity snooze because the thread just did something.
