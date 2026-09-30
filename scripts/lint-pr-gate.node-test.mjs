@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const gate = join(dirname(fileURLToPath(import.meta.url)), "lint-pr-gate.mjs");
 const env = {
@@ -59,7 +59,7 @@ describe("lint-pr-gate base fetch", () => {
 
   test("stacked PR base resolves a merge-base from a shallow checkout", () => {
     const clone = join(root, "shallow-stacked");
-    git(root, "clone", "-q", "--depth=1", "--branch", "fix/top", `file://${origin}`, clone);
+    git(root, "clone", "-q", "--depth=1", "--branch", "fix/top", pathToFileURL(origin).href, clone);
     assert.equal(git(clone, "rev-parse", "--is-shallow-repository"), "true");
     const r = runGate(clone, "origin/fix/base");
     assert.equal(r.status, 0, r.stderr);
@@ -68,7 +68,7 @@ describe("lint-pr-gate base fetch", () => {
 
   test("the base fetch leaves full history and a usable merge-base", () => {
     const clone = join(root, "shallow-history");
-    git(root, "clone", "-q", "--depth=1", "--branch", "fix/top", `file://${origin}`, clone);
+    git(root, "clone", "-q", "--depth=1", "--branch", "fix/top", pathToFileURL(origin).href, clone);
     const r = runGate(clone, "origin/fix/base");
     assert.equal(r.status, 0, r.stderr);
     assert.equal(git(clone, "rev-parse", "--is-shallow-repository"), "false");
@@ -80,21 +80,21 @@ describe("lint-pr-gate base fetch", () => {
 
   test("full-depth checkout with the stacked base also passes", () => {
     const clone = join(root, "full-stacked");
-    git(root, "clone", "-q", "--branch", "fix/top", `file://${origin}`, clone);
+    git(root, "clone", "-q", "--branch", "fix/top", pathToFileURL(origin).href, clone);
     const r = runGate(clone, "origin/fix/base");
     assert.equal(r.status, 0, r.stderr);
   });
 
   test("defaults to origin/main when no base ref is given", () => {
     const clone = join(root, "default-main");
-    git(root, "clone", "-q", "--branch", "fix/base", `file://${origin}`, clone);
+    git(root, "clone", "-q", "--branch", "fix/base", pathToFileURL(origin).href, clone);
     const r = runGate(clone, undefined);
     assert.equal(r.status, 0, r.stderr);
   });
 
   test("a missing base branch still fails loudly", () => {
     const clone = join(root, "missing-base");
-    git(root, "clone", "-q", "--branch", "fix/top", `file://${origin}`, clone);
+    git(root, "clone", "-q", "--branch", "fix/top", pathToFileURL(origin).href, clone);
     const r = runGate(clone, "origin/does-not-exist");
     assert.notEqual(r.status, 0);
   });
