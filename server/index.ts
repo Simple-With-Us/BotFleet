@@ -1255,7 +1255,13 @@ function checkedModelSelection(
   if (current?.busy && changed) {
     return { ok: false, status: 409, error: "the bot is working — stop it before changing models" };
   }
-  for (const entry of [selection, ...(selection.fallbacks ?? [])]) {
+  // Every accepted entry, including a fallback's own fallbacks: a nested
+  // chain is parsed above, so it is judged here like the rest.
+  const everyEntry = (entry: ModelSelection): ModelSelection[] => [
+    entry,
+    ...(entry.fallbacks ?? []).flatMap(everyEntry),
+  ];
+  for (const entry of everyEntry(selection)) {
     const problem = checkSelectionEntry(entry, requireAvailableModel);
     if (problem) return problem;
   }
@@ -12882,10 +12888,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           throw Object.assign(new Error("model slot must include instanceId and model"), { status: 400 });
         }
         // A "Latest <Class>" default stays floating on every bot it lands on.
+        // Absent or null is a pinned slot; anything else must be a class name,
+        // judged by the same rule as a per-bot write, never silently dropped.
+        let latest: string | undefined;
+        if (candidate.latest !== undefined && candidate.latest !== null) {
+          if (typeof candidate.latest !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(candidate.latest)) {
+            throw Object.assign(new Error("model slot latest must be a model class such as \"sonnet\""), { status: 400 });
+          }
+          latest = candidate.latest;
+        }
         return {
           instanceId: candidate.instanceId,
           model: candidate.model,
-          ...(typeof candidate.latest === "string" ? { latest: candidate.latest } : {}),
+          ...(latest ? { latest } : {}),
         };
       };
       const readFallbackSlot = (value: unknown): FallbackSlot => {

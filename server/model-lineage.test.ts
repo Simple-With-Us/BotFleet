@@ -217,6 +217,27 @@ describe("checkLineageWrite", () => {
     expect(write({ ...savedTwice, model: "claude-opus-5-5" }, savedTwice).ok).toBe(true);
   });
 
+  it("leaves an operator's custom id alone even when it reads like a retired or superseded official one", () => {
+    const grok = lineageContextFor({
+      driverKind: "grokAgent",
+      models: {
+        default: "grok-4.7",
+        options: [
+          { id: "grok-4.7", label: "Grok 4.7" },
+          { id: "grok-4.6", label: "My Grok", custom: true },
+        ],
+      },
+    });
+    const result = checkLineageWrite(
+      { instanceId: "g", model: "grok-4.6" },
+      { instanceId: "g", model: "grok-4.6" },
+      undefined,
+      () => grok,
+    );
+    expect(result).toMatchObject({ ok: true, selection: { model: "grok-4.6" } });
+    expect((result as { changes: unknown[] }).changes).toEqual([]);
+  });
+
   it("passes custom and local ids no catalog lists", () => {
     const result = write({ instanceId: "codex", model: "omlx::qwen3-coder", fallbacks: [{ instanceId: "claude", model: "my-proxy-model" }] });
     expect(result).toMatchObject({ ok: true, selection: { model: "omlx::qwen3-coder", fallbacks: [{ model: "my-proxy-model" }] } });

@@ -77,6 +77,7 @@ export function lineageContextFor(
   return {
     driverKind: instance.driverKind,
     offeredIds: officialIds(instance.models),
+    customIds: instance.models.options.filter((option) => option.custom).map((option) => option.id),
     authoritative: catalogIsAuthoritative(instance.driverKind, instance.models),
     ...(effortLevels ? { effortLevels } : {}),
   };

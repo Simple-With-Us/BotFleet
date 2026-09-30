@@ -7544,6 +7544,16 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
     expect(missing.status).toBe(400);
   });
 
+  it("rejects a malformed latest instead of silently dropping it", async () => {
+    for (const latest of [5, true, {}, "Not A Class", ""]) {
+      const res = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "fake", model: "after", latest } },
+      });
+      expect(res.status, JSON.stringify(latest)).toBe(400);
+      expect(res.body.error).toMatch(/latest/);
+    }
+  });
+
   it("leaves a bot that is mid-turn on its own model, and names it in the response", async () => {
     // The per-bot PATCH answers 409 here.  This route validated each slot
     // once with no bot in hand, and checkedModelSelection only raises the
@@ -7757,6 +7767,36 @@ describe("fallback cap: at most three, growth refused, existing chains left alon
     const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
     return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
   };
+
+  it("judges a fallback's own fallbacks like the rest of the chain", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Nested Gate" })).body.bot;
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    const good = { instanceId: "claude", model: claude.models.default };
+    const nope = { instanceId: "no-such-instance-anywhere", model: "m" };
+    try {
+      const flat = await api("PATCH", `/api/bots/${bot.id}`, {
+        requireAvailableModel: true,
+        modelSelection: { ...good, fallbacks: [nope] },
+      });
+      const nested = await api("PATCH", `/api/bots/${bot.id}`, {
+        requireAvailableModel: true,
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [nope] }] },
+      });
+      const fine = await api("PATCH", `/api/bots/${bot.id}`, {
+        requireAvailableModel: true,
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [good] }] },
+      });
+      expect(flat.status).toBe(400);
+      // The same verdict for the same bad entry, one level down.
+      expect(nested.status).toBe(400);
+      expect(nested.body.error).toContain("no-such-instance-anywhere");
+      expect(fine.status).toBe(200);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
 
   it("accepts a chain of three and refuses a fourth", async () => {
     const bot = (await api("POST", "/api/bots", { name: "Cap Three" })).body.bot;

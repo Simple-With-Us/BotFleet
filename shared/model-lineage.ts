@@ -451,6 +451,10 @@ export interface LineageContext {
   driverKind: string;
   /** Official (non-custom) ids the instance's catalog offers right now. */
   offeredIds: readonly string[];
+  /** Ids the operator added to this instance themselves (custom catalog
+   *  rows).  They are never classified, floated or rewritten, even when the
+   *  text of one looks like an official id. */
+  customIds?: readonly string[];
   /** The catalog is the engine's authoritative answer (a live listing, or
    *  a static list that IS the product's source of truth).  A static
    *  fallback that may not match the account is not: nothing is moved or
@@ -505,6 +509,7 @@ export function reconcileEntry<S extends LineageSelection>(
     return { entry };
   }
   const { driverKind } = ctx;
+  if (ctx.customIds?.includes(entry.model)) return { entry };
   const hit = classifyModel(driverKind, entry.model);
 
   if (entry.latest !== undefined) {
