@@ -16,6 +16,11 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 
+/** How long a driver may answer a timed-out `--version` probe with the
+ * last version a REAL probe returned.  Matches the registry's baseline limit,
+ * so repeated timeouts cannot keep an old answer looking fresh. */
+export const KNOWN_VERSION_MAX_AGE_MS = 30 * 60_000;
+
 /** How long past a probe's soft `timeout` execCli waits for stdio to close before forcing the callback. */
 const HARD_EXEC_GRACE_MS = 2_000;
 /** A deadline timer this late means the event loop was stalled. */

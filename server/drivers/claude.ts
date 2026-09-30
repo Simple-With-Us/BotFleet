@@ -20,6 +20,7 @@ import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import {
+  KNOWN_VERSION_MAX_AGE_MS,
   brokerSocketPath,
   classifyVersionProbeFailure,
   describeSpawnFailure,
@@ -1453,6 +1454,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     // Mac does not flip a working, signed-in Claude to "not installed" or
     // "sign-in required".
     let lastKnownVersion: string | null = null;
+    let lastKnownAt = 0;
     let lastKnownAuth: boolean | undefined;
     const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -1466,11 +1468,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       let version = probed.version;
       if (version) {
         lastKnownVersion = version;
+        lastKnownAt = Date.now();
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
         const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
-        if (failure.kind === "transient" && lastKnownVersion) {
+        if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
           // Only a probe that gave no answer may stand on the last good
           // version.  A missing or crashing binary is a verdict.
           version = lastKnownVersion;

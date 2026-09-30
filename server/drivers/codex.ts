@@ -16,7 +16,7 @@ import { z } from "zod";
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../procs.ts";
+import { KNOWN_VERSION_MAX_AGE_MS, classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -850,6 +850,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
   // must not flip a working, signed-in Codex to "not installed" or
   // "sign-in required".
   let lastKnownVersion: string | null = null;
+    let lastKnownAt = 0;
   let lastKnownAuth: boolean | undefined;
   const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
@@ -863,11 +864,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     let version = probed.version;
     if (version) {
       lastKnownVersion = version;
+      lastKnownAt = Date.now();
     } else {
       const elapsed = Date.now() - startedAt;
       logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
       const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
-      if (failure.kind === "transient" && lastKnownVersion) {
+      if (failure.kind === "transient" && lastKnownVersion && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS) {
         // Only a probe that gave no answer may stand on the last good
         // version.  A missing or crashing binary is a verdict.
         version = lastKnownVersion;

@@ -1266,6 +1266,39 @@ describe("ProviderRegistry describe: single flight and last-known-good", () => {
     expect((await registry.describe({ maxAgeMs: 60_000 }))[0].snapshot.version).toBe("v2");
   });
 
+  it("does not let an earlier slow probe overwrite a later settled one while its sweep still waits", async () => {
+    const gateOld = deferred<void>();
+    const gateB = deferred<void>();
+    const calls = new Map<string, number>();
+    const fake = makeFakeDriver({
+      snapshotImpl: async (input) => {
+        const id = String((input as { instanceId?: string }).instanceId ?? input.displayName);
+        const call = (calls.get(id) ?? 0) + 1;
+        calls.set(id, call);
+        if (id === "a" && call === 2) {
+          await gateOld.promise;
+          return { state: "available", version: "a-old" };
+        }
+        if (id === "a") return { state: "available", version: call === 3 ? "a-new" : "a1" };
+        if (call === 3) await gateB.promise;
+        return { state: "available", version: "b" };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], { entryDeadlineMs: 150 });
+    await registry.load({ a: { driver: "fake", displayName: "a" }, b: { driver: "fake", displayName: "b" } });
+    await registry.describe();
+    await registry.describe(); // a's second probe hangs; the sweep answers from its baseline
+    // A newer sweep: a's probe settles at once, b holds the sweep open.
+    const waiting = registry.describe();
+    await tick(20);
+    gateOld.resolve();
+    await tick(20);
+    const seen = await registry.describe({ maxAgeMs: 60_000, staleWhileRevalidate: true });
+    expect(seen.find((row) => row.instanceId === "a")?.snapshot.version).toBe("a-new");
+    gateB.resolve();
+    await waiting;
+  });
+
   it("pushes only when a completed describe changed the answer", async () => {
     const fake = makeFakeDriver({ snapshotImpl: () => ({ state: "available", version: "1.0.0" }) });
     const registry = new ProviderRegistry([fake.driver]);

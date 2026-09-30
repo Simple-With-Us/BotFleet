@@ -22,7 +22,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
-import { classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../../procs.ts";
+import { KNOWN_VERSION_MAX_AGE_MS, classifyVersionProbeFailure, describeSpawnFailure, execCli, killCliTree, logProbeFailure, spawnCli } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
   decodeInitTimeoutMs,
@@ -574,6 +574,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         for (const l of [...listeners]) l(event);
       };
       let lastKnownVersion: string | null = null;
+      let lastKnownAt = 0;
       /** One `--version` probe, with what went wrong when it produced no
        * version — so a timeout can be told apart from a missing binary. */
       const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
@@ -584,6 +585,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
               lastKnownVersion = trimmed;
+              lastKnownAt = Date.now();
               resolve({ version: trimmed, error: null, elapsedMs });
             } else {
               logProbeFailure(input.instanceId, `${effective.cli} --version`, err, elapsedMs);
@@ -598,7 +600,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 20000,
               );
               if (failure.kind !== "transient") lastKnownVersion = null;
-              resolve({ version: failure.kind === "transient" ? lastKnownVersion : null, error: err, elapsedMs });
+              // A remembered version stands in for at most KNOWN_VERSION_MAX_AGE_MS
+              // after the last REAL answer, so repeated timeouts cannot keep
+              // re-presenting it as a fresh definitive snapshot forever.
+              const reusable =
+                failure.kind === "transient" && Date.now() - lastKnownAt <= KNOWN_VERSION_MAX_AGE_MS
+                  ? lastKnownVersion
+                  : null;
+              resolve({ version: reusable, error: err, elapsedMs });
             }
           });
         });

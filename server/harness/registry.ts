@@ -734,11 +734,20 @@ export class ProviderRegistry {
 
   /** A probe that missed its sweep's deadline landed: fold it into the last
    * completed describe so clients see it without asking again. */
-  private applyLateEntry(info: DescribedInstance): void {
+  private applyLateEntry(late: DescribedInstance): void {
     const done = this.lastDone;
     if (!done) return;
-    const meta = this.entryMeta.get(info);
+    let info = late;
+    let meta = this.entryMeta.get(info);
     if (!meta || meta.gen !== this.genOf(info.instanceId)) return;
+    // A probe that started later may already have settled while the sweep
+    // that owns lastDone is still waiting on other engines.  The newest
+    // settled answer wins, not merely this one.
+    const latest = this.latestSettled.get(info.instanceId);
+    if (latest && latest.gen === meta.gen && latest.seq > meta.seq) {
+      info = latest.info;
+      meta = this.entryMeta.get(info) ?? { at: latest.at, seq: latest.seq, gen: latest.gen };
+    }
     const index = done.result.findIndex((item) => item.instanceId === info.instanceId);
     if (index < 0) return;
     const current = this.entryMeta.get(done.result[index]);
