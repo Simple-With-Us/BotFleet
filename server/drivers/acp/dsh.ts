@@ -13,8 +13,10 @@ import {
   classifyDshError,
   dshCredentialCandidates,
   dshModelIdFromOptionValue,
+  DshModelNotOfferedError,
   dshModelOptionValue,
   dshProviderForModel,
+  dshSameModel,
   dshSpawnArgs as harnessDshSpawnArgs,
   dshSupport as harnessDshSupport,
   dshVersionCompatibilityReason,
@@ -243,7 +245,13 @@ export function readDshModelCatalog(
   }
   for (const row of discovered) {
     if (isExcludedModelId(row.id)) continue;
-    const index = options.findIndex((option) => option.id === row.id);
+    // Fold, don't duplicate: a settings row that spells a static model
+    // differently (`deepseek-flash`, an owner's `deepseek-v4.1-flash`) is the
+    // same model as the static `DeepSeek-V4.1-Flash` row, so it merges there.
+    // dshSameModel covers the DeepSeek alias spellings plus case; any other
+    // id still needs an exact match, so an unrelated model lands as its own
+    // row exactly as before.
+    const index = options.findIndex((option) => dshSameModel(option.id, row.id));
     if (index === -1) {
       options.push(row);
       continue;
@@ -263,11 +271,13 @@ export {
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
+  DshModelNotOfferedError,
   classifyDshError,
   dshCredentialCandidates,
   dshModelIdFromOptionValue,
   dshModelOptionValue,
   dshProviderForModel,
+  dshSameModel,
   dshVersionCompatibilityReason,
 };
 
