@@ -42,3 +42,15 @@ describe("ChatView mascot avatars stay paused once settled", () => {
     expect(SRC).toContain("animated={Boolean(bot.busy) && pageVisible}");
   });
 });
+
+describe("ChatView footer chips", () => {
+  it("renders the session chips from the open thread's task, directly under the composer", () => {
+    const composer = SRC.indexOf("<Composer\n");
+    const bar = SRC.indexOf("<ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />");
+    expect(composer).toBeGreaterThan(-1);
+    expect(bar).toBeGreaterThan(composer);
+    // nothing else opens between the two: the chips sit right under the composer
+    expect(SRC.slice(composer, bar)).not.toMatch(/<(?:div|section|main)\b/);
+    expect(SRC).toContain("const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);");
+  });
+});

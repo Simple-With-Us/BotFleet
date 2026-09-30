@@ -15,7 +15,7 @@ import { deriveSessionStats, deriveTokenUsage } from "@/lib/thread-stats";
 import type { TaskStats, TaskUsage } from "@/state/store";
 
 const CHIP =
-  "inline-flex min-w-0 items-center whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11.5px] leading-4 text-ink-secondary transition-colors hover:bg-raised hover:text-ink aria-expanded:bg-raised aria-expanded:text-ink";
+  "inline-block whitespace-nowrap rounded-md px-1.5 py-0.5 text-[11.5px] leading-4 text-ink-secondary transition-colors hover:bg-raised hover:text-ink aria-expanded:bg-raised aria-expanded:text-ink";
 
 function StatRows({ rows }: { rows: ReadonlyArray<{ label: string; value: string }> }) {
   return (
