@@ -21,6 +21,7 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -238,6 +239,9 @@ export interface Task {
   lastActivity?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
+  /** Timing aggregate banked with `usage`; absent on tasks from before it
+   *  existed.  Durations are milliseconds. */
+  stats?: TaskStats;
   /** Per-instance breakdown of `usage`, banked from the selection that
    *  actually ran each turn (post-fallback).  `engineId` is the registry
    *  engine resolved at bank time, so attribution survives deleting the
@@ -260,6 +264,19 @@ export interface Task {
    * window left open across one is not, which is why the sidebar checks the
    * clock too.  See `shared/thread-snooze.ts`. */
   snoozedUntil?: number;
+}
+
+/** Mirror of the server's `TaskStats`: running timing totals for a task,
+ *  in milliseconds, banked once per settled turn.  Aggregates only. */
+export interface TaskStats {
+  turns: number;
+  steps: number;
+  modelMs: number;
+  toolMs: number;
+  ttftMsSum?: number;
+  ttftSamples?: number;
+  tpsTokens?: number;
+  tpsMs?: number;
 }
 
 export interface TaskUsage {
@@ -2867,6 +2884,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "runtime": {
           const event = frame.event;
+          // the Trajectory tab's door: free unless that thread's tab is open
+          publishRuntimeEvent(event);
           if (event.type === "content.delta") {
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
@@ -2932,6 +2951,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (frame.kind === "hello") {
         clearTimeout(hydrationFallback);
         if (frame.resumed !== true) {
+          // The events missed while disconnected are not coming back over the
+          // stream: an open Trajectory tab re-reads its thread's log.
+          publishRuntimeGap();
           // The snapshot replaces the pre-gap transcript.  Discard both
           // rendered fragments and queued deltas from that older boundary.
           deltaBuffer.current.clear();
