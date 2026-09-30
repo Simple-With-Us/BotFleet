@@ -9,8 +9,6 @@
 // - `<ComputerProviderToggle>` row per provider (ASCII.dev Box, Self-
 //   Hosted VPS, Local VM, This Computer), each with a caption explaining
 //   the impact of turning it off.
-// - `<VpsModeToggle>` next to the VPS row so the operator can pick
-//   Shared, Per-Bot, or Not Used.
 // - `<BotComputerMatrix>` so every bot's grant is visible in one table,
 //   with a one-click "Apply new default to all" that opens a confirm
 //   dialog.
@@ -336,6 +334,7 @@ export function LocalComputerSection() {
   return (
     <>
       <Card
+        id="setting-computers-providers"
         title="Providers"
         subtitle="The computer providers any bot in this workspace is allowed to use.  Disabling a provider here keeps every bot off it, no matter what a bot's own settings say.  Leave the shipped set on to keep the current behavior."
       >
@@ -358,6 +357,7 @@ export function LocalComputerSection() {
       </Card>
 
       <Card
+        id="setting-computers-matrix"
         title="Bots"
         subtitle="Which providers every bot in this workspace has.  Per-bot edits live in each bot's settings; the matrix is the master view."
       >

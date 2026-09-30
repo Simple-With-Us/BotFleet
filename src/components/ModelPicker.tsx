@@ -363,14 +363,18 @@ export function ModelPicker({
             "flex overflow-hidden rounded-2xl border border-hairline/50 bg-card",
             contained
               ? "relative mt-3 w-full max-h-[min(420px,50dvh)]"
-              : "absolute right-0 top-full z-30 mt-2 w-[420px] max-h-[min(480px,calc(100dvh-7rem))] shadow-2xl shadow-black/50",
+              : "absolute right-0 top-full z-30 mt-2 w-[420px] min-w-[380px] max-w-[min(640px,calc(100vw-2rem))] max-h-[min(560px,calc(100dvh-7rem))] resize shadow-2xl shadow-black/50",
           )}
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
               const availableInstances = state.instances.filter((i) => {
                 if (i.enabled === false) return false;
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId) return false;
+                const isInstalledOrSubscription =
+                  i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
+                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId && !isInstalledOrSubscription) {
+                  return false;
+                }
                 if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
                 return true;
               });

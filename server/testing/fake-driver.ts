@@ -28,6 +28,8 @@ export interface FakeDriverOptions {
    *  test can prove the registry merges that verdict rather than replacing
    *  it with whatever a balance endpoint said. */
   quota?: ProviderSnapshot["quota"];
+  /** Default config returned by driver.defaultConfig(). */
+  defaultConfig?: Record<string, unknown> | (() => Record<string, unknown>);
 }
 
 export interface FakeDriverHandle {
@@ -55,7 +57,11 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
         handle.decodedConfigs.push(raw);
         return (raw ?? {}) as Record<string, unknown>;
       },
-      defaultConfig: () => ({ isDefault: true }),
+      defaultConfig: () => {
+        if (typeof opts.defaultConfig === "function") return { isDefault: true, ...opts.defaultConfig() };
+        if (opts.defaultConfig) return { isDefault: true, ...opts.defaultConfig };
+        return { isDefault: true };
+      },
       async create(input: DriverCreateInput<Record<string, unknown>>): Promise<ProviderInstance> {
         if (opts.failCreate) throw new Error(opts.failCreate);
         const listeners = new Set<RuntimeEventListener>();

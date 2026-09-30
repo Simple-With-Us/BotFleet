@@ -41,9 +41,18 @@ public struct SkillExecutionReceiptView: View {
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#8B5CF6"))
                     
-                    Text(skillName)
-                        .font(.caption2.weight(.bold))
-                        .foregroundColor(isDark ? Color(hex: "#F8FAFC") : Color(hex: "#0F172A"))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(skillName)
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(isDark ? Color(hex: "#F8FAFC") : Color(hex: "#0F172A"))
+                        if !parameters.isEmpty {
+                            Text(parameters)
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundColor(isDark ? Color(hex: "#94A3B8") : Color(hex: "#64748B"))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
                     
                     if durationMs > 0 {
                         Text("• \(durationMs)ms")
@@ -70,27 +79,29 @@ public struct SkillExecutionReceiptView: View {
             .disabled(!hasDetails)
             
             if isExpanded && hasDetails {
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 6) {
                     if !parameters.isEmpty {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("INPUT")
+                            Text("COMMAND / INPUT")
                                 .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
                                 .foregroundColor(Color(hex: "#8B5CF6"))
                             Text(parameters)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
+                                .textSelection(.enabled)
                         }
                     }
                     
                     if !output.isEmpty {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("OUTPUT")
+                            Text(status == "error" ? "ERROR" : "OUTPUT")
                                 .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
-                                .foregroundColor(Color(hex: "#10B981"))
+                                .foregroundColor(status == "error" ? Color.red : Color(hex: "#10B981"))
                             Text(output)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundColor(isDark ? Color(hex: "#E2E8F0") : Color(hex: "#1E293B"))
-                                .lineLimit(6)
+                                .lineLimit(16)
+                                .textSelection(.enabled)
                         }
                     }
                 }

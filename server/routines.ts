@@ -1,4 +1,5 @@
 import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-retention.ts";
+import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -260,6 +261,8 @@ export interface RoutineManagerOptions {
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 const CATCH_UP_MS = 12 * 60 * 60_000;
 const MAX_RUNS = 2_000;
+/** What acknowledging the backlog is allowed to clear — see markAllSeen. */
+const ATTENTION_STATUSES: ReadonlySet<RoutineRunStatus> = new Set(ROUTINE_ATTENTION_STATUSES);
 /** Settled runs that keep their full prompt snapshot.  A webhook run's
  * snapshot carries its whole payload, so 2,000 of them made routines.json
  * 35 MB and turned every save() below into a multi-second main-thread stall
@@ -899,6 +902,40 @@ export class RoutineManager {
       this.emitRun(run);
     }
     return { ...run };
+  }
+
+  /** Acknowledge the unseen-failure backlog, optionally for one trigger.
+   *
+   *  Clearing the badge one run at a time does not scale: a webhook that has
+   *  been failing for a week leaves hundreds of old failures that no longer
+   *  describe anything the person can act on, and the only way to silence
+   *  them today is to click every one in the calendar.  Acknowledging is not
+   *  deleting — every run keeps its status, error, and history, it just stops
+   *  being unread.  A failure that happens after this call arrives with no
+   *  `seenAt` of its own, so the next real error still raises the badge.
+   *
+   *  `triggerId` narrows the sweep to one webhook or resource trigger so a
+   *  per-trigger badge clears only its own failures.  It matches the same
+   *  `webhookId` field the client's `triggerAttentionKey` groups on, and
+   *  `triggerSource` disambiguates: both kinds of run carry the trigger id in
+   *  `webhookId`, so without the source a webhook and a resource trigger
+   *  sharing an id would each clear the other's badge.  A scheduled routine
+   *  has no `webhookId`, so a trigger sweep never touches one by accident. */
+  markAllSeen(filter: { triggerId?: string; triggerSource?: RoutineRunTrigger } = {}): { acknowledged: number; runs: RoutineRun[] } {
+    const seenAt = this.now();
+    const acknowledged: RoutineRun[] = [];
+    for (const run of this.runs) {
+      if (!ATTENTION_STATUSES.has(run.status) || run.seenAt) continue;
+      if (filter.triggerId && run.webhookId !== filter.triggerId) continue;
+      if (filter.triggerSource && run.triggerSource !== filter.triggerSource) continue;
+      run.seenAt = seenAt;
+      acknowledged.push({ ...run });
+    }
+    if (acknowledged.length > 0) {
+      this.save();
+      for (const run of acknowledged) this.emitRun(run);
+    }
+    return { acknowledged: acknowledged.length, runs: acknowledged };
   }
 
   start() {

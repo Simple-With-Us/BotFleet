@@ -807,20 +807,35 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     return { turnId };
   };
 
+  let lastKnownVersion: string | null = null;
   const snapshot = async (): Promise<ProviderSnapshot> => {
     const env = childEnv();
-    const version = await new Promise<string | null>((resolve) => {
-      execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-        resolve(err ? null : stdout.trim()),
-      );
+    let version = await new Promise<string | null>((resolve) => {
+      execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+        const trimmed = err ? null : stdout.trim();
+        if (trimmed) {
+          lastKnownVersion = trimmed;
+          resolve(trimmed);
+        } else if (lastKnownVersion) {
+          resolve(lastKnownVersion);
+        } else {
+          resolve(null);
+        }
+      });
     });
-    if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+    if (!version) {
+      if (lastKnownVersion) {
+        version = lastKnownVersion;
+      } else {
+        return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      }
+    }
     const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
     if (match && (parseInt(match[1]) === 0 && parseInt(match[2]) < 151)) {
       return { state: "unavailable", reason: `Codex CLI is out of date (needs 0.151.0+). Run \`npm install -g @openai/codex\`` };
     }
     const authenticated = await new Promise<boolean>((resolve) => {
-      execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
+      execCli(config.cli, ["login", "status"], { timeout: 20000, env }, (err, stdout, stderr) =>
         resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
       );
     });

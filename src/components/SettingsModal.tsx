@@ -2,9 +2,11 @@
 // Per-bot settings (persona, model, computer) stay in SettingsPanel — this
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
+import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
+import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   ROOM_LABEL_MAX_LENGTH,
@@ -56,6 +58,41 @@ import { QdrantRagConnection } from "./QdrantRagConnection";
 import { cn } from "@/lib/cn";
 import { putAutomaticUpdateSetting } from "@/lib/automatic-update-setting";
 
+export const DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292; // 1100px + 192px (2 inches wider)
+export const DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976; // 880px + 96px (1 inch taller)
+export const MIN_SETTINGS_MODAL_WIDTH_PX = 760;
+export const MIN_SETTINGS_MODAL_HEIGHT_PX = 520;
+export const SETTINGS_MODAL_SIZE_STORAGE_KEY = "botfleet.settingsModalSize";
+
+export function loadSettingsModalSize(): { width: number; height: number } {
+  if (typeof window === "undefined") {
+    return { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+  }
+  try {
+    const raw = localStorage.getItem(SETTINGS_MODAL_SIZE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.width === "number" && typeof parsed?.height === "number") {
+        return {
+          width: Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, parsed.width),
+          height: Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, parsed.height),
+        };
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+}
+
+export function saveSettingsModalSize(size: { width: number; height: number }): void {
+  try {
+    localStorage.setItem(SETTINGS_MODAL_SIZE_STORAGE_KEY, JSON.stringify(size));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 const SECTIONS: Array<{
   id: AppSettingsSection;
   label: string;
@@ -74,10 +111,18 @@ const SECTIONS: Array<{
   { id: "secrets", label: "Secrets", icon: KeyRound, keywords: ["infisical", "vault", "credentials", "secret", "provenance"] },
 ];
 
-function sectionMatches(section: (typeof SECTIONS)[number], query: string): boolean {
-  if (!query) return true;
-  return [section.label, ...section.keywords].some((part) => part.toLowerCase().includes(query));
-}
+const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
+  general: User,
+  connections: KeyRound,
+  remote: Globe,
+  engines: Terminal,
+  models: Layers,
+  companion: Smartphone,
+  computers: Monitor,
+  usage: Coins,
+  observability: Activity,
+  secrets: KeyRound,
+};
 
 /** Name + email, persisted to /api/config {profile} on blur. */
 function ProfileFields() {
@@ -1044,15 +1089,78 @@ export function SettingsModal() {
   const remoteAccessUrl = ingress?.enabled === false ? null : (ingress?.publicUrl ?? null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
-  const q = query.trim().toLowerCase();
-  const visibleSections = SECTIONS.filter((entry) => sectionMatches(entry, q));
+  const trimmedQuery = query.trim();
+  const searchResult = useMemo(() => searchSettings(trimmedQuery), [trimmedQuery]);
+  const [selectedSectionFilter, setSelectedSectionFilter] = useState<AppSettingsSection | null>(null);
+  const [highlightedDomId, setHighlightedDomId] = useState<string | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
+
+  const visibleSections = useMemo(
+    () => SECTIONS.filter((entry) => searchResult.matchingSectionIds.has(entry.id)),
+    [searchResult.matchingSectionIds],
+  );
 
   useEffect(() => {
-    const visible = SECTIONS.filter((entry) => sectionMatches(entry, q));
-    if (visible.some((entry) => entry.id === section)) return;
-    const first = visible[0];
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
+
+  const HIGHLIGHT_CLASSES = [
+    "ring-2",
+    "ring-accent",
+    "ring-offset-2",
+    "ring-offset-panel",
+    "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
+    "rounded-xl",
+    "transition-all",
+    "duration-300",
+  ];
+
+  const handleNavigateToSetting = (item: SettingsSearchItem) => {
+    setQuery("");
+    setSelectedSectionFilter(null);
+    dispatch({ type: "toggleAppSettings", open: true, section: item.sectionId });
+    setHighlightedDomId(item.domId);
+
+    if (highlightTimerRef.current !== null) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedDomId(null);
+    }, 2600);
+
+    setTimeout(() => {
+      const el = document.getElementById(item.domId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add(...HIGHLIGHT_CLASSES);
+        setTimeout(() => {
+          el.classList.remove(
+            "ring-2",
+            "ring-accent",
+            "ring-offset-2",
+            "ring-offset-panel",
+            "shadow-[0_0_20px_rgba(33,139,255,0.35)]",
+          );
+        }, 2600);
+      }
+    }, 80);
+  };
+
+  const highlightClass = (domId: string) =>
+    highlightedDomId === domId
+      ? "ring-2 ring-accent ring-offset-2 ring-offset-panel shadow-[0_0_20px_rgba(33,139,255,0.35)] rounded-xl transition-all duration-300"
+      : undefined;
+
+  useEffect(() => {
+    if (trimmedQuery) return;
+    if (visibleSections.some((entry) => entry.id === section)) return;
+    const first = visibleSections[0];
     if (first) dispatch({ type: "toggleAppSettings", open: true, section: first.id });
-  }, [dispatch, q, section]);
+  }, [dispatch, visibleSections, section, trimmedQuery]);
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -1097,6 +1205,95 @@ export function SettingsModal() {
     };
   }, [dispatch]);
 
+  const [modalSize, setModalSize] = useState(() => loadSettingsModalSize());
+  const isResizingRef = useRef(false);
+  const [isResizing, setIsResizing] = useState(false);
+
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    setIsResizing(true);
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startW = modalSize.width;
+    const startH = modalSize.height;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const maxW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, window.innerWidth - 32);
+      const maxH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, window.innerHeight - 32);
+      // Since the modal is centered with flexbox, moving mouse by deltaX moves the right edge by deltaX
+      // and requires the width to expand by deltaX * 2 so the edge stays right under the mouse.
+      const deltaX = (moveEvent.clientX - startX) * 2;
+      const deltaY = (moveEvent.clientY - startY) * 2;
+      const nextW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, Math.min(maxW, Math.round(startW + deltaX)));
+      const nextH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, Math.min(maxH, Math.round(startH + deltaY)));
+      setModalSize({ width: nextW, height: nextH });
+    };
+
+    const onMouseUp = (upEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      isResizingRef.current = false;
+      setIsResizing(false);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      const maxW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, window.innerWidth - 32);
+      const maxH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, window.innerHeight - 32);
+      const deltaX = (upEvent.clientX - startX) * 2;
+      const deltaY = (upEvent.clientY - startY) * 2;
+      const finalW = Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, Math.min(maxW, Math.round(startW + deltaX)));
+      const finalH = Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, Math.min(maxH, Math.round(startH + deltaY)));
+      const finalSize = { width: finalW, height: finalH };
+      setModalSize(finalSize);
+      saveSettingsModalSize(finalSize);
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  };
+
+  const resetSize = () => {
+    const def = { width: DEFAULT_SETTINGS_MODAL_WIDTH_PX, height: DEFAULT_SETTINGS_MODAL_HEIGHT_PX };
+    setModalSize(def);
+    saveSettingsModalSize(def);
+  };
+
+  const handleResizeKey = (e: React.KeyboardEvent) => {
+    const step = 20;
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, width: Math.min(window.innerWidth - 32, prev.width + step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, width: Math.max(MIN_SETTINGS_MODAL_WIDTH_PX, prev.width - step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, height: Math.min(window.innerHeight - 32, prev.height + step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setModalSize((prev) => {
+        const next = { ...prev, height: Math.max(MIN_SETTINGS_MODAL_HEIGHT_PX, prev.height - step) };
+        saveSettingsModalSize(next);
+        return next;
+      });
+    } else if (e.key === "Home" || e.key === "0") {
+      e.preventDefault();
+      resetSize();
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
@@ -1108,7 +1305,14 @@ export function SettingsModal() {
         aria-modal="true"
         aria-labelledby="app-settings-title"
         tabIndex={-1}
-        className="flex h-[min(880px,calc(100dvh-3rem))] w-full max-w-[1100px] overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none"
+        style={{
+          width: `min(${modalSize.width}px, calc(100vw - 2rem))`,
+          height: `min(${modalSize.height}px, calc(100dvh - 2rem))`,
+        }}
+        className={cn(
+          "relative flex overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none",
+          isResizing && "select-none",
+        )}
       >
         {/* section nav */}
         <nav className="flex w-[164px] shrink-0 flex-col gap-0.5 border-r border-hairline/40 p-3">
@@ -1123,39 +1327,106 @@ export function SettingsModal() {
               onKeyDown={(e) => {
                 if (e.key !== "Escape") return;
                 e.stopPropagation();
-                if (query) setQuery("");
-                else dispatch({ type: "toggleAppSettings", open: false });
+                if (query) {
+                  setQuery("");
+                  setSelectedSectionFilter(null);
+                } else {
+                  dispatch({ type: "toggleAppSettings", open: false });
+                }
               }}
               placeholder="Search"
               aria-label="Search Settings"
               className="w-full bg-transparent text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
             />
+            {query ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery("");
+                  setSelectedSectionFilter(null);
+                }}
+                aria-label="Clear search"
+                className="shrink-0 rounded p-0.5 text-ink-secondary hover:text-ink"
+              >
+                <X size={13} />
+              </button>
+            ) : null}
           </div>
-          {visibleSections.length === 0 && (
-            <div className="px-2.5 py-4 text-[12.5px] leading-relaxed text-ink-secondary">
-              Nothing matches “{query.trim()}”
-            </div>
-          )}
-          {visibleSections.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
-              aria-current={section === id ? "page" : undefined}
-              className={cn(
-                "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+
+          {trimmedQuery ? (
+            <>
+              {searchResult.totalMatches === 0 ? (
+                <div className="px-2.5 py-4 text-[12px] leading-relaxed text-ink-secondary">
+                  No matches for &ldquo;{trimmedQuery}&rdquo;
+                </div>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setSelectedSectionFilter(null)}
+                    aria-current={selectedSectionFilter === null ? "page" : undefined}
+                    className={cn(
+                      "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
+                      selectedSectionFilter === null
+                        ? "bg-control text-ink font-medium"
+                        : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                    )}
+                  >
+                    <Search size={14} className="shrink-0 text-accent" />
+                    <span className="truncate">All Results</span>
+                    <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
+                      {searchResult.totalMatches}
+                    </span>
+                  </button>
+                  {visibleSections.map(({ id, label, icon: Icon }) => {
+                    const matchCount = searchResult.matchCountBySection[id] ?? 0;
+                    const isSelected = selectedSectionFilter === id;
+                    return (
+                      <button
+                        key={id}
+                        onClick={() => setSelectedSectionFilter(isSelected ? null : id)}
+                        aria-current={isSelected ? "page" : undefined}
+                        className={cn(
+                          "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
+                          isSelected
+                            ? "bg-control text-ink font-medium"
+                            : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                        )}
+                      >
+                        <Icon size={14} className="shrink-0" />
+                        <span className="truncate">{label}</span>
+                        {matchCount > 0 ? (
+                          <span className="ml-auto shrink-0 rounded-full bg-hairline/60 px-1.5 py-0.5 text-[11px] font-medium text-ink-secondary">
+                            {matchCount}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </>
               )}
-            >
-              <Icon size={15} />
-              {label}
-            </button>
-          ))}
+            </>
+          ) : (
+            SECTIONS.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
+                aria-current={section === id ? "page" : undefined}
+                className={cn(
+                  "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
+                  section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
+                )}
+              >
+                <Icon size={15} />
+                {label}
+              </button>
+            ))
+          )}
         </nav>
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center justify-between px-5 py-3">
             <span className="text-[15px] font-semibold text-ink">
-              {SECTIONS.find((s) => s.id === section)?.label}
+              {trimmedQuery ? "Settings Search" : SECTIONS.find((s) => s.id === section)?.label}
             </span>
             <button
               onClick={() => dispatch({ type: "toggleAppSettings", open: false })}
@@ -1166,110 +1437,217 @@ export function SettingsModal() {
             </button>
           </div>
 
-          <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
-            {section === "general" && (
-              <>
-                <Card title="Profile" subtitle="Shown in the sidebar. Saved as you go.">
-                  <ProfileFields />
-                </Card>
-                <Card title="Skin" subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light.">
-                  <SkinPicker />
-                </Card>
-                <ConversationModeRow />
-                <TerminologyRow />
-                <Card title="Channel Turns" subtitle="Set one maximum duration for every bot turn in a channel.">
-                  <RoomTurnTimeoutSettings />
-                </Card>
-                <ToolCallsRow />
-                <ExperimentalFeaturesRow />
-                <UpdatesRow />
-                <UpdateNotificationsRow />
-                <DiagnosticsRow />
-                <AnalyticsRow />
-              </>
-            )}
-
-            {section === "connections" && (
-              <Card
-                title="Connections"
-                subtitle={"Connected apps use a connected-apps service when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
-              >
-                <div className="flex flex-col gap-4">
-                  {state.config?.composio.mode === "managed" ? (
-                    <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
-                      Connected apps service is ready
-                    </div>
-                  ) : state.config?.composio.managedSetup?.status === "failed" ? (
-                    <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
-                      {state.config.composio.managedSetup.message ?? "Connected apps could not be set up."}
-                    </div>
-                  ) : null}
-                  <TranscriptionSettings />
-                  <ApiKeyRow section="box" />
-                  <ApiKeyRow section="opencodeGo" />
-                  <ApiKeyRow section="deepseek" />
-                  <div>
-                    <EngineKeyRow engine="minimax" />
-                    <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
+          {trimmedQuery ? (
+            <SettingsSearchResultsView
+              query={trimmedQuery}
+              searchResult={searchResult}
+              selectedSectionFilter={selectedSectionFilter}
+              onSelectSectionFilter={setSelectedSectionFilter}
+              onNavigateToSetting={handleNavigateToSetting}
+              onClearSearch={() => {
+                setQuery("");
+                setSelectedSectionFilter(null);
+              }}
+              onSelectChipQuery={(chip) => setQuery(chip)}
+              sectionIcons={SECTION_ICONS}
+            />
+          ) : (
+            <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-5 pb-5">
+              {section === "general" && (
+                <>
+                  <Card
+                    id="setting-general-profile"
+                    className={highlightClass("setting-general-profile")}
+                    title="Profile"
+                    subtitle="Shown in the sidebar. Saved as you go."
+                  >
+                    <ProfileFields />
+                  </Card>
+                  <Card
+                    id="setting-general-skin"
+                    className={highlightClass("setting-general-skin")}
+                    title="Skin"
+                    subtitle="Applies instantly and is remembered on this machine.  System Auto uses Midnight when this computer is dark, and Studio when it is light."
+                  >
+                    <SkinPicker />
+                  </Card>
+                  <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
+                    <ConversationModeRow />
                   </div>
-                  <EngineKeyRow engine="openaiCompat" />
-                  <QdrantRagConnection />
-                  <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                    <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
-                    <div className="mt-3">
-                      <CustomIngressFields />
-                    </div>
-                  </details>
-                  <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
-                    <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps</summary>
-                    <div className="mt-3">
-                      <ApiKeyRow section="composio" />
-                    </div>
-                  </details>
-                  <LinqSettings
-                    bots={bots}
-                    config={state.config ?? undefined}
-                    onPatch={async (patch) => {
-                      await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
-                    }}
-                  />
-                </div>
-              </Card>
-            )}
+                  <div id="setting-general-terminology" className={highlightClass("setting-general-terminology")}>
+                    <TerminologyRow />
+                  </div>
+                  <Card
+                    id="setting-general-room-turn-timeout"
+                    className={highlightClass("setting-general-room-turn-timeout")}
+                    title="Channel Turns"
+                    subtitle="Set one maximum duration for every bot turn in a channel."
+                  >
+                    <RoomTurnTimeoutSettings />
+                  </Card>
+                  <div id="setting-general-tool-calls" className={highlightClass("setting-general-tool-calls")}>
+                    <ToolCallsRow />
+                  </div>
+                  <div id="setting-general-experimental" className={highlightClass("setting-general-experimental")}>
+                    <ExperimentalFeaturesRow />
+                  </div>
+                  <div id="setting-general-updates" className={highlightClass("setting-general-updates")}>
+                    <UpdatesRow />
+                  </div>
+                  <div id="setting-general-update-notifications" className={highlightClass("setting-general-update-notifications")}>
+                    <UpdateNotificationsRow />
+                  </div>
+                  <div id="setting-general-diagnostics" className={highlightClass("setting-general-diagnostics")}>
+                    <DiagnosticsRow />
+                  </div>
+                  <div id="setting-general-analytics" className={highlightClass("setting-general-analytics")}>
+                    <AnalyticsRow />
+                  </div>
+                </>
+              )}
 
-            {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />}
-
-            {section === "engines" && (
-              <Card title="Engine CLIs" subtitle="Which binary each engine runs. Saved as you go.">
-                <EnginesSettings />
-              </Card>
-            )}
-
-            {section === "models" && <FleetModelsSection />}
-
-            {section === "companion" && <CompanionSection profileEmail={state.config?.profile?.email} />}
-
-            {section === "computers" && (
-              <>
-                <LocalComputerSection />
+              {section === "connections" && (
                 <Card
-                  title="VPS Connection"
-                  subtitle="Configure SSH access for your Self-hosted VPS."
+                  id="setting-connections-composio"
+                  className={highlightClass("setting-connections-composio")}
+                  title="Connections"
+                  subtitle={"Connected apps use a connected-apps service via Composio when one is configured, or your own Composio project key.\u00a0 Other optional service keys stay on this computer."}
                 >
-                  <VpsConnection />
+                  <div className="flex flex-col gap-4">
+                    {state.config?.composio.mode === "managed" ? (
+                      <div className="rounded-lg border border-success/25 bg-success/10 px-3 py-2 text-[13px] text-success">
+                        Connected apps service via Composio is ready
+                      </div>
+                    ) : state.config?.composio.managedSetup?.status === "failed" ? (
+                      <div role="status" className="rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[13px] text-warning">
+                        {state.config.composio.managedSetup.message ?? "Connected apps via Composio could not be set up."}
+                      </div>
+                    ) : null}
+                    <div id="setting-connections-transcription" className={highlightClass("setting-connections-transcription")}>
+                      <TranscriptionSettings />
+                    </div>
+                    <div id="setting-connections-api-keys" className={cn("flex flex-col gap-4", highlightClass("setting-connections-api-keys"))}>
+                      <ApiKeyRow section="box" />
+                      <ApiKeyRow section="opencodeGo" />
+                      <ApiKeyRow section="deepseek" />
+                      <div>
+                        <EngineKeyRow engine="minimax" />
+                        <p className="mt-1 text-[12px] text-ink-secondary">Powers MiniMax language models and all MiniMax voice synthesis features across BotFleet.</p>
+                      </div>
+                      <EngineKeyRow engine="openaiCompat" />
+                    </div>
+                    <div id="setting-connections-qdrant" className={highlightClass("setting-connections-qdrant")}>
+                      <QdrantRagConnection />
+                    </div>
+                    <div id="setting-connections-ingress" className={highlightClass("setting-connections-ingress")}>
+                      <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Custom Webhook Domain / Ingress</summary>
+                        <div className="mt-3">
+                          <CustomIngressFields />
+                        </div>
+                      </details>
+                    </div>
+                    <div id="setting-connections-selfhost-composio" className={highlightClass("setting-connections-selfhost-composio")}>
+                      <details className="rounded-lg border border-hairline/40 bg-inset px-3 py-2">
+                        <summary className="cursor-pointer text-[13px] text-ink-secondary">Self-Host Connected Apps via Composio</summary>
+                        <div className="mt-3">
+                          <ApiKeyRow section="composio" />
+                        </div>
+                      </details>
+                    </div>
+                    <div id="setting-connections-linq" className={highlightClass("setting-connections-linq")}>
+                      <LinqSettings
+                        bots={bots}
+                        config={state.config ?? undefined}
+                        onPatch={async (patch) => {
+                          await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+                        }}
+                      />
+                    </div>
+                  </div>
                 </Card>
-                <BotComputerDefaults />
-                <LocalVmRuntimeCard />
-                <SharedVpsRuntimeCard />
-              </>
-            )}
+              )}
 
-            {section === "usage" && <UsageSection />}
+              {section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />}
 
-            {section === "observability" && <ObservabilitySection />}
+              {section === "engines" && (
+                <Card
+                  id="setting-engines-clis"
+                  className={highlightClass("setting-engines-clis")}
+                  title="Engine CLIs"
+                  subtitle="Which binary each engine runs. Saved as you go."
+                >
+                  <EnginesSettings highlightClass={highlightClass} />
+                </Card>
+              )}
 
-            {section === "secrets" && <SecretsSection />}
-          </div>
+              {section === "models" && (
+                <div id="setting-models-fleet" className={highlightClass("setting-models-fleet")}>
+                  <FleetModelsSection />
+                </div>
+              )}
+
+              {section === "companion" && (
+                <div id="setting-companion-pairing" className={highlightClass("setting-companion-pairing")}>
+                  <CompanionSection profileEmail={state.config?.profile?.email} />
+                </div>
+              )}
+
+              {section === "computers" && (
+                <>
+                  <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
+                    <LocalComputerSection />
+                  </div>
+                  <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
+                    <LocalVmRuntimeCard />
+                  </div>
+                  <div id="setting-computers-shared-vps" className={highlightClass("setting-computers-shared-vps")}>
+                    <SharedVpsRuntimeCard />
+                  </div>
+                  <Card
+                    id="setting-computers-vps-connection"
+                    className={highlightClass("setting-computers-vps-connection")}
+                    title="VPS Connection"
+                    subtitle="Configure SSH access for your Self-hosted VPS."
+                  >
+                    <VpsConnection />
+                  </Card>
+                  <div id="setting-computers-defaults" className={highlightClass("setting-computers-defaults")}>
+                    <BotComputerDefaults />
+                  </div>
+                </>
+              )}
+
+              {section === "usage" && <UsageSection highlightClass={highlightClass} />}
+
+              {section === "observability" && <ObservabilitySection highlightClass={highlightClass} />}
+
+              {section === "secrets" && (
+                <div id="setting-secrets-infisical" className={highlightClass("setting-secrets-infisical")}>
+                  <SecretsSection />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Resize handle */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize settings dialog"
+          tabIndex={0}
+          title="Drag to resize, double-click to reset"
+          onMouseDown={startResize}
+          onDoubleClick={resetSize}
+          onKeyDown={handleResizeKey}
+          className="absolute bottom-1 right-1 z-50 flex size-4 cursor-nwse-resize items-center justify-center text-ink-secondary/40 hover:text-ink select-none"
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="stroke-current stroke-1">
+            <line x1="8" y1="2" x2="2" y2="8" />
+            <line x1="8" y1="5" x2="5" y2="8" />
+            <line x1="8" y1="8" x2="8" y2="8" />
+          </svg>
         </div>
       </div>
     </div>

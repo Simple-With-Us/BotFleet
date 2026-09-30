@@ -98,11 +98,12 @@ describe("Title Case for controls and headings", () => {
 });
 
 describe("Settings Models layout", () => {
-  it("grows the Settings dialog about 25-30 percent", () => {
+  it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
     const settings = FILES.find((entry) => entry.rel === "components/SettingsModal.tsx");
     expect(settings, "SettingsModal.tsx is missing").toBeDefined();
-    expect(settings!.text).toContain("max-w-[1100px]");
-    expect(settings!.text).toContain("h-[min(880px,calc(100dvh-3rem))]");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976");
+    expect(settings!.text).toContain("saveSettingsModalSize");
     expect(settings!.text).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings!.text).not.toContain("h-[560px]");
     expect(settings!.text).not.toContain("max-w-[860px]");

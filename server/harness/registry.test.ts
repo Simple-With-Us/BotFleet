@@ -1011,6 +1011,78 @@ describe("ProviderRegistry", () => {
 
       rmSync(tmpDir, { recursive: true, force: true });
     });
+
+    it("preserves previously available instance on transient probe failure when candidates exist", async () => {
+      const tmpDir = join(tmpdir(), `botfleet-cache-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const cachePath = join(tmpDir, "engine-cache.json");
+      mkdirSync(tmpDir, { recursive: true });
+      const fakeBin = join(tmpDir, "fake-cli");
+      writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(cachePath, JSON.stringify({
+        at: Date.now() - 1000,
+        instances: [{
+          instanceId: "test",
+          driverKind: "fake",
+          displayName: "Test",
+          enabled: true,
+          snapshot: { state: "available", version: "1.0.0" } as const,
+          models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+          capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+          computerReach: { local: false, box: false, vps: false },
+          access: "subscription",
+          cliCandidates: [fakeBin],
+          fullAuto: false,
+        }],
+      }));
+
+      const failingDriver = makeFakeDriver({
+        failSnapshot: "CLI probe timed out",
+        defaultConfig: { cli: fakeBin },
+      });
+      const reg = new ProviderRegistry([failingDriver.driver]);
+      reg.setDiskCachePath(cachePath);
+      await reg.load({ test: { driver: "fake" } });
+
+      const result = await reg.describeFresh();
+      expect(result[0].snapshot.state).toBe("available");
+      expect(result[0].snapshot.version).toBe("1.0.0");
+
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("does not preserve previously available instance when candidates are empty (e.g. uninstalled)", async () => {
+      const tmpDir = join(tmpdir(), `botfleet-cache-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const cachePath = join(tmpDir, "engine-cache.json");
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(cachePath, JSON.stringify({
+        at: Date.now() - 1000,
+        instances: [{
+          instanceId: "test",
+          driverKind: "fake",
+          displayName: "Test",
+          enabled: true,
+          snapshot: { state: "available", version: "1.0.0" } as const,
+          models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+          capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+          computerReach: { local: false, box: false, vps: false },
+          access: "subscription",
+          cliCandidates: ["/path/that/was/deleted"],
+          fullAuto: false,
+        }],
+      }));
+
+      const failingDriver = makeFakeDriver({
+        failSnapshot: "CLI probe timed out",
+      });
+      const reg = new ProviderRegistry([failingDriver.driver]);
+      reg.setDiskCachePath(cachePath);
+      await reg.load({ test: { driver: "fake" } });
+
+      const result = await reg.describeFresh();
+      expect(result[0].snapshot.state).toBe("unavailable");
+
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
   });
 });
 

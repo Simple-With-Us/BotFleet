@@ -51,6 +51,7 @@ import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
+import { describeResult } from "../../shared/tool-activity.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
 
@@ -1142,6 +1143,12 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
               const itemId = `${conversationId ?? o.conversation_id ?? "conv"}:${payload.step_index}`;
               // a tool is running, or has run: a relaunch would repeat it
               sawOutput = true;
+              const rawInput =
+                payload.tool_info?.parameters ??
+                payload.tool_input ??
+                payload.input ??
+                payload.args ??
+                payload.parameters;
               if (payload.state === "ACTIVE") {
                 activeTools.add(itemId);
                 emit({
@@ -1150,17 +1157,46 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
                   itemType: "tool",
                   itemId,
                   title: payload.tool_name,
-                  ...toolFields(payload.tool_name, payload.tool_input ?? payload.input ?? payload.args),
+                  ...toolFields(payload.tool_name, rawInput, { cwd: turn.cwd }),
                 });
               } else {
                 // Any state other than ACTIVE means the step is no longer
                 // running (CANCELED included), so the longer tool window
                 // must not outlive it.
                 activeTools.delete(itemId);
+                const rawDetail =
+                  payload.output ??
+                  payload.tool_info?.output ??
+                  payload.result ??
+                  payload.tool_info?.result ??
+                  payload.tool_info?.error ??
+                  payload.error ??
+                  payload.content;
+                const detail = describeResult(rawDetail);
+                const durationMs =
+                  typeof payload.duration_seconds === "number" && Number.isFinite(payload.duration_seconds)
+                    ? Math.round(payload.duration_seconds * 1000)
+                    : undefined;
                 if (payload.state === "DONE") {
-                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: true });
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: true,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                  });
                 } else if (payload.state === "ERROR") {
-                  emit({ ...base(threadId, turnId), type: "item.completed", itemType: "tool", itemId, ok: false });
+                  emit({
+                    ...base(threadId, turnId),
+                    type: "item.completed",
+                    itemType: "tool",
+                    itemId,
+                    ok: false,
+                    ...(detail ? { detail } : {}),
+                    ...(durationMs ? { durationMs } : {}),
+                  });
                 }
               }
             } else if (payload.step_type === "agent_response") {
@@ -1455,13 +1491,28 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
+    let lastKnownVersion: string | null = null;
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
-          resolve(err ? null : stdout.trim()),
-        );
+      let version = await new Promise<string | null>((resolve) => {
+        execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
+          const trimmed = err ? null : stdout.trim();
+          if (trimmed) {
+            lastKnownVersion = trimmed;
+            resolve(trimmed);
+          } else if (lastKnownVersion) {
+            resolve(lastKnownVersion);
+          } else {
+            resolve(null);
+          }
+        });
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      if (!version) {
+        if (lastKnownVersion) {
+          version = lastKnownVersion;
+        } else {
+          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        }
+      }
       // No auth field: agy auth is keyring-backed with no reliable file marker
       // (~/.gemini/antigravity-cli/ exists after first run even when logged
       // out), so any file heuristic would overstate "signed in". Leave undefined.

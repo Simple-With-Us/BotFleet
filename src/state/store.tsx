@@ -98,6 +98,8 @@ export interface Message {
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  /** The model that actually generated this reply; absent on legacy rows. */
+  modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
@@ -455,12 +457,17 @@ export interface ConfigStatus {
     vpsMode?: "shared" | "per-bot" | null;
   };
   ingress?: { publicUrl?: string; enabled?: boolean };
-  localVm: { mode: "shared" | "per-bot"; maxInstances: number };
+  localVm: {
+    mode: "shared" | "per-bot";
+    maxInstances: number;
+    shareCliCredentials?: boolean;
+    allowHostTerminal?: boolean;
+  };
   opencodeGo?: { configured: boolean };
   /** Voice (MiniMax). `configured` = a key is saved; `ready` = a key AND
    * a voice, which is what it takes to actually speak. The key itself is
    * never echoed back. */
-  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean };
+  tts?: { configured: boolean; ready: boolean; voice: string; provider?: "minimax" | "system"; optimizedSummary?: boolean };
   /** Call-mode STT preference + global vocabulary, mirrored from AppConfig.
    * `provider` is undefined when the picker has no explicit preference and
    * chooses the platform default. `keyterms` is the global voice vocabulary
@@ -698,6 +705,8 @@ export interface InstanceInfo {
       badgeTitle?: string;
       effortLevels?: readonly EffortLevel[];
       supportsEffort?: boolean;
+      /** Absent inherits the instance-wide image capability. */
+      images?: boolean;
     }>;
   };
   capabilities?: {
@@ -887,6 +896,8 @@ export type Action =
   | { type: "runRoutine"; routineId: string }
   | { type: "cancelRoutineRun"; runId: string }
   | { type: "markRoutineRunSeen"; runId: string }
+  | { type: "acknowledgeAllAttention" }
+  | { type: "acknowledgeTriggerAttention"; triggerId: string; triggerSource: "webhook" | "resource" }
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
@@ -1870,6 +1881,10 @@ export function reducer(state: AppState, action: Action): AppState {
     case "cancelRoutineRun":
     case "markRoutineRunSeen":
       return state;
+    case "acknowledgeAllAttention":
+      return state;
+    case "acknowledgeTriggerAttention":
+      return state;
   }
 }
 
@@ -2217,6 +2232,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "markRoutineRunSeen":
           api(`/api/routine-runs/${action.runId}/seen`, { method: "POST" }).catch(showError);
+          break;
+        case "acknowledgeAllAttention":
+          // Apply the acknowledged runs from the response as well as from the
+          // server's own run frames: an upsert by id either way, and the badge
+          // clears immediately instead of waiting on the event stream.
+          void api("/api/routine-runs/seen", { method: "POST" })
+            .then((body) => {
+              for (const run of (body?.runs ?? []) as RoutineRun[]) rawDispatch({ type: "routineRunPatched", run });
+            })
+            .catch(showError);
+          break;
+        case "acknowledgeTriggerAttention":
+          // Scoped to one webhook or resource trigger, so clearing that badge
+          // never sweeps another trigger's backlog.  Applied from the response
+          // for the same reason as above: the badge clears immediately.
+          void api("/api/routine-runs/seen", { method: "POST", body: JSON.stringify({ triggerId: action.triggerId, triggerSource: action.triggerSource }) })
+            .then((body) => {
+              for (const run of (body?.runs ?? []) as RoutineRun[]) rawDispatch({ type: "routineRunPatched", run });
+            })
+            .catch(showError);
           break;
         case "cancelQueued":
           void api(`/api/bots/${action.botId}/queue/${action.queueId}`, { method: "DELETE" })

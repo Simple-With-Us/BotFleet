@@ -123,6 +123,17 @@ const PerModelEffortSupport: AcpSupport = {
 };
 const PerModelEffortDriver = createAcpDriver(PerModelEffortSupport);
 
+const PerModelImagesDriver = createAcpDriver({
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "perModelImagesTest",
+  models: { default: "flash", options: [
+    { id: "flash", label: "Flash" },
+    { id: "pro", label: "Pro", images: false },
+    { id: "custom", label: "Custom" },
+  ] },
+  perModelImages: { flash: true, pro: true },
+});
+
 describe("skipSubscriptionAuthForLocalInject", () => {
   it("is true only for a host:: inject id", () => {
     expect(skipSubscriptionAuthForLocalInject("omlx::MiniMax-M3-4bit")).toBe(true);
@@ -1340,6 +1351,32 @@ describe("ACP turns (fake CLI)", () => {
     // A model absent from the map gets none: it falls back to the
     // driver-wide list.
     expect(options.find((option) => option.id === "m-three")?.effortLevels).toBeUndefined();
+  });
+
+  it("overlays image flags onto static models without overriding an explicit false", () => {
+    expect(PerModelImagesDriver.models.options).toEqual([
+      { id: "flash", label: "Flash", images: true },
+      { id: "pro", label: "Pro", images: false },
+      { id: "custom", label: "Custom" },
+    ]);
+  });
+
+  it("overlays image flags onto live-discovered models", async () => {
+    const driver = createAcpDriver({
+      ...SELECT_MODEL_SUPPORT,
+      driverKind: "perModelImagesRefreshTest",
+      perModelImages: { "dynamic-model": false },
+      resolveModels: async () => ({ default: "dynamic-model", options: [{ id: "dynamic-model", label: "Dynamic" }] }),
+    });
+    const inst = await driver.create({
+      instanceId: "images-refresh", displayName: "Images", environment: {}, enabled: true,
+      config: driver.defaultConfig(),
+    });
+    try {
+      expect(inst.models.options).toEqual([{ id: "dynamic-model", label: "Dynamic", images: false }]);
+    } finally {
+      await inst.dispose();
+    }
   });
 
   it("leaves the catalog untouched when no per-model map is declared", () => {

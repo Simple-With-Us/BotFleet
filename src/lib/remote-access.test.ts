@@ -98,8 +98,8 @@ describe("Remote Access copy", () => {
     const settings = readFileSync(join(here, "../components/SettingsModal.tsx"), "utf8");
     expect(settings).toContain('id: "remote"');
     expect(settings).toContain('label: "Remote Access"');
-    expect(settings).toContain('<RemoteAccessSection configuredUrl={remoteAccessUrl} />');
-    expect(settings).toContain('section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} />');
+    expect(settings).toContain('<RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
+    expect(settings).toContain('section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
     // The address is the saved per-install one, read from the config the
     // harness already publishes — not a constant.
     expect(settings).toContain("ingress?.publicUrl");

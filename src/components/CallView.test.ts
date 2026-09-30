@@ -49,3 +49,21 @@ describe("CallTargetButton visibility", () => {
     expect(SRC).toMatch(/Add an AssemblyAI API key in Settings to make calls on this computer/);
   });
 });
+
+describe("Personal Voice cannot start a desktop call", () => {
+  it("treats a personal voice id as unspeakable on the desktop call path", () => {
+    // Server-side voiceReady refuses personal voices; passing entry on a
+    // non-empty-but-unspeakable id connected the call and stayed silent.
+    expect(SRC).toMatch(/voice\.startsWith\("personal:"\)/);
+    expect(SRC).toMatch(/voice\.startsWith\("apple-personal:"\)/);
+    expect(SRC).toMatch(/voices\.every\(\(voice\) => !isPersonalVoiceId\(voice\)\)/);
+    expect(SRC).toMatch(/!isPersonalVoiceId\(state\.config\?\.tts\?\.voice\)/);
+    // An explicit Personal Voice must not pass via an otherwise ready workspace fallback.
+    expect(SRC).toMatch(/configured && !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)/);
+  });
+
+  it("says Personal Voice is iPhone-only instead of a generic pick-a-voice", () => {
+    expect(SRC).toMatch(/Personal Voice is iPhone-only/);
+    expect(SRC).toMatch(/Apple Personal Voice speaks on iPhone only/);
+  });
+});

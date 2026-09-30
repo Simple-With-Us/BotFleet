@@ -103,6 +103,31 @@ struct ChatView: View {
         return session.instanceDriverKinds[selection.instanceId]
     }
 
+    private var mentionTrigger: (trigger: String, query: String, start: Int)? {
+        guard !draft.isEmpty else { return nil }
+        let validDelimiters: Set<Character> = [" ", "\n", "(", "[", "\"", "'", "“", "‘"]
+        var lastAt = -1
+        var lastHash = -1
+        let chars = Array(draft)
+        for i in 0..<chars.count {
+            let c = chars[i]
+            if c == "@" && (i == 0 || validDelimiters.contains(chars[i - 1])) {
+                lastAt = i
+            } else if c == "#" && (i == 0 || validDelimiters.contains(chars[i - 1])) {
+                lastHash = i
+            } else if c == " " || c == "\n" {
+                if lastAt != -1 && i > lastAt { lastAt = -1 }
+                if lastHash != -1 && i > lastHash { lastHash = -1 }
+            }
+        }
+        let start = max(lastAt, lastHash)
+        guard start != -1 else { return nil }
+        let trigger = String(chars[start])
+        let query = String(chars[(start + 1)...])
+        guard query.count <= 30 else { return nil }
+        return (trigger: trigger, query: query, start: start)
+    }
+
     /// VoiceOver for the header identity button. The explicit button label
     /// replaces child accessibility content, so the provider mark must be
     /// named here or it would become silent chrome.
@@ -739,6 +764,19 @@ struct ChatView: View {
                     }
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
+            } else if let mention = mentionTrigger {
+                MentionAutocompleteView(
+                    text: $draft,
+                    trigger: mention.trigger,
+                    query: mention.query,
+                    bots: session.state.bots,
+                    rooms: session.state.rooms,
+                    accentColor: BotPalette.color(current.color)
+                ) { selected in
+                    let prefix = String(draft.prefix(mention.start))
+                    draft = "\(prefix)\(mention.trigger)\(selected.name) "
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             } else if current.busy, case .bot = current {
                 HStack(spacing: 8) {
                     Button(action: steer) {
@@ -1205,7 +1243,7 @@ struct MessageRow: View {
             }
 
             if message.role == .bot, message.kind == .text, senderBot != nil,
-               (message.audio?.isEmpty == false || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
+               (message.audio?.isEmpty == false || PersonalVoiceContract.isPersonalVoice(senderBot?.voice) || session.config?.canSpeak(agentVoice: senderBot?.voice) == true) {
                 Button {
                     session.playVoice(message, threadId: chat.threadId)
                 } label: {
@@ -1750,7 +1788,10 @@ struct ActivityChip: View {
         if let tool {
             SkillExecutionReceiptView(
                 skillName: tool.name,
-                status: tool.ok.map { $0 ? "success" : "error" } ?? "running"
+                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                durationMs: tool.durationMs ?? 0,
+                parameters: tool.target ?? "",
+                output: tool.detail ?? ""
             )
             .padding(.leading, 2)
         }
@@ -1868,7 +1909,10 @@ struct ActivityRunView: View {
                         if let tool = msg.tool {
                             SkillExecutionReceiptView(
                                 skillName: tool.name,
-                                status: tool.ok.map { $0 ? "success" : "error" } ?? "running"
+                                status: tool.ok.map { $0 ? "success" : "error" } ?? "running",
+                                durationMs: tool.durationMs ?? 0,
+                                parameters: tool.target ?? "",
+                                output: tool.detail ?? ""
                             )
                         }
                     }

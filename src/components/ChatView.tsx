@@ -382,6 +382,16 @@ function Bubble({
               setTimeout(() => setCopied(false), 1400);
             }}
           />
+          {message.role === "bot" && message.kind === "text" && (
+            <SpeakButton
+              text={text}
+              botId={bot.id}
+              threadId={bot.threadId}
+              messageId={message.id}
+              voiceId={bot.voice}
+              hasAudio={Boolean(message.audio?.length)}
+            />
+          )}
           <button
             type="button"
             onClick={onReply}
@@ -425,19 +435,18 @@ function Bubble({
         {/* Row 3: reactions, the "+", then which model answered — the mark
             is a logo only; the model name still lives in its tooltip. */}
         <div className="flex items-center gap-1.5">
-          {message.role === "bot" && message.kind === "text" && <SpeakButton text={text} botId={bot.id} threadId={bot.threadId} messageId={message.id} voiceId={bot.voice} hasAudio={Boolean(message.audio?.length)} />}
           {message.kind === "text" && <ReactionBar threadId={bot.threadId} message={message} />}
-          {bot && bot.modelSelection && (() => {
-            const instance = state.instances.find((i: any) => i.instanceId === bot.modelSelection.instanceId);
-            const modelOption = instance?.models?.options?.find((o: any) => o.id === bot.modelSelection.model);
-            const modelName = modelOption?.label || bot.modelSelection.model;
-            const title = instance ? `${modelName} (${instance.displayName || instance.driverKind})` : bot.modelSelection.model;
+          {message.role === "bot" && message.modelSelection && (() => {
+            const instance = state.instances.find((i: any) => i.instanceId === message.modelSelection?.instanceId);
+            const modelOption = instance?.models?.options?.find((o: any) => o.id === message.modelSelection?.model);
+            const modelName = modelOption?.label || message.modelSelection.model;
+            const title = instance ? `${modelName} (${instance.displayName || instance.driverKind})` : message.modelSelection.model;
             return (
               <span
                 className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
                 title={title}
               >
-                <ProviderMark driverKind={instance?.driverKind ?? "openai"} model={bot.modelSelection.model} size={16} />
+                <ProviderMark driverKind={instance?.driverKind ?? "openai"} model={message.modelSelection.model} size={16} />
               </span>
             );
           })()}
@@ -1488,6 +1497,46 @@ export function ChatView({ bot }: { bot: Bot }) {
               <span className="@max-4xl/chathead:hidden">Stop</span>
             </button>
           )}
+          {/* Quick toggle: speak replies aloud */}
+          <label
+            className={cn(
+              "flex items-center gap-1.5 rounded-full border border-hairline/40 px-2.5 py-1 text-[13px] transition-colors cursor-pointer select-none",
+              COMPACT_BUBBLE,
+              (bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies)
+                ? "bg-accent/15 border-accent/40 text-accent font-medium hover:bg-accent/25"
+                : "bg-raised/60 text-ink-secondary hover:bg-raised hover:text-ink",
+            )}
+            title={
+              (bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies)
+                ? "Speak replies aloud is ON (click to turn off)"
+                : "Speak replies aloud is OFF (click to turn on)"
+            }
+          >
+            <input
+              type="checkbox"
+              checked={Boolean(bot.speechDevices ? bot.speechDevices.includes("mac") : bot.speakReplies)}
+              onChange={(e) => {
+                const next = e.target.checked;
+                dispatch({
+                  type: "updateBot",
+                  botId: bot.id,
+                  patch: {
+                    speakReplies: next,
+                    speechDevices: next ? ["mac"] : [],
+                  },
+                });
+                void api(`/api/bots/${bot.id}`, {
+                  method: "PATCH",
+                  body: JSON.stringify({
+                    speakReplies: next,
+                    speechDevices: next ? ["mac"] : [],
+                  }),
+                });
+              }}
+              className="size-3.5 rounded border-hairline text-accent accent-accent focus:ring-accent cursor-pointer"
+            />
+            <span className="@max-4xl/chathead:hidden">Speak replies aloud</span>
+          </label>
           <ModelPicker bot={bot} />
           <CallButton bot={bot} />
           <ChatHeaderOverflowMenu bot={bot} />
