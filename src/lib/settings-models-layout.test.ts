@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_MAX_TOOL_ROUNDS, MAX_TOOL_ROUNDS } from "../../shared/bot-profile";
+import { MAX_MODEL_FALLBACKS } from "../../shared/model-limits";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -57,7 +58,8 @@ describe("desktop Settings Models layout", () => {
 
   it("uses Title Case controls and drops developer-speak on this surface", () => {
     expect(fleet).toContain("Set Default");
-    expect(fleet).toContain("Workspace Default");
+    expect(fleet).toContain("Apply to All Bots");
+    expect(fleet).not.toContain("Workspace Default");
     expect(fleet).toContain("Set All Bots To Default");
     expect(fleet).not.toContain("Set default");
     expect(fleet).not.toContain(">slot<");
@@ -139,6 +141,45 @@ describe("Maximum Tool Rounds", () => {
     expect(panel).not.toContain("engine?.capabilities?.agentsMcp === true");
     expect(panel).not.toContain("engine?.capabilities?.composioMcp === true");
     expect(panel).not.toContain("engine?.capabilities?.approvalReview === true");
+  });
+});
+
+describe("Fallback cap agreement", () => {
+  // The cap was a bare 2 typed in three places that disagreed.  What is pinned
+  // now is AGREEMENT: every surface reads the one shared number, so raising it
+  // is a one-line change that cannot leave a screen behind.
+  const profile = source("ios/App/AgentProfileView.swift");
+  const fleet = source("src/components/FleetModelsSection.tsx");
+  const panel = source("src/components/SettingsPanel.tsx");
+  const panelFallbacks = source("src/components/BotFallbackModels.tsx");
+
+  it("the Models page reads the shared cap and keeps no number of its own", () => {
+    expect(fleet).toContain("shared/model-limits");
+    expect(fleet).toContain("fallbackSlotCount(fallbacks.length)");
+    expect(fleet).toContain("canAddFallback(fallbacks.length)");
+    expect(fleet).not.toContain("MAX_FALLBACKS");
+  });
+
+  it("the per-bot panel gates Add on the shared cap and lists every stored entry", () => {
+    expect(panel).toContain("<BotFallbackModels");
+    expect(panel).not.toMatch(/fallbacks\?\.length \|\| 0\) < \d/);
+    expect(panelFallbacks).toContain("shared/model-limits");
+    expect(panelFallbacks).toContain("canAddFallback(fallbacks.length)");
+    expect(panelFallbacks).toContain("fallbacks.map(");
+    expect(panelFallbacks).not.toMatch(/fallbacks\.length\s*<\s*\d/);
+  });
+
+  it("iOS mirrors the shared cap and lists every stored entry", () => {
+    expect(profile).toContain(`private static let maximumFallbacks = ${MAX_MODEL_FALLBACKS}`);
+    expect(profile).toContain("fallbacks.count < Self.maximumFallbacks");
+    expect(profile).not.toMatch(/fallbacks\.count\s*<\s*\d/);
+    expect(profile).toContain("ForEach(fallbacks.indices");
+  });
+
+  it("the server reads the same cap", () => {
+    const server = source("server/index.ts");
+    expect(server).toContain("shared/model-limits.ts");
+    expect(server).toContain("fallbackCountAllowed(");
   });
 });
 
