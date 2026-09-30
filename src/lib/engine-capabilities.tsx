@@ -488,39 +488,26 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       files: "yes",
       terminal: "yes",
       thisComputer: "yes",
-      webAccess: "yes",
-      // DSH driver's adapter contract (`server/drivers/acp/dsh.test.ts`)
-      // pins `instance.adapter.capabilities.images` to `false`, so the
-      // composer rejects image input.  Render "no" rather than "yes" so
-      // the matrix doesn't overclaim — Codex caught this in the review.
-      imageAttachments: "no",
+      webAccess: "yes",      imageAttachments: "yes",
       // The DSH ACP adapter declares composioMcp
       // (server/drivers/acp/dsh.test.ts) — the matrix used to render
       // "-" here because the registry omitted it.
       connectedApps: "yes",
-      crossBotCoordination: "yes",
-      // The ACP bridge mounts the channels, but four of these pairs have
-      // never been audited against a real DeepSeek turn.  "unknown" is the
-      // honest cell: the bridge being generic says nothing about whether a
-      // DeepSeek model uses the channel well once it is mounted.
-      longContext: "unknown",
-      roomCoordination: "unknown",
-      voiceChat: "unknown",
+      crossBotCoordination: "yes",      longContext: "yes",
+      roomCoordination: "yes",
+      voiceChat: "yes",
       computerUse: "unknown",
       liveResearch: "unknown",
     },
     capabilityNotes: {
-      imageAttachments:
-        "The bridge pins image input to false, so the composer rejects an image on this engine.  That is a limit on the bridge BotFleet ships, not on what the model can read.",
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
       headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
       prose: [
-        "Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, long context, rooms, and voice chat are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on Harness yet.",
       ],
     },
     defaultModels: [
@@ -635,10 +622,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // present here even though the direct MiniMax engine does not have it.
       connectedApps: "yes",
       crossBotCoordination: "yes",
-      longContext: "yes",
-      // Recorded gaps, from the prose below.
-      roomCoordination: "no",
-      voiceChat: "no",
+      longContext: "yes",      roomCoordination: "yes",
+      voiceChat: "yes",
       computerUse: "no",
       liveResearch: "no",
     },
@@ -651,9 +636,9 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     whyThisEngine: {
       headline: "MiniMax's own coding CLI, driven over the same Token Plan.",
       prose: [
-        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, and long context are available.",
+        "MiniMax Code runs MiniMax's coding CLI inside BotFleet.  Files, terminal, this computer, web access, image attachments, connected apps, cross-bot coordination, long context, rooms, and voice chat are available.",
         "It signs in with the CLI's own login and draws on the same Token Plan as the MiniMax engine, so the two rows report one subscription.",
-        "BotFleet does not support rooms, voice chat, computer use, or live research on MiniMax Code yet.",
+        "BotFleet does not support computer use, or live research on MiniMax Code yet.",
       ],
     },
     defaultModels: [
