@@ -13,7 +13,9 @@
 // fixed place (Primary, Fallback 1, 2, 3) and is sent by that place.  An empty
 // picker is a deliberate "leave this model alone" — important because users
 // frequently want to standardize the primary without flattening their
-// hand-curated fallback chain.
+// hand-curated fallback chain.  A chosen fallback always lands in its own
+// place, so a bot that would be left with an empty place before it is skipped
+// whole and named under the button, with the empty place in its reason.
 //
 // Every bot row draws every fallback the bot actually stores, even past the
 // cap, so a chain written through the API is never hidden from the page that
@@ -205,7 +207,9 @@ function DefaultModelBlock() {
           {applying ? "Applying…" : "Set All Bots To Default"}
         </button>
         <span className="text-[11.5px] text-ink-secondary">
-          Empty fields keep each bot's current model.
+          Empty fields keep each bot's current model.{"\u00A0 "}Fallbacks fill in order: a bot
+          that would be left with an empty place before a chosen fallback is skipped and named
+          below.
         </span>
       </div>
       {skipped.length > 0 && (
