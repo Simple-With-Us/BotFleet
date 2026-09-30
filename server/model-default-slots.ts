@@ -21,6 +21,13 @@ export type FallbackSlot =
 
 export const KEEP_FALLBACK_SLOT: FallbackSlot = { kind: "keep" };
 
+/** The result of applying slots to one bot's chain: the new chain, or the
+ *  reason this bot cannot take the request and must be left exactly as it was.
+ *  `reason` is operator-facing and reads after a bot's name in parentheses. */
+export type FallbackSlotResult =
+  | { ok: true; fallbacks: ModelSelection[] }
+  | { ok: false; reason: string };
+
 /** Whether any place in `slots` would change a bot's chain. */
 export function touchesFallbacks(slots: readonly FallbackSlot[]): boolean {
   return slots.some((slot) => slot.kind !== "keep");
@@ -28,16 +35,27 @@ export function touchesFallbacks(slots: readonly FallbackSlot[]): boolean {
 
 /** Apply fixed-position slots to one bot's existing fallback chain.
  *
+ *  The rule is one sentence: a `set` lands at its own place, or the bot is
+ *  refused.  It is never slid to a neighbouring place.
+ *
  *  - A `set` at a place the bot already has overwrites that place in place.
- *  - A `set` past the end of the bot's chain is appended.  A chain cannot hold
- *    a hole — the validator rejects empty entries — and padding the bot with a
- *    copy of its primary so the place exists would invent a fallback nobody
- *    chose.  So a bot with one fallback that is told "Fallback 3" ends up with
- *    two, the new one last, which is also exactly where the per-bot "Add
- *    Fallback" control would have put it.
+ *  - A `set` at the first place past the end of the chain extends it by one.
+ *    That is still its own position: a bot with one fallback told "Fallback 2"
+ *    gets a Fallback 2.
+ *  - A `set` whose place has an empty place before it would leave a hole.  A
+ *    chain cannot hold one — the validator rejects empty entries — and the
+ *    only ways to close it are to slide the entry down to the wrong place or
+ *    to pad the bot with a copy of its primary nobody chose.  Both make
+ *    "Fallback 3" land somewhere other than Fallback 3, so neither is done:
+ *    the bot is REFUSED, left exactly as it was, and the reason names the
+ *    empty place so the operator can fill it.  The route reports it in the
+ *    same `skipped` list a busy bot goes in.  A request that sets places 1, 2
+ *    and 3 together is never refused, because each place is filled in turn.
  *  - A `clear` removes the entry at that place; the entries after it move up,
  *    as they do when the per-bot Remove control is used.  Clearing a place the
- *    bot does not have is a no-op.
+ *    bot does not have is a no-op.  A cleared place counts as empty for any
+ *    `set` after it, for the same reason a short chain does: that entry would
+ *    move up into the cleared place.
  *  - Places are read against the bot's chain AS IT WAS, so a request that sets
  *    Fallback 1 and clears Fallback 2 touches those two entries and nothing
  *    else, whatever order the slots are processed in.
@@ -47,7 +65,7 @@ export function touchesFallbacks(slots: readonly FallbackSlot[]): boolean {
 export function applyFallbackSlots(
   existing: readonly ModelSelection[],
   slots: readonly FallbackSlot[],
-): ModelSelection[] {
+): FallbackSlotResult {
   // `null` marks a cleared place so later places keep their original index.
   const next: (ModelSelection | null)[] = [...existing];
   const places = Math.min(slots.length, MAX_MODEL_FALLBACKS);
@@ -58,8 +76,16 @@ export function applyFallbackSlots(
       if (index < next.length) next[index] = null;
       continue;
     }
+    for (let before = 0; before < index; before++) {
+      if (next[before] == null) {
+        return {
+          ok: false,
+          reason: `Fallback ${before + 1} is empty, so Fallback ${index + 1} cannot be set`,
+        };
+      }
+    }
     if (index < next.length) next[index] = { ...slot.selection };
     else next.push({ ...slot.selection });
   }
-  return next.filter((entry): entry is ModelSelection => entry !== null);
+  return { ok: true, fallbacks: next.filter((entry): entry is ModelSelection => entry !== null) };
 }

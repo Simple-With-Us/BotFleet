@@ -81,6 +81,21 @@ describe("Usage Monitor BotFleet quota integration", () => {
     expect(rows.find((row) => row.label === "Third-Party Models · Weekly")?.skip).toBe(false);
   });
 
+  it("shows a pool stored under a legacy Claude and GPT label as Third-Party", () => {
+    const rows = antigravityQuotaWindows([
+      window({ id: "legacy-5h", label: "Claude & GPT · 5-hour", window: "5h", remainingPercent: 35 }),
+      window({ id: "legacy-week", label: "Claude and GPT models (weekly)", window: "weekly", remainingPercent: 55 }),
+    ]);
+
+    expect(rows.map((row) => `${row.label}:${row.remainingPercent}`)).toEqual([
+      "Gemini Models · 5-hour:null",
+      "Gemini Models · Weekly:null",
+      "Third-Party Models · 5-hour:35",
+      "Third-Party Models · Weekly:55",
+    ]);
+    expect(rows.map((row) => row.label).join(" ")).not.toMatch(/claude|gpt/i);
+  });
+
   it("prefers the newest observation before applying the conservative percentage tie-break", () => {
     const old = "2026-09-13T08:00:00.000Z";
     const fresh = "2026-09-13T09:00:00.000Z";

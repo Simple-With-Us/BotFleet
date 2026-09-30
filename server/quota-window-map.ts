@@ -304,9 +304,15 @@ export const MODEL_TYPE_FAMILIES: Readonly<Record<string, string[]>> = {
   deepseek: ["deepseek"],
 };
 
+/** The second Antigravity pool's display name is "Third-Party".  Producers
+ *  that predate the rename ship the pool as "Claude and GPT", "Claude & GPT"
+ *  or "Claude + GPT", and stored or ingested windows keep those labels, so
+ *  every spelling has to resolve to the same pool. */
+const THIRD_PARTY_LABEL = /third[ -]?party|claude\s*(?:and|&|\+)\s*gpt/;
+
 export function familiesForWindow(window: QuotaWindowMatch): string[] {
   const label = window.label.toLowerCase();
-  if (label.includes("claude and gpt") || label.includes("third-party")) return THIRD_PARTY_FAMILIES;
+  if (THIRD_PARTY_LABEL.test(label)) return THIRD_PARTY_FAMILIES;
   if (label.includes("gemini")) return GEMINI_FAMILIES;
   if (label.includes("cursor")) return ["cursor"];
   if (!window.modelType) return [];
