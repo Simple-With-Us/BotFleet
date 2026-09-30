@@ -1436,6 +1436,68 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it("keeps a disk seed for the first load only, not for a later credential reload", async () => {
+    const tmpDir = join(tmpdir(), `botfleet-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const cachePath = join(tmpDir, "engine-cache.json");
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(cachePath, JSON.stringify({
+      at: Date.now() - 60_000,
+      instances: [{
+        instanceId: "test",
+        driverKind: "fake",
+        displayName: "Test",
+        enabled: true,
+        snapshot: { state: "available", version: "seeded" } as const,
+        models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+        computerReach: { local: false, box: false, vps: false },
+        access: "subscription",
+        cliCandidates: [],
+        fullAuto: false,
+      }],
+    }));
+    const fake = makeFakeDriver({
+      snapshotImpl: () => ({ state: "unavailable", transient: true, reason: "Fake did not answer in time" }),
+    });
+    const registry = new ProviderRegistry([fake.driver]);
+    registry.setDiskCachePath(cachePath);
+    await registry.load({ test: { driver: "fake" } });
+    expect((await registry.describeFresh())[0].snapshot.version).toBe("seeded");
+    // New credentials: the boot-time cache must not stand in for them.
+    await registry.load({ test: { driver: "fake" } });
+    const [row] = await registry.describeFresh();
+    expect(row.snapshot.state).toBe("unavailable");
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("answers a sweep caller for the current fleet, and persists nothing, when the fleet reloads mid-sweep", async () => {
+    const tmpDir = join(tmpdir(), `botfleet-obsolete-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const cachePath = join(tmpDir, "engine-cache.json");
+    mkdirSync(tmpDir, { recursive: true });
+    const gate = deferred<void>();
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => {
+        if (call === 1) {
+          await gate.promise;
+          return { state: "available", version: "obsolete" };
+        }
+        return { state: "available", version: "current" };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver]);
+    registry.setDiskCachePath(cachePath);
+    await registry.load({ a: { driver: "fake" } });
+    const sweep = registry.describe();
+    await tick(10);
+    await registry.load({ a: { driver: "fake" } });
+    gate.resolve();
+    const result = await sweep;
+    expect(result[0].snapshot.version).toBe("current");
+    const saved = JSON.parse(readFileSync(cachePath, "utf8"));
+    expect(JSON.stringify(saved)).not.toContain("obsolete");
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
   it("orders overlapping probes of one engine by when they started, not when they settled", async () => {
     const gate = deferred<void>();
     const fake = makeFakeDriver({

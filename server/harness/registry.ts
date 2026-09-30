@@ -311,6 +311,8 @@ export class ProviderRegistry {
     }
   }
 
+  private loadedOnce = false;
+
   async load(configs: InstanceConfigMap) {
     // A new fleet: nothing completed before this describes it, and a sweep
     // still running against the old instances must not become the answer.
@@ -320,11 +322,13 @@ export class ProviderRegistry {
     // The definitive baselines describe the old fleet too: a config change
     // (CLI path, enabled, credentials) must not be masked by what an engine
     // said before it.
-    // Disk-seeded baselines (seq 0) belong to the process start, not to a
-    // fleet, and stay until a real probe replaces them.
+    // Disk-seeded baselines (seq 0) are bootstrap-only: they survive the
+    // first load of the process and are dropped by every later one, so a
+    // credential reload is never masked by a cache written before it.
     for (const [instanceId, record] of this.lastDefinitive) {
-      if (record.seq > 0) this.lastDefinitive.delete(instanceId);
+      if (record.seq > 0 || this.loadedOnce) this.lastDefinitive.delete(instanceId);
     }
+    this.loadedOnce = true;
     for (const [instanceId, entry] of Object.entries(configs)) {
       await this.loadEntry(instanceId, entry);
     }
@@ -340,7 +344,14 @@ export class ProviderRegistry {
     if (existing?.live) {
       await existing.live.dispose().catch(() => {});
     }
-    return this.loadEntry(instanceId, entry);
+    // A probe of the old entry that started while dispose was awaited carries
+    // the generation bumped above; invalidate again so it cannot pass as the
+    // replacement's, and once more after the install for probes begun in
+    // between.
+    this.forgetInstanceProbes(instanceId);
+    const loaded = await this.loadEntry(instanceId, entry);
+    this.forgetInstanceProbes(instanceId);
+    return loaded;
   }
 
   /** Drop a single instance (deleted custom engine) without tearing down the
@@ -499,6 +510,23 @@ export class ProviderRegistry {
     const maxAge = opts?.maxAgeMs ?? 0;
     const now = Date.now();
     const done = this.lastDone;
+    // A sweep already running that started after the last completed one is
+    // the newest answer there is, and a caller that decides something from
+    // engine health (the automatic fallback walk) must see it rather than an
+    // older completed answer that is merely inside maxAge.  Callers that
+    // accept a stale answer (staleWhileRevalidate) keep getting the completed
+    // one immediately.
+    if (maxAge > 0 && !opts?.staleWhileRevalidate) {
+      const running = this.inFlight;
+      if (
+        running &&
+        running.generation === this.sweepKey() &&
+        now - running.startedAt <= maxAge &&
+        (!done || running.startedAt > done.at)
+      ) {
+        return running.promise;
+      }
+    }
     if (maxAge > 0 && done && now - done.at <= maxAge) return done.result;
 
     // A caller that can live with a slightly old answer gets the last
@@ -562,8 +590,14 @@ export class ProviderRegistry {
     const promise = this.describeFresh({ notBefore }).then((result) => {
       // A sweep that began before load()/removeInstance() describes a fleet
       // that no longer exists: its callers get it, the memo does not.
-      if (generation === this.sweepKey()) this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
-      return result;
+      if (generation === this.sweepKey()) {
+        this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
+        return result;
+      }
+      // The fleet was reloaded while this sweep ran: what it found describes
+      // engines that are gone, so its callers get an answer for the current
+      // fleet, not the obsolete one.
+      return this.freshSweep(startedAt);
     });
     const slot = { startedAt, generation, promise };
     this.inFlight = slot;
@@ -597,6 +631,7 @@ export class ProviderRegistry {
    * for tests; callers go through describe(). */
   async describeFresh(opts?: { notBefore?: number }): Promise<DescribedInstance[]> {
     const notBefore = opts?.notBefore ?? Date.now();
+    const sweepKeyAtStart = this.sweepKey();
     // Multiple instances may share a driver. Scan each default binary once
     // per response instead of repeating filesystem work for every row.
     const candidatesByName = new Map<string, string[]>();
@@ -605,7 +640,8 @@ export class ProviderRegistry {
     );
     const merged = probed.map((info) => this.newestFor(info));
     const at = Date.now();
-    this.saveDiskCache(merged, at);
+    // An obsolete sweep (the fleet was reloaded meanwhile) never persists.
+    if (sweepKeyAtStart === this.sweepKey()) this.saveDiskCache(merged, at);
     this.describedAtByResult.set(merged, at);
     return merged;
   }
