@@ -1,7 +1,7 @@
 /** Published MiniMax API rates, USD per million tokens, STANDARD service
  *  tier — the driver never sends `service_tier: "priority"`.  Source:
  *  https://platform.minimax.io/docs/guides/pricing-paygo, verified
- *  Tue, Sep 8, 2026.  MiniMax-M3's listed rates already reflect MiniMax's
+ *  Tue, Sep 8, 2026.  MiniMax-M3.1-Flash-Preview's listed rates already reflect MiniMax's
  *  own "Permanent 50% off" discount, and it is the one model here with a
  *  published tier for prompts over 512K input tokens, at double the base
  *  rate — the tier with no `maxInputTokens` is the catch-all.
@@ -30,11 +30,10 @@ export interface MinimaxPriceTier {
 export type MinimaxPriceTable = Record<string, MinimaxPriceTier[] | null>;
 
 export const MINIMAX_PRICE_PER_MILLION = {
-  "MiniMax-M3": [
+  "MiniMax-M3.1-Flash-Preview": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
-  "MiniMax-M2.7": [{ input: 0.3, output: 1.2, cachedInput: 0.06 }],
   "MiniMax-M2.7-highspeed": [{ input: 0.6, output: 2.4, cachedInput: 0.06 }],
 } satisfies MinimaxPriceTable;
 
@@ -65,13 +64,12 @@ type MinimaxDisplayLabel = { model: string; badge: string };
 // server/drivers/minimax.ts documents.
 // oxlint-disable-next-line anti-slop/no-known-value-widening
 const DISPLAY: Record<string, MinimaxDisplayLabel> = {
-  "MiniMax-M3": { model: "MiniMax M3", badge: "Default · ≤512K ctx" },
-  "MiniMax-M2.7": { model: "MiniMax M2.7", badge: "API" },
+  "MiniMax-M3.1-Flash-Preview": { model: "MiniMax M3.1 Flash Preview", badge: "Default · ≤512K ctx" },
   "MiniMax-M2.7-highspeed": { model: "MiniMax M2.7 Highspeed", badge: "API" },
 };
 
 /** One row per PRICED catalog model, cheapest (first) tier only — a single
- *  reference table has no room to show MiniMax-M3's >512K tier, so the
+ *  reference table has no room to show MiniMax-M3.1-Flash-Preview's >512K tier, so the
  *  badge says which tier the number is.  A model priced `null` is left out
  *  of the table rather than shown as "—" everywhere, matching how every
  *  other unpriced-model gap in this fleet reads (nothing shown beats a

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Gauge, Loader2, Pause, Play, Plus, Trash2, X } from "lucide-react";
 
 import { BotAvatar } from "@/components/Avatar";
+import { TriggerErrorBadge } from "@/components/TriggerErrorBadge";
 import { stateForBot } from "@/lib/mascot";
 import { cn } from "@/lib/cn";
 import {
@@ -187,6 +188,7 @@ export function ResourceTriggersPanel({ bots }: { bots: Bot[] }) {
                     {" · "}last fire {relativeTime(trigger.lastFiredAt)}
                   </p>
                 </div>
+                <TriggerErrorBadge triggerId={trigger.id} name={trigger.name} source="resource" />
                 <button onClick={() => void toggle(trigger)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label={trigger.enabled ? "Pause" : "Enable"}>
                   {trigger.enabled ? <Pause size={14} /> : <Play size={14} />}
                 </button>

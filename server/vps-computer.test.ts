@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -14,6 +17,7 @@ import {
 } from "./container-computer.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB, type AppConfig } from "./config.ts";
 import {
+  SHARED_VPS_TARGET,
   VPS_CONTAINER_LABEL,
   VPS_IMAGE,
   VPS_MANAGED_LABEL,
@@ -29,6 +33,7 @@ import {
   vpsDockerArgs,
   vpsDriverError,
   vpsSshTunnelArgs,
+  vpsSyncCliCredentials,
   reuseVps,
   type VpsCommandRunner,
 } from "./vps-computer.ts";
@@ -106,7 +111,7 @@ function fixture({
     if (index >= 0) return provisioningArgs[index + 1] ?? "";
     return provisioningArgs.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1) ?? "";
   };
-  const calls: Array<{ args: string[]; options?: { input?: string; timeoutMs?: number } }> = [];
+  const calls: Array<{ args: string[]; options?: { input?: string | Buffer; timeoutMs?: number } }> = [];
   const state = { image, container, running, imageLabelsMatch, inspectedImageId, containerImageId };
   const runner: VpsCommandRunner = async (args, options) => {
     calls.push({ args, options });
@@ -642,5 +647,69 @@ describe("VPS computer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe("vpsSyncCliCredentials", () => {
+    it("rejects if VPS SSH alias is not configured", async () => {
+      await expect(vpsSyncCliCredentials({}, SHARED_VPS_TARGET)).rejects.toMatchObject({
+        message: expect.stringContaining("VPS is not configured"),
+        status: 409,
+      });
+    });
+
+    it("rejects if the target container does not exist", async () => {
+      const fake = fixture({ container: false });
+      await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner)).rejects.toMatchObject({
+        message: expect.stringContaining("does not exist"),
+        status: 404,
+      });
+    });
+
+    it("rejects if the target container is not running", async () => {
+      const fake = fixture({ container: true, running: false });
+      await expect(vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner)).rejects.toMatchObject({
+        message: expect.stringContaining("is not running"),
+        status: 409,
+      });
+    });
+
+    it("returns empty synced array if no candidate credentials exist", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-empty-"));
+      try {
+        const fake = fixture({ container: true, running: true });
+        const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
+        expect(result.ok).toBe(true);
+        expect(result.synced).toEqual([]);
+        expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
+        expect(fake.calls.some(({ args }) => args.includes("tar"))).toBe(false);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("packages and streams credentials to the container", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-test-"));
+      try {
+        mkdirSync(join(tempDir, ".ssh"), { recursive: true });
+        writeFileSync(join(tempDir, ".ssh", "id_ed25519"), "dummy-key\n");
+        writeFileSync(join(tempDir, ".gitconfig"), "[user]\n  name = Test\n");
+
+        const fake = fixture({ container: true, running: true });
+        const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
+        expect(result.ok).toBe(true);
+        expect(result.synced).toContain(".ssh");
+        expect(result.synced).toContain(".gitconfig");
+        expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
+
+        const tarCall = fake.calls.find(({ args }) => args.includes("tar") && args.includes("-xf"));
+        expect(tarCall).toBeDefined();
+        expect(Buffer.isBuffer(tarCall?.options?.input)).toBe(true);
+
+        const chmodCall = fake.calls.find(({ args }) => args.some((arg) => arg.includes("chmod")));
+        expect(chmodCall).toBeDefined();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 });

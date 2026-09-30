@@ -221,6 +221,8 @@ const localVmConfigSchema = z.object({
     .min(MIN_LOCAL_VM_MAX_INSTANCES)
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
+  shareCliCredentials: z.boolean().optional(),
+  allowHostTerminal: z.boolean().optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -268,7 +270,7 @@ const appConfigSchema = z.object({
   /** Voice credentials and the selected voice id. `provider` picks the
    * engine: "minimax" (default; needs a key) or "system" (the Mac's
    * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "elevenlabs", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
+  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["minimax", "system"]).optional(), optimizedSummary: z.boolean().optional(), credentialStorage: externalCredentialStorage }).optional(),
   callStt: z.object({ provider: z.enum(["apple", "assemblyai"]).nullable().optional(), keyterms: z.array(z.string().trim().min(1)).max(100).optional() }).optional(),
   /** OpenAI key used only by the in-process avatar image generator. */
   imageGen: z.object({ key: optionalText, credentialStorage: externalCredentialStorage }).optional(),
@@ -440,7 +442,7 @@ export interface AppConfig {
   vps?: { sshAlias?: string; memoryGib?: number; cpus?: number };
   opencodeGo?: { apiKey?: string; credentialStorage?: "external" };
   deepseek?: { key?: string; url?: string; credentialStorage?: "external" };
-  tts?: { key?: string; voice?: string; provider?: "minimax" | "elevenlabs" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
+  tts?: { key?: string; voice?: string; provider?: "minimax" | "system"; optimizedSummary?: boolean; credentialStorage?: "external" };
   /** Call-mode dictation. The picker in `src/lib/transcription-provider.ts`
    *  falls back to platform defaults when `provider` is absent (Apple on
    *  macOS without a cloud key, AssemblyAI on every other platform, and
@@ -507,7 +509,12 @@ export interface AppConfig {
   ingress?: { publicUrl?: string; enabled?: boolean };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
-  localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
+  localVm?: {
+    mode?: "shared" | "per-bot";
+    maxInstances?: number;
+    shareCliCredentials?: boolean;
+    allowHostTerminal?: boolean;
+  };
   /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
    * `accessClientSecret` are a Cloudflare Access service token: a pair of
    * headers, needed when the recall service sits behind Access, where a
@@ -591,6 +598,15 @@ export type ConfigPatch = Omit<z.output<typeof appConfigPatchSchema>, "conversat
 };
 
 export function parseStoredConfig(value: JsonValue): AppConfig {
+  // Stored installs may still explicitly name the retired provider. Normalize
+  // that one legacy value before the strict schema runs, otherwise loadConfig
+  // catches the rejection as a first run and drops every setting in the file.
+  // API patches still use parseConfigPatch and cannot reintroduce ElevenLabs.
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      value.tts && typeof value.tts === "object" && !Array.isArray(value.tts) &&
+      value.tts.provider === "elevenlabs") {
+    value = { ...value, tts: { ...value.tts, provider: "minimax" } };
+  }
   const parsed = appConfigSchema.safeParse(value);
   if (!parsed.success) throw new Error(schemaIssue(parsed.error, "Invalid stored configuration"));
   return {
@@ -994,7 +1010,7 @@ export function migrateLegacyElevenLabsTtsProvider(cfg: AppConfig): boolean {
   // Trim because a stale env-overlay can leave a whitespace-only key that
   // would not match any provider's `verifyKey` probe; that case is "no key".
   if (!cfg.tts.key?.trim()) return false;
-  cfg.tts = { ...cfg.tts, provider: "elevenlabs" };
+  cfg.tts = { ...cfg.tts, provider: "minimax" };
   return true;
 }
 

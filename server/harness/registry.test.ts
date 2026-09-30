@@ -202,10 +202,10 @@ describe("ProviderRegistry", () => {
     // The other half of the shadow rule: reach is derived from the driver
     // KIND as well as from the capabilities, because a remote agent's reach
     // is a property of where the turn runs.  This is what the client computed
-    // for a shadow before the reach shipped, so a shadowed Computer engine
+    // for a shadow before the reach shipped, so a shadowed ASCII.dev Box engine
     // must not quietly lose the one destination it has.
     const registry = new ProviderRegistry([makeFakeDriver().driver]);
-    await registry.load({ computer: { driver: "boxAgent", displayName: "Computer" } });
+    await registry.load({ computer: { driver: "boxAgent", displayName: "ASCII.dev Box" } });
 
     const [described] = await registry.describe();
     expect(described.snapshot.state).toBe("unavailable");
@@ -1008,6 +1008,78 @@ describe("ProviderRegistry", () => {
       // the stale "cached-instance" answer instead of actually probing.
       const result = await registry.describe({ maxAgeMs: 60_000 });
       expect(result[0].instanceId).toBe("test");
+
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("preserves previously available instance on transient probe failure when candidates exist", async () => {
+      const tmpDir = join(tmpdir(), `botfleet-cache-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const cachePath = join(tmpDir, "engine-cache.json");
+      mkdirSync(tmpDir, { recursive: true });
+      const fakeBin = join(tmpDir, "fake-cli");
+      writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(cachePath, JSON.stringify({
+        at: Date.now() - 1000,
+        instances: [{
+          instanceId: "test",
+          driverKind: "fake",
+          displayName: "Test",
+          enabled: true,
+          snapshot: { state: "available", version: "1.0.0" } as const,
+          models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+          capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+          computerReach: { local: false, box: false, vps: false },
+          access: "subscription",
+          cliCandidates: [fakeBin],
+          fullAuto: false,
+        }],
+      }));
+
+      const failingDriver = makeFakeDriver({
+        failSnapshot: "CLI probe timed out",
+        defaultConfig: { cli: fakeBin },
+      });
+      const reg = new ProviderRegistry([failingDriver.driver]);
+      reg.setDiskCachePath(cachePath);
+      await reg.load({ test: { driver: "fake" } });
+
+      const result = await reg.describeFresh();
+      expect(result[0].snapshot.state).toBe("available");
+      expect(result[0].snapshot.version).toBe("1.0.0");
+
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("does not preserve previously available instance when candidates are empty (e.g. uninstalled)", async () => {
+      const tmpDir = join(tmpdir(), `botfleet-cache-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const cachePath = join(tmpDir, "engine-cache.json");
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(cachePath, JSON.stringify({
+        at: Date.now() - 1000,
+        instances: [{
+          instanceId: "test",
+          driverKind: "fake",
+          displayName: "Test",
+          enabled: true,
+          snapshot: { state: "available", version: "1.0.0" } as const,
+          models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+          capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+          computerReach: { local: false, box: false, vps: false },
+          access: "subscription",
+          cliCandidates: ["/path/that/was/deleted"],
+          fullAuto: false,
+        }],
+      }));
+
+      const failingDriver = makeFakeDriver({
+        failSnapshot: "CLI probe timed out",
+      });
+      const reg = new ProviderRegistry([failingDriver.driver]);
+      reg.setDiskCachePath(cachePath);
+      await reg.load({ test: { driver: "fake" } });
+
+      const result = await reg.describeFresh();
+      expect(result[0].snapshot.state).toBe("unavailable");
 
       rmSync(tmpDir, { recursive: true, force: true });
     });

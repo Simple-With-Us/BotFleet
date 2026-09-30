@@ -7,6 +7,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../contracts.ts";
+import { decodeInjectId, INJECT_MODEL_ID as MODEL_ID, INJECT_SEP } from "../../shared/local-hosts.ts";
+
+// The `host::model` id shape lives in shared/ so the desktop picker can read it
+// too; re-exported here because every driver imports it from this module.
+export { decodeInjectId, INJECT_SEP };
 
 export interface LocalHost {
   id: string;
@@ -26,10 +31,7 @@ export const LOCAL_HOSTS: LocalHost[] = [
   { id: "unsloth_api", label: "Unsloth", baseUrl: "http://127.0.0.1:8888/v1", apiKeyEnv: "UNSLOTH_STUDIO_AUTH_TOKEN" },
 ];
 
-export const INJECT_SEP = "::";
-
 const HOST_BY_ID = new Map(LOCAL_HOSTS.map((host) => [host.id, host]));
-const MODEL_ID = /^[\w][\w./:+-]*$/;
 
 export interface InjectedModel {
   id: string;
@@ -68,16 +70,6 @@ export function contextWindowsFromPs(extra: unknown): Map<string, number> {
 
 export function encodeInjectId(host: string, model: string): string {
   return `${host}${INJECT_SEP}${model}`;
-}
-
-export function decodeInjectId(id: string | null | undefined): { host: string; model: string } | null {
-  if (!id) return null;
-  const sep = id.indexOf(INJECT_SEP);
-  if (sep <= 0) return null;
-  const host = id.slice(0, sep);
-  const model = id.slice(sep + INJECT_SEP.length);
-  if (!HOST_BY_ID.has(host) || !MODEL_ID.test(model)) return null;
-  return { host, model };
 }
 
 export function localHost(id: string): LocalHost | undefined {

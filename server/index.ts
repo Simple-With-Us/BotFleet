@@ -43,7 +43,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, offerableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -91,6 +91,7 @@ import {
   AUTO_FALLBACK_PRIORITY,
   enableQuotaCooldownPersist,
   inheritedUnattended,
+  dshVisionSelection,
   lastTurnStartIndex,
   parseQuotaResetTime,
   providerErrorCodeFromStopReason,
@@ -123,6 +124,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
   localVmModeSwitchTargets,
@@ -2498,7 +2500,12 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   localVmActiveThreads.set(target.key, { threadId, botId });
   localVmIdleFor(target).touch();
-  const localVm = await containerComputerStatus(undefined, undefined, target);
+  let localVm = await containerComputerStatus(undefined, undefined, target);
+  try {
+    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
+  }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
   }
@@ -2606,7 +2613,14 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.completed":
       if (event.itemType === "assistant_text") {
-        pushMessage({ role: "bot", kind: "text", text: event.text });
+        const activeOwner = activeTurnOwners.current(event.threadId);
+        const resolvedSelection = activeOwner?.selection ?? (bot?.modelSelection ? { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model } : undefined);
+        pushMessage({
+          role: "bot",
+          kind: "text",
+          text: event.text,
+          ...(resolvedSelection ? { modelSelection: { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model } } : {}),
+        });
         if (bot) {
           void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text, event.turnId).then((r) => {
             if (r.sent) console.log(`[linq-outbound] delivered thread=${event.threadId}`);
@@ -2800,15 +2814,21 @@ bus.subscribe((event: RuntimeEvent) => {
           requestId: event.requestId,
           tool: permission ? event.tool : undefined,
           // the exact grant "always allow" would remember, decided here so
-          // client and server can never derive it differently
+          // client and server can never derive it differently. Bare shell
+          // runners, destructive operations, and sensitive paths are never
+          // offered as "Always allow" grants.
           allowKey:
-            permission && event.approvalScope !== "local-computer"
-              ? approvalKey(event.tool, event.summary, event.approvalScope)
+            permission
+              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope)
               : undefined,
-          // in auto mode a card can only mean the guard stopped it — say so
+          // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
             permission && asker?.autoApprove
-              ? "This looked destructive, so auto mode stopped to ask."
+              ? verdict?.source === "destructive-guard"
+                ? "This looked destructive, so auto mode stopped to ask."
+                : verdict?.source === "sensitive-guard"
+                  ? "This touched sensitive files or credentials, so auto mode stopped to ask."
+                  : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
         },
@@ -3752,7 +3772,7 @@ async function startTurn(
   const titleText = firstTurnTitleText(text, opts?.automationSource, opts?.cardContinuation);
   if (titleText) store.titleTaskFromFirstMessage(bot.id, titleText, threadId);
 
-  const fallbackPolicy = task.modelSelection ?? bot.modelSelection;
+  let fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
     ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
 
@@ -3808,7 +3828,7 @@ async function startTurn(
   // Box-backed cloud borrows the boxAgent default model (and no per-bot effort).
   // VPS-backed cloud keeps the bot's modelSelection — that is the engine that
   // actually runs on the VPS.
-  const model = boxCloud ? instance.models.default : selection.model;
+  let model = boxCloud ? instance.models.default : selection.model;
   let effort = boxCloud ? undefined : selection.effort;
   // A selection can be persisted while its engine is offline. Re-check when
   // the engine returns so an old or unsupported value never reaches a CLI.
@@ -3856,7 +3876,19 @@ async function startTurn(
     }
   }
 
-  // an edit hands us its already-branched user message; a plain send appends.
+  // DeepSeek-V4.1-Pro lacks vision; visual data sharing automatically routes
+  // to DeepSeek-V4.1-Flash and updates the stored selection so the switch persists.
+  if (instanceId === "dsh" && model === "DeepSeek-V4.1-Pro" && text.includes("<attached-image ")) {
+    model = "DeepSeek-V4.1-Flash";
+    // Persist against the selection that owns this thread, and keep the
+    // dispatch fallback policy aligned with the new primary and its chain.
+    fallbackPolicy = dshVisionSelection(fallbackPolicy);
+    if (task.modelSelection) {
+      store.patchTask(bot.id, threadId, { modelSelection: fallbackPolicy });
+    } else {
+      store.patchBot(bot.id, { modelSelection: fallbackPolicy });
+    }
+  }
   // Auto-delivered instructions are stored as role=system so iOS/desktop
   // never paint a blue user bubble.  The model still receives them as the
   // turn prompt via transcriptPromptRole.
@@ -4172,7 +4204,17 @@ async function startTurn(
             botFleetStatusSystemPrompt(),
           )
         : integrations.agents && sectionPeers.length > 0
-          ? "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply."
+          ? [
+              "You can work with the other bots in your section through the agents tools — list_bots shows who's available, ask_bot sends one of them a message and returns their reply" +
+                (availableAgentTools.includes("delegate_bot")
+                  ? ", and delegate_bot assigns an asynchronous task to a specialist peer."
+                  : "."),
+              "Never dismiss incoming alerts, webhook notifications, or tasks by merely claiming 'not my problem'.  When an issue, error, or notification falls outside your domain or expertise, identify the specialist bot best suited to solve it (e.g. Compiler for build/typecheck errors, Deployer for PRs/merges, Fixer for bug fixes/tests, Plumber for infra/secrets/health, Housekeeper for disk/workspace maintenance, Builder for features) and forward the alert with a clear summary using " +
+                (availableAgentTools.includes("delegate_bot")
+                  ? "delegate_bot (preferred) or ask_bot"
+                  : "ask_bot") +
+                " rather than stopping without action.",
+            ].join(" ")
           : "";
       const credentialPrompt = credentialPromptFor(availableAgentTools);
       const routinePrompt = routinePromptFor(availableAgentTools);
@@ -4272,6 +4314,7 @@ async function startTurn(
             // The room lane passes the same flag.  A driver-loop engine holds
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
+            hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -6197,6 +6240,7 @@ async function runGroupMemberTurn(
         boxAgent: instance.driverKind === "boxAgent",
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
+        hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the
@@ -7748,7 +7792,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-const TTS_PROVIDERS = ["minimax", "elevenlabs", "system"] as const;
+const TTS_PROVIDERS = ["minimax", "system"] as const;
 // The same list as a domain value, so a save is judged against the names the
 // harness actually has rather than against a string comparison in the handler.
 const ttsProviderName = z.enum(TTS_PROVIDERS);
@@ -7783,7 +7827,7 @@ function ttsProviderClaim(body: Record<string, unknown>): TtsProviderClaim {
   // those.  Anything else has to name a provider the harness knows.
   if (provider === undefined || provider === null) return {};
   const known = ttsProviderName.safeParse(ttsProviderFold.safeParse(provider).data).success;
-  return known ? {} : { error: "tts.provider must be minimax, elevenlabs, or system" };
+  return known ? {} : { error: "tts.provider must be minimax or system" };
 }
 
 function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<any> {
@@ -8679,6 +8723,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       return routines!.remove(routineMatch[1])
         ? json(res, 200, { ok: true })
         : json(res, 404, { error: "no such routine" });
+    }
+    // Acknowledge the unseen-failure backlog, or just one trigger's share of
+    // it when a per-trigger badge is cleared.  A trigger that has been failing
+    // for a week leaves hundreds of old failures that cannot each be clicked
+    // in the calendar, and a badge that cannot be cleared stops being read.
+    // Acknowledged runs keep their status and history; the next failure raises
+    // the count again.
+    if (path === "/api/routine-runs/seen" && method === "POST") {
+      const body = await readBody(req);
+      const triggerId = typeof body?.triggerId === "string" ? body.triggerId : undefined;
+      const triggerSource = body?.triggerSource === "webhook" || body?.triggerSource === "resource" ? body.triggerSource : undefined;
+      const { acknowledged, runs } = routines!.markAllSeen({ ...(triggerId ? { triggerId } : {}), ...(triggerSource ? { triggerSource } : {}) });
+      return json(res, 200, { acknowledged, runs });
     }
     const runMatch = path.match(/^\/api\/routine-runs\/([\w-]+)\/(cancel|seen)$/);
     if (runMatch && method === "POST") {
@@ -11174,6 +11231,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (method === "GET" && path === "/api/vps-computer") {
       return json(res, 200, await vps.vpsComputerStatus(cfg, "workspace"));
     }
+    if (method === "POST" && path === "/api/vps-computer/sync-credentials") {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: UNSUPPORTED_JSON_BODY });
+      }
+      if (computerProviderOff(cfg, "selfHostedVps")) {
+        return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.selfHostedVps} is turned off in Computer settings` });
+      }
+      return json(res, 200, await vps.vpsSyncCliCredentials(cfg, vps.SHARED_VPS_TARGET));
+    }
     m = path.match(/^\/api\/local-computer\/(pull|run|start|stop|remove)$/);
     if (m && method === "POST") {
       // Requiring JSON makes these localhost lifecycle mutations non-simple
@@ -11311,17 +11377,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: `${COMPUTER_PROVIDER_LABEL.localVm} is turned off in Computer settings` });
       }
       const target = localVmTargetForBot(bot.id);
-      if (target.key === SHARED_LOCAL_VM_TARGET.key) {
-        return json(res, 409, { error: "Shared mode manages this desktop in App Settings → Local VM" });
-      }
       if (localVmImageBusy || localVmModeChangeBusy || localVmLifecycleBusy.has(target.key)) {
-        return json(res, 409, { error: "this bot's Local VM setup action is still running" });
+        return json(res, 409, { error: "this Local VM setup action is still running" });
       }
       if (action === "run" && localVmProvisionBusy) {
-        return json(res, 409, { error: "another per-bot Local VM is being created — retry after it finishes" });
+        return json(res, 409, { error: "another Local VM is being created — retry after it finishes" });
       }
       const vmOwner = localVmLeaseFor(target).current(localVmOwnerBusy);
-      if (vmOwner) return json(res, 409, { error: "this bot is using its Local VM — stop the turn first" });
+      if (vmOwner) return json(res, 409, { error: "this Local VM is in use — stop the turn first" });
       // Fence this target, and the cross-target capacity decision for creates,
       // before the first await so two requests cannot both pass the limit.
       localVmLifecycleBusy.add(target.key);
@@ -13151,6 +13214,26 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
     }
 
+    // ── custom voice identifier management ────────────────────────────
+    if (method === "POST" && path === "/api/tts/custom-voice") {
+      const body = await readBody(req);
+      const voiceId = typeof body?.voiceId === "string" ? body.voiceId.trim() : "";
+      const label = typeof body?.label === "string" ? body.label.trim() : "";
+      if (!voiceId) return json(res, 400, { error: "voiceId required" });
+      try {
+        const added = tts.addCustomVoice(voiceId, label || undefined);
+        return json(res, 200, { ok: true, voice: added });
+      } catch (e) {
+        return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    m = path.match(/^\/api\/tts\/custom-voice\/([\w.-]+)$/);
+    if (m && method === "DELETE") {
+      const [, voiceId] = m;
+      const deleted = tts.deleteCustomVoice(voiceId);
+      return json(res, 200, { ok: true, deleted });
+    }
+
     // ── connectors (Composio) ──
     const composioCredentialPending = workspaceCredentialPending(cfg, "composioApiKey");
     const connectorReadOnlyStatus = method === "GET"
@@ -13355,7 +13438,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ? vps.closeVpsDesktopTunnel(cfg, bot.id)
         : { closed: false });
     }
-    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot|remove)$/);
+    m = path.match(/^\/api\/bots\/([\w-]+)\/computer\/(provision|join|sleep|exec|screenshot|remove|sync-credentials)$/);
     if (m && method === "POST") {
       const botId = m[1];
       const bot = store.bot(botId);
@@ -13427,12 +13510,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           return json(res, 200, await vps.vpsComputerJoin(cfg, botId));
         }
         if (m[2] === "screenshot") return json(res, 200, await vps.vpsComputerScreenshot(cfg, botId));
+        if (m[2] === "sync-credentials") return json(res, 200, await vps.vpsSyncCliCredentials(cfg, vps.vpsTargetFor(cfg, botId)));
         const action = m[2] === "provision" ? "provision" : m[2] === "remove" ? "remove" : "stop";
         return json(res, 200, await vps.vpsComputerAction(action, cfg, botId));
       }
       if (m[2] === "remove") {
         // Boxes sleep and wake; only the VPS backend has a container to remove.
         return json(res, 409, { error: "the cloud Box backend has no container to remove — use sleep instead" });
+      }
+      if (m[2] === "sync-credentials") {
+        return json(res, 409, { error: "the cloud Box backend does not support credential sync — only VPS containers do" });
       }
       switch (m[2]) {
         case "provision":

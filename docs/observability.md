@@ -1,7 +1,7 @@
 # Observability (Sentry)
 
 BotFleet reports crashes, errors, and a sample of performance traces to
-Sentry (`jays-services/botfleet`) from five surfaces: the Mac harness, the
+Sentry (`simple-with-us/botfleet`) from five surfaces: the Mac harness, the
 Electron desktop renderer, the iOS TestFlight app, the public desktop
 releases (macOS/Windows/Ubuntu installers built by CI), and a local desktop
 package built by hand on the owner's Mac.  Every surface is off unless a DSN
@@ -257,7 +257,7 @@ iOS app is a different product with no analytics SDK at all — see
 
 ## What is intentionally out of scope
 
-- A second Sentry project — everything lands in `jays-services/botfleet`.
+- A second Sentry project — everything lands in `simple-with-us/botfleet`.
 - `@sentry/profiling-node` — not installed; `profilingAvailable` reports
   `false` and the harness warns once rather than silently no-oping.
 - `ios/App/SentryTelemetry.swift` and `ios/project.yml` already handle an

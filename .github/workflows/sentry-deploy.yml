@@ -116,7 +116,7 @@ jobs:
       - name: Attach Sentry production deploy
         env:
           SENTRY_AUTH_TOKEN: ${{ env.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: jays-services
+          SENTRY_ORG: simple-with-us
           SENTRY_PROJECT: botfleet
           VERSION: ${{ github.event.workflow_run.head_sha }}
           PR_NUMBER: ${{ steps.pr-info.outputs.pr_number }}

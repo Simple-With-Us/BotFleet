@@ -344,7 +344,37 @@ export class ProviderRegistry {
     try {
       const dir = dirname(this.diskCachePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileAtomic(this.diskCachePath, JSON.stringify({ at: Date.now(), instances }));
+      let toSave = instances;
+      if (existsSync(this.diskCachePath)) {
+        try {
+          const raw = readFileSync(this.diskCachePath, "utf8");
+          const parsed = JSON.parse(raw);
+          const previousList: DescribedInstance[] = Array.isArray(parsed) ? parsed : parsed?.instances;
+          if (Array.isArray(previousList)) {
+            const prevById = new Map(previousList.map((i) => [i.instanceId, i]));
+            toSave = instances.map((curr) => {
+              const prev = prevById.get(curr.instanceId);
+              if (
+                prev &&
+                prev.snapshot?.state === "available" &&
+                curr.snapshot?.state === "unavailable" &&
+                curr.cliCandidates &&
+                curr.cliCandidates.length > 0
+              ) {
+                return {
+                  ...curr,
+                  snapshot: prev.snapshot,
+                  models: curr.models.options.length > 0 ? curr.models : prev.models,
+                };
+              }
+              return curr;
+            });
+          }
+        } catch {
+          // Non-fatal if parsing existing cache fails
+        }
+      }
+      writeFileAtomic(this.diskCachePath, JSON.stringify({ at: Date.now(), instances: toSave }));
     } catch {
       // Non-fatal if saving cache fails
     }
@@ -370,7 +400,8 @@ export class ProviderRegistry {
   }
 
   private refreshDescribe(at: number) {
-    const result = this.describeFresh();
+    const previous = this.lastDescribe;
+    const result = this.describeFresh(previous);
     this.lastDescribe = { at, result };
     // describeFresh() already persists the disk cache once on success (see
     // below); only guard against a failed probe here, or every probe would
@@ -381,15 +412,49 @@ export class ProviderRegistry {
     return result;
   }
 
-  async describeFresh(): Promise<DescribedInstance[]> {
+  async describeFresh(previousMemo?: { at: number; result: Promise<DescribedInstance[]> } | null): Promise<DescribedInstance[]> {
     // Multiple instances may share a driver. Scan each default binary once
     // per response instead of repeating filesystem work for every row.
     const candidatesByName = new Map<string, string[]>();
     const instances = await Promise.all(
       this.entries().map((entry) => this.describeEntry(entry, candidatesByName)),
     );
-    this.saveDiskCache(instances);
-    return instances;
+    let previousList: DescribedInstance[] | undefined;
+    if (previousMemo && previousMemo !== this.lastDescribe) {
+      try {
+        previousList = await previousMemo.result;
+      } catch {
+        // Ignore previous describe error
+      }
+    }
+    if (!previousList && this.diskCachePath && existsSync(this.diskCachePath)) {
+      try {
+        const raw = readFileSync(this.diskCachePath, "utf8");
+        const parsed = JSON.parse(raw);
+        previousList = Array.isArray(parsed) ? parsed : parsed?.instances;
+      } catch {
+        // Ignore disk cache read error
+      }
+    }
+    const merged = instances.map((curr) => {
+      const prev = previousList?.find((p) => p.instanceId === curr.instanceId);
+      if (
+        prev &&
+        prev.snapshot?.state === "available" &&
+        curr.snapshot?.state === "unavailable" &&
+        curr.cliCandidates &&
+        curr.cliCandidates.length > 0
+      ) {
+        return {
+          ...curr,
+          snapshot: prev.snapshot,
+          models: curr.models.options.length > 0 ? curr.models : prev.models,
+        };
+      }
+      return curr;
+    });
+    this.saveDiskCache(merged);
+    return merged;
   }
 
   private async describeEntry(

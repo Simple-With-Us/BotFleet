@@ -93,7 +93,9 @@ describe("UsageWhatIfProjection", () => {
 
 import {
   ENGINE_PLAN_OPTIONS,
+  autoDetectAllEnginePlans,
   defaultEnginePlan,
+  detectEnginePlanFromWindows,
   findMatchingPreset,
   getInitialEnginePlans,
   modelDisplayName,
@@ -129,7 +131,7 @@ describe("modelDisplayName", () => {
 });
 
 describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
-  it("matches first-paint registry defaults for Cursor and DeepSeek Harness", () => {
+  it("matches first-paint registry defaults for Cursor and Harness", () => {
     const cursorPreset = findMatchingPreset("cursor", "Cursor Ultra", null);
     expect(cursorPreset).toBeDefined();
     expect(cursorPreset?.label).toBe("Cursor Ultra");
@@ -151,7 +153,7 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(legacyMatch).toBeDefined();
   });
 
-  it("does not include a confusing $0 custom row for DeepSeek Harness", () => {
+  it("does not include a confusing $0 custom row for Harness", () => {
     const options = ENGINE_PLAN_OPTIONS["deepseek-harness"];
     expect(options.length).toBe(1);
     expect(options[0].costPerMonth).toBeNull();
@@ -201,6 +203,54 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(plans.cursor).toEqual({ planName: "Cursor Ultra", costPerMonth: null });
     // Unset engines take their defaults
     expect(plans.grok).toEqual({ planName: "xAI SuperGrok Heavy", costPerMonth: 99 });
+  });
+
+  it("detects engine plans from CodeCaps / Usage Monitor quota windows", () => {
+    const windows = [
+      { providerKey: "cursor", planName: "ultra", label: "Cursor Ultra" },
+      { providerKey: "anthropic", planName: "pro", label: "Claude Pro" },
+      { providerKey: "openai", planName: "plus", label: "ChatGPT Plus" },
+      { providerKey: "xai", planName: "super", label: "xAI SuperGrok" },
+      { providerKey: "minimax", planName: "starter", label: "MiniMax Token Plan Starter" },
+      { providerKey: "google", planName: "ultra", label: "Google AI Ultra" },
+    ];
+
+    expect(detectEnginePlanFromWindows("cursor", windows)).toEqual({
+      label: "Cursor Ultra",
+      planName: "Cursor Ultra",
+      costPerMonth: null,
+    });
+    expect(detectEnginePlanFromWindows("claude", windows)).toEqual({
+      label: "Claude Pro ($20/mo)",
+      planName: "Claude Pro",
+      costPerMonth: 20,
+    });
+    expect(detectEnginePlanFromWindows("codex", windows)).toEqual({
+      label: "ChatGPT Plus ($20/mo)",
+      planName: "ChatGPT Plus",
+      costPerMonth: 20,
+    });
+    expect(detectEnginePlanFromWindows("grok", windows)).toEqual({
+      label: "xAI SuperGrok ($30/mo)",
+      planName: "xAI SuperGrok",
+      costPerMonth: 30,
+    });
+    expect(detectEnginePlanFromWindows("minimax", windows)).toEqual({
+      label: "Token Plan Starter ($15/mo)",
+      planName: "MiniMax Token Plan Starter",
+      costPerMonth: 15,
+    });
+    expect(detectEnginePlanFromWindows("antigravity", windows)).toEqual({
+      label: "Google AI Ultra ($105.79/mo)",
+      planName: "Google AI Ultra",
+      costPerMonth: 105.79,
+    });
+
+    const all = autoDetectAllEnginePlans(windows);
+    expect(all.cursor.planName).toBe("Cursor Ultra");
+    expect(all.claude.planName).toBe("Claude Pro");
+    expect(all.codex.planName).toBe("ChatGPT Plus");
+    expect(all.grok.planName).toBe("xAI SuperGrok");
   });
 });
 

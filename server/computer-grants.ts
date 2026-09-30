@@ -171,6 +171,7 @@ export function computerSystemPrompt(
      * rather than MCP servers.  Both dispatchers pass it, so the two lanes
      * cannot describe the same grant differently. */
     toolLoopSurface?: boolean;
+    hasHostTerminal?: boolean;
   } = {},
 ): string {
   if (mounts.length === 0) return "";
@@ -178,6 +179,10 @@ export function computerSystemPrompt(
   const protectedInput =
     " At a sign-in, password, MFA, CAPTCHA, or other protected-input step, stop and ask the user to complete it" +
     " on the visible computer. Never type their password or ask them to paste a password or one-time code into chat.";
+
+  const hostTerminalNotice = opts.hasHostTerminal
+    ? " You can also run commands and inspect files on the host computer through `bash` and the file tools without affecting the host desktop."
+    : "";
 
   if (mounts.length === 1) {
     const [only] = mounts;
@@ -189,7 +194,7 @@ export function computerSystemPrompt(
         : only.kind === "local"
           ? localPrompt(opts.toolLoopSurface === true)
           : SINGLE_PROMPTS[only.kind];
-    return body + protectedInput;
+    return body + hostTerminalNotice + protectedInput;
   }
 
   const host = mounts.find(isHostMount);
@@ -200,6 +205,7 @@ export function computerSystemPrompt(
     ` You have ${mounts.length} computers, each with its own separate set of tools:\n${lines}\n` +
     `They are separate machines: a file, a browser session, or an application on one is not on the other.` +
     policy +
+    hostTerminalNotice +
     protectedInput
   );
 }
@@ -629,7 +635,8 @@ async function resolveMounts<Lease>(
   });
   const mountsCloudComputer = reach.box;
   const mountsLocalComputer = reach.local && !unattendedAgy;
-  const hasHostComputer = Boolean(wantsLocal && mountsLocalComputer);
+  const allowHostTerminalWithVm = Boolean(wantsVm && cfg.localVm?.allowHostTerminal === true);
+  const hasHostComputer = Boolean((wantsLocal || allowHostTerminalWithVm) && mountsLocalComputer);
 
   // Explicit destinations are strict.  In particular, Local VM must never
   // fall through to host CUA and accidentally click on the user's Mac.
@@ -758,13 +765,13 @@ async function resolveMounts<Lease>(
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
       if (shouldThrowOnCloudFailure) {
-        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the ASCII.dev Box engine");
       }
       deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();
-    // Explicit Cloud and the box-native Computer engine provision on first
+    // Explicit Cloud and the box-native ASCII.dev Box engine provision on first
     // use.  Auto remains non-surprising and only reuses an existing box.
     if (!b && mountsCloudComputer && (wantsCloudFiltered || engine.driverKind === "boxAgent")) {
       deps.broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });

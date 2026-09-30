@@ -173,7 +173,7 @@ export interface AcpSupport {
   /** Omit for subscription CLIs (the default). Custom-only CLIs sit below
    *  the picker-rail divider and have no first-party cloud catalog. */
   access?: "subscription" | "custom";
-  models: { default: string; options: Array<{ id: string; label: string }> };
+  models: ModelCatalog;
   /** Effort levels this harness's CLI accepts, ascending. Omit when it has
    * no reasoning-effort control. Static for the same reason `models` is:
    * describe() runs before any session exists, so there is no _meta to read
@@ -186,6 +186,8 @@ export interface AcpSupport {
    * `AcpSupport.perModelEffortLevels` shape so a Harness-published map can
    * be passed straight through. */
   perModelEffortLevels?: Readonly<Record<string, readonly EffortLevel[]>>;
+  /** Harness's model-specific image truth; explicit catalog values take priority. */
+  perModelImages?: Readonly<Record<string, boolean>>;
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
   /** Base `initialize` deadline for a CLI whose cold boot is heavier than
@@ -465,6 +467,22 @@ function withPerModelEffortLevels(
   return changed ? { ...catalog, options } : catalog;
 }
 
+function withPerModelImages(catalog: ModelCatalog, perModel: AcpSupport["perModelImages"]): ModelCatalog {
+  if (!perModel) return catalog;
+  let changed = false;
+  const options = catalog.options.map((option) => {
+    const images = perModel[option.id];
+    if (images === undefined || option.images !== undefined) return option;
+    changed = true;
+    return { ...option, images };
+  });
+  return changed ? { ...catalog, options } : catalog;
+}
+
+function withModelCapabilities(catalog: ModelCatalog, support: AcpSupport): ModelCatalog {
+  return withPerModelImages(withPerModelEffortLevels(catalog, support.perModelEffortLevels), support.perModelImages);
+}
+
 export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> {
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
@@ -487,7 +505,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       access: support.access ?? "subscription",
     },
     install: support.install,
-    models: withPerModelEffortLevels(support.models, support.perModelEffortLevels),
+    models: withModelCapabilities(support.models, support),
     decodeConfig,
     defaultConfig: () => decodeConfig({}),
 
@@ -511,13 +529,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         support.transformEnv?.(env, effective);
         return env;
       };
-      let models = withPerModelEffortLevels(support.models, support.perModelEffortLevels);
+      let models = withModelCapabilities(support.models, support);
       const refreshModels = async () => {
         if (!support.resolveModels) return;
         try {
           const resolved = await support.resolveModels(childEnv(), config);
           if (resolved.options.length) {
-            models = withPerModelEffortLevels(resolved, support.perModelEffortLevels);
+            models = withModelCapabilities(resolved, support);
           }
         } catch {
           // Keep the last usable catalog when an optional discovery source is down.
@@ -552,11 +570,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
       };
+      let lastKnownVersion: string | null = null;
       const cliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
         new Promise<string | null>((resolve) => {
-          execCli(effective.cli, ["--version"], { timeout: 8000, env: cliProbeEnvironment(env) }, (err, stdout) =>
-            resolve(err ? null : stdout.trim()),
-          );
+          execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
+            const trimmed = err ? null : stdout.trim();
+            if (trimmed) {
+              lastKnownVersion = trimmed;
+              resolve(trimmed);
+            } else if (lastKnownVersion) {
+              resolve(lastKnownVersion);
+            } else {
+              resolve(null);
+            }
+          });
         });
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
@@ -1589,8 +1616,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
       const snapshot = async (): Promise<ProviderSnapshot> => {
         const env = childEnv();
-        const version = await cliVersion(config, env);
-        if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        let version = await cliVersion(config, env);
+        if (!version) {
+          if (lastKnownVersion) {
+            version = lastKnownVersion;
+          } else {
+            return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+          }
+        }
         const incompatible = support.versionCompatibilityReason?.(version, config);
         if (incompatible) return { state: "unavailable", reason: incompatible, version };
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };

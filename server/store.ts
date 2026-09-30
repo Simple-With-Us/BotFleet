@@ -108,6 +108,8 @@ export interface Message {
   automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
+  /** The model that actually generated this reply; absent on legacy rows. */
+  modelSelection?: { instanceId: string; model: string };
   /** Persisted audio clips for this exact reply, in playback order. */
   audio?: Array<{ path: string; mime: string }>;
   /** Original incoming microphone recording and recognizer output never change. */

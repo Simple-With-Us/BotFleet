@@ -33,7 +33,7 @@
     "dev:desktop": "node scripts/prepare-cloudflared.mjs --current && electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:server-start",
+    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start",
     "test:ci-scope": "node --test scripts/ci-change-scope.node-test.mjs",
     "test:e2e": "playwright test",
     "test:ios-ship": "node --test scripts/ios-ship-workflow.node-test.mjs",
@@ -85,7 +85,8 @@
     "control-plane:dry-run": "pnpm --filter @botfleet/control-plane dry-run",
     "test:board-audit": "node --test scripts/audit-effort-board.node-test.mjs",
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs",
-    "postinstall": "node scripts/compile-harness-dep.mjs"
+    "postinstall": "node scripts/compile-harness-dep.mjs",
+    "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",
@@ -93,7 +94,7 @@
     "@sentry/react": "^10.73.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
-    "harness": "github:jaywedgeworth22/Harness#421fd5b74fbc7040742643848b64bbf3bd07107f",
+    "harness": "github:jaywedgeworth22/Harness#6a13d62978e8527369cfe40a66475d72bd5a5c4c",
     "lucide-react": "^0.539.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",

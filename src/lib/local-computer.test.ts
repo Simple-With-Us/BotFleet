@@ -37,7 +37,7 @@ const instanceFor = (fixture: EngineFixture): InstanceInfo[] =>
 describe("local computer UI eligibility", () => {
   it("requires the selected instance to advertise approval-capable local MCP", () => {
     expect(instanceSupportsLocalComputer(instanceFor(engineFixture("Claude")), BOT)).toBe(true);
-    expect(instanceSupportsLocalComputer(instanceFor(engineFixture("Computer")), BOT)).toBe(false);
+    expect(instanceSupportsLocalComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT)).toBe(false);
   });
 
   it("does not offer This computer to an engine that only has the computer MCP surface", () => {
@@ -123,6 +123,14 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+    expect(
+      autoSelectsLocalComputer({
+        platform: "darwin",
+        computers: ["vm"],
+        capabilitiesReady: true,
+        localSelectable: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -139,30 +147,30 @@ describe("computer destination eligibility", () => {
     // Stated as a TRANSPORT rather than as `driverKind === "boxAgent"`: the
     // reason is that the agent runs on the remote machine, so there is no
     // local agent to mount a VM into — not that one engine is special-cased.
-    expect(instanceSupportsLocalVm(instanceFor(engineFixture("Computer")), BOT)).toBe(false);
+    expect(instanceSupportsLocalVm(instanceFor(engineFixture("ASCII.dev Box")), BOT)).toBe(false);
   });
 
-  it("offers a remote desktop to the Computer engine and to anything with the computer surface", () => {
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "box")).toBe(true);
+  it("offers a remote desktop to the ASCII.dev Box engine and to anything with the computer surface", () => {
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Claude")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ACP without MCP servers")), BOT, "box")).toBe(false);
   });
 
-  it("does not offer Cloud to the Computer engine when the backend resolves to a VPS", () => {
+  it("does not offer Cloud to the ASCII.dev Box engine when the backend resolves to a VPS", () => {
     // REGRESSION.  This helper could not see the backend at all, so it
     // answered "box" for every bot and returned true for the box-native
     // engine unconditionally.  A bot on that engine whose cloud backend
     // resolved to "vps" was therefore offered Cloud in Settings and then
     // died mid-turn at server/vps-computer.ts's vpsDriverError, which
     // refuses boxAgent outright.  Same engine, two backends, two answers.
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "vps")).toBe(false);
-    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Computer")), BOT, "box")).toBe(true);
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "vps")).toBe(false);
+    expect(instanceSupportsCloudComputer(instanceFor(engineFixture("ASCII.dev Box")), BOT, "box")).toBe(true);
     expect(instanceSupportsCloudComputer(instanceFor(engineFixture("Claude")), BOT, "vps")).toBe(true);
     expect(
-      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("Computer")), BOT, "vps"),
+      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("ASCII.dev Box")), BOT, "vps"),
     ).toContain("cannot drive a remote desktop");
     expect(
-      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("Computer")), BOT, "box"),
+      computerDestinationDisabledReason("cloud", instanceFor(engineFixture("ASCII.dev Box")), BOT, "box"),
     ).toBeNull();
   });
 

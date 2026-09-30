@@ -3,7 +3,7 @@ name: Sentry CI Report
 # Fleet-wide CI observability: receives completion events from the observed
 # workflows, but only reserves a runner for failures or scheduled check-ins.
 # It reports those actionable events to the shared `fleet-infra` Sentry project
-# (org jays-services).  ADDITIVE ONLY — this file must never modify the behavior
+# (org simple-with-us).  ADDITIVE ONLY — this file must never modify the behavior
 # of the workflows it observes.
 #
 # Two independent signals per completed run:

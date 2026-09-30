@@ -81,6 +81,14 @@ export interface RoutineOutcomeRecord {
   output?: string;
 }
 
+/** Statuses that left a task unfinished without anyone choosing to: the run
+ *  settled without delivering the work it promised.  `cancelled` is a
+ *  deliberate outcome and `completed` is the point, so neither is an
+ *  unanswered failure.  Shared because the server decides what acknowledging
+ *  clears and the client decides what the badge counts — two lists would
+ *  drift into a badge the owner cannot dismiss. */
+export const ROUTINE_ATTENTION_STATUSES = ["failed", "missed"] as const;
+
 export function routineOutcomeCode(run: RoutineOutcomeRecord): RoutineOutcomeCode | undefined {
   if (run.outcomeCode) return run.outcomeCode;
   // Older releases settled combined receipts at dispatch, without retaining

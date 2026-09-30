@@ -19,6 +19,10 @@ struct ProviderMarkView: View {
         // provider is still Antigravity. Keep the driver identity for both
         // its mark and VoiceOver label instead of renaming it from model text.
         if driverKind == "antigravity" || driverKind == "antigravityAgent" { return driverKind }
+        // DeepSeek Harness and MiniMax Code also keep their distinct driver identities
+        // so that model keywords (e.g. "minimax" or "deepseek") do not clobber them.
+        if driverKind == "dsh" || driverKind == "dshAgent" { return driverKind }
+        if driverKind == "mcode" || driverKind == "mcodeAgent" { return driverKind }
         guard let model = model?.lowercased() else { return driverKind }
         if model.contains("minimax") { return "minimax" }
         if model.contains("qwen") { return "qwenAgent" }
@@ -42,7 +46,7 @@ struct ProviderMarkView: View {
         /// it stays visible on both light and dark headers.
         case templateAsset(String)
         /// A generic SF Symbol standing in for a mark that has no brand
-        /// artwork of its own (e.g. the "computer" driver).
+        /// artwork of its own (e.g. the ASCII.dev Box driver).
         case symbol(String)
         /// No art shipped for this driver kind — fall back to a monogram.
         case monogram
@@ -73,10 +77,10 @@ struct ProviderMarkView: View {
             return .asset("ProviderMarkGemini")
         case "cursor", "cursorAgent":
             return .templateAsset("ProviderMarkCursor")
-        case "minimax", "minimaxAgent", "mcodeAgent":
+        case "minimax", "minimaxAgent", "mcode", "mcodeAgent":
             return .asset("ProviderMarkMiniMax")
         case "boxAgent":
-            return .symbol("desktopcomputer")
+            return .symbol("shippingbox")
         // No source art shipped for these — they render on the monogram
         // fallback below, which is expected and fine.
         case "droid", "droidAgent", "kimi", "kimiAgent", "qwenAgent",
@@ -100,7 +104,8 @@ struct ProviderMarkView: View {
         case "claude", "claudeAgent": return "Claude"
         case "grok", "grokAgent": return "Grok"
         case "grok-bot": return "Grok Bot"
-        case "deepseek", "deepseekAgent", "dsh", "dshAgent": return "DeepSeek"
+        case "deepseek", "deepseekAgent": return "DeepSeek"
+        case "dsh", "dshAgent": return "DeepSeek Harness"
         case "codex": return "Codex"
         case "openai-compat", "openai": return "OpenAI"
         case "gemini", "geminiAgent": return "Gemini"
@@ -109,8 +114,8 @@ struct ProviderMarkView: View {
         case "minimax", "minimaxAgent": return "MiniMax"
         // mcode is the same subscription read as a coding CLI, so it keeps the
         // MiniMax mark but announces as its own product name.
-        case "mcodeAgent": return "MiniMax Code"
-        case "boxAgent": return "Computer"
+        case "mcode", "mcodeAgent": return "MiniMax Code"
+        case "boxAgent": return "ASCII.dev Box"
         case "kimi", "kimiAgent": return "Kimi"
         case "droid", "droidAgent": return "Droid"
         case "qwenAgent": return "Qwen"

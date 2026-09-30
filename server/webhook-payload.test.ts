@@ -353,7 +353,7 @@ describe("slimWebhookPayload", () => {
         issue: {
           title: "Cron failure",
           shortId: "FLEET-1",
-          permalink: "https://jays-services.sentry.io/issues/101/",
+          permalink: "https://simple-with-us.sentry.io/issues/101/",
           project: { slug: "fleet-infra" },
         },
       },
@@ -422,7 +422,7 @@ describe("slimWebhookPayload", () => {
           level: "warning",
           status: "unresolved",
           substatus: "regressed",
-          permalink: "https://jays-services.sentry.io/issues/7669443788/",
+          permalink: "https://simple-with-us.sentry.io/issues/7669443788/",
           project: { id: "4511650513158144", name: "agentic-trading", slug: "socratic-trade", platform: "javascript-nextjs" },
           count: "3",
           userCount: 0,

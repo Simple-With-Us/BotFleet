@@ -29,7 +29,7 @@ beforeAll(() => {
     beforeSend: (event) => safeScrubHook(event),
     beforeSendTransaction: (event) => safeScrubHook(event),
     beforeSendLog: (log) => safeScrubHook(log),
-    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, urlQueryParams: false },
+    dataCollection: { httpBodies: [], httpHeaders: { request: false, response: false }, cookies: false, queryParams: false },
   });
 });
 

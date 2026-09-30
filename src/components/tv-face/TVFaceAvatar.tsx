@@ -1,6 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { BotState, BotColor } from "@/lib/mascot";
-import { TVFACE_MANIFEST, TVFACE_HAS_ENTER_RETURN, TVFaceExpression } from "./manifest";
+import {
+  TVFACE_HAS_ENTER_RETURN,
+  TVFACE_MANIFEST,
+  type TVFaceExpression,
+} from "./manifest";
+
+/** The expression an idle bot rests on. */
+const RESTING: TVFaceExpression = "resting";
+
+/**
+ * How long the enter and return animations are assumed to run.
+ *
+ * This is a contract with the asset pack, not a rendering detail: a correctly
+ * generated ~600ms enter freezes on its last frame for the remainder, because
+ * the player waits a fixed time before swapping to the hold. Whoever
+ * regenerates the pack must hold enter and return to this duration.
+ */
+export const TVFACE_TRANSITION_MS = 1000;
 
 export type TVFaceSkin = BotColor | "default";
 
@@ -12,7 +29,25 @@ export interface TVFaceAvatarProps {
   animated?: boolean;
 }
 
-const AVAILABLE_SKINS = new Set(["default"]);
+/** Skins whose art actually ships under public/tv-face/skins. Blue, green,
+ * purple, pink, red, and yellow are PLANNED skins with no assets yet:
+ * mapping them to their own directories 404s every GIF and still. Until
+ * the art lands, every color renders the default skin — and the profile
+ * picker's preview shows exactly what the bot will get.
+ *
+ * This was previously INVERTED: it named exactly the six skins whose
+ * directories did not exist, so a bot set to blue built a 404 path. It is
+ * asserted against the real directory listing in tvFaceSkins.test.ts, because
+ * a hand-maintained whitelist next to a hand-maintained directory listing is
+ * how it drifted in the first place. */
+export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>(["orange"]);
+
+/** The skins directory a color renders from. `orange` IS the default skin
+ * (public/tv-face/skins/default); every unshipped color falls back to it
+ * rather than 404ing. */
+export function tvFaceSkinDir(color: TVFaceSkin): string {
+  return SHIPPED_SKINS.has(color) && color !== "orange" ? color : "default";
+}
 
 export interface TVFaceFrame {
   expression: TVFaceExpression;
@@ -28,6 +63,59 @@ export function tvFaceFrameChanged(prev: TVFaceFrame, next: TVFaceFrame): boolea
   return prev.expression !== next.expression || prev.skin !== next.skin;
 }
 
+export type FrameStep = {
+  expression: TVFaceExpression;
+  kind: "enter" | "hold" | "return" | "still";
+  /** Delay before the NEXT step, in ms. 0 on the final step. */
+  delayAfterMs: number;
+};
+
+/**
+ * The sequence of assets to play when moving from one expression to another.
+ *
+ * Extracted from the component's effect so it is testable at all — the logic
+ * previously lived inside a useEffect interleaved with setTimeout and could
+ * only be exercised by rendering the component.
+ *
+ * The back-to-back case is the important one. The asset guidelines anchor
+ * every `_enter` to resting.png, but a preceding `_hold` ends wherever it
+ * ends, so playing an enter on a state-to-state change pops visibly. With
+ * enter and return now on all 15 expressions that would happen on EVERY
+ * transition, so a change between two active states cuts straight to the new
+ * hold: enter only from rest, return only to rest.
+ */
+export function planFrame(prev: TVFaceExpression, next: TVFaceExpression): FrameStep[] {
+  if (prev === next) {
+    return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
+  }
+
+  if (next === RESTING) {
+    // Return sequence: play the leaving expression's return, then land on the
+    // resting still. The return is skipped if the expression has none.
+    if (!TVFACE_HAS_ENTER_RETURN.has(prev)) {
+      return [{ expression: RESTING, kind: "still", delayAfterMs: 0 }];
+    }
+    return [
+      { expression: prev, kind: "return", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: RESTING, kind: "still", delayAfterMs: 0 },
+    ];
+  }
+
+  if (prev === RESTING) {
+    if (!TVFACE_HAS_ENTER_RETURN.has(next)) {
+      return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
+    }
+    return [
+      { expression: next, kind: "enter", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: next, kind: "hold", delayAfterMs: 0 },
+    ];
+  }
+
+  // State to state: no enter. The previous hold ends where it ends, and
+  // `next`'s enter is anchored to resting, so playing it would pop.
+  return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
+}
+
 export function TVFaceAvatar({
   state = "idle",
   color = "orange",
@@ -35,13 +123,11 @@ export function TVFaceAvatar({
   label,
   animated = true,
 }: TVFaceAvatarProps) {
-  const expression = TVFACE_MANIFEST[state] || "resting";
-  // fallback to orange if the color isn't one of the known skins
-  const mappedColor = AVAILABLE_SKINS.has(color) ? color : "orange";
-  const skinDir = mappedColor === "orange" ? "default" : mappedColor;
-  
+  const expression = TVFACE_MANIFEST[state] || RESTING;
+  const skinDir = tvFaceSkinDir(color);
+
   const [currentGif, setCurrentGif] = useState<string>("");
-  const previousFrame = useRef<TVFaceFrame>({ expression: "resting", skin: skinDir });
+  const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) => {
@@ -52,6 +138,11 @@ export function TVFaceAvatar({
     return `${base}/gifs/${expr}_${type}.gif`;
   };
 
+  const pathForStep = (step: FrameStep): string => {
+    if (step.kind === "still") return getAssetPath(step.expression, "hold", true);
+    return getAssetPath(step.expression, step.kind);
+  };
+
   useEffect(() => {
     if (!animated) {
       setCurrentGif(getAssetPath(expression, "hold", true));
@@ -59,34 +150,21 @@ export function TVFaceAvatar({
     }
 
     const prev = previousFrame.current;
-    
-    // Clear any existing transition
+
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
 
-    const playSequence = async () => {
-      // If going from something to something else
-      if (prev.expression !== "resting" && expression === "resting" && TVFACE_HAS_ENTER_RETURN.has(prev.expression)) {
-        // Return sequence
-        setCurrentGif(getAssetPath(prev.expression, "return"));
-        
-        timeoutRef.current = setTimeout(() => {
-          setCurrentGif(getAssetPath("resting", "hold", true)); // idle rests on a still or hold
-        }, 1000); // approximate transition time
-      } else if (prev.expression !== expression && TVFACE_HAS_ENTER_RETURN.has(expression)) {
-        // Enter sequence
-        setCurrentGif(getAssetPath(expression, "enter"));
-        
-        timeoutRef.current = setTimeout(() => {
-          setCurrentGif(getAssetPath(expression, "hold"));
-        }, 1000);
-      } else {
-        // Direct jump (hold loop)
-        setCurrentGif(getAssetPath(expression, "hold"));
-      }
-    };
-
     if (tvFaceFrameChanged(prev, { expression, skin: skinDir })) {
-      playSequence();
+      const steps = planFrame(prev.expression, expression);
+      let i = 0;
+      const advance = () => {
+        const step = steps[i];
+        setCurrentGif(pathForStep(step));
+        i += 1;
+        if (i < steps.length) {
+          timeoutRef.current = setTimeout(advance, steps[i - 1].delayAfterMs);
+        }
+      };
+      advance();
     } else if (!currentGif) {
       setCurrentGif(getAssetPath(expression, "hold"));
     }

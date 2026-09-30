@@ -106,6 +106,10 @@ public struct ToolActivity: Codable, Hashable, Sendable {
     public var spoken: String?
     /// Marks an error fixed by installing something, not by retrying.
     public var setup: Bool?
+    public var target: String?
+    public var kind: String?
+    public var detail: String?
+    public var durationMs: Int?
 }
 
 public struct Sender: Codable, Hashable, Sendable {
@@ -659,6 +663,36 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
 
     public var isEnabled: Bool { enabled != false }
 
+    /// A user-facing engine name: the Mac-side display name when set,
+    /// otherwise the provider name for its driver — never the raw instance id.
+    public var settingsDisplayName: String {
+        if let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
+        switch driverKind {
+        case "dsh", "dshAgent": return "DeepSeek Harness"
+        case "mcode", "mcodeAgent": return "MiniMax Code"
+        case "deepseek", "deepseekAgent": return "DeepSeek"
+        case "claude", "claudeAgent": return "Claude"
+        case "grok", "grokAgent": return "Grok"
+        case "codex": return "Codex"
+        case "antigravity", "antigravityAgent": return "Antigravity"
+        case "cursor", "cursorAgent": return "Cursor"
+        case "minimax", "minimaxAgent": return "MiniMax"
+        case "kimi": return "Kimi"
+        case "droid": return "Droid"
+        case "qwenAgent": return "Qwen"
+        case "opencodeGo": return "OpenCode Go"
+        case "hermesAgent": return "Hermes"
+        case "piAgent": return "Pi"
+        case "grok-bot": return "Grok Bot"
+        case "boxAgent": return "ASCII.dev Box"
+        case "openai-compat", "openai": return "OpenAI"
+        case "gemini", "geminiAgent": return "Gemini"
+        default: return displayName ?? instanceId
+        }
+    }
+
     public func effortLevels(for modelId: String) -> [String] {
         guard let engineLevels = capabilities?.effortLevels, !engineLevels.isEmpty else {
             return []
@@ -697,6 +731,7 @@ public enum VoiceProvider: Hashable, Sendable {
     case minimax
     case elevenlabs
     case system
+    case personal
     /// A provider this phone build does not know yet. Keep its setup copy
     /// generic rather than sending the person toward the wrong credential.
     case unknown
@@ -815,6 +850,9 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     public func canSpeak(agentVoice: String?) -> Bool {
+        if PersonalVoiceContract.isPersonalVoice(agentVoice) {
+            return true
+        }
         let hasAgentVoice = !(agentVoice?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         return isTTSConfigured && (hasAgentVoice || hasWorkspaceDefaultVoice)
     }
@@ -828,6 +866,7 @@ public struct ConfigStatus: Codable, Sendable {
         case nil, "minimax": return .minimax
         case "elevenlabs": return .elevenlabs
         case "system": return .system
+        case "personal", "apple-personal": return .personal
         default: return .unknown
         }
     }
@@ -872,6 +911,17 @@ public struct BotProfilePatch: Encodable, Sendable {
         case clear
     }
 
+    public var autoApprove: Bool?
+    public var autoReview: String?
+    public var approvePeerComms: Bool?
+    public var computers: [String]?
+    public var cwd: CwdString?
+
+    public enum CwdString: Equatable, Sendable {
+        case set(String)
+        case clear
+    }
+
     public init(
         name: String? = nil,
         title: String? = nil,
@@ -884,7 +934,12 @@ public struct BotProfilePatch: Encodable, Sendable {
         speechDevices: [String]? = nil,
         modelSelection: ModelSelection? = nil,
         section: SectionString? = nil,
-        maxToolRounds: MaxToolRounds? = nil
+        maxToolRounds: MaxToolRounds? = nil,
+        autoApprove: Bool? = nil,
+        autoReview: String? = nil,
+        approvePeerComms: Bool? = nil,
+        computers: [String]? = nil,
+        cwd: CwdString? = nil
     ) {
         self.name = name
         self.title = title
@@ -898,10 +953,15 @@ public struct BotProfilePatch: Encodable, Sendable {
         self.modelSelection = modelSelection
         self.section = section
         self.maxToolRounds = maxToolRounds
+        self.autoApprove = autoApprove
+        self.autoReview = autoReview
+        self.approvePeerComms = approvePeerComms
+        self.computers = computers
+        self.cwd = cwd
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds
+        case name, title, description, notifications, avatarUrl, avatarCrop, voice, speakReplies, speechDevices, modelSelection, section, maxToolRounds, autoApprove, autoReview, approvePeerComms, computers, cwd
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -933,6 +993,16 @@ public struct BotProfilePatch: Encodable, Sendable {
             case .clear: try values.encodeNil(forKey: .maxToolRounds)
             }
         }
+        try values.encodeIfPresent(autoApprove, forKey: .autoApprove)
+        try values.encodeIfPresent(autoReview, forKey: .autoReview)
+        try values.encodeIfPresent(approvePeerComms, forKey: .approvePeerComms)
+        try values.encodeIfPresent(computers, forKey: .computers)
+        if let cwd {
+            switch cwd {
+            case let .set(val): try values.encode(val, forKey: .cwd)
+            case .clear: try values.encodeNil(forKey: .cwd)
+            }
+        }
     }
 }
 
@@ -940,6 +1010,14 @@ public struct Voice: Codable, Hashable, Identifiable, Sendable {
     public var id: String
     public var label: String
     public var description: String?
+    public var isPersonalVoice: Bool?
+
+    public init(id: String, label: String, description: String? = nil, isPersonalVoice: Bool? = nil) {
+        self.id = id
+        self.label = label
+        self.description = description
+        self.isPersonalVoice = isPersonalVoice
+    }
 }
 
 public struct RoutineSchedule: Codable, Hashable, Sendable {

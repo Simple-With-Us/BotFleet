@@ -98,11 +98,12 @@ describe("Title Case for controls and headings", () => {
 });
 
 describe("Settings Models layout", () => {
-  it("grows the Settings dialog about 25-30 percent", () => {
+  it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
     const settings = FILES.find((entry) => entry.rel === "components/SettingsModal.tsx");
     expect(settings, "SettingsModal.tsx is missing").toBeDefined();
-    expect(settings!.text).toContain("max-w-[1100px]");
-    expect(settings!.text).toContain("h-[min(880px,calc(100dvh-3rem))]");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_WIDTH_PX = 1292");
+    expect(settings!.text).toContain("DEFAULT_SETTINGS_MODAL_HEIGHT_PX = 976");
+    expect(settings!.text).toContain("saveSettingsModalSize");
     expect(settings!.text).not.toContain("h-[min(720px,calc(100dvh-3rem))]");
     expect(settings!.text).not.toContain("h-[560px]");
     expect(settings!.text).not.toContain("max-w-[860px]");
@@ -119,7 +120,12 @@ describe("Settings Models layout", () => {
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
     expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
-    expect(picker!.text).toContain("if (selection.fallbacks?.length) nextSelection.fallbacks = selection.fallbacks");
+    // picking a new primary keeps the bot's fallback chain: the picker builds the
+    // selection with selectionForPick, which copies the fallbacks across
+    const pick = FILES.find((entry) => entry.rel === "lib/model-pick.ts");
+    expect(pick, "model-pick.ts is missing").toBeDefined();
+    expect(picker!.text).toContain("selectionForPick(selection, instance, model)");
+    expect(pick!.text).toContain("if (current.fallbacks?.length) next.fallbacks = current.fallbacks");
   });
 
   it("stacks iOS primary and fallback pickers on their own rows", () => {

@@ -41,7 +41,7 @@ export function modelEffortLevels(
   const driverKind = (engine?.driverKind ?? "").toLowerCase();
 
   // Known engine + model rules:
-  // 1. DSH / DeepSeek Harness: MiniMax models do not support reasoning effort.
+  // 1. DSH / Harness: MiniMax models do not support reasoning effort.
   if ((driverKind.includes("dsh") || driverKind.includes("deepseek")) && lowerId.includes("minimax")) {
     return [];
   }

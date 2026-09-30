@@ -46,6 +46,20 @@ function isBuiltInClaudeSonnetOrOpus(model: string): boolean {
   );
 }
 
+/** A DSH Pro route cannot read images. Replace it throughout the saved chain
+ * when switching an image turn to Flash so no stale Pro fallback can retry
+ * the same image prompt. Other engines and models remain untouched. */
+export function dshVisionSelection(chain: ModelSelection): ModelSelection {
+  const switchPro = (entry: ModelSelection): ModelSelection =>
+    entry.instanceId === "dsh" && entry.model === "DeepSeek-V4.1-Pro"
+      ? { ...entry, model: "DeepSeek-V4.1-Flash" }
+      : entry;
+  return {
+    ...switchPro(chain),
+    ...(chain.fallbacks ? { fallbacks: chain.fallbacks.map(switchPro) } : {}),
+  };
+}
+
 /** A turn inherits the bot's unattended mark only when it continues work that
  *  mark covers: a card continuation or delegated (commsDepth > 0) work.  A
  *  scheduled or manual run, or a typed turn, is decided by its own automation

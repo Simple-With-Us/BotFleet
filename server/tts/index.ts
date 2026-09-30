@@ -5,10 +5,9 @@
 // is a voice at all.
 import type { AppConfig } from "../config.ts";
 import * as minimax from "./minimax.ts";
-import * as elevenlabs from "./elevenlabs.ts";
 import * as systemVoices from "./system-voices.ts";
 
-export type VoiceProvider = "minimax" | "elevenlabs" | "system";
+export type VoiceProvider = "minimax" | "system";
 
 export class NoVoiceConfigured extends Error {
   // a plain field rather than a constructor parameter property: the harness
@@ -28,9 +27,8 @@ export class NoVoiceConfigured extends Error {
 
 export function voiceProvider(cfg: AppConfig): VoiceProvider {
   if (cfg.tts?.provider === "system") return "system";
-  if (cfg.tts?.provider === "elevenlabs") return "elevenlabs";
-  // Default to MiniMax — cheaper for the operator and on the same network
-  // as the rest of the bot's voice surface.
+  // Default to MiniMax.  Legacy configs with provider: "elevenlabs" fall
+  // through here and use MiniMax — ElevenLabs support was removed.
   return "minimax";
 }
 
@@ -50,9 +48,18 @@ export function voiceConfigured(cfg: AppConfig): boolean {
   return Boolean(cfg.tts?.key && cfg.tts?.voice);
 }
 
+export function isPersonalVoice(voiceId?: string): boolean {
+  if (!voiceId) return false;
+  return voiceId.startsWith("personal:") || voiceId.startsWith("apple-personal:");
+}
+
 /** A per-bot voice is a complete choice too; it should not be blocked just
  * because the app-wide fallback has not been selected yet. */
 export function voiceReady(cfg: AppConfig, voiceId?: string): boolean {
+  if (isPersonalVoice(voiceId)) {
+    // Apple Personal Voices speak on-device on iOS, not on the server.
+    return false;
+  }
   if (voiceProvider(cfg) === "system") {
     return systemVoices.systemVoicesAvailable() && Boolean(voiceId || cfg.tts?.voice);
   }
@@ -71,22 +78,48 @@ export function describeVoice(cfg: AppConfig) {
   };
 }
 
-export function verifyKey(key: string, cfg: AppConfig) {
-  // Verify the provider selected by the merged incoming config, so switching
-  // a saved ElevenLabs connection does not probe the wrong service.
-  return voiceProvider(cfg) === "elevenlabs" ? elevenlabs.verifyKey(key) : minimax.verifyKey(key);
+export function verifyKey(key: string, _cfg: AppConfig) {
+  return minimax.verifyKey(key);
 }
 
 export async function listVoices(cfg: AppConfig, run?: systemVoices.Runner): Promise<minimax.Voice[]> {
   if (voiceProvider(cfg) === "system") return systemVoices.listSystemVoices(run);
   const key = cfg.tts?.key;
-  if (!key) return [];
-  return voiceProvider(cfg) === "elevenlabs" ? elevenlabs.listVoices(key) : minimax.listVoices(key);
+  let voices: minimax.Voice[] = [];
+  if (key) {
+    try {
+      voices = await minimax.listVoices(key);
+    } catch {
+      voices = [...minimax.listClonedVoices(), ...minimax.CANNED_VOICES];
+    }
+  } else {
+    voices = [...minimax.listClonedVoices(), ...minimax.CANNED_VOICES];
+  }
+  if (cfg.tts?.voice && !voices.some((v) => v.id === cfg.tts?.voice)) {
+    const defaultVoiceId = cfg.tts.voice;
+    voices.unshift({ id: defaultVoiceId, label: defaultVoiceId, description: "Workspace default" });
+  }
+  return voices;
+}
+
+export function addCustomVoice(voiceId: string, label?: string) {
+  return minimax.addCustomVoice(voiceId, label);
+}
+
+export function deleteCustomVoice(voiceId: string) {
+  return minimax.deleteCustomVoice(voiceId);
+}
+
+export function listCustomVoices() {
+  return minimax.listClonedVoices();
 }
 
 /** Synthesize one utterance. Throws NoVoiceConfigured when there is nothing
  * to speak with, which the route turns into a 409 the client can explain. */
 export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: systemVoices.Runner) {
+  if (isPersonalVoice(voiceId)) {
+    throw new Error("Apple Personal Voices speak on-device on authorized iOS companion devices and cannot be synthesized on the server.");
+  }
   if (voiceProvider(cfg) === "system") {
     const voice = voiceId || cfg.tts?.voice;
     // An injected runner is the cross-platform test seam for `/usr/bin/say`;
@@ -99,7 +132,7 @@ export function speak(cfg: AppConfig, text: string, voiceId?: string, run?: syst
   if (!key) throw new NoVoiceConfigured("key");
   const voice = voiceId || cfg.tts?.voice;
   if (!voice) throw new NoVoiceConfigured("voice");
-  return voiceProvider(cfg) === "elevenlabs" ? elevenlabs.synthesize(text, voice, key) : minimax.synthesize(text, voice, key);
+  return minimax.synthesize(text, voice, key);
 }
 
 /** Clone a voice.  The harness route unpacks the base64 body and passes
