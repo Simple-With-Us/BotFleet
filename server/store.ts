@@ -19,6 +19,7 @@ import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 
 export type BotColor =
   | "green"
@@ -257,6 +258,8 @@ export interface TaskRecord {
   lastInstanceId?: string;
   /** what this task has spent: banked once per turn from turn.completed */
   usage?: TaskUsage;
+  /** Timing aggregate banked with `usage` at each settled turn. */
+  stats?: TaskStats;
   /** Per-instance breakdown of `usage`, banked from the selection that
    *  ACTUALLY ran each turn (post-fallback), so cost attribution follows
    *  the engine that ran, not the configured one.  Absent on records from
@@ -304,6 +307,31 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+}
+
+/** Running timing aggregate for one task, banked at each settled turn from
+ *  the harness's own wall clock (no driver reports timing).  Aggregates only —
+ *  never a per-turn array — so it stays a few bytes however long the thread
+ *  runs.  Durations are milliseconds.  Absent on tasks from before it
+ *  existed; those show nothing until their next turn. */
+export interface TaskStats {
+  /** Settled turns this aggregate covers (may be fewer than `usage.turns`). */
+  turns: number;
+  /** Tool steps run across those turns. */
+  steps: number;
+  /** Wall time neither in a tool nor waiting on a person. */
+  modelMs: number;
+  /** Wall time with a tool in flight (parallel tools overlap, not sum). */
+  toolMs: number;
+  /** Sum and count of time-to-first-token samples; turns that streamed
+   *  nothing contribute no sample. */
+  ttftMsSum?: number;
+  ttftSamples?: number;
+  /** Output tokens and model time of the turns that reported an output
+   *  figure — the pair tok/s is derived from, so a turn without output
+   *  tokens never drags the rate toward zero. */
+  tpsTokens?: number;
+  tpsMs?: number;
 }
 
 /** Per-instance usage bucket: the running tally plus the registry engine
@@ -1925,13 +1953,23 @@ export class Store {
   addTaskUsage(
     botId: string,
     threadId: string,
-    turn: { input?: number; output?: number; cachedInput?: number; costUsd: number | null; billingMode?: TurnBillingMode },
+    turn: {
+      input?: number;
+      output?: number;
+      cachedInput?: number;
+      costUsd: number | null;
+      billingMode?: TurnBillingMode;
+      /** This turn's timing, banked in the same write so the task reaches
+       *  every window once, not twice. */
+      stats?: TurnStatsSample;
+    },
     instanceId?: string,
     meta?: { engineId?: string; model?: string },
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
     task.usage = mergeTaskUsage(task.usage, turn);
+    if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});
       const key = forkKey(byInstance, instanceId, meta);

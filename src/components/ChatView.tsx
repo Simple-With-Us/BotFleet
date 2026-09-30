@@ -61,7 +61,12 @@ import { SecretRequestCard } from "./SecretRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
+import { ThreadStatsBar } from "./ThreadStatsBar";
 import { ThreadTabs } from "./ThreadTabs";
+import { ThreadViewSwitch } from "./ThreadViewSwitch";
+import { TrajectoryView } from "./TrajectoryView";
+import { requestTrajectorySearch } from "@/lib/trajectory-search";
+import { useThreadView } from "@/lib/thread-view";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
 import { SpeakButton } from "./SpeakButton";
@@ -1099,6 +1104,13 @@ function formatHoverTime(at: number) {
 export function ChatView({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const scrollRef = useRef<HTMLDivElement>(null);
+  // the open thread's task: its banked usage and timing feed the footer chips
+  const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  // Chat or Trajectory, remembered per thread.  The chat pane below stays
+  // mounted (just not shown) in Trajectory, so its scroll position, draft and
+  // streaming state are exactly where they were when the person switches back.
+  const [threadView, setThreadView] = useThreadView(bot.threadId);
+  const trajectoryOpen = threadView === "trajectory";
 
   const stream = useStreaming();
   const streaming = stream.streaming[bot.threadId];
@@ -1133,12 +1145,15 @@ export function ChatView({ bot }: { bot: Bot }) {
     const onFind = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
         event.preventDefault();
-        setFindOpen(true);
+        // The conversation is not on screen in Trajectory: search the steps
+        // there instead of arming a find bar the person cannot see.
+        if (trajectoryOpen) requestTrajectorySearch();
+        else setFindOpen(true);
       }
     };
     window.addEventListener("keydown", onFind);
     return () => window.removeEventListener("keydown", onFind);
-  }, []);
+  }, [trajectoryOpen]);
 
   // only the active branch is rendered; forks stay reachable via ‹ › nav
   //
@@ -1355,12 +1370,16 @@ export function ChatView({ bot }: { bot: Bot }) {
 
   // deps track the FULL messages.length, so expanding the window (which only
   // changes windowedMessages) can never re-trigger this bottom scrollTo
+  //
+  // Not while the pane is hidden behind the Trajectory view: a hidden box has
+  // no height, so "scroll to the bottom" would pin the offset to zero.  Coming
+  // back re-runs this, and a reader who was following lands on the newest.
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el || !followRef.current) return;
+    if (!el || !followRef.current || trajectoryOpen) return;
     el.scrollTo({ top: el.scrollHeight });
     previousScrollTop.current = el.scrollTop;
-  }, [bot.id, bot.threadId, messages.length, streaming, reasoning, bot.busy, follow, composerHeight]);
+  }, [bot.id, bot.threadId, messages.length, streaming, reasoning, bot.busy, follow, composerHeight, trajectoryOpen]);
 
   // Expanding prepends rows: capture the height first, then after the commit
   // shift scrollTop by the growth so the message under the cursor stays put
@@ -1400,7 +1419,11 @@ export function ChatView({ bot }: { bot: Bot }) {
 
   // keyboard is a scroll gesture too (upstream lesson): PageUp/Home break
   // follow like an upward wheel; the at-end onScroll check re-arms it
+  //
+  // Not while Trajectory is showing: Home and PageUp there belong to the step
+  // list, and must not turn off follow on a chat that is hidden behind it.
   useEffect(() => {
+    if (trajectoryOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "PageUp" || (e.key === "Home" && !(e.target instanceof HTMLTextAreaElement))) {
         setBottomFollow(false);
@@ -1408,7 +1431,7 @@ export function ChatView({ bot }: { bot: Bot }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setBottomFollow]);
+  }, [setBottomFollow, trajectoryOpen]);
 
   const atEnd = () => {
     const el = scrollRef.current;
@@ -1472,15 +1495,18 @@ export function ChatView({ bot }: { bot: Bot }) {
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
         <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+          <ThreadViewSwitch view={threadView} onChange={setThreadView} />
+          {/* Always here, so the switch beside it never slides under the pointer:
+              in Trajectory the same magnifier searches the steps. */}
           <button
-            onClick={() => setFindOpen((open) => !open)}
-            aria-label="Find in Conversation"
-            aria-pressed={findOpen}
+            onClick={() => (trajectoryOpen ? requestTrajectorySearch() : setFindOpen((open) => !open))}
+            aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}
+            aria-pressed={trajectoryOpen ? undefined : findOpen}
             className={cn(
               "rounded-md p-1.5 hover:bg-raised",
-              findOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
+              findOpen && !trajectoryOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
             )}
-            title="Find in Conversation (⌘F)"
+            title={trajectoryOpen ? "Search Steps (⌘F)" : "Find in Conversation (⌘F)"}
           >
             <Search size={18} />
           </button>
@@ -1545,23 +1571,37 @@ export function ChatView({ bot }: { bot: Bot }) {
 
       <ThreadTabs bot={bot} />
 
-      {findOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
+      {findOpen && !trajectoryOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 
       
       {/* Pinned message banner */}
-      <PinnedBanner
-        bot={bot}
-        pinnedId={bot.pinnedMessageId}
-        messages={messages}
-        onJump={(messageId) =>
-          dispatch({ type: "focusMessage", threadId: bot.threadId, messageId })
-        }
-        onUnpin={() =>
-          dispatch({ type: "updateBot", botId: bot.id, patch: { pinnedMessageId: "" } })
-        }
-      />
+      {!trajectoryOpen && (
+        <PinnedBanner
+          bot={bot}
+          pinnedId={bot.pinnedMessageId}
+          messages={messages}
+          onJump={(messageId) =>
+            dispatch({ type: "focusMessage", threadId: bot.threadId, messageId })
+          }
+          onUnpin={() =>
+            dispatch({ type: "updateBot", botId: bot.id, patch: { pinnedMessageId: "" } })
+          }
+        />
+      )}
 
-      {showToolCallsEnabled(state.config) && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
+      {showToolCallsEnabled(state.config) && !trajectoryOpen && <TaskTimeline messages={messages} busy={bot.busy ?? false} />}
+
+      {/* Trajectory: what the bot did and where the time went.  Keyed by
+          thread so its search, expanded steps and live tail never carry over. */}
+      {trajectoryOpen && (
+        <TrajectoryView
+          key={bot.threadId}
+          threadId={bot.threadId}
+          messages={serverMessages}
+          running={Boolean(bot.busy)}
+          knownTurns={activeTask?.usage?.turns}
+        />
+      )}
 
       {/* Messages + composer share one pane so bubbles scroll into the pill
           instead of dying on a rectangular clip above a black dock.
@@ -1571,7 +1611,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           this the containing block for any `fixed`-positioned descendant —
           today that's only ChatMarkdown's file-link menu backdrop, which
           still covers the whole transcript, just not the sidebar/header. */}
-      <div className="relative min-h-0 flex-1 @container/chat">
+      <div className={cn("relative min-h-0 flex-1 @container/chat", trajectoryOpen && "hidden")}>
       <TurnErrorAnnouncement
         key={`${bot.threadId}:${errorBranchKey}`}
         latestMessage={latestServerError}
@@ -1729,6 +1769,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         onClearReply={() => setReplyTo(null)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
+      <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>
       </div>
       </div>
