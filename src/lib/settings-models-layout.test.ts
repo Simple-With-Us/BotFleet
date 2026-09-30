@@ -17,6 +17,7 @@ function source(rel: string): string {
 
 describe("desktop Settings Models layout", () => {
   const settings = source("src/components/SettingsModal.tsx");
+  const nav = source("src/components/SettingsNav.tsx");
   const fleet = source("src/components/FleetModelsSection.tsx");
 
   it("grows the Settings dialog so the capability table and fleet rows fit with user resizability", () => {
@@ -36,7 +37,8 @@ describe("desktop Settings Models layout", () => {
     // EngineCapabilitiesMatrix.MATRIX_CONTENT_BUDGET_PX is derived from
     // these two numbers; widening the nav back would reintroduce the
     // horizontal scroll the transposed matrix was built to remove.
-    expect(settings).toContain("w-[164px]");
+    expect(nav).toContain('SETTINGS_NAV_WIDTH_CLASS = "w-[164px]"');
+    expect(nav).not.toContain("w-[190px]");
     expect(settings).not.toContain("w-[190px]");
   });
 
