@@ -94,7 +94,7 @@
     "@sentry/react": "^10.73.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
-    "harness": "github:jaywedgeworth22/Harness#d1b1ca91222ffa7a2074bc26e3b6a62b85743f45",
+    "harness": "github:jaywedgeworth22/Harness#6a13d62978e8527369cfe40a66475d72bd5a5c4c",
     "lucide-react": "^0.539.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",

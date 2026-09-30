@@ -31,8 +31,8 @@ importers:
         specifier: ^2.1.1
         version: 2.1.1
       harness:
-        specifier: github:jaywedgeworth22/Harness#d1b1ca91222ffa7a2074bc26e3b6a62b85743f45
-        version: https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/d1b1ca91222ffa7a2074bc26e3b6a62b85743f45(fa0ef49c8cbc14680f36a6f0a75be232)
+        specifier: github:jaywedgeworth22/Harness#6a13d62978e8527369cfe40a66475d72bd5a5c4c
+        version: https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/6a13d62978e8527369cfe40a66475d72bd5a5c4c(fa0ef49c8cbc14680f36a6f0a75be232)
       lucide-react:
         specifier: ^0.539.0
         version: 0.539.0(react@19.2.8)
@@ -5527,8 +5527,8 @@ packages:
   hachure-fill@0.5.2:
     resolution: {integrity: sha512-3GKBOn+m2LX9iq+JC1064cSFprJY4jL1jCXTcpnfER5HYE2l/4EfWSGzkPa/ZDBmYI0ZOEj5VHV/eKnPGkHuOg==}
 
-  harness@https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/d1b1ca91222ffa7a2074bc26e3b6a62b85743f45:
-    resolution: {tarball: https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/d1b1ca91222ffa7a2074bc26e3b6a62b85743f45}
+  harness@https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/6a13d62978e8527369cfe40a66475d72bd5a5c4c:
+    resolution: {tarball: https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/6a13d62978e8527369cfe40a66475d72bd5a5c4c}
     version: 0.1.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -13587,7 +13587,7 @@ snapshots:
 
   hachure-fill@0.5.2: {}
 
-  harness@https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/d1b1ca91222ffa7a2074bc26e3b6a62b85743f45(fa0ef49c8cbc14680f36a6f0a75be232):
+  harness@https://codeload.github.com/jaywedgeworth22/Harness/tar.gz/6a13d62978e8527369cfe40a66475d72bd5a5c4c(fa0ef49c8cbc14680f36a6f0a75be232):
     optionalDependencies:
       '@deepseek-ai/dsh': 0.1.5-rc.2(fa0ef49c8cbc14680f36a6f0a75be232)
     transitivePeerDependencies:
