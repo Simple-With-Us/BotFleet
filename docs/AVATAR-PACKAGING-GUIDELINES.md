@@ -14,29 +14,31 @@ The avatar player uses a 3-part animation lifecycle to transition smoothly betwe
 
 *Flow:* `Resting` → (Trigger: Bot starts thinking) → `thinking_enter.gif` → `thinking_hold.gif` (loops) → (Trigger: Bot finishes) → `thinking_return.gif` → `Resting`.
 
-## 2. Core Actions & Expressions (The 15-State Matrix)
+## 2. Core Actions & Expressions (The 17-State Matrix)
 
-To be fully compatible with BotFleet, an avatar pack must cover these exact **15 core expressions**. 
-Each expression requires an `_enter` (intro), `_hold` (loop), and `_return` (outro) animation, resulting in exactly **45 animations** per skin. 
+To be fully compatible with BotFleet, an avatar pack must cover these exact **17 core expressions**. 
+Each expression requires an `_enter` (intro), `_hold` (loop), and `_return` (outro) animation, resulting in exactly **51 animations** per skin. 
 
 If a specific state isn't provided, BotFleet gracefully falls back to the `resting` face.
 
-### The 15 Core States
+### The 17 Core States
 1. `resting` (Default idle state / anchor)
 2. `working` (General task execution)
 3. `thinking` (Processing / reasoning)
 4. `speaking` (TTS / Dictating)
 5. `listening` (Waiting for user input)
 6. `computer` (Using a computer terminal or code)
-7. `error` (Crash / error state)
-8. `success` (Happy / celebrate / proud)
-9. `confused` (Suspicious / not understanding)
-10. `alerting` (Notifying / waking)
-11. `searching` (Looking up data)
-12. `sending` (Uploading / transmitting)
-13. `receiving` (Downloading / reading)
-14. `fleet` (Multi-agent coordination)
-15. `tools` (Using an MCP tool / routine)
+7. `crash` (Crash / error state)
+8. `happy` (Happy / positive result)
+9. `celebrate` (Celebration / milestone)
+10. `proud` (Proud / accomplishment)
+11. `confused` (Suspicious / not understanding)
+12. `alerting` (Notifying / waking)
+13. `searching` (Looking up data)
+14. `sending` (Uploading / transmitting)
+15. `receiving` (Downloading / reading)
+16. `fleet` (Multi-agent coordination)
+17. `tools` (Using an MCP tool / routine)
 
 ## 3. Filesystem Structure (The `.botface` / `.zip` format)
 
@@ -58,7 +60,7 @@ AvatarName/
 ```
 
 ### The `manifest.json`
-Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.
+Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders. Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) is currently **orange-only** — blue, green, purple, pink, red, and yellow are planned skins with no assets yet, and any color without shipped art renders the default skin rather than 404ing. `orange` IS the default skin (`public/tv-face/skins/default`).
 
 ```json
 {
@@ -66,7 +68,7 @@ Every pack must include a `manifest.json` that maps BotFleet's internal states t
   "version": "1.0.0",
   "author": "BotFleet",
   "defaultSkin": "orange",
-  "skins": ["orange", "blue", "green", "purple", "pink", "red", "yellow"],
+  "skins": ["orange"],
   "format": "gif",
   "resolution": "480x480",
   "mapping": {
