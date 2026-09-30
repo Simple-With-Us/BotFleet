@@ -11,6 +11,7 @@ import {
   filterRows,
   formatClock,
   formatGap,
+  fitLabels,
   groupByTurn,
   inputsFromMessages,
   MAX_TOOL_ROWS,
@@ -668,13 +669,43 @@ describe("groupByTurn", () => {
     expect(groupByTurn(tail.rows, tail.turns, { emptyTurnsFrom: 0 }).map((g) => g.turn?.id)).toEqual(["a", "b"]);
   });
 
-  it("puts rows outside any turn in their own group instead of dropping them", () => {
-    const t = buildTrajectory([{ ...base(0, undefined), type: "session.started", sessionId: "s" }, turnStarted(1), turnDone(2)], {
-      inputs: [{ id: "u", at: ms(0.5), role: "user", text: "hi" }],
+  it("keeps the message and session that began a turn with that turn", () => {
+    const t = buildTrajectory(
+      [
+        { ...base(0, undefined), type: "session.started", sessionId: "s" },
+        turnStarted(1, "t1"),
+        said(2, "Hello", "t1"),
+        turnDone(3, {}, "t1"),
+        turnStarted(100, "t2"),
+        said(101, "Again", "t2"),
+        turnDone(102, {}, "t2"),
+      ],
+      { inputs: [{ id: "u1", at: ms(0.5), role: "user", text: "hi" }, { id: "u2", at: ms(99.5), role: "user", text: "more" }] },
+    );
+    const groups = groupByTurn(t.rows, t.turns);
+    expect(groups.map((g) => [g.turn?.id, g.rows.map((r) => r.title)])).toEqual([
+      ["t1", ["Session", "You", "Assistant"]],
+      ["t2", ["You", "Assistant"]],
+    ]);
+    expect(groups.flatMap((g) => g.rows)).toHaveLength(t.rows.length);
+  });
+
+  it("puts rows after the last turn in a group of their own instead of dropping them", () => {
+    const t = buildTrajectory([turnStarted(1), said(2, "Hello"), turnDone(3)], {
+      inputs: [{ id: "u", at: ms(50), role: "user", text: "still there?" }],
     });
     const groups = groupByTurn(t.rows, t.turns);
+    expect(groups.map((g) => [g.turn?.id, g.rows.map((r) => r.kind)])).toEqual([
+      ["t1", ["assistant"]],
+      [undefined, ["user"]],
+    ]);
     expect(groups.flatMap((g) => g.rows)).toHaveLength(t.rows.length);
-    expect(groups[0]!.turn).toBeUndefined();
+  });
+
+  it("keeps a turn-less row between two of one turn's rows with that turn", () => {
+    const t = buildTrajectory([turnStarted(1), said(2, "a"), { ...base(3, undefined), type: "session.exited" } as RuntimeEvent, said(4, "b"), turnDone(5)]);
+    // the session row carries no turn id of its own, but the turn was open
+    expect(groupByTurn(t.rows, t.turns)).toHaveLength(1);
   });
 });
 
@@ -801,5 +832,37 @@ describe("inputsFromMessages", () => {
     // the trajectory then calls an unlabelled one a system message
     const t = buildTrajectory([turnStarted(1), turnDone(2)], { inputs: [{ id: "x", at: ms(0.5), role: "system", text: "go" }] });
     expect(t.rows[0]!.title).toBe("System message");
+  });
+});
+
+describe("fitLabels", () => {
+  const label = (x: number, text: string, align: "left" | "center" | "right" = "left") => ({ x, text, align });
+
+  it("keeps everything when there is room", () => {
+    const labels = [label(0, "14:00:00"), label(0.5, "15:00:00"), label(1, "16:00:00", "right")];
+    expect(fitLabels(labels, 800)).toEqual(labels);
+  });
+
+  it("drops a label that would print on top of a neighbour", () => {
+    const labels = [label(0, "14:00:00"), label(0.5, "15:00:00"), label(0.52, "15:10:00"), label(1, "16:00:00", "right")];
+    const kept = fitLabels(labels, 400);
+    expect(kept.map((l) => l.text)).toEqual(["14:00:00", "15:00:00", "16:00:00"]);
+  });
+
+  it("always keeps where the strip starts and ends, dropping middle labels for them", () => {
+    // the middle label sits where the end label needs to go
+    const labels = [label(0, "14:00:00"), label(0.93, "15:00:00"), label(1, "16:00:00", "right")];
+    expect(fitLabels(labels, 300).map((l) => l.text)).toEqual(["14:00:00", "16:00:00"]);
+  });
+
+  it("handles centred captions and returns them in strip order", () => {
+    const labels = [label(0.2, "1h 59m later", "center"), label(0.27, "1h 30m later", "center")];
+    expect(fitLabels(labels, 720)).toHaveLength(1);
+    expect(fitLabels([label(0.1, "1h 59m later", "center"), label(0.8, "1h 30m later", "center")], 720).map((l) => l.x)).toEqual([0.1, 0.8]);
+  });
+
+  it("copes with no labels and with a strip too narrow for any", () => {
+    expect(fitLabels([], 400)).toEqual([]);
+    expect(fitLabels([label(0, "14:00:00"), label(1, "16:00:00", "right")], 60).map((l) => l.text)).toEqual(["14:00:00"]);
   });
 });

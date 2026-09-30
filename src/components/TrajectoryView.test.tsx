@@ -136,7 +136,7 @@ describe("TrajectoryPanel: Turns", () => {
   const html = render({}, "turns");
 
   it("groups steps under a heading per turn, with duration and tokens", () => {
-    expect(html.match(/<h3/g)).toHaveLength(3);
+    expect(html.match(/<h3/g)).toHaveLength(2);
     const t = text(html);
     expect(t).toContain("Turn 1");
     expect(t).toContain("Turn 2");
@@ -145,9 +145,24 @@ describe("TrajectoryPanel: Turns", () => {
     expect(html).not.toContain('aria-label="Timeline"');
   });
 
-  it("puts the message that started the thread outside any turn, rather than dropping it", () => {
-    expect(text(html)).toContain("Outside a Turn");
-    expect(text(html)).toContain("Please run the suite");
+  it("keeps the message that started a turn with that turn", () => {
+    const t = text(html);
+    expect(t).not.toContain("Outside a Turn");
+    expect(t.indexOf("Turn 1")).toBeLessThan(t.indexOf("Please run the suite"));
+    expect(t.indexOf("Please run the suite")).toBeLessThan(t.indexOf("Turn 2"));
+  });
+
+  it("does not drop a message after the last turn", () => {
+    const late = buildTrajectory(events(), { inputs: [...inputs, { id: "u9", at: T0 + 4000 * 1000, role: "user", text: "still there?" }] });
+    const t = text(render({ trajectory: late }, "turns"));
+    expect(t).toContain("Outside a Turn");
+    expect(t.indexOf("Turn 2")).toBeLessThan(t.indexOf("Outside a Turn"));
+    expect(t).toContain("still there?");
+  });
+
+  it("shows a turn that recorded no steps, so none goes missing", () => {
+    expect(text(html)).toContain("Turn 2");
+    expect(text(html)).toContain("No steps in this turn.");
   });
 
   it("marks an unfinished or failed turn", () => {

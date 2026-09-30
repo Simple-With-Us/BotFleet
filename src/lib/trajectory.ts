@@ -336,6 +336,41 @@ export function axisX(axis: Axis, at: number): number {
   return segments.at(-1)!.x1;
 }
 
+// ── keeping axis labels from printing on top of each other ────────────
+
+export interface AxisLabel {
+  /** Position along the strip, 0..1 */
+  x: number;
+  text: string;
+  /** Which side of `x` the text extends to. */
+  align: "left" | "center" | "right";
+}
+
+/**
+ * The labels that fit on a strip `widthPx` wide without touching, in order.
+ * Text width is estimated (`charPx` per character of a small tabular figure),
+ * which is close enough for a caption and needs no measuring.  The first and
+ * last labels are placed first — where the strip starts and ends is the one
+ * thing a reader always wants — then the rest, left to right, each dropped if
+ * it would land on one already placed.
+ */
+export function fitLabels<T extends AxisLabel>(labels: readonly T[], widthPx: number, charPx = 6.2, spacingPx = 10): T[] {
+  const extent = (label: T): [number, number] => {
+    const width = label.text.length * charPx;
+    const x = label.x * widthPx;
+    if (label.align === "left") return [x, x + width];
+    if (label.align === "right") return [x - width, x];
+    return [x - width / 2, x + width / 2];
+  };
+  const order = labels.length <= 2 ? [...labels] : [labels[0]!, labels[labels.length - 1]!, ...labels.slice(1, -1)];
+  const placed: Array<{ label: T; lo: number; hi: number }> = [];
+  for (const label of order) {
+    const [lo, hi] = extent(label);
+    if (placed.every((other) => hi + spacingPx <= other.lo || lo >= other.hi + spacingPx)) placed.push({ label, lo, hi });
+  }
+  return placed.map((entry) => entry.label).sort((a, b) => a.x - b.x);
+}
+
 // ── building ──────────────────────────────────────────────────────────
 
 interface MutableRow extends TrajectoryRow {
@@ -1135,12 +1170,13 @@ export interface TurnGroup {
   rows: TrajectoryRow[];
 }
 
-/** Consecutive rows of one turn, each group headed by that turn's summary.
- *  Rows outside any turn (a session starting, a message between turns) form
- *  their own groups, so nothing is dropped and order is preserved.  A turn
- *  that recorded no steps at all still has a duration and a state worth
- *  showing: with `emptyTurnsFrom`, those that began at or after that time get a
- *  group of their own, in place. */
+/** Rows grouped under the turn they belong to, each group headed by that
+ *  turn's summary, in order.  A row with no turn of its own — the message that
+ *  started a turn, a session starting — travels with the turn that follows it,
+ *  since it is what began it; only rows after the last turn stand alone.
+ *  Nothing is dropped.  A turn that recorded no steps at all still has a
+ *  duration and a state worth showing: with `emptyTurnsFrom`, those that began
+ *  at or after that time get a group of their own, in place. */
 export function groupByTurn(
   rows: readonly TrajectoryRow[],
   turns: readonly TurnSummary[],
@@ -1148,15 +1184,27 @@ export function groupByTurn(
 ): TurnGroup[] {
   const byId = new Map(turns.map((turn) => [turn.id, turn]));
   const groups: TurnGroup[] = [];
+  let pending: TrajectoryRow[] = [];
   for (const row of rows) {
-    const key = row.turnId ?? "";
+    if (!row.turnId) {
+      pending.push(row);
+      continue;
+    }
     const last = groups.at(-1);
-    if (last && (last.turn?.id ?? "") === key) {
+    if (last && last.turn?.id === row.turnId && pending.length === 0) {
       last.rows.push(row);
       continue;
     }
-    groups.push({ key: `${key || "outside"}:${groups.length}`, turn: row.turnId ? byId.get(row.turnId) : undefined, rows: [row] });
+    if (last && last.turn?.id === row.turnId) {
+      // a row without a turn between two of the same turn's rows belongs to it
+      last.rows.push(...pending, row);
+      pending = [];
+      continue;
+    }
+    groups.push({ key: `${row.turnId}:${groups.length}`, turn: byId.get(row.turnId), rows: [...pending, row] });
+    pending = [];
   }
+  if (pending.length > 0) groups.push({ key: `outside:${groups.length}`, rows: pending });
   if (options.emptyTurnsFrom !== undefined) {
     const withRows = new Set(rows.map((row) => row.turnId));
     for (const turn of turns) {

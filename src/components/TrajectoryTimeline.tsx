@@ -12,14 +12,17 @@
 // Color never carries meaning alone: every lane has a text label, every span
 // has an accessible name that says its outcome, and an unfinished span is
 // drawn dashed, not just tinted.
+import { useEffect, useRef, useState } from "react";
 import { Popover } from "@/components/ui/Popover";
 import { cn } from "@/lib/cn";
 import {
   axisX,
   formatClock,
   formatGap,
+  fitLabels,
   formatSpan,
   type Axis,
+  type AxisLabel,
   type Span,
   type SpanStatus,
   type Trajectory,
@@ -35,10 +38,8 @@ const LANES = [
 /** Height of one stacked row in the Tools lane, and the air between rows. */
 const ROW_PX = 14;
 const ROW_GAP_PX = 3;
-/** A collapsed gap gets a caption only while there are few enough not to collide. */
-const MAX_GAP_CAPTIONS = 6;
-/** The least axis a time label needs before it is drawn, as a fraction of the strip. */
-const LABEL_SPACING = 0.1;
+/** The strip's width before it has been measured (and under server rendering). */
+const DEFAULT_STRIP_PX = 720;
 
 const OUTCOME: Record<SpanStatus, string> = {
   ok: "Succeeded",
@@ -166,42 +167,56 @@ function Track({
   );
 }
 
-/** Where along the axis to print a clock time, without printing them on top of each other. */
-function timeLabels(axis: Axis, end: number): Array<{ x: number; text: string; align: "left" | "right" }> {
-  const out: Array<{ x: number; text: string; align: "left" | "right" }> = [];
-  let lastX = -1;
-  axis.segments.forEach((segment, i) => {
-    if (i > 0 && segment.x0 - lastX < LABEL_SPACING) return;
-    out.push({ x: segment.x0, text: formatClock(segment.start), align: "left" });
-    lastX = segment.x0;
-  });
+/** The clock times to print along the axis: where each stretch begins, and where it all ends. */
+function timeLabels(axis: Axis, end: number): AxisLabel[] {
+  const out: AxisLabel[] = axis.segments.map((segment) => ({ x: segment.x0, text: formatClock(segment.start), align: "left" }));
   const last = axis.segments.at(-1);
-  if (last && last.x1 - lastX >= LABEL_SPACING) out.push({ x: last.x1, text: formatClock(end), align: "right" });
+  if (last) out.push({ x: last.x1, text: formatClock(end), align: "right" });
   return out;
+}
+
+/** The strip's width in pixels, kept current, so labels can be fitted to it. */
+function useStripWidth(mounted: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(DEFAULT_STRIP_PX);
+  useEffect(() => {
+    const el = ref.current;
+    if (!mounted || !el) return;
+    const update = () => setWidth(el.clientWidth || DEFAULT_STRIP_PX);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mounted]);
+  return [ref, width] as const;
 }
 
 export function TrajectoryTimeline({ trajectory }: { trajectory: Trajectory }) {
   const { axis, bounds } = trajectory;
+  // a hook, so ahead of the early return below
+  const [stripRef, stripPx] = useStripWidth(Boolean(axis && bounds));
   if (!axis || !bounds) return null;
   const rowsById = new Map(trajectory.rows.map((row) => [row.id, row]));
   const rowCount = { input: 1, model: 1, tools: trajectory.toolRows } as const;
-  const captions = axis.gaps.length > 0 && axis.gaps.length <= MAX_GAP_CAPTIONS;
-  const labels = timeLabels(axis, bounds.end);
+  // labels are fitted to the strip's real width, so a narrow window drops the
+  // ones that would collide instead of printing them on top of each other
+  const gapCaptions = fitLabels(
+    axis.gaps.map((gap): AxisLabel => ({ x: (gap.x0 + gap.x1) / 2, text: formatGap(gap.ms), align: "center" })),
+    stripPx,
+  );
+  const labels = fitLabels(timeLabels(axis, bounds.end), stripPx);
 
   return (
     <div role="group" aria-label="Timeline" className="px-5 pb-1 pt-3">
       <div className="grid grid-cols-[3.25rem_minmax(0,1fr)] items-center gap-x-2 gap-y-1.5">
-        {captions && (
+        {gapCaptions.length > 0 && (
           <>
             <span aria-hidden="true" />
             <div aria-hidden="true" className="relative h-3.5 text-[10.5px] leading-[14px] text-ink-secondary">
-              {axis.gaps.map((gap) => (
-                <span
-                  key={`${gap.from}-${gap.to}`}
-                  className="absolute -translate-x-1/2 whitespace-nowrap"
-                  style={{ left: `${((gap.x0 + gap.x1) / 2) * 100}%` }}
-                >
-                  {formatGap(gap.ms)}
+              {gapCaptions.map((caption) => (
+                <span key={caption.x} className="absolute -translate-x-1/2 whitespace-nowrap" style={{ left: `${caption.x * 100}%` }}>
+                  {caption.text}
                 </span>
               ))}
             </div>
@@ -214,7 +229,7 @@ export function TrajectoryTimeline({ trajectory }: { trajectory: Trajectory }) {
           </div>
         ))}
         <span aria-hidden="true" />
-        <div aria-hidden="true" className="relative h-3.5 text-[10.5px] tabular-nums leading-[14px] text-ink-secondary">
+        <div ref={stripRef} aria-hidden="true" className="relative h-3.5 text-[10.5px] tabular-nums leading-[14px] text-ink-secondary">
           {labels.map((label) => (
             <span
               key={`${label.align}-${label.x}`}
