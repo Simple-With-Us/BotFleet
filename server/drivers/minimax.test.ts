@@ -106,12 +106,17 @@ describe("MinimaxDriver", () => {
 
   it("offers only current official text models", () => {
     expect(MinimaxDriver.models).toEqual({
-      default: "MiniMax-M3",
+      default: "MiniMax-M3.1-Flash-Preview",
       options: [
-        { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
+        { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
         { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
       ],
     });
+    // The retired MiniMax-M3 is neither offered nor priced: it is out of the
+    // static catalog and out of MINIMAX_PRICE_PER_MILLION, so costing a turn
+    // against it returns null rather than a stale tariff.
+    expect(MinimaxDriver.models.options.some((o) => o.id === "MiniMax-M3")).toBe(false);
+    expect(costUsd({ input: 1, output: 1 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3")).toBeNull();
   });
 
   it("normalizes custom API roots", () => {
@@ -580,7 +585,7 @@ describe("MinimaxDriver", () => {
 
   it("refreshModels replaces the static catalog from GET /models, off the same fetch snapshot() uses", async () => {
     const fetchMock = vi.fn(async () => new Response(
-      JSON.stringify({ data: [{ id: "MiniMax-M3" }, { id: "MiniMax-Next" }] }),
+      JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }, { id: "MiniMax-M3" }, { id: "MiniMax-M2.7" }] }),
       { status: 200, headers: { "content-type": "application/json" } },
     ));
     vi.stubGlobal("fetch", fetchMock);
@@ -593,11 +598,16 @@ describe("MinimaxDriver", () => {
     });
 
     await instance.refreshModels?.();
-    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3", "MiniMax-Next"]);
+    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3.1-Flash-Preview", "MiniMax-Next"]);
     // a model already in the static catalog keeps its hand-written label
-    expect(instance.models.options.find((o) => o.id === "MiniMax-M3")?.label).toBe("MiniMax M3");
+    expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.label).toBe("MiniMax M3.1 Flash Preview");
     // a genuinely new model gets its id as the label rather than nothing
     expect(instance.models.options.find((o) => o.id === "MiniMax-Next")?.label).toBe("MiniMax-Next");
+    // a retired id the API still serves does not reappear at all: a live
+    // list is the same kind of stale source as a stale settings row, and
+    // the picker keeps latest-per-class only.
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M3")).toBe(false);
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M2.7")).toBe(false);
 
     // one call already spent by refreshModels; snapshot() reuses the cached
     // probe rather than firing a second GET /models
@@ -618,9 +628,9 @@ describe("MinimaxDriver", () => {
 
     await instance.refreshModels?.();
     expect(instance.models).toEqual({
-      default: "MiniMax-M3",
+      default: "MiniMax-M3.1-Flash-Preview",
       options: [
-        { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
+        { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
         { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
       ],
     });
@@ -652,7 +662,7 @@ describe("MinimaxDriver", () => {
     const body = JSON.parse(String(request?.body));
 
     expect(body).toMatchObject({
-      model: "MiniMax-M3",
+      model: "MiniMax-M3.1-Flash-Preview",
       stream: true,
       reasoning_split: true,
       stream_options: { include_usage: true },
@@ -1505,7 +1515,7 @@ describe("MinimaxDriver", () => {
     }
   });
 
-  it("prices a settled turn from its real usage, at the M3 ≤512K-token rate", async () => {
+  it("prices a settled turn from its real usage, at the M3.1 Flash Preview ≤512K-token rate", async () => {
     vi.stubGlobal("fetch", vi.fn(async () =>
       sse(
         '{"choices":[{"delta":{"content":"here you go"}}]}',
@@ -1528,7 +1538,7 @@ describe("MinimaxDriver", () => {
     // (100,000 @ $0.30/M) + (50,000 @ $1.20/M) = $0.03 + $0.06 = $0.09
     expect(costOf(completed)).toBeCloseTo(0.09, 10);
     expect(costOf(completed)).toBe(
-      costUsd({ input: 100_000, output: 50_000 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3"),
+      costUsd({ input: 100_000, output: 50_000 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash-Preview"),
     );
     recorder.stop();
     await instance.dispose();
@@ -1616,7 +1626,7 @@ describe("MinimaxDriver", () => {
     // TOOL_CALL_ROUND's own usage: prompt_tokens: 10, completion_tokens: 5
     expect(completed).toMatchObject({ ok: false, stopReason: "error", usage: { input: 10, output: 5 } });
     expect(costOf(completed)).toBeCloseTo(
-      costUsd({ input: 10, output: 5 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3")!,
+      costUsd({ input: 10, output: 5 }, MINIMAX_PRICE_PER_MILLION, "MiniMax-M3.1-Flash-Preview")!,
       12,
     );
     recorder.stop();
