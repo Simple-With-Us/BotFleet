@@ -1108,6 +1108,48 @@ function reconcileModelLineage(opts: { botIds?: readonly string[]; ownerDirectiv
   }
 }
 
+/** Engine-level checks for one entry of a RECONCILED selection: the engine
+ *  exists and offers the model (only when the caller asks for that), and the
+ *  effort is one the model serves.  Runs on the primary and on every fallback,
+ *  after the lineage reconcile so a retired id has already moved forward. */
+function checkSelectionEntry(
+  entry: ModelSelection,
+  requireAvailableModel: boolean,
+): { ok: false; status: number; error: string } | null {
+  const target = registry.get(entry.instanceId);
+  // Model IDs remain free-form at the app's general API boundary. Custom
+  // engines can accept IDs that are not in their discovery catalog, and
+  // several drivers only learn the final catalog when a turn starts. The
+  // MCP tool applies a stricter discovered-model policy for its own calls.
+  if (requireAvailableModel) {
+    if (!target) {
+      return { ok: false, status: 400, error: `model instance "${entry.instanceId}" is unavailable` };
+    }
+    const offered =
+      entry.model === target.models.default ||
+      target.models.options.some((option) => option.id === entry.model);
+    if (!offered) {
+      return {
+        ok: false,
+        status: 400,
+        error: `model "${entry.model}" is not offered by instance "${entry.instanceId}"`,
+      };
+    }
+  }
+  const targetOption = target?.models.options.find((option) => option.id === entry.model);
+  const allowed: readonly string[] = target
+    ? modelEffortLevels(
+        { driverKind: target.driverKind, capabilities: target.adapter.capabilities },
+        targetOption,
+        entry.model,
+      )
+    : [];
+  if (target && entry.effort !== undefined && !allowed.includes(entry.effort)) {
+    return { ok: false, status: 400, error: `effort "${entry.effort}" is not offered by model "${entry.model}"` };
+  }
+  return null;
+}
+
 function checkedModelSelection(
   raw: unknown,
   current?: { selection: ModelSelection; busy: boolean },
@@ -1165,7 +1207,11 @@ function checkedModelSelection(
       selection.fallbacks = parsedFallbacks;
     }
   }
-  if (!nested) {
+  // A fallback entry is only parsed here.  Availability and effort are checked
+  // once, on the reconciled chain below: a retired fallback has to reach the
+  // lineage migration before it is judged against the live catalog.
+  if (nested) return { ok: true, selection };
+  {
     // Retired and superseded ids move forward, Latest entries resolve to
     // the slug they will run, and the saved chain is reconciled the same way
     // so the busy check below compares like with like.
@@ -1183,36 +1229,9 @@ function checkedModelSelection(
   if (current?.busy && changed) {
     return { ok: false, status: 409, error: "the bot is working — stop it before changing models" };
   }
-  const target = registry.get(selection.instanceId);
-  // Model IDs remain free-form at the app's general API boundary. Custom
-  // engines can accept IDs that are not in their discovery catalog, and
-  // several drivers only learn the final catalog when a turn starts. The
-  // MCP tool applies a stricter discovered-model policy for its own calls.
-  if (requireAvailableModel) {
-    if (!target) {
-      return { ok: false, status: 400, error: `model instance "${selection.instanceId}" is unavailable` };
-    }
-    const offered =
-      selection.model === target.models.default ||
-      target.models.options.some((option) => option.id === selection.model);
-    if (!offered) {
-      return {
-        ok: false,
-        status: 400,
-        error: `model "${selection.model}" is not offered by instance "${selection.instanceId}"`,
-      };
-    }
-  }
-  const targetOption = target?.models.options.find((option) => option.id === selection.model);
-  const allowed: readonly string[] = target
-    ? modelEffortLevels(
-        { driverKind: target.driverKind, capabilities: target.adapter.capabilities },
-        targetOption,
-        selection.model,
-      )
-    : [];
-  if (target && selection.effort !== undefined && !allowed.includes(selection.effort)) {
-    return { ok: false, status: 400, error: `effort "${selection.effort}" is not offered by model "${selection.model}"` };
+  for (const entry of [selection, ...(selection.fallbacks ?? [])]) {
+    const problem = checkSelectionEntry(entry, requireAvailableModel);
+    if (problem) return problem;
   }
   return { ok: true, selection };
 }

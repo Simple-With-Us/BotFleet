@@ -36,8 +36,19 @@ export function hasDefaults(primary: DefaultModelSlot, fallbacks: readonly Defau
   return primary !== null || fallbacks.some((slot) => slot !== null);
 }
 
-const wire = (slot: DefaultModelSlot): { instanceId: string; model: string } | null =>
-  slot ? { instanceId: slot.instanceId, model: slot.model } : null;
+type WireSlot = { instanceId: string; model: string; latest?: string };
+
+/** A "Latest <Class>" pick keeps its class on the wire, so every bot floats
+ *  on the class instead of freezing on today's slug.  A pinned pick
+ *  (`latest` null or absent) sends no class. */
+const wire = (slot: DefaultModelSlot): WireSlot | null =>
+  slot
+    ? {
+        instanceId: slot.instanceId,
+        model: slot.model,
+        ...(typeof slot.latest === "string" && slot.latest ? { latest: slot.latest } : {}),
+      }
+    : null;
 
 /** The body for POST /api/bots/apply-model-defaults.
  *
@@ -47,7 +58,7 @@ const wire = (slot: DefaultModelSlot): { instanceId: string; model: string } | n
 export function applyDefaultsBody(
   primary: DefaultModelSlot,
   fallbacks: readonly DefaultModelSlot[],
-): { slots: { primary: { instanceId: string; model: string } | null; fallbacks: ({ instanceId: string; model: string } | null)[] } } {
+): { slots: { primary: WireSlot | null; fallbacks: (WireSlot | null)[] } } {
   return {
     slots: {
       primary: wire(primary),

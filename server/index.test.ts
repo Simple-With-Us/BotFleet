@@ -2103,6 +2103,41 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("migrates a retired fallback before judging availability on a strict write", async () => {
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const strict = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-3-7-sonnet" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(strict.status).toBe(200);
+      const saved = strict.body.bot.modelSelection.fallbacks;
+      expect(saved).toHaveLength(1);
+      // Moved forward to the current Sonnet, not left on the retired id.
+      expect(saved[0].model).toBe(claude.models.default);
+
+      // A fallback that is neither retired nor offered is still refused, after reconciliation.
+      const unknown = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5-5",
+          fallbacks: [{ instanceId: "claude", model: "not-a-real-model" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(unknown.status).toBe(400);
+      expect(unknown.body.error).toMatch(/not offered/i);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("rejects incomplete model selections instead of persisting a broken bot", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {

@@ -171,7 +171,13 @@ function DefaultModelBlock() {
           bot={standIn}
           label="Primary"
           value={primary}
-          onChange={(selection) => setPrimary({ instanceId: selection.instanceId, model: selection.model })}
+          onChange={(selection) =>
+            setPrimary({
+              instanceId: selection.instanceId,
+              model: selection.model,
+              ...(selection.latest ? { latest: selection.latest } : {}),
+            })
+          }
           onClear={() => setPrimary(null)}
         />
         {fallbacks.map((slot, index) => (
@@ -182,7 +188,11 @@ function DefaultModelBlock() {
             value={slot}
             onChange={(selection) =>
               setFallbacks((current) =>
-                withSlot(current, index, { instanceId: selection.instanceId, model: selection.model }),
+                withSlot(current, index, {
+                  instanceId: selection.instanceId,
+                  model: selection.model,
+                  ...(selection.latest ? { latest: selection.latest } : {}),
+                }),
               )
             }
             onClear={() => setFallbacks((current) => withSlot(current, index, null))}

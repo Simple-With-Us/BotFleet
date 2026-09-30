@@ -87,4 +87,15 @@ describe("applyDefaultsBody", () => {
     expect(body.slots.primary).toEqual({ instanceId: "codex", model: "a" });
     expect(body.slots.fallbacks[0]).toEqual({ instanceId: "codex", model: "a" });
   });
+  it("keeps a Latest class on the wire and sends nothing for a pinned pick", () => {
+    const floating = { instanceId: "claude", model: "sonnet-5", latest: "sonnet" };
+    const pinned = { instanceId: "claude", model: "sonnet-4", latest: null };
+    const body = applyDefaultsBody(floating, [pinned, floating, null]);
+    expect(body.slots.primary).toEqual({ instanceId: "claude", model: "sonnet-5", latest: "sonnet" });
+    expect(body.slots.fallbacks).toEqual([
+      { instanceId: "claude", model: "sonnet-4" },
+      { instanceId: "claude", model: "sonnet-5", latest: "sonnet" },
+      null,
+    ]);
+  });
 });
