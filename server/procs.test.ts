@@ -73,6 +73,24 @@ describe("execCli deadlines", () => {
     expect(isProbeTimeout(err)).toBe(true);
   });
 
+  it("settles an exited child whose grandchild still holds the pipes, keeping what it printed", async () => {
+    // The child answers and exits; a background process inherits stdout and
+    // keeps it open.  The probe must still settle near its soft deadline with
+    // the output it read, not hang until the grandchild lets go.
+    const started = Date.now();
+    const { err, stdout } = await run("/bin/sh", ["-c", "printf 2.1.284; sleep 4 &"], 300);
+    expect(Date.now() - started).toBeLessThan(2_500);
+    expect(stdout).toBe("2.1.284");
+    expect(err).toBeNull();
+  });
+
+  it("does not call a child that died on a signal a timeout", async () => {
+    const { err } = await run("/bin/sh", ["-c", "kill -SEGV $$"], 5_000);
+    expect(err).not.toBeNull();
+    expect(err?.timedOut).not.toBe(true);
+    expect(isProbeTimeout(err)).toBe(false);
+  });
+
   it("does not call a fast non-zero exit a timeout", async () => {
     const { err } = await run("/bin/sh", ["-c", "exit 3"], 5_000);
     expect(err).not.toBeNull();
@@ -110,6 +128,15 @@ describe("classifyVersionProbeFailure", () => {
     });
     // Empty output that only arrived after the deadline (an event-loop stall).
     expect(classifyVersionProbeFailure(null, "agy", "Antigravity", 20_500, 20_000).kind).toBe("transient");
+  });
+
+  it("calls a crash on a signal a failure, not a slow answer, however long it ran", () => {
+    const segv = Object.assign(new Error("Command failed"), { killed: false, signal: "SIGSEGV" });
+    expect(classifyVersionProbeFailure(segv, "pi", "Pi", 40, 20_000).kind).toBe("failed");
+    expect(classifyVersionProbeFailure(segv, "pi", "Pi", 25_000, 20_000).kind).toBe("failed");
+    const abrt = Object.assign(new Error("Command failed"), { killed: true, signal: "SIGABRT" });
+    expect(classifyVersionProbeFailure(abrt, "pi", "Pi", 40, 20_000).kind).toBe("failed");
+    expect(isProbeTimeout(abrt)).toBe(false);
   });
 
   it("reports a CLI that ran and failed on its own as a failure, not as missing", () => {

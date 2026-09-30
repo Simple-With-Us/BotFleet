@@ -79,6 +79,15 @@ export function engineStatus(instance: InstanceInfo): string {
   return instance.snapshot.version ?? "Ready";
 }
 
+/** Whether the picker shows the engine's setup card instead of its models.
+ *  An engine whose probe did not answer in time is blocked too: it has no
+ *  models to list yet, and EngineSetup draws its "Checking" card rather than
+ *  leaving an empty pane. */
+export function pickerBlocked(instance: InstanceInfo, pane: "main" | "custom"): boolean {
+  if (isCheckingEngine(instance)) return true;
+  return pane === "custom" ? needsCli(instance) : needsCli(instance) || needsSignIn(instance);
+}
+
 /** Whether an unusable engine's CLI is actually absent.  One that is on this
  *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
  *  own check failed) is unavailable, not "not installed" — the reason says
@@ -386,11 +395,8 @@ export function ModelPicker({
   // in Codex, an extra from Claude's settings) stay in their own engine's list.
   // The local ones are on the Local Models entry.
   const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
-  const blocked = railInstance
-    ? pane === "custom"
-      ? needsCli(railInstance)
-      : needsCli(railInstance) || needsSignIn(railInstance)
-    : false;
+  const blocked = railInstance ? pickerBlocked(railInstance, pane) : false;
+  const checking = isCheckingEngine(railInstance);
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -560,10 +566,10 @@ export function ModelPicker({
                         "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
                         railInstance.snapshot.quota?.capped
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          : checking
+                          ? "bg-inset text-ink-secondary"
                           : blocked
                           ? "bg-warning/10 text-warning"
-                          : isCheckingEngine(railInstance)
-                          ? "bg-inset text-ink-secondary"
                           : "bg-success/10 text-success",
                       )}
                     >
@@ -594,7 +600,9 @@ export function ModelPicker({
                     <WhyThisEngineCallout instance={railInstance} />
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
-                      {pane === "main" && official.length > 0
+                      {checking
+                        ? "Models will appear as soon as the check finishes."
+                        : pane === "main" && official.length > 0
                         ? `${official.length} ${official.length === 1 ? "model" : "models"} will appear after setup.`
                         : "Local models will appear as soon as the engine is installed."}
                     </p>

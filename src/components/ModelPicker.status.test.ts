@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
-import { engineStatus, railEngines } from "./ModelPicker";
+import { engineStatus, pickerBlocked, railEngines } from "./ModelPicker";
 
 function engine(
   instanceId: string,
@@ -99,5 +99,27 @@ describe("railEngines", () => {
       "claude",
     );
     expect(rail.map((i) => i.instanceId)).toEqual(["cursor"]);
+  });
+});
+
+describe("pickerBlocked", () => {
+  const checking = engine("claude", { state: "unavailable", transient: true, reason: "Claude did not answer in time" });
+
+  it("shows the setup card, not an empty models pane, for an engine that is still being checked", () => {
+    expect(pickerBlocked(checking, "main")).toBe(true);
+    expect(pickerBlocked(checking, "custom")).toBe(true);
+  });
+
+  it("still blocks a missing CLI, and a sign-out only on the main pane", () => {
+    const missing = engine("codex", { state: "unavailable", reason: "`codex` CLI not found" });
+    expect(pickerBlocked(missing, "main")).toBe(true);
+    expect(pickerBlocked(missing, "custom")).toBe(true);
+    const signedOut = engine("claude", { state: "available", authenticated: false, version: "2.1.284" });
+    expect(pickerBlocked(signedOut, "main")).toBe(true);
+    expect(pickerBlocked(signedOut, "custom")).toBe(false);
+  });
+
+  it("leaves a ready engine's models showing", () => {
+    expect(pickerBlocked(engine("claude", { state: "available", version: "2.1.284" }), "main")).toBe(false);
   });
 });

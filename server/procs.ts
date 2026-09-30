@@ -199,11 +199,12 @@ const HARD_TIMEOUT_TEXT = /did not exit within \d+ms/;
  * nothing about whether the CLI is installed or signed in. */
 export function isProbeTimeout(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
-  const e = err as { timedOut?: unknown; killed?: unknown; signal?: unknown; code?: unknown; message?: unknown };
+  const e = err as { timedOut?: unknown; code?: unknown; message?: unknown };
+  // Evidence that WE ran out of the deadline: execCli marks its own kill
+  // `timedOut`.  A bare `killed` flag or a signal is not evidence: a CLI that
+  // dies on SIGSEGV or SIGABRT crashed, it did not run out of time.
   return (
     e.timedOut === true ||
-    e.killed === true ||
-    (typeof e.signal === "string" && e.signal.length > 0) ||
     e.code === "ETIMEDOUT" ||
     (typeof e.message === "string" && HARD_TIMEOUT_TEXT.test(e.message))
   );
@@ -235,7 +236,7 @@ export function classifyVersionProbeFailure(
   elapsedMs: number,
   timeoutMs: number,
 ): VersionProbeFailure {
-  const e = err as (NodeJS.ErrnoException & { status?: unknown }) | null;
+  const e = err as (NodeJS.ErrnoException & { status?: unknown; signal?: unknown }) | null;
   if (e && typeof e.code === "string") {
     const spawn = describeSpawnFailure(e, cli);
     if (spawn.setup) {
@@ -248,11 +249,14 @@ export function classifyVersionProbeFailure(
   // 127 is the shell's "command not found" — a node-shebang CLI whose
   // `node` is gone exits with it.  That is setup, not a slow answer.
   if (e && (e.code as unknown) === 127) return { kind: "setup", reason: `\`${cli}\` CLI not found` };
-  if (isProbeTimeout(e) || (timeoutMs > 0 && elapsedMs >= timeoutMs)) {
+  // A child that died on a signal without timeout evidence crashed; a long
+  // run before the crash does not make it a slow answer.
+  const crashed = !!e && typeof e.signal === "string" && e.signal.length > 0 && !isProbeTimeout(e);
+  if (!crashed && (isProbeTimeout(e) || (timeoutMs > 0 && elapsedMs >= timeoutMs))) {
     return { kind: "transient", reason: `${engine} did not answer in time` };
   }
   if (e) {
-    const code = typeof e.code === "number" ? ` (exit ${e.code})` : "";
+    const code = typeof e.code === "number" ? ` (exit ${e.code})` : crashed ? ` (${String(e.signal)})` : "";
     return { kind: "failed", reason: `\`${cli} --version\` failed${code}` };
   }
   return { kind: "failed", reason: `\`${cli} --version\` printed no version` };

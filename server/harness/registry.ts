@@ -317,6 +317,14 @@ export class ProviderRegistry {
     this.generation++;
     this.lastDone = null;
     this.latestSettled.clear();
+    // The definitive baselines describe the old fleet too: a config change
+    // (CLI path, enabled, credentials) must not be masked by what an engine
+    // said before it.
+    // Disk-seeded baselines (seq 0) belong to the process start, not to a
+    // fleet, and stay until a real probe replaces them.
+    for (const [instanceId, record] of this.lastDefinitive) {
+      if (record.seq > 0) this.lastDefinitive.delete(instanceId);
+    }
     for (const [instanceId, entry] of Object.entries(configs)) {
       await this.loadEntry(instanceId, entry);
     }
@@ -381,24 +389,32 @@ export class ProviderRegistry {
    *    "Check again" button, a just-created engine) never joins a sweep that
    *    started earlier: it queues one trailing sweep instead. */
   private lastDone: { at: number; result: DescribedInstance[] } | null = null;
-  private inFlight: { startedAt: number; generation: number; promise: Promise<DescribedInstance[]> } | null = null;
+  private inFlight: { startedAt: number; generation: string; promise: Promise<DescribedInstance[]> } | null = null;
   private trailing: { createdAt: number; promise: Promise<DescribedInstance[]> } | null = null;
   /** Bumped when the fleet itself changes (load, removeInstance). */
   private generation = 0;
+  /** Bumped when ONE instance is reloaded.  A sweep that started before it
+   *  probed the old config of that engine, so it must neither be joined nor
+   *  committed, exactly like a sweep of a previous fleet. */
+  private sweepEpoch = 0;
+  /** Monotonic start order of engine probes.  Overlapping probes of one
+   *  engine are ordered by when they STARTED, not when they settled: a slow
+   *  earlier probe landing last must not overwrite a newer answer. */
+  private probeSeq = 0;
   /** Bumped per instance when that one instance is reloaded. */
   private instanceGeneration = new Map<InstanceId, number>();
   /** One running probe per instance, shared by overlapping sweeps. */
-  private entryProbes = new Map<InstanceId, { startedAt: number; gen: string; promise: Promise<DescribedInstance> }>();
+  private entryProbes = new Map<InstanceId, { startedAt: number; seq: number; gen: string; promise: Promise<DescribedInstance> }>();
   /** The last definitive answer per engine — never a timeout — which an
    * inconclusive probe falls back to, field by field. */
-  private lastDefinitive = new Map<InstanceId, { at: number; info: DescribedInstance }>();
+  private lastDefinitive = new Map<InstanceId, { at: number; seq: number; info: DescribedInstance }>();
   /** The newest settled describe per instance, so a sweep that finishes after
    * a single-engine refresh (or a late probe) never puts an older answer back. */
-  private latestSettled = new Map<InstanceId, { at: number; gen: string; info: DescribedInstance }>();
+  private latestSettled = new Map<InstanceId, { at: number; seq: number; gen: string; info: DescribedInstance }>();
   /** When each describe result finished, for the client's ordering guard. */
   private describedAtByResult = new WeakMap<DescribedInstance[], number>();
   /** Settle time and generation of each entry a probe produced. */
-  private entryMeta = new WeakMap<DescribedInstance, { at: number; gen: string }>();
+  private entryMeta = new WeakMap<DescribedInstance, { at: number; seq: number; gen: string }>();
   /** Snapshots whose snapshot() threw — an error, not a verdict. */
   private thrownSnapshots = new WeakSet<ProviderSnapshot>();
   private describeListeners = new Set<DescribeListener>();
@@ -416,12 +432,17 @@ export class ProviderRegistry {
     return this.describedAtByResult.get(result);
   }
 
+  private sweepKey(): string {
+    return `${this.generation}:${this.sweepEpoch}`;
+  }
+
   private genOf(instanceId: InstanceId): string {
     return `${this.generation}:${this.instanceGeneration.get(instanceId) ?? 0}`;
   }
 
   private forgetInstanceProbes(instanceId: InstanceId): void {
     this.instanceGeneration.set(instanceId, (this.instanceGeneration.get(instanceId) ?? 0) + 1);
+    this.sweepEpoch++;
     this.lastDefinitive.delete(instanceId);
     this.latestSettled.delete(instanceId);
     this.entryProbes.delete(instanceId);
@@ -448,10 +469,11 @@ export class ProviderRegistry {
         // baseline for this process's first, possibly slow, probes.
         // Unavailable rows are not: an older build wrote a slow probe as
         // "CLI not found", and that must not become ground truth.
-        const now = Date.now();
+        // Aged from when the cache was written, not from now: a day-old cache
+        // must not look fresh to the DEFINITIVE_MAX_AGE_MS check.
         for (const info of instances as DescribedInstance[]) {
           if (info?.snapshot?.state === "available" && !info.snapshot.transient && !this.lastDefinitive.has(info.instanceId)) {
-            this.lastDefinitive.set(info.instanceId, { at: now, info });
+            this.lastDefinitive.set(info.instanceId, { at, seq: 0, info });
           }
         }
       }
@@ -503,7 +525,7 @@ export class ProviderRegistry {
   /** Join the running sweep of the current fleet, or start one. */
   private ensureSweep(): Promise<DescribedInstance[]> {
     const running = this.inFlight;
-    if (running && running.generation === this.generation) return running.promise;
+    if (running && running.generation === this.sweepKey()) return running.promise;
     return this.startSweep(0);
   }
 
@@ -512,7 +534,7 @@ export class ProviderRegistry {
     const running = this.inFlight;
     // Nothing running, or only a sweep of a fleet that has since been
     // reloaded: start now.
-    if (!running || running.generation !== this.generation) return this.startSweep(requestedAt);
+    if (!running || running.generation !== this.sweepKey()) return this.startSweep(requestedAt);
     if (running.startedAt >= requestedAt) return running.promise;
     if (!this.trailing) {
       const createdAt = Date.now();
@@ -523,7 +545,7 @@ export class ProviderRegistry {
           // Something else started a sweep after every caller sharing this
           // trailing one asked: that sweep already answers them.
           const now = this.inFlight;
-          if (now && now.startedAt >= createdAt && now.generation === this.generation) return now.promise;
+          if (now && now.startedAt >= createdAt && now.generation === this.sweepKey()) return now.promise;
           return this.startSweep(createdAt);
         });
       this.trailing = { createdAt, promise };
@@ -532,7 +554,7 @@ export class ProviderRegistry {
   }
 
   private startSweep(notBefore: number): Promise<DescribedInstance[]> {
-    const generation = this.generation;
+    const generation = this.sweepKey();
     const startedAt = Date.now();
     // notBefore 0: this caller accepts any answer still being produced, so a
     // slow engine's probe left running by an earlier sweep is joined rather
@@ -540,7 +562,7 @@ export class ProviderRegistry {
     const promise = this.describeFresh({ notBefore }).then((result) => {
       // A sweep that began before load()/removeInstance() describes a fleet
       // that no longer exists: its callers get it, the memo does not.
-      if (generation === this.generation) this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
+      if (generation === this.sweepKey()) this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
       return result;
     });
     const slot = { startedAt, generation, promise };
@@ -595,7 +617,7 @@ export class ProviderRegistry {
     const latest = this.latestSettled.get(info.instanceId);
     if (!latest || latest.gen !== this.genOf(info.instanceId)) return info;
     const meta = this.entryMeta.get(info);
-    if (!meta || meta.gen !== latest.gen || latest.at > meta.at) return latest.info;
+    if (!meta || meta.gen !== latest.gen || latest.seq >= meta.seq) return latest.info;
     return info;
   }
 
@@ -611,8 +633,9 @@ export class ProviderRegistry {
     const running = this.entryProbes.get(id);
     if (running && running.gen === gen && running.startedAt >= notBefore) return running.promise;
     const startedAt = Date.now();
-    const promise = this.describeEntry(entry, candidatesByName).then((raw) => this.settleEntry(raw, gen));
-    const slot = { startedAt, gen, promise };
+    const seq = ++this.probeSeq;
+    const promise = this.describeEntry(entry, candidatesByName).then((raw) => this.settleEntry(raw, gen, seq));
+    const slot = { startedAt, seq, gen, promise };
     this.entryProbes.set(id, slot);
     const clear = () => {
       if (this.entryProbes.get(id) === slot) this.entryProbes.delete(id);
@@ -666,7 +689,10 @@ export class ProviderRegistry {
     // No quota was computed for this engine this time: keep what the last
     // definitive answer knew rather than dropping a cap.
     const info = this.mergeWithDefinitive(shell, { keepPreviousQuota: true });
-    this.entryMeta.set(info, { at: Date.now(), gen: this.genOf(entry.instanceId) });
+    // Ordered just before the probe it fell back on, so that probe's real
+    // answer replaces this stand-in when it lands.
+    const seq = (this.entryProbes.get(entry.instanceId)?.seq ?? this.probeSeq) - 0.5;
+    this.entryMeta.set(info, { at: Date.now(), seq, gen: this.genOf(entry.instanceId) });
     return info;
   }
 
@@ -680,7 +706,7 @@ export class ProviderRegistry {
     const index = done.result.findIndex((item) => item.instanceId === info.instanceId);
     if (index < 0) return;
     const current = this.entryMeta.get(done.result[index]);
-    if (current && current.gen === meta.gen && current.at >= meta.at) return;
+    if (current && current.gen === meta.gen && current.seq >= meta.seq) return;
     const next = [...done.result];
     next[index] = info;
     this.commit(next, Date.now(), true);
@@ -688,18 +714,19 @@ export class ProviderRegistry {
 
   /** Record a probe's answer: merge it against the engine's last definitive
    * snapshot, and make it the new baseline when it is itself definitive. */
-  private settleEntry(raw: DescribedInstance, gen: string): DescribedInstance {
+  private settleEntry(raw: DescribedInstance, gen: string, seq: number): DescribedInstance {
     const current = gen === this.genOf(raw.instanceId);
     const info = current ? this.mergeWithDefinitive(raw) : raw;
     const at = Date.now();
-    this.entryMeta.set(info, { at, gen });
+    this.entryMeta.set(info, { at, seq, gen });
     if (!current) return info;
     if (!raw.snapshot.transient && !this.thrownSnapshots.has(raw.snapshot)) {
-      this.lastDefinitive.set(raw.instanceId, { at, info });
+      const baseline = this.lastDefinitive.get(raw.instanceId);
+      if (!baseline || baseline.seq <= seq) this.lastDefinitive.set(raw.instanceId, { at, seq, info });
     }
     const latest = this.latestSettled.get(raw.instanceId);
-    if (!latest || latest.gen !== gen || latest.at <= at) {
-      this.latestSettled.set(raw.instanceId, { at, gen, info });
+    if (!latest || latest.gen !== gen || latest.seq <= seq) {
+      this.latestSettled.set(raw.instanceId, { at, seq, gen, info });
     }
     return info;
   }
@@ -1068,7 +1095,7 @@ export class ProviderRegistry {
     // No completed describe to patch yet, but one is running: it will pick
     // this answer up (newestFor), so wait for it rather than starting a
     // second full sweep.
-    if (!this.lastDone && this.inFlight && this.inFlight.generation === this.generation) {
+    if (!this.lastDone && this.inFlight && this.inFlight.generation === this.sweepKey()) {
       await this.inFlight.promise.catch(() => undefined);
     }
     const done = this.lastDone;

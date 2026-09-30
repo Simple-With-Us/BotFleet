@@ -587,7 +587,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               resolve({ version: trimmed, error: null, elapsedMs });
             } else {
               logProbeFailure(input.instanceId, `${effective.cli} --version`, err, elapsedMs);
-              resolve({ version: lastKnownVersion, error: err, elapsedMs });
+              // The last good version stands in only for a probe that gave no
+              // answer.  A missing or crashing binary is a verdict and also
+              // retires the remembered version.
+              const failure = classifyVersionProbeFailure(
+                err,
+                effective.cli,
+                input.displayName || input.instanceId,
+                elapsedMs,
+                20000,
+              );
+              if (failure.kind !== "transient") lastKnownVersion = null;
+              resolve({ version: failure.kind === "transient" ? lastKnownVersion : null, error: err, elapsedMs });
             }
           });
         });
@@ -1629,24 +1640,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const probed = await probeCliVersion(config, env);
         let version = probed.version;
         if (!version) {
-          if (lastKnownVersion) {
-            version = lastKnownVersion;
-          } else {
-            // Only a binary that is missing or cannot run is "not found".  A
-            // probe that ran out of time on a busy Mac is transient: the
-            // registry answers from the last good snapshot and the UI says
-            // "Checking".
-            const failure = classifyVersionProbeFailure(
-              probed.error,
-              config.cli,
-              input.displayName || input.instanceId,
-              probed.elapsedMs,
-              20000,
-            );
-            return failure.kind === "transient"
-              ? { state: "unavailable", transient: true, reason: failure.reason }
-              : { state: "unavailable", reason: failure.reason };
-          }
+          // probeCliVersion already reused the last good version for a
+          // transient failure; what reaches here is classified, not reused.
+          // Only a binary that is missing or cannot run is "not found".  A
+          // probe that ran out of time on a busy Mac is transient: the
+          // registry answers from the last good snapshot and the UI says
+          // "Checking".
+          const failure = classifyVersionProbeFailure(
+            probed.error,
+            config.cli,
+            input.displayName || input.instanceId,
+            probed.elapsedMs,
+            20000,
+          );
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
         const incompatible = support.versionCompatibilityReason?.(version, config);
         if (incompatible) return { state: "unavailable", reason: incompatible, version };
