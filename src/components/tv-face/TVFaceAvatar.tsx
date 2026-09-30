@@ -1,12 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import { BotState, BotColor } from "@/lib/mascot";
 import {
-  RESTING,
   TVFACE_HAS_ENTER_RETURN,
   TVFACE_MANIFEST,
-  TVFACE_TRANSITION_MS,
   type TVFaceExpression,
 } from "./manifest";
+
+/** The expression an idle bot rests on. */
+const RESTING: TVFaceExpression = "resting";
+
+/**
+ * How long the enter and return animations are assumed to run.
+ *
+ * This is a contract with the asset pack, not a rendering detail: a correctly
+ * generated ~600ms enter freezes on its last frame for the remainder, because
+ * the player waits a fixed time before swapping to the hold. Whoever
+ * regenerates the pack must hold enter and return to this duration.
+ */
+export const TVFACE_TRANSITION_MS = 1000;
 
 export type TVFaceSkin = BotColor | "default";
 
