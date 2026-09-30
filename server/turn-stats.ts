@@ -44,8 +44,14 @@ interface LiveTurn {
  */
 export class TurnStatsTracker {
   private readonly live = new Map<string, LiveTurn>();
+  private readonly now: () => number;
 
-  constructor(private readonly now: () => number = () => Date.now()) {}
+  // Not a parameter property: the harness runs under Node's strip-only
+  // TypeScript mode, which rejects `constructor(private readonly x)` at load
+  // and takes the whole server down with it.
+  constructor(now: () => number = () => Date.now()) {
+    this.now = now;
+  }
 
   /** A turn was dispatched.  Replaces any leftover entry for the thread. */
   begin(threadId: string, at = this.now()): void {

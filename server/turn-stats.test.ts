@@ -2,9 +2,10 @@
 // pure in-memory class driven by explicit timestamps, so every case here is a
 // deterministic script of events.  Its wiring in server/index.ts (which cannot
 // be imported without booting the harness) is pinned by source at the bottom.
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { mergeTaskStats, TurnStatsTracker } from "./turn-stats.ts";
@@ -165,6 +166,26 @@ describe("mergeTaskStats", () => {
       { steps: 1, modelMs: 10, toolMs: 0 },
     );
     expect(next).toEqual({ turns: 1, steps: 1, modelMs: 10, toolMs: 5 });
+  });
+});
+
+describe("turn-stats.ts as the harness loads it", () => {
+  it("loads under Node's strip-only TypeScript mode, which rejects parameter properties and enums", () => {
+    // The harness runs `node --experimental-strip-types server/index.ts`;
+    // vitest transpiles fully, so only a real load catches syntax that strip
+    // mode cannot erase — and that failure takes the whole server down at boot.
+    const file = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "turn-stats.ts")).href;
+    const run = spawnSync(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "-e",
+        `const m = await import(${JSON.stringify(file)}); if (typeof m.TurnStatsTracker !== "function" || typeof m.mergeTaskStats !== "function") process.exit(2);`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect({ status: run.status, stderr: run.status === 0 ? "" : run.stderr }).toEqual({ status: 0, stderr: "" });
   });
 });
 
