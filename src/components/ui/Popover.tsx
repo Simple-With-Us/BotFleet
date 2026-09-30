@@ -84,6 +84,50 @@ const OPEN_DELAY_MS = 80;
 /** Bridges the gap between the trigger and its panel. */
 const CLOSE_DELAY_MS = 140;
 
+/**
+ * Whether a hover should be ignored.  Closing a panel on purpose (Escape, or
+ * a click that unpins) must not let the pointer still resting on the trigger
+ * reopen it, so the hover is suppressed — but only while a pointer really is
+ * over the trigger or panel.  Otherwise the flag would outlive a keyboard-only
+ * dismissal, with no pointer to ever leave and clear it, and swallow the next
+ * genuine hover.  Pure, so it is unit-tested.
+ */
+export class HoverGate {
+  private inside = false;
+  private suppressed = false;
+
+  /** A pointer entered the trigger or panel; true when it may open a hover. */
+  enter(touch: boolean): boolean {
+    this.inside = true;
+    // a touch "hover" is the emulated one that precedes a tap; the tap pins
+    return !touch && !this.suppressed;
+  }
+
+  /** The pointer left; the next visit is a fresh one. */
+  leave(): void {
+    this.inside = false;
+    this.suppressed = false;
+  }
+
+  /** The panel was closed on purpose.  A no-op with no pointer present. */
+  suppressWhilePointerInside(): void {
+    this.suppressed = this.inside;
+  }
+}
+
+/** What losing focus from the trigger means for a panel.  `next` is where
+ *  focus went (null when nowhere — a click on the panel's own text, a window
+ *  switch — which neither closes a pinned panel nor counts as leaving). */
+export function focusLeaving(
+  next: Node | null,
+  panel: { contains(node: Node | null): boolean } | null | undefined,
+): "stay" | "blur" | "dismiss" {
+  if (next && panel?.contains(next)) return "stay";
+  // tabbing on to another control dismisses a pinned dialog as well, or it
+  // would float over the composer with a sibling's panel beside it
+  return next ? "dismiss" : "blur";
+}
+
 export interface PopoverProps {
   /** The panel's heading, which is also the dialog's accessible name. */
   title: string;
@@ -91,6 +135,10 @@ export interface PopoverProps {
   titleAside?: ReactNode;
   /** What the trigger button shows. */
   trigger: ReactNode;
+  /** The trigger's accessible name, when its visible pieces do not read as
+   *  one phrase to a screen reader (adjacent spans run together).  Should
+   *  contain the visible text. */
+  triggerLabel?: string;
   /** The panel body. */
   children: ReactNode;
   /** Classes for the trigger button. */
@@ -107,6 +155,7 @@ export function Popover({
   title,
   titleAside,
   trigger,
+  triggerLabel,
   children,
   className,
   panelClassName,
@@ -124,9 +173,9 @@ export function Popover({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const timer = useRef<number | undefined>(undefined);
-  // set by Escape / an unpin click so the pointer that is still resting on
-  // the trigger does not immediately reopen it; cleared on pointer leave
-  const suppressHover = useRef(false);
+  // stops the pointer still resting on the trigger from reopening a panel the
+  // person just closed; see HoverGate
+  const [gate] = useState(() => new HoverGate());
   const open = pinned || hovered || focused;
 
   const clearTimer = useCallback(() => {
@@ -154,7 +203,7 @@ export function Popover({
       // a pinned panel is a dialog the person opened, so Escape belongs to
       // it; a hover peek is not, and leaves Escape to whatever else wants it
       if (pinned) event.stopPropagation();
-      if (hovered) suppressHover.current = true;
+      gate.suppressWhilePointerInside();
       closeAll();
     };
     const onPointerDown = (event: PointerEvent) => {
@@ -168,7 +217,7 @@ export function Popover({
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("pointerdown", onPointerDown, true);
     };
-  }, [open, pinned, hovered, closeAll]);
+  }, [open, pinned, gate, closeAll]);
 
   // placement: measured once the panel is in the DOM, before paint, then kept
   // current while the window or the panel's own size changes
@@ -204,13 +253,12 @@ export function Popover({
   }, [open, placement]);
 
   const enter = (event: ReactPointerEvent) => {
-    // a touch "hover" is the emulated one that precedes a tap; the tap pins
-    if (event.pointerType === "touch" || suppressHover.current) return;
+    if (!gate.enter(event.pointerType === "touch")) return;
     if (hovered) clearTimer();
     else hoverAfter(true, OPEN_DELAY_MS);
   };
   const leave = () => {
-    suppressHover.current = false;
+    gate.leave();
     if (hovered) hoverAfter(false, CLOSE_DELAY_MS);
     else clearTimer();
   };
@@ -226,14 +274,16 @@ export function Popover({
     if (visible) setFocused(true);
   };
   const onBlur = (event: FocusEvent<HTMLButtonElement>) => {
-    if (panelRef.current?.contains(event.relatedTarget as Node | null)) return;
+    const next = focusLeaving(event.relatedTarget as Node | null, panelRef.current);
+    if (next === "stay") return;
     setFocused(false);
+    if (next === "dismiss") setPinned(false);
   };
   const onClick = () => {
     clearTimer();
     if (pinned) {
       // unpin means close now, even with the pointer or focus still here
-      suppressHover.current = true;
+      gate.suppressWhilePointerInside();
       closeAll();
     } else {
       setPinned(true);
@@ -275,6 +325,7 @@ export function Popover({
         type="button"
         className={className}
         aria-haspopup="dialog"
+        aria-label={triggerLabel}
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         onPointerEnter={enter}

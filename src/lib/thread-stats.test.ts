@@ -52,6 +52,16 @@ describe("formatRate", () => {
     expect(formatRate(3)).toBe("3 tok/s");
   });
 
+  it("never prints a positive rate as a fake 0", () => {
+    // 10 tokens over 5 minutes of model time is 0.033 tok/s: toFixed(1) would say "0.0"
+    expect(formatRate(0.033)).toBeUndefined();
+    expect(formatRate(0.0999)).toBeUndefined();
+    expect(formatRate(0.1)).toBe("0.1 tok/s");
+    const view = deriveSessionStats(stats({ turns: 1, tpsTokens: 10, tpsMs: 300_000 }), usage({ turns: 1 }));
+    expect(view?.rate).toBeUndefined();
+    expect(view?.rows.map((r) => r.label)).not.toContain("Tokens per second");
+  });
+
   it("has no answer for a missing or non-positive rate", () => {
     for (const bad of [undefined, 0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(formatRate(bad as number | undefined)).toBeUndefined();

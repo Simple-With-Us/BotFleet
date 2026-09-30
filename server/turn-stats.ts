@@ -18,19 +18,31 @@ export interface TurnStatsSample {
 type Bucket = "model" | "tool" | "wait";
 
 interface LiveTurn {
-  /** Where the turn began — TTFT is measured from here. */
-  startedAt: number;
   /** The clock's cursor: time up to here is already apportioned. */
   at: number;
   /** Set once any delta or tool has been seen, so a late `turn.started`
    *  cannot move the start past real activity. */
   touched: boolean;
+  /** Set once the turn provably reached a model: the provider said it began,
+   *  or something streamed, or a tool ran.  A turn that settles without this
+   *  (a rejected preflight, a spawn error) only ever spent setup time, and
+   *  must not bank that as model time. */
+  reachedModel: boolean;
   bucket: Bucket;
   ms: Record<Bucket, number>;
   steps: number;
-  activeTools: number;
+  /** Tool items in flight, by item id.  A set, so a repeated start cannot
+   *  double count and a completion for an item never started cannot end
+   *  another tool's interval. */
+  activeTools: Set<string>;
   openRequests: number;
-  firstTokenMs?: number;
+  /** Model time at the model's first output of any kind — a token or a tool
+   *  call.  A turn that opens with tool calls did not make the person wait
+   *  for the whole run of model rounds before the model first spoke. */
+  firstOutputMs?: number;
+  /** Whether a text or reasoning token ever streamed.  Time to first token is
+   *  only banked then: an engine that streams nothing has no such figure. */
+  streamed: boolean;
 }
 
 /**
@@ -56,14 +68,15 @@ export class TurnStatsTracker {
   /** A turn was dispatched.  Replaces any leftover entry for the thread. */
   begin(threadId: string, at = this.now()): void {
     this.live.set(threadId, {
-      startedAt: at,
       at,
       touched: false,
+      reachedModel: false,
       bucket: "model",
       ms: { model: 0, tool: 0, wait: 0 },
       steps: 0,
-      activeTools: 0,
+      activeTools: new Set(),
       openRequests: 0,
+      streamed: false,
     });
   }
 
@@ -71,36 +84,47 @@ export class TurnStatsTracker {
    *  not the model's time, so the clock restarts — but only before activity. */
   started(threadId: string, at = this.now()): void {
     const turn = this.live.get(threadId);
-    if (turn && !turn.touched) turn.startedAt = turn.at = at;
+    if (!turn) return;
+    turn.reachedModel = true;
+    if (!turn.touched) turn.at = at;
   }
 
-  /** A token streamed (assistant text or reasoning).  The first one fixes the
-   *  turn's time to first token: the model's own time up to here, so a tool run
-   *  or an approval the turn waited on before speaking is not counted as the
-   *  model being slow. */
+  /** A token streamed (assistant text or reasoning).  Time to first token is
+   *  the model's own time up to its first output, so a tool run or an approval
+   *  the turn waited on before speaking is not counted as the model being
+   *  slow. */
   firstToken(threadId: string, at = this.now()): void {
     const turn = this.live.get(threadId);
     if (!turn) return;
     this.advance(turn, at);
     turn.touched = true;
-    turn.firstTokenMs ??= turn.ms.model;
+    turn.reachedModel = true;
+    turn.streamed = true;
+    turn.firstOutputMs ??= turn.ms.model;
   }
 
-  toolStarted(threadId: string, at = this.now()): void {
+  /** A tool item began.  A tool call is model output, so it also fixes the
+   *  first-output mark; the time it then runs is tool time, not model time.
+   *  Blocking calls (a peer bot's reply, a long command) belong here too — the
+   *  caller must pass an item id for every tool it sees, whether or not the
+   *  transcript shows a row for it. */
+  toolStarted(threadId: string, itemId: string, at = this.now()): void {
     const turn = this.live.get(threadId);
-    if (!turn) return;
+    if (!turn || turn.activeTools.has(itemId)) return;
     this.advance(turn, at);
     turn.touched = true;
+    turn.reachedModel = true;
+    turn.firstOutputMs ??= turn.ms.model;
     turn.steps += 1;
-    turn.activeTools += 1;
+    turn.activeTools.add(itemId);
     this.reclassify(turn);
   }
 
-  toolEnded(threadId: string, at = this.now()): void {
+  toolEnded(threadId: string, itemId: string, at = this.now()): void {
     const turn = this.live.get(threadId);
-    if (!turn || turn.activeTools === 0) return;
+    if (!turn || !turn.activeTools.has(itemId)) return;
     this.advance(turn, at);
-    turn.activeTools -= 1;
+    turn.activeTools.delete(itemId);
     this.reclassify(turn);
   }
 
@@ -120,20 +144,24 @@ export class TurnStatsTracker {
     this.reclassify(turn);
   }
 
-  /** The turn ended: close its clock, drop the entry, return what it spent. */
+  /** The turn ended: close its clock, drop the entry, return what it spent.
+   *  Undefined when there is nothing to bank — no live entry, or a turn that
+   *  never reached a model (its time was setup, which is nobody's model time
+   *  and no reason to count a turn). */
   settle(threadId: string, outputTokens?: number, at = this.now()): TurnStatsSample | undefined {
     const turn = this.live.get(threadId);
     if (!turn) return undefined;
     this.live.delete(threadId);
+    const reportedOutput = typeof outputTokens === "number" && Number.isFinite(outputTokens) && outputTokens > 0;
+    // a provider that reports output tokens ran a model, whatever else it said
+    if (!turn.reachedModel && !reportedOutput) return undefined;
     this.advance(turn, at);
     return {
       steps: turn.steps,
       modelMs: Math.round(turn.ms.model),
       toolMs: Math.round(turn.ms.tool),
-      ...(turn.firstTokenMs === undefined ? {} : { ttftMs: Math.round(turn.firstTokenMs) }),
-      ...(typeof outputTokens === "number" && Number.isFinite(outputTokens) && outputTokens > 0
-        ? { outputTokens: Math.trunc(outputTokens) }
-        : {}),
+      ...(turn.streamed && turn.firstOutputMs !== undefined ? { ttftMs: Math.round(turn.firstOutputMs) } : {}),
+      ...(reportedOutput ? { outputTokens: Math.trunc(outputTokens) } : {}),
     };
   }
 
@@ -155,7 +183,7 @@ export class TurnStatsTracker {
   }
 
   private reclassify(turn: LiveTurn): void {
-    turn.bucket = turn.openRequests > 0 ? "wait" : turn.activeTools > 0 ? "tool" : "model";
+    turn.bucket = turn.openRequests > 0 ? "wait" : turn.activeTools.size > 0 ? "tool" : "model";
   }
 }
 

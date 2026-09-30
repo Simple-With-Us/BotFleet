@@ -9,13 +9,13 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { Popover, placePopover, POPOVER_ANCHOR_GAP, POPOVER_VIEWPORT_MARGIN } from "./Popover.tsx";
+import { focusLeaving, HoverGate, Popover, placePopover, POPOVER_ANCHOR_GAP, POPOVER_VIEWPORT_MARGIN } from "./Popover.tsx";
 
 const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "Popover.tsx"), "utf8");
 const M = POPOVER_VIEWPORT_MARGIN;
 const G = POPOVER_ANCHOR_GAP;
 
-const render = (props: { defaultOpen?: boolean; titleAside?: string } = {}) =>
+const render = (props: { defaultOpen?: boolean; titleAside?: string; triggerLabel?: string } = {}) =>
   renderToStaticMarkup(
     createElement(Popover, {
       title: "Session Statistics",
@@ -58,6 +58,13 @@ describe("Popover markup", () => {
     expect(html).not.toContain("aria-modal");
   });
 
+  it("puts an explicit accessible name on the trigger only when asked to", () => {
+    expect(render()).not.toContain("aria-label");
+    expect(render({ triggerLabel: "Session Statistics: 2 turns, 27 steps" })).toContain(
+      'aria-label="Session Statistics: 2 turns, 27 steps"',
+    );
+  });
+
   it("starts hidden until it has been measured, so it never flashes at 0,0", () => {
     expect(render({ defaultOpen: true })).toContain("visibility:hidden");
   });
@@ -78,8 +85,13 @@ describe("Popover behavior (pinned by source)", () => {
     expect(SRC).toContain("setPinned(true)");
   });
 
+  it("routes blur through focusLeaving so tabbing away dismisses a pinned panel", () => {
+    expect(SRC).toContain("focusLeaving(event.relatedTarget as Node | null, panelRef.current)");
+    expect(SRC).toContain('if (next === "dismiss") setPinned(false)');
+  });
+
   it("ignores the emulated touch hover, so a tap pins instead of flashing", () => {
-    expect(SRC).toContain('event.pointerType === "touch"');
+    expect(SRC).toContain('gate.enter(event.pointerType === "touch")');
   });
 
   it("closes on Escape and on a press outside the trigger and panel", () => {
@@ -94,6 +106,59 @@ describe("Popover behavior (pinned by source)", () => {
     expect(SRC).toContain('addEventListener("resize", place)');
     expect(SRC).toContain('addEventListener("scroll", place, true)');
     expect(SRC).toContain("new ResizeObserver(place)");
+  });
+});
+
+describe("HoverGate", () => {
+  it("suppresses the hover after a mouse-driven close, until the pointer leaves", () => {
+    const gate = new HoverGate();
+    expect(gate.enter(false)).toBe(true);
+    gate.suppressWhilePointerInside(); // Escape or an unpin click with the mouse on the chip
+    expect(gate.enter(false)).toBe(false); // the pointer jitters on the chip: no reopen
+    gate.leave();
+    expect(gate.enter(false)).toBe(true); // a fresh visit opens again
+  });
+
+  it("does not let a keyboard-only unpin swallow the next genuine hover", () => {
+    // pin with Enter, unpin with Enter, pointer nowhere near the chip
+    const gate = new HoverGate();
+    gate.suppressWhilePointerInside();
+    expect(gate.enter(false)).toBe(true);
+  });
+
+  it("clears the suppression when the pointer had already left before Escape", () => {
+    const gate = new HoverGate();
+    gate.enter(false);
+    gate.leave();
+    gate.suppressWhilePointerInside(); // Escape inside the close-delay window
+    expect(gate.enter(false)).toBe(true);
+  });
+
+  it("never opens on the emulated touch hover, but still knows the pointer is there", () => {
+    const gate = new HoverGate();
+    expect(gate.enter(true)).toBe(false);
+    gate.suppressWhilePointerInside(); // the tap that unpins
+    gate.leave(); // touch pointerleave follows the tap
+    expect(gate.enter(false)).toBe(true);
+  });
+});
+
+describe("focusLeaving", () => {
+  const node = (name: string) => ({ name }) as unknown as Node;
+  const panel = { contains: (n: Node | null) => (n as unknown as { name: string } | null)?.name === "inside-panel" };
+
+  it("keeps the panel when focus moves into it", () => {
+    expect(focusLeaving(node("inside-panel"), panel)).toBe("stay");
+  });
+
+  it("dismisses even a pinned panel when focus tabs on to another control", () => {
+    expect(focusLeaving(node("another-chip"), panel)).toBe("dismiss");
+    expect(focusLeaving(node("composer"), null)).toBe("dismiss");
+  });
+
+  it("only blurs, leaving a pinned panel alone, when focus went nowhere", () => {
+    // a click on the panel's own text, or a switch to another window
+    expect(focusLeaving(null, panel)).toBe("blur");
   });
 });
 

@@ -3,6 +3,10 @@
 //
 //   2 turns · 27 steps · 92 tok/s      645k tok · Cache hit 91%
 //
+// The trigger's visible pieces are adjacent spans, which a screen reader would
+// fuse ("2 turns27 steps"), so each carries a full aria-label of its figures —
+// including the ones the container query hides.
+//
 // Both are derived from what the task already banked (`stats` and `usage`),
 // so nothing here measures anything.  A figure the engine never reported is
 // left out rather than shown as 0, and a chip with nothing to say is not
@@ -46,6 +50,7 @@ export function ThreadStatsBar({ stats, usage }: { stats?: TaskStats; usage?: Ta
         {session ? (
           <Popover
             title="Session Statistics"
+            triggerLabel={`Session Statistics: ${[session.turns, session.steps, session.rate].filter(Boolean).join(", ")}`}
             className={CHIP}
             trigger={
               <>
@@ -75,6 +80,7 @@ export function ThreadStatsBar({ stats, usage }: { stats?: TaskStats; usage?: Ta
           <Popover
             title="Token Usage"
             titleAside={tokens.headline}
+            triggerLabel={`Token Usage: ${[tokens.total, tokens.cacheHit ? `cache hit ${tokens.cacheHit}` : undefined].filter(Boolean).join(", ")}`}
             className={CHIP}
             trigger={
               <>

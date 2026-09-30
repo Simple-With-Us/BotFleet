@@ -29,9 +29,12 @@ export function formatDuration(ms: number | undefined): string | undefined {
   return h > 0 ? `${h}h${pad(m)}m` : `${m}m${pad(s)}s`;
 }
 
-/** "92 tok/s"; one decimal below 10 so a slow engine isn't rounded to "0". */
+/** "92 tok/s"; one decimal below 10 so a slow engine isn't rounded to "0".
+ *  Below a tenth of a token a second there is no honest figure to print — it
+ *  would round to "0" — and no engine streams that slowly, so it is a rate
+ *  polluted by time that was not generation (a wait), and is left out. */
 export function formatRate(tokPerSec: number | undefined): string | undefined {
-  if (!positive(tokPerSec)) return undefined;
+  if (!positive(tokPerSec) || tokPerSec < 0.1) return undefined;
   return tokPerSec < 10 ? `${tokPerSec.toFixed(1).replace(/\.0$/, "")} tok/s` : `${Math.round(tokPerSec)} tok/s`;
 }
 

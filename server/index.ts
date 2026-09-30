@@ -2674,8 +2674,11 @@ bus.subscribe((event: RuntimeEvent) => {
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
-          if (bot) turnStats.toolEnded(event.threadId);
         }
+        // Outside the message check: a tool with no transcript row (ask_bot,
+        // whose own chip is appended by the internal endpoint) still held the
+        // turn for as long as it ran, and must stop the tool clock when it ends.
+        if (bot) turnStats.toolEnded(event.threadId, event.itemId);
         // the bot just acted ON ITS SCREEN — refresh the preview now. Only
         // computer tools can change the screen, and each capture competes
         // with the agent for the box's command endpoint, so a bot grinding
@@ -2687,6 +2690,10 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.started":
       if (event.itemType === "tool") {
+        // Timed before the ask_bot early exit below: that call blocks until
+        // the other bot replies (minutes, or a person's approval), and left
+        // unclocked it would all be billed to the model.
+        if (bot && event.itemId) turnStats.toolStarted(event.threadId, event.itemId);
         // ask_bot's raw tool chip is redundant — the internal endpoint
         // appends a richer "Messaged @X" chip linking to the channel
         if (event.title?.endsWith("__ask_bot")) break;
@@ -2708,7 +2715,6 @@ bus.subscribe((event: RuntimeEvent) => {
           const key = `${event.threadId}:${event.itemId}`;
           toolMessageByItem.set(key, message.id);
           toolStartedAt.set(key, Date.now());
-          if (bot) turnStats.toolStarted(event.threadId);
         }
       }
       break;

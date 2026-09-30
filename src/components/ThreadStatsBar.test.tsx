@@ -33,6 +33,23 @@ describe("ThreadStatsBar", () => {
     expect(html.match(/aria-haspopup="dialog"/g)).toHaveLength(2);
   });
 
+  it("names each chip with every figure, spaced, so a screen reader does not fuse them", () => {
+    // the visible spans sit side by side with no text between them
+    // ("2 turns27 steps"), and the narrow-width ones are display:none, so the
+    // accessible name has to be an explicit, complete label
+    const html = render({ stats: stats(), usage: usage() });
+    expect(html).toContain('aria-label="Session Statistics: 2 turns, 27 steps, 92 tok/s"');
+    expect(html).toContain('aria-label="Token Usage: 645k tok, cache hit 91%"');
+    // each label contains the chip's visible text, so voice control can say it
+    for (const visible of ["2 turns", "27 steps", "92 tok/s", "645k tok", "91%"]) expect(html).toContain(visible);
+  });
+
+  it("leaves unknown figures out of the accessible name too", () => {
+    const html = render({ stats: stats({ steps: 0, tpsTokens: undefined, tpsMs: undefined }), usage: usage({ cachedInput: undefined }) });
+    expect(html).toContain('aria-label="Session Statistics: 2 turns"');
+    expect(html).toContain('aria-label="Token Usage: 645k tok"');
+  });
+
   it("renders nothing when there is neither timing nor spend", () => {
     expect(render({})).toBe("");
     expect(render({ usage: usage({ input: 0, output: 0, cachedInput: undefined, turns: 1 }) })).toBe("");
@@ -61,7 +78,8 @@ describe("ThreadStatsBar", () => {
     const html = render({ stats: stats(), usage: usage() });
     // the container-query threshold on the span that holds each piece
     const threshold = (needle: string) => {
-      const at = html.indexOf(needle);
+      // ">" so this finds the visible text, not the same words in an aria-label
+      const at = html.indexOf(`>${needle}`);
       const before = html.slice(Math.max(0, at - 260), at);
       const found = [...before.matchAll(/@min-\[(\d+)rem\]\/statsbar:inline/g)].at(-1);
       return found ? Number(found[1]) : undefined;
