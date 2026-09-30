@@ -208,7 +208,7 @@ export function LocalModelsPanel({
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
         {shown.map((group) => (
           <div key={group.instance.instanceId} role="group" aria-label={`Runs on ${group.instance.displayName}`}>
-            <EngineGroupLabel className="px-2 pb-1 pt-2">Runs on {group.instance.displayName}</EngineGroupLabel>
+            <EngineGroupLabel className="px-2 pb-1 pt-2">Runs On {group.instance.displayName}</EngineGroupLabel>
             {group.options.map((option) => (
               <ModelRow
                 key={option.id}
@@ -268,7 +268,11 @@ export function ModelPicker({
   // Every configured local model.  Empty means the rail shows no Local Models
   // entry — there is no setup row standing in for it.
   const localGroups = collectLocalModels(state.instances, selection);
-  const localView = railId === LOCAL_MODELS_RAIL_ID && localGroups.length > 0;
+  // With no rail entry chosen yet, a bot already on a local model opens on the
+  // Local Models entry — an engine's own list does not show that model.
+  const localView =
+    localGroups.length > 0 &&
+    (railId === LOCAL_MODELS_RAIL_ID || (railId === null && opensOnLocalModels(localGroups, active, selection)));
   const railInstance = localView
     ? undefined
     : state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
@@ -302,13 +306,6 @@ export function ModelPicker({
   };
 
   const openFor = (instance: InstanceInfo | undefined) => {
-    // A bot already on a local model opens where that model is listed.
-    if (opensOnLocalModels(localGroups, instance, selection)) {
-      setRailId(LOCAL_MODELS_RAIL_ID);
-      setPane("main");
-      resetList();
-      return;
-    }
     const official = instance?.models.options.filter((option) => !option.custom) ?? [];
     setPane(isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
     resetList();
@@ -391,7 +388,7 @@ export function ModelPicker({
     <button
       type="button"
       onClick={() => {
-        setRailId(selection.instanceId);
+        setRailId(null);
         setOpen((wasOpen) => {
           const next = !wasOpen;
           if (next) openFor(state.instances.find((instance) => instance.instanceId === selection.instanceId));
