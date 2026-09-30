@@ -21,6 +21,7 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import { publishRuntimeEvent } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -2875,6 +2876,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "runtime": {
           const event = frame.event;
+          // the Trajectory tab's door: free unless that thread's tab is open
+          publishRuntimeEvent(event);
           if (event.type === "content.delta") {
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so

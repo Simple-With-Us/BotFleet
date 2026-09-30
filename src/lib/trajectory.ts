@@ -1011,7 +1011,6 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
       .filter((part): part is string => typeof part === "string" && part.length > 0)
       .join("\n")
       .toLowerCase();
-    if (row.kind === "tool" && row.durationMs !== undefined) row.detail.meta = [["Duration", formatSpan(row.durationMs)], ...row.detail.meta];
   }
 
   // ── tools lane: overlapping calls stack ───────────────────────────
@@ -1077,6 +1076,47 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
     trimmed,
     eventCount: stamped.length,
   };
+}
+
+// ── the thread's own messages ─────────────────────────────────────────
+
+/** The part of a chat message this needs; structural, so the chat store's
+ *  `Message` satisfies it without this module importing the store. */
+export interface MessageLike {
+  id: string;
+  at: number;
+  role: "bot" | "user" | "system";
+  kind: string;
+  text?: string;
+  queued?: boolean;
+  automationSource?: string;
+}
+
+const AUTOMATION_LABEL: Record<string, string> = {
+  schedule: "Routine",
+  manual: "Manual run",
+  webhook: "Webhook",
+  resource: "Resource trigger",
+  delegation: "Delegation",
+  imessage: "iMessage",
+};
+
+/** What the person (or an automation) said, from the thread's messages.  A
+ *  message still queued has not reached the bot, so it is not an input yet. */
+export function inputsFromMessages(messages: readonly MessageLike[]): TrajectoryInput[] {
+  const out: TrajectoryInput[] = [];
+  for (const message of messages) {
+    if (message.role === "bot" || message.kind !== "text" || message.queued) continue;
+    if (!message.text?.trim() || !Number.isFinite(message.at)) continue;
+    out.push({
+      id: message.id,
+      at: message.at,
+      role: message.role,
+      text: message.text,
+      label: message.role === "system" ? (AUTOMATION_LABEL[message.automationSource ?? ""] ?? undefined) : undefined,
+    });
+  }
+  return out;
 }
 
 // ── searching and grouping ────────────────────────────────────────────

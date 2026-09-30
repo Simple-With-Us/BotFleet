@@ -12,6 +12,7 @@ import {
   formatClock,
   formatGap,
   groupByTurn,
+  inputsFromMessages,
   MAX_TOOL_ROWS,
   sortCalls,
   toolCalls,
@@ -741,5 +742,43 @@ describe("formatClock / formatGap", () => {
     expect(formatGap(12 * 60_000)).toBe("12m later");
     expect(formatGap(2 * 3600_000 + 10 * 60_000)).toBe("2h 10m later");
     expect(formatGap(3 * 3600_000)).toBe("3h later");
+  });
+});
+
+describe("inputsFromMessages", () => {
+  const msg = (over: Record<string, unknown>) => ({ id: "m", at: 1000, role: "user" as const, kind: "text", text: "hello", ...over });
+
+  it("keeps what people and automations said, and leaves the bot's own replies out", () => {
+    const inputs = inputsFromMessages([
+      msg({ id: "u", role: "user" }),
+      msg({ id: "b", role: "bot", text: "reply" }),
+      msg({ id: "s", role: "system", text: "nightly", automationSource: "schedule" }),
+    ]);
+    expect(inputs.map((i) => [i.id, i.role, i.label])).toEqual([
+      ["u", "user", undefined],
+      ["s", "system", "Routine"],
+    ]);
+  });
+
+  it("leaves out cards, activity chips, empty text, queued messages and bad times", () => {
+    expect(
+      inputsFromMessages([
+        msg({ id: "a", kind: "activity" }),
+        msg({ id: "e", text: "   " }),
+        msg({ id: "n", text: undefined }),
+        msg({ id: "q", queued: true }),
+        msg({ id: "t", at: Number.NaN }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("labels each way an automation can fire, and falls back for an unknown one", () => {
+    const labels = ["schedule", "manual", "webhook", "resource", "delegation", "imessage", "mystery"].map(
+      (automationSource) => inputsFromMessages([msg({ role: "system", automationSource })])[0]!.label,
+    );
+    expect(labels).toEqual(["Routine", "Manual run", "Webhook", "Resource trigger", "Delegation", "iMessage", undefined]);
+    // the trajectory then calls an unlabelled one a system message
+    const t = buildTrajectory([turnStarted(1), turnDone(2)], { inputs: [{ id: "x", at: ms(0.5), role: "system", text: "go" }] });
+    expect(t.rows[0]!.title).toBe("System message");
   });
 });
