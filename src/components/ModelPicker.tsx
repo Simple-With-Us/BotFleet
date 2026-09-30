@@ -1,11 +1,26 @@
 // Compact model picker: providers live on a Cloud/Local rail. Ready engines
 // show a short suggested list with search and an explicit all-models view;
 // engines that need setup show one focused action instead of a disabled wall.
+// Local models are not a row under each engine: when any are configured the
+// rail grows one "Local Models" entry that lists them all, and when none are
+// there is nothing to show.
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "lucide-react";
+import { Check, ChevronDown, Search } from "lucide-react";
 import { useStore, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
+import {
+  LOCAL_MODELS_DRIVER_KIND,
+  LOCAL_MODELS_RAIL_ID,
+  LOCAL_MODELS_TITLE,
+  collectLocalModels,
+  filterLocalModelGroups,
+  isInjectedLocalModel,
+  localModelCount,
+  opensOnLocalModels,
+  type LocalModelGroup,
+} from "@/lib/local-models";
+import { selectionForPick } from "@/lib/model-pick";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { EngineGroupLabel } from "./EngineGroupLabel";
@@ -13,7 +28,6 @@ import { EngineCallout } from "./EngineCallout";
 import { formatDualQuotaBadge } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
-import { modelEffortLevels } from "@/lib/model-effort";
 import { readableModelLabel } from "@/lib/model-label";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
@@ -157,6 +171,67 @@ function ModelSearch({
   );
 }
 
+/** The Local Models entry's panel: every configured local model in one list,
+ * grouped under the engine that runs it.  Picking a row goes through the same
+ * `onPick` as any engine's own list. */
+export function LocalModelsPanel({
+  groups,
+  selection,
+  query,
+  onQueryChange,
+  onPick,
+}: {
+  groups: readonly LocalModelGroup[];
+  selection: Pick<ModelSelection, "instanceId" | "model">;
+  query: string;
+  onQueryChange: (value: string) => void;
+  onPick: (instance: InstanceInfo, modelId: string) => void;
+}) {
+  const total = localModelCount(groups);
+  const shown = filterLocalModelGroups(groups, query);
+  return (
+    <>
+      <div className="shrink-0 px-4 pb-2 pt-3.5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="truncate text-[14px] font-semibold text-ink">{LOCAL_MODELS_TITLE}</div>
+          <span className="shrink-0 rounded-full bg-success/10 px-2 py-0.5 text-[10.5px] font-medium text-success">
+            {total} {total === 1 ? "model" : "models"}
+          </span>
+        </div>
+        <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+          Run this bot with a model on this computer or at an endpoint you added.
+        </div>
+      </div>
+      {total > COMPACT_MODEL_COUNT && (
+        <ModelSearch value={query} local onChange={onQueryChange} onEscape={() => onQueryChange("")} />
+      )}
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+        {shown.map((group) => (
+          <div key={group.instance.instanceId} role="group" aria-label={`Runs on ${group.instance.displayName}`}>
+            <EngineGroupLabel className="px-2 pb-1 pt-2">Runs on {group.instance.displayName}</EngineGroupLabel>
+            {group.options.map((option) => (
+              <ModelRow
+                key={option.id}
+                option={option}
+                current={selection.instanceId === group.instance.instanceId && selection.model === option.id}
+                defaultId=""
+                onPick={() => onPick(group.instance, option.id)}
+                quota={group.instance.snapshot.quota?.models?.[option.id]}
+                windowsLabel={group.instance.snapshot.quota?.windowsLabel}
+              />
+            ))}
+          </div>
+        ))}
+        {shown.length === 0 && (
+          <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
+            Nothing matches “{query.trim()}”
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function ModelPicker({
   bot,
   className,
@@ -164,6 +239,8 @@ export function ModelPicker({
   label,
   selection: propSelection,
   onChange,
+  initialOpen = false,
+  initialRailId = null,
 }: {
   bot: Bot;
   className?: string;
@@ -173,10 +250,14 @@ export function ModelPicker({
   label?: ReactNode;
   selection?: ModelSelection;
   onChange?: (selection: ModelSelection) => void;
+  /** Start with the menu open on this rail entry.  The picker opens from a
+   * click in the app; tests have no click, so they start it open. */
+  initialOpen?: boolean;
+  initialRailId?: string | null;
 }) {
   const { state, dispatch, refreshInstances } = useStore();
-  const [open, setOpen] = useState(false);
-  const [railId, setRailId] = useState<string | null>(null);
+  const [open, setOpen] = useState(initialOpen);
+  const [railId, setRailId] = useState<string | null>(initialRailId);
   const [pane, setPane] = useState<"main" | "custom">("main");
   const [query, setQuery] = useState("");
   const [showAll, setShowAll] = useState(false);
@@ -184,8 +265,13 @@ export function ModelPicker({
 
   const selection = propSelection || bot.modelSelection;
   const active = state.instances.find((instance) => instance.instanceId === selection.instanceId);
-  const railInstance =
-    state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
+  // Every configured local model.  Empty means the rail shows no Local Models
+  // entry — there is no setup row standing in for it.
+  const localGroups = collectLocalModels(state.instances, selection);
+  const localView = railId === LOCAL_MODELS_RAIL_ID && localGroups.length > 0;
+  const railInstance = localView
+    ? undefined
+    : state.instances.find((instance) => instance.instanceId === (railId ?? selection.instanceId)) ?? state.instances[0];
 
   useEffect(() => {
     if (open) void refreshInstances();
@@ -200,7 +286,6 @@ export function ModelPicker({
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       if (query) setQuery("");
-      else if (pane === "custom" && railInstance?.models.options.some((option) => !option.custom)) setPane("main");
       else setOpen(false);
     };
     window.addEventListener("mousedown", closeOnOutsideClick);
@@ -209,7 +294,7 @@ export function ModelPicker({
       window.removeEventListener("mousedown", closeOnOutsideClick);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [open, pane, query, railInstance]);
+  }, [open, query]);
 
   const resetList = () => {
     setQuery("");
@@ -217,11 +302,21 @@ export function ModelPicker({
   };
 
   const openFor = (instance: InstanceInfo | undefined) => {
+    // A bot already on a local model opens where that model is listed.
+    if (opensOnLocalModels(localGroups, instance, selection)) {
+      setRailId(LOCAL_MODELS_RAIL_ID);
+      setPane("main");
+      resetList();
+      return;
+    }
     const official = instance?.models.options.filter((option) => !option.custom) ?? [];
-    const selectedIsCustom = instance?.models.options.some(
-      (option) => option.id === selection.model && option.custom,
-    );
-    setPane(selectedIsCustom || isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
+    setPane(isCustomOnly(instance) || official.length === 0 ? "custom" : "main");
+    resetList();
+  };
+
+  const selectLocalModels = () => {
+    setRailId(LOCAL_MODELS_RAIL_ID);
+    setPane("main");
     resetList();
   };
 
@@ -233,20 +328,7 @@ export function ModelPicker({
   };
 
   const pick = (instance: InstanceInfo, model: string) => {
-    const nextSelection: ModelSelection = {
-      instanceId: instance.instanceId,
-      model,
-    };
-    if (selection.effort) {
-      const targetOption = instance.models.options.find((o) => o.id === model);
-      const allowed = modelEffortLevels(instance, targetOption, model);
-      if (allowed.includes(selection.effort)) {
-        nextSelection.effort = selection.effort;
-      }
-    }
-    // Fleet Models passes onChange for the primary pill.  Keep that bot's
-    // fallbacks so picking a new primary does not wipe the chain.
-    if (selection.fallbacks?.length) nextSelection.fallbacks = selection.fallbacks;
+    const nextSelection = selectionForPick(selection, instance, model);
 
     if (onChange) {
        onChange(nextSelection);
@@ -271,13 +353,15 @@ export function ModelPicker({
   const shownOfficial = query ? filteredOfficial : showAll ? official : compactOfficial;
   const filteredCustom = filterCustomModels(custom, query);
   const { pinned, rest } = partitionCustomModels(filteredCustom);
+  // Custom rows that are not a local host's model (a cloud provider configured
+  // in Codex, an extra from Claude's settings) stay in their own engine's list.
+  // The local ones are on the Local Models entry.
+  const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
   const blocked = railInstance
     ? pane === "custom"
       ? needsCli(railInstance)
       : needsCli(railInstance) || needsSignIn(railInstance)
     : false;
-  const canOpenCustom = Boolean(railInstance && !needsCli(railInstance));
-  const canReturnToOfficial = official.length > 0 && !isCustomOnly(railInstance);
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -413,8 +497,23 @@ export function ModelPicker({
                     <EngineGroupLabel className="px-0 pb-0.5 pt-0.5 text-center text-[9px]">Cloud</EngineGroupLabel>
                   )}
                   {subscription.map(railButton)}
-                  {local.length > 0 && (
+                  {(local.length > 0 || localGroups.length > 0) && (
                     <EngineGroupLabel className="px-0 pb-0.5 pt-2 text-center text-[9px]">Local</EngineGroupLabel>
+                  )}
+                  {localGroups.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={selectLocalModels}
+                      aria-label={LOCAL_MODELS_TITLE}
+                      aria-pressed={localView}
+                      title={`${LOCAL_MODELS_TITLE} · ${localModelCount(localGroups)} ${localModelCount(localGroups) === 1 ? "model" : "models"}`}
+                      className={cn(
+                        "relative flex size-9 items-center justify-center rounded-lg",
+                        localView ? "bg-control ring-1 ring-hairline/50" : "hover:bg-control/60",
+                      )}
+                    >
+                      <ProviderMark driverKind={LOCAL_MODELS_DRIVER_KIND} size={18} />
+                    </button>
                   )}
                   {local.map(railButton)}
                 </>
@@ -423,7 +522,15 @@ export function ModelPicker({
           </div>
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-            {railInstance ? (
+            {localView ? (
+              <LocalModelsPanel
+                groups={localGroups}
+                selection={selection}
+                query={query}
+                onQueryChange={setQuery}
+                onPick={pick}
+              />
+            ) : railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
                   <div className="flex items-center justify-between gap-3">
@@ -460,19 +567,6 @@ export function ModelPicker({
                   )}
                 </div>
 
-                {pane === "custom" && canReturnToOfficial && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPane("main");
-                      resetList();
-                    }}
-                    className="mx-2 mb-1 flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[12px] text-ink-secondary hover:bg-control/60"
-                  >
-                    <ChevronLeft size={13} /> Back to {railInstance.displayName} models
-                  </button>
-                )}
-
                 {blocked ? (
                   <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3 pt-1">
                     <WhyThisEngineCallout instance={railInstance} />
@@ -496,7 +590,6 @@ export function ModelPicker({
                         }}
                         onEscape={() => {
                           if (query) setQuery("");
-                          else if (pane === "custom" && canReturnToOfficial) setPane("main");
                         }}
                       />
                     )}
@@ -511,7 +604,7 @@ export function ModelPicker({
                             {query ? `${filteredOfficial.length} results` : showAll ? `All models · ${official.length}` : "Suggested"}
                           </EngineGroupLabel>
                           {shownOfficial.map(renderRow)}
-                          {shownOfficial.length === 0 && (
+                          {shownOfficial.length === 0 && shownOtherCustom.length === 0 && (
                             <div className="px-2 py-5 text-center text-[12.5px] text-ink-secondary">
                               Nothing matches “{query.trim()}”
                             </div>
@@ -533,6 +626,12 @@ export function ModelPicker({
                             >
                               Show suggested only
                             </button>
+                          )}
+                          {shownOtherCustom.length > 0 && (
+                            <>
+                              <EngineGroupLabel className="px-2 pb-1 pt-3">Custom</EngineGroupLabel>
+                              {shownOtherCustom.map(renderRow)}
+                            </>
                           )}
                         </>
                       ) : (
@@ -562,31 +661,6 @@ export function ModelPicker({
                       )}
                     </div>
                   </>
-                )}
-
-                {pane === "main" && (
-                  <button
-                    type="button"
-                    aria-label={
-                      custom.length > 0 ? `Use a Local Model (${custom.length} available)` : "Use a Local Model"
-                    }
-                    disabled={!canOpenCustom}
-                    onClick={() => {
-                      setPane("custom");
-                      resetList();
-                    }}
-                    className="flex w-full shrink-0 items-center justify-between gap-2 border-t border-hairline/40 px-4 py-3 text-left text-[12.5px] font-medium text-ink hover:bg-control/60 disabled:cursor-not-allowed disabled:text-ink-secondary/40 disabled:hover:bg-transparent"
-                  >
-                    <span>Use a Local Model</span>
-                    <span className="flex items-center gap-2">
-                      {custom.length > 0 && (
-                        <span className="rounded-full bg-inset px-2 py-0.5 text-[10.5px] text-ink-secondary">
-                          {custom.length} available
-                        </span>
-                      )}
-                      <ChevronRight size={14} className="text-ink-secondary" />
-                    </span>
-                  </button>
                 )}
               </>
             ) : (
