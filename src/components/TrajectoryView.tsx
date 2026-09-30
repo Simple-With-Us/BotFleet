@@ -29,7 +29,7 @@ import {
   type MessageLike,
   type Trajectory,
 } from "@/lib/trajectory";
-import { createEventBatcher, subscribeRuntimeEvents, subscribeRuntimeGap } from "@/lib/runtime-feed";
+import { createDelayedRun, createEventBatcher, subscribeRuntimeEvents, subscribeRuntimeGap } from "@/lib/runtime-feed";
 import { onTrajectorySearchRequest } from "@/lib/trajectory-search";
 import type { InspectorPage } from "@/lib/inspector";
 import type { RuntimeEvent } from "../../server/contracts.ts";
@@ -316,7 +316,8 @@ export const TrajectoryView = memo(function TrajectoryView({ threadId, messages,
   // the live tail's source of truth: event callbacks append to it directly, so
   // a history read that lands mid-burst prunes what is really there
   const liveRef = useRef<RuntimeEvent[]>([]);
-  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // the pending "read the log again", shared by every reason to want one
+  const reloader = useRef<ReturnType<typeof createDelayedRun> | null>(null);
 
   const load = useCallback(async () => {
     loadAbort.current?.abort();
@@ -346,21 +347,11 @@ export const TrajectoryView = memo(function TrajectoryView({ threadId, messages,
     }
   }, [threadId]);
 
-  /** Re-read the log soon, once however many reasons arrive meanwhile. */
-  const reloadSoon = useCallback(
-    (delayMs: number) => {
-      if (reloadTimer.current) clearTimeout(reloadTimer.current);
-      reloadTimer.current = setTimeout(() => {
-        reloadTimer.current = null;
-        void load();
-      }, delayMs);
-    },
-    [load],
-  );
-
   // Subscribe BEFORE reading history, so nothing that happens in between is
   // missed; the duplicates that overlap are dropped by event id when built.
   useEffect(() => {
+    const reload = createDelayedRun(() => void load());
+    reloader.current = reload;
     const batcher = createEventBatcher((batch) => {
       const next = [...liveRef.current, ...batch];
       const overflow = next.length > LIVE_CAP;
@@ -368,8 +359,10 @@ export const TrajectoryView = memo(function TrajectoryView({ threadId, messages,
       setLive(liveRef.current);
       // The oldest live events just fell off.  The log has them, so reading it
       // again turns what would be a silent hole mid-timeline into a trimmed
-      // front (the note says so).
-      if (overflow) reloadSoon(BURST_RELOAD_MS);
+      // front (the note says so).  Not `soon`: a stream fast enough to
+      // overflow on every batch would keep pushing a restarted wait out, and
+      // the hole would stay until the burst ended.
+      if (overflow) reload.ifIdle(BURST_RELOAD_MS);
     });
     const unsubscribe = subscribeRuntimeEvents(threadId, (event) => {
       batcher.push(event);
@@ -380,30 +373,30 @@ export const TrajectoryView = memo(function TrajectoryView({ threadId, messages,
       // reads as an interrupted turn for a quarter of a second.
       if (settles || event.type === "turn.started") batcher.flushNow();
       // let the log catch up with what streamed
-      if (settles) reloadSoon(SETTLE_RELOAD_MS);
+      if (settles) reload.soon(SETTLE_RELOAD_MS);
     });
     // The stream reconnected and could not replay what it missed (a sleeping
     // laptop, a network blip): whatever this tab was showing may be missing steps.
-    const unsubscribeGap = subscribeRuntimeGap(() => reloadSoon(BURST_RELOAD_MS));
+    const unsubscribeGap = subscribeRuntimeGap(() => reload.soon(BURST_RELOAD_MS));
     void load();
     return () => {
       unsubscribe();
       unsubscribeGap();
       batcher.dispose();
-      if (reloadTimer.current) clearTimeout(reloadTimer.current);
-      reloadTimer.current = null;
+      reload.dispose();
+      if (reloader.current === reload) reloader.current = null;
       loadAbort.current?.abort();
     };
-  }, [threadId, load, reloadSoon]);
+  }, [threadId, load]);
 
   // The turn ended without this tab hearing it (the stream dropped mid-turn):
   // the log has the rest, so read it.  The ordinary end is covered above and
   // this just joins that same debounced read.
   const wasRunning = useRef(running);
   useEffect(() => {
-    if (wasRunning.current && !running) reloadSoon(SETTLE_RELOAD_MS);
+    if (wasRunning.current && !running) reloader.current?.soon(SETTLE_RELOAD_MS);
     wasRunning.current = running;
-  }, [running, reloadSoon]);
+  }, [running]);
 
   // a running turn's open spans grow: tick once a second, and never behind a hidden tab
   useEffect(() => {

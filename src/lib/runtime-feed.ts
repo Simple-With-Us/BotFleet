@@ -116,3 +116,41 @@ export function createEventBatcher(
     pendingCount: () => pending.length,
   };
 }
+
+/**
+ * Runs `run` once after a delay, however many times it is asked for.  The two
+ * ways of asking differ in what a burst does to the wait:
+ *
+ * - `soon` restarts it, so a flurry of reasons becomes one run after the last.
+ * - `ifIdle` only arms it when nothing is waiting, so a reason that repeats
+ *   faster than the delay (a long turn overflowing its buffer on every batch)
+ *   cannot keep pushing the run out for as long as the burst lasts.
+ */
+export function createDelayedRun(
+  run: () => void,
+  schedule: (fn: () => void, ms: number) => unknown = (fn, ms) => setTimeout(fn, ms),
+  cancel: (handle: unknown) => void = (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+) {
+  let handle: unknown = null;
+  const arm = (ms: number) => {
+    handle = schedule(() => {
+      handle = null;
+      run();
+    }, ms);
+  };
+  return {
+    soon(ms: number) {
+      if (handle !== null) cancel(handle);
+      arm(ms);
+    },
+    ifIdle(ms: number) {
+      if (handle === null) arm(ms);
+    },
+    /** Drop the pending run, if any (the view went away). */
+    dispose() {
+      if (handle !== null) cancel(handle);
+      handle = null;
+    },
+    pending: () => handle !== null,
+  };
+}

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeEvent } from "../../server/contracts.ts";
-import { createEventBatcher, publishRuntimeEvent, publishRuntimeGap, subscribeRuntimeEvents, subscribeRuntimeGap, watchedThreadCount } from "./runtime-feed.ts";
+import { createDelayedRun, createEventBatcher, publishRuntimeEvent, publishRuntimeGap, subscribeRuntimeEvents, subscribeRuntimeGap, watchedThreadCount } from "./runtime-feed.ts";
 
 const ev = (threadId: string, over: Record<string, unknown> = {}): RuntimeEvent =>
   ({ eventId: `e-${Math.random()}`, provider: "claude", threadId, createdAt: "2026-09-29T14:00:00.000Z", type: "turn.started", ...over }) as RuntimeEvent;
@@ -199,5 +199,110 @@ describe("delivering a settling turn at once", () => {
     // the timer that was cancelled must not deliver a second, empty batch
     timers[0]!();
     expect(flushed).toHaveLength(1);
+  });
+});
+
+describe("createDelayedRun", () => {
+  /** A hand-cranked clock, so the tests never sleep. */
+  function clock() {
+    let now = 0;
+    let nextId = 1;
+    const timers = new Map<number, { at: number; fn: () => void }>();
+    return {
+      schedule: (fn: () => void, ms: number) => {
+        const id = nextId++;
+        timers.set(id, { at: now + ms, fn });
+        return id;
+      },
+      cancel: (handle: unknown) => void timers.delete(handle as number),
+      advance(ms: number) {
+        const end = now + ms;
+        for (;;) {
+          const due = [...timers.entries()].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+          if (!due) break;
+          now = due[1].at;
+          timers.delete(due[0]);
+          due[1].fn();
+        }
+        now = end;
+      },
+    };
+  }
+
+  it("runs once after the delay", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    delayed.soon(600);
+    expect(delayed.pending()).toBe(true);
+    c.advance(599);
+    expect(run).not.toHaveBeenCalled();
+    c.advance(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(delayed.pending()).toBe(false);
+  });
+
+  it("soon restarts the wait, so a flurry of reasons becomes one run after the last", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    delayed.soon(600);
+    c.advance(400);
+    delayed.soon(600);
+    c.advance(400);
+    expect(run).not.toHaveBeenCalled();
+    c.advance(200);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("ifIdle leaves a wait that is already running alone, so a fast repeat cannot starve it", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    // a burst asking every 100 ms for a run 1000 ms out
+    for (let t = 0; t < 10; t++) {
+      delayed.ifIdle(1000);
+      c.advance(100);
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("ifIdle arms a new wait once the last run has fired", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    delayed.ifIdle(1000);
+    c.advance(1000);
+    delayed.ifIdle(1000);
+    c.advance(1000);
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("a soon after an ifIdle replaces its wait", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    delayed.ifIdle(1000);
+    c.advance(900);
+    delayed.soon(600);
+    c.advance(599);
+    expect(run).not.toHaveBeenCalled();
+    c.advance(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    c.advance(5000);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("dispose drops the pending run", () => {
+    const c = clock();
+    const run = vi.fn();
+    const delayed = createDelayedRun(run, c.schedule, c.cancel);
+    delayed.soon(600);
+    delayed.dispose();
+    expect(delayed.pending()).toBe(false);
+    c.advance(5000);
+    expect(run).not.toHaveBeenCalled();
+    // and is safe to call with nothing pending
+    expect(() => delayed.dispose()).not.toThrow();
   });
 });

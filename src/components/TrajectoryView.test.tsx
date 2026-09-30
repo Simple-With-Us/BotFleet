@@ -490,13 +490,15 @@ describe("the live tail's wiring", () => {
   });
 
   it("reads the log again when a turn settles, when the live tail overflows, and after a stream gap", () => {
-    expect(SRC).toContain("if (settles) reloadSoon(SETTLE_RELOAD_MS);");
-    expect(SRC).toContain("if (overflow) reloadSoon(BURST_RELOAD_MS);");
-    expect(SRC).toContain("subscribeRuntimeGap(() => reloadSoon(BURST_RELOAD_MS))");
+    expect(SRC).toContain("if (settles) reload.soon(SETTLE_RELOAD_MS);");
+    // overflow uses ifIdle: a stream that overflows every batch must not keep
+    // restarting the wait (see createDelayedRun)
+    expect(SRC).toContain("if (overflow) reload.ifIdle(BURST_RELOAD_MS);");
+    expect(SRC).toContain("subscribeRuntimeGap(() => reload.soon(BURST_RELOAD_MS))");
   });
 
   it("reads the log again when the bot stops running without this tab having heard the turn end", () => {
-    expect(SRC).toContain("if (wasRunning.current && !running) reloadSoon(SETTLE_RELOAD_MS);");
+    expect(SRC).toContain("if (wasRunning.current && !running) reloader.current?.soon(SETTLE_RELOAD_MS);");
   });
 
   it("answers the header's search request by focusing its own search box", () => {
