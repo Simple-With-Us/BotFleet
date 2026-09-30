@@ -1,0 +1,131 @@
+{
+  "tip": "2d2462ceb1abfcaac844aa77d1c96c1f6e89f4c6",
+  "shots": [
+    {
+      "file": "01-pathA-rest-hold.png",
+      "phase": "Path seed — idle/resting hold",
+      "src": "/tv-face/skins/default/gifs/resting_hold.gif",
+      "step": {
+        "expression": "resting",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "02-pathA-thinking-enter-mid.png",
+      "phase": "Path 1 — rest→thinking ENTER",
+      "src": "/tv-face/skins/default/gifs/thinking_enter.gif",
+      "step": {
+        "expression": "thinking",
+        "kind": "enter",
+        "delayAfterMs": 1000
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "03-pathA-thinking-hold.png",
+      "phase": "Path 1 — rest→thinking ENTER",
+      "src": "/tv-face/skins/default/gifs/thinking_hold.gif",
+      "step": {
+        "expression": "thinking",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "04-pathA-working-hold.png",
+      "phase": "Path 1 — thinking→working HOLD cut",
+      "src": "/tv-face/skins/default/gifs/working_hold.gif",
+      "step": {
+        "expression": "working",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "05-pathA-rest-still.png",
+      "phase": "Path 1 — working→rest STILL",
+      "src": "/tv-face/skins/default/stills/resting.png",
+      "step": {
+        "expression": "resting",
+        "kind": "still",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "06-pathB-thinking-hold-seed.png",
+      "phase": "Path 2 seed — thinking hold",
+      "src": "/tv-face/skins/default/gifs/thinking_hold.gif",
+      "step": {
+        "expression": "thinking",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "07-pathB-thinking-return-mid.png",
+      "phase": "Path 2 — thinking→rest RETURN",
+      "src": "/tv-face/skins/default/gifs/thinking_return.gif",
+      "step": {
+        "expression": "thinking",
+        "kind": "return",
+        "delayAfterMs": 1000
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "08-pathB-rest-still-after-return.png",
+      "phase": "Path 2 — thinking→rest RETURN",
+      "src": "/tv-face/skins/default/stills/resting.png",
+      "step": {
+        "expression": "resting",
+        "kind": "still",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": false,
+      "onErrorCascade": ""
+    },
+    {
+      "file": "09-pathC-proud-hold-request.png",
+      "phase": "Path 3 — idle→proud HOLD (missing)",
+      "src": "/tv-face/skins/default/stills/proud.png",
+      "step": {
+        "expression": "proud",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": true,
+      "onErrorCascade": "/tv-face/skins/default/gifs/proud_hold.gif → /tv-face/skins/default/stills/proud.png"
+    },
+    {
+      "file": "10-pathC-proud-still-onError.png",
+      "phase": "Path 3 — idle→proud HOLD (missing)",
+      "src": "/tv-face/skins/default/stills/proud.png",
+      "step": {
+        "expression": "proud",
+        "kind": "hold",
+        "delayAfterMs": 0
+      },
+      "onErrorFired": true,
+      "onErrorCascade": "/tv-face/skins/default/gifs/proud_hold.gif → /tv-face/skins/default/stills/proud.png"
+    }
+  ],
+  "proudHoldResponses": [
+    {
+      "url": "http://127.0.0.1:8765/tv-face/skins/default/gifs/proud_hold.gif",
+      "status": 404
+    }
+  ]
+}
