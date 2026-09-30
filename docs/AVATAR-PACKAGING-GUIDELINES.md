@@ -14,29 +14,41 @@ The avatar player uses a 3-part animation lifecycle to transition smoothly betwe
 
 *Flow:* `Resting` → (Trigger: Bot starts thinking) → `thinking_enter.gif` → `thinking_hold.gif` (loops) → (Trigger: Bot finishes) → `thinking_return.gif` → `Resting`.
 
-## 2. Core Actions & Expressions (The 15-State Matrix)
+## 2. Common Bot Actions (The Vocabulary)
 
-To be fully compatible with BotFleet, an avatar pack must cover these exact **15 core expressions**. 
-Each expression requires an `_enter` (intro), `_hold` (loop), and `_return` (outro) animation, resulting in exactly **45 animations** per skin. 
+To be fully compatible with BotFleet, an avatar pack should cover as many of these core 39 states as possible. If a specific state isn't provided, BotFleet gracefully falls back to the `resting` face.
 
-If a specific state isn't provided, BotFleet gracefully falls back to the `resting` face.
+### Lifecycle & Core States
+- `resting` (Default idle state)
+- `sleeping` / `waking`
+- `listening` (Waiting for user input)
+- `thinking` (Processing / reasoning)
+- `searching` (Looking up data / web browsing)
+- `working` (General task execution)
 
-### The 15 Core States
-1. `resting` (Default idle state / anchor)
-2. `working` (General task execution)
-3. `thinking` (Processing / reasoning)
-4. `speaking` (TTS / Dictating)
-5. `listening` (Waiting for user input)
-6. `computer` (Using a computer terminal or code)
-7. `error` (Crash / error state)
-8. `success` (Happy / celebrate / proud)
-9. `confused` (Suspicious / not understanding)
-10. `alerting` (Notifying / waking)
-11. `searching` (Looking up data)
-12. `sending` (Uploading / transmitting)
-13. `receiving` (Downloading / reading)
-14. `fleet` (Multi-agent coordination)
-15. `tools` (Using an MCP tool / routine)
+### Product Cycle & I/O
+- `loading`
+- `typing` (Writing code or text)
+- `speaking` (TTS / Dictating)
+- `sending` / `receiving` / `uploading`
+- `notifying` / `alerting`
+- `powering_down`
+
+### Tools & Integration
+- `fleet` (Multi-agent coordination / orbit)
+- `crash` (Error state / recovery)
+- `memory` (Accessing storage/memory)
+- `tools` (Using an MCP tool)
+- `routine` (Running a background job/progress)
+- `screen` (Focusing on UI/Desktop)
+- `git` (Committing code)
+- `webhook` (Sending data)
+- `computer` (Using a computer terminal)
+
+### Reactions & Emotions
+- Positive: `happy`, `excited`, `celebrate`, `proud`, `playful`, `laughing`
+- Neutral: `curious`, `surprised`, `shy`, `bored`, `drowsy`
+- Negative: `confused`, `sad`, `angry`, `scared`, `suspicious`
 
 ## 3. Filesystem Structure (The `.botface` / `.zip` format)
 
@@ -92,8 +104,8 @@ When generating assets for a BotFleet avatar, strictly adhere to these constrain
      - *Why:* BotFleet state changes happen quickly. If an "enter" transition is too long, the bot might finish its task before the animation finishes playing. Keep it snappy and responsive.
    - **Hold Loops**:
      - *Must be:* Seamlessly looping.
-     - *Recommended:* 5 to 8 seconds per cycle.
-     - *Why:* Fast 2-second loops look jittery and annoying if you have to watch them for 45 seconds while a build runs. Deep-work holds should be slow and ambient.
+     - *Recommended:* 2 to 4 seconds per cycle.
+     - *Why:* A hold animation plays continuously while a bot works. If the loop is too short (e.g., 0.5 seconds), the avatar will look jittery and frantic. If it is too long, the file size will become bloated.
    - **Idle / Ambient Loops (Optional)**:
      - *Recommended:* 4 to 8 seconds. 
      - *Why:* The resting face is on screen 90% of the time. Occasional blinks or subtle floating should be spaced out so it doesn't distract the user.
