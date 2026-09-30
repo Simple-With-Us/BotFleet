@@ -6,13 +6,16 @@ import {
   catalogIsAuthoritative,
   catalogIsLive,
   checkLineageWrite,
+  claudeModelsTooNewFor,
+  gateLineageByCliVersion,
   lineageContextFor,
   matchesStaticFallback,
+  parseCliVersion,
   presentDescribedInstances,
 } from "./model-lineage.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { STATIC_GROK_MODELS } from "./drivers/acp/grok.ts";
-import type { LineageContext } from "../shared/model-lineage.ts";
+import { reconcileEntry, type LineageContext } from "../shared/model-lineage.ts";
 
 const CODEX_LIVE = {
   default: "gpt-5.6-luna",
@@ -93,6 +96,57 @@ describe("presentDescribedInstances", () => {
     expect((presented[2]!.models as { live?: boolean }).live).toBe(true);
     // An engine with no lineage comes back as the same object.
     expect(presented[3]).toBe(minimax);
+  });
+});
+
+describe("Claude CLI version gate", () => {
+  const claude = lineageContextFor(instances.claude)!;
+  const optionIds = (models: { options: Array<{ id: string }> }) => models.options.map((option) => option.id);
+
+  it("reads the version the CLI prints", () => {
+    expect(parseCliVersion("2.1.284 (Claude Code)")).toEqual([2, 1, 284]);
+    expect(parseCliVersion(null)).toBeUndefined();
+    expect(parseCliVersion("claude")).toBeUndefined();
+  });
+
+  it("names the models an older CLI's own catalog does not list yet", () => {
+    expect([...claudeModelsTooNewFor("2.1.232 (Claude Code)")]).toEqual(["claude-opus-5-5"]);
+    expect([...claudeModelsTooNewFor("2.1.279")]).toEqual(["claude-opus-5-5"]);
+    expect(claudeModelsTooNewFor("2.1.280").size).toBe(0);
+    expect(claudeModelsTooNewFor("3.0.0").size).toBe(0);
+    expect(claudeModelsTooNewFor(undefined).size).toBe(0);
+  });
+
+  it("moves nothing on a Claude engine until its CLI has reported a version", () => {
+    expect(gateLineageByCliVersion(claude, undefined)?.authoritative).toBe(false);
+    const pinned = { instanceId: "claude", model: "claude-opus-5" };
+    expect(reconcileEntry(pinned, gateLineageByCliVersion(claude, null)).entry).toBe(pinned);
+  });
+
+  it("keeps a pinned Opus 5 on Opus 5 for a CLI too old for Opus 5.5, and moves it on a new one", () => {
+    const pinned = { instanceId: "claude", model: "claude-opus-5" };
+    const old = gateLineageByCliVersion(claude, "2.1.232 (Claude Code)")!;
+    expect(old.offeredIds).not.toContain("claude-opus-5-5");
+    expect(old.offeredIds).toContain("claude-sonnet-5-5");
+    expect(reconcileEntry(pinned, old).entry).toBe(pinned);
+    // Latest Opus resolves to what that CLI can run.
+    expect(reconcileEntry({ ...pinned, latest: "opus" }, old).entry.model).toBe("claude-opus-5");
+    expect(reconcileEntry(pinned, gateLineageByCliVersion(claude, "2.1.284 (Claude Code)")).entry.model).toBe("claude-opus-5-5");
+  });
+
+  it("leaves other engines alone", () => {
+    const codex = lineageContextFor(instances.codex)!;
+    expect(gateLineageByCliVersion(codex, undefined)).toBe(codex);
+  });
+
+  it("offers Opus 5 instead of Opus 5.5 in the picker for an older CLI", () => {
+    const [old] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.232 (Claude Code)" } }]);
+    expect(optionIds(old!.models)).toEqual(expect.arrayContaining(["claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1"]));
+    expect(optionIds(old!.models)).not.toContain("claude-opus-5-5");
+    expect(old!.models.default).toBe("claude-sonnet-5-5");
+    const [current] = presentDescribedInstances([{ ...instances.claude, snapshot: { version: "2.1.284 (Claude Code)" } }]);
+    expect(optionIds(current!.models)).toContain("claude-opus-5-5");
+    expect(optionIds(current!.models)).not.toContain("claude-opus-5");
   });
 });
 

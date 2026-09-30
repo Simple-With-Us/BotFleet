@@ -211,7 +211,13 @@ import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
 import { reconcileEntry, type LineageContext } from "../shared/model-lineage.ts";
-import { checkLineageWrite, lineageContextFor, modelNameFor, presentDescribedInstances } from "./model-lineage.ts";
+import {
+  checkLineageWrite,
+  gateLineageByCliVersion,
+  lineageContextFor,
+  modelNameFor,
+  presentDescribedInstances,
+} from "./model-lineage.ts";
 import {
   isEffortLevel,
   type CloudBackend,
@@ -1080,19 +1086,38 @@ async function defaultSelection(excludeInstanceId?: string) {
 // context, so nothing on it is moved.  An engine that failed to start is
 // still known by its driver kind: the owner-directed Latest flags can land on
 // it, but nothing is resolved until its catalog is back.
+// The CLI version each engine last reported, from the latest describe.  The
+// Claude gate (server/model-lineage.ts) reads it synchronously: until an
+// engine has reported one, nothing on a Claude engine is moved.
+const cliVersionByInstance = new Map<string, string | null | undefined>();
+
+function recordCliVersions(described: ReadonlyArray<{ instanceId: string; snapshot?: { version?: string | null } }>): void {
+  for (const instance of described) cliVersionByInstance.set(instance.instanceId, instance.snapshot?.version);
+}
+
+/** Every describe goes through here on its way to a picker, so the version
+ *  cache follows the engines' own answers. */
+function presentInstances<T extends Parameters<typeof presentDescribedInstances>[0][number] & { instanceId: string }>(
+  described: T[],
+): T[] {
+  recordCliVersions(described);
+  return presentDescribedInstances(described);
+}
+
 function lineageContextForInstance(instanceId: string): LineageContext | undefined {
   const instance = registry.get(instanceId);
   if (!instance) {
     const shadow = registry.entries().find((entry) => entry.instanceId === instanceId)?.shadow;
     return shadow ? { driverKind: shadow.driverKind, offeredIds: [], authoritative: false } : undefined;
   }
-  return lineageContextFor(instance, (model) =>
+  const context = lineageContextFor(instance, (model) =>
     modelEffortLevels(
       { driverKind: instance.driverKind, capabilities: instance.adapter.capabilities },
       instance.models.options.find((option) => option.id === model),
       model,
     ),
   );
+  return gateLineageByCliVersion(context, cliVersionByInstance.get(instanceId));
 }
 
 /** Reconcile saved selections against the engines' current catalogs.  The
@@ -2344,6 +2369,17 @@ watchdog.start();
 // and the SSE broadcaster exists.  Later catalog refreshes and every
 // dispatch run the regular pass.
 reconcileModelLineage({ ownerDirective: true });
+// That pass cannot move anything on a Claude engine yet: no Claude CLI has
+// reported its version (server/model-lineage.ts, gateLineageByCliVersion).
+// The first describe, shared with the warm-up probe above, records them and
+// the regular pass runs again against it.
+void registry
+  .describe({ maxAgeMs: 15_000, staleWhileRevalidate: true })
+  .then((described) => {
+    recordCliVersions(described);
+    reconcileModelLineage({ skipBusy: true });
+  })
+  .catch(() => {});
 
 async function reviewPermissionCard(args: {
   instance: ProviderInstance;
@@ -12047,8 +12083,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // A describe is the catalog refresh: move saved selections forward
       // against what the engines offer now.  Working bots wait for their
       // next dispatch, which reconciles them first.
+      const instances = presentInstances(described);
       reconcileModelLineage({ skipBusy: true });
-      return json(res, 200, { instances: presentDescribedInstances(described) });
+      return json(res, 200, { instances });
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -12195,7 +12232,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, { instances: presentDescribedInstances(instances) });
+        return json(res, 200, { instances: presentInstances(instances) });
       } finally {
         providerConfigBusy = false;
       }
@@ -12370,7 +12407,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances: presentDescribedInstances(await registry.describe()),
+          instances: presentInstances(await registry.describe()),
         });
       } finally {
         providerConfigBusy = false;
@@ -12492,7 +12529,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         resetPathCache();
         return json(res, 200, {
           ok: true,
-          instances: presentDescribedInstances(await registry.describe()),
+          instances: presentInstances(await registry.describe()),
         });
       } finally {
         providerConfigBusy = false;

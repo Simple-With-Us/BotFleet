@@ -7594,6 +7594,12 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
 
 describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
   type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
+  // A describe records each engine's CLI version; until the Claude CLI has
+  // reported one, nothing on a Claude engine is moved.  The fixture CLI
+  // reports 2.1.232, older than the 2.1.280 that Opus 5.5 needs.
+  beforeAll(async () => {
+    await api("GET", "/api/instances");
+  });
   const selectionOf = async (id: string): Promise<Saved | undefined> =>
     (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.modelSelection;
   const withBot = async (name: string, run: (bot: { id: string; threadId: string }) => Promise<void>) => {
@@ -7605,14 +7611,26 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     }
   };
 
-  it("hides superseded rows from /api/instances and keeps the newest of each class", async () => {
+  it("hides superseded rows from /api/instances, and keeps Opus 5 for a CLI too old for Opus 5.5", async () => {
     const claude = (await api("GET", "/api/instances")).body.instances.find(
       (instance: { instanceId: string }) => instance.instanceId === "claude",
     );
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
     const ids = claude.models.options.map((option: { id: string }) => option.id);
-    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5-5", "claude-opus-5-5"]));
+    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5-5", "claude-opus-5"]));
     expect(ids).not.toContain("claude-sonnet-5");
-    expect(ids).not.toContain("claude-opus-5");
+    expect(ids).not.toContain("claude-opus-5-5");
+  });
+
+  it("never moves a pinned Opus 5 onto Opus 5.5 for a CLI too old to run it", async () => {
+    await withBot("Lineage Old CLI", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      await api("GET", "/api/instances?fresh=1");
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-opus-5" });
+      expect((await selectionOf(bot.id))?.latest).toBeUndefined();
+    });
   });
 
   it("saves a retired id as Latest of its successor class, with the real slug in model", async () => {
@@ -7692,15 +7710,15 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
 
       const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
       const floated = await api("PATCH", taskPath, {
-        modelSelection: { instanceId: "claude2", model: "claude-opus-5", latest: "opus" },
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
       });
       expect(floated.status).toBe(200);
-      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-opus-5-5", latest: "opus" });
+      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
       const resent = await api("PATCH", taskPath, {
-        modelSelection: { instanceId: "claude2", model: "claude-opus-5-5" },
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5-5" },
       });
       expect(resent.status).toBe(200);
-      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-opus-5-5", latest: "opus" });
+      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
     });
   });
 
@@ -7709,7 +7727,7 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       const floating = await api("POST", "/api/bots/apply-model-defaults", {
         slots: {
           primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
-          fallbacks: [{ instanceId: "claude2", model: "claude-opus-5-5", latest: "opus" }, null, null],
+          fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }, null, null],
         },
       });
       expect(floating.status).toBe(200);
@@ -7717,7 +7735,7 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
         instanceId: "claude",
         model: "claude-sonnet-5-5",
         latest: "sonnet",
-        fallbacks: [{ instanceId: "claude2", model: "claude-opus-5-5", latest: "opus" }],
+        fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }],
       });
 
       const pinned = await api("POST", "/api/bots/apply-model-defaults", {
@@ -7727,7 +7745,7 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       const after = await selectionOf(bot.id);
       expect(after?.latest).toBeUndefined();
       // The fallback place the request left empty keeps its float.
-      expect(after?.fallbacks?.[0]?.latest).toBe("opus");
+      expect(after?.fallbacks?.[0]?.latest).toBe("haiku");
     });
   });
 });

@@ -52,6 +52,6 @@ Only saved selections move.  Message rows, per-task and per-instance usage bucke
 - A saved id the catalog no longer offers gets a "Retired", "Superseded", or (only against a live catalog) "Not in catalog" badge, with a one-click "Switch To …".
 - `src/lib/usage-plans.ts` no longer carries its own stale Claude, GPT, and Grok labels; those come from the model class.  Usage attribution is unchanged.
 
-## Known Gaps
+## Claude CLI Version
 
-- Nothing checks the Claude CLI version before a saved Opus 5 moves to Opus 5.5.  The CLI's own model catalog lists Opus 5.5 from Claude Code 2.1.280.  This Mac runs 2.1.284, so it is not affected; an install on an older CLI might reject Opus 5.5 turns, which #740 reports as an error row before moving to the next fallback, when there is one.  A version gate needs the detected CLI version (the Claude snapshot already carries it) wired into the lineage context, and is left as a follow-up.
+The Claude CLI's own model catalog lists Opus 5.5 only from Claude Code 2.1.280; Sonnet 5.5 declares no minimum.  The harness keeps each engine's last reported CLI version from its describe.  For a Claude engine whose CLI is older than 2.1.280, Opus 5.5 is left out of the picker catalog and out of what the lineage pass may move onto, so a pinned Opus 5 stays on Opus 5 and "Latest Opus" runs Opus 5.  Until a Claude CLI has reported a version, nothing on that engine is moved; the harness runs its first describe right after the boot pass and runs the regular pass again against it.  Fable 5.1 (listed from 2.1.251) was offered to every CLI before lineage existed and is left as it was.

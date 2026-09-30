@@ -7,6 +7,7 @@ import type { ModelSelection } from "./contracts.ts";
 import { STATIC_CODEX_MODELS } from "./drivers/codex-catalog.ts";
 import {
   anyLineageLabel,
+  compareRank,
   hasLineage,
   presentCatalog,
   reconcileChain,
@@ -81,13 +82,76 @@ export function lineageContextFor(
   };
 }
 
+// ── Claude CLI version gate ──────────────────────────────────────────────
+// The Claude CLI's own model catalog lists Opus 5.5 only from Claude Code
+// 2.1.280 (its `min_claude_code_version`); Sonnet 5.5 declares no minimum.
+// On an older CLI the Opus 5.5 row is not offered and no saved selection is
+// moved onto it: a move there would also hide Opus 5, the model the bot ran
+// on before, with no way back in the picker.  Fable 5.1 (listed from 2.1.251)
+// was offered to every CLI before lineage existed and is left as it was.
+const CLAUDE_CLI_MINIMUM = {
+  "claude-opus-5-5": [2, 1, 280],
+} as const satisfies Readonly<Record<string, readonly number[]>>;
+
+/** `2.1.284 (Claude Code)` -> [2, 1, 284]; undefined when no version is known. */
+export function parseCliVersion(text: string | null | undefined): number[] | undefined {
+  const match = text ? /(\d+)\.(\d+)\.(\d+)/.exec(text) : null;
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+}
+
+/** Claude model ids this CLI version is too old for (empty when unknown). */
+export function claudeModelsTooNewFor(cliVersion: string | null | undefined): Set<string> {
+  const version = parseCliVersion(cliVersion);
+  const tooNew = new Set<string>();
+  if (!version) return tooNew;
+  for (const [id, minimum] of Object.entries(CLAUDE_CLI_MINIMUM)) {
+    if (compareRank(version, minimum) < 0) tooNew.add(id);
+  }
+  return tooNew;
+}
+
+/** A Claude lineage context as the detected CLI can run it.  Until the CLI
+ *  has answered `--version` the catalog is not authoritative, so nothing on
+ *  a Claude engine is resolved or moved on a guess; once it has, models it is
+ *  too old for are left out of what the pass may move onto. */
+export function gateLineageByCliVersion(
+  ctx: LineageContext | undefined,
+  cliVersion: string | null | undefined,
+): LineageContext | undefined {
+  if (!ctx || ctx.driverKind !== "claudeAgent" || !hasLineage(ctx.driverKind)) return ctx;
+  if (!parseCliVersion(cliVersion)) return { ...ctx, authoritative: false };
+  const tooNew = claudeModelsTooNewFor(cliVersion);
+  if (!tooNew.size) return ctx;
+  return { ...ctx, offeredIds: ctx.offeredIds.filter((id) => !tooNew.has(id)) };
+}
+
+/** A Claude catalog without the rows the detected CLI is too old for.  Other
+ *  engines, an unknown version, and custom rows come back unchanged. */
+export function withoutModelsTooNewForCli<C extends CatalogLike>(
+  driverKind: string,
+  models: C,
+  cliVersion: string | null | undefined,
+): C {
+  if (driverKind !== "claudeAgent") return models;
+  const tooNew = claudeModelsTooNewFor(cliVersion);
+  if (!tooNew.size) return models;
+  const options = models.options.filter((option) => Boolean(option.custom) || !tooNew.has(option.id));
+  if (options.length === models.options.length) return models;
+  const fallbackDefault = options.find((option) => !option.custom)?.id ?? models.default;
+  return { ...models, options, default: tooNew.has(models.default) ? fallbackDefault : models.default };
+}
+
 /** What `/api/instances` hands every picker (desktop, iOS, the MCP tool):
- *  superseded and retired rows removed, and `live` set where "Not in
- *  catalog" may be claimed.  Validation and dispatch keep reading the full
- *  catalog from the registry, so a saved older id still resolves. */
-export function presentDescribedInstances<T extends { driverKind: string; models: CatalogLike }>(described: T[]): T[] {
+ *  rows the detected Claude CLI is too old for, superseded and retired rows
+ *  removed, and `live` set where "Not in catalog" may be claimed.
+ *  Validation and dispatch keep reading the full catalog from the registry,
+ *  so a saved older id still resolves. */
+export function presentDescribedInstances<
+  T extends { driverKind: string; models: CatalogLike; snapshot?: { version?: string | null } },
+>(described: T[]): T[] {
   return described.map((instance) => {
-    const presented = presentCatalog(instance.driverKind, instance.models);
+    const runnable = withoutModelsTooNewForCli(instance.driverKind, instance.models, instance.snapshot?.version);
+    const presented = presentCatalog(instance.driverKind, runnable);
     const live = catalogIsLive(instance.driverKind, instance.models);
     if (presented === instance.models && !live) return instance;
     return { ...instance, models: { ...presented, ...(live ? { live: true } : {}) } };
