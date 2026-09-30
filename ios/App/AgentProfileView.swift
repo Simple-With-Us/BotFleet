@@ -242,7 +242,7 @@ struct AgentProfileView: View {
                         }
                     }
 
-                    if fallbacks.count < 2 {
+                    if fallbacks.count < Self.maximumFallbacks {
                         Section {
                             Button("Add Fallback", systemImage: "plus.circle") {
                                 let firstInst = instances.first
@@ -658,6 +658,12 @@ struct AgentProfileView: View {
             }
         }
     }
+
+    /// Shared with `shared/model-limits.ts` `MAX_MODEL_FALLBACKS`.  Only the Add
+    /// control is gated on it: every fallback a bot already stores is listed
+    /// and can be removed, however many that is, so a chain written through the
+    /// API before the cap existed is never hidden from its owner.
+    private static let maximumFallbacks = 3
 
     /// Shared with `shared/bot-profile.ts` `MAX_TOOL_ROUNDS`.
     private static let maximumToolRoundsCap = 200

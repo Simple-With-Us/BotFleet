@@ -23,6 +23,13 @@ import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseCli
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
+import {
+  applyFallbackSlots,
+  KEEP_FALLBACK_SLOT,
+  touchesFallbacks,
+  type FallbackSlot,
+} from "./model-default-slots.ts";
 import { firstTurnTitleText } from "./task-title.ts";
 import {
   allowsMultipleBotThreads,
@@ -1087,6 +1094,16 @@ function checkedModelSelection(
   }
   
   if ("fallbacks" in value && Array.isArray(value.fallbacks)) {
+    // Refuse a chain that GROWS past the cap, never one that merely keeps the
+    // length it already has: a bot written before the cap existed re-sends its
+    // whole chain whenever only its primary changes, and that must still save.
+    if (!fallbackCountAllowed(value.fallbacks.length, current?.selection.fallbacks?.length ?? 0)) {
+      return {
+        ok: false,
+        status: 400,
+        error: `a bot can have at most ${MAX_MODEL_FALLBACKS} fallback models`,
+      };
+    }
     const parsedFallbacks: ModelSelection[] = [];
     for (const f of value.fallbacks) {
        const res = checkedModelSelection(f, undefined, requireAvailableModel);
@@ -12507,11 +12524,25 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body || typeof body !== "object" || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
-      // The four slots may each be present OR absent.  An absent slot is
-      // "do not touch bots that already have a value here" — exactly the
-      // behavior the UI promises when an empty picker means "leave alone".
+      // Primary and each fallback place may be present OR absent.  An absent
+      // (or null) place is "do not touch what bots already have here" — exactly
+      // the behavior the UI promises when an empty picker means "leave alone".
+      //
+      // Fallbacks travel by FIXED position: `fallbacks[0]` is every bot's
+      // Fallback 1, `fallbacks[1]` its Fallback 2, and so on up to the cap.  A
+      // place is a selection (write it), null or absent (leave it), or
+      // `{ clear: true }` (remove that entry from every bot).  The older
+      // `secondary` / `fallback1` / `fallback2` names are still read, as
+      // aliases for places 0, 1 and 2 — by position, not compacted — so a
+      // client that has not been updated yet cannot land in the wrong place.
       const slots = body.slots as
-        | { primary?: unknown; secondary?: unknown; fallback1?: unknown; fallback2?: unknown }
+        | {
+            primary?: unknown;
+            fallbacks?: unknown;
+            secondary?: unknown;
+            fallback1?: unknown;
+            fallback2?: unknown;
+          }
         | undefined;
       if (!slots || typeof slots !== "object") {
         return json(res, 400, { error: "slots must be a JSON object" });
@@ -12528,22 +12559,61 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         return { instanceId: candidate.instanceId, model: candidate.model };
       };
+      const readFallbackSlot = (value: unknown): FallbackSlot => {
+        if (
+          value &&
+          typeof value === "object" &&
+          !Array.isArray(value) &&
+          (value as Record<string, unknown>).clear === true
+        ) {
+          return { kind: "clear" };
+        }
+        const selection = readSlot(value);
+        return selection ? { kind: "set", selection } : KEEP_FALLBACK_SLOT;
+      };
       let primary: ModelSelection | null;
-      let secondary: ModelSelection | null;
-      let fallback1: ModelSelection | null;
-      let fallback2: ModelSelection | null;
+      const fallbackSlots: FallbackSlot[] = [];
       try {
         primary = readSlot(slots.primary);
-        secondary = readSlot(slots.secondary);
-        fallback1 = readSlot(slots.fallback1);
-        fallback2 = readSlot(slots.fallback2);
+        const legacyPlaces = [slots.secondary, slots.fallback1, slots.fallback2];
+        if (slots.fallbacks !== undefined) {
+          if (!Array.isArray(slots.fallbacks)) {
+            throw Object.assign(new Error("slots.fallbacks must be an array"), { status: 400 });
+          }
+          if (slots.fallbacks.length > MAX_MODEL_FALLBACKS) {
+            throw Object.assign(
+              new Error(`slots.fallbacks can address at most ${MAX_MODEL_FALLBACKS} places`),
+              { status: 400 },
+            );
+          }
+          if (legacyPlaces.some((value) => value !== undefined)) {
+            throw Object.assign(
+              new Error("send slots.fallbacks or the older secondary, fallback1 and fallback2 slots, not both"),
+              { status: 400 },
+            );
+          }
+          for (const value of slots.fallbacks) fallbackSlots.push(readFallbackSlot(value));
+        } else {
+          for (const value of legacyPlaces) fallbackSlots.push(readFallbackSlot(value));
+        }
       } catch (error) {
         const status = (error as { status?: number }).status ?? 400;
         return json(res, status, { error: (error as Error).message });
       }
+      // Clearing a place removes an entry from every bot at once, and nothing
+      // can bring it back.  Naming the intent twice keeps a stray `{ clear }`
+      // in a hand-built request from wiping a fleet's fallbacks.
+      if (fallbackSlots.some((slot) => slot.kind === "clear") && body.confirmClear !== true) {
+        return json(res, 400, {
+          error: "clearing a fallback place removes it from every bot — send confirmClear: true to do that",
+        });
+      }
       // Shape and engine validation, once, with no bot in hand: these are
       // request-level errors and the whole apply should fail on them.
-      for (const selection of [primary, secondary, fallback1, fallback2]) {
+      for (const selection of [
+        primary,
+        ...fallbackSlots.map((slot) => (slot.kind === "set" ? slot.selection : null)),
+      ]) {
         if (selection === null) continue;
         const checked = checkedModelSelection(selection, undefined, false);
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
@@ -12565,26 +12635,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const next: ModelSelection = { ...bot.modelSelection };
         const existingFallbacks = next.fallbacks ?? [];
         if (primary) next.instanceId = primary.instanceId, next.model = primary.model;
-        // Secondary and the two fallbacks all map onto the same fallbacks
-        // list: secondary is the first entry, the fallbacks are the rest.
-        const nextFallbacks: ModelSelection[] = [];
-        if (secondary) nextFallbacks.push(secondary);
-        if (fallback1) nextFallbacks.push(fallback1);
-        if (fallback2) nextFallbacks.push(fallback2);
-        if (nextFallbacks.length > 0) {
-          // Only OVERWRITE positions that the defaults actually supplied.
-          // An empty picker at the UI level MUST leave the bot's value at
-          // that slot alone — that is the contract "Set all bots to
-          // default" promises when a default is empty.
-          const merged: ModelSelection[] = [...existingFallbacks];
-          while (merged.length < nextFallbacks.length) merged.push(nextFallbacks[merged.length]!);
-          for (let i = 0; i < nextFallbacks.length; i++) merged[i] = nextFallbacks[i]!;
-          // Trim trailing empties: the user can carry fewer fallbacks than
-          // the default offers, and we should not pad their bot to match.
-          next.fallbacks = merged.filter(
-            (entry, i) => i < nextFallbacks.length || entry.instanceId !== "" || entry.model !== "",
-          );
-          if (next.fallbacks.length === 0) delete next.fallbacks;
+        if (touchesFallbacks(fallbackSlots)) {
+          // Only the places the request named are written, each at its own
+          // position, so an empty picker leaves that place exactly as it was
+          // and a lone "Fallback 3" can never land on a bot's Fallback 1.
+          const applied = applyFallbackSlots(existingFallbacks, fallbackSlots);
+          if (applied.length > 0) next.fallbacks = applied;
+          else delete next.fallbacks;
         }
         if (bot.modelSelection.instanceId === next.instanceId &&
             bot.modelSelection.model === next.model &&
