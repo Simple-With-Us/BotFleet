@@ -3,10 +3,11 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
+import { Activity, Coins, Globe, KeyRound, Layers, Monitor, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { searchSettings, type SettingsSearchItem } from "@/lib/settings-search";
 import { SettingsSearchResultsView } from "./SettingsSearchResultsView";
+import { SETTINGS_SECTIONS, SettingsNav } from "./SettingsNav";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   ROOM_LABEL_MAX_LENGTH,
@@ -92,24 +93,6 @@ export function saveSettingsModalSize(size: { width: number; height: number }): 
     // Ignore storage errors
   }
 }
-
-const SECTIONS: Array<{
-  id: AppSettingsSection;
-  label: string;
-  icon: typeof User;
-  keywords: string[];
-}> = [
-  { id: "general", label: "General", icon: User, keywords: ["profile", "name", "email", "skin", "theme", "appearance", "analytics", "updates", "tools", "tool calls", "simple", "projects", "threads", "workspace"] },
-  { id: "connections", label: "Connections", icon: KeyRound, keywords: ["keys", "api", "composio", "box", "xai", "vps", "voice", "tts", "speech"] },
-  { id: "remote", label: "Remote Access", icon: Globe, keywords: ["remote", "url", "tunnel", "cloudflare", "access", "health"] },
-  { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
-  { id: "models", label: "Models", icon: Layers, keywords: ["model", "fallback", "primary", "engine", "per bot", "fleet"] },
-  { id: "companion", label: "Phone", icon: Smartphone, keywords: ["companion", "phone", "pair", "mobile", "gateway", "sidecar"] },
-  { id: "computers", label: "Computers", icon: Monitor, keywords: ["vm", "virtual", "desktop", "computer", "vps", "box", "mac", "sandbox"] },
-  { id: "usage", label: "Usage", icon: Coins, keywords: ["tokens", "cost", "billing"] },
-  { id: "observability", label: "Observability", icon: Activity, keywords: ["sentry", "errors", "crashes", "traces", "logs", "diagnostics"] },
-  { id: "secrets", label: "Secrets", icon: KeyRound, keywords: ["infisical", "vault", "credentials", "secret", "provenance"] },
-];
 
 const SECTION_ICONS: Record<AppSettingsSection, typeof User> = {
   general: User,
@@ -1096,7 +1079,7 @@ export function SettingsModal() {
   const highlightTimerRef = useRef<number | null>(null);
 
   const visibleSections = useMemo(
-    () => SECTIONS.filter((entry) => searchResult.matchingSectionIds.has(entry.id)),
+    () => SETTINGS_SECTIONS.filter((entry) => searchResult.matchingSectionIds.has(entry.id)),
     [searchResult.matchingSectionIds],
   );
 
@@ -1315,118 +1298,25 @@ export function SettingsModal() {
         )}
       >
         {/* section nav */}
-        <nav className="flex w-[164px] shrink-0 flex-col gap-0.5 border-r border-hairline/40 p-3">
-          <div id="app-settings-title" className="px-2 pb-2 pt-1 text-[15px] font-semibold text-ink">
-            Settings
-          </div>
-          <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-control/70 px-2.5 py-1.5">
-            <Search size={14} className="shrink-0 text-ink-secondary" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key !== "Escape") return;
-                e.stopPropagation();
-                if (query) {
-                  setQuery("");
-                  setSelectedSectionFilter(null);
-                } else {
-                  dispatch({ type: "toggleAppSettings", open: false });
-                }
-              }}
-              placeholder="Search"
-              aria-label="Search Settings"
-              className="w-full bg-transparent text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
-            />
-            {query ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setQuery("");
-                  setSelectedSectionFilter(null);
-                }}
-                aria-label="Clear search"
-                className="shrink-0 rounded p-0.5 text-ink-secondary hover:text-ink"
-              >
-                <X size={13} />
-              </button>
-            ) : null}
-          </div>
-
-          {trimmedQuery ? (
-            <>
-              {searchResult.totalMatches === 0 ? (
-                <div className="px-2.5 py-4 text-[12px] leading-relaxed text-ink-secondary">
-                  No matches for &ldquo;{trimmedQuery}&rdquo;
-                </div>
-              ) : (
-                <>
-                  <button
-                    onClick={() => setSelectedSectionFilter(null)}
-                    aria-current={selectedSectionFilter === null ? "page" : undefined}
-                    className={cn(
-                      "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
-                      selectedSectionFilter === null
-                        ? "bg-control text-ink font-medium"
-                        : "text-ink-secondary hover:bg-control/50 hover:text-ink",
-                    )}
-                  >
-                    <Search size={14} className="shrink-0 text-accent" />
-                    <span className="truncate">All Results</span>
-                    <span className="ml-auto shrink-0 rounded-full bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent">
-                      {searchResult.totalMatches}
-                    </span>
-                  </button>
-                  {visibleSections.map(({ id, label, icon: Icon }) => {
-                    const matchCount = searchResult.matchCountBySection[id] ?? 0;
-                    const isSelected = selectedSectionFilter === id;
-                    return (
-                      <button
-                        key={id}
-                        onClick={() => setSelectedSectionFilter(isSelected ? null : id)}
-                        aria-current={isSelected ? "page" : undefined}
-                        className={cn(
-                          "flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px]",
-                          isSelected
-                            ? "bg-control text-ink font-medium"
-                            : "text-ink-secondary hover:bg-control/50 hover:text-ink",
-                        )}
-                      >
-                        <Icon size={14} className="shrink-0" />
-                        <span className="truncate">{label}</span>
-                        {matchCount > 0 ? (
-                          <span className="ml-auto shrink-0 rounded-full bg-hairline/60 px-1.5 py-0.5 text-[11px] font-medium text-ink-secondary">
-                            {matchCount}
-                          </span>
-                        ) : null}
-                      </button>
-                    );
-                  })}
-                </>
-              )}
-            </>
-          ) : (
-            SECTIONS.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: id })}
-                aria-current={section === id ? "page" : undefined}
-                className={cn(
-                  "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[14px]",
-                  section === id ? "bg-control text-ink" : "text-ink-secondary hover:bg-control/50 hover:text-ink",
-                )}
-              >
-                <Icon size={15} />
-                {label}
-              </button>
-            ))
-          )}
-        </nav>
+        <SettingsNav
+          section={section}
+          query={query}
+          onQueryChange={setQuery}
+          onClearQuery={() => {
+            setQuery("");
+            setSelectedSectionFilter(null);
+          }}
+          onEscapeEmpty={() => dispatch({ type: "toggleAppSettings", open: false })}
+          searchResult={searchResult}
+          selectedSectionFilter={selectedSectionFilter}
+          onSelectSectionFilter={setSelectedSectionFilter}
+          onSelectSection={(id) => dispatch({ type: "toggleAppSettings", open: true, section: id })}
+        />
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center justify-between px-5 py-3">
             <span className="text-[15px] font-semibold text-ink">
-              {trimmedQuery ? "Settings Search" : SECTIONS.find((s) => s.id === section)?.label}
+              {trimmedQuery ? "Settings Search" : SETTINGS_SECTIONS.find((s) => s.id === section)?.label}
             </span>
             <button
               onClick={() => dispatch({ type: "toggleAppSettings", open: false })}
