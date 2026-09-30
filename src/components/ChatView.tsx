@@ -78,6 +78,7 @@ import { useFocusMessage } from "@/lib/focus-message";
 import { groupActivityRuns } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { ToolLine } from "./ToolLine";
+import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
@@ -741,7 +742,7 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   }
   // everything that is not a bot⇄bot chip is a step in the work, and a step
   // is a log line — see ToolLine for why it stopped being a card
-  return <ToolLine message={message} actor={message.from?.name ?? bot.name} />;
+  return <ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />;
 }
 
 /** A frame of the bot's computer.
@@ -1036,6 +1037,12 @@ const MessagesList = memo(function MessagesList({
           <div key={m.id} className="contents" data-mid={m.id}>
             {newDay && <DaySeparator at={m.at} />}
             {row}
+            {/* what the harness put in front of the model for the turn this
+                message started, as quiet rows right under it; gated with the
+                tool calls, the other "under the hood" detail */}
+            {showToolCalls && m.contextInjections?.length ? (
+              <ContextInjectionRows entries={m.contextInjections} threadId={bot.threadId} />
+            ) : null}
           </div>
         );
       })}

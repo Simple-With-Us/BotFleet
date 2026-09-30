@@ -9,10 +9,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeEvent } from "../../server/contracts.ts";
 import { buildTrajectory, type Trajectory, type TrajectoryInput } from "@/lib/trajectory";
+import { clearItemIoCache, primeItemIo } from "@/lib/item-io";
 import { ThreadViewSwitch } from "./ThreadViewSwitch.tsx";
 import { STEP_WINDOW, TrajectoryPanel, TrajectoryView, type TrajectoryMode, type TrajectoryPanelProps } from "./TrajectoryView.tsx";
 import { TrajectoryTimeline } from "./TrajectoryTimeline.tsx";
@@ -301,6 +302,106 @@ describe("TrajectoryPanel: an opened step", () => {
     const tool = trajectory.rows.find((r) => r.title === "Read")!;
     const html = render({ trajectory, expanded: new Set([tool.id]) }, "calls");
     expect(text(html.slice(html.indexOf(`id="${tool.id}::detail"`)))).toContain("Result 42 lines");
+  });
+});
+
+// ── a step's full input and output ────────────────────────────────────
+describe("TrajectoryPanel: an opened step reads its full payload", () => {
+  afterEach(() => clearItemIoCache());
+
+  const ioEvents = (): RuntimeEvent[] => [
+    ev(0, { type: "turn.started" }),
+    ev(1, { type: "item.started", itemType: "tool", itemId: "toolu_1", title: "Bash", target: "ls" }),
+    ev(3, { type: "item.completed", itemType: "tool", itemId: "toolu_1", ok: true, detail: "3 files" }),
+    ev(5, { type: "turn.completed", ok: true }),
+  ];
+  const field = (value: string, over: Record<string, unknown> = {}) => ({ text: value, truncated: false, length: value.length, ...over });
+  const open = (trajectory: Trajectory, props: Partial<TrajectoryPanelProps> = {}, mode: TrajectoryMode = "duration") => {
+    const tool = trajectory.rows.find((r) => r.kind === "tool")!;
+    const html = render({ trajectory, expanded: new Set([tool.id]), threadId: "th", ...props }, mode);
+    return html.slice(html.indexOf(`id="${tool.id}::detail"`));
+  };
+
+  it("shows the whole input and output, labelled, instead of the clipped line", () => {
+    const trajectory = buildTrajectory(ioEvents());
+    primeItemIo(
+      { threadId: "th", itemId: "toolu_1", turnId: "t1" },
+      { status: "loaded", io: { itemId: "toolu_1", at: "x", input: field('{\n  "command": "ls"\n}'), output: field("a.ts\nb.ts\nc.ts") } },
+    );
+    const html = open(trajectory);
+    expect(html).toContain('data-io="in"');
+    expect(html).toContain('data-io="out"');
+    expect(html).toContain("a.ts\nb.ts\nc.ts");
+    // the clipped "Result 3 files" block is what it replaced
+    expect(text(html)).not.toContain("Result 3 files");
+  });
+
+  it("says when a field was cut", () => {
+    const trajectory = buildTrajectory(ioEvents());
+    primeItemIo(
+      { threadId: "th", itemId: "toolu_1", turnId: "t1" },
+      { status: "loaded", io: { itemId: "toolu_1", at: "x", output: field("x".repeat(100), { truncated: true, length: 9000 }) } },
+    );
+    expect(text(open(trajectory))).toContain("Truncated — showing first 100 of 9,000 characters");
+  });
+
+  it("keeps the clipped result and says nothing was recorded when it was not", () => {
+    const trajectory = buildTrajectory(ioEvents());
+    primeItemIo({ threadId: "th", itemId: "toolu_1", turnId: "t1" }, { status: "unavailable" });
+    const detail = text(open(trajectory));
+    expect(detail).toContain("Result 3 files");
+    expect(detail).toContain("Full input and output weren't recorded for this step.");
+  });
+
+  it("keeps the clipped result and shows a loading note while the payload is on its way", () => {
+    const detail = text(open(buildTrajectory(ioEvents())));
+    expect(detail).toContain("Result 3 files");
+    expect(detail).toContain("Loading the full input and output…");
+  });
+
+  it("reads it in the Calls table too", () => {
+    const trajectory = buildTrajectory(ioEvents());
+    primeItemIo(
+      { threadId: "th", itemId: "toolu_1", turnId: "t1" },
+      { status: "loaded", io: { itemId: "toolu_1", at: "x", output: field("from the table") } },
+    );
+    expect(open(trajectory, {}, "calls")).toContain("from the table");
+  });
+
+  it("asks for nothing when the tab has no thread to ask about", () => {
+    const html = open(buildTrajectory(ioEvents()), { threadId: undefined });
+    expect(html).not.toContain("data-io");
+    expect(html).not.toContain("Loading the full input and output");
+    expect(text(html)).toContain("Result 3 files");
+  });
+
+  it("shows an injected context row's full text, fetched when it opens", () => {
+    const { turnId: _none, ...stamp } = base(0);
+    const trajectory = buildTrajectory([
+      { ...stamp, type: "context.injected", itemId: "ctx-1", source: "memory", preview: "likes tea", bytes: 9 } as RuntimeEvent,
+      ...ioEvents(),
+    ]);
+    const row = trajectory.rows.find((r) => r.title === "Context injection · memory")!;
+    expect(row).toBeDefined();
+    primeItemIo(
+      { threadId: "th", itemId: "ctx-1" },
+      { status: "loaded", io: { itemId: "ctx-1", at: "x", text: field("likes tea\nand quiet") } },
+    );
+    const html = render({ trajectory, expanded: new Set([row.id]), threadId: "th" });
+    const detail = html.slice(html.indexOf(`id="${row.id}::detail"`));
+    expect(detail).toContain('data-io="text"');
+    expect(detail).toContain("likes tea\nand quiet");
+  });
+
+  it("lists an injection as a CONTEXT step beside the steps it preceded", () => {
+    const { turnId: _none, ...stamp } = base(0);
+    const trajectory = buildTrajectory([
+      { ...stamp, type: "context.injected", itemId: "ctx-1", source: "skill", preview: "Use the phone skill.", bytes: 20 } as RuntimeEvent,
+      ...ioEvents(),
+    ]);
+    const html = render({ trajectory, threadId: "th" });
+    expect(html).toContain("CONTEXT");
+    expect(text(html)).toContain("Context injection · skill 20 B Use the phone skill.");
   });
 });
 

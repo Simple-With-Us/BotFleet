@@ -24,6 +24,8 @@ import {
   type TurnSummary,
 } from "@/lib/trajectory";
 import { formatTokens, formatUsd } from "@/lib/usage";
+import type { ItemIoRef } from "@/lib/item-io";
+import { ItemIoBlocks, useItemIo } from "./ItemIoBlocks";
 
 const BADGE: Record<RowKind, string> = {
   user: "bg-accent/15 text-accent-text",
@@ -146,8 +148,51 @@ function Block({ label, text }: { label: string; text: string }) {
   );
 }
 
+/** The part of an opened step that is the step's own payload.
+ *
+ *  A step opened in place reads its full input and output from the harness
+ *  (only now — a closed step asks for nothing).  Until they arrive, or when
+ *  they were never recorded, the clipped Arguments and Result the list already
+ *  has are shown instead, with a line saying which it is.  A row with no thread
+ *  to ask (the pure renderer in a test) keeps the clipped blocks alone. */
+function StepPayload({ row, threadId }: { row: TrajectoryRow; threadId?: string }) {
+  const { detail } = row;
+  const ref: ItemIoRef | null = threadId && row.ioRef ? { threadId, itemId: row.ioRef.itemId, turnId: row.ioRef.turnId } : null;
+  // a step still running has no output written yet: show what is there, keep nothing
+  const io = useItemIo(ref, true, row.status !== "running");
+  const clippedArguments = detail.arguments ? <Block label="Arguments" text={detail.arguments} /> : null;
+  const clippedResult = detail.result ? <Block label="Result" text={detail.result} /> : null;
+  const clippedText = detail.text ? <Block label="Text" text={detail.text} /> : null;
+  if (!ref) {
+    return (
+      <>
+        {clippedArguments}
+        {clippedResult}
+        {clippedText}
+      </>
+    );
+  }
+  return (
+    <div className="mt-2 flex flex-col gap-2">
+      <ItemIoBlocks
+        state={io.state}
+        failed={row.status === "error"}
+        onRetry={io.retry}
+        fallback={
+          <>
+            {clippedArguments}
+            {clippedResult}
+            {clippedText}
+          </>
+        }
+        outputFallback={clippedResult}
+      />
+    </div>
+  );
+}
+
 /** A step opened in place: when, how long, and everything the line clipped. */
-export function StepDetail({ row, id }: { row: TrajectoryRow; id: string }) {
+export function StepDetail({ row, id, threadId }: { row: TrajectoryRow; id: string; threadId?: string }) {
   const { detail } = row;
   return (
     <div id={id} className="border-t border-hairline/20 bg-inset/60 px-3 pb-2.5 pt-2 text-[11.5px]">
@@ -174,14 +219,15 @@ export function StepDetail({ row, id }: { row: TrajectoryRow; id: string }) {
         ))}
       </dl>
       {detail.target ? <Block label="Target" text={detail.target} /> : null}
-      {detail.arguments ? <Block label="Arguments" text={detail.arguments} /> : null}
-      {detail.result ? <Block label="Result" text={detail.result} /> : null}
-      {detail.text ? <Block label="Text" text={detail.text} /> : null}
+      <StepPayload row={row} threadId={threadId} />
     </div>
   );
 }
 
 export interface ListControl {
+  /** The thread the steps belong to, so an opened step can read its full
+   *  input and output.  Absent in the pure renderer's tests. */
+  threadId?: string;
   expanded: ReadonlySet<string>;
   onToggle: (id: string) => void;
   /** The one step that is a tab stop. */
@@ -191,6 +237,7 @@ export interface ListControl {
 
 interface StepProps {
   row: TrajectoryRow;
+  threadId?: string;
   open: boolean;
   /** This step is the list's one tab stop. */
   tabStop: boolean;
@@ -200,7 +247,7 @@ interface StepProps {
 
 /** Primitives and stable callbacks only, so a list re-render (a keystroke in
  *  the search box, focus moving) leaves every step it did not change alone. */
-const Step = memo(function Step({ row, open, tabStop, onToggle, onFocusStep }: StepProps) {
+const Step = memo(function Step({ row, threadId, open, tabStop, onToggle, onFocusStep }: StepProps) {
   const detailId = `${row.id}::detail`;
   return (
     <li className={cn("border-b border-hairline/20", row.kind === "error" && "bg-danger/5")}>
@@ -234,7 +281,7 @@ const Step = memo(function Step({ row, open, tabStop, onToggle, onFocusStep }: S
           </span>
         ) : null}
       </button>
-      {open && <StepDetail row={row} id={detailId} />}
+      {open && <StepDetail row={row} id={detailId} threadId={threadId} />}
     </li>
   );
 });
@@ -243,6 +290,7 @@ function StepItem({ row, control }: { row: TrajectoryRow; control: ListControl }
   return (
     <Step
       row={row}
+      threadId={control.threadId}
       open={control.expanded.has(row.id)}
       tabStop={control.tabStopId === row.id}
       onToggle={control.onToggle}
@@ -388,6 +436,7 @@ export function CallsTable({
             <CallRows
               key={row.id}
               row={row}
+              threadId={control.threadId}
               open={control.expanded.has(row.id)}
               tabStop={control.tabStopId === row.id}
               onToggle={control.onToggle}
@@ -400,7 +449,7 @@ export function CallsTable({
   );
 }
 
-const CallRows = memo(function CallRows({ row, open, tabStop, onToggle, onFocusStep }: StepProps) {
+const CallRows = memo(function CallRows({ row, threadId, open, tabStop, onToggle, onFocusStep }: StepProps) {
   const detailId = `${row.id}::detail`;
   return (
     <>
@@ -439,7 +488,7 @@ const CallRows = memo(function CallRows({ row, open, tabStop, onToggle, onFocusS
       {open && (
         <tr className="border-b border-hairline/20">
           <td colSpan={HEADERS.length} className="p-0">
-            <StepDetail row={row} id={detailId} />
+            <StepDetail row={row} id={detailId} threadId={threadId} />
           </td>
         </tr>
       )}

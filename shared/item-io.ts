@@ -111,7 +111,9 @@ export function inputText(value: unknown): string | undefined {
       (trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"));
     if (wholeValue && trimmed.length <= ITEM_IO_CAPTURE_LIMIT * 4) {
       try {
-        return JSON.stringify(JSON.parse(trimmed), null, 2);
+        const indented = JSON.stringify(JSON.parse(trimmed), null, 2);
+        // a tool called with `{}` took no arguments: no IN block worth showing
+        return indented === "{}" || indented === "[]" ? undefined : indented;
       } catch {
         // a fragment of arguments still streaming in: show it as it is
         return value;

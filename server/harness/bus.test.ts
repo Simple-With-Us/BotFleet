@@ -9,6 +9,7 @@ import { EVENTS_DIR, ensureDirs } from "../config.ts";
 import type { RuntimeEvent } from "../contracts.ts";
 import { LOG_TEE_MAX_STRING_CHARS } from "../redact.ts";
 import { makeFakeDriver } from "../testing/fake-driver.ts";
+import type { ItemIoCapture } from "../../shared/item-io.ts";
 import type { AppendWriter } from "../transcript-retention.ts";
 import { EventBus } from "./bus.ts";
 
@@ -347,5 +348,139 @@ describe("EventBus", () => {
 
     expect(seen).toHaveLength(1);
     expect(seen[0].providerInstanceId).toBe("inst-2");
+  });
+});
+
+describe("EventBus tool input and output capture", () => {
+  const buses: EventBus[] = [];
+  const makeBus = (...args: ConstructorParameters<typeof EventBus>) => {
+    const bus = new EventBus(...args);
+    buses.push(bus);
+    return bus;
+  };
+  const recorder = () => {
+    const writes: Array<{ threadId: string; write: { itemId: string; turnId?: string; at?: string; io: ItemIoCapture } }> = [];
+    return { writes, record: (threadId: string, write: (typeof writes)[number]["write"]) => void writes.push({ threadId, write }) };
+  };
+  const logFor = (threadId: string) => {
+    const file = join(EVENTS_DIR, `${threadId}.ndjson`);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+
+  beforeEach(() => {
+    rmSync(EVENTS_DIR, { recursive: true, force: true });
+    ensureDirs();
+  });
+
+  afterEach(async () => {
+    await Promise.all(buses.splice(0).map((bus) => bus.flush()));
+  });
+
+  const started = (over: Partial<RuntimeEvent> = {}) =>
+    testEvent({ type: "item.started", itemType: "tool", itemId: "toolu_1", turnId: "turn-1", title: "Bash", ...over } as Partial<RuntimeEvent>);
+
+  it("hands a driver's capture to the store and strips it from everything downstream", async () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    const io: ItemIoCapture = { output: { text: "WHOLE-RESULT-MARKER", truncated: false, length: 19 } };
+    bus.publish(started({ io }));
+    await bus.flush();
+    expect(sink.writes).toEqual([
+      { threadId: "thread-1", write: expect.objectContaining({ itemId: "toolu_1", turnId: "turn-1", io }) },
+    ]);
+    // the wire and the subscribers never see it...
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toHaveProperty("io");
+    expect(JSON.stringify(seen)).not.toContain("WHOLE-RESULT-MARKER");
+    // ...and neither does the event log
+    expect(logFor("thread-1")).not.toContain("WHOLE-RESULT-MARKER");
+    expect(logFor("thread-1")).toContain("toolu_1");
+  });
+
+  it("strips a capture even when no store is attached", async () => {
+    const bus = makeBus();
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(started({ io: { input: { text: "x", truncated: false, length: 1 } } }));
+    await bus.flush();
+    expect(seen[0]).not.toHaveProperty("io");
+    expect(logFor("thread-1")).not.toContain('"io"');
+  });
+
+  it("derives the input from an HTTP engine's full JSON arguments", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    expect(sink.writes).toHaveLength(1);
+    expect(sink.writes[0].write.io.input?.text).toBe('{\n  "path": "a.ts"\n}');
+    expect(sink.writes[0].write.io.output).toBeUndefined();
+  });
+
+  it("files the settled arguments and the result of a completed tool together", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(
+      testEvent({
+        type: "item.completed",
+        itemType: "tool",
+        itemId: "call_1",
+        ok: true,
+        arguments: '{"n":1}',
+        io: { output: { text: "done", truncated: false, length: 4 } },
+      } as Partial<RuntimeEvent>),
+    );
+    expect(sink.writes[0].write.io.input?.text).toBe('{\n  "n": 1\n}');
+    expect(sink.writes[0].write.io.output?.text).toBe("done");
+  });
+
+  it("does not record an event with nothing to record, or no item id to key it by", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started());
+    bus.publish(started({ itemId: undefined, io: { output: { text: "x", truncated: false, length: 1 } } }));
+    bus.publish(testEvent({ type: "content.delta", streamKind: "assistant_text", delta: "hi" } as Partial<RuntimeEvent>));
+    expect(sink.writes).toEqual([]);
+  });
+
+  it("carries an injected context record's full text to the store and only its preview on the event", async () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(
+      testEvent({
+        type: "context.injected",
+        itemId: "ctx-1",
+        source: "memory",
+        preview: "likes tea",
+        bytes: 900,
+        io: { text: { text: "FULL-INJECTED-TEXT", truncated: false, length: 18 } },
+      } as Partial<RuntimeEvent>),
+    );
+    await bus.flush();
+    expect(sink.writes[0].write.io.text?.text).toBe("FULL-INJECTED-TEXT");
+    expect(JSON.stringify(seen)).not.toContain("FULL-INJECTED-TEXT");
+    expect(logFor("thread-1")).toContain("likes tea");
+    expect(logFor("thread-1")).not.toContain("FULL-INJECTED-TEXT");
+  });
+
+  it("delivers the event even when the store throws", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bus = makeBus(undefined, {
+      itemIo: {
+        record: () => {
+          throw new Error("store down");
+        },
+      },
+    });
+    const seen: RuntimeEvent[] = [];
+    bus.subscribe((event) => seen.push(event));
+    bus.publish(started({ io: { output: { text: "x", truncated: false, length: 1 } } }));
+    await bus.flush();
+    expect(seen).toHaveLength(1);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
   });
 });
