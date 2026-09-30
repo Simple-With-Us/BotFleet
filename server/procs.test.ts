@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { classifyVersionProbeFailure, execCli, isProbeTimeout, KNOWN_VERSION_MAX_AGE_MS, LastKnownVersion } from "./procs.ts";
+import { classifyVersionProbeFailure, execCli, isProbeTimeout, KNOWN_VERSION_MAX_AGE_MS, LastKnownAnswer } from "./procs.ts";
 
 type Result = { err: (Error & { timedOut?: boolean; killed?: boolean }) | null; stdout: string };
 
@@ -199,10 +199,10 @@ describe("classifyVersionProbeFailure", () => {
   });
 });
 
-describe("LastKnownVersion", () => {
+describe("LastKnownAnswer", () => {
   it("stands in for a probe that gave no answer only until it is too old", () => {
     let now = 1_000;
-    const remembered = new LastKnownVersion(KNOWN_VERSION_MAX_AGE_MS, () => now);
+    const remembered = new LastKnownAnswer<string>(KNOWN_VERSION_MAX_AGE_MS, () => now);
     expect(remembered.get()).toBeNull();
     remembered.record("2.1.284");
     now += KNOWN_VERSION_MAX_AGE_MS;
@@ -217,8 +217,17 @@ describe("LastKnownVersion", () => {
     expect(remembered.get()).toBe("2.1.285");
   });
 
+  it("remembers a false answer too (a sign-out), within the same limit", () => {
+    let now = 0;
+    const signedIn = new LastKnownAnswer<boolean>(1_000, () => now);
+    signedIn.record(false);
+    expect(signedIn.get()).toBe(false);
+    now = 1_001;
+    expect(signedIn.get()).toBeNull();
+  });
+
   it("forgets on a definitive failure", () => {
-    const remembered = new LastKnownVersion(60_000, () => 0);
+    const remembered = new LastKnownAnswer<string>(60_000, () => 0);
     remembered.record("1.0.0");
     remembered.forget();
     expect(remembered.get()).toBeNull();

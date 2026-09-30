@@ -34,7 +34,7 @@ import {
   classifyVersionProbeFailure,
   describeSpawnFailure,
   killCliTree,
-  LastKnownVersion,
+  LastKnownAnswer,
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
@@ -931,7 +931,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
     // Last good `--version`, so one probe that runs out of time on a busy
     // Mac does not flip a working pi to "not installed".
-    const lastKnownVersion = new LastKnownVersion();
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {

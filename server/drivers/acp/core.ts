@@ -27,7 +27,7 @@ import {
   describeSpawnFailure,
   execCli,
   killCliTree,
-  LastKnownVersion,
+  LastKnownAnswer,
   logProbeFailure,
   spawnCli,
 } from "../../procs.ts";
@@ -583,7 +583,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       };
       // Expires KNOWN_VERSION_MAX_AGE_MS after the CLI last answered, so a
       // CLI that wedges for good settles as "did not answer in time".
-      const lastKnownVersion = new LastKnownVersion();
+      const lastKnownVersion = new LastKnownAnswer<string>();
       /** One `--version` probe, with what went wrong when it produced no
        * version — so a timeout can be told apart from a missing binary. */
       const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>

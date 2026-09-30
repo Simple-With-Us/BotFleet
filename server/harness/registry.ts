@@ -65,11 +65,13 @@ const DEFAULT_PROBE_CONCURRENCY = 6;
  * from its last definitive snapshot.  The probe keeps running; its answer is
  * folded in (and pushed to clients) when it lands. */
 const DEFAULT_ENTRY_DEADLINE_MS = 30_000;
-/** How long a definitive snapshot may stand in for inconclusive probes.  A
- * driver's remembered `--version` ages out after the same span (procs.ts
- * LastKnownVersion), so an engine that never answers again settles as "did
- * not answer in time" once both have lapsed: at most twice this after the
- * CLI last really answered. */
+/** How long a definitive snapshot may stand in for inconclusive probes, and
+ * a sign-in for auth checks that give no answer (aged from the probe that
+ * actually answered it).  A driver's remembered `--version` and sign-in age
+ * out after the same span (procs.ts LastKnownAnswer), so an engine that never
+ * answers again settles as "did not answer in time", and its sign-in as
+ * unknown, once both have lapsed: at most twice this after the CLI last
+ * really answered. */
 const DEFINITIVE_MAX_AGE_MS = KNOWN_VERSION_MAX_AGE_MS;
 /** First look again at engines a describe left as "Checking" (their probe
  * gave no answer and nothing definitive stood in).  Doubles on each look
@@ -433,7 +435,7 @@ export class ProviderRegistry {
   private entryProbes = new Map<InstanceId, { startedAt: number; seq: number; gen: string; promise: Promise<DescribedInstance> }>();
   /** The last definitive answer per engine — never a timeout — which an
    * inconclusive probe falls back to, field by field. */
-  private lastDefinitive = new Map<InstanceId, { at: number; seq: number; info: DescribedInstance }>();
+  private lastDefinitive = new Map<InstanceId, { at: number; seq: number; info: DescribedInstance; authAt: number }>();
   /** The newest settled describe per instance, so a sweep that finishes after
    * a single-engine refresh (or a late probe) never puts an older answer back. */
   private latestSettled = new Map<InstanceId, { at: number; seq: number; gen: string; info: DescribedInstance }>();
@@ -503,7 +505,7 @@ export class ProviderRegistry {
         // must not look fresh to the DEFINITIVE_MAX_AGE_MS check.
         for (const info of instances as DescribedInstance[]) {
           if (info?.snapshot?.state === "available" && !info.snapshot.transient && !this.lastDefinitive.has(info.instanceId)) {
-            this.lastDefinitive.set(info.instanceId, { at, seq: 0, info });
+            this.lastDefinitive.set(info.instanceId, { at, seq: 0, info, authAt: at });
           }
         }
       }
@@ -863,7 +865,13 @@ export class ProviderRegistry {
     if (!current) return info;
     if (!raw.snapshot.transient && !this.thrownSnapshots.has(raw.snapshot)) {
       const baseline = this.lastDefinitive.get(raw.instanceId);
-      if (!baseline || baseline.seq <= seq) this.lastDefinitive.set(raw.instanceId, { at, seq, info });
+      if (!baseline || baseline.seq <= seq) {
+        // A sign-in borrowed from the baseline (this probe's own auth check
+        // gave no answer) keeps the age of the answer that set it, so
+        // repeated auth timeouts cannot renew an old verdict for ever.
+        const borrowedAuth = raw.snapshot.authenticated === undefined && typeof info.snapshot.authenticated === "boolean";
+        this.lastDefinitive.set(raw.instanceId, { at, seq, info, authAt: borrowedAuth && baseline ? baseline.authAt : at });
+      }
     }
     const latest = this.latestSettled.get(raw.instanceId);
     if (!latest || latest.gen !== gen || latest.seq <= seq) {
@@ -885,9 +893,14 @@ export class ProviderRegistry {
     opts: { keepPreviousQuota?: boolean } = {},
   ): DescribedInstance {
     const record = this.lastDefinitive.get(curr.instanceId);
-    if (!record || Date.now() - record.at > DEFINITIVE_MAX_AGE_MS) return curr;
+    const now = Date.now();
+    if (!record || now - record.at > DEFINITIVE_MAX_AGE_MS) return curr;
     const prev = record.info;
     if (prev.driverKind !== curr.driverKind || (prev.enabled !== false) !== (curr.enabled !== false)) return curr;
+    // Whether the baseline's sign-in is still young enough to stand in: it
+    // ages from the probe that actually answered it, not from later probes
+    // that only borrowed it.
+    const authFresh = now - record.authAt <= DEFINITIVE_MAX_AGE_MS;
     const thrown =
       this.thrownSnapshots.has(curr.snapshot) &&
       prev.snapshot.state === "available" &&
@@ -895,11 +908,12 @@ export class ProviderRegistry {
     if (curr.snapshot.transient || thrown) {
       // Quota (cooldowns, windows) was computed for THIS describe; only a
       // deadline fallback, which computed none, borrows the old one.
-      const { quota: previousQuota, ...previous } = prev.snapshot;
+      const { quota: previousQuota, authenticated: previousAuth, ...previous } = prev.snapshot;
       const quota = opts.keepPreviousQuota ? curr.snapshot.quota ?? previousQuota : curr.snapshot.quota;
+      const standIn = authFresh && previousAuth !== undefined ? { ...previous, authenticated: previousAuth } : previous;
       return {
         ...curr,
-        snapshot: quota ? { ...previous, quota } : previous,
+        snapshot: quota ? { ...standIn, quota } : standIn,
         models: curr.models.options.length > 0 ? curr.models : prev.models,
       };
     }
@@ -907,7 +921,8 @@ export class ProviderRegistry {
       curr.snapshot.state === "available" &&
       curr.snapshot.authenticated === undefined &&
       prev.snapshot.state === "available" &&
-      typeof prev.snapshot.authenticated === "boolean"
+      typeof prev.snapshot.authenticated === "boolean" &&
+      authFresh
     ) {
       return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };
     }

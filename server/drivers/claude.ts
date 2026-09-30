@@ -26,7 +26,7 @@ import {
   execCli,
   isProbeTimeout,
   killCliTree,
-  LastKnownVersion,
+  LastKnownAnswer,
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
@@ -1467,8 +1467,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     // Last definitive answers, so one probe that runs out of time on a busy
     // Mac does not flip a working, signed-in Claude to "not installed" or
     // "sign-in required".
-    const lastKnownVersion = new LastKnownVersion();
-    let lastKnownAuth: boolean | undefined;
+    const lastKnownVersion = new LastKnownAnswer<string>();
+    const lastKnownAuth = new LastKnownAnswer<boolean>();
     const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
@@ -1508,8 +1508,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         };
       }
       const probedAuth = await claudeSignedIn(config.cli, env);
-      if (probedAuth !== undefined) lastKnownAuth = probedAuth;
-      const authenticated = probedAuth ?? lastKnownAuth;
+      if (probedAuth !== undefined) lastKnownAuth.record(probedAuth);
+      // Only as old as KNOWN_VERSION_MAX_AGE_MS: past that, unknown.
+      const authenticated = probedAuth ?? lastKnownAuth.get() ?? undefined;
       // claudeEnvironment strips ANTHROPIC_API_KEY, so turns run on the
       // CLI's own login (Pro/Max): the cost it reports is what the call
       // WOULD bill, not a charge

@@ -43,7 +43,7 @@ import {
   describeSpawnFailure,
   execCli,
   killCliTree,
-  LastKnownVersion,
+  LastKnownAnswer,
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
@@ -1499,7 +1499,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
-    const lastKnownVersion = new LastKnownVersion();
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {

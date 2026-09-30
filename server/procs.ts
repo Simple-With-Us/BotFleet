@@ -16,9 +16,10 @@ import {
   type SpawnOptions,
 } from "node:child_process";
 
-/** How long a driver may answer a timed-out `--version` probe with the
- * last version a REAL probe returned.  Matches the registry's baseline limit,
- * so repeated timeouts cannot keep an old answer looking fresh. */
+/** How long a driver may answer a timed-out `--version` (or sign-in) probe
+ * with the last answer a REAL probe returned.  Matches the registry's
+ * baseline limit, so repeated timeouts cannot keep an old answer looking
+ * fresh. */
 export const KNOWN_VERSION_MAX_AGE_MS = 30 * 60_000;
 
 /** How long past a probe's soft `timeout` execCli waits for stdio to close before forcing the callback. */
@@ -215,13 +216,13 @@ export function isProbeTimeout(err: unknown): boolean {
   );
 }
 
-/** A CLI's last good `--version`, for a later probe that gets no answer (a
- * busy Mac, not a verdict).  It is only good for KNOWN_VERSION_MAX_AGE_MS
- * after the CLI last actually answered: past that, the probe's own "did not
- * answer in time" stands, so a CLI that has wedged for good stops reading as
- * available instead of living on its last answer for ever. */
-export class LastKnownVersion {
-  private value: string | null = null;
+/** A CLI's last real answer — its `--version`, or whether it is signed in —
+ * for a later probe that gets no answer (a busy Mac, not a verdict).  It is
+ * only good for KNOWN_VERSION_MAX_AGE_MS after the CLI last actually
+ * answered: past that, the probe's own "did not answer" stands, so a CLI that
+ * has wedged for good stops living on its last answer for ever. */
+export class LastKnownAnswer<T> {
+  private held: { value: T } | null = null;
   private confirmedAt = 0;
   // Plain fields, not parameter properties: the harness runs this file under
   // Node's type stripping, which rejects those.
@@ -233,21 +234,21 @@ export class LastKnownVersion {
     this.now = now;
   }
 
-  /** The CLI answered with this version. */
-  record(version: string): void {
-    this.value = version;
+  /** The CLI answered this. */
+  record(value: T): void {
+    this.held = { value };
     this.confirmedAt = this.now();
   }
 
   /** The CLI gave a definitive failure: nothing to stand on any more. */
   forget(): void {
-    this.value = null;
+    this.held = null;
   }
 
-  /** The remembered version while it may still stand in, else null. */
-  get(): string | null {
-    if (this.value !== null && this.now() - this.confirmedAt > this.maxAgeMs) this.value = null;
-    return this.value;
+  /** The remembered answer while it may still stand in, else null. */
+  get(): T | null {
+    if (this.held && this.now() - this.confirmedAt > this.maxAgeMs) this.held = null;
+    return this.held ? this.held.value : null;
   }
 }
 

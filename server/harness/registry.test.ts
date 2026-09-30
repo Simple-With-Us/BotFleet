@@ -1657,6 +1657,31 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     expect(again.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b:new");
   });
 
+  it("does not renew a borrowed sign-in: it ages from the probe that actually answered it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = Date.now();
+      const fake = makeFakeDriver({
+        snapshotImpl: (_input, call) =>
+          call === 1
+            ? { state: "available", version: "1.0.0", authenticated: true }
+            : // The auth check gave no answer; the version answered.
+              { state: "available", version: "1.0.0" },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      expect((await registry.describeFresh())[0].snapshot.authenticated).toBe(true);
+      vi.setSystemTime(start + 20 * 60_000);
+      expect((await registry.describeFresh())[0].snapshot.authenticated).toBe(true);
+      // 31 minutes since Claude last really said "signed in": no longer known,
+      // however recently a probe borrowed it.
+      vi.setSystemTime(start + 31 * 60_000);
+      expect((await registry.describeFresh())[0].snapshot.authenticated).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("looks again on its own at an engine it could only report as checking", async () => {
     const fake = makeFakeDriver({
       snapshotImpl: (_input, call) =>

@@ -21,7 +21,7 @@ import {
   describeSpawnFailure,
   execCli,
   killCliTree,
-  LastKnownVersion,
+  LastKnownAnswer,
   logProbeFailure,
   spawnCli,
 } from "../procs.ts";
@@ -857,8 +857,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
   // Last definitive answers: one probe that runs out of time on a busy Mac
   // must not flip a working, signed-in Codex to "not installed" or
   // "sign-in required".
-  const lastKnownVersion = new LastKnownVersion();
-  let lastKnownAuth: boolean | undefined;
+  const lastKnownVersion = new LastKnownAnswer<string>();
+  const lastKnownAuth = new LastKnownAnswer<boolean>();
   const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
     const env = childEnv();
@@ -899,9 +899,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         resolve(answer);
       });
     });
-    if (probedAuth !== undefined) lastKnownAuth = probedAuth;
+    if (probedAuth !== undefined) lastKnownAuth.record(probedAuth);
     // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
-    return { state: "available", version, authenticated: probedAuth ?? lastKnownAuth, billing: "subscription" };
+    return { state: "available", version, authenticated: probedAuth ?? lastKnownAuth.get() ?? undefined, billing: "subscription" };
   };
 
   return {
