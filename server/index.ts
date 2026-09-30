@@ -12673,7 +12673,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Fallbacks travel by FIXED position: `fallbacks[0]` is every bot's
       // Fallback 1, `fallbacks[1]` its Fallback 2, and so on up to the cap.  A
       // place is a selection (write it), null or absent (leave it), or
-      // `{ clear: true }` (remove that entry from every bot).  The older
+      // `{ clear: true }` (remove that entry from every bot).  A selection
+      // always lands at its own place: a bot whose chain has an empty place
+      // before it is skipped and named in `skipped`, never given the entry at
+      // a neighbouring place.  The older
       // `secondary` / `fallback1` / `fallback2` names are still read, as
       // aliases for places 0, 1 and 2 — by position, not compacted — so a
       // client that has not been updated yet cannot land in the wrong place.
@@ -12779,10 +12782,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (primary) next.instanceId = primary.instanceId, next.model = primary.model;
         if (touchesFallbacks(fallbackSlots)) {
           // Only the places the request named are written, each at its own
-          // position, so an empty picker leaves that place exactly as it was
-          // and a lone "Fallback 3" can never land on a bot's Fallback 1.
+          // position, so an empty picker leaves that place exactly as it was.
+          // A place that would leave an empty one before it (a lone
+          // "Fallback 3" on a bot with one fallback) cannot be honoured
+          // without landing on the wrong place, and a chain cannot hold a
+          // hole, so that bot keeps everything it had — primary included —
+          // and is named with the empty place in the response.
           const applied = applyFallbackSlots(existingFallbacks, fallbackSlots);
-          if (applied.length > 0) next.fallbacks = applied;
+          if (!applied.ok) {
+            skipped.push({ id: bot.id, name: bot.name, reason: applied.reason });
+            continue;
+          }
+          if (applied.fallbacks.length > 0) next.fallbacks = applied.fallbacks;
           else delete next.fallbacks;
         }
         if (bot.modelSelection.instanceId === next.instanceId &&
