@@ -1703,26 +1703,29 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
   // The owner's "Sign in to Claude" callout on a signed-in Mac: `auth status`
   // ran past its budget under load, and the timeout read as a sign-out.
   it("keeps the last known sign-in when an auth probe runs out of time", async () => {
-    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "400";
     await create();
     process.env.FAKE_CLAUDE_AUTH = "in";
     expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: true });
 
+    // Only the hanging probe gets the short budget: on a loaded machine the
+    // fake CLI itself can take seconds to start.
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
     process.env.FAKE_CLAUDE_AUTH = "hang";
     const slow = await instance.snapshot();
     expect(slow).toMatchObject({ state: "available", authenticated: true });
 
     // A definitive answer still wins over the remembered one.
+    delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
     process.env.FAKE_CLAUDE_AUTH = "out";
     expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: false });
-  }, 20_000);
+  }, 60_000);
 
   it("reports sign-in as unknown, never false, when the first auth probe gets no answer", async () => {
-    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "400";
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
     process.env.FAKE_CLAUDE_AUTH = "hang";
     await create();
     const snapshot = await instance.snapshot();
     expect(snapshot.state).toBe("available");
     expect(snapshot.authenticated).toBeUndefined();
-  }, 20_000);
+  }, 60_000);
 });

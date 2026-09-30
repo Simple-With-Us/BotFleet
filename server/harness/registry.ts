@@ -534,7 +534,10 @@ export class ProviderRegistry {
   private startSweep(notBefore: number): Promise<DescribedInstance[]> {
     const generation = this.generation;
     const startedAt = Date.now();
-    const promise = this.describeFresh({ notBefore: notBefore || startedAt }).then((result) => {
+    // notBefore 0: this caller accepts any answer still being produced, so a
+    // slow engine's probe left running by an earlier sweep is joined rather
+    // than spawned a second time.
+    const promise = this.describeFresh({ notBefore }).then((result) => {
       // A sweep that began before load()/removeInstance() describes a fleet
       // that no longer exists: its callers get it, the memo does not.
       if (generation === this.generation) this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
@@ -660,7 +663,9 @@ export class ProviderRegistry {
       transient: true,
       reason: `${entry.live?.displayName || entry.instanceId} did not answer in time`,
     });
-    const info = this.mergeWithDefinitive(shell);
+    // No quota was computed for this engine this time: keep what the last
+    // definitive answer knew rather than dropping a cap.
+    const info = this.mergeWithDefinitive(shell, { keepPreviousQuota: true });
     this.entryMeta.set(info, { at: Date.now(), gen: this.genOf(entry.instanceId) });
     return info;
   }
@@ -707,7 +712,10 @@ export class ProviderRegistry {
    *    definitive true/false instead of reading as signed out.
    *  - Anything definitive stands: a real sign-out, "Disabled in settings",
    *    "too old", a missing CLI. */
-  private mergeWithDefinitive(curr: DescribedInstance): DescribedInstance {
+  private mergeWithDefinitive(
+    curr: DescribedInstance,
+    opts: { keepPreviousQuota?: boolean } = {},
+  ): DescribedInstance {
     const record = this.lastDefinitive.get(curr.instanceId);
     if (!record || Date.now() - record.at > DEFINITIVE_MAX_AGE_MS) return curr;
     const prev = record.info;
@@ -717,9 +725,13 @@ export class ProviderRegistry {
       prev.snapshot.state === "available" &&
       curr.cliCandidates.length > 0;
     if (curr.snapshot.transient || thrown) {
+      // Quota (cooldowns, windows) was computed for THIS describe; only a
+      // deadline fallback, which computed none, borrows the old one.
+      const { quota: previousQuota, ...previous } = prev.snapshot;
+      const quota = opts.keepPreviousQuota ? curr.snapshot.quota ?? previousQuota : curr.snapshot.quota;
       return {
         ...curr,
-        snapshot: { ...prev.snapshot, quota: curr.snapshot.quota ?? prev.snapshot.quota },
+        snapshot: quota ? { ...previous, quota } : previous,
         models: curr.models.options.length > 0 ? curr.models : prev.models,
       };
     }

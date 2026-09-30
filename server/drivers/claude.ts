@@ -1389,7 +1389,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
     // Probe capabilities once per detected version.  A "no" expires after
     // 30 s so an upgrade is noticed without a restart; a probe that gave no
-    // answer (timeout) is not cached at all, and never reads as "too old".
+    // answer (timeout) is kept only 5 s, and never reads as "too old".
     type StrictMcpAnswer = "yes" | "no" | "unknown";
     let strictMcpProbe: { version: string; expiresAt: number; result: Promise<StrictMcpAnswer> } | undefined;
     const probeStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<StrictMcpAnswer> => {
@@ -1415,7 +1415,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       strictMcpProbe = probe;
       void probe.result.then((answer) => {
         if (answer === "yes") probe.expiresAt = Infinity;
-        else if (answer === "unknown") probe.expiresAt = 0;
+        // Not an answer: look again soon, but not on every call — each look
+        // is another process on an already busy Mac.
+        else if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
       });
       return probe.result;
     };

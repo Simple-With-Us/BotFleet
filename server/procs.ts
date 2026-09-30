@@ -18,6 +18,10 @@ import {
 
 /** How long past a probe's soft `timeout` execCli waits for stdio to close before forcing the callback. */
 const HARD_EXEC_GRACE_MS = 2_000;
+/** A deadline timer this late means the event loop was stalled. */
+const STALL_SLACK_MS = 500;
+/** How long a late deadline waits for queued child events before acting. */
+const STALL_GRACE_MS = 250;
 import type { Readable, Writable } from "node:stream";
 import { join } from "node:path";
 import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
@@ -111,42 +115,76 @@ export function execCli(
       // already closed
     }
   };
+  // The child answered and exited, but its output has not been delivered
+  // yet (a stall, or a grandchild still holding the pipe): let the close land
+  // on its own, then stop waiting on the pipes so execFile hands over what it
+  // read.
+  let draining = false;
+  const drainExited = () => {
+    if (draining) return;
+    draining = true;
+    setTimeout(() => {
+      if (!settled) stopReading();
+    }, 250).unref?.();
+  };
+  const giveUp = () => {
+    if (settled) return;
+    timedOut = true;
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+    finish(Object.assign(new Error(`\`${cli}\` did not exit within ${softTimeout}ms`), { killed: true }), "");
+  };
+  // A deadline timer that fires well after it was due means the event loop
+  // was stalled, and whatever the child did meanwhile may still be queued
+  // behind it.  Such a deadline looks once more after a short grace instead
+  // of acting on a stale view — once, so a loop that keeps stalling still
+  // settles.
+  const firedLate = (dueAt: number) => Date.now() - dueAt > STALL_SLACK_MS;
+  const onSoftDeadline = (dueAt: number, rearmed: boolean) => () => {
+    setImmediate(() => {
+      if (settled) return;
+      if (exited()) return drainExited();
+      if (!rearmed && firedLate(dueAt)) {
+        softTimer = setTimeout(onSoftDeadline(Date.now() + STALL_GRACE_MS, true), STALL_GRACE_MS);
+        return;
+      }
+      timedOut = true;
+      stopReading();
+      try {
+        child.kill(killSignal);
+      } catch {
+        // already gone
+      }
+    });
+  };
+  const onHardDeadline = (dueAt: number, rearmed: boolean) => () => {
+    setImmediate(() => {
+      if (settled) return;
+      if (exited()) {
+        // It did answer — a stall held the delivery back.  Drain first and
+        // only give up if even that does not settle.
+        drainExited();
+        setTimeout(giveUp, 1_000).unref?.();
+        return;
+      }
+      if (!rearmed && firedLate(dueAt)) {
+        hardTimer = setTimeout(onHardDeadline(Date.now() + STALL_GRACE_MS, true), STALL_GRACE_MS);
+        hardTimer.unref?.();
+        return;
+      }
+      giveUp();
+    });
+  };
   if (softTimeout) {
-    softTimer = setTimeout(() => {
-      setImmediate(() => {
-        if (settled) return;
-        if (exited()) {
-          // The child answered and exited; only a grandchild still holds its
-          // pipe.  Give the close a moment, then deliver what it printed.
-          setTimeout(() => {
-            if (!settled) stopReading();
-          }, 250).unref?.();
-          return;
-        }
-        timedOut = true;
-        stopReading();
-        try {
-          child.kill(killSignal);
-        } catch {
-          // already gone
-        }
-      });
-    }, softTimeout);
-    hardTimer = setTimeout(() => {
-      setImmediate(() => {
-        if (settled) return;
-        timedOut = true;
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
-        finish(
-          Object.assign(new Error(`\`${cli}\` did not exit within ${softTimeout}ms`), { killed: true }),
-          "",
-        );
-      });
-    }, softTimeout + HARD_EXEC_GRACE_MS);
+    const startedAt = Date.now();
+    softTimer = setTimeout(onSoftDeadline(startedAt + softTimeout, false), softTimeout);
+    hardTimer = setTimeout(
+      onHardDeadline(startedAt + softTimeout + HARD_EXEC_GRACE_MS, false),
+      softTimeout + HARD_EXEC_GRACE_MS,
+    );
     hardTimer.unref?.();
   }
 }
