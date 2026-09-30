@@ -145,6 +145,19 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
   });
 
+  it("files a step's own input (not its outcome fields) for the side store", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1")!;
+    const input = JSON.parse(started.io!.input!.text) as Record<string, unknown>;
+    expect(input).toEqual({ type: "commandExecution", command: "ls -la" });
+    // the headline is unchanged
+    expect(started).toMatchObject({ title: "ls -la", target: "ls -la" });
+    // this fake reports no output, so the completion captures none
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemId === "i1")?.io).toBeUndefined();
+  });
+
   it("keeps the full command when a Windows interpreter prefix is long", async () => {
     await create({ mode: "windows-command" });
     await instance.adapter.sendTurn({ threadId: "t-windows-command", text: "read notes" });

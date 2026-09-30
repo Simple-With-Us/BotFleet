@@ -487,6 +487,19 @@ describe("ACP turns (fake CLI)", () => {
     expect(recorder.events.some((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1" && "ok" in event && event.ok === true)).toBe(true);
   });
 
+  it("files a tool call's raw input and its content for the side store, beside the clipped headline", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "50";
+    await create(GrokAgentDriver, "quiet-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-tool-io", text: "build it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")!;
+    expect(started).toMatchObject({ title: "pnpm build", target: "pnpm build" });
+    expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
+    expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
   it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
     process.env.FAKE_ACP_DRIP_MS = "20";
     // no FAKE_ACP_DRIP_COUNT: drips forever, so the idle guard (5 s, never
