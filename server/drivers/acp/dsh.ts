@@ -30,12 +30,12 @@ import { dshWrapSpawn } from "./dsh-mcp.ts";
 
 export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Harness package still publishes
- * MiniMax-M2.7, but it is dropped here per the product decision (M3 dominates
- * on context and is the canonical DSH-hosted MiniMax row). */
+ * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
+ * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
 /** BotFleet DSH model catalog.
  *
  *  Owner-facing list (2026-09-27): DeepSeek V4 Pro, DeepSeek V4 Flash, then
- *  MiniMax M3.1 Flash Preview, M3, and M2.7 Highspeed.  DeepSeek's catalog is
+ *  MiniMax M3.1 Flash Preview and M2.7 Highspeed.  DeepSeek's catalog is
  *  only two models — `deepseek-flash` IS the image+video model, billed at the
  *  same rate as text (its image tokens bill "together with your text tokens"),
  *  so there is deliberately no third DeepSeek row for the multimodal variant.
@@ -43,8 +43,10 @@ export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
  *  both sit in `DSH_EXCLUDED_MODEL_IDS` so a profile written against the old
  *  catalog cannot re-add them to the picker.
  *
- *  `MiniMax-M2.7` is dropped per the product decision (M3 dominates on context
- *  and is the canonical DSH-hosted MiniMax row).
+ *  `MiniMax-M2.7` and `MiniMax-M3` are dropped per the product decision (M3.1
+ *  Flash Preview dominates on context and is the canonical DSH-hosted MiniMax
+ *  row); both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with
+ *  an older settings file cannot re-add them.
  *
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
@@ -79,12 +81,6 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
     },
     {
-      id: "MiniMax-M3",
-      label: "MiniMax-M3",
-      images: true,
-      contextWindow: 1_000_000,
-    },
-    {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
       images: true,
@@ -101,6 +97,10 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
+  // Superseded by MiniMax-M3.1-Flash-Preview.  Dropping it from the static
+  // options is not enough: a settings file written while M3 shipped still
+  // declares it, and the live-catalog union below would re-add it.
+  "MiniMax-M3",
   // Retired by the V4.1 rename.  A settings file written against the old
   // catalog still declares these, and the union below would otherwise
   // re-add them as stale duplicates of the V4.1 rows.

@@ -67,13 +67,12 @@ describe("DshAgentDriver config", () => {
     // Owner 2026-09-27.  DeepSeek's catalog is only two models: `deepseek-flash`
     // IS the image/video model, and its image tokens bill at the same rate as
     // text, so there is deliberately no third DeepSeek row.  MiniMax-M2.7
-    // (non-highspeed) stays out — M3 dominates it on context.
+    // (non-highspeed) stays out — M3.1 Flash Preview dominates it on context.
     expect(STATIC_DSH_MODELS.default).toBe("DeepSeek-V4.1-Flash");
     expect(STATIC_DSH_MODELS.options.map((option) => option.id)).toEqual([
       "DeepSeek-V4.1-Flash",
       "DeepSeek-V4.1-Pro",
       "MiniMax-M3.1-Flash-Preview",
-      "MiniMax-M3",
       "MiniMax-M2.7-highspeed",
     ]);
   });
@@ -89,13 +88,13 @@ describe("DshAgentDriver config", () => {
     expect(byId.get("DeepSeek-V4.1-Pro")?.badgeTitle).toContain("Switch to DeepSeek-V4.1-Flash to attach an image");
     expect(byId.get("DeepSeek-V4.1-Flash")?.images).toBe(true);
     expect(byId.get("DeepSeek-V4.1-Pro")?.images).toBe(false);
-    expect(byId.get("MiniMax-M3")?.images).toBe(true);
     // Preview: Token Plan / MiniMax Code only, so it needs a Token Plan key.
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.badge).toBe("Preview");
     // 2x Cost: $0.60/$2.40 against M3's $0.30/$1.20.
     expect(byId.get("MiniMax-M2.7-highspeed")?.badge).toBe("2x the $");
-    // M3 is the base rate, so it carries no cost chip.
-    expect(byId.get("MiniMax-M3")?.badge).toBeUndefined();
+    // M3 is out of the picker entirely (superseded by M3.1 Flash Preview);
+    // the stale-settings-union guard for it is covered below.
+    expect(byId.has("MiniMax-M3")).toBe(false);
   });
 
   it("gives every chip a hover explanation, since a bare chip is not a price", () => {
@@ -108,7 +107,6 @@ describe("DshAgentDriver config", () => {
 
   it("keeps every MiniMax row on a 1M-or-204k context window", () => {
     const byId = new Map(STATIC_DSH_MODELS.options.map((option) => [option.id, option]));
-    expect(byId.get("MiniMax-M3")?.contextWindow).toBe(1_000_000);
     expect(byId.get("MiniMax-M3.1-Flash-Preview")?.contextWindow).toBe(1_000_000);
     expect(byId.get("MiniMax-M2.7-highspeed")?.contextWindow).toBe(204_800);
   });
@@ -116,8 +114,8 @@ describe("DshAgentDriver config", () => {
   it("encodes the ACP model option with its provider while preserving the picker id", () => {
     expect(dshModelOptionValue("DeepSeek-V4.1-Pro")).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
     expect(dshModelIdFromOptionValue('["deepseek-official","DeepSeek-V4.1-Pro"]')).toBe("DeepSeek-V4.1-Pro");
-    expect(dshModelOptionValue("MiniMax-M3")).toBe('["minimax","MiniMax-M3"]');
-    expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3"]')).toBe("MiniMax-M3");
+    expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe('["minimax","MiniMax-M3.1-Flash-Preview"]');
+    expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3.1-Flash-Preview"]')).toBe("MiniMax-M3.1-Flash-Preview");
     expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4.1-Pro"]')).toBeNull();
     expect(dshModelIdFromOptionValue("DeepSeek-V4.1-Pro")).toBeNull();
   });
@@ -570,7 +568,7 @@ describe("readDshModelCatalog", () => {
   });
 
   it("adds a model the static catalog has never heard of", () => {
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n        - id: MiniMax-M4\n"));
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n        - id: MiniMax-M4\n"));
     const catalog = readDshModelCatalog({ HOME: home });
     expect(catalog.options.map((option) => option.id)).toContain("MiniMax-M4");
   });
@@ -579,7 +577,7 @@ describe("readDshModelCatalog", () => {
     // This profile configures only the minimax provider.  deepseek-v4-flash is
     // the static default and is still reachable, so the live read must not drop
     // it -- that would silently remove a working engine from the picker.
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n"));
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n"));
     const catalog = readDshModelCatalog({ HOME: home });
     for (const id of STATIC_IDS) expect(catalog.options.map((option) => option.id)).toContain(id);
   });
@@ -621,29 +619,33 @@ describe("readDshModelCatalog", () => {
   });
 
   it("keeps the hand-written label for a model it already knows", () => {
-    const known = STATIC_DSH_MODELS.options.find((option) => option.id === "MiniMax-M3")!;
-    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3\n          name: Renamed By Profile\n"));
-    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3");
+    const known = STATIC_DSH_MODELS.options.find((option) => option.id === "MiniMax-M3.1-Flash-Preview")!;
+    writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n          name: Renamed By Profile\n"));
+    const row = readDshModelCatalog({ HOME: home }).options.find((option) => option.id === "MiniMax-M3.1-Flash-Preview");
     expect(row?.label).toBe(known.label);
     expect(row?.images).toBe(true);
   });
 
-  it("still drops MiniMax-M2.7 when the settings file offers it", () => {
+  it("still drops MiniMax-M2.7 and MiniMax-M3 when the settings file offers them", () => {
     writeSettings(llmPiAi("    minimax:\n      models:\n        - id: MiniMax-M2.7\n        - id: MiniMax-M3\n"));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).not.toContain("MiniMax-M2.7");
+    // M3 is excluded the same way: dropping it from the static options is not
+    // enough, because a stale settings row would re-add it through the union.
+    expect(ids).not.toContain("MiniMax-M3");
     expect(ids).toContain("MiniMax-M2.7-highspeed");
   });
 
   it("merges several provider blocks into one catalog", () => {
     writeSettings(llmPiAi(
-      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3\n",
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n    minimax:\n      models:\n        - id: MiniMax-M3.1-Flash-Preview\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).toContain("DeepSeek-V4.1-Pro");
-    expect(ids).toContain("MiniMax-M3");
+    expect(ids).toContain("MiniMax-M3.1-Flash-Preview");
     // The fixture's pre-rename id must not survive the union as a stale row.
     expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids).not.toContain("MiniMax-M3");
   });
 
   it("drops every retired pre-rename DeepSeek id a stale profile still offers", () => {
