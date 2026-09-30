@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * The Computer engine's own callout, pinned the way MiniMaxCallout.test.ts
+ * The ASCII.dev Box engine's own callout, pinned the way MiniMaxCallout.test.ts
  * pins MiniMax's.
  *
  * `boxAgent` declares exactly one capability (server/drivers/boxagent.ts:
@@ -11,8 +11,9 @@ import { join } from "node:path";
  * workspaces in server/index.ts, and `respondToRequest` answers
  * "unavailable".  So a bot on this engine really does have no harness tools,
  * no peers, no approval cards, no memory and no skills — and until this
- * callout the app said nothing about it, which made "Computer" the least
- * capable engine in the fleet and the one with the most inviting name.
+ * callout the app said nothing about it, which made a generic-sounding name the least
+ * capable engine in the fleet and the one with the most inviting label.  It is
+ * called ASCII.dev Box now, after where it runs.
  *
  * These assertions exist so that stays said.  If the engine ever gains one
  * of those, delete the claim here in the same change that grants it.
@@ -42,7 +43,7 @@ function expectNoCollapsingSentenceGaps(box: string): void {
   }
 }
 
-describe("Computer engine callout — EnginesSettings row", () => {
+describe("ASCII.dev Box engine callout — EnginesSettings row", () => {
   const box = engineBox(ENGINES_SETTINGS_SRC, 'instance.driverKind === "boxAgent"');
 
   it("names where the turn actually runs", () => {
@@ -65,7 +66,7 @@ describe("Computer engine callout — EnginesSettings row", () => {
   });
 });
 
-describe("Computer engine callout — ModelPicker rail", () => {
+describe("ASCII.dev Box engine callout — ModelPicker rail", () => {
   const box = engineBox(MODEL_PICKER_SRC, 'railInstance.driverKind === "boxAgent"');
 
   it("says the same thing in one sentence", () => {
