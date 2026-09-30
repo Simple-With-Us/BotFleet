@@ -11732,7 +11732,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: "limit must be a positive whole number" });
       }
       const limit = parsedLimit;
-      return json(res, 200, readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit }));
+      // `view=trajectory` is the Trajectory tab's read: runtime log only, no
+      // streamed deltas, long fields clipped (see readThreadEvents).  Any
+      // other value is a mistake rather than a fallback.
+      const view = url.searchParams.get("view");
+      if (view !== null && view !== "trajectory") return json(res, 400, { error: "view must be trajectory" });
+      return json(
+        res,
+        200,
+        readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit, runtimeOnly: view === "trajectory" }),
+      );
     }
 
     // ── the fleet-wide authorization decision log ──

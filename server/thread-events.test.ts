@@ -412,6 +412,111 @@ describe("readThreadEvents", () => {
     expect(decoded).toBeLessThanOrEqual(window + 64 * 1024);
   });
 
+  // The Trajectory tab reads the runtime log alone: no native tee, no streamed
+  // deltas (a paragraph is hundreds of them and the settled item carries the
+  // text), long fields clipped, and a flag for records still on disk behind
+  // the page.
+  describe("runtimeOnly (the Trajectory tab's read)", () => {
+    const delta = (i: number) =>
+      runtime({ eventId: `d${i}`, type: "content.delta", createdAt: String(i).padStart(6, "0"), streamKind: "assistant_text", delta: "x" });
+    const started = (id: string, at: string) => runtime({ eventId: id, type: "turn.started", createdAt: at });
+
+    it("never opens the native tee and leaves the streamed deltas out", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(join(nativeDir, "t1.ndjson"), line({ at: "000002", dir: "in", source: "claude", msg: { type: "user" } }));
+      writeFileSync(
+        join(eventsDir, "t1.ndjson"),
+        line(started("e1", "000001")) + line(delta(2)) + line(delta(3)) + line(started("e4", "000004")),
+      );
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
+      expect(page.entries.map((e) => [e.kind, (e.data as { eventId: string }).eventId])).toEqual([
+        ["runtime", "e1"],
+        ["runtime", "e4"],
+      ]);
+      // the line count still counts every line, deltas included
+      expect(page.total).toEqual({ runtime: 4, native: 0 });
+      expect(page.older).toBe(false);
+    });
+
+    it("keeps looking back past deltas so the limit counts steps, not tokens", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      let body = line(started("first", "000000"));
+      for (let i = 1; i <= 50; i++) body += line(delta(i));
+      body += line(started("last", "000099"));
+      writeFileSync(join(eventsDir, "t1.ndjson"), body);
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true, limit: 2 });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["first", "last"]);
+      expect(page.older).toBe(false);
+    });
+
+    it("reports older records when the page is full and the file holds more", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      let body = "";
+      for (let i = 0; i < 5; i++) body += line(started(`e${i}`, String(i).padStart(6, "0")));
+      writeFileSync(join(eventsDir, "t1.ndjson"), body);
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true, limit: 3 });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["e2", "e3", "e4"]);
+      expect(page.older).toBe(true);
+    });
+
+    it("reports older records when the rotated generation holds lines the full live page did not need", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(join(eventsDir, "t1.ndjson.1"), line(started("old", "000001")));
+      writeFileSync(join(eventsDir, "t1.ndjson"), line(started("a", "000002")) + line(started("b", "000003")));
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true, limit: 2 });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["a", "b"]);
+      expect(page.older).toBe(true);
+    });
+
+    it("says nothing is older when the rotated generation completed the page and both were read whole", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(join(eventsDir, "t1.ndjson.1"), line(started("old", "000001")));
+      writeFileSync(join(eventsDir, "t1.ndjson"), line(started("a", "000002")));
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true, limit: 5 });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["old", "a"]);
+      expect(page.older).toBe(false);
+    });
+
+    it("clips long free-text fields and drops the raw payload, leaving ids and times alone", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(
+        join(eventsDir, "t1.ndjson"),
+        line(
+          runtime({
+            eventId: "big",
+            type: "item.started",
+            itemType: "tool",
+            itemId: "i1",
+            turnId: "t",
+            createdAt: "000001",
+            title: "write_file",
+            arguments: "a".repeat(50_000),
+            raw: { source: "x", payload: { huge: "y".repeat(50_000) } },
+          }),
+        ),
+      );
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
+      const event = page.entries[0]!.data as { arguments: string; itemId: string; createdAt: string; raw?: unknown; title: string };
+      expect(event.arguments.length).toBeLessThanOrEqual(2000);
+      expect(event.arguments.endsWith("…")).toBe(true);
+      expect(event).toMatchObject({ itemId: "i1", createdAt: "000001", title: "write_file" });
+      expect(event.raw).toBeUndefined();
+    });
+
+    it("does not add the older flag to the Inspector's own response", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(join(eventsDir, "t1.ndjson"), line(started("e1", "000001")));
+      expect(readThreadEvents({ eventsDir, nativeDir, threadId: "t1" })).not.toHaveProperty("older");
+    });
+  });
+
   it("refuses a thread id that could escape the log directory", () => {
     const eventsDir = tmp();
     const nativeDir = tmp();
