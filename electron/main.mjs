@@ -2068,8 +2068,8 @@ function setupApplicationMenu() {
                 click: () => sendToRenderer("open-settings"),
               },
               // "<Section Name>  (<descriptor>...)" — the leading word is the
-              // section's own name in Settings (SECTIONS in
-              // src/components/SettingsModal.tsx) so the menu and the in-app
+              // section's own name in Settings (SETTINGS_SECTIONS in
+              // src/components/SettingsNav.tsx) so the menu and the in-app
               // sidebar agree, and every id below must be a real
               // AppSettingsSection. There is no "keys" section: API keys live
               // in Connections, which is why both key entries land there.

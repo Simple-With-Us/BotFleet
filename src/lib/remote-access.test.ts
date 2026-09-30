@@ -31,6 +31,7 @@ const SHIPPED_SURFACES = [
   ["src/lib/remote-access.ts", join(here, "remote-access.ts")],
   ["src/components/RemoteAccessSection.tsx", join(here, "../components/RemoteAccessSection.tsx")],
   ["src/components/SettingsModal.tsx", join(here, "../components/SettingsModal.tsx")],
+  ["src/components/SettingsNav.tsx", join(here, "../components/SettingsNav.tsx")],
 ] as const;
 
 /** Banned as a literal AND as a reassembly, because joining the pieces of a
@@ -50,10 +51,10 @@ describe("Remote Access ships no owner-private host or name", () => {
   });
 
   it("keeps the personal name out of the Settings search keywords", () => {
-    const settings = readFileSync(join(here, "../components/SettingsModal.tsx"), "utf8");
+    const nav = readFileSync(join(here, "../components/SettingsNav.tsx"), "utf8");
     // The Remote Access entry used to answer a search for the owner's tunnel
     // by name, so the name shipped in a public app's search index.
-    const entry = settings.split("\n").find((line) => line.includes('id: "remote"')) ?? "";
+    const entry = nav.split("\n").find((line) => line.includes('id: "remote"')) ?? "";
     expect(entry).toContain('id: "remote"');
     expect(entry.toLowerCase()).not.toContain("jay");
   });
@@ -96,8 +97,12 @@ describe("Remote Access copy", () => {
 
   it("wires a Settings sidebar section to this install's configured address", () => {
     const settings = readFileSync(join(here, "../components/SettingsModal.tsx"), "utf8");
-    expect(settings).toContain('id: "remote"');
-    expect(settings).toContain('label: "Remote Access"');
+    const nav = readFileSync(join(here, "../components/SettingsNav.tsx"), "utf8");
+    expect(nav).toContain('id: "remote"');
+    // The tab says "Remote" so it fits on one line in the rail; the card it
+    // opens keeps the full "Remote Access" heading.
+    expect(nav).toContain('label: "Remote"');
+    expect(nav).not.toContain('label: "Remote Access"');
     expect(settings).toContain('<RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
     expect(settings).toContain('section === "remote" && <RemoteAccessSection configuredUrl={remoteAccessUrl} highlightClass={highlightClass} />');
     // The address is the saved per-install one, read from the config the

@@ -200,10 +200,10 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
   {
     id: "remote:access",
     sectionId: "remote",
-    sectionLabel: "Remote Access",
+    sectionLabel: "Remote",
     title: "Remote Access",
-    subtitle: "Reach BotFleet from the Companion phone app or route incoming webhooks when away from your desk.",
-    keywords: ["remote access", "remote url", "public url", "ingress", "tunnel", "reachability", "test connection", "health check", "cloudflare", "companion"],
+    subtitle: "Open BotFleet on this Mac from another computer through your tunnel, and check that its address is reachable.",
+    keywords: ["remote", "remote access", "remote url", "public url", "ingress", "tunnel", "reachability", "test connection", "health check", "cloudflare", "browser", "other computer"],
     domId: "setting-remote-access",
     badge: "Networking",
   },
