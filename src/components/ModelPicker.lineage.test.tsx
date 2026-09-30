@@ -93,6 +93,28 @@ describe("ModelPicker chip", () => {
   });
 });
 
+describe("open picker", () => {
+  it("puts the Latest rows first and never offers a superseded model", () => {
+    const html = renderToStaticMarkup(
+      createElement(ModelPicker, {
+        bot: bot({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }),
+        contained: true,
+        initialOpen: true,
+        initialRailId: "claude",
+      }),
+    );
+    // The open menu only: the trigger chip above it names the saved model.
+    expect(html).toContain('role="dialog"');
+    const menu = text(html.slice(html.indexOf('role="dialog"')));
+    expect(menu).toContain("Latest Sonnet Claude Sonnet 5.5");
+    expect(menu.indexOf("Latest Sonnet")).toBeLessThan(menu.indexOf("Suggested"));
+    // Opus 5 and Sonnet 5 are older members of classes the catalog has a
+    // newer member of, so neither is a row.
+    expect(menu).not.toMatch(/Claude Opus 5(?!\.5)/);
+    expect(menu).not.toMatch(/Claude Sonnet 5(?!\.5)/);
+  });
+});
+
 describe("LatestModelRows", () => {
   it("lists one Latest row per class with the model it runs now, checking the saved one", () => {
     const html = renderToStaticMarkup(
