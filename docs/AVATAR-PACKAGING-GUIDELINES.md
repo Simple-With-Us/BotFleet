@@ -5,7 +5,7 @@ This document provides the definitive framework, rules, and filesystem structure
 ## 1. The State Machine (How it works)
 
 BotFleet avatars are not just static images; they are reactive, state-driven animated characters. 
-The avatar player uses a 3-part animation lifecycle to transition smoothly between actions - but only for the 13 transition expressions listed in section 2. The other 27 expressions render as transparent stills with no transition GIFs.
+The avatar player uses a 3-part animation lifecycle to transition smoothly between actions - but only for the 13 transition expressions listed in section 2.  The other 27 expressions have no enter or return GIF, so they never run that lifecycle; they render from their still, or from a `_hold.gif` when one is supplied.
 
 1. **Enter** (`[action]_enter.gif`): A smooth transition *from* the idle/resting state *into* the action.
 2. **Hold** (`[action]_hold.gif`): A looping animation that plays continuously while the action is happening.
@@ -16,14 +16,14 @@ The avatar player uses a 3-part animation lifecycle to transition smoothly betwe
 
 ## 2. Core Actions & Expressions (The 40-Expression Contract)
 
-The runtime source of truth is `src/components/tv-face/manifest.ts`: `TVFACE_MANIFEST` maps 50 bot states onto **40 unique expressions**, and `TVFACE_HAS_ENTER_RETURN` names the **13 expressions that ship transition GIFs**. This doc reflects that manifest; verify against it before generating assets.
+The runtime source of truth is `src/components/tv-face/manifest.ts`: `TVFACE_MANIFEST` maps 50 bot states onto **40 unique expressions**, and `TVFACE_HAS_ENTER_RETURN` names the **13 expressions that ship transition GIFs**.  This doc reflects that manifest; verify against it before generating assets.
 
-### The 13 transition expressions (enter + hold + return GIFs, plus a still)
+### The 13 Transition Expressions (Enter + Hold + Return GIFs, Plus a Still)
 `listening`, `thinking`, `typing`, `speaking`, `computer`, `fleet`, `crash`, `memory`, `tools`, `routine`, `screen`, `git`, `webhook`
 
 Each of these requires `_enter.gif`, `_hold.gif`, and `_return.gif` plus a transparent still: **39 GIFs + 13 stills per skin**.
 
-### The 27 non-transition expressions (still required, hold optional)
+### The 27 Non-Transition Expressions (Still Required, Hold Optional)
 `resting`, `sleeping`, `waking`, `searching`, `working`, `happy`, `excited`, `celebrate`, `confused`, `curious`, `sad`, `alerting`, `angry`, `scared`, `surprised`, `suspicious`, `shy`, `bored`, `drowsy`, `proud`, `playful`, `laughing`, `loading`, `sending`, `receiving`, `notifying`, `powering_down`
 
 A transparent `[expression].png` is **required** for each of these.  A `_hold.gif` is **optional, but the player uses it whenever it is present**: `planFrame()` returns a `hold` step for these expressions on the same-state, rest-to-active, and active-to-active paths, and `pathForStep()` then requests `[expression]_hold.gif`, falling back to the still only after that request fails.  So a missing hold is not a broken avatar — it is a static one — but shipping no holds for a pack the default one already covers means a guaranteed 404 on every request.  The default skin ships 12 non-transition holds: `alerting`, `angry`, `excited`, `happy`, `laughing`, `loading`, `notifying`, `resting`, `searching`, `sleeping`, `surprised`, `working`.  Enter and return are the parts that genuinely do not apply here: `TVFACE_HAS_ENTER_RETURN` covers only the 13 expressions in the previous section, and `planFrame()` never plans an enter or return outside that set.  Per skin: **27 stills**, plus any holds you choose to add.
