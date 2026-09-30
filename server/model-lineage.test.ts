@@ -18,16 +18,20 @@ const CODEX_LIVE = {
   options: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"].map((id) => ({ id, label: id })),
 };
 
-const instances = {
+interface FixtureInstance {
+  driverKind: string;
+  models: { default: string; options: Array<{ id: string; label: string; custom?: boolean }> };
+}
+
+const instances: Record<string, FixtureInstance> = {
   claude: { driverKind: "claudeAgent", models: STATIC_CLAUDE_MODELS },
   codex: { driverKind: "codex", models: CODEX_LIVE },
   grok: { driverKind: "grokAgent", models: STATIC_GROK_MODELS },
   grokApi: { driverKind: "grok", models: { default: "grok-4.7", options: [{ id: "grok-4.7", label: "Grok 4.7" }] } },
   minimax: { driverKind: "minimax", models: { default: "MiniMax-M3", options: [{ id: "MiniMax-M3", label: "MiniMax M3" }] } },
-} as const;
+};
 
-const contextFor = (id: string): LineageContext | undefined =>
-  lineageContextFor(instances[id as keyof typeof instances] as never);
+const contextFor = (id: string): LineageContext | undefined => lineageContextFor(instances[id]);
 
 describe("catalog authority", () => {
   it("treats the Codex static fallback as non-authoritative and a live listing as live", () => {
@@ -50,13 +54,11 @@ describe("catalog authority", () => {
 
 describe("presentDescribedInstances", () => {
   it("hides Grok 4.5 and 4.6 and superseded Claude rows, and marks live catalogs", () => {
-    const minimax = { instanceId: "minimax", ...instances.minimax };
-    const presented = presentDescribedInstances([
-      { instanceId: "grok", ...instances.grok },
-      { instanceId: "claude", ...instances.claude },
-      { instanceId: "codex", ...instances.codex },
-      minimax,
-    ]);
+    const described: Array<FixtureInstance & { instanceId: string }> = ["grok", "claude", "codex", "minimax"].map(
+      (instanceId) => ({ instanceId, ...instances[instanceId]! }),
+    );
+    const minimax = described[3];
+    const presented = presentDescribedInstances(described);
     expect(presented[0]!.models.options.map((o) => o.id)).toEqual(["grok-4.7", "grok-4.7-build-fast"]);
     expect(presented[1]!.models.options.map((o) => o.id)).toEqual([
       "claude-fable-5-1",

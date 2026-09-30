@@ -12767,7 +12767,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (typeof candidate.instanceId !== "string" || typeof candidate.model !== "string") {
           throw Object.assign(new Error("model slot must include instanceId and model"), { status: 400 });
         }
-        return { instanceId: candidate.instanceId, model: candidate.model };
+        // A "Latest <Class>" default stays floating on every bot it lands on.
+        return {
+          instanceId: candidate.instanceId,
+          model: candidate.model,
+          ...(typeof candidate.latest === "string" ? { latest: candidate.latest } : {}),
+        };
       };
       const readFallbackSlot = (value: unknown): FallbackSlot => {
         if (
@@ -12844,7 +12849,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       for (const bot of store.bots) {
         const next: ModelSelection = { ...bot.modelSelection };
         const existingFallbacks = next.fallbacks ?? [];
-        if (primary) next.instanceId = primary.instanceId, next.model = primary.model;
+        if (primary) {
+          next.instanceId = primary.instanceId;
+          next.model = primary.model;
+          // A "Latest <Class>" default floats on every bot it lands on; a
+          // pinned default pins.
+          if (primary.latest) next.latest = primary.latest;
+          else delete next.latest;
+        }
         if (touchesFallbacks(fallbackSlots)) {
           // Only the places the request named are written, each at its own
           // position, so an empty picker leaves that place exactly as it was
@@ -12855,6 +12867,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         if (bot.modelSelection.instanceId === next.instanceId &&
             bot.modelSelection.model === next.model &&
+            (bot.modelSelection.latest ?? null) === (next.latest ?? null) &&
             JSON.stringify(bot.modelSelection.fallbacks ?? []) === JSON.stringify(next.fallbacks ?? [])) {
           continue;
         }
@@ -12880,8 +12893,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // must not fail the whole request the way the per-bot route's 409
         // does — the operator asked for the fleet — so that bot keeps exactly
         // what it had and is named, with its real reason, in the response.
+        // `next` is built from the bot's own saved chain plus the request, so
+        // every entry already says whether it floats.  An explicit `latest:
+        // null` on the pinned ones keeps the gate from carrying an older
+        // "Latest" forward onto a pinned default, which it does only for
+        // clients that predate the field.
+        const explicitLatest = (entry: ModelSelection) => ({ ...entry, latest: entry.latest ?? null });
         const gate = checkedModelSelection(
-          next,
+          { ...explicitLatest(next), ...(next.fallbacks ? { fallbacks: next.fallbacks.map(explicitLatest) } : {}) },
           { selection: bot.modelSelection, busy: Boolean(bot.busy) },
           false,
         );
@@ -12889,7 +12908,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           skipped.push({ id: bot.id, name: bot.name, reason: gate.error });
           continue;
         }
-        const patched = store.patchBot(bot.id, { modelSelection: next, activeModelSelection: next });
+        // The gate's copy: lineage-reconciled (retired and superseded ids
+        // moved forward, Latest entries resolved), exactly like a per-bot PATCH.
+        const patched = store.patchBot(bot.id, { modelSelection: gate.selection, activeModelSelection: gate.selection });
         if (patched) updated.push({ id: patched.id, bot: wireBot(patched) });
       }
       for (const { bot } of updated) broadcast({ kind: "bot", bot });
