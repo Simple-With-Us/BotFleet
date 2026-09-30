@@ -144,6 +144,25 @@ describe("checkLineageWrite", () => {
     expect(write(edited, saved).ok).toBe(true);
   });
 
+  it("lets one saved dead target cover one slot only, not a duplicate added by the write", () => {
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [{ instanceId: "grokApi", model: "grok-3-mini" }],
+    };
+    const duplicated: ModelSelection = {
+      ...saved,
+      fallbacks: [{ instanceId: "grokApi", model: "grok-3-mini" }, { instanceId: "grokApi", model: "grok-3-mini" }],
+    };
+    expect(write(duplicated, saved)).toEqual({
+      ok: false,
+      error: 'retired model "grok-3-mini" in fallback 2 — choose another model',
+    });
+    // Two saved copies still grandfather two.
+    const savedTwice: ModelSelection = { ...saved, fallbacks: duplicated.fallbacks };
+    expect(write({ ...savedTwice, model: "claude-opus-5-5" }, savedTwice).ok).toBe(true);
+  });
+
   it("passes custom and local ids no catalog lists", () => {
     const result = write({ instanceId: "codex", model: "omlx::qwen3-coder", fallbacks: [{ instanceId: "claude", model: "my-proxy-model" }] });
     expect(result).toMatchObject({ ok: true, selection: { model: "omlx::qwen3-coder", fallbacks: [{ model: "my-proxy-model" }] } });

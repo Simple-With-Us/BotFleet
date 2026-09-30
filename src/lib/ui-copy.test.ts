@@ -120,9 +120,11 @@ describe("Settings Models layout", () => {
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
     expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
-    // picking a new primary keeps the bot's fallback chain: the picker builds the
-    // selection with pickedSelection, which builds on selectionForPick, which
-    // copies the fallbacks across
+    // picking a new primary keeps the bot's fallback chain: the picker commits
+    // pickedSelection, which builds on selectionForPick and copies the
+    // fallbacks across. The behavior itself is covered in model-pick.test.ts
+    // (pickedSelection "keeps the chain"); these only pin that the picker
+    // still goes through it.
     const pick = FILES.find((entry) => entry.rel === "lib/model-pick.ts");
     expect(pick, "model-pick.ts is missing").toBeDefined();
     expect(picker!.text).toContain("pickedSelection(selection, instance, model, latest)");

@@ -193,13 +193,17 @@ export function checkLineageWrite(
   delete incoming.fallbacks;
   if (selection.fallbacks) incoming.fallbacks = carried.slice(1);
   const entries = chainEntries(incoming);
+  const unclaimed = [...saved];
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
     const driverKind = contextFor(entry.instanceId)?.driverKind;
     const retired = retiredModel(driverKind, entry.model);
     if (!retired || retired.successorClass !== null) continue;
-    const alreadySaved = saved.some((s) => sameTarget(s, entry));
-    if (!alreadySaved) {
+    // Each saved slot grandfathers ONE incoming copy: a single saved dead
+    // target must not cover a second copy of it added in this write.
+    const savedAt = unclaimed.findIndex((s) => sameTarget(s, entry));
+    if (savedAt >= 0) unclaimed.splice(savedAt, 1);
+    else {
       return {
         ok: false,
         error: `retired model "${entry.model}" in ${slotFor(i - 1)} — choose another model`,
