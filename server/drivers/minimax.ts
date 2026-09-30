@@ -61,10 +61,11 @@ const SNAPSHOT_PROBE_TIMEOUT_MS = 8_000;
 const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 // Plain MiniMax-M2.7 dropped: it billed the same $0.30/$1.20 per million as
-// M3's own <=512K tier for a fifth of the context, so M3 strictly dominated
-// it.  M2.7-highspeed stays — it is MiniMax's own faster-inference tier
-// (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different from
-// M3's rate at any input size highspeed's own 204,800 context can hold.
+// M3.1's own <=512K tier for a fifth of the context, so M3.1 strictly
+// dominates it.  M2.7-highspeed stays — it is MiniMax's own faster-inference
+// tier (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different
+// from M3.1's rate at any input size highspeed's own 204,800 context can
+// hold.
 const MODELS: ModelCatalog = {
   default: "MiniMax-M3.1-Flash-Preview",
   options: [
