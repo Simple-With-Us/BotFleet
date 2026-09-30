@@ -248,11 +248,10 @@ function BotModelRow({ bot }: { bot: Bot }) {
     save({
       ...bot.modelSelection,
       // Seeded from the primary, because the picker opens on something
-      // real rather than on an empty control.
-      fallbacks: [
-        ...fallbacks,
-        { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model },
-      ],
+      // real rather than on an empty control.  slotFromPick carries a
+      // floating primary's class, as Set Default does, so the new fallback
+      // floats with it instead of silently pinning.
+      fallbacks: [...fallbacks, slotFromPick(bot.modelSelection)],
     });
 
   return (

@@ -132,6 +132,15 @@ describe("Settings Models layout", () => {
     expect(pick!.text).toContain("if (current.fallbacks?.length) next.fallbacks = current.fallbacks");
   });
 
+  it("seeds Add Fallback through slotFromPick so a floating primary's class carries over", () => {
+    for (const rel of ["components/FleetModelsSection.tsx", "components/BotFallbackModels.tsx"]) {
+      const file = FILES.find((entry) => entry.rel === rel);
+      expect(file, `${rel} is missing`).toBeDefined();
+      expect(file!.text).toContain("slotFromPick(bot.modelSelection)");
+      expect(file!.text).not.toMatch(/\{ instanceId: bot\.modelSelection\.instanceId, model: bot\.modelSelection\.model \}/);
+    }
+  });
+
   it("stacks iOS primary and fallback pickers on their own rows", () => {
     const swift = readFileSync(join(SRC, "../ios/App/AgentProfileView.swift"), "utf8");
     expect(swift).toContain('Section("Primary Model")');
