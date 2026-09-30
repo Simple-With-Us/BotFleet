@@ -84,7 +84,7 @@ describe("Title Case for controls and headings", () => {
     ["components/UsageSection.tsx", "Test connection", "Test Connection"],
     ["components/FleetModelsSection.tsx", "Set default", "Set Default"],
     ["components/FleetModelsSection.tsx", "Add fallback", "Add Fallback"],
-    ["components/FleetModelsSection.tsx", "Workspace default", "Workspace Default"],
+    ["components/FleetModelsSection.tsx", "Apply to all bots", "Apply to All Bots"],
   ];
 
   for (const [file, wrong, right] of LABELS) {

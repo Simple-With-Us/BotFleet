@@ -7,11 +7,17 @@
 // somewhere cheaper, or you want to move a whole tier off a provider that
 // is rate-limiting you.  This is that comparison, and it edits in place.
 //
-// Above the per-bot list sits a Default block with the same Primary plus
-// fallback pickers.  Set All Bots To Default applies those values in one
-// call.  An empty picker is a deliberate "leave this model alone" —
-// important because users frequently want to standardize the primary
-// without flattening their hand-curated fallback chain.
+// Above the per-bot list sits an Apply to All Bots block with the same
+// Primary plus fallback pickers.  Set All Bots To Default applies those values
+// in one call; nothing is stored as a default afterward.  Each picker owns one
+// fixed place (Primary, Fallback 1, 2, 3) and is sent by that place.  An empty
+// picker is a deliberate "leave this model alone" — important because users
+// frequently want to standardize the primary without flattening their
+// hand-curated fallback chain.
+//
+// Every bot row draws every fallback the bot actually stores, even past the
+// cap, so a chain written through the API is never hidden from the page that
+// edits it.
 //
 // Pills wrap instead of sharing a four-column grid, so Primary, fallbacks,
 // and Add Fallback never overlap when names are long.
@@ -20,19 +26,20 @@ import { Plus, X } from "lucide-react";
 
 import { api, useStore, type Bot, type ConfigStatus, type ModelSelection } from "@/state/store";
 import { cn } from "@/lib/cn";
+import {
+  applyDefaultsBody,
+  emptyFallbackSlots,
+  hasDefaults,
+  withSlot,
+  type DefaultModelSlot,
+} from "@/lib/default-model-slots";
+import { canAddFallback, fallbackSlotCount } from "../../shared/model-limits";
 import { BotAvatar } from "./Avatar";
 import { ModelPicker } from "./ModelPicker";
-
-/** The most fallbacks a bot may carry, matching the per-bot profile. */
-const MAX_FALLBACKS = 2;
 
 /** Shared width so Primary, fallbacks, and Add Fallback wrap as siblings. */
 const CHIP = "flex min-w-[16rem] max-w-full flex-[1_1_16rem] flex-col gap-1";
 
-/** A default-model slot is either a real selection (so the server can
- * PATCH the bot's own value to match) or empty (so the server should leave
- * the bot's existing value at that place alone). */
-type DefaultSlot = ModelSelection | null;
 
 function pickEmptyBot(bots: Bot[]): Bot | null {
   return bots.find((bot) => !bot.hidden) ?? null;
@@ -53,7 +60,7 @@ function DefaultSlot({
   onClear,
 }: {
   bot: Bot;
-  value: DefaultSlot;
+  value: DefaultModelSlot;
   label: string;
   onChange: (next: ModelSelection) => void;
   onClear: () => void;
@@ -99,10 +106,10 @@ function DefaultSlot({
 
 function DefaultModelBlock() {
   const { state, dispatch } = useStore();
-  const [primary, setPrimary] = useState<DefaultSlot>(null);
-  const [secondary, setSecondary] = useState<DefaultSlot>(null);
-  const [fallback1, setFallback1] = useState<DefaultSlot>(null);
-  const [fallback2, setFallback2] = useState<DefaultSlot>(null);
+  // One slot per fixed place: Primary, then Fallback 1..N by index.  A slot
+  // is a real selection to write, or null for "leave this place alone".
+  const [primary, setPrimary] = useState<DefaultModelSlot>(null);
+  const [fallbacks, setFallbacks] = useState<DefaultModelSlot[]>(emptyFallbackSlots);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [skipped, setSkipped] = useState<{ name: string; reason: string }[]>([]);
@@ -111,7 +118,7 @@ function DefaultModelBlock() {
   // first non-hidden bot as a stand-in for the engine catalog.  The
   // picker's callbacks are still the only state we keep.
   const standIn = pickEmptyBot(state.bots);
-  const noneFilled = !primary && !secondary && !fallback1 && !fallback2;
+  const noneFilled = !hasDefaults(primary, fallbacks);
 
   const apply = () => {
     if (!standIn) {
@@ -123,14 +130,7 @@ function DefaultModelBlock() {
     setSkipped([]);
     api("/api/bots/apply-model-defaults", {
       method: "POST",
-      body: JSON.stringify({
-        slots: {
-          primary,
-          secondary,
-          fallback1,
-          fallback2,
-        },
-      }),
+      body: JSON.stringify(applyDefaultsBody(primary, fallbacks)),
     })
       .then((response: { applied: number; skipped?: { name: string; reason: string }[]; config?: ConfigStatus }) => {
         if (response.config) dispatch({ type: "configStatus", config: response.config });
@@ -144,9 +144,7 @@ function DefaultModelBlock() {
         // Clear the form on success: the next operator action should
         // start from a clean "no default set" state.
         setPrimary(null);
-        setSecondary(null);
-        setFallback1(null);
-        setFallback2(null);
+        setFallbacks(emptyFallbackSlots());
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setApplying(false));
@@ -155,14 +153,18 @@ function DefaultModelBlock() {
   if (!standIn) {
     return (
       <div className="rounded-xl border border-hairline/40 bg-card px-3 py-3 text-[13px] text-ink-secondary">
-        Add a bot to set a default model.
+        Add a bot first to apply models to every bot.
       </div>
     );
   }
 
   return (
     <div className="rounded-xl border border-hairline/40 bg-card px-3 py-3">
-      <div className="text-[14px] font-medium text-ink">Workspace Default</div>
+      <div className="text-[14px] font-medium text-ink">Apply to All Bots</div>
+      <div className="mt-1 text-[12px] text-ink-secondary">
+        Choose models and apply them to every bot at once.{"\u00A0 "}This is not a saved default:
+        each bot keeps its own list afterward.
+      </div>
       <div className="mt-3 flex flex-wrap items-start gap-2">
         <DefaultSlot
           bot={standIn}
@@ -171,20 +173,20 @@ function DefaultModelBlock() {
           onChange={(selection) => setPrimary({ instanceId: selection.instanceId, model: selection.model })}
           onClear={() => setPrimary(null)}
         />
-        <DefaultSlot
-          bot={standIn}
-          label="Fallback 1"
-          value={secondary}
-          onChange={(selection) => setSecondary({ instanceId: selection.instanceId, model: selection.model })}
-          onClear={() => setSecondary(null)}
-        />
-        <DefaultSlot
-          bot={standIn}
-          label="Fallback 2"
-          value={fallback1}
-          onChange={(selection) => setFallback1({ instanceId: selection.instanceId, model: selection.model })}
-          onClear={() => setFallback1(null)}
-        />
+        {fallbacks.map((slot, index) => (
+          <DefaultSlot
+            key={index}
+            bot={standIn}
+            label={`Fallback ${index + 1}`}
+            value={slot}
+            onChange={(selection) =>
+              setFallbacks((current) =>
+                withSlot(current, index, { instanceId: selection.instanceId, model: selection.model }),
+              )
+            }
+            onClear={() => setFallbacks((current) => withSlot(current, index, null))}
+          />
+        ))}
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
@@ -271,12 +273,16 @@ function BotModelRow({ bot }: { bot: Bot }) {
           <ModelPicker bot={bot} contained selection={bot.modelSelection} onChange={savePrimary} />
         </div>
 
-        {Array.from({ length: MAX_FALLBACKS }, (_, index) => {
+        {/* Never fewer places than the bot stores: a chain longer than the cap
+            (written through the API) still shows every entry and can still be
+            trimmed from here. */}
+        {Array.from({ length: fallbackSlotCount(fallbacks.length) }, (_, index) => {
           const fallback = fallbacks[index];
           if (!fallback) {
             // Only the next empty place offers to fill itself, so the row does
-            // not sprout two identical buttons.
-            const isNext = index === fallbacks.length;
+            // not sprout identical buttons — and only while the chain is
+            // under the cap.
+            const isNext = index === fallbacks.length && canAddFallback(fallbacks.length);
             if (!isNext) return null;
             return (
               <div key={index} className={CHIP}>

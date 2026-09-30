@@ -7425,6 +7425,212 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
   });
 });
 
+describe("fallback cap: at most three, growth refused, existing chains left alone", () => {
+  const fallback = (model: string) => ({ instanceId: "fake", model });
+  const chain = (...models: string[]) => models.map(fallback);
+  const fallbacksOf = async (id: string): Promise<string[]> => {
+    const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
+    return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
+  };
+
+  it("accepts a chain of three and refuses a fourth", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Three" })).body.bot;
+    try {
+      const three = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      });
+      expect(three.status).toBe(200);
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+
+      const four = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(four.status).toBe(400);
+      expect(four.body.error).toMatch(/at most 3 fallback/);
+      // The refused write changed nothing.
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("keeps a chain at the cap editable: changing only the primary re-sends it unchanged", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Primary" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      const repoint = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p2", fallbacks: chain("a", "b", "c") },
+      });
+      expect(repoint.status).toBe(200);
+      expect(repoint.body.bot.modelSelection.model).toBe("p2");
+      expect(await fallbacksOf(bot.id)).toEqual(["a", "b", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("lets a chain shrink and then refuses to grow it back past the cap", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Shrink" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a") },
+      })).status).toBe(200);
+      expect(await fallbacksOf(bot.id)).toEqual(["a"]);
+      const grow = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(grow.status).toBe(400);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("applies the cap to a new bot's chain too", async () => {
+    const over = await api("POST", "/api/bots", {
+      name: "Cap Create Four",
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+    });
+    expect(over.status).toBe(400);
+    expect(over.body.error).toMatch(/at most 3 fallback/);
+
+    const ok = await api("POST", "/api/bots", {
+      name: "Cap Create Three",
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+    });
+    expect(ok.status).toBe(201);
+    expect(await fallbacksOf(ok.body.bot.id)).toEqual(["a", "b", "c"]);
+    await api("DELETE", `/api/bots/${ok.body.bot.id}`);
+  });
+});
+
+describe("POST /api/bots/apply-model-defaults (fixed fallback places)", () => {
+  const fallback = (model: string) => ({ instanceId: "fake", model });
+  const botWithChain = async (name: string, ...models: string[]) => {
+    const bot = (await api("POST", "/api/bots", { name })).body.bot;
+    const set = await api("PATCH", `/api/bots/${bot.id}`, {
+      modelSelection: { instanceId: "fake", model: "p", fallbacks: models.map(fallback) },
+    });
+    expect(set.status).toBe(200);
+    return bot.id as string;
+  };
+  const fallbacksOf = async (id: string): Promise<string[]> => {
+    const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
+    return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
+  };
+
+  it("writes Fallback 2 alone at position 1 and leaves Fallback 1 and 3 alone", async () => {
+    // The old route compacted the filled slots with push(), so a value chosen
+    // only for Fallback 2 was written over every bot's Fallback 1.
+    const id = await botWithChain("Place Two", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, fallback("y"), null] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("writes a lone Fallback 3 at position 2 on a bot that has three", async () => {
+    const id = await botWithChain("Place Three", "a", "b", "c");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, null, fallback("z")] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "b", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("writes all three places by position, and never grows a chain past three", async () => {
+    const id = await botWithChain("Place All", "a");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [fallback("x"), fallback("y"), fallback("z")] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["x", "y", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("appends a place past the end of a short chain instead of leaving a hole", async () => {
+    const id = await botWithChain("Place Short", "a");
+    try {
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, null, fallback("z")] },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "z"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("still reads the older secondary, fallback1 and fallback2 names, by position", async () => {
+    const id = await botWithChain("Place Legacy", "a", "b", "c");
+    try {
+      // `fallback1` is position 1 (Fallback 2), not the first filled slot.
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallback1: fallback("y") },
+      });
+      expect(apply.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "y", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("clears a place only when the request confirms it, and later entries move up", async () => {
+    const id = await botWithChain("Place Clear", "a", "b", "c");
+    try {
+      const unconfirmed = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, { clear: true }, null] },
+      });
+      expect(unconfirmed.status).toBe(400);
+      expect(unconfirmed.body.error).toMatch(/confirmClear/);
+      expect(await fallbacksOf(id)).toEqual(["a", "b", "c"]);
+
+      const confirmed = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { fallbacks: [null, { clear: true }, null] },
+        confirmClear: true,
+      });
+      expect(confirmed.status).toBe(200);
+      expect(await fallbacksOf(id)).toEqual(["a", "c"]);
+    } finally {
+      await api("DELETE", `/api/bots/${id}`);
+    }
+  });
+
+  it("rejects a fallbacks list that is not an array, is too long, or mixes both shapes", async () => {
+    const notArray = await api("POST", "/api/bots/apply-model-defaults", { slots: { fallbacks: "x" } });
+    expect(notArray.status).toBe(400);
+    const tooLong = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [null, null, null, fallback("w")] },
+    });
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.error).toMatch(/at most 3 places/);
+    const both = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [fallback("x")], fallback1: fallback("y") },
+    });
+    expect(both.status).toBe(400);
+    const badEntry = await api("POST", "/api/bots/apply-model-defaults", {
+      slots: { fallbacks: [{ instanceId: "fake" }] },
+    });
+    expect(badEntry.status).toBe(400);
+  });
+});
+
 describe("trust boundaries: phone-originated room folders, coarse always-allow, and the packaged UI folder", () => {
   const phone = { "x-botfleet-companion": "1" };
   type PhoneApiBody = {
