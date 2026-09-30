@@ -264,3 +264,50 @@ describe("BoxAgentDriver turns (fake API)", () => {
     expect(settled).toMatchObject({ itemId: "e1", ok: false });
   });
 });
+
+// Owner request: the Computer engine (box.ascii.dev) stays out of every
+// engine list until a Box token is configured — but stays registered, so a
+// token added later just works.
+describe("BoxAgentDriver snapshot without a Box token", () => {
+  it("is unavailable and hidden from engine lists", async () => {
+    const env = process.env;
+    const previous = env.BOX_TOKEN;
+    delete env.BOX_TOKEN;
+    const instance = await BoxAgentDriver.create({
+      instanceId: "computer",
+      displayName: "Computer",
+      environment: {},
+      enabled: true,
+      config: { pollMs: 0 },
+    });
+    try {
+      expect(await instance.snapshot()).toMatchObject({
+        state: "unavailable",
+        hidden: true,
+        reason: expect.stringContaining("no Box token"),
+      });
+    } finally {
+      await instance.dispose();
+      if (previous !== undefined) env.BOX_TOKEN = previous;
+    }
+  });
+
+  it("is listed again once a token is configured", async () => {
+    const restore = installFakeBox([{ events: [] }]);
+    const instance = await BoxAgentDriver.create({
+      instanceId: "computer",
+      displayName: "Computer",
+      environment: { BOX_TOKEN: "box-test-token" },
+      enabled: true,
+      config: { pollMs: 0 },
+    });
+    try {
+      const snapshot = await instance.snapshot();
+      expect(snapshot.state).toBe("available");
+      expect(snapshot.hidden).toBeUndefined();
+    } finally {
+      await instance.dispose();
+      restore();
+    }
+  });
+});

@@ -655,6 +655,13 @@ export interface InstanceInfo {
   snapshot: {
     state: "available" | "unavailable";
     reason?: string;
+    /** The probe gave no answer (timeout) — show "Checking", not a setup
+     *  problem.  See server/contracts.ts ProviderSnapshot.transient. */
+    transient?: boolean;
+    /** Optional integration not set up (Computer with no Box token): kept
+     *  out of engine lists until it is. */
+    hidden?: boolean;
+    /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
@@ -764,6 +771,10 @@ export interface AppState {
   bots: Bot[];
   groups: Group[];
   instances: InstanceInfo[];
+  /** When the server produced `instances` (its `describedAt`), so an older
+   *  answer arriving late — a slow GET, the hydrate racing the `instances`
+   *  push, a PATCH response — never replaces a newer one. */
+  instancesDescribedAt: number;
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
@@ -919,7 +930,7 @@ export type Action =
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
-  | { type: "instances"; instances: InstanceInfo[] }
+  | { type: "instances"; instances: InstanceInfo[]; describedAt?: number }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
   | { type: "send"; botId: string; text: string; replyToId?: string }
@@ -1283,8 +1294,14 @@ export function reducer(state: AppState, action: Action): AppState {
       const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
       return { ...state, groups, selectedId };
     }
-    case "instances":
-      return { ...state, instances: action.instances };
+    case "instances": {
+      // Every response carries the server's describedAt; drop one older than
+      // what is already shown.  A payload without one (an older server) is
+      // applied as before.
+      const at = typeof action.describedAt === "number" ? action.describedAt : undefined;
+      if (at !== undefined && at < state.instancesDescribedAt) return state;
+      return { ...state, instances: action.instances, instancesDescribedAt: at ?? state.instancesDescribedAt };
+    }
     case "configStatus":
       return {
         ...state,
@@ -1895,6 +1912,7 @@ export const initialState: AppState = {
   bots: [],
   groups: [],
   instances: [],
+  instancesDescribedAt: 0,
   config: null,
   selectedId: "",
   activeView: "chat",
@@ -2644,7 +2662,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         {
           label: "engines",
           request: api("/api/instances")
-            .then(({ instances }) => alive && rawDispatch({ type: "instances", instances })),
+            .then(({ instances, describedAt }) => alive && rawDispatch({ type: "instances", instances, describedAt })),
         },
         {
           label: "settings",
@@ -2907,8 +2925,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             config: configStatusFromFrame(frame),
           });
           api("/api/instances")
-            .then(({ instances }) => rawDispatch({ type: "instances", instances }))
+            .then(({ instances, describedAt }) => rawDispatch({ type: "instances", instances, describedAt }))
             .catch(() => {});
+          break;
+        // A describe finished on the server (a background sweep behind a
+        // stale answer, or a slow engine's probe landing late).  Applied
+        // directly — re-fetching here would only start another sweep.
+        case "instances":
+          if (Array.isArray(frame.instances)) {
+            rawDispatch({ type: "instances", instances: frame.instances, describedAt: frame.describedAt });
+          }
           break;
       }
     };
@@ -2961,8 +2987,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // "Check again"/"Refresh" click, or a just-saved CLI/fullAuto override.
   const refreshInstances = useCallback(async (opts?: { fresh?: boolean }) => {
     try {
-      const { instances } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
-      rawDispatch({ type: "instances", instances });
+      const { instances, describedAt } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
+      rawDispatch({ type: "instances", instances, describedAt });
     } catch {
       /* offline or server down — the existing list stays */
     }

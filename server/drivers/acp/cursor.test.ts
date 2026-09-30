@@ -426,6 +426,30 @@ describe("cursor probe caching and scoping", () => {
     expect(runs).toBe(2);
   });
 
+  it("never caches an undetermined sign-in (both probes timed out) as signed out", async () => {
+    let runs = 0;
+    const timedOut: any = (_cli: string, _args: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) => {
+      runs += 1;
+      cb(Object.assign(new Error("Command failed"), { killed: true, timedOut: true }), "");
+    };
+    expect(await probeCursorAuth("cursor", {}, timedOut)).toBeUndefined();
+    expect(runs).toBe(2);
+    // Asked again next time instead of reading "signed out" for five minutes.
+    expect(await probeCursorAuth("cursor", {}, timedOut)).toBeUndefined();
+    expect(runs).toBe(4);
+  });
+
+  it("takes a signed-out answer even when `status` exits non-zero, and caches it", async () => {
+    let runs = 0;
+    const loggedOut: any = (_cli: string, _args: string[], _opts: unknown, cb: (err: Error | null, out: string, err2?: string) => void) => {
+      runs += 1;
+      cb(Object.assign(new Error("Command failed"), { code: 1 }), "Not logged in\n");
+    };
+    expect(await probeCursorAuth("cursor", {}, loggedOut)).toBe(false);
+    expect(await probeCursorAuth("cursor", {}, loggedOut)).toBe(false);
+    expect(runs).toBe(1);
+  });
+
   it("scopes probe caches to effective environment", async () => {
     let executedEnvs: string[] = [];
     const trackingExec: any = (_cli: string, _args: string[], opts: any, cb: any) => {

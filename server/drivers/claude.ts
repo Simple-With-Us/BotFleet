@@ -19,7 +19,16 @@ import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  brokerSocketPath,
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  isProbeTimeout,
+  killCliTree,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -84,28 +93,62 @@ function sweepReceiptsOnce(): void {
   }
 }
 
-/** Whether `claude` has been signed in.
+/** How long `claude auth status --json` may take: the same budget as
+ * `--version`.  On a busy Mac it measured 5-12 s, past the old 8 s budget, and
+ * every probe that ran out of time used to read as a sign-out. */
+export const CLAUDE_AUTH_TIMEOUT_MS = 20_000;
+
+function claudeAuthTimeoutMs(): number {
+  // Test fixtures shorten the budget so a hanging fake CLI costs a second,
+  // not twenty.
+  const override = Number(process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_AUTH_TIMEOUT_MS;
+}
+
+/** `loggedIn` from `claude auth status --json`, or undefined when stdout is
+ * not that document. */
+function parseClaudeLoggedIn(stdout: string | undefined): boolean | undefined {
+  try {
+    const status: unknown = JSON.parse(stdout ?? "");
+    if (typeof status !== "object" || status === null) return undefined;
+    return "loggedIn" in status && status.loggedIn === true;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `claude` has been signed in: true, false, or undefined when the
+ * probe could not tell.
  *
  * Credential storage is deliberately not inspected here. Claude Code uses the
  * macOS Keychain for OAuth, a JSON file on some platforms, and may gain other
  * backends over time. Presence checks also accept stale credentials. The CLI's
  * own machine-readable auth command is the source of truth for every backend.
+ *
+ * The answer is three-valued because a probe that ran out of time is not a
+ * sign-out.  Parsed JSON is definitive whatever the exit code: a genuinely
+ * signed-out CLI exits 1 AND prints `{"loggedIn":false}`.  A fast failure with
+ * no JSON (an older CLI without the `auth` subcommand) still fails closed.
+ * Only a timeout or kill — no answer at all — is undefined, and the caller
+ * keeps whatever it last knew.
  */
 export function claudeSignedIn(
   cli: string,
   env: NodeJS.ProcessEnv,
   run: typeof execCli = execCli,
-): Promise<boolean> {
+  timeoutMs: number = claudeAuthTimeoutMs(),
+): Promise<boolean | undefined> {
   return new Promise((resolve) => {
-    run(cli, ["auth", "status", "--json"], { timeout: 8000, env }, (_error, stdout) => {
-      try {
-        const status: unknown = JSON.parse(stdout);
-        resolve(
-          typeof status === "object" && status !== null && "loggedIn" in status && status.loggedIn === true,
-        );
-      } catch {
-        resolve(false);
+    const startedAt = Date.now();
+    run(cli, ["auth", "status", "--json"], { timeout: timeoutMs, env }, (error, stdout) => {
+      const answer = parseClaudeLoggedIn(stdout);
+      if (answer !== undefined) return resolve(answer);
+      const elapsed = Date.now() - startedAt;
+      if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= timeoutMs)) {
+        logProbeFailure("claude", `${cli} auth status --json`, error, elapsed);
+        return resolve(undefined);
       }
+      resolve(false);
     });
   });
 }
@@ -1344,28 +1387,40 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       return writeUser(s, threadId, text);
     };
 
-    // Probe capabilities once per detected version.  Failed probes expire so
-    // a transient timeout does not require a harness restart to recover.
-    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<boolean> } | undefined;
-    const supportsStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<boolean> => {
+    // Probe capabilities once per detected version.  A "no" expires after
+    // 30 s so an upgrade is noticed without a restart; a probe that gave no
+    // answer (timeout) is not cached at all, and never reads as "too old".
+    type StrictMcpAnswer = "yes" | "no" | "unknown";
+    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<StrictMcpAnswer> } | undefined;
+    const probeStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<StrictMcpAnswer> => {
       if (strictMcpProbe?.version === version && strictMcpProbe.expiresAt > Date.now()) {
         return strictMcpProbe.result;
       }
+      const startedAt = Date.now();
       const probe = {
         version,
         expiresAt: Date.now() + 30_000,
-        result: new Promise<boolean>((resolve) => {
+        result: new Promise<StrictMcpAnswer>((resolve) => {
           execCli(config.cli, ["--help"], { timeout: 10000, env }, (error, stdout) => {
-            resolve(!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout));
+            if (!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout)) return resolve("yes");
+            const elapsed = Date.now() - startedAt;
+            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= 10000)) {
+              logProbeFailure(instanceId, `${config.cli} --help`, error, elapsed);
+              return resolve("unknown");
+            }
+            resolve("no");
           });
         }),
       };
       strictMcpProbe = probe;
-      void probe.result.then((supported) => {
-        if (supported) probe.expiresAt = Infinity;
+      void probe.result.then((answer) => {
+        if (answer === "yes") probe.expiresAt = Infinity;
+        else if (answer === "unknown") probe.expiresAt = 0;
       });
       return probe.result;
     };
+    const supportsStrictMcp = async (version: string, env: NodeJS.ProcessEnv): Promise<boolean> =>
+      (await probeStrictMcp(version, env)) === "yes";
 
     const requireStrictMcp = async (): Promise<void> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
@@ -1392,36 +1447,48 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       throw reason;
     };
 
+    // Last definitive answers, so one probe that runs out of time on a busy
+    // Mac does not flip a working, signed-in Claude to "not installed" or
+    // "sign-in required".
     let lastKnownVersion: string | null = null;
+    let lastKnownAuth: boolean | undefined;
+    const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      let version = await new Promise<string | null>((resolve) => {
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
         execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
-          const trimmed = err ? null : stdout.trim();
-          if (trimmed) {
-            lastKnownVersion = trimmed;
-            resolve(trimmed);
-          } else if (lastKnownVersion) {
-            resolve(lastKnownVersion);
-          } else {
-            resolve(null);
-          }
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
         });
       });
-      if (!version) {
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion = version;
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
         if (lastKnownVersion) {
           version = lastKnownVersion;
         } else {
-          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+          const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
       }
-      if (!(await supportsStrictMcp(version, env))) {
+      const strict = await probeStrictMcp(version, env);
+      if (strict === "unknown") {
+        return { state: "unavailable", transient: true, reason: `${engineLabel} did not answer in time`, version };
+      }
+      if (strict === "no") {
         return {
           state: "unavailable",
           reason: CLAUDE_ISOLATION_REASON,
         };
       }
-      const authenticated = await claudeSignedIn(config.cli, env);
+      const probedAuth = await claudeSignedIn(config.cli, env);
+      if (probedAuth !== undefined) lastKnownAuth = probedAuth;
+      const authenticated = probedAuth ?? lastKnownAuth;
       // claudeEnvironment strips ANTHROPIC_API_KEY, so turns run on the
       // CLI's own login (Pro/Max): the cost it reports is what the call
       // WOULD bill, not a charge

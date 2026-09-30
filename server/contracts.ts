@@ -528,6 +528,18 @@ export interface ProviderAdapter {
 export interface ProviderSnapshot {
   state: "available" | "unavailable";
   reason?: string;
+  /** True when the probe behind this snapshot gave no answer — a CLI that
+   * did not respond in time, or no process slot to run it — rather than a
+   * verdict.  `reason` then says so ("Claude did not answer in time"), the
+   * registry answers from the engine's last definitive snapshot when it has
+   * one, and the UI says "Checking" instead of "Not installed". */
+  transient?: boolean;
+  /** An optional integration nobody has set up (Computer with no Box token).
+   * It stays registered so configuring it later just works, but it is left
+   * out of the engine rail, Settings → Engines and the Usage rows until then. */
+  hidden?: boolean;
+  /** Undefined when the auth probe was inconclusive (timed out); only an
+   * explicit answer from the CLI is `true` or `false`. */
   authenticated?: boolean;
   version?: string | null;
   /** How this instance is paid for, when the driver can tell: a reported

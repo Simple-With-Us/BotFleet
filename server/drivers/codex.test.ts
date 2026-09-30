@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { CodexDriver } from "./codex.ts";
+import { CodexDriver, codexLoginAnswer } from "./codex.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", "fake-codex-app-server.ts");
@@ -826,6 +826,17 @@ describe("CodexDriver turns (fake app-server)", () => {
       state: "available",
       authenticated: true,
     });
+  });
+
+  it("reads `login status` as three-valued: only an explicit answer is true or false", () => {
+    // A signed-out CLI exits 1 with "Not logged in" on stderr: that text is
+    // the answer whatever the exit code.
+    expect(codexLoginAnswer("\nNot logged in\n")).toBe(false);
+    expect(codexLoginAnswer("Logged in using ChatGPT\n")).toBe(true);
+    expect(codexLoginAnswer("\nLogged in using an API key")).toBe(true);
+    // A probe that timed out printed nothing: unknown, never a sign-out.
+    expect(codexLoginAnswer("\n")).toBeUndefined();
+    expect(codexLoginAnswer("error: something unexpected")).toBeUndefined();
   });
 
   it("marks a Codex 401 as setup so the UI offers sign-in instead of Retry", async () => {

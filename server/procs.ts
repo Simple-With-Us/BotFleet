@@ -66,31 +66,172 @@ export function execCli(
   // leaves a grandchild holding the pipe (Cursor 2026.08 prints and never
   // exits), would otherwise hang every probe — and the harness boot with it.
   // A hard deadline a little past the soft one guarantees the caller settles.
+  //
+  // Both deadlines are this function's own timers rather than execFile's
+  // `timeout`, because a timer is serviced BEFORE the poll phase that
+  // delivers a finished child's output and exit status.  After the event
+  // loop stalls (a busy harness paged out under swap), execFile's timer
+  // fired for a child that had answered in milliseconds, destroyed the
+  // unread stdout and reported `(null, "")` — a working CLI read as "not
+  // found" and a signed-in one as signed out.  Each deadline here waits one
+  // setImmediate, which runs after that poll phase, and kills only a child
+  // that is genuinely still running.
+  const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
+  const killSignal = opts.killSignal ?? "SIGTERM";
+  const execOpts: ExecFileOptions = { ...opts };
+  delete execOpts.timeout;
   let settled = false;
+  let timedOut = false;
+  let softTimer: ReturnType<typeof setTimeout> | undefined;
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
   const finish = (err: Error | null, stdout: string, stderr?: string) => {
     if (settled) return;
     settled = true;
+    if (softTimer) clearTimeout(softTimer);
     if (hardTimer) clearTimeout(hardTimer);
+    // Typed so a driver can tell "the CLI did not answer in time" (probe
+    // inconclusive) from "the CLI answered no" without parsing messages.
+    if (err && timedOut) (err as ProbeTimeoutError).timedOut = true;
     cb(err, stdout, stderr);
   };
   const child = execFile(
     resolved.command,
     resolved.args,
-    { ...opts, windowsHide: true, encoding: "utf8" },
+    { ...execOpts, windowsHide: true, encoding: "utf8" },
     (err, stdout, stderr) => finish(err, stdout, stderr),
   );
-  const softTimeout = typeof opts.timeout === "number" && opts.timeout > 0 ? opts.timeout : 0;
-  const hardTimer = softTimeout
-    ? setTimeout(() => {
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  // Stop waiting on the pipes.  execFile keeps what it already read and hands
+  // it to the callback once the streams close.
+  const stopReading = () => {
+    try {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    } catch {
+      // already closed
+    }
+  };
+  if (softTimeout) {
+    softTimer = setTimeout(() => {
+      setImmediate(() => {
+        if (settled) return;
+        if (exited()) {
+          // The child answered and exited; only a grandchild still holds its
+          // pipe.  Give the close a moment, then deliver what it printed.
+          setTimeout(() => {
+            if (!settled) stopReading();
+          }, 250).unref?.();
+          return;
+        }
+        timedOut = true;
+        stopReading();
+        try {
+          child.kill(killSignal);
+        } catch {
+          // already gone
+        }
+      });
+    }, softTimeout);
+    hardTimer = setTimeout(() => {
+      setImmediate(() => {
+        if (settled) return;
+        timedOut = true;
         try {
           child.kill("SIGKILL");
         } catch {
           // already gone
         }
-        finish(new Error(`\`${cli}\` did not exit within ${softTimeout}ms`), "");
-      }, softTimeout + HARD_EXEC_GRACE_MS)
-    : undefined;
-  hardTimer?.unref?.();
+        finish(
+          Object.assign(new Error(`\`${cli}\` did not exit within ${softTimeout}ms`), { killed: true }),
+          "",
+        );
+      });
+    }, softTimeout + HARD_EXEC_GRACE_MS);
+    hardTimer.unref?.();
+  }
+}
+
+/** An execCli error from a probe that ran past its deadline. */
+export type ProbeTimeoutError = Error & { timedOut?: boolean; killed?: boolean; signal?: string | null };
+
+const HARD_TIMEOUT_TEXT = /did not exit within \d+ms/;
+
+/** Whether a probe failed because it ran out of time (or was killed) rather
+ * than because the CLI answered.  A timed-out probe is inconclusive: it says
+ * nothing about whether the CLI is installed or signed in. */
+export function isProbeTimeout(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { timedOut?: unknown; killed?: unknown; signal?: unknown; code?: unknown; message?: unknown };
+  return (
+    e.timedOut === true ||
+    e.killed === true ||
+    (typeof e.signal === "string" && e.signal.length > 0) ||
+    e.code === "ETIMEDOUT" ||
+    (typeof e.message === "string" && HARD_TIMEOUT_TEXT.test(e.message))
+  );
+}
+
+/** Spawn errno codes that mean "the Mac could not start a process right
+ * now" — out of process slots, file descriptors or memory.  Transient. */
+const TRANSIENT_SPAWN_CODES = new Set(["EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "EBUSY", "EINTR"]);
+
+/** What a failed `<cli> --version` probe means for the engine's snapshot. */
+export type VersionProbeFailure =
+  /** The binary is missing or cannot run: a setup problem the user fixes. */
+  | { kind: "setup"; reason: string }
+  /** The probe gave no answer (timeout, kill, no process slots): try again. */
+  | { kind: "transient"; reason: string }
+  /** The CLI ran and failed on its own: report it, do not retry blindly. */
+  | { kind: "failed"; reason: string };
+
+/** Classify a `--version` probe that produced no version.
+ *
+ * Only a spawn failure the user must fix (ENOENT, EACCES, a shebang whose
+ * interpreter is missing) reads as "CLI not found".  A probe that ran out of
+ * time — or printed nothing by the time its deadline passed — is transient:
+ * the CLI is there, the Mac was just too busy to hear back. */
+export function classifyVersionProbeFailure(
+  err: Error | null,
+  cli: string,
+  engine: string,
+  elapsedMs: number,
+  timeoutMs: number,
+): VersionProbeFailure {
+  const e = err as (NodeJS.ErrnoException & { status?: unknown }) | null;
+  if (e && typeof e.code === "string") {
+    const spawn = describeSpawnFailure(e, cli);
+    if (spawn.setup) {
+      return { kind: "setup", reason: e.code === "ENOENT" ? `\`${cli}\` CLI not found` : spawn.message };
+    }
+    if (TRANSIENT_SPAWN_CODES.has(e.code)) {
+      return { kind: "transient", reason: `${engine} could not be checked right now` };
+    }
+  }
+  // 127 is the shell's "command not found" — a node-shebang CLI whose
+  // `node` is gone exits with it.  That is setup, not a slow answer.
+  if (e && (e.code as unknown) === 127) return { kind: "setup", reason: `\`${cli}\` CLI not found` };
+  if (isProbeTimeout(e) || (timeoutMs > 0 && elapsedMs >= timeoutMs)) {
+    return { kind: "transient", reason: `${engine} did not answer in time` };
+  }
+  if (e) {
+    const code = typeof e.code === "number" ? ` (exit ${e.code})` : "";
+    return { kind: "failed", reason: `\`${cli} --version\` failed${code}` };
+  }
+  return { kind: "failed", reason: `\`${cli} --version\` printed no version` };
+}
+
+/** One log line per failed engine probe: which engine, which command, why,
+ * and how long it took.  Never stdout or stderr — those can carry account
+ * details — only the error's shape. */
+export function logProbeFailure(engine: string, command: string, err: Error | null, elapsedMs: number): void {
+  const e = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: string | null; timedOut?: boolean }) | null;
+  const parts: string[] = [];
+  if (e?.timedOut) parts.push("timed out");
+  if (e?.code !== undefined && e?.code !== null) parts.push(`code=${String(e.code)}`);
+  if (e?.killed) parts.push("killed");
+  if (e?.signal) parts.push(`signal=${e.signal}`);
+  if (!e) parts.push("no output");
+  console.warn(`[probe] ${engine}: \`${command}\` failed after ${Math.round(elapsedMs)}ms (${parts.join(", ") || "error"})`);
 }
 
 /** Human wording for a failed CLI spawn.

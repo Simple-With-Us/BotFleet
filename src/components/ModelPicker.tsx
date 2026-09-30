@@ -23,6 +23,7 @@ import {
 import { selectionForPick } from "@/lib/model-pick";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { formatDualQuotaBadge } from "@/lib/quota-display";
@@ -65,14 +66,36 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
   );
 }
 
-function engineStatus(instance: InstanceInfo): string {
+export function engineStatus(instance: InstanceInfo): string {
   if (instance.snapshot.quota?.capped) return "Quota Cap";
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
+  // The last probe gave no answer: a slow Mac, not a missing CLI or a
+  // sign-out.  Never "Not installed" or "Sign-in required" for it.
+  if (isCheckingEngine(instance)) return "Checking";
   if (needsCli(instance)) return "Not installed";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
+}
+
+/** The engines the picker's rail offers.  The selected engine always stays
+ *  so the picker can explain it; otherwise turned-off engines, uninstalled
+ *  custom ones, and optional integrations nobody set up (Computer with no Box
+ *  token) are left out. */
+export function railEngines(instances: InstanceInfo[], selectedInstanceId: string): InstanceInfo[] {
+  return instances.filter((i) => {
+    if (i.enabled === false) return false;
+    const selected = i.instanceId === selectedInstanceId;
+    if (isHiddenEngine(i) && !selected) return false;
+    const isInstalledOrSubscription =
+      i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
+    if (i.snapshot.state === "unavailable" && !selected && !isInstalledOrSubscription) {
+      return false;
+    }
+    if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && !selected) return false;
+    return true;
+  });
 }
 
 function ModelRow({
@@ -449,16 +472,7 @@ export function ModelPicker({
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
-              const availableInstances = state.instances.filter((i) => {
-                if (i.enabled === false) return false;
-                const isInstalledOrSubscription =
-                  i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId && !isInstalledOrSubscription) {
-                  return false;
-                }
-                if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
-                return true;
-              });
+              const availableInstances = railEngines(state.instances, selection.instanceId);
               const { subscription, custom: local } = splitEngineRail(availableInstances);
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
@@ -539,6 +553,8 @@ export function ModelPicker({
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
                           : blocked
                           ? "bg-warning/10 text-warning"
+                          : isCheckingEngine(railInstance)
+                          ? "bg-inset text-ink-secondary"
                           : "bg-success/10 text-success",
                       )}
                     >

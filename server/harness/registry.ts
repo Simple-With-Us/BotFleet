@@ -56,6 +56,52 @@ export function isCustomInstance(driverKind: string, instanceId: InstanceId): bo
   return instanceId !== (RESERVED_INSTANCE_ID.get(driverKind) ?? driverKind);
 }
 
+/** How many engines one describe sweep probes at once.  Every engine used to
+ * be probed in parallel, and on a saturated Mac the pile-up is what pushed
+ * each CLI past its own deadline. */
+const DEFAULT_PROBE_CONCURRENCY = 6;
+/** How long one engine may take to describe before the sweep answers for it
+ * from its last definitive snapshot.  The probe keeps running; its answer is
+ * folded in (and pushed to clients) when it lands. */
+const DEFAULT_ENTRY_DEADLINE_MS = 30_000;
+/** How long a definitive snapshot may stand in for inconclusive probes.  An
+ * engine that never answers again settles as "did not answer in time". */
+const DEFINITIVE_MAX_AGE_MS = 30 * 60_000;
+
+export interface ProviderRegistryOptions {
+  probeConcurrency?: number;
+  entryDeadlineMs?: number;
+}
+
+/** Called when a completed describe changes what clients were last told. */
+export type DescribeListener = (instances: DescribedInstance[], describedAt: number) => void;
+
+/** Run `fn` over `items`, at most `limit` at a time, keeping order. */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return results;
+}
+
+/** A snapshot read back from engine-cache.json.  Available rows are served
+ * as they were; an unavailable row written by an earlier process — possibly
+ * one that mistook a slow probe for a missing CLI — is shown as "checking"
+ * until this process has probed it, never as a verdict. */
+function seedFromDisk(info: DescribedInstance): DescribedInstance {
+  const snapshot = info.snapshot;
+  if (!snapshot || snapshot.state === "available" || snapshot.reason === "Disabled in settings" || snapshot.hidden) {
+    return info;
+  }
+  return { ...info, snapshot: { ...snapshot, transient: true } };
+}
+
 /** MiniMax's global-region API host — the value `decodeMinimaxConfig` falls
  *  back to, and the one `MinimaxDriver.create()` compares against when it
  *  decides whether ~/.mmx/config.json's host outranks the instance's own.
@@ -174,9 +220,13 @@ export class ProviderRegistry {
    *  "minimax". */
   private minimaxContextByInstance = new Map<InstanceId, { apiKey: string; apiUrl: string }>();
   private driversByKind: Map<string, AnyProviderDriver>;
+  private readonly probeConcurrency: number;
+  private readonly entryDeadlineMs: number;
 
-  constructor(drivers: readonly AnyProviderDriver[]) {
+  constructor(drivers: readonly AnyProviderDriver[], options: ProviderRegistryOptions = {}) {
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
+    this.probeConcurrency = Math.max(1, options.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY);
+    this.entryDeadlineMs = options.entryDeadlineMs ?? DEFAULT_ENTRY_DEADLINE_MS;
   }
 
   private async loadEntry(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
@@ -262,7 +312,11 @@ export class ProviderRegistry {
   }
 
   async load(configs: InstanceConfigMap) {
-    this.lastDescribe = null;
+    // A new fleet: nothing completed before this describes it, and a sweep
+    // still running against the old instances must not become the answer.
+    this.generation++;
+    this.lastDone = null;
+    this.latestSettled.clear();
     for (const [instanceId, entry] of Object.entries(configs)) {
       await this.loadEntry(instanceId, entry);
     }
@@ -271,6 +325,9 @@ export class ProviderRegistry {
   /** Reload a single instance after an override/setting change without tearing
    * down the whole fleet. */
   async reloadInstance(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
+    // Its config changed (CLI path, enabled, credentials): what it said
+    // before is no longer a safe stand-in for an inconclusive probe.
+    this.forgetInstanceProbes(instanceId);
     const existing = this.byId.get(instanceId);
     if (existing?.live) {
       await existing.live.dispose().catch(() => {});
@@ -293,7 +350,9 @@ export class ProviderRegistry {
     this.fullAutoByInstance.delete(instanceId);
     this.enabledByInstance.delete(instanceId);
     this.minimaxContextByInstance.delete(instanceId);
-    this.lastDescribe = null;
+    this.forgetInstanceProbes(instanceId);
+    this.generation++;
+    this.lastDone = null;
   }
 
   get(instanceId: InstanceId): ProviderInstance | null {
@@ -308,15 +367,65 @@ export class ProviderRegistry {
     return [...this.byId.values()].flatMap((e) => (e.live ? [e.live] : []));
   }
 
-  /** instance snapshots for the model picker: id, driver, models, health */
-  /** The last full describe(), shared with callers that accept a slightly
-   * stale view. Probing every engine CLI (`--version`, auth status, model
-   * discovery) costs seconds on a machine with many CLIs installed, and a
-   * bot being created does not need a fresher answer than the rail did a
-   * moment ago. In-flight describes are shared too, so a burst of callers
-   * spawns one probe per engine, not one per caller. */
-  private lastDescribe: { at: number; result: Promise<DescribedInstance[]> } | null = null;
+  /** instance snapshots for the model picker: id, driver, models, health
+   *
+   * Probing every engine CLI (`--version`, auth status, model discovery)
+   * costs seconds, and tens of seconds on a busy Mac.  So:
+   *  - `lastDone` is the last COMPLETED describe and the time it finished.
+   *    Callers that accept a slightly old answer get it immediately.
+   *  - `inFlight` is at most one running sweep.  Every caller that may share
+   *    it does; nothing starts a second one beside it.  (A sweep used to be
+   *    stamped with its START time, so once it ran past the 15 s memo every
+   *    passive refresh started another full sweep on top of it.)
+   *  - A caller that must not be answered from before its own request (the
+   *    "Check again" button, a just-created engine) never joins a sweep that
+   *    started earlier: it queues one trailing sweep instead. */
+  private lastDone: { at: number; result: DescribedInstance[] } | null = null;
+  private inFlight: { startedAt: number; generation: number; promise: Promise<DescribedInstance[]> } | null = null;
+  private trailing: { createdAt: number; promise: Promise<DescribedInstance[]> } | null = null;
+  /** Bumped when the fleet itself changes (load, removeInstance). */
+  private generation = 0;
+  /** Bumped per instance when that one instance is reloaded. */
+  private instanceGeneration = new Map<InstanceId, number>();
+  /** One running probe per instance, shared by overlapping sweeps. */
+  private entryProbes = new Map<InstanceId, { startedAt: number; gen: string; promise: Promise<DescribedInstance> }>();
+  /** The last definitive answer per engine — never a timeout — which an
+   * inconclusive probe falls back to, field by field. */
+  private lastDefinitive = new Map<InstanceId, { at: number; info: DescribedInstance }>();
+  /** The newest settled describe per instance, so a sweep that finishes after
+   * a single-engine refresh (or a late probe) never puts an older answer back. */
+  private latestSettled = new Map<InstanceId, { at: number; gen: string; info: DescribedInstance }>();
+  /** When each describe result finished, for the client's ordering guard. */
+  private describedAtByResult = new WeakMap<DescribedInstance[], number>();
+  /** Settle time and generation of each entry a probe produced. */
+  private entryMeta = new WeakMap<DescribedInstance, { at: number; gen: string }>();
+  /** Snapshots whose snapshot() threw — an error, not a verdict. */
+  private thrownSnapshots = new WeakSet<ProviderSnapshot>();
+  private describeListeners = new Set<DescribeListener>();
   private diskCachePath: string | null = null;
+
+  /** Subscribe to completed describes that changed the answer — a finished
+   * background sweep, a single-engine refresh, a slow probe landing late. */
+  onDescribed(listener: DescribeListener): () => void {
+    this.describeListeners.add(listener);
+    return () => this.describeListeners.delete(listener);
+  }
+
+  /** When a list this registry returned was produced (ms since epoch). */
+  describedAtOf(result: DescribedInstance[]): number | undefined {
+    return this.describedAtByResult.get(result);
+  }
+
+  private genOf(instanceId: InstanceId): string {
+    return `${this.generation}:${this.instanceGeneration.get(instanceId) ?? 0}`;
+  }
+
+  private forgetInstanceProbes(instanceId: InstanceId): void {
+    this.instanceGeneration.set(instanceId, (this.instanceGeneration.get(instanceId) ?? 0) + 1);
+    this.lastDefinitive.delete(instanceId);
+    this.latestSettled.delete(instanceId);
+    this.entryProbes.delete(instanceId);
+  }
 
   setDiskCachePath(path: string | null): void {
     this.diskCachePath = path;
@@ -332,135 +441,306 @@ export class ProviderRegistry {
       const at = legacy ? Date.now() : typeof parsed?.at === "number" ? parsed.at : Date.now();
       const instances = legacy ? parsed : parsed?.instances;
       if (Array.isArray(instances) && instances.length > 0) {
-        this.lastDescribe = { at, result: Promise.resolve(instances as DescribedInstance[]) };
+        const seeded = (instances as DescribedInstance[]).map(seedFromDisk);
+        this.lastDone = { at, result: seeded };
+        this.describedAtByResult.set(seeded, at);
+        // An engine that was working when this cache was written is the
+        // baseline for this process's first, possibly slow, probes.
+        // Unavailable rows are not: an older build wrote a slow probe as
+        // "CLI not found", and that must not become ground truth.
+        const now = Date.now();
+        for (const info of instances as DescribedInstance[]) {
+          if (info?.snapshot?.state === "available" && !info.snapshot.transient && !this.lastDefinitive.has(info.instanceId)) {
+            this.lastDefinitive.set(info.instanceId, { at: now, info });
+          }
+        }
       }
     } catch {
       // Corrupt or unreadable cache — ignore and start fresh
     }
   }
 
-  private saveDiskCache(instances: DescribedInstance[]): void {
+  private saveDiskCache(instances: DescribedInstance[], at: number = Date.now()): void {
     if (!this.diskCachePath) return;
     try {
       const dir = dirname(this.diskCachePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      let toSave = instances;
-      if (existsSync(this.diskCachePath)) {
-        try {
-          const raw = readFileSync(this.diskCachePath, "utf8");
-          const parsed = JSON.parse(raw);
-          const previousList: DescribedInstance[] = Array.isArray(parsed) ? parsed : parsed?.instances;
-          if (Array.isArray(previousList)) {
-            const prevById = new Map(previousList.map((i) => [i.instanceId, i]));
-            toSave = instances.map((curr) => {
-              const prev = prevById.get(curr.instanceId);
-              if (
-                prev &&
-                prev.snapshot?.state === "available" &&
-                curr.snapshot?.state === "unavailable" &&
-                curr.cliCandidates &&
-                curr.cliCandidates.length > 0
-              ) {
-                return {
-                  ...curr,
-                  snapshot: prev.snapshot,
-                  models: curr.models.options.length > 0 ? curr.models : prev.models,
-                };
-              }
-              return curr;
-            });
-          }
-        } catch {
-          // Non-fatal if parsing existing cache fails
-        }
-      }
-      writeFileAtomic(this.diskCachePath, JSON.stringify({ at: Date.now(), instances: toSave }));
+      // Already merged field by field against each engine's last definitive
+      // snapshot, so a timeout never overwrites a good row here.
+      writeFileAtomic(this.diskCachePath, JSON.stringify({ at, instances }));
     } catch {
       // Non-fatal if saving cache fails
     }
   }
 
-  async describe(opts?: { maxAgeMs?: number; staleWhileRevalidate?: boolean }) {
+  async describe(opts?: { maxAgeMs?: number; staleWhileRevalidate?: boolean }): Promise<DescribedInstance[]> {
     const maxAge = opts?.maxAgeMs ?? 0;
     const now = Date.now();
-    const memo = this.lastDescribe;
-    if (maxAge > 0 && memo && now - memo.at <= maxAge) return memo.result;
+    const done = this.lastDone;
+    if (maxAge > 0 && done && now - done.at <= maxAge) return done.result;
 
-    // A caller that can live with a slightly old answer gets the previous one
-    // immediately while a new probe runs behind it.  Probing every engine CLI
-    // takes tens of seconds on a machine with many installed, which is longer
-    // than the phone waits before giving up — so making every caller block on
-    // it is what makes the model picker look empty rather than slow.
-    if (opts?.staleWhileRevalidate && memo) {
-      void this.refreshDescribe(now);
-      return memo.result;
+    // A caller that can live with a slightly old answer gets the last
+    // completed one immediately while a new probe runs behind it.  Probing
+    // every engine CLI takes tens of seconds on a machine with many
+    // installed, which is longer than the phone waits before giving up — so
+    // making every caller block on it is what makes the model picker look
+    // empty rather than slow.
+    if (opts?.staleWhileRevalidate && done) {
+      void this.ensureSweep().catch(() => {});
+      return done.result;
     }
 
-    return this.refreshDescribe(now);
+    // Accepts an answer up to maxAge old: a sweep already running is at
+    // least that fresh.
+    if (maxAge > 0) return this.ensureSweep();
+
+    // No memo at all: the user's own action ("Check again", a just-created
+    // or just-deleted engine) must never be served a sweep that started
+    // before it.
+    return this.freshSweep(now);
   }
 
-  private refreshDescribe(at: number) {
-    const previous = this.lastDescribe;
-    const result = this.describeFresh(previous);
-    this.lastDescribe = { at, result };
-    // describeFresh() already persists the disk cache once on success (see
-    // below); only guard against a failed probe here, or every probe would
-    // write the cache twice.
-    void result.catch(() => {
-      if (this.lastDescribe?.result === result) this.lastDescribe = null;
+  /** Join the running sweep of the current fleet, or start one. */
+  private ensureSweep(): Promise<DescribedInstance[]> {
+    const running = this.inFlight;
+    if (running && running.generation === this.generation) return running.promise;
+    return this.startSweep(0);
+  }
+
+  /** A sweep that starts no earlier than `requestedAt`. */
+  private freshSweep(requestedAt: number): Promise<DescribedInstance[]> {
+    const running = this.inFlight;
+    // Nothing running, or only a sweep of a fleet that has since been
+    // reloaded: start now.
+    if (!running || running.generation !== this.generation) return this.startSweep(requestedAt);
+    if (running.startedAt >= requestedAt) return running.promise;
+    if (!this.trailing) {
+      const createdAt = Date.now();
+      const promise: Promise<DescribedInstance[]> = running.promise
+        .then(() => undefined, () => undefined)
+        .then(() => {
+          if (this.trailing?.promise === promise) this.trailing = null;
+          // Something else started a sweep after every caller sharing this
+          // trailing one asked: that sweep already answers them.
+          const now = this.inFlight;
+          if (now && now.startedAt >= createdAt && now.generation === this.generation) return now.promise;
+          return this.startSweep(createdAt);
+        });
+      this.trailing = { createdAt, promise };
+    }
+    return this.trailing.promise;
+  }
+
+  private startSweep(notBefore: number): Promise<DescribedInstance[]> {
+    const generation = this.generation;
+    const startedAt = Date.now();
+    const promise = this.describeFresh({ notBefore: notBefore || startedAt }).then((result) => {
+      // A sweep that began before load()/removeInstance() describes a fleet
+      // that no longer exists: its callers get it, the memo does not.
+      if (generation === this.generation) this.commit(result, this.describedAtByResult.get(result) ?? Date.now(), false);
+      return result;
     });
-    return result;
+    const slot = { startedAt, generation, promise };
+    this.inFlight = slot;
+    const clear = () => {
+      if (this.inFlight === slot) this.inFlight = null;
+    };
+    promise.then(clear, clear);
+    return promise;
   }
 
-  async describeFresh(previousMemo?: { at: number; result: Promise<DescribedInstance[]> } | null): Promise<DescribedInstance[]> {
+  /** Make `result` the last completed describe and tell listeners if it
+   * changed anything. */
+  private commit(result: DescribedInstance[], at: number, persist: boolean): void {
+    const previous = this.lastDone;
+    this.lastDone = { at, result };
+    this.describedAtByResult.set(result, at);
+    if (persist) this.saveDiskCache(result, at);
+    if (this.describeListeners.size === 0) return;
+    if (previous && JSON.stringify(previous.result) === JSON.stringify(result)) return;
+    for (const listener of [...this.describeListeners]) {
+      try {
+        listener(result, at);
+      } catch {
+        // a listener's failure is its own
+      }
+    }
+  }
+
+  /** Probe every engine (a few at a time), merge each answer against that
+   * engine's last definitive snapshot, persist, and return the list.  Public
+   * for tests; callers go through describe(). */
+  async describeFresh(opts?: { notBefore?: number }): Promise<DescribedInstance[]> {
+    const notBefore = opts?.notBefore ?? Date.now();
     // Multiple instances may share a driver. Scan each default binary once
     // per response instead of repeating filesystem work for every row.
     const candidatesByName = new Map<string, string[]>();
-    const instances = await Promise.all(
-      this.entries().map((entry) => this.describeEntry(entry, candidatesByName)),
+    const probed = await mapWithConcurrency(this.entries(), this.probeConcurrency, (entry) =>
+      this.probeEntryWithDeadline(entry, candidatesByName, notBefore),
     );
-    let previousList: DescribedInstance[] | undefined;
-    if (previousMemo && previousMemo !== this.lastDescribe) {
-      try {
-        previousList = await previousMemo.result;
-      } catch {
-        // Ignore previous describe error
-      }
-    }
-    if (!previousList && this.diskCachePath && existsSync(this.diskCachePath)) {
-      try {
-        const raw = readFileSync(this.diskCachePath, "utf8");
-        const parsed = JSON.parse(raw);
-        previousList = Array.isArray(parsed) ? parsed : parsed?.instances;
-      } catch {
-        // Ignore disk cache read error
-      }
-    }
-    const merged = instances.map((curr) => {
-      const prev = previousList?.find((p) => p.instanceId === curr.instanceId);
-      if (
-        prev &&
-        prev.snapshot?.state === "available" &&
-        curr.snapshot?.state === "unavailable" &&
-        curr.cliCandidates &&
-        curr.cliCandidates.length > 0
-      ) {
-        return {
-          ...curr,
-          snapshot: prev.snapshot,
-          models: curr.models.options.length > 0 ? curr.models : prev.models,
-        };
-      }
-      return curr;
-    });
-    this.saveDiskCache(merged);
+    const merged = probed.map((info) => this.newestFor(info));
+    const at = Date.now();
+    this.saveDiskCache(merged, at);
+    this.describedAtByResult.set(merged, at);
     return merged;
   }
 
-  private async describeEntry(
+  /** `info`, unless a newer answer for the same instance settled meanwhile —
+   * a single-engine refresh after a Settings change, or this engine's own
+   * slow probe landing after the sweep answered for it. */
+  private newestFor(info: DescribedInstance): DescribedInstance {
+    const latest = this.latestSettled.get(info.instanceId);
+    if (!latest || latest.gen !== this.genOf(info.instanceId)) return info;
+    const meta = this.entryMeta.get(info);
+    if (!meta || meta.gen !== latest.gen || latest.at > meta.at) return latest.info;
+    return info;
+  }
+
+  /** One engine's describe, shared with any overlapping sweep whose caller
+   * accepts a probe that started no earlier than `notBefore`. */
+  private probeEntry(
     entry: RegistryEntry,
     candidatesByName: Map<string, string[]>,
+    notBefore: number,
   ): Promise<DescribedInstance> {
+    const id = entry.instanceId;
+    const gen = this.genOf(id);
+    const running = this.entryProbes.get(id);
+    if (running && running.gen === gen && running.startedAt >= notBefore) return running.promise;
+    const startedAt = Date.now();
+    const promise = this.describeEntry(entry, candidatesByName).then((raw) => this.settleEntry(raw, gen));
+    const slot = { startedAt, gen, promise };
+    this.entryProbes.set(id, slot);
+    const clear = () => {
+      if (this.entryProbes.get(id) === slot) this.entryProbes.delete(id);
+    };
+    promise.then(clear, clear);
+    return promise;
+  }
+
+  /** probeEntry with a deadline: past it, the engine is answered from its
+   * last definitive snapshot (or reported as not answering yet), and the
+   * probe's own answer is folded in when it lands. */
+  private probeEntryWithDeadline(
+    entry: RegistryEntry,
+    candidatesByName: Map<string, string[]>,
+    notBefore: number,
+  ): Promise<DescribedInstance> {
+    const probe = this.probeEntry(entry, candidatesByName, notBefore);
+    if (!(this.entryDeadlineMs > 0) || entry.shadow) return probe;
+    return new Promise<DescribedInstance>((resolve) => {
+      let answered = false;
+      const timer = setTimeout(() => {
+        answered = true;
+        console.warn(
+          `[engines] ${entry.instanceId} took longer than ${this.entryDeadlineMs}ms to describe; answering from its last known state`,
+        );
+        resolve(this.deadlineFallback(entry, candidatesByName));
+        void probe.then((late) => this.applyLateEntry(late)).catch(() => {});
+      }, this.entryDeadlineMs);
+      timer.unref?.();
+      probe.then(
+        (info) => {
+          if (answered) return;
+          clearTimeout(timer);
+          resolve(info);
+        },
+        () => {
+          if (answered) return;
+          clearTimeout(timer);
+          resolve(this.deadlineFallback(entry, candidatesByName));
+        },
+      );
+    });
+  }
+
+  private deadlineFallback(entry: RegistryEntry, candidatesByName: Map<string, string[]>): DescribedInstance {
+    const shell = this.entryShell(entry, candidatesByName, {
+      state: "unavailable",
+      transient: true,
+      reason: `${entry.live?.displayName || entry.instanceId} did not answer in time`,
+    });
+    const info = this.mergeWithDefinitive(shell);
+    this.entryMeta.set(info, { at: Date.now(), gen: this.genOf(entry.instanceId) });
+    return info;
+  }
+
+  /** A probe that missed its sweep's deadline landed: fold it into the last
+   * completed describe so clients see it without asking again. */
+  private applyLateEntry(info: DescribedInstance): void {
+    const done = this.lastDone;
+    if (!done) return;
+    const meta = this.entryMeta.get(info);
+    if (!meta || meta.gen !== this.genOf(info.instanceId)) return;
+    const index = done.result.findIndex((item) => item.instanceId === info.instanceId);
+    if (index < 0) return;
+    const current = this.entryMeta.get(done.result[index]);
+    if (current && current.gen === meta.gen && current.at >= meta.at) return;
+    const next = [...done.result];
+    next[index] = info;
+    this.commit(next, Date.now(), true);
+  }
+
+  /** Record a probe's answer: merge it against the engine's last definitive
+   * snapshot, and make it the new baseline when it is itself definitive. */
+  private settleEntry(raw: DescribedInstance, gen: string): DescribedInstance {
+    const current = gen === this.genOf(raw.instanceId);
+    const info = current ? this.mergeWithDefinitive(raw) : raw;
+    const at = Date.now();
+    this.entryMeta.set(info, { at, gen });
+    if (!current) return info;
+    if (!raw.snapshot.transient && !this.thrownSnapshots.has(raw.snapshot)) {
+      this.lastDefinitive.set(raw.instanceId, { at, info });
+    }
+    const latest = this.latestSettled.get(raw.instanceId);
+    if (!latest || latest.gen !== gen || latest.at <= at) {
+      this.latestSettled.set(raw.instanceId, { at, gen, info });
+    }
+    return info;
+  }
+
+  /** Field-by-field merge against the engine's last definitive snapshot.
+   *  - A transient snapshot (the probe gave no answer) is replaced by the
+   *    last definitive one.  So is a snapshot() that threw, for a CLI that is
+   *    still on disk and was working.
+   *  - An unknown `authenticated` (auth probe timed out) keeps the last
+   *    definitive true/false instead of reading as signed out.
+   *  - Anything definitive stands: a real sign-out, "Disabled in settings",
+   *    "too old", a missing CLI. */
+  private mergeWithDefinitive(curr: DescribedInstance): DescribedInstance {
+    const record = this.lastDefinitive.get(curr.instanceId);
+    if (!record || Date.now() - record.at > DEFINITIVE_MAX_AGE_MS) return curr;
+    const prev = record.info;
+    if (prev.driverKind !== curr.driverKind || (prev.enabled !== false) !== (curr.enabled !== false)) return curr;
+    const thrown =
+      this.thrownSnapshots.has(curr.snapshot) &&
+      prev.snapshot.state === "available" &&
+      curr.cliCandidates.length > 0;
+    if (curr.snapshot.transient || thrown) {
+      return {
+        ...curr,
+        snapshot: { ...prev.snapshot, quota: curr.snapshot.quota ?? prev.snapshot.quota },
+        models: curr.models.options.length > 0 ? curr.models : prev.models,
+      };
+    }
+    if (
+      curr.snapshot.state === "available" &&
+      curr.snapshot.authenticated === undefined &&
+      prev.snapshot.state === "available" &&
+      typeof prev.snapshot.authenticated === "boolean"
+    ) {
+      return { ...curr, snapshot: { ...curr.snapshot, authenticated: prev.snapshot.authenticated } };
+    }
+    return curr;
+  }
+
+  /** Everything describe() reports for an entry except what its probe
+   * found, around the given snapshot. */
+  private entryShell(
+    entry: RegistryEntry,
+    candidatesByName: Map<string, string[]>,
+    snapshot: ProviderSnapshot,
+  ): DescribedInstance {
     const driver = this.driversByKind.get(entry.shadow?.driverKind ?? entry.live!.driverKind);
     const candidatesFor = (d: AnyProviderDriver | undefined): string[] => {
       const name = cliDefaultOf(d);
@@ -478,7 +758,7 @@ export class ProviderRegistry {
         driverKind: entry.shadow.driverKind,
         displayName: entry.shadow.displayName ?? entry.shadow.driverKind,
         enabled,
-        snapshot: { state: "unavailable", reason: entry.shadow.reason } satisfies ProviderSnapshot,
+        snapshot,
         models: { default: "", options: [] },
         capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false, toolLoop: false },
         // A shadow has no adapter to ask, so the derivation is fed the same
@@ -501,6 +781,55 @@ export class ProviderRegistry {
         iconUrl: undefined,
         isCustom: isCustomInstance(entry.shadow.driverKind, entry.instanceId),
       };
+    }
+    const inst = entry.live!;
+    const enabled = this.enabledByInstance.get(entry.instanceId) ?? true;
+    return {
+      instanceId: inst.instanceId,
+      driverKind: inst.driverKind,
+      displayName: inst.displayName ?? inst.driverKind,
+      enabled,
+      snapshot,
+      models: inst.models,
+      capabilities: {
+        computerMcp: inst.adapter.capabilities.computerMcp === true,
+        agentsMcp: inst.adapter.capabilities.agentsMcp === true,
+        composioMcp: inst.adapter.capabilities.composioMcp === true,
+        phoneMcp: inst.adapter.capabilities.phoneMcp === true,
+        images: inst.adapter.capabilities.images === true,
+        effortLevels: inst.adapter.capabilities.effortLevels,
+        queueing: inst.adapter.capabilities.queueing === true,
+        localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
+        approvalReview: inst.reviewPermission !== undefined,
+        toolLoop: inst.adapter.capabilities.toolLoop === true,
+      },
+      // Derived here, on the one wire where adapter capabilities already
+      // become an InstanceInfo, so the client never recomputes it and can
+      // never drift from the dispatch again.
+      computerReach: computerReach({
+        driverKind: inst.driverKind,
+        capabilities: inst.adapter.capabilities,
+      }),
+      access: driver?.metadata.access ?? "subscription",
+      install: driver?.install,
+      cli: this.cliByInstance.get(inst.instanceId),
+      cliDefault: cliDefaultOf(driver),
+      // every copy of the driver's default binary on the augmented PATH —
+      // the dropdown's "detected" entries. Snapshotted per describe() so a
+      // newly installed CLI shows up on the next refresh.
+      cliCandidates: candidatesFor(driver),
+      fullAuto: this.fullAutoByInstance.get(inst.instanceId) ?? false,
+      iconUrl: inst.iconUrl,
+      isCustom: isCustomInstance(inst.driverKind, inst.instanceId),
+    };
+  }
+
+  private async describeEntry(
+    entry: RegistryEntry,
+    candidatesByName: Map<string, string[]>,
+  ): Promise<DescribedInstance> {
+    if (entry.shadow) {
+      return this.entryShell(entry, candidatesByName, { state: "unavailable", reason: entry.shadow.reason });
     }
     const inst = entry.live!;
     const enabled = this.enabledByInstance.get(entry.instanceId) ?? true;
@@ -709,46 +1038,10 @@ export class ProviderRegistry {
         }
       } catch (e) {
         snapshot = { state: "unavailable", reason: e instanceof Error ? e.message : String(e) };
+        this.thrownSnapshots.add(snapshot);
       }
     }
-    return {
-      instanceId: inst.instanceId,
-      driverKind: inst.driverKind,
-      displayName: inst.displayName ?? inst.driverKind,
-      enabled,
-      snapshot,
-      models: inst.models,
-      capabilities: {
-        computerMcp: inst.adapter.capabilities.computerMcp === true,
-        agentsMcp: inst.adapter.capabilities.agentsMcp === true,
-        composioMcp: inst.adapter.capabilities.composioMcp === true,
-        phoneMcp: inst.adapter.capabilities.phoneMcp === true,
-        images: inst.adapter.capabilities.images === true,
-        effortLevels: inst.adapter.capabilities.effortLevels,
-        queueing: inst.adapter.capabilities.queueing === true,
-        localComputerMcp: inst.adapter.capabilities.localComputerMcp === true,
-        approvalReview: inst.reviewPermission !== undefined,
-        toolLoop: inst.adapter.capabilities.toolLoop === true,
-      },
-      // Derived here, on the one wire where adapter capabilities already
-      // become an InstanceInfo, so the client never recomputes it and can
-      // never drift from the dispatch again.
-      computerReach: computerReach({
-        driverKind: inst.driverKind,
-        capabilities: inst.adapter.capabilities,
-      }),
-      access: driver?.metadata.access ?? "subscription",
-      install: driver?.install,
-      cli: this.cliByInstance.get(inst.instanceId),
-      cliDefault: cliDefaultOf(driver),
-      // every copy of the driver's default binary on the augmented PATH —
-      // the dropdown's "detected" entries. Snapshotted per describe() so a
-      // newly installed CLI shows up on the next refresh.
-      cliCandidates: candidatesFor(driver),
-      fullAuto: this.fullAutoByInstance.get(inst.instanceId) ?? false,
-      iconUrl: inst.iconUrl,
-      isCustom: isCustomInstance(inst.driverKind, inst.instanceId),
-    };
+    return this.entryShell(entry, candidatesByName, snapshot);
   }
 
   /** Probes ONLY the modified instance and updates the cached describe
@@ -757,35 +1050,25 @@ export class ProviderRegistry {
     const entry = this.byId.get(instanceId);
     if (!entry) return this.describe();
 
-    const candidatesByName = new Map<string, string[]>();
-    const freshInfo = await this.describeEntry(entry, candidatesByName);
+    // A probe that starts now: the caller just changed this engine.
+    const freshInfo = await this.probeEntryWithDeadline(entry, new Map(), Date.now());
 
-    if (this.lastDescribe) {
-      try {
-        while (this.lastDescribe) {
-          const current: { at: number; result: Promise<DescribedInstance[]> } = this.lastDescribe;
-          const list: DescribedInstance[] = await current.result;
-          if (this.lastDescribe !== current) {
-            // A concurrent describe completed in the meantime; re-merge into the fresher snapshot
-            continue;
-          }
-          const index = list.findIndex((item) => item.instanceId === instanceId);
-          const nextList = [...list];
-          if (index >= 0) {
-            nextList[index] = freshInfo;
-          } else {
-            nextList.push(freshInfo);
-          }
-          this.lastDescribe = { at: Date.now(), result: Promise.resolve(nextList) };
-          this.saveDiskCache(nextList);
-          return nextList;
-        }
-      } catch {
-        // Fall back to full describe if cached promise errored
-      }
+    // No completed describe to patch yet, but one is running: it will pick
+    // this answer up (newestFor), so wait for it rather than starting a
+    // second full sweep.
+    if (!this.lastDone && this.inFlight && this.inFlight.generation === this.generation) {
+      await this.inFlight.promise.catch(() => undefined);
     }
+    const done = this.lastDone;
+    if (!done) return this.describe();
 
-    return this.refreshDescribe(Date.now());
+    const nextList = [...done.result];
+    const index = nextList.findIndex((item) => item.instanceId === instanceId);
+    const newest = this.newestFor(freshInfo);
+    if (index >= 0) nextList[index] = newest;
+    else nextList.push(newest);
+    this.commit(nextList, Date.now(), true);
+    return nextList;
   }
 
   async disposeAll() {
