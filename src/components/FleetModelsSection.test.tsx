@@ -126,6 +126,15 @@ describe("Apply to All Bots block", () => {
     expect(count(block, "Set Default")).toBe(1 + MAX_MODEL_FALLBACKS);
   });
 
+  it("says a bot with a gap before a chosen fallback is skipped, not shifted", () => {
+    const { block } = render([bot("a", [])]);
+    expect(block).toContain("Fallbacks fill in order");
+    expect(block).toContain("skipped and named below");
+    // The two-space gap survives as a real U+00A0 plus a space, never as the entity.
+    expect(block).toContain("current model.\u00A0 Fallbacks fill in order");
+    expect(block).not.toContain("&nbsp;");
+  });
+
   it("keeps the apply button, disabled until something is chosen", () => {
     const { block } = render([bot("a", [])]);
     expect(block).toContain("Set All Bots To Default");
