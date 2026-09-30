@@ -40,7 +40,6 @@ import { ModelPicker } from "./ModelPicker";
 /** Shared width so Primary, fallbacks, and Add Fallback wrap as siblings. */
 const CHIP = "flex min-w-[16rem] max-w-full flex-[1_1_16rem] flex-col gap-1";
 
-
 function pickEmptyBot(bots: Bot[]): Bot | null {
   return bots.find((bot) => !bot.hidden) ?? null;
 }
