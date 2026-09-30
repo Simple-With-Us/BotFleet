@@ -187,7 +187,8 @@ export function TrajectoryPanel({
           )}
         </label>
         {!empty && (
-          <span className="ml-auto flex items-center gap-2 text-[12px] tabular-nums text-ink-secondary" role="status">
+          // not a live region: while a turn runs this text changes every second
+          <span className="ml-auto flex items-center gap-2 text-[12px] tabular-nums text-ink-secondary">
             {trajectory.running && (
               <span className="flex items-center gap-1.5 text-accent-text">
                 <span aria-hidden="true" className="size-1.5 rounded-full bg-accent motion-safe:animate-pulse" />

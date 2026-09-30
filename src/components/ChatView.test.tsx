@@ -68,6 +68,11 @@ describe("ChatView Trajectory switch", () => {
     expect(SRC).toContain('cn("relative min-h-0 flex-1 @container/chat", trajectoryOpen && "hidden")');
   });
 
+  it("does not pin the hidden chat pane's scroll to zero while Trajectory is open", () => {
+    expect(SRC).toContain("if (!el || !followRef.current || trajectoryOpen) return;");
+    expect(SRC).toContain("follow, composerHeight, trajectoryOpen]);");
+  });
+
   it("mounts the Trajectory view keyed by thread, fed the thread's own state", () => {
     expect(SRC).toMatch(/\{trajectoryOpen && \(\s*<TrajectoryView\s+key=\{bot\.threadId\}\s+threadId=\{bot\.threadId\}\s+messages=\{serverMessages\}\s+running=\{Boolean\(bot\.busy\)\}\s+knownTurns=\{activeTask\?\.usage\?\.turns\}\s*\/>\s*\)\}/);
   });

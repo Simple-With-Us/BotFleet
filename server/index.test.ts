@@ -4450,6 +4450,22 @@ describe("harness HTTP API", () => {
     expect(ok.body.total).toEqual({ runtime: expect.any(Number), native: expect.any(Number) });
   });
 
+  it("serves the Trajectory tab's runtime-only read and rejects any other view", async () => {
+    const bot = (await api("GET", "/api/bots")).body.bots[0];
+    const ok = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=5`);
+    expect(ok.status).toBe(200);
+    expect(ok.body.entries.every((entry: { kind: string }) => entry.kind === "runtime")).toBe(true);
+    // the native tee is never opened for this read, and it says whether older records remain
+    expect(ok.body.total.native).toBe(0);
+    expect(typeof ok.body.older).toBe("boolean");
+    // the Inspector's own response carries neither
+    const inspector = await api("GET", `/api/threads/${bot.threadId}/events?limit=5`);
+    expect(inspector.body).not.toHaveProperty("older");
+    const bad = await api("GET", `/api/threads/${bot.threadId}/events?view=raw`);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toContain("view must be trajectory");
+  });
+
   it("404s unknown routes with the route in the error", async () => {
     const res = await api("GET", "/api/definitely-not-a-route");
     expect(res.status).toBe(404);

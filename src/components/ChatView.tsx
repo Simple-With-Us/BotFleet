@@ -1366,12 +1366,16 @@ export function ChatView({ bot }: { bot: Bot }) {
 
   // deps track the FULL messages.length, so expanding the window (which only
   // changes windowedMessages) can never re-trigger this bottom scrollTo
+  //
+  // Not while the pane is hidden behind the Trajectory view: a hidden box has
+  // no height, so "scroll to the bottom" would pin the offset to zero.  Coming
+  // back re-runs this, and a reader who was following lands on the newest.
   useEffect(() => {
     const el = scrollRef.current;
-    if (!el || !followRef.current) return;
+    if (!el || !followRef.current || trajectoryOpen) return;
     el.scrollTo({ top: el.scrollHeight });
     previousScrollTop.current = el.scrollTop;
-  }, [bot.id, bot.threadId, messages.length, streaming, reasoning, bot.busy, follow, composerHeight]);
+  }, [bot.id, bot.threadId, messages.length, streaming, reasoning, bot.busy, follow, composerHeight, trajectoryOpen]);
 
   // Expanding prepends rows: capture the height first, then after the commit
   // shift scrollTop by the growth so the message under the cursor stays put
