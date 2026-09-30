@@ -674,20 +674,39 @@ describe("readDshModelCatalog", () => {
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).toContain("DeepSeek-V4.1-Pro");
     expect(ids).toContain("MiniMax-M3.1-Flash-Preview");
-    // The fixture's pre-rename id must not survive the union as a stale row.
+    // `deepseek-v4-pro` is the id dsh still declares for Pro: it folds onto
+    // the V4.1 row and never survives the union as its own stale row.
     expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
     expect(ids).not.toContain("MiniMax-M3");
   });
 
-  it("drops every retired pre-rename DeepSeek id a stale profile still offers", () => {
+  it("drops the retired v4-flash id a stale profile still offers", () => {
     writeSettings(llmPiAi(
-      "    deepseek-official:\n      models:\n        - id: deepseek-v4-flash\n        - id: deepseek-v4-pro\n",
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-flash\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).not.toContain("deepseek-v4-flash");
-    expect(ids).not.toContain("deepseek-v4-pro");
     expect(ids).toContain("DeepSeek-V4.1-Flash");
     expect(ids).toContain("DeepSeek-V4.1-Pro");
+  });
+
+  it("does not exclude deepseek-v4-pro, which dsh still declares: it folds onto the V4.1-Pro row", () => {
+    // dsh 0.1.5-rc.2 declares `deepseek-v4-pro` (display name DeepSeek-V4.1-Pro)
+    // and the owner's override keeps it.  It is live, not retired, so its live
+    // contextWindow must merge into the Pro row instead of being discarded by
+    // an exclusion, and the model must still be listed exactly once.
+    writeSettings(llmPiAi(
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n          name: DeepSeek-V4.1-Pro\n          contextWindow: 777000\n",
+    ));
+    const catalog = readDshModelCatalog({ HOME: home });
+    const ids = catalog.options.map((o) => o.id);
+    expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
+    const pro = catalog.options.find((o) => o.id === "DeepSeek-V4.1-Pro");
+    expect(pro?.contextWindow).toBe(777000);
+    expect(pro?.label).toBe("DeepSeek-V4.1-Pro");
+    expect(pro?.images).toBe(false);
   });
 
   it("folds a stock-spelling settings row onto its static row instead of duplicating the model", () => {
@@ -832,5 +851,31 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
     expect(() => dshModelOptionValue("DeepSeek-V4.1-Flash", [
       { id: "model", options: [{ value: '["minimax","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
     ])).toThrow(DshModelNotOfferedError);
+  });
+
+  it("names the provider route of a refused model, so a wrong-route pick does not read as a contradiction", () => {
+    // Harness #56: a model declared only under another provider stays refused
+    // (a different route has its own credentials and billing), and the error
+    // now lists offers as provider/id and says where the model is declared.
+    let thrown: unknown;
+    try {
+      dshModelOptionValue("MiniMax-M3.1-Flash-Preview", [
+        {
+          id: "model",
+          options: [
+            { group: "deepseek-official", options: [{ value: '["deepseek-official","deepseek-flash"]', name: "DeepSeek-V4.1-Flash" }] },
+            { group: "minimax-cn", options: [{ value: '["minimax-cn","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
+          ],
+        },
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(DshModelNotOfferedError);
+    const error = thrown as DshModelNotOfferedError;
+    expect(error.elsewhere).toEqual(["minimax-cn"]);
+    expect(error.offered).toContain("minimax-cn/MiniMax-M3.1-Flash-Preview");
+    expect(error.message).toContain("MiniMax-M3.1-Flash-Preview is declared only under minimax-cn");
+    expect(dshSupport.classifyError?.(error)).toBe("model_catalog_outage");
   });
 });
