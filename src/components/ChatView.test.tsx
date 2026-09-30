@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ChatView.tsx"), "utf8");
+const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "ChatView.tsx"), "utf8").replace(/\r\n/g, "\n");
 
 describe("ChatView mascot avatars stay paused once settled", () => {
   it("renders both the expanded and collapsed bot-to-bot comm chip paused — a settled message never needs motion", () => {
