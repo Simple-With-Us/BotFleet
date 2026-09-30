@@ -451,6 +451,8 @@ export class ProviderRegistry {
    *  will wait (see DEFAULT_TRANSIENT_RECHECK_MS). */
   private recheckTimer: ReturnType<typeof setTimeout> | null = null;
   private recheckDelayMs = 0;
+  /** The describedAt of the last commit (see commit()). */
+  private lastDescribedAt = 0;
 
   /** Subscribe to completed describes that changed the answer — a finished
    * background sweep, a single-engine refresh, a slow probe landing late. */
@@ -631,7 +633,12 @@ export class ProviderRegistry {
 
   /** Make `result` the last completed describe and tell listeners if it
    * changed anything. */
-  private commit(result: DescribedInstance[], at: number, persist: boolean): void {
+  private commit(result: DescribedInstance[], answeredAt: number, persist: boolean): void {
+    // Strictly increasing, so two different answers never share a stamp and
+    // the client's describedAt guard is a total order: the last commit wins
+    // wherever its REST response and SSE push arrive in between.
+    const at = Math.max(answeredAt, this.lastDescribedAt + 1);
+    this.lastDescribedAt = at;
     const previous = this.lastDone;
     this.lastDone = { at, result };
     this.describedAtByResult.set(result, at);
@@ -1246,13 +1253,20 @@ export class ProviderRegistry {
     if (!entry) return this.describe();
 
     // A probe that starts now: the caller just changed this engine.
-    const freshInfo = await this.probeEntryWithDeadline(entry, new Map(), Date.now());
+    const gen = this.genOf(instanceId);
+    const freshInfo = await this.probeEntryWithDeadline(entry, new Map(), Date.now(), gen);
 
     // No completed describe to patch yet, but one is running: it will pick
     // this answer up (newestFor), so wait for it rather than starting a
     // second full sweep.
     if (!this.lastDone && this.inFlight && this.inFlight.generation === this.sweepKey()) {
       await this.inFlight.promise.catch(() => undefined);
+    }
+    // The engine was reloaded or removed while this probe ran (a Settings
+    // save during a background re-check): its answer describes a config that
+    // no longer exists, so it is never committed.  Ask the current one.
+    if (gen !== this.genOf(instanceId) || this.byId.get(instanceId) !== entry) {
+      return this.byId.has(instanceId) ? this.describeWithFreshInstance(instanceId) : this.describe();
     }
     const done = this.lastDone;
     if (!done) return this.describe();

@@ -109,8 +109,10 @@ export function railEngines(instances: InstanceInfo[], selectedInstanceId: strin
     if (i.enabled === false) return false;
     const selected = i.instanceId === selectedInstanceId;
     if (isHiddenEngine(i) && !selected) return false;
+    // A configured `cli` override counts: the registry lists only copies of
+    // the default command, so an absolute override leaves candidates empty.
     const isInstalledOrSubscription =
-      i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
+      i.access !== "custom" || Boolean(i.cli) || (i.cliCandidates?.length ?? 0) > 0;
     if (i.snapshot.state === "unavailable" && !selected && !isInstalledOrSubscription) {
       return false;
     }

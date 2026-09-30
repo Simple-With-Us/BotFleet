@@ -119,6 +119,20 @@ describe("railEngines", () => {
     );
     expect(rail.map((i) => i.instanceId)).toEqual(["cursor"]);
   });
+
+  it("keeps a custom engine whose configured CLI override is not on PATH", () => {
+    // The registry lists copies of the default command only, so an absolute
+    // override leaves cliCandidates empty even though the binary exists.
+    const checking = { state: "unavailable" as const, transient: true, reason: "Pi did not answer in time" };
+    const rail = railEngines(
+      [
+        engine("pi", checking, { access: "custom", cli: "/opt/pi/bin/pi", cliCandidates: [] }),
+        engine("hermes", { state: "unavailable", reason: "`hermes` CLI not found" }, { access: "custom", cliCandidates: [] }),
+      ],
+      "claude",
+    );
+    expect(rail.map((i) => i.instanceId)).toEqual(["pi"]);
+  });
 });
 
 describe("pickerBlocked", () => {

@@ -1682,6 +1682,56 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     }
   });
 
+  it("never commits a single-engine refresh whose engine was reloaded while it ran", async () => {
+    const gate = deferred<void>();
+    let blockNext = false;
+    const fake = makeFakeDriver({
+      snapshotImpl: async (input) => {
+        const tag = String((input.config as { tag?: string }).tag);
+        if (blockNext) {
+          blockNext = false;
+          await gate.promise;
+        }
+        return { state: "available", version: tag };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+    await registry.load({ a: { driver: "fake", config: { tag: "old" } } });
+    await registry.describe();
+
+    // A background re-check probes the old config; Settings saves meanwhile.
+    blockNext = true;
+    const refresh = registry.describeWithFreshInstance("a");
+    await tick();
+    await registry.reloadInstance("a", { driver: "fake", config: { tag: "new" } });
+    const pushed: string[] = [];
+    registry.onDescribed((instances) => pushed.push(String(instances[0].snapshot.version)));
+    gate.resolve();
+    const answer = await refresh;
+    expect(answer[0].snapshot.version).toBe("new");
+    expect(pushed).not.toContain("old");
+    expect((await registry.describe({ maxAgeMs: 60_000 }))[0].snapshot.version).toBe("new");
+  });
+
+  it("stamps every commit with a later describedAt, even within one millisecond", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const fake = makeFakeDriver({ snapshotImpl: (_input, call) => ({ state: "available", version: `v${call}` }) });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      const stamps: number[] = [];
+      registry.onDescribed((_instances, at) => stamps.push(at));
+      await registry.describe();
+      await registry.describeWithFreshInstance("a");
+      await registry.describeWithFreshInstance("a");
+      expect(stamps).toHaveLength(3);
+      expect(stamps[1]).toBeGreaterThan(stamps[0]);
+      expect(stamps[2]).toBeGreaterThan(stamps[1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("looks again on its own at an engine it could only report as checking", async () => {
     const fake = makeFakeDriver({
       snapshotImpl: (_input, call) =>
