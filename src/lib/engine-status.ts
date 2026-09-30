@@ -9,9 +9,19 @@ export function isCheckingEngine(instance: Pick<InstanceInfo, "snapshot"> | unde
   return instance?.snapshot.transient === true;
 }
 
-/** An optional integration nobody has set up (Computer with no Box token):
+/** An optional integration nobody has set up (the ASCII.dev Box engine with no Box token):
  *  left out of the engine rail, Settings → Engines and the Usage rows until
  *  it is configured. */
 export function isHiddenEngine(instance: Pick<InstanceInfo, "snapshot"> | undefined): boolean {
   return instance?.snapshot.hidden === true;
+}
+
+/** Nothing on this machine can run a bot: every engine has answered and none
+ *  is available.  An engine still being checked might be, so it holds the
+ *  "install an engine" screen back — a busy Mac is not an empty one. */
+export function noEngineCanRun(instances: readonly Pick<InstanceInfo, "snapshot">[]): boolean {
+  return (
+    instances.length > 0 &&
+    !instances.some((instance) => instance.snapshot.state === "available" || isCheckingEngine(instance))
+  );
 }

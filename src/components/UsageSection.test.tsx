@@ -303,7 +303,7 @@ describe("hidesIdleUnavailableEngineRow", () => {
     expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "Disabled in settings" } })).toBe(true);
   });
 
-  it("hides the Computer engine until a Box token is configured", () => {
+  it("hides the ASCII.dev Box engine until a Box token is configured", () => {
     expect(
       hidesIdleUnavailableEngineRow({
         snapshot: { state: "unavailable", hidden: true, reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' },

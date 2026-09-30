@@ -137,6 +137,26 @@ describe("ReplayBuffer", () => {
     expect(buffer.entries).toEqual([{ seq: 1, kind: "screen", frame: null }]);
   });
 
+  it("replays only the newest engine list: an older instances payload is dropped, its slot kept", () => {
+    const buffer = new ReplayBuffer(10, 1_000_000);
+    buffer.push(1, "instances", "list-one");
+    buffer.push(2, "message", "hello");
+    buffer.push(3, "instances", "list-two");
+    expect(buffer.entries).toEqual([
+      { seq: 1, kind: "instances", frame: null },
+      { seq: 2, kind: "message", frame: "hello" },
+      { seq: 3, kind: "instances", frame: "list-two" },
+    ]);
+  });
+
+  it("gives a superseded engine list's bytes back to the budget", () => {
+    const buffer = new ReplayBuffer(100, 30);
+    buffer.push(1, "instances", "x".repeat(20));
+    buffer.push(2, "instances", "y".repeat(20)); // would be 40 bytes without the drop
+    buffer.push(3, "message", "m".repeat(10)); // 30 bytes: nothing evicted
+    expect(buffer.entries.map((e) => e.seq)).toEqual([1, 2, 3]);
+  });
+
   it("evicts oldest first past the byte cap even under the count cap (HS17)", () => {
     const buffer = new ReplayBuffer(100, 30); // 30-byte budget
     buffer.push(1, "message", "a".repeat(10)); // 10 bytes

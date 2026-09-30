@@ -265,7 +265,7 @@ describe("BoxAgentDriver turns (fake API)", () => {
   });
 });
 
-// Owner request: the Computer engine (box.ascii.dev) stays out of every
+// Owner request: the ASCII.dev Box engine (instance "computer", box.ascii.dev) stays out of every
 // engine list until a Box token is configured — but stays registered, so a
 // token added later just works.
 describe("BoxAgentDriver snapshot without a Box token", () => {
@@ -275,7 +275,7 @@ describe("BoxAgentDriver snapshot without a Box token", () => {
     delete env.BOX_TOKEN;
     const instance = await BoxAgentDriver.create({
       instanceId: "computer",
-      displayName: "Computer",
+      displayName: "ASCII.dev Box",
       environment: {},
       enabled: true,
       config: { pollMs: 0 },
@@ -296,7 +296,7 @@ describe("BoxAgentDriver snapshot without a Box token", () => {
     const restore = installFakeBox([{ events: [] }]);
     const instance = await BoxAgentDriver.create({
       instanceId: "computer",
-      displayName: "Computer",
+      displayName: "ASCII.dev Box",
       environment: { BOX_TOKEN: "box-test-token" },
       enabled: true,
       config: { pollMs: 0 },

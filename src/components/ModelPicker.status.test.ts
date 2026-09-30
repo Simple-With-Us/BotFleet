@@ -1,6 +1,6 @@
 // The picker's rail and status chip: an engine whose probe did not answer in
 // time reads "Checking", never "Not installed" or "Sign-in required", and the
-// Computer engine stays off the rail until a Box token is configured.
+// ASCII.dev Box engine stays off the rail until a Box token is configured.
 import { describe, expect, it } from "vitest";
 
 import type { InstanceInfo } from "@/state/store";
@@ -38,6 +38,28 @@ describe("engineStatus", () => {
     );
     expect(engineStatus(engine("kimi", { state: "unavailable", reason: "Disabled in settings" }))).toBe("Disabled");
   });
+
+  it("does not call a CLI that is on this Mac but cannot run bots yet Not installed", () => {
+    const onDisk = { cliCandidates: ["/opt/homebrew/bin/claude"] };
+    expect(
+      engineStatus(
+        engine("claude", { state: "unavailable", reason: "Update Claude Code to use isolated bot MCP servers." }, onDisk),
+      ),
+    ).toBe("Unavailable");
+    expect(
+      engineStatus(
+        engine(
+          "codex",
+          { state: "unavailable", reason: "Codex CLI is out of date (needs 0.151.0+). Run `npm install -g @openai/codex`" },
+          { cliCandidates: ["/opt/homebrew/bin/codex"] },
+        ),
+      ),
+    ).toBe("Unavailable");
+    // A missing binary stays "Not installed" even when another copy is on PATH.
+    expect(
+      engineStatus(engine("claude", { state: "unavailable", reason: "`/tmp/gone/claude` CLI not found" }, onDisk)),
+    ).toBe("Not installed");
+  });
 });
 
 describe("railEngines", () => {
@@ -47,7 +69,7 @@ describe("railEngines", () => {
     reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json',
   };
 
-  it("leaves the Computer engine off the rail until a Box token is configured", () => {
+  it("leaves the ASCII.dev Box engine off the rail until a Box token is configured", () => {
     const rail = railEngines(
       [
         engine("claude", { state: "available", version: "2.1.284" }),
@@ -58,7 +80,7 @@ describe("railEngines", () => {
     expect(rail.map((i) => i.instanceId)).toEqual(["claude"]);
   });
 
-  it("lists Computer once it is configured", () => {
+  it("lists the ASCII.dev Box engine once it is configured", () => {
     const rail = railEngines(
       [engine("computer", { state: "available", authenticated: true, version: null }, { driverKind: "boxAgent" })],
       "claude",

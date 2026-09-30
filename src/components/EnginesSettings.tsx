@@ -789,7 +789,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
   );
 
   // Include CLI engines, MiniMax, OpenAI-compat, and custom engines — but
-  // not an optional integration nobody has set up (Computer with no Box token).
+  // not an optional integration nobody has set up (the ASCII.dev Box engine with no Box token).
   const rows = state.instances.filter((i) =>
     !isHiddenEngine(i) && (
       i.cli !== undefined ||

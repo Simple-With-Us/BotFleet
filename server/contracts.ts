@@ -534,7 +534,7 @@ export interface ProviderSnapshot {
    * registry answers from the engine's last definitive snapshot when it has
    * one, and the UI says "Checking" instead of "Not installed". */
   transient?: boolean;
-  /** An optional integration nobody has set up (Computer with no Box token).
+  /** An optional integration nobody has set up (the ASCII.dev Box engine with no Box token).
    * It stays registered so configuring it later just works, but it is left
    * out of the engine rail, Settings → Engines and the Usage rows until then. */
   hidden?: boolean;

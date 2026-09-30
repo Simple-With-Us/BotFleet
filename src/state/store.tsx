@@ -658,7 +658,7 @@ export interface InstanceInfo {
     /** The probe gave no answer (timeout) — show "Checking", not a setup
      *  problem.  See server/contracts.ts ProviderSnapshot.transient. */
     transient?: boolean;
-    /** Optional integration not set up (Computer with no Box token): kept
+    /** Optional integration not set up (the ASCII.dev Box engine with no Box token): kept
      *  out of engine lists until it is. */
     hidden?: boolean;
     /** Undefined when the auth probe could not tell. */

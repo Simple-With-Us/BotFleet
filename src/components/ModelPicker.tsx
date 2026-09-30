@@ -74,14 +74,23 @@ export function engineStatus(instance: InstanceInfo): string {
   // The last probe gave no answer: a slow Mac, not a missing CLI or a
   // sign-out.  Never "Not installed" or "Sign-in required" for it.
   if (isCheckingEngine(instance)) return "Checking";
-  if (needsCli(instance)) return "Not installed";
+  if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
 }
 
+/** Whether an unusable engine's CLI is actually absent.  One that is on this
+ *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
+ *  own check failed) is unavailable, not "not installed" — the reason says
+ *  what to do. */
+function isCliMissing(instance: InstanceInfo): boolean {
+  if (/CLI not found/i.test(instance.snapshot.reason ?? "")) return true;
+  return (instance.cliCandidates?.length ?? 0) === 0;
+}
+
 /** The engines the picker's rail offers.  The selected engine always stays
  *  so the picker can explain it; otherwise turned-off engines, uninstalled
- *  custom ones, and optional integrations nobody set up (Computer with no Box
+ *  custom ones, and optional integrations nobody set up (the ASCII.dev Box engine with no Box
  *  token) are left out. */
 export function railEngines(instances: InstanceInfo[], selectedInstanceId: string): InstanceInfo[] {
   return instances.filter((i) => {

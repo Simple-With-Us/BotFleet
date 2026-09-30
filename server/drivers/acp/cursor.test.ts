@@ -439,6 +439,26 @@ describe("cursor probe caching and scoping", () => {
     expect(runs).toBe(4);
   });
 
+  it("does not read undecodable output from a probe that ran out of time as signed out", async () => {
+    let runs = 0;
+    const noisyTimeout: any = (_cli: string, _args: string[], _opts: unknown, cb: (err: Error | null, out: string, err2?: string) => void) => {
+      runs += 1;
+      cb(Object.assign(new Error("Command failed"), { killed: true, timedOut: true }), "", "warning: slow disk\n");
+    };
+    expect(await probeCursorAuth("cursor", {}, noisyTimeout)).toBeUndefined();
+    expect(runs).toBe(2);
+    // Not cached: the next look asks again.
+    expect(await probeCursorAuth("cursor", {}, noisyTimeout)).toBeUndefined();
+    expect(runs).toBe(4);
+  });
+
+  it("still takes a decodable answer printed before the deadline killed a CLI that never exits", async () => {
+    const printsThenHangs: any = (_cli: string, _args: string[], _opts: unknown, cb: (err: Error | null, out: string) => void) => {
+      cb(Object.assign(new Error("Command failed"), { killed: true, timedOut: true }), '{"isAuthenticated":true}\n');
+    };
+    expect(await probeCursorAuth("cursor", {}, printsThenHangs)).toBe(true);
+  });
+
   it("takes a signed-out answer even when `status` exits non-zero, and caches it", async () => {
     let runs = 0;
     const loggedOut: any = (_cli: string, _args: string[], _opts: unknown, cb: (err: Error | null, out: string, err2?: string) => void) => {
