@@ -93,9 +93,11 @@ export type CompanionBridge = {
 type AccountBridge = NonNullable<NonNullable<Window["ogb"]>["companionAccount"]>;
 type StateBridge<T> = { state: () => Promise<T> };
 const DIRECT_PAIRING_UNAVAILABLE =
-  "Direct Wi-Fi pairing isn’t available on this computer right now. Connect this computer to Wi-Fi, then try again.";
+  "Direct Wi-Fi pairing isn’t available on this computer right now.  Connect this computer to Wi-Fi, then try again.";
+const TAILSCALE_PAIRING_UNAVAILABLE =
+  "Tailscale pairing isn’t available right now.  Make sure Tailscale is connected and MagicDNS is on.";
 const PROTECTED_PAIRING_UNAVAILABLE =
-  "The HTTPS pairing route became unavailable. Check secure access, then create a new code.";
+  "The HTTPS pairing route became unavailable.  Check secure access, then create a new code.";
 
 interface OwnedCompanionPairingRoutePin extends CompanionPairingRoutePin {
   generation: number;
@@ -399,7 +401,7 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
         if (explicitRoute && !companionPairingRoute(started, routeMode)) {
           setProvisioning(false);
           setError(routeMode === "tailscale"
-            ? "Tailscale pairing isn’t available right now. Make sure Tailscale is connected and MagicDNS is on."
+            ? TAILSCALE_PAIRING_UNAVAILABLE
             : DIRECT_PAIRING_UNAVAILABLE);
           dispatchFlow({ type: "reset" });
           return;
@@ -445,7 +447,7 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
           setError(pairingFailure ?? (routeMode === "local"
             ? DIRECT_PAIRING_UNAVAILABLE
             : routeMode === "tailscale"
-              ? "Tailscale pairing isn’t available right now. Make sure Tailscale is connected and MagicDNS is on."
+              ? TAILSCALE_PAIRING_UNAVAILABLE
               : PROTECTED_PAIRING_UNAVAILABLE));
           dispatchFlow({ type: "reset" });
           return;
@@ -695,9 +697,14 @@ export function usePhoneSetupController(profileEmail = ""): PhoneSetupController
     setState((current) => current ? { ...current, pairing: null } : current);
     setProvisioning(false);
     setSetupTimedOut(false);
+    const routeError = pin.protectedEndpoint?.kind === "tailnet"
+      ? TAILSCALE_PAIRING_UNAVAILABLE
+      : pin.protectedEndpoint === null
+        ? DIRECT_PAIRING_UNAVAILABLE
+        : PROTECTED_PAIRING_UNAVAILABLE;
     setError(tokenMatches
-      ? PROTECTED_PAIRING_UNAVAILABLE
-      : "The pairing code changed before setup finished. Create a new code and try again.");
+      ? routeError
+      : "The pairing code changed before setup finished.  Create a new code and try again.");
     dispatchFlow({ type: "reset" });
 
     if (tokenMatches && companion) {

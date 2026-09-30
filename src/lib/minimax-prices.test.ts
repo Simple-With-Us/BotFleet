@@ -25,9 +25,9 @@ describe("MiniMax published rates", () => {
     ]);
   });
 
-  it("has exactly one row per catalog model id", () => {
+  it("has exactly one row per catalog model id — MiniMax-M3.1-Flash-Preview, MiniMax-M2.7-highspeed", () => {
     expect(Object.keys(MINIMAX_PRICE_PER_MILLION).sort()).toEqual(
-      ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3", "MiniMax-M3.1-Flash-Preview"].sort(),
+      ["MiniMax-M2.7-highspeed", "MiniMax-M3.1-Flash-Preview"].sort(),
     );
     // a coverage test can only force a decision when a model is ADDED to
     // the catalog with no row — it cannot, on its own, detect a model
@@ -51,8 +51,8 @@ describe("MiniMax published rates", () => {
     }
   });
 
-  it("keeps MiniMax-M3's over-512K tier at double the base rate, with no upper bound of its own", () => {
-    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3"]!;
+  it("keeps MiniMax-M3.1-Flash-Preview's over-512K tier at double the base rate, with no upper bound of its own", () => {
+    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3.1-Flash-Preview"]!;
     expect(base.maxInputTokens).toBe(512_000);
     expect(over.maxInputTokens).toBeUndefined();
     expect(over.input).toBeCloseTo(base.input * 2, 10);

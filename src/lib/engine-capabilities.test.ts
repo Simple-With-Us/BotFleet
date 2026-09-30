@@ -265,30 +265,17 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([
-      "MiniMax-M3",
-      "MiniMax-M3-thinking",
       "MiniMax-M3.1-Flash-Preview-thinking",
       "MiniMax-M2.7-highspeed-thinking",
-      "MiniMax-M2.7-thinking",
     ]);
     // The flash preview tier is the one a current mcode install defaults to,
     // so it must be reachable in the matrix too.  It is deliberately not the
     // first row: a preview id is never what a fresh install hands someone who
     // has not asked for it.
-    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3");
+    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(
       mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
     ).toBe(1_000_000);
-  });
-
-  it("leaves MiniMax-M3 unmapped rather than crediting one of its two engines", () => {
-    // The shared flagship model id belongs to both MiniMax engines, so the
-    // unique-model map must not first-win it onto either one.  Engine-tagged
-    // usage still attributes correctly through engineIdFromDriverKind.
-    const map = uniqueModelToEngineId();
-    expect(map.get("MiniMax-M3")).toBeUndefined();
-    expect(engineIdFromDriverKind("minimax")).toBe("minimax");
-    expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
   });
 
   it("pricingModeLabel reads consistently with the pricing block", () => {

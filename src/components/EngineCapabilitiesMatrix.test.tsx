@@ -44,7 +44,7 @@ const html = renderToStaticMarkup(createElement(EngineCapabilitiesMatrix));
 
 /** `renderToStaticMarkup` drops event handlers and class maps that never made
  *  it onto an element, so the behaviour assertions below read the component
- *  source.  Same pattern the ComputerEngineCallout and ui-copy tests use. */
+ *  source.  Same pattern the BoxEngineCallout and ui-copy tests use. */
 const source = readFileSync(new URL("./EngineCapabilitiesMatrix.tsx", import.meta.url), "utf8");
 
 describe("EngineCapabilitiesMatrix layout budget", () => {

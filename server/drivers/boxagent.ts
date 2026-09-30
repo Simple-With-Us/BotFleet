@@ -48,7 +48,7 @@ function decodeConfig(raw: unknown): BoxAgentConfig {
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Computer", supportsMultipleInstances: false },
+  metadata: { displayName: "ASCII.dev Box", supportsMultipleInstances: false },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),

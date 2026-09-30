@@ -202,10 +202,10 @@ describe("ProviderRegistry", () => {
     // The other half of the shadow rule: reach is derived from the driver
     // KIND as well as from the capabilities, because a remote agent's reach
     // is a property of where the turn runs.  This is what the client computed
-    // for a shadow before the reach shipped, so a shadowed Computer engine
+    // for a shadow before the reach shipped, so a shadowed ASCII.dev Box engine
     // must not quietly lose the one destination it has.
     const registry = new ProviderRegistry([makeFakeDriver().driver]);
-    await registry.load({ computer: { driver: "boxAgent", displayName: "Computer" } });
+    await registry.load({ computer: { driver: "boxAgent", displayName: "ASCII.dev Box" } });
 
     const [described] = await registry.describe();
     expect(described.snapshot.state).toBe("unavailable");

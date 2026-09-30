@@ -14,7 +14,7 @@ import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 export const STATIC_MCODE_MODELS: ModelCatalog = {
-  default: "MiniMax-M3.1-Flash-Preview",
+  default: "MiniMax-M3.1-Flash-Preview-thinking",
   options: [
     { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview" },
     { id: "MiniMax-M3.1-Flash-Preview-thinking", label: "MiniMax M3.1 Flash Preview · thinking" },

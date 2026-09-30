@@ -270,7 +270,7 @@ const DRIVER_DISPLAY_NAME = new Map<string, string>([
   ["droidAgent", "Droid"],
   ["cursorAgent", "Cursor"],
   ["antigravityAgent", "Antigravity"],
-  ["boxAgent", "Computer"],
+  ["boxAgent", "ASCII.dev Box"],
   ["kimiAgent", "Kimi"],
   ["qwenAgent", "Qwen"],
   ["hermesAgent", "Hermes"],

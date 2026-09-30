@@ -686,7 +686,7 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
         case "hermesAgent": return "Hermes"
         case "piAgent": return "Pi"
         case "grok-bot": return "Grok Bot"
-        case "boxAgent": return "Computer"
+        case "boxAgent": return "ASCII.dev Box"
         case "openai-compat", "openai": return "OpenAI"
         case "gemini", "geminiAgent": return "Gemini"
         default: return displayName ?? instanceId

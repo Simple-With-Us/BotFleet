@@ -131,7 +131,7 @@ describe("modelDisplayName", () => {
 });
 
 describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
-  it("matches first-paint registry defaults for Cursor and DeepSeek Harness", () => {
+  it("matches first-paint registry defaults for Cursor and Harness", () => {
     const cursorPreset = findMatchingPreset("cursor", "Cursor Ultra", null);
     expect(cursorPreset).toBeDefined();
     expect(cursorPreset?.label).toBe("Cursor Ultra");
@@ -153,7 +153,7 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(legacyMatch).toBeDefined();
   });
 
-  it("does not include a confusing $0 custom row for DeepSeek Harness", () => {
+  it("does not include a confusing $0 custom row for Harness", () => {
     const options = ENGINE_PLAN_OPTIONS["deepseek-harness"];
     expect(options.length).toBe(1);
     expect(options[0].costPerMonth).toBeNull();

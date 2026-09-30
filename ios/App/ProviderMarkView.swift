@@ -46,7 +46,7 @@ struct ProviderMarkView: View {
         /// it stays visible on both light and dark headers.
         case templateAsset(String)
         /// A generic SF Symbol standing in for a mark that has no brand
-        /// artwork of its own (e.g. the "computer" driver).
+        /// artwork of its own (e.g. the ASCII.dev Box driver).
         case symbol(String)
         /// No art shipped for this driver kind — fall back to a monogram.
         case monogram
@@ -80,7 +80,7 @@ struct ProviderMarkView: View {
         case "minimax", "minimaxAgent", "mcode", "mcodeAgent":
             return .asset("ProviderMarkMiniMax")
         case "boxAgent":
-            return .symbol("desktopcomputer")
+            return .symbol("shippingbox")
         // No source art shipped for these — they render on the monogram
         // fallback below, which is expected and fine.
         case "droid", "droidAgent", "kimi", "kimiAgent", "qwenAgent",
@@ -115,7 +115,7 @@ struct ProviderMarkView: View {
         // mcode is the same subscription read as a coding CLI, so it keeps the
         // MiniMax mark but announces as its own product name.
         case "mcode", "mcodeAgent": return "MiniMax Code"
-        case "boxAgent": return "Computer"
+        case "boxAgent": return "ASCII.dev Box"
         case "kimi", "kimiAgent": return "Kimi"
         case "droid", "droidAgent": return "Droid"
         case "qwenAgent": return "Qwen"

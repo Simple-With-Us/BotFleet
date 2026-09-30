@@ -64,7 +64,7 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
 
   // The remote agent.  Its driver declares no computer flag at all: the turn
   // runs on the box, so there is nothing to mount.
-  { displayName: "Computer", driverKind: "boxAgent", capabilities: {} },
+  { displayName: "ASCII.dev Box", driverKind: "boxAgent", capabilities: {} },
 ];
 
 /** Cells that no shipped engine occupies but the derivation still has to
@@ -82,7 +82,7 @@ export const SYNTHETIC_FIXTURES: readonly EngineFixture[] = [
   // The box-native engine is asked again with host control declared, because
   // "runs somewhere else" has to beat a flag, not lose to it.
   {
-    displayName: "Computer with host control declared",
+    displayName: "ASCII.dev Box with host control declared",
     driverKind: "boxAgent",
     capabilities: { localComputerMcp: true },
   },

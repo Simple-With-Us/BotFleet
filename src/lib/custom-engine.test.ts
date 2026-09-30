@@ -284,7 +284,7 @@ describe("the Add Engine form's driver choice", () => {
     // driver's non-reserved id, an extra instance of one of those used to
     // claim a wire shape its endpoint may not speak at all.
     expect(customEngineCalloutTitle("claudeAgent")).toBe("Added Claude Connection.");
-    expect(customEngineCalloutTitle("boxAgent")).toBe("Added Computer Connection.");
+    expect(customEngineCalloutTitle("boxAgent")).toBe("Added ASCII.dev Box Connection.");
     // A driver nobody listed is named after itself rather than mislabelled.
     expect(customEngineCalloutTitle("someFutureDriver")).toBe("Added SomeFutureDriver Connection.");
     expect(customEngineCalloutTitle("nimbus")).toBe("Added Nimbus Connection.");

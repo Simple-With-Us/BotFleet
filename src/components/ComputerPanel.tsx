@@ -272,7 +272,7 @@ export function ComputerPanel({
       };
     }
     if ((bot.computers ?? []).includes("cloud") && !cloudSupported) {
-      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the Computer engine.");
+      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the ASCII.dev Box engine.");
       setPhase("error");
       return;
     }

@@ -13,6 +13,20 @@
 //                        stop_reason "stop_sequence" left over from the CLI's
 //                        result-builder — the regression case for trusting
 //                        stop_reason over terminal_reason on a failed turn)
+//                      | model-not-found (the CLI's answer to a model id it
+//                        cannot use, shaped like production frames: a
+//                        synthetic assistant frame with zero usage and a
+//                        top-level error "model_not_found", then a result
+//                        frame with is_error true, terminal_reason
+//                        "api_error" and api_error_status 404)
+//                      | model-not-found-text (the same, from a CLI that
+//                        drops the `error` field: only the synthetic model
+//                        and the text name the rejection)
+//                      | model-404 (a bare 404 result frame, no assistant
+//                        frame at all)
+//                      | model-lookalike (a REAL reply, with real usage, whose
+//                        prose opens with the rejection words: a success that
+//                        must stay an ordinary assistant message)
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -249,6 +263,51 @@ const playTurn = (prompt: JsonValue) => {
       num_turns: 1,
       total_cost_usd: 0,
     });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "model-not-found" || mode === "model-not-found-text" || mode === "model-404") {
+    const rejection =
+      `There's an issue with the selected model (${model}). It may not exist or you may not have access to it. ` +
+      "Run /model to pick a different model.";
+    const synthetic = {
+      model: "<synthetic>",
+      role: "assistant",
+      content: [{ type: "text", text: rejection }],
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+    };
+    // the structural marker; the text-only mode is a CLI that drops it
+    if (mode === "model-not-found") out({ type: "assistant", error: "model_not_found", message: synthetic });
+    if (mode === "model-not-found-text") out({ type: "assistant", message: synthetic });
+    const failure = {
+      type: "result",
+      is_error: true,
+      subtype: "success",
+      stop_reason: "stop_sequence",
+      terminal_reason: "api_error",
+      api_error_status: 404,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+    };
+    out(mode === "model-404" ? failure : { ...failure, result: rejection });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "model-lookalike") {
+    out({
+      type: "assistant",
+      message: {
+        model: "claude-fake",
+        content: [{ type: "text", text: "There's an issue with the selected model dropdown: it listed stale ids, so I fixed the filter." }],
+        usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 18 },
+      },
+    });
+    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 18 } });
     turnRunning = false;
     finishIfDone();
     return;

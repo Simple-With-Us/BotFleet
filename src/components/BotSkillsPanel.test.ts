@@ -138,11 +138,11 @@ describe("panel chrome", () => {
     }
   });
 
-  it("tells the truth about the Computer engine, which has no workspace to hold a skill", () => {
+  it("tells the truth about the ASCII.dev Box engine, which has no workspace to hold a skill", () => {
     expect(skillsEngineNote("claudeAgent")).toBeNull();
     expect(skillsEngineNote(undefined)).toBeNull();
     const note = skillsEngineNote("boxAgent");
-    expect(note).toContain("runs on the Computer engine");
+    expect(note).toContain("runs on the ASCII.dev Box engine");
     expect(note).toContain("Imported skills never reach it.");
     expect(note).toContain("  ");
   });

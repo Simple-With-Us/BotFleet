@@ -4,7 +4,7 @@
 // change left the old skin's GIF on screen.
 import { describe, expect, it } from "vitest";
 
-import { tvFaceFrameChanged, tvFaceSkinDir } from "./TVFaceAvatar";
+import { planFrame, tvFaceFrameChanged, tvFaceSkinDir, TVFACE_TRANSITION_MS } from "./TVFaceAvatar";
 
 describe("tvFaceFrameChanged", () => {
   it("stays quiet when nothing about the frame changed", () => {
@@ -35,3 +35,87 @@ describe("tvFaceSkinDir", () => {
     expect(tvFaceSkinDir("chartreuse" as never)).toBe("default");
   });
 });
+
+describe("planFrame", () => {
+  // Real shipped expression names, and deliberately drawn from the set that
+  // actually has enter/return art on disk.
+  // Every member below is in TVFACE_HAS_ENTER_RETURN, so each has enter AND
+  // return art on disk. Picking an expression outside the set makes these
+  // assertions meaningless, because such an expression has no return file.
+  const withTransitions = [
+    "listening", "thinking", "typing", "speaking", "computer", "memory",
+  ] as const;
+
+  it("plays enter then hold when leaving rest", () => {
+    expect(planFrame("resting", "typing")).toEqual([
+      { expression: "typing", kind: "enter", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: "typing", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("plays return then the resting still when going back to rest", () => {
+    // "typing" is in TVFACE_HAS_ENTER_RETURN, so it has a return on disk.
+    expect(planFrame("typing", "resting")).toEqual([
+      { expression: "typing", kind: "return", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: "resting", kind: "still", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("cuts straight to the new hold between two active states - no enter", () => {
+    // The pop fix. Every `_enter` is anchored to resting.png while the
+    // previous `_hold` ends wherever it ends, so playing an enter here jumped
+    // on every state-to-state transition.
+    expect(planFrame("thinking", "typing")).toEqual([
+      { expression: "typing", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("cuts between holds without a transition delay", () => {
+    const steps = planFrame("speaking", "searching");
+    expect(steps).toHaveLength(1);
+    expect(steps[0].delayAfterMs).toBe(0);
+  });
+
+  it("holds in place when the expression is unchanged", () => {
+    expect(planFrame("working", "working")).toEqual([
+      { expression: "working", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("never ends on a delay, so the last frame is terminal", () => {
+    for (const [from, to] of [
+      ["resting", "typing"],
+      ["working", "resting"],
+      ["thinking", "speaking"],
+      ["resting", "resting"],
+    ] as const) {
+      const steps = planFrame(from, to);
+      expect(steps[steps.length - 1].delayAfterMs).toBe(0);
+    }
+  });
+
+  it("only ever emits an enter when coming from rest", () => {
+    for (const from of withTransitions) {
+      for (const to of withTransitions) {
+        if (from === to) continue;
+        expect(planFrame(from, to).some((s) => s.kind === "enter")).toBe(false);
+      }
+    }
+  });
+
+  it("only ever emits a return when going to rest", () => {
+    for (const from of withTransitions) {  // every member has a return on disk
+      const steps = planFrame(from, "resting");
+      expect(steps.filter((s) => s.kind === "return")).toHaveLength(1);
+      expect(steps[steps.length - 1].expression).toBe("resting");
+    }
+  });
+
+  it("skips the return for an expression that has no transition art", () => {
+    // happy has a hold but no return, so going home from it must land
+    // directly on the resting still rather than requesting a 404.
+    const steps = planFrame("happy", "resting");
+    expect(steps).toEqual([{ expression: "resting", kind: "still", delayAfterMs: 0 }]);
+  });
+});
+

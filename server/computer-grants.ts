@@ -765,13 +765,13 @@ async function resolveMounts<Lease>(
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
       if (shouldThrowOnCloudFailure) {
-        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the ASCII.dev Box engine");
       }
       deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();
-    // Explicit Cloud and the box-native Computer engine provision on first
+    // Explicit Cloud and the box-native ASCII.dev Box engine provision on first
     // use.  Auto remains non-surprising and only reuses an existing box.
     if (!b && mountsCloudComputer && (wantsCloudFiltered || engine.driverKind === "boxAgent")) {
       deps.broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });

@@ -1,6 +1,7 @@
 // Provider brand marks, keyed by driver kind. Official logos only.
-import { Monitor } from "lucide-react";
+import { Box as BoxIcon, Monitor } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { LOCAL_MODELS_DRIVER_KIND } from "@/lib/local-models";
 import { HermesMark } from "./HermesMark";
 import { CursorMark } from "./CursorMark";
 
@@ -116,8 +117,15 @@ export function AntigravityMark({ size = 16, className }: IconProps) {
 
 export const GeminiMark = AntigravityMark;
 
-export function ComputerMark({ size = 16, className }: IconProps) {
+/** The Local Models picker entry: a monitor, the machine the models run on. */
+export function LocalModelsMark({ size = 16, className }: IconProps) {
   return <Monitor size={size} className={cn("text-ink-secondary", className)} />;
+}
+
+/** ASCII.dev Box — the remote engine whose turns run on box.ascii.dev.  A
+ * cube, deliberately not the monitor: that one means "on this machine". */
+export function BoxMark({ size = 16, className }: IconProps) {
+  return <BoxIcon size={size} className={cn("text-ink-secondary", className)} />;
 }
 
 /** Official Kimi mark (Moonshot) — monochrome "K" glyph. */
@@ -287,7 +295,9 @@ export function ProviderMark({
     case "hermesAgent":
       return <HermesMark size={size} className={className} />;
     case "boxAgent":
-      return <ComputerMark size={size} className={className} />;
+      return <BoxMark size={size} className={className} />;
+    case LOCAL_MODELS_DRIVER_KIND:
+      return <LocalModelsMark size={size} className={className} />;
     case "piAgent":
       return <PiMark size={size} className={className} />;
     default:

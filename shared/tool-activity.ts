@@ -4,7 +4,7 @@
 // BotFleet threw the payload away and kept the name.  A transcript of seven
 // `read_file` chips tells the reader nothing: not which files, not whether
 // the bot was going in circles, not where the twenty seconds went.  The
-// harnesses people compare us to (DeepSeek Harness, Claude Code, Codex) all
+// harnesses people compare us to (Harness, Claude Code, Codex) all
 // render one dense line per step — a verb, the thing it touched, and how
 // long it took — and that line is what makes a long turn skimmable.
 //
