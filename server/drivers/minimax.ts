@@ -66,9 +66,9 @@ const STREAM_IDLE_TIMEOUT_MS = 120_000;
 // (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different from
 // M3's rate at any input size highspeed's own 204,800 context can hold.
 const MODELS: ModelCatalog = {
-  default: "MiniMax-M3",
+  default: "MiniMax-M3.1-Flash-Preview",
   options: [
-    { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
+    { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
     { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
   ],
 };
@@ -93,7 +93,7 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3": [
+  "MiniMax-M3.1-Flash-Preview": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
