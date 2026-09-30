@@ -2678,7 +2678,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // Outside the message check: a tool with no transcript row (ask_bot,
         // whose own chip is appended by the internal endpoint) still held the
         // turn for as long as it ran, and must stop the tool clock when it ends.
-        if (bot) turnStats.toolEnded(event.threadId, event.itemId);
+        if (bot && event.itemId) turnStats.toolEnded(event.threadId, event.itemId);
         // the bot just acted ON ITS SCREEN — refresh the preview now. Only
         // computer tools can change the screen, and each capture competes
         // with the agent for the box's command endpoint, so a bot grinding
