@@ -509,12 +509,114 @@ describe("readThreadEvents", () => {
       expect(event.raw).toBeUndefined();
     });
 
+    // The Trajectory read discards deltas, so on a delta-heavy log the page
+    // never fills and the scan walks the whole window.  It used to re-decode
+    // and re-parse everything it had buffered after every 64 KB step: 8 MB of
+    // deltas cost about 8 seconds on the harness event loop, on a route the
+    // tab refetches after every turn.  Each byte must be decoded once.
+    it("decodes a delta-heavy log once, not once per chunk", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      let body = "";
+      let deltas = 0;
+      const steps: string[] = [];
+      // ~2.3 MB: 16,000 deltas of ~140 bytes with a settled step every 400
+      for (let i = 0; i < 16_000; i++) {
+        if (i % 400 === 0) {
+          const id = `step-${String(i / 400).padStart(3, "0")}`;
+          steps.push(id);
+          body += line(started(id, String(i).padStart(6, "0")));
+        }
+        body += line(delta(deltas++));
+      }
+      writeFileSync(join(eventsDir, "t1.ndjson"), body);
+
+      const window = 1024 * 1024;
+      let decoded = 0;
+      const page = readThreadEvents({
+        eventsDir,
+        nativeDir,
+        threadId: "t1",
+        runtimeOnly: true,
+        limit: 1000,
+        maxTailBytes: window,
+        decode: (bytes) => {
+          decoded += bytes.length;
+          return bytes.toString("utf8");
+        },
+      });
+
+      // one pass over the window: the old scan decoded 64 + 128 + … + 1024 KB
+      expect(decoded).toBeLessThanOrEqual(window + 128 * 1024);
+      // the steps inside the window all came back, in order, none twice
+      const ids = page.entries.map((e) => (e.data as { eventId: string }).eventId);
+      expect(ids.length).toBeGreaterThan(5);
+      expect(ids).toEqual(steps.slice(-ids.length));
+      expect(ids.at(-1)).toBe(steps.at(-1));
+      expect(page.total.runtime).toBe(16_000 + steps.length);
+      expect(page.older).toBe(true);
+    });
+
+    it("does not skip a record that only quotes the delta marker in its raw payload", () => {
+      const eventsDir = tmp();
+      const nativeDir = tmp();
+      writeFileSync(
+        join(eventsDir, "t1.ndjson"),
+        line(runtime({ eventId: "quoted", type: "turn.started", createdAt: "000001", raw: { source: "x", payload: { type: "content.delta" } } })) +
+          line(delta(2)),
+      );
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["quoted"]);
+    });
+
     it("does not add the older flag to the Inspector's own response", () => {
       const eventsDir = tmp();
       const nativeDir = tmp();
       writeFileSync(join(eventsDir, "t1.ndjson"), line(started("e1", "000001")));
       expect(readThreadEvents({ eventsDir, nativeDir, threadId: "t1" })).not.toHaveProperty("older");
     });
+  });
+
+  // The scan cuts its buffer at newlines and joins the held-back first line to
+  // the next older chunk.  Compare it with a plain parse of the whole file over
+  // lines of mixed width (multi-byte text that straddles 64 KB boundaries),
+  // torn and corrupt lines, and streamed deltas, at several limits.
+  it("returns exactly what a whole-file parse would, across chunk boundaries", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    let seed = 7;
+    const next = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed;
+    };
+    const expected: string[] = [];
+    const expectedAll: string[] = [];
+    let body = "";
+    for (let i = 0; i < 1400; i++) {
+      const id = `e${String(i).padStart(5, "0")}`;
+      const roll = next() % 10;
+      if (roll === 0) {
+        body += "{\"eventId\":\"torn\",\"type\":\"turn.sta\n";
+      } else if (roll < 4) {
+        body += line(runtime({ eventId: id, type: "content.delta", createdAt: String(i).padStart(6, "0"), streamKind: "assistant_text", delta: "δ".repeat(next() % 40) }));
+        expectedAll.push(id);
+      } else {
+        const title = "日本語é".repeat(1 + (next() % 60));
+        body += line(runtime({ eventId: id, type: "item.started", itemType: "tool", createdAt: String(i).padStart(6, "0"), title }));
+        expected.push(id);
+        expectedAll.push(id);
+      }
+    }
+    writeFileSync(join(eventsDir, "t1.ndjson"), body);
+    expect(Buffer.byteLength(body)).toBeGreaterThan(3 * 64 * 1024);
+
+    for (const limit of [1, 7, 60, 300, 2000]) {
+      const trajectory = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly: true, limit });
+      expect(trajectory.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(expected.slice(-limit));
+      expect(trajectory.older).toBe(limit < expected.length);
+      const inspector = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", limit });
+      expect(inspector.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(expectedAll.slice(-limit));
+    }
   });
 
   it("refuses a thread id that could escape the log directory", () => {
