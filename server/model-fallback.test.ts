@@ -1,6 +1,7 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
@@ -1811,5 +1812,33 @@ describe("ModelRejectionRegistry", () => {
     const third = new ModelRejectionRegistry();
     third.enablePersist(file, () => undefined);
     expect(third.list()).toEqual([]);
+  });
+});
+
+// The launcher lives in server/index.ts, which boots a harness on import, so
+// its stop-latch handling is pinned by shape the way secret-persistence pins
+// the credential fingerprint: a later edit that files a failed routine run for
+// a turn somebody stopped is caught even though the HTTP suite cannot race a
+// Stop against a fallback that has not started yet.
+describe("launchFallbackTurn and a stopped turn", () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf8");
+  const launcher = source.slice(
+    source.indexOf("async function launchFallbackTurn("),
+    source.indexOf("bus.subscribe((event: RuntimeEvent)"),
+  );
+
+  it("files a failed routine run only for a turn nobody stopped", () => {
+    expect(launcher.length).toBeGreaterThan(0);
+    // the chain-ran-out exit: notice and failed run share one `!stopped` gate
+    expect(launcher).toMatch(
+      /if \(!stopped\) \{\s*note\(`No other engine[^`]*`\);\s*routines\?\.failThread\(threadId, `Could not start /,
+    );
+    // the walk-ending throw consumes the latch before it speaks
+    expect(launcher).toMatch(
+      /if \(!stoppedTurns\.delete\(key\)\) \{\s*note\(`Couldn't retry this turn[^`]*`\);\s*routines\?\.failThread\(threadId, `Could not retry on /,
+    );
+    // and no failThread outside those two gates
+    const sites = launcher.split("\n").filter((line) => /routines\?\.failThread/.test(line));
+    expect(sites).toHaveLength(2);
   });
 });

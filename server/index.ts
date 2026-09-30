@@ -2627,9 +2627,15 @@ async function launchFallbackTurn(input: {
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
-        // A Stop ends the walk on purpose; only a chain that ran out is news.
-        if (!stopped) note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
-        routines?.failThread(threadId, `Could not start ${pick.model}: ${why}`, "dispatch_failed");
+        // A Stop ends the walk on purpose; only a chain that ran out is news,
+        // and only that is a failed run.  Every source of the latch settles
+        // the routine run itself (a user Stop and a forced update cancel it, a
+        // stall and a provider reload fail it with their own code), so a
+        // failure filed here would only re-label a run the owner cancelled.
+        if (!stopped) {
+          note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
+          routines?.failThread(threadId, `Could not start ${pick.model}: ${why}`, "dispatch_failed");
+        }
         return;
       }
       const nextSelection: ModelSelection = {
@@ -2677,8 +2683,13 @@ async function launchFallbackTurn(input: {
       const why = redactSecretsInText(message).slice(0, 300);
       console.error(`fallback startTurn failed for ${botId}: ${why}`);
       fallbackAttemptByTurn.delete(key);
-      note(`Couldn't retry this turn on ${pick.model} \u2014 ${why}`);
-      routines?.failThread(threadId, `Could not retry on ${pick.model}: ${why}`, "dispatch_failed");
+      // These refusals are exactly what a provider reload or a forced update
+      // raises, and both latch the turn as stopped and settle it themselves;
+      // the notice and the failed run are for a turn nobody stopped.
+      if (!stoppedTurns.delete(key)) {
+        note(`Couldn't retry this turn on ${pick.model} \u2014 ${why}`);
+        routines?.failThread(threadId, `Could not retry on ${pick.model}: ${why}`, "dispatch_failed");
+      }
     }
   };
   await launch(input.pick);
@@ -7609,13 +7620,13 @@ async function runProviderReload() {
   bus.detachAll();
   await registry.disposeAll();
   await registry.load(withInstanceKeyOverrides(instanceConfigs(cfg)));
-  // New credentials, a new CLI or an edited catalog may have made a rejected
-  // model available again; a mark from before the rebuild proves nothing.
-  modelRejections.clearWhere(() => true);
   // The fleet now exists on exactly these credentials — record that, so the
   // next comparison is against what was built rather than against whatever
   // `cfg` happened to hold when the comparison ran.
   loadedCredentialFingerprint = credentialFingerprint(cfg);
+  // New credentials, a new CLI or an edited catalog may have made a rejected
+  // model available again; a mark from before the rebuild proves nothing.
+  modelRejections.clearWhere(() => true);
   bus.attach(registry.instances());
   for (const turn of killedTurns) routines?.failThread(turn.threadId, RELOAD_REASON, "runtime_reconfigured");
   // A killed turn's terminal events can die with the old fleet (dispose is
