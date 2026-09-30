@@ -305,6 +305,21 @@ describe("reconcileChain", () => {
     });
   });
 
+  it("reconciles nested descendants, not just immediate fallbacks", () => {
+    const result = reconcileChain(
+      {
+        instanceId: "claude",
+        model: "claude-opus-5",
+        fallbacks: [
+          { instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }] },
+        ],
+      },
+      contextFor,
+    );
+    expect(result.selection.fallbacks?.[0].fallbacks?.[0].model).toBe("claude-sonnet-5-5");
+    expect(result.changes.map((c) => c.slot)).toContain("fallback 1.1");
+  });
+
   it("leaves unknown instances and engines without lineage untouched", () => {
     const selection = { instanceId: "minimax", model: "MiniMax-M3", fallbacks: [{ instanceId: "gone", model: "x" }] };
     expect(reconcileChain(selection, contextFor)).toEqual({ selection, changes: [] });
@@ -337,6 +352,35 @@ describe("applyOwnerDirective", () => {
       ],
     });
     expect(flagged.map((f) => f.slot)).toEqual(["primary", "fallback 1"]);
+  });
+
+  it("never flags a custom id that looks like an official Sonnet, at any depth", () => {
+    const custom = (id: string) =>
+      ({ driverKind: "claudeAgent", offeredIds: [], customIds: ["claude-sonnet-5"], authoritative: true }) as const;
+    const { selection, flagged } = applyOwnerDirective(
+      {
+        instanceId: "claude",
+        model: "claude-sonnet-5",
+        fallbacks: [{ instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }] }],
+      },
+      () => "claudeAgent",
+      custom,
+    );
+    expect(flagged).toEqual([]);
+    expect(JSON.stringify(selection)).not.toContain("latest");
+  });
+
+  it("flags nested fallbacks", () => {
+    const { selection, flagged } = applyOwnerDirective(
+      {
+        instanceId: "claude",
+        model: "claude-opus-5",
+        fallbacks: [{ instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }] }],
+      },
+      () => "claudeAgent",
+    );
+    expect(flagged.map((f) => f.slot)).toEqual(["fallback 1.1"]);
+    expect(selection.fallbacks?.[0].fallbacks?.[0].latest).toBe("sonnet");
   });
 });
 

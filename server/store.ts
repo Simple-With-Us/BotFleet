@@ -2248,7 +2248,7 @@ export class Store {
       }
     };
     const pass = (selection: ModelSelection, directive: boolean) => {
-      const flagged = directive ? applyOwnerDirective(selection, driverKindFor) : { selection, flagged: [] };
+      const flagged = directive ? applyOwnerDirective(selection, driverKindFor, opts.contextFor) : { selection, flagged: [] };
       const reconciled = reconcileChain(flagged.selection, opts.contextFor);
       return { selection: reconciled.selection, flagged: flagged.flagged, changes: reconciled.changes };
     };
