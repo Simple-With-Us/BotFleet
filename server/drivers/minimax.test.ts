@@ -585,7 +585,7 @@ describe("MinimaxDriver", () => {
 
   it("refreshModels replaces the static catalog from GET /models, off the same fetch snapshot() uses", async () => {
     const fetchMock = vi.fn(async () => new Response(
-      JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }, { id: "MiniMax-M3" }] }),
+      JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }, { id: "MiniMax-M3" }, { id: "MiniMax-M2.7" }] }),
       { status: 200, headers: { "content-type": "application/json" } },
     ));
     vi.stubGlobal("fetch", fetchMock);
@@ -598,15 +598,16 @@ describe("MinimaxDriver", () => {
     });
 
     await instance.refreshModels?.();
-    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3.1-Flash-Preview", "MiniMax-Next", "MiniMax-M3"]);
+    expect(instance.models.options.map((o) => o.id)).toEqual(["MiniMax-M3.1-Flash-Preview", "MiniMax-Next"]);
     // a model already in the static catalog keeps its hand-written label
     expect(instance.models.options.find((o) => o.id === "MiniMax-M3.1-Flash-Preview")?.label).toBe("MiniMax M3.1 Flash Preview");
     // a genuinely new model gets its id as the label rather than nothing
     expect(instance.models.options.find((o) => o.id === "MiniMax-Next")?.label).toBe("MiniMax-Next");
-    // a retired id the API still serves is NOT re-inflated: no hand-written
-    // label, no contextWindow - it renders as its bare id, and the retired-id
-    // assertions above keep it unpriced.
-    expect(instance.models.options.find((o) => o.id === "MiniMax-M3")).toEqual({ id: "MiniMax-M3", label: "MiniMax-M3", contextWindow: undefined });
+    // a retired id the API still serves does not reappear at all: a live
+    // list is the same kind of stale source as a stale settings row, and
+    // the picker keeps latest-per-class only.
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M3")).toBe(false);
+    expect(instance.models.options.some((o) => o.id === "MiniMax-M2.7")).toBe(false);
 
     // one call already spent by refreshModels; snapshot() reuses the cached
     // probe rather than firing a second GET /models

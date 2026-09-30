@@ -66,6 +66,21 @@ const STREAM_IDLE_TIMEOUT_MS = 120_000;
 // tier (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different
 // from M3.1's rate at any input size highspeed's own 204,800 context can
 // hold.
+/** Ids the picker retired on purpose.  refreshModels replaces the static
+ *  catalog with whatever GET /models serves, and the MiniMax API keeps
+ *  listing retired models after the picker drops them - without this
+ *  filter a live list re-inflates them as bare-id rows, the same
+ *  stale-source shape as an old settings row in the DSH union
+ *  (DSH_EXCLUDED_MODEL_IDS).  Exact ids only: MiniMax-M2.7-highspeed and
+ *  the M3.1 rows are current and must not match. */
+const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
+  // Dropped as dominated: same $0.30/$1.20 as M3.1's <=512K tier for a
+  // fifth of the context.
+  "MiniMax-M2.7",
+  // Superseded by MiniMax-M3.1-Flash-Preview.
+  "MiniMax-M3",
+];
+
 const MODELS: ModelCatalog = {
   default: "MiniMax-M3.1-Flash-Preview",
   options: [
@@ -851,7 +866,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const options: ModelCatalog["options"] = [];
       for (const row of probe.rows) {
         const id = typeof (row as { id?: unknown })?.id === "string" ? (row as { id: string }).id : "";
-        if (!id || seen.has(id)) continue;
+        if (!id || seen.has(id) || MINIMAX_RETIRED_MODEL_IDS.includes(id)) continue;
         seen.add(id);
         // Preserve the hand-written label/contextWindow for a model MODELS
         // already knows about; a genuinely new model gets its id as the
