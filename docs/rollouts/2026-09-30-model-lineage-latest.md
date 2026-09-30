@@ -8,7 +8,7 @@ Board row `da11b074`.  Owner asks: stale models should not be selectable, Grok 4
 
 - **Model classes.**  Claude: Fable, Opus, Sonnet, Haiku.  Codex: Astra, Sol, Terra, Luna.  Grok: Grok, Grok Build Fast.  Droid carries all three families.  A class member is recognised from its id pattern, so a newly listed version is classified without a code change.
 - **Version rank** from the id (`claude-sonnet-5-5` is 5.5, `gpt-5.6-luna` is 5.6, `grok-4.7` is 4.7).  A dated id ranks equal to its undated twin.
-- **List prices** where known (Claude, from the Anthropic first-party table).  Codex and Grok Build ride subscriptions and have no per-token price here.
+- **List prices** where known: Claude from the Anthropic first-party table, and Grok 4.6 and 4.7 from the xAI API list prices already in `src/lib/engine-capabilities.tsx`, which decide only for the API-key `grok` engine.  Codex and Grok Build ride subscriptions and have no per-token price here; Grok 4.5 and Build Fast have no list price in the repo, so none is guessed.
 - **Retired ids** with their successor class: `claude-3-7-sonnet` (Sonnet), `grok-4.5` and `grok-4.6` (Grok), and `grok-3-mini` (no successor).
 
 MiniMax, mcode, and the DeepSeek Harness are deliberately not classified yet (their catalogs belong to other lanes, and the DeepSeek V4.1 ids are not yet proven accepted on this Mac).  Adding them is one entry in `DRIVER_LINEAGE`.
@@ -36,7 +36,10 @@ An older client that re-sends a floating entry without `latest` keeps it floatin
 - **Every pass:** a retired id becomes Latest of its successor class.  A pinned older class member moves to the newest member when the blended list price (3 input : 1 output) changes by at most 25%; with no price on either side, a subscription CLI engine moves on the class match and an API-key engine stays.  The target must be offered by the instance's authoritative catalog.
 - The pass covers bot and task `modelSelection` (primary and fallbacks) and `activeModelSelection`.  A fallback the pass made identical to the primary is dropped; a placeholder fallback that already matched it is kept.
 - Each moved bot gets one notice in its active thread, and each move is logged (`model-lineage: …`).
-- A write that introduces a retired id with no successor gets `400 retired model "…" in <slot>`.  A saved leftover does not block editing another slot, and custom or local ids no catalog lists still pass.
+- A write that introduces a retired id with no successor gets `400 retired model "…" in <slot>`.  A saved leftover does not block editing another slot, on a bot or on a task override, and custom or local ids no catalog lists still pass.
+- A client that never sends `latest` (the shipped iOS app) keeps a floating entry floating when it re-sends the same engine and model, even after removing a fallback in front of it.  The desktop picker sends `latest: null` for a pinned pick.
+- Apply to All Bots sends a Latest slot's class, so every bot it lands on floats; a pinned slot pins.
+- Availability (with `requireAvailableModel`, the MCP tool) and effort are checked on every entry of the chain after the lineage pass, so a retired fallback is judged by the model it becomes.
 
 ## No Aliasing
 
@@ -48,3 +51,7 @@ Only saved selections move.  Message rows, per-task and per-instance usage bucke
 - The chat header chip names the model that runs; its tooltip adds the Latest class and the slug.  Settings chips read "Latest Sonnet · Claude Sonnet 5.5".
 - A saved id the catalog no longer offers gets a "Retired", "Superseded", or (only against a live catalog) "Not in catalog" badge, with a one-click "Switch To …".
 - `src/lib/usage-plans.ts` no longer carries its own stale Claude, GPT, and Grok labels; those come from the model class.  Usage attribution is unchanged.
+
+## Known Gaps
+
+- Nothing checks the Claude CLI version before a saved Opus 5 moves to Opus 5.5.  The CLI's own model catalog lists Opus 5.5 from Claude Code 2.1.280.  This Mac runs 2.1.284, so it is not affected; an install on an older CLI might reject Opus 5.5 turns, which #740 reports as an error row before moving to the next fallback, when there is one.  A version gate needs the detected CLI version (the Claude snapshot already carries it) wired into the lineage context, and is left as a follow-up.

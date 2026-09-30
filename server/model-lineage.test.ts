@@ -170,6 +170,49 @@ describe("checkLineageWrite", () => {
     });
   });
 
+  it("keeps a float when an older client removes the fallback in front of it", () => {
+    // The shipped iOS app removes a fallback by index and re-sends the rest
+    // without `latest`, so the floating Fallback 2 arrives as Fallback 1.
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+      fallbacks: [
+        { instanceId: "codex", model: "gpt-5.6-luna" },
+        { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+      ],
+    };
+    const ios: ModelSelection = { instanceId: "claude", model: "claude-opus-5-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5" }] };
+    const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
+    expect(result).toMatchObject({ ok: true, selection: { fallbacks: [{ model: "claude-sonnet-5-5", latest: "sonnet" }] } });
+    expect(result.ok && result.selection.latest).toBeUndefined();
+  });
+
+  it("never hands a pinned entry the float of another place that names the same model", () => {
+    // Primary pinned on Sonnet 5.5, Fallback 1 floating on the same slug
+    // (the settings UI seeds a new fallback from the primary).  Each keeps
+    // its own answer when an older client re-sends the chain unchanged.
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
+    };
+    const ios: ModelSelection = { instanceId: "claude", model: "claude-sonnet-5-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5" }] };
+    const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
+    expect(result.ok && result.selection.latest).toBeUndefined();
+    expect(result.ok && result.selection.fallbacks?.[0]?.latest).toBe("sonnet");
+  });
+
+  it("does not float an entry the older client moved onto a different model", () => {
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+      fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
+    };
+    const ios: ModelSelection = { instanceId: "claude", model: "claude-opus-5-5", fallbacks: [{ instanceId: "claude", model: "claude-haiku-4-5" }] };
+    const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
+    expect(result.ok && result.selection.fallbacks?.[0]).toEqual({ instanceId: "claude", model: "claude-haiku-4-5" });
+  });
+
   it("pins when the picker sends latest: null", () => {
     const saved: ModelSelection = { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" };
     const parsed: ModelSelection = { instanceId: "claude", model: "claude-sonnet-5-5" };

@@ -6,8 +6,10 @@ import {
   classifyModel,
   latestOptions,
   lineageStatus,
+  modelPrice,
   newestInClass,
   presentCatalog,
+  pricesWithinBand,
   reconcileChain,
   reconcileEntry,
   retiredModel,
@@ -150,6 +152,22 @@ describe("25% price band", () => {
     expect(withinPriceBand("codex", "gpt-5.6-luna", "gpt-6-luna")).toBe(true);
     expect(withinPriceBand("grok", "grok-4.7", "grok-4.8")).toBe(false);
     expect(withinPriceBand("grokAgent", "grok-4.7", "grok-4.8")).toBe(true);
+  });
+
+  it("prices the API-key Grok engine from the repo's xAI list prices", () => {
+    expect(modelPrice("grok", "grok-4.7")).toEqual({ input: 2, output: 6 });
+    expect(withinPriceBand("grok", "grok-4.6", "grok-4.7")).toBe(true);
+  });
+
+  it("puts a change of exactly 25% inside the band, either way, and anything past it outside", () => {
+    // Blended at 3:1 input:output, so equal input and output prices blend to
+    // themselves: $4 -> $5 is +25%, $4 -> $3 is -25%.
+    const base = { input: 4, output: 4 };
+    expect(pricesWithinBand(base, { input: 5, output: 5 })).toBe(true);
+    expect(pricesWithinBand(base, { input: 3, output: 3 })).toBe(true);
+    expect(pricesWithinBand(base, { input: 5.01, output: 5.01 })).toBe(false);
+    expect(pricesWithinBand(base, { input: 2.99, output: 2.99 })).toBe(false);
+    expect(pricesWithinBand({ input: 0, output: 0 }, base)).toBe(false);
   });
 });
 

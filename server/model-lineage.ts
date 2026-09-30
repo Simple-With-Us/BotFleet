@@ -116,21 +116,53 @@ function rawFallback(raw: unknown, index: number): unknown {
   return Array.isArray(fallbacks) ? fallbacks[index] : undefined;
 }
 
-/** A client that predates `latest` (the shipped iOS app decodes only
- *  instanceId / model / effort / fallbacks) re-sends a floating entry
- *  without the field.  When the entry still names the same engine and
- *  model, keep it floating.  An explicit `latest: null` is how the desktop
- *  picker pins the resolved model instead. */
-function carryLatest(entry: ModelSelection, raw: unknown, saved: ModelSelection | undefined): ModelSelection {
-  if (entry.latest !== undefined || !saved?.latest) return entry;
-  if (rawLatest(raw).present) return entry;
-  if (saved.instanceId !== entry.instanceId || saved.model !== entry.model) return entry;
-  return { ...entry, latest: saved.latest };
-}
-
 function chainEntries(selection: ModelSelection | undefined): ModelSelection[] {
   if (!selection) return [];
   return [selection, ...(selection.fallbacks ?? [])];
+}
+
+function sameTarget(a: ModelSelection, b: ModelSelection): boolean {
+  return a.instanceId === b.instanceId && a.model === b.model;
+}
+
+/** A client that predates `latest` (the shipped iOS app decodes only
+ *  instanceId / model / effort / fallbacks) re-sends a floating entry
+ *  without the field.  When the entry still names the engine and model of a
+ *  saved floating entry, keep it floating.  An explicit `latest: null` is how
+ *  the desktop picker pins the resolved model instead.
+ *
+ *  Entries are paired with the saved chain by position first.  An entry
+ *  whose saved entry at the same position names something else (iOS removed
+ *  or reordered a fallback, so the rest of the chain shifted) is then paired
+ *  with the first unpaired saved entry that names the same engine and model.
+ *  Each saved entry is paired at most once, so a pinned entry is never
+ *  handed a float that belongs to a different place in the chain. */
+function carryLatestChain(incoming: ModelSelection[], raws: unknown[], saved: ModelSelection[]): ModelSelection[] {
+  const out = [...incoming];
+  const used = new Set<number>();
+  const open: number[] = [];
+  const carries = (index: number) => {
+    const entry = incoming[index]!;
+    return entry.latest === undefined && !rawLatest(raws[index]).present;
+  };
+  incoming.forEach((entry, index) => {
+    const same = saved[index];
+    if (same && sameTarget(same, entry)) {
+      used.add(index);
+      if (carries(index) && same.latest) out[index] = { ...entry, latest: same.latest };
+      return;
+    }
+    open.push(index);
+  });
+  for (const index of open) {
+    const entry = incoming[index]!;
+    const match = saved.findIndex((candidate, at) => !used.has(at) && sameTarget(candidate, entry));
+    if (match < 0) continue;
+    used.add(match);
+    const from = saved[match]!;
+    if (carries(index) && from.latest) out[index] = { ...entry, latest: from.latest };
+  }
+  return out;
 }
 
 export type LineageWriteResult =
@@ -154,23 +186,19 @@ export function checkLineageWrite(
   current: ModelSelection | undefined,
   contextFor: (instanceId: string) => LineageContext | undefined,
 ): LineageWriteResult {
-  let incoming = carryLatest(selection, raw, current);
-  if (selection.fallbacks) {
-    incoming = {
-      ...incoming,
-      fallbacks: selection.fallbacks.map((fallback, index) =>
-        carryLatest(fallback, rawFallback(raw, index), current?.fallbacks?.[index]),
-      ),
-    };
-  }
   const saved = chainEntries(current);
+  const raws = [raw, ...(selection.fallbacks ?? []).map((_, index) => rawFallback(raw, index))];
+  const carried = carryLatestChain(chainEntries(selection), raws, saved);
+  const incoming: ModelSelection = { ...carried[0]! };
+  delete incoming.fallbacks;
+  if (selection.fallbacks) incoming.fallbacks = carried.slice(1);
   const entries = chainEntries(incoming);
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
     const driverKind = contextFor(entry.instanceId)?.driverKind;
     const retired = retiredModel(driverKind, entry.model);
     if (!retired || retired.successorClass !== null) continue;
-    const alreadySaved = saved.some((s) => s.instanceId === entry.instanceId && s.model === entry.model);
+    const alreadySaved = saved.some((s) => sameTarget(s, entry));
     if (!alreadySaved) {
       return {
         ok: false,

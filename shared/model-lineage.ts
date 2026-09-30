@@ -184,6 +184,16 @@ const GROK: Family = {
   label(_id, c) {
     return c.classKey === "grok" ? `Grok ${versionText(c.rank)}` : `Grok ${versionText(c.rank)} Build Fast`;
   },
+  // xAI API list prices, from the `grok` engine's table in
+  // src/lib/engine-capabilities.tsx (under-200k-token tier): Grok 4.7 is
+  // $2 input / $6 output, and xAI's grok-4.6 card has the same rates.  Only
+  // the API-key `grok` engine is decided by them; a subscription engine with
+  // an unpriced side still moves on the class match.  Grok 4.5 and the Build
+  // Fast line have no list price in the repo, so none is guessed here.
+  prices: {
+    "grok@4.7": { input: 2, output: 6 },
+    "grok@4.6": { input: 2, output: 6 },
+  },
   // Owner, 2026-09-30: "Grok 4.5 and 4.6 shouldn't be visible options and
   // anything on that should go to Grok 4.7."  grok-3-mini left the xAI
   // catalog with docs/rollouts/2026-09-18-latest-model-ids.md and has no
@@ -331,17 +341,21 @@ export function blendedPrice(price: ModelPrice): number {
   return (3 * price.input + price.output) / 4;
 }
 
+/** Whether the blended price moves by at most PRICE_BAND, either way.  A
+ *  change of exactly 25% is inside the band. */
+export function pricesWithinBand(from: ModelPrice, to: ModelPrice): boolean {
+  const base = blendedPrice(from);
+  if (base <= 0) return false;
+  return Math.abs(blendedPrice(to) - base) / base <= PRICE_BAND + 1e-9;
+}
+
 /** Whether moving `from` -> `to` on this engine stays inside the owner's
  *  25% band.  Unknown prices: a subscription CLI engine moves on the class
  *  match; an API-key engine does not. */
 export function withinPriceBand(driverKind: string | undefined, from: string, to: string): boolean {
   const a = modelPrice(driverKind, from);
   const b = modelPrice(driverKind, to);
-  if (a && b) {
-    const base = blendedPrice(a);
-    if (base <= 0) return false;
-    return Math.abs(blendedPrice(b) - base) / base <= PRICE_BAND + 1e-9;
-  }
+  if (a && b) return pricesWithinBand(a, b);
   return Boolean(driverKind && DRIVER_LINEAGE[driverKind]?.subscription);
 }
 

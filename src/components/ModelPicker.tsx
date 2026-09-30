@@ -20,7 +20,7 @@ import {
   opensOnLocalModels,
   type LocalModelGroup,
 } from "@/lib/local-models";
-import { selectionForPick } from "@/lib/model-pick";
+import { pickedSelection } from "@/lib/model-pick";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { EngineGroupLabel } from "./EngineGroupLabel";
@@ -423,9 +423,7 @@ export function ModelPicker({
   /** `latest` picks a "Latest <Class>" row; a pinned pick sends `null` so
    *  the harness does not carry an older float forward onto it. */
   const pick = (instance: InstanceInfo, model: string, latest?: string) => {
-    const nextSelection: ModelSelection = { ...selectionForPick(selection, instance, model), latest: latest ?? null };
-
-    commit(nextSelection);
+    commit(pickedSelection(selection, instance, model, latest));
     setOpen(false);
   };
 

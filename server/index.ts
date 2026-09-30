@@ -11457,7 +11457,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           broadcast({ kind: "bot", bot: fresh });
           return json(res, 200, { task: wireTask(cleared) });
         }
-        const checked = checkedModelSelection(body.modelSelection);
+        // The task's saved chain (or the bot's, which a task without an
+        // override runs on) lets the lineage check tell a retired id this
+        // edit introduces from one the chain already held, and carry a float
+        // an older client re-sends without `latest`.  No busy gate: a task
+        // override applies from that thread's next turn.
+        const savedTask = store.taskByThread(m[1], m[2])?.modelSelection ?? store.bot(m[1])?.modelSelection;
+        const checked = checkedModelSelection(
+          body.modelSelection,
+          savedTask ? { selection: savedTask, busy: false } : undefined,
+        );
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
         const updated = store.patchTask(m[1], m[2], { modelSelection: checked.selection });
         if (!updated) return json(res, 404, { error: "no such task" });

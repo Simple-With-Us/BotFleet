@@ -32,6 +32,7 @@ import {
   applyDefaultsBody,
   emptyFallbackSlots,
   hasDefaults,
+  slotFromPick,
   withSlot,
   type DefaultModelSlot,
 } from "@/lib/default-model-slots";
@@ -52,7 +53,7 @@ function ChipLabel({ children }: { children: string }) {
 
 /** One default slot: a Set Default pill, or a picker with a clear control.
  * Tapping Set Default seeds from the stand-in bot so the picker opens on a
- * real model instead of an empty control. */
+ * real model instead of an empty control, floating when that bot floats. */
 function DefaultSlot({
   bot,
   value,
@@ -72,9 +73,7 @@ function DefaultSlot({
       {!value ? (
         <button
           type="button"
-          onClick={() =>
-            onChange({ instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model })
-          }
+          onClick={() => onChange(slotFromPick(bot.modelSelection))}
           className="flex w-full items-center justify-center gap-1.5 rounded-full border border-dashed border-hairline/60 px-2.5 py-1 text-[13px] text-ink-secondary hover:border-hairline hover:text-ink"
         >
           <Plus size={13} />
@@ -171,13 +170,7 @@ function DefaultModelBlock() {
           bot={standIn}
           label="Primary"
           value={primary}
-          onChange={(selection) =>
-            setPrimary({
-              instanceId: selection.instanceId,
-              model: selection.model,
-              ...(selection.latest ? { latest: selection.latest } : {}),
-            })
-          }
+          onChange={(selection) => setPrimary(slotFromPick(selection))}
           onClear={() => setPrimary(null)}
         />
         {fallbacks.map((slot, index) => (
@@ -187,13 +180,7 @@ function DefaultModelBlock() {
             label={`Fallback ${index + 1}`}
             value={slot}
             onChange={(selection) =>
-              setFallbacks((current) =>
-                withSlot(current, index, {
-                  instanceId: selection.instanceId,
-                  model: selection.model,
-                  ...(selection.latest ? { latest: selection.latest } : {}),
-                }),
-              )
+              setFallbacks((current) => withSlot(current, index, slotFromPick(selection)))
             }
             onClear={() => setFallbacks((current) => withSlot(current, index, null))}
           />
