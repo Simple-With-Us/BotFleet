@@ -24,6 +24,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Lint (no new anti-slop errors in changed files)
         if: github.event_name == 'pull_request'
+        env:
+          LINT_BASE_REF: origin/${{ github.base_ref }}
         run: node scripts/lint-pr-gate.mjs
       - name: Lint (full repo)
         if: github.event_name != 'pull_request'
