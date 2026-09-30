@@ -1297,7 +1297,7 @@ export {
 export function vpsDriverError(driverKind: string, reach: ComputerReach): string | null {
   if (reach.vps) return null;
   if (driverKind === "boxAgent") {
-    return "The Computer engine runs its agent on Box and cannot use a self-hosted VPS — choose Claude or an ACP engine";
+    return "The ASCII.dev Box engine runs its agent on Box and cannot use a self-hosted VPS — choose Claude or an ACP engine";
   }
   return "This model engine cannot mount a self-hosted VPS computer — choose Claude or an ACP engine";
 }

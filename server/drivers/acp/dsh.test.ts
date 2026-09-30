@@ -12,6 +12,7 @@ import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import { createPatchCleanup, dshMcpPatchPaths } from "../dsh-acp-bridge.ts";
 import {
   classifyDshError,
+  DshModelNotOfferedError,
   dshCredentialCandidates,
   dshSupport,
   dshModelIdFromOptionValue,
@@ -243,6 +244,36 @@ describe("native DSH ACP turns", () => {
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: pro } },
       { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "reasoning_effort", value: "max" } },
     ]);
+  });
+
+  it("sends the advertised wire value for a picker id the install declares differently", async () => {
+    // Harness #54 through BotFleet's ACP core: stock dsh declares
+    // `deepseek-flash` (display name DeepSeek-V4.1-Flash), so the constructed
+    // value `["deepseek-official","DeepSeek-V4.1-Flash"]` would be refused.
+    // The resolver must send the advertised tuple, and the session must still
+    // report the picker id.
+    const dump = join(scratch, "dsh-resolved.json");
+    // The fake's current model is the first advertised option, so pick the
+    // other one: the switch must fire, and it must send the DECLARED tuple.
+    const advertisedPro = '["deepseek-official","deepseek-v4-pro"]';
+    process.env.FAKE_ACP_DUMP = dump;
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify(['["deepseek-official","deepseek-flash"]', advertisedPro]);
+    await create();
+
+    await instance!.adapter.sendTurn({
+      threadId: "dsh-resolved-turn",
+      text: "resolve the picker id against the advertised catalog",
+      model: "DeepSeek-V4.1-Pro",
+    });
+    const done = await recorder!.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    expect(JSON.parse(readFileSync(`${dump}.config.json`, "utf8"))).toEqual([
+      { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: advertisedPro } },
+    ]);
+    expect(recorder!.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Pro" }),
+    ]));
   });
 
   it("reports input tokens (no fabricated output) from DSH's usage_update notification", async () => {
@@ -643,20 +674,58 @@ describe("readDshModelCatalog", () => {
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).toContain("DeepSeek-V4.1-Pro");
     expect(ids).toContain("MiniMax-M3.1-Flash-Preview");
-    // The fixture's pre-rename id must not survive the union as a stale row.
+    // `deepseek-v4-pro` is the id dsh still declares for Pro: it folds onto
+    // the V4.1 row and never survives the union as its own stale row.
     expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
     expect(ids).not.toContain("MiniMax-M3");
   });
 
-  it("drops every retired pre-rename DeepSeek id a stale profile still offers", () => {
+  it("drops the retired v4-flash id a stale profile still offers", () => {
     writeSettings(llmPiAi(
-      "    deepseek-official:\n      models:\n        - id: deepseek-v4-flash\n        - id: deepseek-v4-pro\n",
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-flash\n",
     ));
     const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
     expect(ids).not.toContain("deepseek-v4-flash");
-    expect(ids).not.toContain("deepseek-v4-pro");
     expect(ids).toContain("DeepSeek-V4.1-Flash");
     expect(ids).toContain("DeepSeek-V4.1-Pro");
+  });
+
+  it("does not exclude deepseek-v4-pro, which dsh still declares: it folds onto the V4.1-Pro row", () => {
+    // dsh 0.1.5-rc.2 declares `deepseek-v4-pro` (display name DeepSeek-V4.1-Pro)
+    // and the owner's override keeps it.  It is live, not retired, so its live
+    // contextWindow must merge into the Pro row instead of being discarded by
+    // an exclusion, and the model must still be listed exactly once.
+    writeSettings(llmPiAi(
+      "    deepseek-official:\n      models:\n        - id: deepseek-v4-pro\n          name: DeepSeek-V4.1-Pro\n          contextWindow: 777000\n",
+    ));
+    const catalog = readDshModelCatalog({ HOME: home });
+    const ids = catalog.options.map((o) => o.id);
+    expect(ids).not.toContain("deepseek-v4-pro");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Pro")).toHaveLength(1);
+    const pro = catalog.options.find((o) => o.id === "DeepSeek-V4.1-Pro");
+    expect(pro?.contextWindow).toBe(777000);
+    expect(pro?.label).toBe("DeepSeek-V4.1-Pro");
+    expect(pro?.images).toBe(false);
+  });
+
+  it("folds a stock-spelling settings row onto its static row instead of duplicating the model", () => {
+    // Stock dsh declares `deepseek-flash` (display name DeepSeek-V4.1-Flash).
+    // Without the fold the picker would list the same model twice.
+    writeSettings(llmPiAi("    deepseek-official:\n      models:\n        - id: deepseek-flash\n          name: DeepSeek-V4.1-Flash\n          contextWindow: 999000\n"));
+    const catalog = readDshModelCatalog({ HOME: home });
+    const ids = catalog.options.map((o) => o.id);
+    expect(ids).not.toContain("deepseek-flash");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Flash")).toHaveLength(1);
+    // The fold keeps the merge behavior: a live context window still wins.
+    expect(catalog.options.find((o) => o.id === "DeepSeek-V4.1-Flash")?.contextWindow).toBe(999000);
+  });
+
+  it("folds an owner-override spelling (deepseek-v4.1-flash) onto the V4.1-Flash row", () => {
+    writeSettings(llmPiAi("    deepseek-official:\n      models:\n        - id: deepseek-v4.1-flash\n"));
+    const ids = readDshModelCatalog({ HOME: home }).options.map((o) => o.id);
+    expect(ids).not.toContain("deepseek-v4.1-flash");
+    expect(ids.filter((id) => id === "DeepSeek-V4.1-Flash")).toHaveLength(1);
   });
 
   it("falls back to the static catalog when there is no settings file", () => {
@@ -711,5 +780,102 @@ describe("readDshModelCatalog", () => {
     // delete the DeepSeek rows.
     const real = readDshModelCatalog({});
     for (const id of STATIC_IDS) expect(real.options.map((o) => o.id)).toContain(id);
+  });
+});
+
+describe("dsh model option resolution (Harness #54 consumer)", () => {
+  // What stock dsh 0.1.5-rc.x advertises at session/new: opaque route tuples
+  // whose ids are NOT the picker ids.
+  const STOCK_ADVERTISED = [
+    {
+      id: "model",
+      options: [
+        {
+          group: "deepseek-official",
+          options: [
+            { value: '["deepseek-official","deepseek-flash"]', name: "DeepSeek-V4.1-Flash" },
+            { value: '["deepseek-official","deepseek-v4-pro"]', name: "DeepSeek-V4.1-Pro" },
+          ],
+        },
+        {
+          group: "minimax",
+          options: [
+            { value: '["minimax","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" },
+          ],
+        },
+      ],
+    },
+  ];
+
+  it("sends the value the install declared for the picker id, not a value built from it", () => {
+    expect(dshModelOptionValue("DeepSeek-V4.1-Flash", STOCK_ADVERTISED)).toBe(
+      '["deepseek-official","deepseek-flash"]',
+    );
+  });
+
+  it("resolves a pre-rename saved selection to the current declared Flash", () => {
+    // Selections saved before the V4.1 rename store `deepseek-v4-flash`; the
+    // stored id is never rewritten, but the wire value must be one dsh
+    // actually advertises.
+    expect(dshModelOptionValue("deepseek-v4-flash", STOCK_ADVERTISED)).toBe(
+      '["deepseek-official","deepseek-flash"]',
+    );
+  });
+
+  it("builds the value from the picker id exactly as before when nothing is advertised", () => {
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", undefined)).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [])).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [{ id: "model", options: [] }])).toBe(
+      '["deepseek-official","DeepSeek-V4.1-Pro"]',
+    );
+  });
+
+  it("refuses a retired MiniMax id instead of silently substituting another model", () => {
+    // The #729 retired-id exclusion through the new resolution path: M3 is not
+    // advertised, and no alias family maps it onto M3.1-Flash-Preview, so the
+    // turn fails as a catalog outage rather than running a model nobody picked.
+    let thrown: unknown;
+    try {
+      dshModelOptionValue("MiniMax-M3", STOCK_ADVERTISED);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(DshModelNotOfferedError);
+    expect(classifyDshError(thrown)).toBe("model_catalog_outage");
+    expect(dshSupport.classifyError?.(thrown)).toBe("model_catalog_outage");
+  });
+
+  it("never resolves a picker id into another provider's namespace", () => {
+    // DeepSeek id against a MiniMax-only advertisement: no cross-provider
+    // match, so the same outage classification instead of a wrong-model turn.
+    expect(() => dshModelOptionValue("DeepSeek-V4.1-Flash", [
+      { id: "model", options: [{ value: '["minimax","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
+    ])).toThrow(DshModelNotOfferedError);
+  });
+
+  it("names the provider route of a refused model, so a wrong-route pick does not read as a contradiction", () => {
+    // Harness #56: a model declared only under another provider stays refused
+    // (a different route has its own credentials and billing), and the error
+    // now lists offers as provider/id and says where the model is declared.
+    let thrown: unknown;
+    try {
+      dshModelOptionValue("MiniMax-M3.1-Flash-Preview", [
+        {
+          id: "model",
+          options: [
+            { group: "deepseek-official", options: [{ value: '["deepseek-official","deepseek-flash"]', name: "DeepSeek-V4.1-Flash" }] },
+            { group: "minimax-cn", options: [{ value: '["minimax-cn","MiniMax-M3.1-Flash-Preview"]', name: "MiniMax-M3.1-Flash-Preview" }] },
+          ],
+        },
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(DshModelNotOfferedError);
+    const error = thrown as DshModelNotOfferedError;
+    expect(error.elsewhere).toEqual(["minimax-cn"]);
+    expect(error.offered).toContain("minimax-cn/MiniMax-M3.1-Flash-Preview");
+    expect(error.message).toContain("MiniMax-M3.1-Flash-Preview is declared only under minimax-cn");
+    expect(dshSupport.classifyError?.(error)).toBe("model_catalog_outage");
   });
 });
