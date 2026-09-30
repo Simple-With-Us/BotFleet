@@ -34,6 +34,7 @@
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { z } from "zod";
 import { writeFileAtomic } from "./atomic.ts";
 
 /** How long a rejected model stays out of the walk. */
@@ -54,6 +55,16 @@ export interface ModelRejection {
   recordedAt: number;
   expiresAt: number;
 }
+
+/** One persisted row.  Anything that does not parse is dropped, like an expired one. */
+const persistedRowSchema = z.object({
+  botId: z.string(),
+  instanceId: z.string(),
+  model: z.string(),
+  reason: z.string().optional(),
+  recordedAt: z.number().optional(),
+  expiresAt: z.number(),
+});
 
 export class ModelRejectionRegistry {
   private readonly rows = new Map<string, ModelRejection>();
@@ -89,29 +100,26 @@ export class ModelRejectionRegistry {
     if (!this.persistPath) return;
     try {
       if (!existsSync(this.persistPath)) return;
-      const parsed = JSON.parse(readFileSync(this.persistPath, "utf8")) as { rejections?: unknown };
-      if (!Array.isArray(parsed.rejections)) return;
+      const parsed = z.object({ rejections: z.array(z.unknown()) }).safeParse(
+        JSON.parse(readFileSync(this.persistPath, "utf8")),
+      );
+      if (!parsed.success) return;
       const now = Date.now();
       let removed = false;
-      for (const row of parsed.rejections as Array<Partial<ModelRejection> | null>) {
-        if (
-          !row ||
-          typeof row.botId !== "string" ||
-          typeof row.instanceId !== "string" ||
-          typeof row.model !== "string" ||
-          typeof row.expiresAt !== "number" ||
-          row.expiresAt <= now
-        ) {
+      for (const raw of parsed.data.rejections) {
+        const row = persistedRowSchema.safeParse(raw);
+        if (!row.success || row.data.expiresAt <= now) {
           removed = true;
           continue;
         }
-        this.rows.set(ModelRejectionRegistry.key(row.botId, row.instanceId, row.model), {
-          botId: row.botId,
-          instanceId: row.instanceId,
-          model: row.model,
-          reason: typeof row.reason === "string" ? row.reason : "",
-          recordedAt: typeof row.recordedAt === "number" ? row.recordedAt : now,
-          expiresAt: row.expiresAt,
+        const { botId, instanceId, model, reason, recordedAt, expiresAt } = row.data;
+        this.rows.set(ModelRejectionRegistry.key(botId, instanceId, model), {
+          botId,
+          instanceId,
+          model,
+          reason: reason ?? "",
+          recordedAt: recordedAt ?? now,
+          expiresAt,
         });
       }
       if (removed) this.persist();
@@ -155,7 +163,8 @@ export class ModelRejectionRegistry {
   list(now = Date.now()): ModelRejection[] {
     const live: ModelRejection[] = [];
     let expired = false;
-    for (const [key, row] of [...this.rows.entries()]) {
+    // Deleting the entry being visited is safe in a Map iteration.
+    for (const [key, row] of this.rows) {
       if (now >= row.expiresAt) {
         this.rows.delete(key);
         expired = true;
@@ -173,7 +182,7 @@ export class ModelRejectionRegistry {
 
   clearWhere(predicate: (row: ModelRejection) => boolean): void {
     let changed = false;
-    for (const [key, row] of [...this.rows.entries()]) {
+    for (const [key, row] of this.rows) {
       if (!predicate(row)) continue;
       this.rows.delete(key);
       changed = true;

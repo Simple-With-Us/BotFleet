@@ -2612,7 +2612,8 @@ async function launchFallbackTurn(input: {
       // A dispatch failure already put its own error row in the transcript;
       // a throw before dispatch did not, so it is told here.
       if (!shownAlready) note(`Couldn't start ${pick.model} \u2014 ${why}`);
-      const following = stoppedTurns.delete(key)
+      const stopped = stoppedTurns.delete(key);
+      const following = stopped
         ? undefined
         : selectTurnFallback({
             ok: false,
@@ -2626,7 +2627,8 @@ async function launchFallbackTurn(input: {
           });
       if (!following) {
         fallbackAttemptByTurn.delete(key);
-        note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
+        // A Stop ends the walk on purpose; only a chain that ran out is news.
+        if (!stopped) note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
         routines?.failThread(threadId, `Could not start ${pick.model}: ${why}`, "dispatch_failed");
         return;
       }
@@ -2665,7 +2667,7 @@ async function launchFallbackTurn(input: {
         console.error(`fallback skipped for ${botId}: a newer turn owns the bot \u2014 ${message}`);
         return;
       }
-      if ((error as { pickUnusable?: unknown } | null)?.pickUnusable === true) {
+      if (error instanceof Error && "pickUnusable" in error && error.pickUnusable === true) {
         advance(message);
         return;
       }

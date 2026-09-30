@@ -339,9 +339,7 @@ export function turnModelRejectionEvidence(
     }
     return { text: "The provider rejected the model.", source: "stop-reason" };
   }
-  const botTexts = messagesAfterUser.filter(
-    (message) => message.role === "bot" && message.kind === "text" && typeof message.text === "string",
-  );
+  const botTexts = messagesAfterUser.filter((message) => message.role === "bot" && message.kind === "text");
   const text = botTexts.at(-1)?.text?.trim();
   if (text && isModelRejectionText(text)) return { text, source: "terminal-text" };
   return undefined;
@@ -864,6 +862,12 @@ export class QuotaCooldownRegistry {
     if (!cd && !primaryRejected) {
       return { selection: primary, isFallback: false };
     }
+    // A rejected primary has no cooldown row, so the result carries none.
+    const resolved = (selection: ModelSelection, isFallback: boolean) => {
+      const result: { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } = { selection, isFallback };
+      if (cd) result.cooldown = cd;
+      return result;
+    };
     const fallbacks = primary.fallbacks;
     if (fallbacks && fallbacks.length > 0) {
       const isDoomed = doomedGate(opts.isDoomed);
@@ -871,10 +875,10 @@ export class QuotaCooldownRegistry {
         if (this.get(botId, fb.instanceId, fb.model, now)) continue;
         if (isDoomed(botId, fb.instanceId, now)) continue;
         if (isRejected(botId, fb.instanceId, fb.model, now)) continue;
-        return { selection: fb, isFallback: true, ...(cd ? { cooldown: cd } : {}) };
+        return resolved(fb, true);
       }
     }
-    return { selection: primary, isFallback: false, ...(cd ? { cooldown: cd } : {}) };
+    return resolved(primary, false);
   }
 }
 

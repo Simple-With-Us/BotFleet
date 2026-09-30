@@ -6,6 +6,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { z } from "zod";
 
 import { isEffortLevel, type EffortLevel, type ModelCatalog } from "../contracts.ts";
 import { killCliTree, spawnCli } from "../procs.ts";
@@ -46,7 +47,10 @@ function unverifiedRow(id: string, label: string): ModelCatalog["options"][numbe
  * release; do not add them back on a guess.
  */
 export const STATIC_CODEX_MODELS: ModelCatalog = {
-  default: "gpt-6-astra",
+  // Luna stays the default, as the owner asked when GPT-6 landed, but on the
+  // id Codex actually serves.  The live catalog's own default replaces it
+  // whenever Codex answers.
+  default: "gpt-5.6-luna",
   options: [
     unverifiedRow("gpt-6-astra", "GPT-6 Astra"),
     unverifiedRow("gpt-5.6-sol", "GPT-5.6 Sol"),
@@ -247,6 +251,17 @@ export interface CodexCatalogMemory {
   lastGood?: ModelCatalog;
 }
 
+const modelsCacheFileSchema = z.object({ models: z.array(z.unknown()) });
+const modelsCacheRowSchema = z.object({
+  slug: z.string(),
+  display_name: z.string().optional(),
+  visibility: z.string(),
+  // Either a bare level or `{ effort, description }`; both read as the level.
+  supported_reasoning_levels: z
+    .array(z.union([z.string(), z.object({ effort: z.string() }).transform((level) => level.effort)]))
+    .optional(),
+});
+
 /** Visible rows from Codex's own `models_cache.json`: slug, display name and
  *  reasoning efforts only, read-only.  The CLI refreshes this file itself
  *  whenever it talks to the server, so it survives a harness restart and
@@ -256,47 +271,32 @@ export interface CodexCatalogMemory {
 export function readCodexModelsCache(env: Record<string, string | undefined>): ModelCatalog | null {
   const raw = readText(join(codexHome(env), "models_cache.json"));
   if (!raw) return null;
-  let parsed: unknown;
+  let file: z.infer<typeof modelsCacheFileSchema>;
   try {
-    parsed = JSON.parse(raw);
+    file = modelsCacheFileSchema.parse(JSON.parse(raw));
   } catch {
     return null;
   }
-  const records = parsed && typeof parsed === "object" ? (parsed as { models?: unknown }).models : undefined;
-  if (!Array.isArray(records)) return null;
   const options: ModelCatalog["options"] = [];
   const seen = new Set<string>();
-  let defaultModel: string | null = null;
-  for (const record of records) {
-    if (!record || typeof record !== "object") continue;
-    const row = record as {
-      slug?: unknown;
-      display_name?: unknown;
-      visibility?: unknown;
-      supported_reasoning_levels?: unknown;
-    };
-    if (row.visibility !== "list" || typeof row.slug !== "string" || !MODEL_ID.test(row.slug) || seen.has(row.slug)) continue;
+  for (const record of file.models) {
+    const parsed = modelsCacheRowSchema.safeParse(record);
+    if (!parsed.success) continue;
+    const row = parsed.data;
+    if (row.visibility !== "list" || !MODEL_ID.test(row.slug) || seen.has(row.slug)) continue;
     seen.add(row.slug);
-    let effortLevels: EffortLevel[] | undefined;
-    if (Array.isArray(row.supported_reasoning_levels)) {
-      effortLevels = row.supported_reasoning_levels
-        .map((level) =>
-          typeof level === "string"
-            ? level
-            : level && typeof level === "object"
-              ? ((level as { effort?: unknown }).effort as string)
-              : null,
-        )
-        .filter(isEffortLevel);
-    }
-    options.push({
+    const option: ModelCatalog["options"][number] = {
       id: row.slug,
-      label: typeof row.display_name === "string" && row.display_name.trim() ? row.display_name : row.slug,
-      ...(effortLevels !== undefined ? { effortLevels, supportsEffort: effortLevels.length > 0 } : {}),
-    });
-    defaultModel ??= row.slug;
+      label: row.display_name?.trim() ? row.display_name : row.slug,
+    };
+    if (row.supported_reasoning_levels) {
+      const effortLevels = row.supported_reasoning_levels.filter(isEffortLevel);
+      option.effortLevels = effortLevels;
+      option.supportsEffort = effortLevels.length > 0;
+    }
+    options.push(option);
   }
-  return options.length ? { default: defaultModel ?? options[0].id, options } : null;
+  return options.length ? { default: options[0].id, options } : null;
 }
 
 function unquote(raw: string): string {

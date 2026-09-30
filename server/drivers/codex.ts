@@ -167,6 +167,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       try {
         const { catalog, source } = await readCodexModelCatalogDetailed(catalogEnv, fetch, config.cli, {
           memory: catalogMemory,
+          // 8 s by default.  A host under heavy load can need longer to spawn
+          // the app-server; the list served meanwhile is the last good one,
+          // so raising this only delays the refresh, never the picker.
+          probeTimeoutMs: Number(process.env.OMB_CODEX_CATALOG_PROBE_MS) || undefined,
           // The probe used to fail silently, so a timeout under host load
           // looked the same as a CLI that answered with nothing.  Logged on a
           // change only: describe runs often and one line per pass is noise.

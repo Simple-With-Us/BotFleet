@@ -245,6 +245,67 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "api_error" });
   });
 
+  describe("a rejected model id", () => {
+    // The CLI answers an unknown model with an assistant-shaped apology and a
+    // 404 result instead of failing the process.  Forwarded as bot text, that
+    // apology counted as real output: the fallback walk stopped on the dead
+    // entry and every later engine in the chain was never tried.
+    const rejected = async (mode: string, threadId: string) => {
+      await create(mode);
+      await instance.adapter.sendTurn({ threadId, text: "hi", model: "claude-3-7-sonnet" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+      return done;
+    };
+    const expectErrorNotText = () => {
+      const errors = recorder.events.filter((e) => e.type === "runtime.error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({
+        message: expect.stringMatching(/claude-3-7-sonnet.*Pick another model in Settings/),
+      });
+      // a rejection is not a setup failure: it must not mark the bot dead
+      expect(errors[0]).not.toHaveProperty("setup");
+      expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toBe(false);
+      expect(recorder.events.some((e) => e.type === "content.delta")).toBe(false);
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    };
+
+    it("settles unknown_model with an error row and no assistant text (structural frames)", async () => {
+      const done = await rejected("model-not-found", "t-model-rejected");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      expectErrorNotText();
+    });
+
+    it("recognizes the rejection from a CLI that drops the error field (text backstop)", async () => {
+      const done = await rejected("model-not-found-text", "t-model-rejected-text");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      expectErrorNotText();
+    });
+
+    it("recognizes a bare 404 result with no assistant frame", async () => {
+      const done = await rejected("model-404", "t-model-404");
+      expect(done).toMatchObject({ type: "turn.completed", ok: false, stopReason: "unknown_model" });
+      // the requested id still reaches the message, from the turn itself
+      expectErrorNotText();
+    });
+
+    it("keeps a real reply that merely opens with the same words", async () => {
+      await create("model-lookalike");
+      await instance.adapter.sendTurn({ threadId: "t-model-lookalike", text: "hi", model: "claude-sonnet-5" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+      expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+      expect(recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toMatchObject({
+        text: expect.stringMatching(/^There's an issue with the selected model dropdown/),
+      });
+    });
+
+    it("a 429 api_error is still an api_error, not a model rejection", async () => {
+      const done = await rejected("api-error", "t-not-a-model-problem");
+      expect(done).toMatchObject({ ok: false, stopReason: "api_error" });
+      expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    });
+  });
+
   it("streams partial-message text deltas without re-emitting the whole message", async () => {
     await create("stream");
     await instance.adapter.sendTurn({ threadId: "t-stream", text: "hi" });

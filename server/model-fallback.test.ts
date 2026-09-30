@@ -1,5 +1,6 @@
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { EffortLevel, ModelSelection } from "./contracts.ts";
@@ -7,6 +8,7 @@ import {
   AUTO_FALLBACK_PRIORITY,
   DEFAULT_QUOTA_COOLDOWN_TTL_MS,
   bootRecoveryTurnOpts,
+  isModelRejectionText,
   isQuotaOrCapText,
   isShortProviderErrorText,
   lastTurnStartIndex,
@@ -19,6 +21,7 @@ import {
   shouldReplayPersistedStarter,
   sliceIsShortProviderError,
   turnHitQuotaOrCap,
+  turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
   turnProducedAssistantOutput,
   inheritedUnattended,
@@ -28,6 +31,7 @@ import {
 } from "./model-fallback.ts";
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
+import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -1485,5 +1489,327 @@ describe("the default doomed gate is live, not a stub", () => {
     } finally {
       doomedDispatches.clear();
     }
+  });
+});
+
+// A provider that rejects the model id answers before doing any work.  The
+// Claude CLI used to phrase that as an assistant reply, which counted as real
+// output and ended the walk on the dead entry: Deployer's chain held
+// claude-3-7-sonnet ahead of two healthy engines and stopped there in 24 of 26
+// fall-overs.  These tests pin the fold the way index.ts wires it.
+describe("a rejected model id does not end the fallback walk", () => {
+  const T0 = 1_780_000_000_000;
+  const CHAIN: ModelSelection[] = [
+    { instanceId: "claude", model: "claude-3-7-sonnet" },
+    { instanceId: "codex", model: "gpt-5.6-luna" },
+    { instanceId: "minimax", model: "MiniMax-M3" },
+  ];
+  const DEAD_TEXT =
+    "There's an issue with the selected model (claude-3-7-sonnet). It may not exist or you may not have access to it.";
+  const errorRow = (name: string): FallbackScanMessage => ({
+    role: "bot",
+    kind: "activity",
+    tool: { name: `error: ${name}`, ok: false },
+  });
+  const textRow = (text: string): FallbackScanMessage => ({ role: "bot", kind: "text", text });
+  const notice = (name: string): FallbackScanMessage => ({
+    role: "bot",
+    kind: "activity",
+    tool: { name, ok: true, kind: "notice" },
+  });
+
+  /** The fold in server/index.ts, reduced to the decision it feeds. */
+  function walk(
+    afterUser: FallbackScanMessage[],
+    opts: { stopReason?: string | null; used: number; current: { instanceId: string; model: string }; ok?: boolean },
+  ) {
+    const evidence = turnModelRejectionEvidence(afterUser, opts.ok ?? false, opts.stopReason);
+    const textIsError = sliceIsShortProviderError(afterUser) || Boolean(evidence);
+    return selectTurnFallback({
+      ok: (opts.ok ?? false) && !textIsError,
+      stopReason: opts.stopReason,
+      produced: turnProducedAssistantOutput(afterUser, { textIsError }),
+      quotaOrCap: Boolean(turnQuotaOrCapEvidence(afterUser, opts.ok ?? false)),
+      fallbacks: CHAIN,
+      used: opts.used,
+      current: opts.current,
+      botId: "bot-rejected",
+      now: T0,
+    });
+  }
+
+  it("reproduces the dead end this fixes: the apology text alone reads as real output", () => {
+    const afterUser = [errorRow("unknown model option"), notice("Fell over to claude-3-7-sonnet"), textRow(DEAD_TEXT)];
+    // The pre-fix fold knew nothing of rejections: the text counts as output.
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: turnProducedAssistantOutput(afterUser, { textIsError: sliceIsShortProviderError(afterUser) }),
+        fallbacks: CHAIN,
+        used: 1,
+        current: CHAIN[0],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("walks on from a rejection the driver reported structurally", () => {
+    const afterUser = [
+      errorRow("Claude can't use the model claude-3-7-sonnet.  It may not exist."),
+      notice("Fell over to claude-3-7-sonnet"),
+    ];
+    expect(turnModelRejectionEvidence(afterUser, false, "unknown_model")).toMatchObject({
+      source: "stop-reason",
+      text: expect.stringContaining("claude-3-7-sonnet"),
+    });
+    expect(walk(afterUser, { stopReason: "unknown_model", used: 1, current: CHAIN[0] })).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      effort: undefined,
+      nextUsed: 2,
+    });
+  });
+
+  it("walks on from the rejection prose when an older driver forwarded it as text", () => {
+    const afterUser = [notice("Fell over to claude-3-7-sonnet"), textRow(DEAD_TEXT)];
+    expect(turnModelRejectionEvidence(afterUser, false, "api_error")).toMatchObject({ source: "terminal-text" });
+    expect(walk(afterUser, { stopReason: "api_error", used: 1, current: CHAIN[0] })).toMatchObject({
+      instanceId: "codex",
+      nextUsed: 2,
+    });
+  });
+
+  it("reads the LAST bot text, so a second dead entry is not hidden behind the first", () => {
+    // The slice accumulates across attempts: the fallback re-uses the same
+    // user message.  sliceIsShortProviderError wants exactly one text row and
+    // would have answered false here.
+    const afterUser = [textRow(DEAD_TEXT), notice("Fell over to claude-3-5-sonnet"), textRow(DEAD_TEXT.replace("3-7", "3-5"))];
+    expect(sliceIsShortProviderError(afterUser)).toBe(false);
+    expect(turnModelRejectionEvidence(afterUser, false, "api_error")).toBeDefined();
+    const chain: ModelSelection[] = [
+      { instanceId: "claude", model: "claude-3-7-sonnet" },
+      { instanceId: "claude", model: "claude-3-5-sonnet" },
+      { instanceId: "codex", model: "gpt-5.6-luna" },
+    ];
+    const evidence = turnModelRejectionEvidence(afterUser, false, "api_error");
+    expect(
+      selectTurnFallback({
+        ok: false,
+        produced: turnProducedAssistantOutput(afterUser, { textIsError: Boolean(evidence) }),
+        fallbacks: chain,
+        used: 2,
+        current: chain[1],
+      }),
+    ).toMatchObject({ instanceId: "codex", nextUsed: 3 });
+  });
+
+  it("never reads a successful turn, or ordinary prose about a missing model, as a rejection", () => {
+    // Anchored and length-capped on purpose: a real answer may discuss this.
+    expect(turnModelRejectionEvidence([textRow(DEAD_TEXT)], true, "end_turn")).toBeUndefined();
+    for (const prose of [
+      "The staging model id was not found in the catalog, so I added it.",
+      "that model is not available on the free tier",
+      "There's an issue with the selected model dropdown: it shows stale ids, so I fixed the filter.".repeat(6),
+      "I looked at why there's an issue with the selected model in the UI.",
+    ]) {
+      expect(isModelRejectionText(prose)).toBe(false);
+      expect(turnModelRejectionEvidence([textRow(prose)], false, "api_error")).toBeUndefined();
+    }
+    // …and a failed turn that did answer keeps ending the walk as before.
+    expect(
+      walk([textRow("Here is the diff you asked for."), errorRow("connection reset")], {
+        stopReason: "exit_before_result",
+        used: 0,
+        current: CHAIN[0],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("falls back to a generic line when the driver gave a stop reason and no error row", () => {
+    expect(turnModelRejectionEvidence([], false, "unknown_model")).toMatchObject({
+      source: "stop-reason",
+      text: expect.any(String),
+    });
+  });
+
+  describe("the rejected-model mark", () => {
+    it("skips a marked entry in the walk and lands on the next usable one", () => {
+      const input = {
+        ok: false,
+        produced: false,
+        fallbacks: CHAIN,
+        used: 0,
+        botId: "bot-rejected",
+        now: T0,
+      };
+      expect(selectTurnFallback({ ...input, isModelRejected: () => false })).toMatchObject({ instanceId: "claude", nextUsed: 1 });
+      expect(
+        selectTurnFallback({
+          ...input,
+          isModelRejected: (botId, instanceId, model) =>
+            botId === "bot-rejected" && instanceId === "claude" && model === "claude-3-7-sonnet",
+        }),
+      ).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna", nextUsed: 2 });
+    });
+
+    it("marks one model, not the engine: a healthy entry on the same instance still runs", () => {
+      const chain: ModelSelection[] = [
+        { instanceId: "claude", model: "claude-3-7-sonnet" },
+        { instanceId: "claude", model: "claude-sonnet-5" },
+      ];
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: chain,
+          used: 0,
+          botId: "bot-rejected",
+          now: T0,
+          isModelRejected: (_bot, _instance, model) => model === "claude-3-7-sonnet",
+        }),
+      ).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5", nextUsed: 2 });
+    });
+
+    it("needs a bot id, like the doomed gate: no bot, nothing excluded", () => {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: CHAIN,
+          used: 0,
+          isModelRejected: () => true,
+        }),
+      ).toMatchObject({ instanceId: "claude" });
+    });
+
+    it("ends the walk when every remaining entry is marked", () => {
+      expect(
+        selectTurnFallback({
+          ok: false,
+          produced: false,
+          fallbacks: CHAIN,
+          used: 1,
+          botId: "bot-rejected",
+          now: T0,
+          isModelRejected: () => true,
+        }),
+      ).toBeUndefined();
+    });
+
+    it("reads the process-wide registry when no gate is passed, and stops at its TTL", () => {
+      modelRejections.record({
+        botId: "bot-default-mark",
+        instanceId: "claude",
+        model: "claude-3-7-sonnet",
+        reason: "rejected",
+        now: T0,
+      });
+      try {
+        const input = { ok: false, produced: false, fallbacks: CHAIN, used: 0, botId: "bot-default-mark" };
+        expect(selectTurnFallback({ ...input, now: T0 + 1_000 })).toMatchObject({ instanceId: "codex" });
+        // another bot is unaffected
+        expect(selectTurnFallback({ ...input, botId: "some-other-bot", now: T0 + 1_000 })).toMatchObject({ instanceId: "claude" });
+        // past the TTL the entry is offered again
+        expect(selectTurnFallback({ ...input, now: T0 + MODEL_REJECTION_TTL_MS + 1 })).toMatchObject({ instanceId: "claude" });
+      } finally {
+        modelRejections.clearWhere(() => true);
+      }
+    });
+
+    it("resolveModel routes around a rejected primary without recording a quota cooldown", () => {
+      const registry = new QuotaCooldownRegistry();
+      const primary: ModelSelection = {
+        instanceId: "dsh",
+        model: "DeepSeek-V4.1-Flash",
+        fallbacks: [
+          { instanceId: "claude", model: "claude-3-7-sonnet" },
+          { instanceId: "codex", model: "gpt-5.6-luna" },
+        ],
+      };
+      const rejected = (model: string) => (botId: string, instanceId: string, m: string) =>
+        botId === "bot1" && m === model && instanceId !== "";
+
+      expect(registry.resolveModel("bot1", primary, T0, { isModelRejected: () => false })).toEqual({
+        selection: primary,
+        isFallback: false,
+      });
+
+      // the primary itself was rejected, and so was the first fallback
+      const both = (botId: string, instanceId: string, model: string) =>
+        rejected("DeepSeek-V4.1-Flash")(botId, instanceId, model) || rejected("claude-3-7-sonnet")(botId, instanceId, model);
+      const resolved = registry.resolveModel("bot1", primary, T0, { isModelRejected: both });
+      expect(resolved.isFallback).toBe(true);
+      expect(resolved.selection).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna" });
+      expect(resolved.cooldown).toBeUndefined();
+      // a mark is not a quota hit: nothing for the Usage settings to list
+      expect(registry.list(T0)).toEqual([]);
+    });
+
+    it("resolveModel keeps a rejected primary when no usable fallback is left, so the failure stays visible", () => {
+      const registry = new QuotaCooldownRegistry();
+      const primary: ModelSelection = {
+        instanceId: "claude",
+        model: "claude-3-7-sonnet",
+        fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna" }],
+      };
+      expect(registry.resolveModel("bot1", primary, T0, { isModelRejected: () => true })).toEqual({
+        selection: primary,
+        isFallback: false,
+      });
+      // and with no chain at all
+      const lone: ModelSelection = { instanceId: "claude", model: "claude-3-7-sonnet" };
+      expect(registry.resolveModel("bot1", lone, T0, { isModelRejected: () => true }).selection).toEqual(lone);
+    });
+  });
+});
+
+describe("ModelRejectionRegistry", () => {
+  const T0 = 1_780_000_000_000;
+
+  it("keys on bot, instance and model, expires lazily, and restarts the clock on a repeat", () => {
+    const registry = new ModelRejectionRegistry();
+    registry.record({ botId: "b", instanceId: "claude", model: "claude-3-7-sonnet", reason: "gone", now: T0 });
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + 1)).toBe(true);
+    expect(registry.isRejected("b", "claude", "claude-sonnet-5", T0 + 1)).toBe(false);
+    expect(registry.isRejected("b", "codex", "claude-3-7-sonnet", T0 + 1)).toBe(false);
+    expect(registry.isRejected("other", "claude", "claude-3-7-sonnet", T0 + 1)).toBe(false);
+
+    registry.record({ botId: "b", instanceId: "claude", model: "claude-3-7-sonnet", now: T0 + MODEL_REJECTION_TTL_MS - 10 });
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + MODEL_REJECTION_TTL_MS + 5)).toBe(true);
+    expect(registry.isRejected("b", "claude", "claude-3-7-sonnet", T0 + 2 * MODEL_REJECTION_TTL_MS)).toBe(false);
+    expect(registry.list(T0 + 2 * MODEL_REJECTION_TTL_MS)).toEqual([]);
+  });
+
+  it("clears one mark, one instance, or everything", () => {
+    const registry = new ModelRejectionRegistry();
+    registry.record({ botId: "b", instanceId: "claude", model: "m1", now: T0 });
+    registry.record({ botId: "b", instanceId: "claude", model: "m2", now: T0 });
+    registry.record({ botId: "b", instanceId: "codex", model: "m3", now: T0 });
+    registry.clear("b", "claude", "m1");
+    expect(registry.list(T0).map((row) => row.model).sort()).toEqual(["m2", "m3"]);
+    registry.clearInstance("claude");
+    expect(registry.list(T0).map((row) => row.model)).toEqual(["m3"]);
+    registry.clearWhere(() => true);
+    expect(registry.list(T0)).toEqual([]);
+  });
+
+  it("survives a restart through the persist seam, drops expired rows, and treats a corrupt file as empty", () => {
+    const writes: string[] = [];
+    const first = new ModelRejectionRegistry();
+    first.enablePersist(join(tmpdir(), "omb-model-rejections-missing.json"), (_path, json) => writes.push(json));
+    first.record({ botId: "b", instanceId: "claude", model: "live", reason: "gone", now: Date.now() });
+    first.record({ botId: "b", instanceId: "claude", model: "stale", now: Date.now() - MODEL_REJECTION_TTL_MS - 5_000 });
+    expect(writes.length).toBeGreaterThan(0);
+
+    const file = join(mkdtempSync(join(tmpdir(), "omb-model-rejections-")), "model-rejections.json");
+    writeFileSync(file, writes.at(-1)!);
+    const second = new ModelRejectionRegistry();
+    second.enablePersist(file, () => undefined);
+    expect(second.isRejected("b", "claude", "live")).toBe(true);
+    expect(second.isRejected("b", "claude", "stale")).toBe(false);
+
+    writeFileSync(file, "{not json");
+    const third = new ModelRejectionRegistry();
+    third.enablePersist(file, () => undefined);
+    expect(third.list()).toEqual([]);
   });
 });

@@ -1143,8 +1143,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               Boolean(liveTurn?.modelRejection) ||
               (isError && o.api_error_status === 404 && !liveTurn?.producedOutput);
             if (modelRejected && liveTurn && !liveTurn.modelRejection) {
+              const reported = String(o.result ?? "");
               const message = modelRejectionMessage(
-                typeof o.result === "string" && o.result.length < MODEL_REJECTION_TEXT_MAX ? o.result : "",
+                reported.length < MODEL_REJECTION_TEXT_MAX ? reported : "",
                 liveTurn.input.model,
               );
               liveTurn.modelRejection = message;

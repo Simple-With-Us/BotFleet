@@ -42,6 +42,7 @@ let fakeClaudeDump: string;
 let fakeCrashCli: string;
 /** wrapper CLI that returns a successful-looking quota message */
 let fakeQuotaCli: string;
+let fakeRejectCli: string;
 /** wrapper CLI that returns ordinary prose containing former quota keywords */
 let fakeQuotaProseCli: string;
 /** happy CLI whose canned reply carries a fake API key - drives the SSE secret-redaction test */
@@ -116,7 +117,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 
 const writeFakeClaudeWrapper = (
   file: string,
-  mode: "exit-early" | "hang" | "happy" | "quota",
+  mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
   options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string } = {},
 ): string => {
   const lines = [
@@ -152,6 +153,9 @@ beforeAll(async () => {
   // so this engine never clobbers the argv dump other tests assert on.
   fakeCrashCli = writeFakeClaudeWrapper(join(home, "fake-claude-crash"), "exit-early");
   fakeQuotaCli = writeFakeClaudeWrapper(join(home, "fake-claude-quota"), "quota");
+  // A Claude CLI that rejects whatever model id it is given, the way the real
+  // one answers a retired id: a synthetic model_not_found frame and a 404.
+  fakeRejectCli = writeFakeClaudeWrapper(join(home, "fake-claude-reject"), "model-not-found");
   fakeQuotaProseCli = writeFakeClaudeWrapper(join(home, "fake-claude-quota-prose"), "happy", {
     replyText: "The subscription accounting review is complete.",
   });
@@ -247,6 +251,7 @@ beforeAll(async () => {
         // driver), which is what opens the doomed-dispatch breaker for real.
         deadCli: { driver: "grokAgent", displayName: "Fixture Dead CLI", config: { cli: join(home, "no-such-cli") } },
         quota: { driver: "claudeAgent", displayName: "Fixture Quota", enabled: false, config: { cli: fakeQuotaCli } },
+        rejector: { driver: "claudeAgent", displayName: "Fixture Rejector", enabled: false, config: { cli: fakeRejectCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
         secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
         pricedClaude: { driver: "claudeAgent", displayName: "Fixture Priced Claude", enabled: false, config: { cli: fakePricedClaudeCli } },
@@ -2356,6 +2361,111 @@ describe("harness HTTP API", () => {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
   });
+
+  it("a fallback the provider rejects does not end the walk, and is not offered again", async () => {
+    // The Claude CLI answers a retired model id with an assistant-shaped
+    // apology and a 404.  That used to count as real output and end the walk
+    // on the dead entry, with every later engine in the chain never reached.
+    // Now the apology is an error row, the walk moves on, and the rejected
+    // (bot, engine, model) is remembered so the next turn skips it.
+    expect((await api("PATCH", "/api/instances/rejector", { enabled: true })).status).toBe(200);
+    const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const transcript = async (): Promise<any[]> =>
+      (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.messages ?? [];
+    const chips = async (prefix: string): Promise<string[]> =>
+      (await transcript())
+        .flatMap((message) => (message?.tool?.name ? [String(message.tool.name)] : []))
+        .filter((name) => name.startsWith(prefix));
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "rejector", model: "claude-3-7-sonnet" },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail, get rejected, then hang" })).status).toBe(202);
+      // the walk reaches the healthy entry behind the rejected one
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 30_000 }).toBe("claude");
+
+      const rows = await transcript();
+      expect(await chips("Fell over to claude-3-7-sonnet")).toHaveLength(1);
+      expect(await chips(`Fell over to ${claude.models.default}`)).toHaveLength(1);
+      // the rejection is an error row the person can read, never bot text
+      expect(await chips("error: Claude can't use the model claude-3-7-sonnet")).toHaveLength(1);
+      expect(rows.some((message) => message.kind === "text" && /issue with the selected model/i.test(message.text ?? ""))).toBe(false);
+
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.busy;
+      }, { timeout: 20_000 }).toBe(false);
+
+      // A fresh turn starts at the primary again, fails the same way, and this
+      // time walks straight past the entry the provider already rejected.
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "again" })).status).toBe(202);
+      await expect.poll(async () => (await chips(`Fell over to ${claude.models.default}`)).length, { timeout: 30_000 }).toBe(2);
+      expect(await chips("Fell over to claude-3-7-sonnet")).toHaveLength(1);
+      expect(await chips("error: Claude can't use the model claude-3-7-sonnet")).toHaveLength(1);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 120_000);
+
+  it("a fail-over that cannot start says so and keeps walking the chain", async () => {
+    // The fallback's startTurn throws before dispatch when its instance is
+    // gone.  No turn.completed follows, so the walk used to stop in silence on
+    // a "Fell over to" notice with only a console.error behind it.
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    const names = async (): Promise<string[]> =>
+      ((await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.messages ?? [])
+        .flatMap((message: any) => (message?.tool?.name ? [String(message.tool.name)] : []));
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: claude.models.default,
+          fallbacks: [
+            { instanceId: "retired-engine", model: "retired-model" },
+            { instanceId: "claude", model: claude.models.default },
+          ],
+        },
+      })).status).toBe(200);
+
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "fail, skip the retired engine, then hang" })).status).toBe(202);
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots?messages=0")).body.bots.find(
+          (candidate: { id: string }) => candidate.id === bot.id,
+        );
+        return state?.activeModelSelection?.instanceId;
+      }, { timeout: 30_000 }).toBe("claude");
+
+      const all = await names();
+      expect(all.some((name) => /^Couldn't start retired-model .* "retired-engine" is unavailable/.test(name))).toBe(true);
+      expect(all.some((name) => name === "Fell over to retired-model")).toBe(true);
+      expect(all.some((name) => name === `Fell over to ${claude.models.default}`)).toBe(true);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`, {});
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  }, 120_000);
 
   it("delivers a room approval to the fallback instance that opened it", async () => {
     const instances = (await api("GET", "/api/instances")).body.instances;
