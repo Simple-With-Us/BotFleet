@@ -23,12 +23,12 @@ The runtime source of truth is `src/components/tv-face/manifest.ts`: `TVFACE_MAN
 
 Each of these requires `_enter.gif`, `_hold.gif`, and `_return.gif` plus a transparent still: **39 GIFs + 13 stills per skin**.
 
-### The 27 stills-driven expressions (still PNG only)
+### The 27 non-transition expressions (still required, hold optional)
 `resting`, `sleeping`, `waking`, `searching`, `working`, `happy`, `excited`, `celebrate`, `confused`, `curious`, `sad`, `alerting`, `angry`, `scared`, `surprised`, `suspicious`, `shy`, `bored`, `drowsy`, `proud`, `playful`, `laughing`, `loading`, `sending`, `receiving`, `notifying`, `powering_down`
 
-The player renders `[expression].png` directly for these - no `_enter`/`_hold`/`_return` GIFs exist, and shipping them changes nothing at runtime. Per skin: **27 stills**.
+A transparent `[expression].png` is **required** for each of these.  A `_hold.gif` is **optional, but the player uses it whenever it is present**: `planFrame()` returns a `hold` step for these expressions on the same-state, rest-to-active, and active-to-active paths, and `pathForStep()` then requests `[expression]_hold.gif`, falling back to the still only after that request fails.  So a missing hold is not a broken avatar — it is a static one — but shipping no holds for a pack the default one already covers means a guaranteed 404 on every request.  The default skin ships 12 non-transition holds: `alerting`, `angry`, `excited`, `happy`, `laughing`, `loading`, `notifying`, `resting`, `searching`, `sleeping`, `surprised`, `working`.  Enter and return are the parts that genuinely do not apply here: `TVFACE_HAS_ENTER_RETURN` covers only the 13 expressions in the previous section, and `planFrame()` never plans an enter or return outside that set.  Per skin: **27 stills**, plus any holds you choose to add.
 
-**Per-skin totals: 39 GIFs (13 expressions x enter/hold/return) + 40 stills (one per expression).**
+**Per-skin totals for the shipped `orange` (default) skin: 54 GIFs + 46 stills.**  The 54 GIFs are 39 transition GIFs (13 expressions x enter/hold/return), 12 non-transition hold GIFs, and 3 ambient loops (`anticipate.gif`, `blink.gif`, `idle_loop.gif`).  The 46 stills are one per each of the 40 manifest expressions, plus 6 that ship outside the manifest contract: `orbit`, `progress`, `radar`, `spawning`, `uploading`, and `speaking_hold_preview` — the last of which is an unreferenced build artifact rather than a runtime target.
 
 If a specific state's asset isn't provided, BotFleet gracefully falls back to the `resting` face.
 
@@ -52,7 +52,7 @@ AvatarName/
 ```
 
 ### The `manifest.json`
-Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders. Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) is currently **orange-only** — blue, green, purple, pink, red, and yellow are planned skins with no assets yet, and any color without shipped art renders the default skin rather than 404ing. `orange` IS the default skin (`public/tv-face/skins/default`).
+Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.  Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) is currently **orange-only** — blue, green, purple, pink, red, and yellow are planned skins with no assets yet, and any color without shipped art renders the default skin rather than 404ing.  `orange` IS the default skin (`public/tv-face/skins/default`).
 
 ```json
 {
