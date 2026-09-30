@@ -30,6 +30,10 @@ export interface MinimaxPriceTier {
 export type MinimaxPriceTable = Record<string, MinimaxPriceTier[] | null>;
 
 export const MINIMAX_PRICE_PER_MILLION = {
+  "MiniMax-M3.1-Flash-Preview": [
+    { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
+    { input: 0.6, output: 2.4, cachedInput: 0.12 },
+  ],
   "MiniMax-M3": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
@@ -65,7 +69,8 @@ type MinimaxDisplayLabel = { model: string; badge: string };
 // server/drivers/minimax.ts documents.
 // oxlint-disable-next-line anti-slop/no-known-value-widening
 const DISPLAY: Record<string, MinimaxDisplayLabel> = {
-  "MiniMax-M3": { model: "MiniMax M3", badge: "Default · ≤512K ctx" },
+  "MiniMax-M3.1-Flash-Preview": { model: "MiniMax M3.1 Flash Preview", badge: "Default · ≤512K ctx" },
+  "MiniMax-M3": { model: "MiniMax M3", badge: "Legacy" },
   "MiniMax-M2.7": { model: "MiniMax M2.7", badge: "API" },
   "MiniMax-M2.7-highspeed": { model: "MiniMax M2.7 Highspeed", badge: "API" },
 };
@@ -79,6 +84,7 @@ const DISPLAY: Record<string, MinimaxDisplayLabel> = {
 export function minimaxPriceRows(): MinimaxPriceRow[] {
   const rows: MinimaxPriceRow[] = [];
   for (const [id, tiers] of Object.entries(MINIMAX_PRICE_PER_MILLION)) {
+    if (id === "MiniMax-M3" || id === "MiniMax-M2.7") continue;
     if (!tiers || tiers.length === 0) continue;
     const base = tiers[0];
     const label = DISPLAY[id] ?? { model: id, badge: "API" };

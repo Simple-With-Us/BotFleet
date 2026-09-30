@@ -79,12 +79,6 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
     },
     {
-      id: "MiniMax-M3",
-      label: "MiniMax-M3",
-      images: true,
-      contextWindow: 1_000_000,
-    },
-    {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
       images: true,

@@ -36,13 +36,12 @@ describe("STATIC_MCODE_MODELS", () => {
     // model config option, folded through mcodePickerId.  A row the session
     // does not advertise fails the turn with an opaque "does not offer", so
     // the shipped list is the advertised set and not a hand-written guess.
-    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3");
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview");
     expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
-      "MiniMax-M3",
-      "MiniMax-M3-thinking",
+      "MiniMax-M3.1-Flash-Preview",
       "MiniMax-M3.1-Flash-Preview-thinking",
+      "MiniMax-M2.7-highspeed",
       "MiniMax-M2.7-highspeed-thinking",
-      "MiniMax-M2.7-thinking",
     ]);
   });
 
@@ -58,7 +57,8 @@ describe("STATIC_MCODE_MODELS", () => {
           { value: "m:minimax:MiniMax-M3:v:thinking", name: "M3 · thinking" },
           { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:", name: "M3.1-Flash-Preview" },
           { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking", name: "flash · thinking" },
-          { value: "m:minimax:MiniMax-M2.7-highspeed:v:thinking", name: "M2.7 highspeed" },
+          { value: "m:minimax:MiniMax-M2.7-highspeed:v:", name: "M2.7 highspeed" },
+          { value: "m:minimax:MiniMax-M2.7-highspeed:v:thinking", name: "M2.7 highspeed · thinking" },
           { value: "m:minimax:MiniMax-M2.7:v:thinking", name: "M2.7" },
         ],
       },
@@ -100,7 +100,7 @@ describe("readMcodeModelCatalog", () => {
   it("never adopts a default that is not on offer", () => {
     // Adopting it would send every turn to a row the picker never showed.
     writeConfig(dataDir, ["defaultModel: minimax/MiniMax-M9-Imaginary", "defaultModelVariant: thinking"].join("\n"));
-    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3");
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-Preview");
   });
 
   it("keeps the shipped rows rather than appending unverified ids", () => {
@@ -116,7 +116,7 @@ describe("readMcodeModelCatalog", () => {
 
   it("keeps the shipped catalog when there is no config at all", () => {
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dataDir, "missing") });
-    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview");
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
   });
 
@@ -124,7 +124,7 @@ describe("readMcodeModelCatalog", () => {
     writeConfig(dataDir, "defaultModel: [not, a, string]\n\tdefaultModelVariant: : :\n");
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
-    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview");
   });
 });
 
@@ -229,14 +229,14 @@ describe("mcodeModelOptionValue", () => {
     {
       id: "model",
       options: [
-        { value: "m:minimax:MiniMax-M3:u", name: "MiniMax-M3" },
+        { value: "m:minimax:MiniMax-M3.1-Flash-Preview:u", name: "MiniMax-M3.1-Flash-Preview" },
         { value: "m:minimax:MiniMax-M2.7:v:highspeed", name: "MiniMax-M2.7 (highspeed)" },
       ],
     },
   ];
 
   it("matches a plain model id and returns the advertised value verbatim", () => {
-    expect(mcodeModelOptionValue("MiniMax-M3", advertised)).toBe("m:minimax:MiniMax-M3:u");
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", advertised)).toBe("m:minimax:MiniMax-M3.1-Flash-Preview:u");
   });
 
   it("matches the variant folded into the picker id", () => {
@@ -250,8 +250,8 @@ describe("mcodeModelOptionValue", () => {
 
   it("skips the switch when the session advertises no model option (older mcode)", () => {
     expect(mcodeModelOptionValue("MiniMax-M3", [])).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3", undefined)).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3", [{ id: "mode", options: [] }])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", undefined)).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", [{ id: "mode", options: [] }])).toBeNull();
   });
 
   it("fails clearly when the model is not in the advertised options", () => {
@@ -265,7 +265,7 @@ describe("parseMcodeModelValue / mcodePickerId", () => {
     const parsed = parseMcodeModelValue("m:minimax:MiniMax-M2.7:v:highspeed");
     expect(parsed).toEqual({ providerId: "minimax", modelId: "MiniMax-M2.7", variant: "highspeed" });
     expect(mcodePickerId(parsed!)).toBe("MiniMax-M2.7-highspeed");
-    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3:u")!)).toBe("MiniMax-M3");
+    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:u")!)).toBe("MiniMax-M3.1-Flash-Preview");
     expect(parseMcodeModelValue("m:p:Some%20Model:u")).toEqual({ providerId: "p", modelId: "Some Model" });
   });
 
