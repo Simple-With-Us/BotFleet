@@ -23,6 +23,13 @@ import { ReplayBuffer, SLOW_CLIENT_BYTE_LIMIT, wants, writeToClient, type SseCli
 import { BOT_AVATAR_CROPS, botAvatarUrlFromStoredPath, botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { DEFAULT_ROOM_TERMINOLOGY, resolveRoomLabels } from "../shared/terminology.ts";
 import { isThreadSnoozed, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
+import {
+  applyFallbackSlots,
+  KEEP_FALLBACK_SLOT,
+  touchesFallbacks,
+  type FallbackSlot,
+} from "./model-default-slots.ts";
 import { firstTurnTitleText } from "./task-title.ts";
 import {
   allowsMultipleBotThreads,
@@ -101,11 +108,14 @@ import {
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
   sliceIsShortProviderError,
+  turnModelRejectionEvidence,
   turnQuotaOrCapEvidence,
   BOOT_RECOVERY_NOTICE,
   turnProducedAssistantOutput,
   unattendedModelDowngrade,
+  type TurnFallbackPick,
 } from "./model-fallback.ts";
+import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -236,6 +246,7 @@ import {
   type StalledReleaseDecision,
   type TurnComputerInputs,
 } from "./turn-safety.ts";
+import { TurnStatsTracker } from "./turn-stats.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
@@ -1087,6 +1098,16 @@ function checkedModelSelection(
   }
   
   if ("fallbacks" in value && Array.isArray(value.fallbacks)) {
+    // Refuse a chain that GROWS past the cap, never one that merely keeps the
+    // length it already has: a bot written before the cap existed re-sends its
+    // whole chain whenever only its primary changes, and that must still save.
+    if (!fallbackCountAllowed(value.fallbacks.length, current?.selection.fallbacks?.length ?? 0)) {
+      return {
+        ok: false,
+        status: 400,
+        error: `a bot can have at most ${MAX_MODEL_FALLBACKS} fallback models`,
+      };
+    }
     const parsedFallbacks: ModelSelection[] = [];
     for (const f of value.fallbacks) {
        const res = checkedModelSelection(f, undefined, requireAvailableModel);
@@ -2077,6 +2098,11 @@ configureTurnIdentity((threadId) => {
 // into the task's tally when the turn settles.
 const turnUsage = new Map<string, { input: number; output?: number; cachedInput?: number }>();
 
+// Where each 1:1 turn in flight is spending its wall time (model, tools, or
+// waiting on a person).  Folded into the task's `stats` aggregate at
+// turn.completed; dropped on every path that ends a turn without one.
+const turnStats = new TurnStatsTracker();
+
 // UTF-8 bytes of the system prompt each in-flight turn was handed, split at
 // the volatile boundary (server/system-prompt.ts).  Booked at dispatch and
 // forwarded to Usage Monitor beside the turn's token figures at
@@ -2139,6 +2165,7 @@ function releaseStalledTurnIfUnowned(
   stoppedTurns.delete(`${turn.botId}:${turn.threadId}`);
   activeTurnOwners.clearThread(turn.threadId);
   turnUsage.delete(turn.threadId);
+  turnStats.discard(turn.threadId);
   turnPromptBytes.delete(turn.threadId);
   // The watchdog knows exactly whose turn stalled, so both releases can name
   // the bot — the room lease included, since a stalled room dispatch returns
@@ -2564,6 +2591,134 @@ const localVmStartupProbe = (async () => {
   }
 })();
 
+/** Start the fail-over turn the completion fold picked, and keep walking the
+ *  saved chain when that turn cannot even start.
+ *
+ *  A turn that starts and then fails settles through `turn.completed`, which
+ *  the fold reads to pick the next entry.  A turn that never starts does not:
+ *  `startTurn` throws before dispatch (the instance is gone, the effort is not
+ *  offered) or reports a dispatch failure through `onDispatchError`, and in
+ *  both cases no `turn.completed` follows.  That used to end the walk in
+ *  silence, on a "Fell over to X" notice and an idle bot, with only a
+ *  `console.error` to say why.  Here each such failure is shown in the
+ *  transcript and the walk moves to the next usable entry; a chain with
+ *  nothing left says so and fails the routine run that was waiting on it.
+ *
+ *  The retried turn is a continuation of whatever dispatched the one that just
+ *  fell over: a webhook or resource turn stays unattended, and its
+ *  automationSource travels with it, so a retry never re-titles the task and
+ *  never lets startTurn's default branch call clearUnattended and open the door
+ *  for an autoApprove or always-allow grant mid-fallback. */
+async function launchFallbackTurn(input: {
+  botId: string;
+  threadId: string;
+  userMessage: Message;
+  pick: TurnFallbackPick;
+  chain: ModelSelection[] | undefined;
+  runOn: RoutineRunOn | undefined;
+}): Promise<void> {
+  const { botId, threadId, userMessage, chain, runOn } = input;
+  const key = `${botId}:${threadId}`;
+  const text = userMessage.text || "";
+  const note = (name: string) =>
+    store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name, ok: true, kind: "notice" } });
+
+  const launch = async (pick: TurnFallbackPick): Promise<void> => {
+    const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.model, effort: pick.effort };
+    // Both failure shapes arrive here once.  Whichever reports first wins, so a
+    // dispatch error that also throws cannot advance the walk twice.
+    let advanced = false;
+    const advance = (reason: string, shownAlready = false): void => {
+      if (advanced) return;
+      advanced = true;
+      const why = redactSecretsInText(reason).slice(0, 300);
+      console.error(`fallback startTurn failed for ${botId} on ${pick.instanceId}/${pick.model}: ${why}`);
+      // A dispatch failure already put its own error row in the transcript;
+      // a throw before dispatch did not, so it is told here.
+      if (!shownAlready) note(`Couldn't start ${pick.model} \u2014 ${why}`);
+      const stopped = stoppedTurns.delete(key);
+      const following = stopped
+        ? undefined
+        : selectTurnFallback({
+            ok: false,
+            stopReason: null,
+            produced: false,
+            quotaOrCap: false,
+            fallbacks: chain,
+            used: pick.nextUsed,
+            current: selection,
+            botId,
+          });
+      if (!following) {
+        fallbackAttemptByTurn.delete(key);
+        // A Stop ends the walk on purpose; only a chain that ran out is news,
+        // and only that is a failed run.  Every source of the latch settles
+        // the routine run itself (a user Stop and a forced update cancel it, a
+        // stall and a provider reload fail it with their own code), so a
+        // failure filed here would only re-label a run the owner cancelled.
+        if (!stopped) {
+          note(`No other engine in the fallback chain could start this turn.\u00A0 Pick another model in Settings.`);
+          routines?.failThread(threadId, `Could not start ${pick.model}: ${why}`, "dispatch_failed");
+        }
+        return;
+      }
+      const nextSelection: ModelSelection = {
+        instanceId: following.instanceId,
+        model: following.model,
+        effort: following.effort,
+      };
+      fallbackAttemptByTurn.set(key, following.nextUsed);
+      store.patchBot(botId, { activeModelSelection: nextSelection });
+      store.patchTask(botId, threadId, { activeModelSelection: nextSelection });
+      const fresh = store.bot(botId);
+      if (fresh) broadcast({ kind: "bot", bot: wireBot(fresh) });
+      note(`Fell over to ${following.model}`);
+      void launch(following);
+    };
+    try {
+      await startTurn(botId, text, {
+        userMessage,
+        threadId,
+        modelSelection: selection,
+        automationSource: userMessage.automationSource,
+        unattended: isUnattended(botId),
+        runOn,
+        onDispatchError: (message) => advance(message, true),
+      });
+    } catch (error) {
+      if (isExternalCredentialPendingError(error)) {
+        pendingCredentialFallback.set(key, { botId, threadId, text, userMessage, selection });
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      // A newer turn (a queued send that drained first) owns the bot now, so
+      // replaying the failed one on another engine would talk over it.
+      if (store.bot(botId)?.busy) {
+        console.error(`fallback skipped for ${botId}: a newer turn owns the bot \u2014 ${message}`);
+        return;
+      }
+      if (error instanceof Error && "pickUnusable" in error && error.pickUnusable === true) {
+        advance(message);
+        return;
+      }
+      // Not about this engine (an update is quiescing, providers are
+      // reloading): every other entry would be refused the same way, so show
+      // why the turn ended instead of walking the whole chain into it.
+      const why = redactSecretsInText(message).slice(0, 300);
+      console.error(`fallback startTurn failed for ${botId}: ${why}`);
+      fallbackAttemptByTurn.delete(key);
+      // These refusals are exactly what a provider reload or a forced update
+      // raises, and both latch the turn as stopped and settle it themselves;
+      // the notice and the failed run are for a turn nobody stopped.
+      if (!stoppedTurns.delete(key)) {
+        note(`Couldn't retry this turn on ${pick.model} \u2014 ${why}`);
+        routines?.failThread(threadId, `Could not retry on ${pick.model}: ${why}`, "dispatch_failed");
+      }
+    }
+  };
+  await launch(input.pick);
+}
+
 bus.subscribe((event: RuntimeEvent) => {
   const localVmTarget = localVmThreadTargets.anyOnThread(event.threadId);
   if (localVmTarget) {
@@ -2599,6 +2754,15 @@ bus.subscribe((event: RuntimeEvent) => {
     const message = store.appendMessage(event.threadId, group && m.role === "bot" ? { ...m, from: speaker } : m);
     return message;
   };
+
+  // Timing for 1:1 turns only — a room's shared thread has no task to bank
+  // it on.  Each hook is a no-op unless a turn was dispatched on this thread.
+  if (bot) {
+    if (event.type === "turn.started") turnStats.started(event.threadId);
+    else if (event.type === "content.delta") turnStats.firstToken(event.threadId);
+    else if (event.type === "request.opened") turnStats.requestOpened(event.threadId);
+    else if (event.type === "request.resolved") turnStats.requestResolved(event.threadId);
+  }
 
   switch (event.type) {
     case "session.started":
@@ -2659,6 +2823,10 @@ bus.subscribe((event: RuntimeEvent) => {
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
         }
+        // Outside the message check: a tool with no transcript row (ask_bot,
+        // whose own chip is appended by the internal endpoint) still held the
+        // turn for as long as it ran, and must stop the tool clock when it ends.
+        if (bot && event.itemId) turnStats.toolEnded(event.threadId, event.itemId);
         // the bot just acted ON ITS SCREEN — refresh the preview now. Only
         // computer tools can change the screen, and each capture competes
         // with the agent for the box's command endpoint, so a bot grinding
@@ -2670,6 +2838,10 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     case "item.started":
       if (event.itemType === "tool") {
+        // Timed before the ask_bot early exit below: that call blocks until
+        // the other bot replies (minutes, or a person's approval), and left
+        // unclocked it would all be billed to the model.
+        if (bot && event.itemId) turnStats.toolStarted(event.threadId, event.itemId);
         // ask_bot's raw tool chip is redundant — the internal endpoint
         // appends a richer "Messaged @X" chip linking to the channel
         if (event.title?.endsWith("__ask_bot")) break;
@@ -3004,6 +3176,8 @@ bus.subscribe((event: RuntimeEvent) => {
       // than inside the 1:1 branch because a room turn burns the same tokens
       // and reports them the same way.
       const tokens = event.usage ?? lastReported;
+      // Closes the turn's clock now, before any await below stretches it.
+      const turnTiming = bot ? turnStats.settle(event.threadId, tokens?.output) : undefined;
       // The turn that ended owns its failover: resolve the member from the
       // settled owner (this thread, this provider instance) before the
       // thread's speaker entry, which a crossed room can leave naming the
@@ -3055,6 +3229,8 @@ bus.subscribe((event: RuntimeEvent) => {
       }
       let fallbackUserMessage: Message | undefined;
       let fallbackSelection: ModelSelection | undefined;
+      let fallbackPick: TurnFallbackPick | undefined;
+      let fallbackChain: ModelSelection[] | undefined;
       let deferredAutoFallback = false;
       let waitedForProviderReload = false;
       const fallbackHealthReloadGeneration = providerReloadGeneration;
@@ -3079,12 +3255,23 @@ bus.subscribe((event: RuntimeEvent) => {
         const quotaText = (quotaEvidence?.text ?? reply) || lastMsgText;
         const quotaInfo = parseQuotaResetTime(quotaText, Date.now(), quotaOrCap);
         const textIsCandidateForQuota = !event.ok || Boolean(quotaEvidence);
-        const isTextError = structuredQuotaOrCap === true || Boolean(quotaEvidence) || sliceIsShortProviderError(afterUser);
+        // A provider that rejected the model id answered with nothing the
+        // person asked for: it is a failure to walk past, never a reply that
+        // ends the walk on the dead entry.  The driver reports it structurally
+        // (`unknown_model`); the anchored text check is the backstop.  Only a
+        // turn that already failed is ever read this way.
+        const modelRejection = turnModelRejectionEvidence(afterUser, Boolean(event.ok), event.stopReason);
+        const isTextError =
+          structuredQuotaOrCap === true ||
+          Boolean(quotaEvidence) ||
+          sliceIsShortProviderError(afterUser) ||
+          Boolean(modelRejection);
         const isOk = Boolean(event.ok) && !isTextError;
         if (isOk) {
           fallbackAttemptByTurn.delete(fallbackKey);
           pendingMemberFallback.delete(event.threadId);
           quotaCooldowns.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
+          modelRejections.clear(fallbackBot.id, actualSelection.instanceId, actualSelection.model);
         } else if (
           actualSelection.instanceId &&
           // A hard-ceiling timeout and an idle stall are both a forcibly
@@ -3104,6 +3291,17 @@ bus.subscribe((event: RuntimeEvent) => {
             error: quotaText || "quota exceeded",
             recordedAt: Date.now(),
             source: quotaEvidence?.source ?? (structuredQuotaOrCap === true ? "provider-error-code" : undefined),
+          });
+        }
+        // Remember the rejection so the next turn, and the next fail-over,
+        // skip this entry instead of spending a spawn to hear it again.  Not
+        // a quota cooldown: that would show as a quota hit in Usage settings.
+        if (modelRejection && actualSelection.instanceId && actualSelection.model) {
+          modelRejections.record({
+            botId: fallbackBot.id,
+            instanceId: actualSelection.instanceId,
+            model: actualSelection.model,
+            reason: redactSecretsInText(modelRejection.text),
           });
         }
         const used = fallbackAttemptByTurn.get(fallbackKey) ?? 0;
@@ -3145,6 +3343,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // next engine.  Consume the latch BEFORE selectTurnFallback, because
         // the driver reports this settle as `exit_before_result` and that
         // gate would otherwise wave the failover straight through.
+        fallbackChain = chain;
         const userStopped = stoppedTurns.delete(fallbackKey);
         const next = userStopped ? undefined : selectTurnFallback({
           ok: isOk,
@@ -3170,6 +3369,7 @@ bus.subscribe((event: RuntimeEvent) => {
         }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
           const { nextUsed, instanceId, model, effort } = next;
+          fallbackPick = next;
           fallbackAttemptByTurn.set(fallbackKey, nextUsed);
           fallbackSelection = { instanceId, model, effort };
           store.patchBot(fallbackBot.id, { activeModelSelection: fallbackSelection });
@@ -3225,6 +3425,9 @@ bus.subscribe((event: RuntimeEvent) => {
           cachedInput: tokens?.cachedInput,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
+          // No live entry (a repeated completion, a turn from before a
+          // restart) banks no timing rather than a fake zero-length turn.
+          stats: turnTiming,
           // actualSelection, not the configured selection: a turn that
           // fell over to another engine is that engine's spend.
         }, actualSelection.instanceId, actualUsageMeta);
@@ -3266,37 +3469,14 @@ bus.subscribe((event: RuntimeEvent) => {
         // settled → idle; a setup failure already marked it dead, keep that
         if (store.bot(bot.id)?.activity !== "dead") store.setActivity(bot.id, "idle");
         store.patchBot(bot.id, { unread: true, inflightThreadId: undefined });
-        if (!group && fallbackSelection && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
-          const userMsg = fallbackUserMessage;
-          const fallbackBotId = bot.id;
-          // The retried turn is a continuation of whatever dispatched the
-          // one that just fell over — a webhook/resource turn stays
-          // unattended, and its automationSource travels with it so a
-          // retry never re-titles the task or, more importantly, never
-          // lets startTurn's default branch call clearUnattended and open
-          // the door for an autoApprove/always-allow grant mid-fallback.
-          void startTurn(fallbackBotId, userMsg.text || "", {
-            userMessage: userMsg,
+        if (!group && fallbackPick && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
+          void launchFallbackTurn({
+            botId: bot.id,
             threadId: event.threadId,
-            modelSelection: fallbackSelection,
-            automationSource: userMsg.automationSource,
-            unattended: isUnattended(fallbackBotId),
-            // the destination travels with the turn: a cloud routine or
-            // webhook falls over to another engine in the same cloud, never
-            // silently back to the local bot (E5)
+            userMessage: fallbackUserMessage,
+            pick: fallbackPick,
+            chain: fallbackChain,
             runOn: settledOwner?.computerInputs?.runOn,
-          }).catch((error) => {
-            if (isExternalCredentialPendingError(error)) {
-              pendingCredentialFallback.set(`${fallbackBotId}:${event.threadId}`, {
-                botId: fallbackBotId,
-                threadId: event.threadId,
-                text: userMsg.text || "",
-                userMessage: userMsg,
-                selection: fallbackSelection!,
-              });
-              return;
-            }
-            console.error(`fallback startTurn failed for ${fallbackBotId}:`, error);
           });
         } else if (routineRun?.status !== "failed") {
           // the frame carries the bot's avatar so every desktop client can
@@ -3451,7 +3631,8 @@ async function autoFallbackChain(
       // codex and ahead of openaiCompat, per the PR 10 owner decision.
       priority: AUTO_FALLBACK_PRIORITY,
       isCooling: (candidateBotId, instanceId, model) =>
-        Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)),
+        Boolean(quotaCooldowns.get(candidateBotId, instanceId, model)) ||
+        modelRejections.isRejected(candidateBotId, instanceId, model),
     });
   } catch (error) {
     console.error("automatic fallback health probe failed:", error);
@@ -3821,7 +4002,9 @@ async function startTurn(
           ? "the Cloud VM runner is unavailable — configure Box in App Settings"
           : `provider instance "${selection.instanceId}" is unavailable — pick another model in settings`,
       ),
-      { status: 409 },
+      // `pickUnusable`: this engine cannot take the turn, but another may.
+      // The fail-over walk reads it to move on rather than give up.
+      { status: 409, pickUnusable: true },
     );
   }
   const instanceId = instance.instanceId;
@@ -3871,7 +4054,7 @@ async function startTurn(
     } else {
       throw Object.assign(
         new Error(`effort "${effort}" is not offered by model "${model}" — choose another level in settings`),
-        { status: 409 },
+        { status: 409, pickUnusable: true },
       );
     }
   }
@@ -4001,6 +4184,7 @@ async function startTurn(
     computerInputs: turnComputerInputs(bot, opts?.runOn),
   });
   turnUsage.delete(threadId);
+  turnStats.begin(threadId);
   turnPromptBytes.delete(threadId);
 
   void (async () => {
@@ -4526,6 +4710,7 @@ async function startTurn(
       if (vpsLease) activeVpsThreads.release(vpsLease);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
+      turnStats.discard(threadId);
       turnPromptBytes.delete(threadId);
       const message = e instanceof Error ? e.message : String(e);
       store.appendMessage(threadId, {
@@ -7487,6 +7672,9 @@ async function runProviderReload() {
   // next comparison is against what was built rather than against whatever
   // `cfg` happened to hold when the comparison ran.
   loadedCredentialFingerprint = credentialFingerprint(cfg);
+  // New credentials, a new CLI or an edited catalog may have made a rejected
+  // model available again; a mark from before the rebuild proves nothing.
+  modelRejections.clearWhere(() => true);
   bus.attach(registry.instances());
   for (const turn of killedTurns) routines?.failThread(turn.threadId, RELOAD_REASON, "runtime_reconfigured");
   // A killed turn's terminal events can die with the old fleet (dispose is
@@ -7520,6 +7708,7 @@ async function runInstanceProviderReload(
   settleInterruptedBots(affectedTurns);
   bus.detach(instanceId);
   const newLive = targetEntry ? await registry.reloadInstance(instanceId, targetEntry) : null;
+  modelRejections.clearInstance(instanceId);
   if (newLive) bus.attach([newLive]);
 }
 
@@ -11701,7 +11890,16 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: "limit must be a positive whole number" });
       }
       const limit = parsedLimit;
-      return json(res, 200, readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit }));
+      // `view=trajectory` is the Trajectory tab's read: runtime log only, no
+      // streamed deltas, long fields clipped (see readThreadEvents).  Any
+      // other value is a mistake rather than a fallback.
+      const view = url.searchParams.get("view");
+      if (view !== null && view !== "trajectory") return json(res, 400, { error: "view must be trajectory" });
+      return json(
+        res,
+        200,
+        readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit, runtimeOnly: view === "trajectory" }),
+      );
     }
 
     // ── the fleet-wide authorization decision log ──
@@ -12188,6 +12386,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // outlive the engine it was recorded against and immediately cap a
         // same-named replacement.
         quotaCooldowns.clearWhere((cooldown) => cooldown.instanceId === instanceId);
+        modelRejections.clearInstance(instanceId);
         resetPathCache();
         return json(res, 200, {
           ok: true,
@@ -12507,11 +12706,28 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body || typeof body !== "object" || Array.isArray(body)) {
         return json(res, 400, { error: "body must be a JSON object" });
       }
-      // The four slots may each be present OR absent.  An absent slot is
-      // "do not touch bots that already have a value here" — exactly the
-      // behavior the UI promises when an empty picker means "leave alone".
+      // Primary and each fallback place may be present OR absent.  An absent
+      // (or null) place is "do not touch what bots already have here" — exactly
+      // the behavior the UI promises when an empty picker means "leave alone".
+      //
+      // Fallbacks travel by FIXED position: `fallbacks[0]` is every bot's
+      // Fallback 1, `fallbacks[1]` its Fallback 2, and so on up to the cap.  A
+      // place is a selection (write it), null or absent (leave it), or
+      // `{ clear: true }` (remove that entry from every bot).  A selection
+      // always lands at its own place: a bot whose chain has an empty place
+      // before it is skipped and named in `skipped`, never given the entry at
+      // a neighbouring place.  The older
+      // `secondary` / `fallback1` / `fallback2` names are still read, as
+      // aliases for places 0, 1 and 2 — by position, not compacted — so a
+      // client that has not been updated yet cannot land in the wrong place.
       const slots = body.slots as
-        | { primary?: unknown; secondary?: unknown; fallback1?: unknown; fallback2?: unknown }
+        | {
+            primary?: unknown;
+            fallbacks?: unknown;
+            secondary?: unknown;
+            fallback1?: unknown;
+            fallback2?: unknown;
+          }
         | undefined;
       if (!slots || typeof slots !== "object") {
         return json(res, 400, { error: "slots must be a JSON object" });
@@ -12528,22 +12744,61 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         return { instanceId: candidate.instanceId, model: candidate.model };
       };
+      const readFallbackSlot = (value: unknown): FallbackSlot => {
+        if (
+          value &&
+          typeof value === "object" &&
+          !Array.isArray(value) &&
+          (value as Record<string, unknown>).clear === true
+        ) {
+          return { kind: "clear" };
+        }
+        const selection = readSlot(value);
+        return selection ? { kind: "set", selection } : KEEP_FALLBACK_SLOT;
+      };
       let primary: ModelSelection | null;
-      let secondary: ModelSelection | null;
-      let fallback1: ModelSelection | null;
-      let fallback2: ModelSelection | null;
+      const fallbackSlots: FallbackSlot[] = [];
       try {
         primary = readSlot(slots.primary);
-        secondary = readSlot(slots.secondary);
-        fallback1 = readSlot(slots.fallback1);
-        fallback2 = readSlot(slots.fallback2);
+        const legacyPlaces = [slots.secondary, slots.fallback1, slots.fallback2];
+        if (slots.fallbacks !== undefined) {
+          if (!Array.isArray(slots.fallbacks)) {
+            throw Object.assign(new Error("slots.fallbacks must be an array"), { status: 400 });
+          }
+          if (slots.fallbacks.length > MAX_MODEL_FALLBACKS) {
+            throw Object.assign(
+              new Error(`slots.fallbacks can address at most ${MAX_MODEL_FALLBACKS} places`),
+              { status: 400 },
+            );
+          }
+          if (legacyPlaces.some((value) => value !== undefined)) {
+            throw Object.assign(
+              new Error("send slots.fallbacks or the older secondary, fallback1 and fallback2 slots, not both"),
+              { status: 400 },
+            );
+          }
+          for (const value of slots.fallbacks) fallbackSlots.push(readFallbackSlot(value));
+        } else {
+          for (const value of legacyPlaces) fallbackSlots.push(readFallbackSlot(value));
+        }
       } catch (error) {
         const status = (error as { status?: number }).status ?? 400;
         return json(res, status, { error: (error as Error).message });
       }
+      // Clearing a place removes an entry from every bot at once, and nothing
+      // can bring it back.  Naming the intent twice keeps a stray `{ clear }`
+      // in a hand-built request from wiping a fleet's fallbacks.
+      if (fallbackSlots.some((slot) => slot.kind === "clear") && body.confirmClear !== true) {
+        return json(res, 400, {
+          error: "clearing a fallback place removes it from every bot — send confirmClear: true to do that",
+        });
+      }
       // Shape and engine validation, once, with no bot in hand: these are
       // request-level errors and the whole apply should fail on them.
-      for (const selection of [primary, secondary, fallback1, fallback2]) {
+      for (const selection of [
+        primary,
+        ...fallbackSlots.map((slot) => (slot.kind === "set" ? slot.selection : null)),
+      ]) {
         if (selection === null) continue;
         const checked = checkedModelSelection(selection, undefined, false);
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
@@ -12565,26 +12820,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const next: ModelSelection = { ...bot.modelSelection };
         const existingFallbacks = next.fallbacks ?? [];
         if (primary) next.instanceId = primary.instanceId, next.model = primary.model;
-        // Secondary and the two fallbacks all map onto the same fallbacks
-        // list: secondary is the first entry, the fallbacks are the rest.
-        const nextFallbacks: ModelSelection[] = [];
-        if (secondary) nextFallbacks.push(secondary);
-        if (fallback1) nextFallbacks.push(fallback1);
-        if (fallback2) nextFallbacks.push(fallback2);
-        if (nextFallbacks.length > 0) {
-          // Only OVERWRITE positions that the defaults actually supplied.
-          // An empty picker at the UI level MUST leave the bot's value at
-          // that slot alone — that is the contract "Set all bots to
-          // default" promises when a default is empty.
-          const merged: ModelSelection[] = [...existingFallbacks];
-          while (merged.length < nextFallbacks.length) merged.push(nextFallbacks[merged.length]!);
-          for (let i = 0; i < nextFallbacks.length; i++) merged[i] = nextFallbacks[i]!;
-          // Trim trailing empties: the user can carry fewer fallbacks than
-          // the default offers, and we should not pad their bot to match.
-          next.fallbacks = merged.filter(
-            (entry, i) => i < nextFallbacks.length || entry.instanceId !== "" || entry.model !== "",
-          );
-          if (next.fallbacks.length === 0) delete next.fallbacks;
+        if (touchesFallbacks(fallbackSlots)) {
+          // Only the places the request named are written, each at its own
+          // position, so an empty picker leaves that place exactly as it was.
+          // A place that would leave an empty one before it (a lone
+          // "Fallback 3" on a bot with one fallback) cannot be honoured
+          // without landing on the wrong place, and a chain cannot hold a
+          // hole, so that bot keeps everything it had — primary included —
+          // and is named with the empty place in the response.
+          const applied = applyFallbackSlots(existingFallbacks, fallbackSlots);
+          if (!applied.ok) {
+            skipped.push({ id: bot.id, name: bot.name, reason: applied.reason });
+            continue;
+          }
+          if (applied.fallbacks.length > 0) next.fallbacks = applied.fallbacks;
+          else delete next.fallbacks;
         }
         if (bot.modelSelection.instanceId === next.instanceId &&
             bot.modelSelection.model === next.model &&
@@ -13573,6 +13823,7 @@ routines?.start();
 resourceTriggers.start();
 if (!process.env.OMB_DISABLE_ANTIGRAVITY_QUOTA) {
   enableQuotaCooldownPersist(join(DATA_DIR, "quota-cooldowns.json"));
+  enableModelRejectionPersist(join(DATA_DIR, "model-rejections.json"));
   enableDoomedDispatchPersist(join(DATA_DIR, "doomed-dispatches.json"));
   // OP3 / HS13: only spawn the CLI while at least one Antigravity instance
   // is actually in the fleet.  `instanceConfigs(cfg)` reads the SAME live,

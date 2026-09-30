@@ -166,6 +166,40 @@ describe("Store", () => {
     });
   });
 
+  it("addTaskUsage banks per-turn timing as aggregates only, and it survives a restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.taskByThread(bot.id, bot.threadId)?.stats).toBeUndefined();
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 40,
+      costUsd: null,
+      stats: { steps: 3, modelMs: 4000, toolMs: 1500, ttftMs: 600, outputTokens: 40 },
+    });
+    // a turn with no timing (no live clock entry) leaves the aggregate alone
+    store.addTaskUsage(bot.id, bot.threadId, { input: 10, output: 1, costUsd: null });
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 60,
+      costUsd: null,
+      stats: { steps: 0, modelMs: 2000, toolMs: 0, outputTokens: 60 },
+    });
+    store.flushBotsNow();
+    const stats = new Store(selection).taskByThread(bot.id, bot.threadId)?.stats;
+    expect(stats).toEqual({
+      turns: 2,
+      steps: 3,
+      modelMs: 6000,
+      toolMs: 1500,
+      ttftMsSum: 600,
+      ttftSamples: 1,
+      tpsTokens: 100,
+      tpsMs: 6000,
+    });
+    // aggregates only: a fixed handful of numbers, never a per-turn array
+    expect(Object.values(stats ?? {}).every((v) => typeof v === "number")).toBe(true);
+  });
+
   it("persists the per-bot composio gate", () => {
     const store = new Store(selection);
     const bot = store.createBot();

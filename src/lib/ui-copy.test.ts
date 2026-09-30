@@ -80,11 +80,11 @@ describe("Title Case for controls and headings", () => {
     ["components/RoutinesPage.tsx", "Tasks &amp; routines", "Tasks &amp; Routines"],
     ["components/Sidebar.tsx", ">Archived bots<", ">Archived Bots<"],
     ["components/SettingsModal.tsx", 'title="Usage analytics"', 'title="Usage Analytics"'],
-    ["components/SettingsModal.tsx", 'label: "Remote access"', 'label: "Remote Access"'],
+    ["components/SettingsNav.tsx", 'label: "Remote access"', 'label: "Remote"'],
     ["components/UsageSection.tsx", "Test connection", "Test Connection"],
     ["components/FleetModelsSection.tsx", "Set default", "Set Default"],
     ["components/FleetModelsSection.tsx", "Add fallback", "Add Fallback"],
-    ["components/FleetModelsSection.tsx", "Workspace default", "Workspace Default"],
+    ["components/FleetModelsSection.tsx", "Apply to all bots", "Apply to All Bots"],
   ];
 
   for (const [file, wrong, right] of LABELS) {
