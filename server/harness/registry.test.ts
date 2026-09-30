@@ -1017,7 +1017,7 @@ describe("ProviderRegistry", () => {
       const cachePath = join(tmpDir, "engine-cache.json");
       mkdirSync(tmpDir, { recursive: true });
       const fakeBin = join(tmpDir, "fake-cli");
-      writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(fakeBin, "#!/usr/bin/env node\nprocess.exit(0)\n", { mode: 0o755 });
       writeFileSync(cachePath, JSON.stringify({
         at: Date.now() - 1000,
         instances: [{
@@ -1220,7 +1220,7 @@ describe("ProviderRegistry describe: single flight and last-known-good", () => {
     const tmpDir = join(tmpdir(), `bf-definitive-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(tmpDir, { recursive: true });
     const fakeBin = join(tmpDir, "fake-cli");
-    writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(fakeBin, "#!/usr/bin/env node\nprocess.exit(0)\n", { mode: 0o755 });
     try {
       const fake = makeFakeDriver({
         defaultConfig: { cli: fakeBin },
@@ -1405,7 +1405,7 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     const cachePath = join(tmpDir, "engine-cache.json");
     mkdirSync(tmpDir, { recursive: true });
     const fakeBin = join(tmpDir, "fake-cli");
-    writeFileSync(fakeBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(fakeBin, "#!/usr/bin/env node\nprocess.exit(0)\n", { mode: 0o755 });
     writeFileSync(cachePath, JSON.stringify({
       // Two hours old: past the 30 minute limit on a last-known-good answer.
       at: Date.now() - 2 * 60 * 60_000,

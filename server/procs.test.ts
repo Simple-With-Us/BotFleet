@@ -40,7 +40,7 @@ describe("execCli deadlines", () => {
     // finished child's output, destroyed the unread stdout, and reported
     // (null, "") — a working CLI read as "not found".
     const marker = join(scratch, "done");
-    const pending = run("/bin/sh", ["-c", `printf 2.1.284; : > "${marker}"`], 300);
+    const pending = run(process.execPath, ["-e", `process.stdout.write("2.1.284"); require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")`], 300);
     stallUntil(marker, 1_000);
     const { err, stdout } = await pending;
     expect(err).toBeNull();
@@ -49,7 +49,7 @@ describe("execCli deadlines", () => {
 
   it("keeps the answer even when the stall outlasts the hard deadline", async () => {
     const marker = join(scratch, "done");
-    const pending = run("/bin/sh", ["-c", `printf 2.1.284; : > "${marker}"`], 200);
+    const pending = run(process.execPath, ["-e", `process.stdout.write("2.1.284"); require("node:fs").writeFileSync(${JSON.stringify(marker)}, "")`], 200);
     stallUntil(marker, 2_600);
     const { err, stdout } = await pending;
     expect(err).toBeNull();
@@ -57,16 +57,18 @@ describe("execCli deadlines", () => {
   });
 
   it("reports a typed timeout for a child that is genuinely still running", async () => {
-    const { err, stdout } = await run("/bin/sleep", ["5"], 300);
+    const { err, stdout } = await run(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], 300);
     expect(stdout).toBe("");
     expect(err?.timedOut).toBe(true);
     expect(err?.killed).toBe(true);
     expect(isProbeTimeout(err)).toBe(true);
   });
 
-  it("settles through the hard deadline when the child ignores the kill", async () => {
+  // Ignoring the kill needs a POSIX signal handler; Windows terminates
+  // unconditionally.
+  it.skipIf(process.platform === "win32")("settles through the hard deadline when the child ignores the kill", async () => {
     const started = Date.now();
-    const { err } = await run("/bin/sh", ["-c", "trap '' TERM; sleep 3"], 300);
+    const { err } = await run(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 3000)"], 300);
     expect(Date.now() - started).toBeLessThan(2_900);
     expect(err?.message).toMatch(/did not exit within 300ms/);
     expect(err?.timedOut).toBe(true);
@@ -78,21 +80,22 @@ describe("execCli deadlines", () => {
     // keeps it open.  The probe must still settle near its soft deadline with
     // the output it read, not hang until the grandchild lets go.
     const started = Date.now();
-    const { err, stdout } = await run("/bin/sh", ["-c", "printf 2.1.284; sleep 4 &"], 300);
+    const { err, stdout } = await run(process.execPath, ["-e", `process.stdout.write("2.1.284"); require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 4000)"], { stdio: ["ignore", "inherit", "inherit"] }).unref()`], 300);
     expect(Date.now() - started).toBeLessThan(2_500);
     expect(stdout).toBe("2.1.284");
     expect(err).toBeNull();
   });
 
-  it("does not call a child that died on a signal a timeout", async () => {
-    const { err } = await run("/bin/sh", ["-c", "kill -SEGV $$"], 5_000);
+  // A signal death (SIGSEGV) has no Windows equivalent.
+  it.skipIf(process.platform === "win32")("does not call a child that died on a signal a timeout", async () => {
+    const { err } = await run(process.execPath, ["-e", "process.kill(process.pid, 'SIGSEGV')"], 5_000);
     expect(err).not.toBeNull();
     expect(err?.timedOut).not.toBe(true);
     expect(isProbeTimeout(err)).toBe(false);
   });
 
   it("does not call a fast non-zero exit a timeout", async () => {
-    const { err } = await run("/bin/sh", ["-c", "exit 3"], 5_000);
+    const { err } = await run(process.execPath, ["-e", "process.exit(3)"], 5_000);
     expect(err).not.toBeNull();
     expect(isProbeTimeout(err)).toBe(false);
   });

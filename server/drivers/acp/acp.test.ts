@@ -263,7 +263,17 @@ function switchableCli(dir: string): { cli: string; setWorking: (working: boolea
   const cli = join(dir, "switchable-cli");
   writeFileSync(
     cli,
-    `#!/bin/sh\nif [ -f "${dir}/ok" ]; then echo "9.9.9"; exit 0; fi\nif [ "$(cat "${dir}/mode")" = crash ]; then kill -SEGV $$; fi\nexit 3\n`,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
     { mode: 0o755 },
   );
   writeFileSync(join(dir, "mode"), "exit");
@@ -278,7 +288,8 @@ function switchableCli(dir: string): { cli: string; setWorking: (working: boolea
 }
 
 describe("ACP shared core version reuse", () => {
-  for (const mode of ["exit", "crash"] as const) {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
     it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
       const dir = mkdtempSync(join(tmpdir(), "omb-acp-switch-"));
       const cli = switchableCli(dir);
