@@ -236,6 +236,7 @@ import {
   type StalledReleaseDecision,
   type TurnComputerInputs,
 } from "./turn-safety.ts";
+import { TurnStatsTracker } from "./turn-stats.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 // Read-only probe for the Secrets card: whether ~/.mmx/config.json holds a
@@ -3244,7 +3245,9 @@ bus.subscribe((event: RuntimeEvent) => {
           cachedInput: tokens?.cachedInput,
           costUsd: event.cost ?? null,
           billingMode: event.billingMode,
-          stats: turnTiming ?? { steps: 0, modelMs: 0, toolMs: 0 },
+          // No live entry (a repeated completion, a turn from before a
+          // restart) banks no timing rather than a fake zero-length turn.
+          stats: turnTiming,
           // actualSelection, not the configured selection: a turn that
           // fell over to another engine is that engine's spend.
         }, actualSelection.instanceId, actualUsageMeta);

@@ -233,6 +233,9 @@ export interface Task {
   lastActivity?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
+  /** Timing aggregate banked with `usage`; absent on tasks from before it
+   *  existed.  Durations are milliseconds. */
+  stats?: TaskStats;
   /** Per-instance breakdown of `usage`, banked from the selection that
    *  actually ran each turn (post-fallback).  `engineId` is the registry
    *  engine resolved at bank time, so attribution survives deleting the
@@ -255,6 +258,19 @@ export interface Task {
    * window left open across one is not, which is why the sidebar checks the
    * clock too.  See `shared/thread-snooze.ts`. */
   snoozedUntil?: number;
+}
+
+/** Mirror of the server's `TaskStats`: running timing totals for a task,
+ *  in milliseconds, banked once per settled turn.  Aggregates only. */
+export interface TaskStats {
+  turns: number;
+  steps: number;
+  modelMs: number;
+  toolMs: number;
+  ttftMsSum?: number;
+  ttftSamples?: number;
+  tpsTokens?: number;
+  tpsMs?: number;
 }
 
 export interface TaskUsage {

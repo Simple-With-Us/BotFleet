@@ -61,6 +61,7 @@ import { SecretRequestCard } from "./SecretRequestCard";
 import { AttachedFileChips, AttachedImageGallery } from "./AttachmentPreview";
 import { ModelPicker } from "./ModelPicker";
 import { RenameTitle } from "./RenameTitle";
+import { ThreadStatsBar } from "./ThreadStatsBar";
 import { ThreadTabs } from "./ThreadTabs";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
@@ -1099,6 +1100,8 @@ function formatHoverTime(at: number) {
 export function ChatView({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const scrollRef = useRef<HTMLDivElement>(null);
+  // the open thread's task: its banked usage and timing feed the footer chips
+  const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
 
   const stream = useStreaming();
   const streaming = stream.streaming[bot.threadId];
@@ -1729,6 +1732,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         onClearReply={() => setReplyTo(null)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
+      <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
       </div>
       </div>
       </div>

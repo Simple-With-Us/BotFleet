@@ -68,12 +68,16 @@ export class TurnStatsTracker {
     if (turn && !turn.touched) turn.startedAt = turn.at = at;
   }
 
+  /** A token streamed (assistant text or reasoning).  The first one fixes the
+   *  turn's time to first token: the model's own time up to here, so a tool run
+   *  or an approval the turn waited on before speaking is not counted as the
+   *  model being slow. */
   firstToken(threadId: string, at = this.now()): void {
     const turn = this.live.get(threadId);
     if (!turn) return;
     this.advance(turn, at);
     turn.touched = true;
-    turn.firstTokenMs ??= Math.max(0, at - turn.startedAt - turn.ms.wait);
+    turn.firstTokenMs ??= turn.ms.model;
   }
 
   toolStarted(threadId: string, at = this.now()): void {
