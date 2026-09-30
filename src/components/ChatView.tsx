@@ -65,6 +65,7 @@ import { ThreadStatsBar } from "./ThreadStatsBar";
 import { ThreadTabs } from "./ThreadTabs";
 import { ThreadViewSwitch } from "./ThreadViewSwitch";
 import { TrajectoryView } from "./TrajectoryView";
+import { requestTrajectorySearch } from "@/lib/trajectory-search";
 import { useThreadView } from "@/lib/thread-view";
 import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
@@ -1144,12 +1145,15 @@ export function ChatView({ bot }: { bot: Bot }) {
     const onFind = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
         event.preventDefault();
-        setFindOpen(true);
+        // The conversation is not on screen in Trajectory: search the steps
+        // there instead of arming a find bar the person cannot see.
+        if (trajectoryOpen) requestTrajectorySearch();
+        else setFindOpen(true);
       }
     };
     window.addEventListener("keydown", onFind);
     return () => window.removeEventListener("keydown", onFind);
-  }, []);
+  }, [trajectoryOpen]);
 
   // only the active branch is rendered; forks stay reachable via ‹ › nav
   //
@@ -1415,7 +1419,11 @@ export function ChatView({ bot }: { bot: Bot }) {
 
   // keyboard is a scroll gesture too (upstream lesson): PageUp/Home break
   // follow like an upward wheel; the at-end onScroll check re-arms it
+  //
+  // Not while Trajectory is showing: Home and PageUp there belong to the step
+  // list, and must not turn off follow on a chat that is hidden behind it.
   useEffect(() => {
+    if (trajectoryOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "PageUp" || (e.key === "Home" && !(e.target instanceof HTMLTextAreaElement))) {
         setBottomFollow(false);
@@ -1423,7 +1431,7 @@ export function ChatView({ bot }: { bot: Bot }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [setBottomFollow]);
+  }, [setBottomFollow, trajectoryOpen]);
 
   const atEnd = () => {
     const el = scrollRef.current;
@@ -1488,20 +1496,20 @@ export function ChatView({ bot }: { bot: Bot }) {
         </div>
         <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <ThreadViewSwitch view={threadView} onChange={setThreadView} />
-          {!trajectoryOpen && (
-            <button
-              onClick={() => setFindOpen((open) => !open)}
-              aria-label="Find in Conversation"
-              aria-pressed={findOpen}
-              className={cn(
-                "rounded-md p-1.5 hover:bg-raised",
-                findOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
-              )}
-              title="Find in Conversation (⌘F)"
-            >
-              <Search size={18} />
-            </button>
-          )}
+          {/* Always here, so the switch beside it never slides under the pointer:
+              in Trajectory the same magnifier searches the steps. */}
+          <button
+            onClick={() => (trajectoryOpen ? requestTrajectorySearch() : setFindOpen((open) => !open))}
+            aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}
+            aria-pressed={trajectoryOpen ? undefined : findOpen}
+            className={cn(
+              "rounded-md p-1.5 hover:bg-raised",
+              findOpen && !trajectoryOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
+            )}
+            title={trajectoryOpen ? "Search Steps (⌘F)" : "Find in Conversation (⌘F)"}
+          >
+            <Search size={18} />
+          </button>
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}

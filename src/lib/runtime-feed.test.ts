@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeEvent } from "../../server/contracts.ts";
-import { createEventBatcher, publishRuntimeEvent, subscribeRuntimeEvents, watchedThreadCount } from "./runtime-feed.ts";
+import { createEventBatcher, publishRuntimeEvent, publishRuntimeGap, subscribeRuntimeEvents, subscribeRuntimeGap, watchedThreadCount } from "./runtime-feed.ts";
 
 const ev = (threadId: string, over: Record<string, unknown> = {}): RuntimeEvent =>
   ({ eventId: `e-${Math.random()}`, provider: "claude", threadId, createdAt: "2026-09-29T14:00:00.000Z", type: "turn.started", ...over }) as RuntimeEvent;
@@ -136,5 +136,68 @@ describe("createEventBatcher", () => {
     tick();
     expect(flushed).toHaveLength(0);
     expect(batcher.pendingCount()).toBe(0);
+  });
+});
+
+describe("the stream-gap signal", () => {
+  it("does nothing when nobody is listening", () => {
+    expect(() => publishRuntimeGap()).not.toThrow();
+  });
+
+  it("tells every listener once per gap, until they unsubscribe", () => {
+    const a = vi.fn();
+    const b = vi.fn();
+    const offA = subscribeRuntimeGap(a);
+    const offB = subscribeRuntimeGap(b);
+    publishRuntimeGap();
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).toHaveBeenCalledTimes(1);
+    offA();
+    publishRuntimeGap();
+    expect(a).toHaveBeenCalledTimes(1);
+    expect(b).toHaveBeenCalledTimes(2);
+    offB();
+  });
+
+  it("does not let a thrown listener stop the others", () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const after = vi.fn();
+    const offBad = subscribeRuntimeGap(() => {
+      throw new Error("boom");
+    });
+    const offAfter = subscribeRuntimeGap(after);
+    publishRuntimeGap();
+    expect(after).toHaveBeenCalledTimes(1);
+    offBad();
+    offAfter();
+    quiet.mockRestore();
+  });
+});
+
+describe("delivering a settling turn at once", () => {
+  // The Trajectory tab calls flushNow when a turn starts or settles, so the
+  // event reaches the view BEFORE the bot's busy flag flips behind it.
+  it("hands over what is pending now and leaves nothing on the timer", () => {
+    const flushed: string[][] = [];
+    const timers: Array<() => void> = [];
+    const cancelled: unknown[] = [];
+    const batcher = createEventBatcher(
+      (events) => flushed.push(events.map((event) => event.type)),
+      250,
+      (fn) => {
+        timers.push(fn);
+        return timers.length;
+      },
+      (handle) => cancelled.push(handle),
+    );
+    batcher.push(ev("t", { type: "item.completed" }));
+    batcher.push(ev("t", { type: "turn.completed" }));
+    batcher.flushNow();
+    expect(flushed).toEqual([["item.completed", "turn.completed"]]);
+    expect(batcher.pendingCount()).toBe(0);
+    expect(cancelled).toEqual([1]);
+    // the timer that was cancelled must not deliver a second, empty batch
+    timers[0]!();
+    expect(flushed).toHaveLength(1);
   });
 });

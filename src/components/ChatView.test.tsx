@@ -60,8 +60,27 @@ describe("ChatView Trajectory switch", () => {
     expect(SRC).toContain("const [threadView, setThreadView] = useThreadView(bot.threadId);");
     expect(SRC).toContain("<ThreadViewSwitch view={threadView} onChange={setThreadView} />");
     // in the header's right-hand cluster, ahead of the find button, and not among the thread tabs
-    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf('aria-label="Find in Conversation"'));
+    expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf('aria-label={trajectoryOpen ? "Search Steps" : "Find in Conversation"}'));
     expect(SRC.indexOf("<ThreadViewSwitch")).toBeLessThan(SRC.indexOf("<ThreadTabs bot={bot} />"));
+  });
+
+  // The switch sits beside a button that used to unmount in Trajectory, which
+  // slid the switch about 38px under the pointer as it was clicked.
+  it("keeps the magnifier mounted in Trajectory, where it searches the steps", () => {
+    expect(SRC).not.toMatch(/\{!trajectoryOpen && \(\s*<button\s+onClick=\{\(\) => setFindOpen/);
+    expect(SRC).toContain("onClick={() => (trajectoryOpen ? requestTrajectorySearch() : setFindOpen((open) => !open))}");
+    expect(SRC).toContain('title={trajectoryOpen ? "Search Steps (⌘F)" : "Find in Conversation (⌘F)"}');
+  });
+
+  it("sends the find shortcut to the steps' search box while Trajectory is showing", () => {
+    expect(SRC).toContain("if (trajectoryOpen) requestTrajectorySearch();\n        else setFindOpen(true);");
+    expect(SRC).toContain("  }, [trajectoryOpen]);");
+  });
+
+  // Home and PageUp in the step list must not turn off follow on the hidden chat
+  it("leaves the chat's Home and PageUp handling off while Trajectory is showing", () => {
+    expect(SRC).toContain("    if (trajectoryOpen) return;\n    const onKey = (e: KeyboardEvent) => {\n      if (e.key === \"PageUp\"");
+    expect(SRC).toContain("  }, [setBottomFollow, trajectoryOpen]);");
   });
 
   it("keeps the chat pane mounted but hidden in Trajectory, so its scroll, draft and stream survive", () => {

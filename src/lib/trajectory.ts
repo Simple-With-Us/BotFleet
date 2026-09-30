@@ -128,10 +128,17 @@ export interface TurnSummary {
   /** The log begins partway through this turn. */
   startTrimmed: boolean;
   ok?: boolean;
+  /** The person (or the app) stopped the turn: `ok` is false, but nothing
+   *  failed.  See `STOP_REASONS`. */
+  stopped?: boolean;
   stopReason?: string | null;
   input?: number;
   output?: number;
   cachedInput?: number;
+  /** `input`/`output` are the provider's latest running figure for a turn
+   *  still in flight — what it last reported, not this turn's total.  Never
+   *  set for a settled turn. */
+  usageLive?: boolean;
   costUsd?: number | null;
   toolCalls: number;
   /** Wall time with at least one tool running. */
@@ -261,6 +268,10 @@ export function formatGap(ms: number): string {
   const seconds = Math.round(ms / 1000);
   return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s later` : `${seconds}s later`;
 }
+
+/** How the drivers report a stop the person asked for (the Stop button, a
+ *  cancelled request): `turn.completed` with `ok: false`, but not a failure. */
+const STOP_REASONS: ReadonlySet<string> = new Set(["interrupted", "cancelled"]);
 
 export const ROW_KIND_LABEL: Record<RowKind, string> = {
   user: "USER",
@@ -394,6 +405,7 @@ interface TurnAcc {
   cut: boolean;
   end: number;
   ok?: boolean;
+  stopped?: boolean;
   stopReason?: string | null;
   costUsd?: number | null;
   usage?: { input: number; output?: number; cachedInput?: number };
@@ -798,7 +810,20 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
         turn.stopReason = e.stopReason;
         turn.costUsd = e.cost;
         if (e.usage) turn.usage = e.usage;
-        if (!e.ok) {
+        if (!e.ok && typeof e.stopReason === "string" && STOP_REASONS.has(e.stopReason)) {
+          // the person pressed Stop: worth a line in the trail, not an error
+          turn.stopped = true;
+          pushRow({
+            id: `stopped:${e.eventId}`,
+            kind: "context",
+            at,
+            turnId: turn.id,
+            turnIndex: turn.index,
+            title: "Stopped",
+            text: e.stopReason === "cancelled" ? "cancelled" : "interrupted",
+            detail: { text: e.stopReason, meta: e.denials?.length ? [["Denied", e.denials.join(", ")]] : [] },
+          });
+        } else if (!e.ok) {
           turn.errors += 1;
           pushRow({
             id: `error:${e.eventId}`,
@@ -962,7 +987,12 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
   const last = turns.at(-1);
   const running = Boolean(options.running) && Boolean(last) && !last!.completed && !last!.cut;
   for (const turn of turns) {
-    if (turn.completed || turn.cut) continue;
+    if (turn.completed || turn.cut) {
+      // A tool that started after its turn settled (a late event that still
+      // names the turn) has nothing left to end it.  It never reported one.
+      if (turn.calls.size > 0) finishOpen(turn, turn.lastAt, false);
+      continue;
+    }
     if (turn === last && running) {
       turn.end = now;
       finishOpen(turn, now, true);
@@ -1060,7 +1090,12 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
 
   // ── turns ─────────────────────────────────────────────────────────
   const summaries: TurnSummary[] = turns.map((turn) => {
-    const usage = turn.usage ?? turn.liveUsage;
+    // `thread.token-usage.updated` means different things per driver (a
+    // thread total, one call's usage, a step's) and is never a turn total, so
+    // a settled turn without `usage` shows no token figures; a turn in flight
+    // shows the latest figure, flagged as such.
+    const inFlight = turn === last && running;
+    const usage = turn.usage ?? (inFlight ? turn.liveUsage : undefined);
     return {
       id: turn.id,
       index: turn.index,
@@ -1071,10 +1106,12 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
       cut: turn.cut,
       startTrimmed: turn.startTrimmed,
       ok: turn.completed ? turn.ok : undefined,
+      stopped: turn.stopped || undefined,
       stopReason: turn.stopReason,
       input: usage?.input,
       output: usage?.output,
       cachedInput: usage?.cachedInput,
+      usageLive: usage && !turn.usage ? true : undefined,
       costUsd: turn.costUsd,
       toolCalls: turn.toolCount,
       toolMs: unionMs(turn.toolIntervals),

@@ -21,7 +21,7 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
-import { publishRuntimeEvent } from "@/lib/runtime-feed";
+import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
@@ -2943,6 +2943,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (frame.kind === "hello") {
         clearTimeout(hydrationFallback);
         if (frame.resumed !== true) {
+          // The events missed while disconnected are not coming back over the
+          // stream: an open Trajectory tab re-reads its thread's log.
+          publishRuntimeGap();
           // The snapshot replaces the pre-gap transcript.  Discard both
           // rendered fragments and queued deltas from that older boundary.
           deltaBuffer.current.clear();

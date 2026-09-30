@@ -6,14 +6,18 @@
 //
 // Long idle gaps between turns are collapsed to a fixed-width hatched marker
 // (see `buildAxis`), so a thread that spanned a weekend reads like one that
-// took ten minutes.  Each span is a real button, so the strip is reachable by
-// keyboard and opens the same popover on focus that it does on hover.
+// took ten minutes.  Each span is a real button that opens the same popover on
+// focus that it does on hover, and each lane is ONE tab stop: Left and Right
+// (and Home and End) move between its spans, the way the step list below it
+// moves with Up and Down, so a thread with hundreds of calls is not hundreds
+// of Tab presses.
 //
 // Color never carries meaning alone: every lane has a text label, every span
 // has an accessible name that says its outcome, and an unfinished span is
 // drawn dashed, not just tinted.
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Popover } from "@/components/ui/Popover";
+import { spanKeyDown, tabStop } from "./TrajectoryRows";
 import { cn } from "@/lib/cn";
 import {
   axisX,
@@ -76,7 +80,15 @@ function spanName(span: Span, duration: string): string {
   return `${span.label}, ${duration}, started ${start}, ${OUTCOME[span.status].toLowerCase()}`;
 }
 
-function SpanPopover({ span, row }: { span: Span; row?: TrajectoryRow }) {
+interface SpanPopoverProps {
+  span: Span;
+  row?: TrajectoryRow;
+  /** The lane's one tab stop. */
+  tabStop: boolean;
+  onFocusSpan: (id: string) => void;
+}
+
+const SpanPopover = memo(function SpanPopover({ span, row, tabStop, onFocusSpan }: SpanPopoverProps) {
   const instant = span.end <= span.start;
   // an instant is a thin tick inside a wider hit area, not a filled block
   const tick = span.lane === "input" || instant;
@@ -94,6 +106,9 @@ function SpanPopover({ span, row }: { span: Span; row?: TrajectoryRow }) {
       title={span.label}
       titleAside={instant ? undefined : duration}
       triggerLabel={spanName(span, duration)}
+      tabIndex={tabStop ? 0 : -1}
+      triggerData={{ "data-span": "" }}
+      onTriggerFocus={() => onFocusSpan(span.id)}
       trigger={tick ? <span aria-hidden="true" className={cn("mx-auto block h-full w-[3px] rounded-[1px]", spanClass(span))} /> : null}
       className={cn(
         "block size-full rounded-[3px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus",
@@ -111,7 +126,7 @@ function SpanPopover({ span, row }: { span: Span; row?: TrajectoryRow }) {
       </dl>
     </Popover>
   );
-}
+});
 
 /** One lane's track: the gap markers behind, the spans on top. */
 function Track({
@@ -128,12 +143,19 @@ function Track({
   label: string;
 }) {
   const height = rowCount * ROW_PX + (rowCount - 1) * ROW_GAP_PX;
+  // one tab stop per lane: the span last used, else the first
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const stopId = tabStop(
+    spans.map((span) => span.id),
+    focusId,
+  );
   return (
     <div
       role="group"
       aria-label={`${label} lane, ${spans.length} ${spans.length === 1 ? "item" : "items"}`}
       className="relative rounded-md bg-inset"
       style={{ height: Math.max(height, ROW_PX) + 6 }}
+      onKeyDown={spanKeyDown}
     >
       {axis.gaps.map((gap) => (
         <div
@@ -159,7 +181,12 @@ function Track({
                 : { left: `${left}%`, width: `${right - left}%`, minWidth: 3, top, height: ROW_PX }
             }
           >
-            <SpanPopover span={span} row={span.rowId ? rowsById.get(span.rowId) : undefined} />
+            <SpanPopover
+              span={span}
+              row={span.rowId ? rowsById.get(span.rowId) : undefined}
+              tabStop={span.id === stopId}
+              onFocusSpan={setFocusId}
+            />
           </div>
         );
       })}
@@ -192,7 +219,9 @@ function useStripWidth(mounted: boolean) {
   return [ref, width] as const;
 }
 
-export function TrajectoryTimeline({ trajectory }: { trajectory: Trajectory }) {
+/** Memoized: the step list's search box and focus moves re-render the panel
+ *  around it, and none of that changes the strip. */
+export const TrajectoryTimeline = memo(function TrajectoryTimeline({ trajectory }: { trajectory: Trajectory }) {
   const { axis, bounds } = trajectory;
   // a hook, so ahead of the early return below
   const [stripRef, stripPx] = useStripWidth(Boolean(axis && bounds));
@@ -257,4 +286,4 @@ export function TrajectoryTimeline({ trajectory }: { trajectory: Trajectory }) {
       </ul>
     </div>
   );
-}
+});

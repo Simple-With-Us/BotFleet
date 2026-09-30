@@ -11,8 +11,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 import { buildTrajectory, type Trajectory, type TrajectoryInput } from "@/lib/trajectory";
 import { ThreadViewSwitch } from "./ThreadViewSwitch.tsx";
-import { STEP_WINDOW, TrajectoryPanel, type TrajectoryMode, type TrajectoryPanelProps } from "./TrajectoryView.tsx";
-import { stepKeyDown, tabStop } from "./TrajectoryRows.tsx";
+import { STEP_WINDOW, TrajectoryPanel, TrajectoryView, type TrajectoryMode, type TrajectoryPanelProps } from "./TrajectoryView.tsx";
+import { TrajectoryTimeline } from "./TrajectoryTimeline.tsx";
+import { rovingKeyDown, spanKeyDown, stepKeyDown, tabStop } from "./TrajectoryRows.tsx";
 
 // ── fixture ───────────────────────────────────────────────────────────
 const T0 = Date.parse("2026-09-29T14:00:00.000Z");
@@ -79,6 +80,22 @@ describe("TrajectoryPanel: Duration", () => {
     expect(html).toMatch(/aria-label="Bash, 10s, started [\d:]+, failed"/);
     expect(html).toMatch(/aria-label="Read, 2s, started [\d:]+, succeeded"/);
     expect(html.match(/aria-haspopup="dialog"/g)!.length).toBeGreaterThan(5);
+  });
+
+  it("makes each lane ONE tab stop, however many spans it holds", () => {
+    // the strip sits ahead of the step list, so a tab stop per span would be
+    // hundreds of Tab presses before the list
+    const lanes = html.slice(html.indexOf('aria-label="Timeline"'), html.indexOf('aria-label="Legend"')).split(/aria-label="(?:Input|Model|Tools) lane,/).slice(1);
+    expect(lanes).toHaveLength(3);
+    for (const lane of lanes) {
+      const buttons = lane.match(/<button\b[^>]*>/g)!;
+      expect(buttons.length).toBeGreaterThan(0);
+      expect(buttons.filter((tag) => tag.includes('tabindex="0"'))).toHaveLength(1);
+      expect(buttons.filter((tag) => tag.includes('tabindex="-1"'))).toHaveLength(buttons.length - 1);
+      expect(buttons.every((tag) => tag.includes("data-span"))).toBe(true);
+    }
+    // the tools lane really has several, so this is not vacuous
+    expect(lanes[2]!.match(/<button\b/g)!.length).toBeGreaterThan(1);
   });
 
   it("marks the idle hour between the turns as a gap, with its length", () => {
@@ -170,6 +187,25 @@ describe("TrajectoryPanel: Turns", () => {
     expect(render({ trajectory: cut }, "turns")).toContain("Never finished");
     const failed = buildTrajectory([ev(0, { type: "turn.started" }), ev(1, { type: "turn.completed", ok: false, stopReason: "error" })]);
     expect(render({ trajectory: failed }, "turns")).toContain(">Failed<");
+  });
+
+  it("calls a turn the person stopped Stopped, not Failed", () => {
+    const stopped = buildTrajectory([ev(0, { type: "turn.started" }), ev(1, { type: "turn.completed", ok: false, stopReason: "interrupted" })]);
+    const stoppedHtml = render({ trajectory: stopped }, "turns");
+    expect(stoppedHtml).toContain(">Stopped<");
+    expect(stoppedHtml).not.toContain(">Failed<");
+    expect(stoppedHtml).not.toContain("Turn failed");
+    // the trail still says so, as CONTEXT
+    expect(text(stoppedHtml)).toContain("CONTEXT Stopped interrupted");
+  });
+
+  it("labels a running turn's token figure as the latest, never as a total", () => {
+    const usage = ev(1, { type: "thread.token-usage.updated", input: 900, output: 30 });
+    const running = buildTrajectory([ev(0, { type: "turn.started" }), usage], { running: true, now: T0 + 5000 });
+    expect(text(render({ trajectory: running }, "turns"))).toContain("latest 900 in · 30 out");
+    // a settled turn without usage shows none at all
+    const settled = buildTrajectory([ev(0, { type: "turn.started" }), usage, ev(2, { type: "turn.completed", ok: false, stopReason: "error" })]);
+    expect(text(render({ trajectory: settled }, "turns"))).not.toMatch(/\d in ·/);
   });
 });
 
@@ -378,6 +414,33 @@ describe("keyboard navigation", () => {
     expect(focused).toEqual([]);
   });
 
+  it("moves between a timeline lane's spans with Left and Right, and not with Up and Down", () => {
+    const focused: number[] = [];
+    const nodes = Array.from({ length: 4 }, (_, i) => ({ closest: () => nodes[i], focus: () => focused.push(i) }));
+    const currentTarget = { querySelectorAll: (selector: string) => (selector === "[data-span]" ? nodes : []) };
+    const press = (key: string, from: number) => {
+      const preventDefault = vi.fn();
+      spanKeyDown({ key, altKey: false, ctrlKey: false, metaKey: false, target: nodes[from], currentTarget, preventDefault } as never);
+      return preventDefault;
+    };
+    press("ArrowRight", 0);
+    press("ArrowRight", 3);
+    press("ArrowLeft", 3);
+    press("End", 0);
+    press("Home", 2);
+    expect(focused).toEqual([1, 3, 2, 3, 0]);
+    expect(press("ArrowDown", 0)).not.toHaveBeenCalled();
+    expect(press("ArrowUp", 1)).not.toHaveBeenCalled();
+  });
+
+  it("builds a handler for any selector and key pair", () => {
+    const focused: number[] = [];
+    const nodes = Array.from({ length: 3 }, (_, i) => ({ closest: () => nodes[i], focus: () => focused.push(i) }));
+    const handler = rovingKeyDown("[data-x]", "j", "k");
+    handler({ key: "k", altKey: false, ctrlKey: false, metaKey: false, target: nodes[0], currentTarget: { querySelectorAll: () => nodes }, preventDefault: vi.fn() } as never);
+    expect(focused).toEqual([1]);
+  });
+
   it("ignores a key pressed outside any step (the search box)", () => {
     const preventDefault = vi.fn();
     stepKeyDown({
@@ -390,5 +453,24 @@ describe("keyboard navigation", () => {
       preventDefault,
     } as never);
     expect(preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+// ── re-rendering ──────────────────────────────────────────────────────
+describe("re-rendering", () => {
+  const isMemo = (component: unknown) => (component as { $$typeof?: symbol }).$$typeof === Symbol.for("react.memo");
+
+  // The chat above re-renders on every streamed frame (it reads the stream
+  // context).  This tab shows none of that text, so it must not follow.
+  it("keeps the view, the timeline and the step rows out of the chat's streaming re-renders", () => {
+    expect(isMemo(TrajectoryView)).toBe(true);
+    expect(isMemo(TrajectoryTimeline)).toBe(true);
+  });
+
+  it("still renders through the memo wrappers", () => {
+    const html = renderToStaticMarkup(createElement(TrajectoryView, { threadId: "th", messages: [], running: false }));
+    // no fetch under SSR: the first paint is the loading state
+    expect(html).toContain("Loading steps");
+    expect(renderToStaticMarkup(createElement(TrajectoryTimeline, { trajectory: build() }))).toContain('aria-label="Timeline"');
   });
 });

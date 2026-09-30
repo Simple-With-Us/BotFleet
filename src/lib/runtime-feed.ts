@@ -51,6 +51,28 @@ export function subscribeRuntimeEvents(threadId: string, listener: RuntimeEventL
   };
 }
 
+const gapListeners = new Set<() => void>();
+
+/** The event stream came back without being able to replay what it missed, so
+ *  a subscriber's copy of ANY thread may have a hole.  Free when nobody listens. */
+export function publishRuntimeGap(): void {
+  for (const listener of [...gapListeners]) {
+    try {
+      listener();
+    } catch (error) {
+      console.error("runtime feed: gap listener threw", error);
+    }
+  }
+}
+
+/** Hear about a gap in the stream until the returned function is called. */
+export function subscribeRuntimeGap(listener: () => void): () => void {
+  gapListeners.add(listener);
+  return () => {
+    gapListeners.delete(listener);
+  };
+}
+
 /** How many threads have a subscriber — for tests. */
 export const watchedThreadCount = (): number => listeners.size;
 

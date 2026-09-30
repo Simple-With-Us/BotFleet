@@ -14,7 +14,7 @@
 // `TrajectoryPanel` is the pure renderer (props in, markup out) and is what the
 // tests render; `TrajectoryView` owns the fetching, the live tail and the
 // controls' state.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import {
@@ -29,7 +29,8 @@ import {
   type MessageLike,
   type Trajectory,
 } from "@/lib/trajectory";
-import { createEventBatcher, subscribeRuntimeEvents } from "@/lib/runtime-feed";
+import { createEventBatcher, subscribeRuntimeEvents, subscribeRuntimeGap } from "@/lib/runtime-feed";
+import { onTrajectorySearchRequest } from "@/lib/trajectory-search";
 import type { InspectorPage } from "@/lib/inspector";
 import type { RuntimeEvent } from "../../server/contracts.ts";
 import { CallsTable, ROW_FOCUS, StepList, TurnList, tabStop, type ListControl } from "./TrajectoryRows";
@@ -47,8 +48,13 @@ const MODES: ReadonlyArray<{ id: TrajectoryMode; label: string; hint: string }> 
 export const STEP_WINDOW = 250;
 /** Events asked of the server; it clips each one and skips streamed deltas. */
 const HISTORY_LIMIT = 1000;
-/** Live events held between history reloads. */
+/** Live events held between history reloads.  Past this the oldest are let
+ *  go and the log is re-read, so the gap becomes a trimmed front, not a hole. */
 const LIVE_CAP = 3000;
+/** The log catches up with what streamed within this long of a turn settling. */
+const SETTLE_RELOAD_MS = 600;
+/** A burst of reload reasons (overflow, reconnect, settle) becomes one read. */
+const BURST_RELOAD_MS = 1000;
 
 const plural = (n: number, word: string) => `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
 
@@ -87,10 +93,21 @@ export function TrajectoryPanel({
   error = null,
   onRetry,
 }: TrajectoryPanelProps) {
+  const searchRef = useRef<HTMLInputElement>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [windowSize, setWindowSize] = useState(STEP_WINDOW);
   const [sort, setSort] = useState<CallSort>("start");
   const [descending, setDescending] = useState(false);
+
+  // The header's magnifier and Cmd/Ctrl+F land here while this tab is showing
+  useEffect(
+    () =>
+      onTrajectorySearchRequest(() => {
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      }),
+    [],
+  );
 
   const filtering = query.trim().length > 0;
   const matching = useMemo(() => filterRows(trajectory.rows, query), [trajectory.rows, query]);
@@ -161,6 +178,7 @@ export function TrajectoryPanel({
           <span className="sr-only">Search Steps</span>
           <Search size={13} aria-hidden="true" className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-ink-secondary" />
           <input
+            ref={searchRef}
             type="search"
             value={query}
             onChange={(event) => onQuery(event.target.value)}
@@ -283,7 +301,10 @@ export interface TrajectoryViewProps {
   knownTurns?: number;
 }
 
-export function TrajectoryView({ threadId, messages, running, knownTurns }: TrajectoryViewProps) {
+/** Memoized: the chat above it re-renders on every streamed frame, and this
+ *  tab shows none of that text.  Its props are the thread id, the memoized
+ *  server messages and two scalars, so it re-renders only when they change. */
+export const TrajectoryView = memo(function TrajectoryView({ threadId, messages, running, knownTurns }: TrajectoryViewProps) {
   const [history, setHistory] = useState<{ events: RuntimeEvent[]; older: boolean } | null>(null);
   const [live, setLive] = useState<RuntimeEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -292,6 +313,10 @@ export function TrajectoryView({ threadId, messages, running, knownTurns }: Traj
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const [now, setNow] = useState(() => Date.now());
   const loadAbort = useRef<AbortController | null>(null);
+  // the live tail's source of truth: event callbacks append to it directly, so
+  // a history read that lands mid-burst prunes what is really there
+  const liveRef = useRef<RuntimeEvent[]>([]);
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const load = useCallback(async () => {
     loadAbort.current?.abort();
@@ -308,8 +333,11 @@ export function TrajectoryView({ threadId, messages, running, knownTurns }: Traj
       setHistory({ events, older: page.older === true });
       setError(null);
       // what the log now holds no longer needs the live copy
-      const seen = new Set(events.map((event) => event.eventId));
-      setLive((prev) => (prev.length ? prev.filter((event) => !seen.has(event.eventId)) : prev));
+      if (liveRef.current.length) {
+        const seen = new Set(events.map((event) => event.eventId));
+        liveRef.current = liveRef.current.filter((event) => !seen.has(event.eventId));
+        setLive(liveRef.current);
+      }
     } catch (e) {
       if (controller.signal.aborted) return;
       setError(e instanceof Error ? e.message : String(e));
@@ -318,27 +346,64 @@ export function TrajectoryView({ threadId, messages, running, knownTurns }: Traj
     }
   }, [threadId]);
 
+  /** Re-read the log soon, once however many reasons arrive meanwhile. */
+  const reloadSoon = useCallback(
+    (delayMs: number) => {
+      if (reloadTimer.current) clearTimeout(reloadTimer.current);
+      reloadTimer.current = setTimeout(() => {
+        reloadTimer.current = null;
+        void load();
+      }, delayMs);
+    },
+    [load],
+  );
+
   // Subscribe BEFORE reading history, so nothing that happens in between is
   // missed; the duplicates that overlap are dropped by event id when built.
   useEffect(() => {
-    let settle: ReturnType<typeof setTimeout> | null = null;
-    const batcher = createEventBatcher((batch) => setLive((prev) => [...prev, ...batch].slice(-LIVE_CAP)));
+    const batcher = createEventBatcher((batch) => {
+      const next = [...liveRef.current, ...batch];
+      const overflow = next.length > LIVE_CAP;
+      liveRef.current = overflow ? next.slice(-LIVE_CAP) : next;
+      setLive(liveRef.current);
+      // The oldest live events just fell off.  The log has them, so reading it
+      // again turns what would be a silent hole mid-timeline into a trimmed
+      // front (the note says so).
+      if (overflow) reloadSoon(BURST_RELOAD_MS);
+    });
     const unsubscribe = subscribeRuntimeEvents(threadId, (event) => {
       batcher.push(event);
-      if (event.type === "turn.completed" || event.type === "runtime.error") {
-        // let the log catch up with what streamed
-        if (settle) clearTimeout(settle);
-        settle = setTimeout(() => void load(), 600);
-      }
+      const settles = event.type === "turn.completed" || event.type === "runtime.error";
+      // A turn starting or ending is delivered NOW, not on the batch timer:
+      // the bot's busy flag flips right behind these events, and a view built
+      // from a busy flag that says "done" and a tail that has not heard so
+      // reads as an interrupted turn for a quarter of a second.
+      if (settles || event.type === "turn.started") batcher.flushNow();
+      // let the log catch up with what streamed
+      if (settles) reloadSoon(SETTLE_RELOAD_MS);
     });
+    // The stream reconnected and could not replay what it missed (a sleeping
+    // laptop, a network blip): whatever this tab was showing may be missing steps.
+    const unsubscribeGap = subscribeRuntimeGap(() => reloadSoon(BURST_RELOAD_MS));
     void load();
     return () => {
       unsubscribe();
+      unsubscribeGap();
       batcher.dispose();
-      if (settle) clearTimeout(settle);
+      if (reloadTimer.current) clearTimeout(reloadTimer.current);
+      reloadTimer.current = null;
       loadAbort.current?.abort();
     };
-  }, [threadId, load]);
+  }, [threadId, load, reloadSoon]);
+
+  // The turn ended without this tab hearing it (the stream dropped mid-turn):
+  // the log has the rest, so read it.  The ordinary end is covered above and
+  // this just joins that same debounced read.
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    if (wasRunning.current && !running) reloadSoon(SETTLE_RELOAD_MS);
+    wasRunning.current = running;
+  }, [running, reloadSoon]);
 
   // a running turn's open spans grow: tick once a second, and never behind a hidden tab
   useEffect(() => {
@@ -365,6 +430,7 @@ export function TrajectoryView({ threadId, messages, running, knownTurns }: Traj
       return next;
     });
   }, []);
+  const retry = useCallback(() => void load(), [load]);
 
   return (
     <TrajectoryPanel
@@ -377,7 +443,7 @@ export function TrajectoryView({ threadId, messages, running, knownTurns }: Traj
       onToggle={toggle}
       loading={history === null && error === null}
       error={error}
-      onRetry={() => void load()}
+      onRetry={retry}
     />
   );
-}
+});

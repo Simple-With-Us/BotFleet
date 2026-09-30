@@ -149,6 +149,14 @@ export interface PopoverProps {
   /** Start pinned open.  Without a DOM (server render) an open panel renders
    *  in place rather than portalled, which is how the markup is tested. */
   defaultOpen?: boolean;
+  /** Tab order of the trigger.  A group of many triggers (the Trajectory
+   *  timeline's spans) makes one of them the tab stop and gives the rest -1,
+   *  moving between them with the arrow keys. */
+  tabIndex?: number;
+  /** Runs when the trigger takes focus, whatever moved it there. */
+  onTriggerFocus?: () => void;
+  /** `data-*` attributes for the trigger button, so a group can find its own. */
+  triggerData?: Record<`data-${string}`, string>;
 }
 
 export function Popover({
@@ -161,6 +169,9 @@ export function Popover({
   panelClassName,
   placement = "top",
   defaultOpen = false,
+  tabIndex,
+  onTriggerFocus,
+  triggerData,
 }: PopoverProps) {
   const id = useId();
   const titleId = `${id}-title`;
@@ -263,6 +274,7 @@ export function Popover({
     else clearTimer();
   };
   const onFocus = (event: FocusEvent<HTMLButtonElement>) => {
+    onTriggerFocus?.();
     // keyboard focus only: a mouse press focuses the button too, and that
     // press is the pin click's business, not a second reason to open
     let visible = true;
@@ -321,8 +333,10 @@ export function Popover({
   return (
     <>
       <button
+        {...triggerData}
         ref={triggerRef}
         type="button"
+        tabIndex={tabIndex}
         className={className}
         aria-haspopup="dialog"
         aria-label={triggerLabel}

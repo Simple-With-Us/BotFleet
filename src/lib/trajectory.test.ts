@@ -428,6 +428,61 @@ describe("buildTrajectory: context and error rows", () => {
   });
 });
 
+// ── review findings: settled turns, stops and token figures ───────────
+describe("buildTrajectory: what a settled turn keeps", () => {
+  const usage = (sec: number, input: number, output?: number, turnId = "t1"): RuntimeEvent =>
+    ({ ...base(sec, turnId), type: "thread.token-usage.updated", input, ...(output === undefined ? {} : { output }) }) as RuntimeEvent;
+
+  it("closes a tool that started after its turn settled instead of leaving it running for good", () => {
+    // the Claude driver falls back to the session's first turn id once its own
+    // turn is cleared, so a late start can still name the turn that ended
+    const t = buildTrajectory([turnStarted(0), toolStart(1, "a", "Read"), toolEnd(2, "a"), turnDone(3, { ok: false, stopReason: "interrupted" }), toolStart(5, "late", "Bash")], { running: false });
+    const late = t.spans.tools.find((s) => s.label === "Bash")!;
+    expect(late).toMatchObject({ status: "unknown", open: false, cut: true });
+    const row = t.rows.find((r) => r.title === "Bash")!;
+    expect(row.status).toBe("unknown");
+    expect(row.durationMs).toBe(0);
+  });
+
+  it("still lets a late completion finish the late tool", () => {
+    const t = buildTrajectory([turnStarted(0), turnDone(3), toolStart(5, "late", "Bash"), toolEnd(6, "late", true, "ok")], { running: false });
+    expect(t.spans.tools[0]).toMatchObject({ status: "ok", open: false });
+    expect(t.rows.find((r) => r.title === "Bash")).toMatchObject({ status: "ok", durationMs: 1000 });
+  });
+
+  it("shows no token figures for a settled turn that reported no usage, whatever the live indicator last said", () => {
+    // Codex's live figure is the THREAD total: never a turn's own
+    const t = buildTrajectory([turnStarted(0), usage(1, 1_250_000, 40_000), turnDone(2, { ok: false, stopReason: "error" })], { running: false });
+    expect(t.turns[0]).toMatchObject({ input: undefined, output: undefined });
+    expect(t.turns[0]!.usageLive).toBeUndefined();
+  });
+
+  it("shows a running turn's latest figure, flagged as live, and the settled total once it lands", () => {
+    const running = buildTrajectory([turnStarted(0), usage(1, 900, 30)], { running: true, now: ms(2) });
+    expect(running.turns[0]).toMatchObject({ input: 900, output: 30, usageLive: true });
+    const settled = buildTrajectory([turnStarted(0), usage(1, 900, 30), turnDone(2, { usage: { input: 1000, output: 60 } })], { running: false });
+    expect(settled.turns[0]).toMatchObject({ input: 1000, output: 60 });
+    expect(settled.turns[0]!.usageLive).toBeUndefined();
+  });
+
+  it("does not call a turn the person stopped a failure", () => {
+    for (const stopReason of ["interrupted", "cancelled"]) {
+      const t = buildTrajectory([turnStarted(0), toolStart(1, "a", "Bash"), turnDone(2, { ok: false, stopReason })], { running: false });
+      expect(t.turns[0]).toMatchObject({ ok: false, stopped: true, errors: 0 });
+      expect(t.rows.some((r) => r.kind === "error")).toBe(false);
+      const stopped = t.rows.find((r) => r.title === "Stopped")!;
+      expect(stopped).toMatchObject({ kind: "context", text: stopReason });
+    }
+  });
+
+  it("still counts every other failed turn as an error", () => {
+    const t = buildTrajectory([turnStarted(0), turnDone(2, { ok: false, stopReason: "error" })], { running: false });
+    expect(t.turns[0]).toMatchObject({ ok: false, errors: 1 });
+    expect(t.turns[0]!.stopped).toBeUndefined();
+    expect(t.rows.filter((r) => r.kind === "error").map((r) => r.title)).toEqual(["Turn failed"]);
+  });
+});
+
 // ── robustness ────────────────────────────────────────────────────────
 describe("buildTrajectory: messy input", () => {
   it("returns an empty trajectory for no events", () => {

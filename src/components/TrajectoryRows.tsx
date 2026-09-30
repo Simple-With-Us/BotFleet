@@ -9,7 +9,7 @@
 // Down (and Home and End) move between steps the way they do in a menu, so a
 // keyboard user does not tab through a thousand rows.  The open/closed state
 // lives with the caller, so the lists themselves stay pure renderers.
-import type { KeyboardEvent, ReactNode } from "react";
+import { memo, type KeyboardEvent, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronRight, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import {
@@ -49,20 +49,31 @@ export function tabStop(ids: readonly string[], focused: string | null): string 
   return focused !== null && ids.includes(focused) ? focused : ids[0];
 }
 
-/** Up/Down/Home/End between the list's `[data-step]` controls. */
-export function stepKeyDown(event: KeyboardEvent<HTMLElement>): void {
-  const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
-  if (!keys.includes(event.key) || event.altKey || event.ctrlKey || event.metaKey) return;
-  const target = event.target as HTMLElement;
-  if (!target.closest("[data-step]")) return;
-  const steps = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("[data-step]"));
-  const at = steps.indexOf(target.closest("[data-step]") as HTMLElement);
-  if (at === -1) return;
-  const next =
-    event.key === "Home" ? 0 : event.key === "End" ? steps.length - 1 : Math.max(0, Math.min(steps.length - 1, at + (event.key === "ArrowDown" ? 1 : -1)));
-  event.preventDefault();
-  steps[next]?.focus();
+/** A keydown handler that moves focus between the `selector` controls inside
+ *  the element it is attached to: `previous`/`next` (arrow keys) one at a time,
+ *  Home and End to the ends.  What lets a group of many controls be ONE tab
+ *  stop, the way a menu is. */
+export function rovingKeyDown(selector: string, previous: string, next: string) {
+  const keys = [previous, next, "Home", "End"];
+  return (event: KeyboardEvent<HTMLElement>): void => {
+    if (!keys.includes(event.key) || event.altKey || event.ctrlKey || event.metaKey) return;
+    const target = event.target as HTMLElement;
+    if (!target.closest(selector)) return;
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(selector));
+    const at = items.indexOf(target.closest(selector) as HTMLElement);
+    if (at === -1) return;
+    const to =
+      event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : Math.max(0, Math.min(items.length - 1, at + (event.key === next ? 1 : -1)));
+    event.preventDefault();
+    items[to]?.focus();
+  };
 }
+
+/** Up/Down/Home/End between the list's `[data-step]` controls. */
+export const stepKeyDown = rovingKeyDown("[data-step]", "ArrowUp", "ArrowDown");
+
+/** Left/Right/Home/End between a timeline lane's `[data-span]` controls. */
+export const spanKeyDown = rovingKeyDown("[data-span]", "ArrowLeft", "ArrowRight");
 
 function Outcome({ status }: { status?: SpanStatus }) {
   if (!status) return null;
@@ -178,8 +189,18 @@ export interface ListControl {
   onFocusStep: (id: string) => void;
 }
 
-function Step({ row, control }: { row: TrajectoryRow; control: ListControl }) {
-  const open = control.expanded.has(row.id);
+interface StepProps {
+  row: TrajectoryRow;
+  open: boolean;
+  /** This step is the list's one tab stop. */
+  tabStop: boolean;
+  onToggle: (id: string) => void;
+  onFocusStep: (id: string) => void;
+}
+
+/** Primitives and stable callbacks only, so a list re-render (a keystroke in
+ *  the search box, focus moving) leaves every step it did not change alone. */
+const Step = memo(function Step({ row, open, tabStop, onToggle, onFocusStep }: StepProps) {
   const detailId = `${row.id}::detail`;
   return (
     <li className={cn("border-b border-hairline/20", row.kind === "error" && "bg-danger/5")}>
@@ -189,9 +210,9 @@ function Step({ row, control }: { row: TrajectoryRow; control: ListControl }) {
         data-row-id={row.id}
         aria-expanded={open}
         aria-controls={open ? detailId : undefined}
-        tabIndex={control.tabStopId === row.id ? 0 : -1}
-        onFocus={() => control.onFocusStep(row.id)}
-        onClick={() => control.onToggle(row.id)}
+        tabIndex={tabStop ? 0 : -1}
+        onFocus={() => onFocusStep(row.id)}
+        onClick={() => onToggle(row.id)}
         className={cn("flex w-full items-start gap-2 px-3 py-1 text-left hover:bg-raised/60", ROW_FOCUS)}
       >
         <span className="mt-[3px] shrink-0 text-ink-secondary" aria-hidden="true">
@@ -216,13 +237,25 @@ function Step({ row, control }: { row: TrajectoryRow; control: ListControl }) {
       {open && <StepDetail row={row} id={detailId} />}
     </li>
   );
+});
+
+function StepItem({ row, control }: { row: TrajectoryRow; control: ListControl }) {
+  return (
+    <Step
+      row={row}
+      open={control.expanded.has(row.id)}
+      tabStop={control.tabStopId === row.id}
+      onToggle={control.onToggle}
+      onFocusStep={control.onFocusStep}
+    />
+  );
 }
 
 export function StepList({ rows, control, label }: { rows: readonly TrajectoryRow[]; control: ListControl; label: string }) {
   return (
     <ul aria-label={label} onKeyDown={stepKeyDown} className="font-mono text-[11.5px] leading-5">
       {rows.map((row) => (
-        <Step key={row.id} row={row} control={control} />
+        <StepItem key={row.id} row={row} control={control} />
       ))}
     </ul>
   );
@@ -236,7 +269,9 @@ function turnFacts(turn: TurnSummary): string[] {
   if (turn.modelMs > 0) facts.push(`model ${formatSpan(turn.modelMs)}`);
   if (turn.toolMs > 0) facts.push(`tools ${formatSpan(turn.toolMs)}`);
   if (turn.input !== undefined) {
-    facts.push(turn.output !== undefined ? `${formatTokens(turn.input)} in · ${formatTokens(turn.output)} out` : `${formatTokens(turn.input)} in`);
+    const tokens = turn.output !== undefined ? `${formatTokens(turn.input)} in · ${formatTokens(turn.output)} out` : `${formatTokens(turn.input)} in`;
+    // a turn still running has only the provider's latest figure, not a total
+    facts.push(turn.usageLive ? `latest ${tokens}` : tokens);
   }
   if (typeof turn.costUsd === "number") facts.push(formatUsd(turn.costUsd));
   return facts;
@@ -244,6 +279,8 @@ function turnFacts(turn: TurnSummary): string[] {
 
 function turnState(turn: TurnSummary): { text: string; tone: string } | null {
   if (turn.running) return { text: "Running", tone: "bg-accent/15 text-accent-text" };
+  // a stop the person asked for is not a failure, and is not drawn like one
+  if (turn.stopped) return { text: "Stopped", tone: "bg-inset text-ink-secondary" };
   if (turn.ok === false) return { text: "Failed", tone: "bg-danger/15 text-danger" };
   if (turn.cut) return { text: "Never finished", tone: "bg-warning/15 text-warning" };
   return null;
@@ -288,7 +325,7 @@ function StepListBody({ rows, control }: { rows: readonly TrajectoryRow[]; contr
   return (
     <ul className="font-mono text-[11.5px] leading-5">
       {rows.map((row) => (
-        <Step key={row.id} row={row} control={control} />
+        <StepItem key={row.id} row={row} control={control} />
       ))}
     </ul>
   );
@@ -347,20 +384,24 @@ export function CallsTable({
           </tr>
         </thead>
         <tbody className="font-mono">
-          {calls.map((row) => {
-            const open = control.expanded.has(row.id);
-            const detailId = `${row.id}::detail`;
-            return (
-              <CallRows key={row.id} row={row} open={open} detailId={detailId} control={control} />
-            );
-          })}
+          {calls.map((row) => (
+            <CallRows
+              key={row.id}
+              row={row}
+              open={control.expanded.has(row.id)}
+              tabStop={control.tabStopId === row.id}
+              onToggle={control.onToggle}
+              onFocusStep={control.onFocusStep}
+            />
+          ))}
         </tbody>
       </table>
     </div>
   );
 }
 
-function CallRows({ row, open, detailId, control }: { row: TrajectoryRow; open: boolean; detailId: string; control: ListControl }) {
+const CallRows = memo(function CallRows({ row, open, tabStop, onToggle, onFocusStep }: StepProps) {
+  const detailId = `${row.id}::detail`;
   return (
     <>
       <tr className={cn("border-b border-hairline/20 hover:bg-raised/40", row.status === "error" && "bg-danger/5")}>
@@ -371,9 +412,9 @@ function CallRows({ row, open, detailId, control }: { row: TrajectoryRow; open: 
             data-row-id={row.id}
             aria-expanded={open}
             aria-controls={open ? detailId : undefined}
-            tabIndex={control.tabStopId === row.id ? 0 : -1}
-            onFocus={() => control.onFocusStep(row.id)}
-            onClick={() => control.onToggle(row.id)}
+            tabIndex={tabStop ? 0 : -1}
+            onFocus={() => onFocusStep(row.id)}
+            onClick={() => onToggle(row.id)}
             className={cn("flex w-full items-center gap-1.5 rounded text-left font-semibold text-ink", ROW_FOCUS)}
           >
             <span className="shrink-0 text-ink-secondary" aria-hidden="true">
@@ -404,4 +445,4 @@ function CallRows({ row, open, detailId, control }: { row: TrajectoryRow; open: 
       )}
     </>
   );
-}
+});
