@@ -16,9 +16,10 @@ import fs from 'node:fs';
 function resolveAuthToken(): string | null {
     try {
         const envFile = fs.readFileSync(path.join(process.env.HOME || '/Users/jay', '.secrets', 'seat-mcp.env'), 'utf8');
-        // Anchored to the line start, and the token stops at the first
-        // whitespace or '#': an inline comment after the value must not
-        // become part of the credential.
+        // Anchored to the line start, and the token runs to the first
+        // whitespace: an inline comment after the value (always
+        // whitespace-separated) stays out of the credential, while a '#'
+        // inside the value itself is kept verbatim.
         const match = envFile.match(/^SEAT_MCP_TOKEN=(\S+)/m);
         if (match && match[1]) return match[1];
     } catch (e) { }
@@ -202,7 +203,17 @@ const server = createServer((req, res) => {
                 send(res, 400, 'Bad JSON');
                 return;
             }
-            sessions.get(sessionId)!.process.stdin?.write(JSON.stringify(body) + '\n');
+            // The child can die while the body is in flight: the exit handler
+            // deletes the session during the await above, so re-check instead
+            // of trusting the earlier sessions.has().  A dead session (or a
+            // child whose stdin is already gone) is a 404, never a TypeError.
+            const session = sessions.get(sessionId);
+            const stdin = session?.process.stdin;
+            if (!session || !stdin || stdin.destroyed || !stdin.writable) {
+                send(res, 404, 'Session not found');
+                return;
+            }
+            stdin.write(JSON.stringify(body) + '\n');
             send(res, 202, 'Accepted');
             return;
         }
