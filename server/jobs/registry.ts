@@ -934,7 +934,7 @@ export class JobRegistry {
 export function noticeLine(job: JobSnapshot): string {
   const head = `Background job ${job.id} \`${job.label}\``;
   const took = formatJobDuration(jobElapsedMs(job, job.endedAt ?? job.startedAt));
-  const read = " Read its output with job_output.";
+  const read = "  Read its output with job_output.";
   switch (job.status) {
     case "completed":
       return `${head} finished: exit code 0 after ${took}.${read}`;
