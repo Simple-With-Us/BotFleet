@@ -70,15 +70,18 @@ function count(argument: unknown): number | undefined {
 export function createJobTools(options: JobToolsOptions): Record<string, JobToolExecutor> {
   const now = options.now ?? Date.now;
 
-  /** The job, when it is this bot's own. */
-  const ownJob = (call: TurnToolCall): JobSnapshot | TurnToolOutcome => {
+  /** The job, when it is this bot's own; otherwise the refusal to return. */
+  const ownJob = (call: TurnToolCall): { job: JobSnapshot } | { refused: TurnToolOutcome } => {
     const id = text(call.arguments.job_id).trim();
-    if (!JOB_ID_PATTERN.test(id)) return fail("job_id must be a job id such as job_01J… (see job_list).", "invalid_argument");
+    if (!JOB_ID_PATTERN.test(id)) {
+      return { refused: fail("job_id must be a job id such as job_01J… (see job_list).", "invalid_argument") };
+    }
     const job = options.registry.get(id);
-    if (!job || job.botId !== options.botId) return fail(`No job ${id} of yours exists.  Call job_list to see your jobs.`, "no such job");
-    return job;
+    if (!job || job.botId !== options.botId) {
+      return { refused: fail(`No job ${id} of yours exists.  Call job_list to see your jobs.`, "no such job") };
+    }
+    return { job };
   };
-  const isOutcome = (value: JobSnapshot | TurnToolOutcome): value is TurnToolOutcome => "kind" in value;
 
   const jobStart: JobToolExecutor = async (call) => {
     const command = text(call.arguments.command).trim();
@@ -106,8 +109,9 @@ export function createJobTools(options: JobToolsOptions): Record<string, JobTool
   };
 
   const jobOutput: JobToolExecutor = async (call, _ctx, runtime) => {
-    const found = ownJob(call);
-    if (isOutcome(found)) return found;
+    const owned = ownJob(call);
+    if ("refused" in owned) return owned.refused;
+    const found = owned.job;
     const asked = count(call.arguments.wait_seconds) ?? 0;
     const waitSeconds = Math.max(0, Math.min(options.maxWaitSeconds, asked));
     if (waitSeconds > 0 && isJobActive(found)) {
@@ -147,8 +151,9 @@ export function createJobTools(options: JobToolsOptions): Record<string, JobTool
   };
 
   const jobKill: JobToolExecutor = async (call) => {
-    const found = ownJob(call);
-    if (isOutcome(found)) return found;
+    const owned = ownJob(call);
+    if ("refused" in owned) return owned.refused;
+    const found = owned.job;
     if (!isJobActive(found)) {
       return { kind: "result", content: `${found.id} had already ended.\n${jobStatusLine(found, now())}` };
     }

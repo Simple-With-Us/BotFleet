@@ -24,6 +24,13 @@ import {
   type ToolGateContext,
 } from "./registry.ts";
 import { createPhoneTools } from "./phone.ts";
+import {
+  JOB_DEFAULT_MINUTES,
+  JOB_MODEL_MAX_MINUTES,
+  JOB_OUTPUT_MAX_BYTES,
+  JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP,
+} from "../../shared/jobs.ts";
+import { JOB_SUMMARY_MAX_CHARS } from "./registry.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -479,5 +486,35 @@ describe("the import cycle stays broken", () => {
     // must not drag the harness in behind it.
     const source = readFileSync(join(HERE, "registry.ts"), "utf8");
     expect(source).not.toMatch(/^\s*import\s/m);
+  });
+});
+
+// Background jobs (P1).  registry.ts imports nothing, so the limits its
+// descriptions state are literals; these rows pin them to the numbers
+// shared/jobs.ts actually enforces.
+describe("the background job records", () => {
+  it("state the limits the registry enforces", () => {
+    const start = harnessTool("job_start")!;
+    expect(start.description).toContain(`${JOB_DEFAULT_MINUTES} minutes unless you set timeout_minutes, at most ${JOB_MODEL_MAX_MINUTES}`);
+    const output = harnessTool("job_output")!;
+    expect(output.description).toContain(`at most ${JOB_OUTPUT_MAX_BYTES / 1024} KB`);
+    expect(output.description).toContain(`wait_seconds (at most ${JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP})`);
+    expect(output.timeoutMs).toBeGreaterThan(JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP * 1000);
+  });
+
+  it("ask before job_start only, carrying the whole command, and cut only past the card's limit", () => {
+    const start = harnessTool("job_start")!;
+    expect(start.approval?.policy).toBe("ask");
+    expect(start.approval!.summary({ command: "pnpm test &&\n  pnpm build" })).toBe("job: pnpm test && pnpm build");
+    const long = start.approval!.summary({ command: "y".repeat(JOB_SUMMARY_MAX_CHARS + 50) });
+    expect(long.endsWith("…")).toBe(true);
+    for (const name of ["job_output", "job_list", "job_kill"]) expect(harnessTool(name)!.approval).toBeUndefined();
+  });
+
+  it("are offered on the HTTP lane only, and only when jobs are mounted", () => {
+    const names = ["job_start", "job_output", "job_list", "job_kill"];
+    expect(httpToolDefinitions(gate({ jobs: true })).map((t) => t.name)).toEqual(expect.arrayContaining(names));
+    expect(httpToolDefinitions(gate({ jobs: false })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
+    expect(mcpToolDefinitions(gate({ jobs: true })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
   });
 });

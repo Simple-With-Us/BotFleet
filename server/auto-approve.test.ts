@@ -368,3 +368,58 @@ describe("isCoarseApprovalKey", () => {
     });
   });
 });
+
+// Background jobs (jobs P1).  Owner ruling (c), 2026-10-01: a bot in Auto
+// mode starts jobs without asking; every other bot is asked for every
+// `job_start`; and the job namespace never inherits a bash grant.
+describe("job_start approvals", () => {
+  const host = { scope: "local-computer" as const };
+
+  it("keys a job by its program, in a namespace of its own", () => {
+    expect(approvalKey("job_start", "job: pnpm test && pnpm build")).toBe("job:pnpm");
+    expect(approvalKey("job_start", "job: CI=1 sudo /usr/bin/make all", "local-computer")).toBe("local-computer:job:make");
+    expect(approvalKey("bash", "pnpm test", "local-computer")).toBe("local-computer:bash:pnpm");
+  });
+
+  it("starts a full-auto bot's job without a card, compound commands included", () => {
+    const verdict = autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test && pnpm build", host);
+    expect(verdict.approve).toBe("auto-approved local-computer:job:pnpm");
+    expect(verdict.source).toBe("auto-mode");
+  });
+
+  it("asks a bot that is not full-auto for every job start, whatever it always-allows", () => {
+    const bot = {
+      autoApprove: false,
+      alwaysAllow: ["job:pnpm", "local-computer:job:pnpm", "bash:pnpm", "Bash:pnpm", "local-computer:bash:pnpm", "job_start"],
+    };
+    expect(autoVerdict(bot, "job_start", "job: pnpm test", host).approve).toBeNull();
+    expect(autoVerdict(bot, "job_start", "job: pnpm test").approve).toBeNull();
+  });
+
+  it("never offers or stores an Always Allow for a job", () => {
+    expect(offerableApprovalKey("job_start", "job: pnpm test")).toBeUndefined();
+    expect(offerableApprovalKey("job_start", "job: pnpm test", "local-computer")).toBeUndefined();
+    expect(isCoarseApprovalKey("job:pnpm")).toBe(true);
+    expect(coarseAlwaysAllowRefused("job:pnpm")).toBe(true);
+    expect(coarseAlwaysAllowRefused("local-computer:job:pnpm", host)).toBe(true);
+  });
+
+  it("still stops a full-auto bot at the destructive and sensitive guards", () => {
+    expect(autoVerdict({ autoApprove: true }, "job_start", "job: rm -rf ./build", host).source).toBe("destructive-guard");
+    expect(autoVerdict({ autoApprove: true }, "job_start", "job: cat ~/.ssh/id_ed25519", host).source).toBe("sensitive-guard");
+  });
+
+  it("asks when the command was cut to fit the card, so a hidden tail cannot ride Auto mode", () => {
+    const verdict = autoVerdict({ autoApprove: true }, "job_start", `job: ${"x".repeat(1999)}…`, host);
+    expect(verdict.approve).toBeNull();
+    expect(verdict.rule).toBe("command-needs-full-review");
+  });
+
+  it("asks a full-auto bot in an unattended turn — a job's wake turn included", () => {
+    // The judgment call between rulings (b) and (c): a wake turn is
+    // unattended, and an unattended turn never inherits Auto mode.
+    const verdict = autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ...host, unattended: true });
+    expect(verdict.approve).toBeNull();
+    expect(verdict.source).toBe("unattended-block");
+  });
+});
