@@ -16,14 +16,27 @@ const RESTING: TVFaceExpression = "resting";
  * generated ~600ms enter freezes on its last frame for the remainder, because
  * the player waits a fixed time before swapping to the hold. Whoever
  * regenerates the pack must hold enter and return to this duration.
+ *
+ * Urgent expressions skip the enter/return window entirely (see
+ * `TVFACE_URGENT` / `planFrame`) so a 1–4s delay never blocks an error or
+ * approval cue.  `transitionSpeed` scales the wait without re-encoding.
  */
 export const TVFACE_TRANSITION_MS = 1000;
 
-/** Expressions that should cut in/out instantly — no enter/return dwell. */
+/**
+ * Expressions that must land immediately — no enter, no return wait.
+ * Inspired by OpenMausBot/CursorAvatar treatment of alerting (glyph bang,
+ * high jitter): approval / error / crash / scare cues cut mid-animation so the
+ * face is never "busy playing an intro" when the bot needs attention.
+ *
+ * Keep this set small.  Everyday work (thinking, typing) keeps full enter/return.
+ */
 export const TVFACE_URGENT: ReadonlySet<TVFaceExpression> = new Set([
-  "crash",
   "alerting",
+  "crash",
   "angry",
+  "scared",
+  "notifying",
 ]);
 
 export type TVFaceSkin = BotColor | "default";
@@ -34,26 +47,40 @@ export interface TVFaceAvatarProps {
   size?: number;
   label?: string;
   animated?: boolean;
+  /**
+   * Playback speed for transition GIFs only (enter/return).  1 = pack timing
+   * (~1s).  >1 shortens the wait before hold (faster feel without re-encoding).
+   * Hold GIFs always loop at their authored frame delays — browsers cannot
+   * retarget GIF frame rate on an <img>; re-encode with
+   * `scripts/tv-face-retime-gifs.py` if hold speed must change.
+   */
+  transitionSpeed?: number;
 }
 
-/** Skins whose art actually ships under public/tv-face/skins. Blue, green,
- * purple, pink, red, and yellow are PLANNED skins with no assets yet:
- * mapping them to their own directories 404s every GIF and still. Until
- * the art lands, every color renders the default skin — and the profile
- * picker's preview shows exactly what the bot will get.
+/**
+ * Skins whose art ships under public/tv-face/skins.  Orange is the default
+ * pack (directory name `default`).  Every other BotColor that has a folder
+ * is listed here; unlisted colors fall back to default so they never 404.
  *
- * This was previously INVERTED: it named exactly the six skins whose
- * directories did not exist, so a bot set to blue built a 404 path. It is
- * asserted against the real directory listing in tvFaceSkins.test.ts, because
- * a hand-maintained whitelist next to a hand-maintained directory listing is
- * how it drifted in the first place. */
-export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>(["orange"]);
+ * Asserted against the real directory listing in tvFaceSkins.test.ts.
+ */
+export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
+  "orange",
+  "blue",
+  "green",
+  "purple",
+  "pink",
+  "red",
+  "cyan",
+  "yellow",
+  "teal",
+  "coral",
+]);
 
-/** The skins directory a color renders from. `orange` IS the default skin
- * (public/tv-face/skins/default); every unshipped color falls back to it
- * rather than 404ing. */
+/** The skins directory a color renders from.  `orange` IS the default skin. */
 export function tvFaceSkinDir(color: TVFaceSkin): string {
-  return SHIPPED_SKINS.has(color) && color !== "orange" ? color : "default";
+  if (color === "orange" || color === "default") return "default";
+  return SHIPPED_SKINS.has(color) ? color : "default";
 }
 
 export interface TVFaceFrame {
@@ -77,6 +104,27 @@ export type FrameStep = {
   delayAfterMs: number;
 };
 
+export function isUrgentExpression(expr: TVFaceExpression): boolean {
+  return TVFACE_URGENT.has(expr);
+}
+
+/**
+ * Effective wait after an enter/return step.  Urgent targets get 0 so the
+ * player can cut mid-animation.  `speed` scales the normal wait (2 → 500ms).
+ */
+export function transitionDelayMs(
+  kind: "enter" | "return",
+  next: TVFaceExpression,
+  speed = 1,
+): number {
+  if (isUrgentExpression(next)) return 0;
+  // Returning home is never urgent — keep full return for polish unless
+  // planFrame's interrupt path skipped the return entirely.
+  void kind;
+  const s = Math.max(0.25, speed);
+  return Math.round(TVFACE_TRANSITION_MS / s);
+}
+
 /**
  * The sequence of assets to play when moving from one expression to another.
  *
@@ -84,20 +132,18 @@ export type FrameStep = {
  * previously lived inside a useEffect interleaved with setTimeout and could
  * only be exercised by rendering the component.
  *
- * The back-to-back case is the important one. The asset guidelines anchor
- * every `_enter` to resting.png, but a preceding `_hold` ends wherever it
- * ends, so playing an enter on a state-to-state change pops visibly. With
- * enter and return now on all 15 expressions that would happen on EVERY
- * transition, so a change between two active states cuts straight to the new
- * hold: enter only from rest, return only to rest.
+ * `interrupt` (main) skips enter/return when either side is urgent, and can
+ * be forced false to play enter despite an urgent target.  `speed` (skins
+ * branch) scales the enter/return wait without re-encoding GIFs.
  */
-export type PlanFrameOpts = { interrupt?: boolean };
+export type PlanFrameOpts = { interrupt?: boolean; speed?: number };
 
 export function planFrame(
   prev: TVFaceExpression,
   next: TVFaceExpression,
   opts: PlanFrameOpts = {},
 ): FrameStep[] {
+  const speed = opts.speed ?? 1;
   const interrupt =
     opts.interrupt ?? (TVFACE_URGENT.has(prev) || TVFACE_URGENT.has(next));
 
@@ -112,7 +158,7 @@ export function planFrame(
       return [{ expression: RESTING, kind: "still", delayAfterMs: 0 }];
     }
     return [
-      { expression: prev, kind: "return", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: prev, kind: "return", delayAfterMs: transitionDelayMs("return", RESTING, speed) },
       { expression: RESTING, kind: "still", delayAfterMs: 0 },
     ];
   }
@@ -122,7 +168,7 @@ export function planFrame(
       return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
     }
     return [
-      { expression: next, kind: "enter", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: next, kind: "enter", delayAfterMs: transitionDelayMs("enter", next, speed) },
       { expression: next, kind: "hold", delayAfterMs: 0 },
     ];
   }
@@ -163,6 +209,7 @@ function initialFrameMedia(
   expression: TVFaceExpression,
   skinDir: string,
   animated: boolean,
+  speed: number,
 ): { src: string; imgKey: string; holdEpoch: number } {
   if (!animated) {
     return {
@@ -176,7 +223,7 @@ function initialFrameMedia(
   const nextFrame: TVFaceFrame = { expression, skin: skinDir };
 
   if (tvFaceFrameChanged(prevFrame, nextFrame)) {
-    const step = planFrame(prevFrame.expression, expression)[0];
+    const step = planFrame(prevFrame.expression, expression, { speed })[0];
     return {
       src: pathForStepMedia(skinDir, step, true),
       imgKey: imgKeyForStep(skinDir, step, step.kind === "hold" ? 1 : 0),
@@ -197,16 +244,18 @@ export function TVFaceAvatar({
   size = 44,
   label,
   animated = true,
+  transitionSpeed = 1,
 }: TVFaceAvatarProps) {
   const expression = TVFACE_MANIFEST[state] || RESTING;
   const skinDir = tvFaceSkinDir(color);
 
-  const initialFrame = useRef(initialFrameMedia(expression, skinDir, animated));
+  const initialFrame = useRef(initialFrameMedia(expression, skinDir, animated, transitionSpeed));
   const [currentGif, setCurrentGif] = useState(initialFrame.current.src);
   const [imgKey, setImgKey] = useState(initialFrame.current.imgKey);
   const holdEpochRef = useRef(initialFrame.current.holdEpoch);
   const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const prevSpeed = useRef<number>(transitionSpeed);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) =>
     tvFaceAssetPath(skinDir, expr, type, animated, isStill);
@@ -222,11 +271,15 @@ export function TVFaceAvatar({
     }
 
     const prev = previousFrame.current;
+    // A speed-only change must re-plan the wait with the new delay: the
+    // frame comparison below would otherwise compare the frame against
+    // itself and skip planFrame, leaving the in-flight wait unscaled.
+    const speedChanged = prevSpeed.current !== transitionSpeed;
 
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
 
-    if (tvFaceFrameChanged(prev, { expression, skin: skinDir })) {
-      const steps = planFrame(prev.expression, expression);
+    if (tvFaceFrameChanged(prev, { expression, skin: skinDir }) || speedChanged) {
+      const steps = planFrame(prev.expression, expression, { speed: transitionSpeed });
       let i = 0;
       const advance = () => {
         const step = steps[i];
@@ -251,15 +304,17 @@ export function TVFaceAvatar({
     }
 
     previousFrame.current = { expression, skin: skinDir };
+    prevSpeed.current = transitionSpeed;
 
     return () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
     };
-  }, [expression, animated, color]);
+    // transitionSpeed intentionally included: changing it re-plans the wait.
+  }, [expression, animated, color, skinDir, transitionSpeed]);
 
   return (
-    <div 
-      className="inline-flex shrink-0 relative overflow-hidden" 
+    <div
+      className="inline-flex shrink-0 relative overflow-hidden"
       style={{ width: size, height: size }}
       title={label}
     >
@@ -273,9 +328,9 @@ export function TVFaceAvatar({
           const target = e.currentTarget;
           const stillSrc = getAssetPath(expression, "hold", true);
           const restSrc = getAssetPath("resting", "hold", true);
-          if (target.src.includes(".gif") && !target.src.endsWith(stillSrc)) {
+          if (target.src.includes(".gif") && !target.src.includes(stillSrc)) {
             target.src = stillSrc;
-          } else if (!target.src.endsWith(restSrc)) {
+          } else if (!target.src.includes(restSrc)) {
             target.src = restSrc;
           }
         }}
