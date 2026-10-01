@@ -131,9 +131,12 @@ export function IoBlock({
       </div>
       <pre
         tabIndex={0}
+        role="region"
         aria-label={label}
         className={cn(
-          "max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-inset px-2 py-1.5",
+          // recessed into whatever panel opened it: the same well the
+          // Trajectory's clipped blocks use, so it reads in every skin
+          "max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md border border-hairline/30 bg-app px-2 py-1.5",
           "font-mono text-[11.5px] leading-relaxed select-text",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus",
           tone === "danger" ? "text-danger" : "text-ink",

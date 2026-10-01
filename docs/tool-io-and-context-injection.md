@@ -34,7 +34,7 @@ across turns).
 
 - Drivers attach a bounded `io` capture to `item.started` and `item.completed`
   (`shared/item-io.ts`: Claude, Codex, ACP engines, Pi, Antigravity, the Box
-  agent and the HTTP tool loop).  The headline fields are unchanged.
+  runner and the HTTP tool loop).  The headline fields are unchanged.
 - `EventBus.publish` moves the capture into the store and strips it, so the wire,
   the subscribers and the event log never carry it.  An HTTP engine's full
   `arguments` are filed as the input with no driver change.
