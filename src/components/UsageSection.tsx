@@ -127,6 +127,10 @@ export interface DoomedPair {
   /** Whether this entry is refusing dispatches right now.  Absent on a server
    *  that predates the flag — treated as open, which is the old behaviour. */
   open?: boolean;
+  /** Whether an OPEN breaker here is actually holding this bot, i.e. the
+   *  engine it names is the one the bot would use.  An open breaker on a
+   *  fallback engine outlives the primary's recovery and holds nothing. */
+  holds?: boolean;
 }
 
 /** One bot whose configured fallback chain is longer than the runtime will
@@ -372,7 +376,12 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   // entries, both of which dispatch normally. Rendering every row of it as
   // "held" would report a healthy engine as held after one transient failure,
   // so only the entries that are actually refusing are shown.
-  const heldPairs = doomed.filter((pair) => pair.open !== false);
+  // `holds`, not `open`. An open breaker on a FALLBACK engine does not hold the
+  // bot — the primary still dispatches, and the dispatcher only consults the
+  // engine the run would actually use. The server answers that with the same
+  // question the dispatcher asks, so the panel does not have to re-derive it
+  // from a list that knows nothing about a bot's selection.
+  const heldPairs = doomed.filter((pair) => pair.holds ?? pair.open === true);
   // Count BOTS, not pairs. One bot whose primary and fallback both opened
   // breakers is one bot being held, and a heading that says otherwise sends the
   // reader looking for a bot that does not exist.
@@ -774,7 +783,20 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
                 // collided, and counting rows claimed several bots where there
                 // was one.
                 <li key={`${chain.botId}:${chain.scope ?? "bot"}:${chain.threadId ?? "-"}`}>
-                  <span className="font-medium text-ink">{chain.name}</span> — {chain.total} configured,{" "}
+                  <span className="font-medium text-ink">{chain.name}</span>
+                  {/* Without this, a Projects bot with task overrides shows one
+                      unnamed row per task and the operator cannot tell which
+                      chain to fix. */}
+                  {chain.scope === "task" && (
+                    <>
+                      {"\u00a0\u00a0"}
+                      <span className="font-mono text-ink-secondary">
+                        task {chain.threadId ? chain.threadId.slice(0, 8) : "?"}
+                      </span>
+                    </>
+                  )}
+                  {" — "}
+                  {chain.total} configured,{" "}
                   {chain.effective} usable
                   {chain.redundant.map((entry) => (
                     <span key={`${entry.instanceId}:${entry.model}`}>
