@@ -1420,11 +1420,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
        *  messages (a turn the CLI started on its own, still running when this
        *  turn's message arrived): the message waits in the CLI's queue, and
        *  nothing said before the CLI takes it is this turn's. */
-      const dropForeign = (frame: { type?: unknown; subtype?: unknown }) => {
+      const dropForeign = (frame: { type?: unknown; subtype?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        // a status or hook frame of an idle CLI says nothing about a turn
+        if (!startsUnsolicitedTurn(frame)) return;
         unsolicitedFrames.dropped++;
         if (session.foreignRunning) return;
         session.foreignRunning = true;
-        const subtype = typeof frame.subtype === "string" ? `/${frame.subtype}` : "";
+        const subtype = meta.subtype === undefined ? "" : `/${meta.subtype}`;
         console.warn(
           `[claude] thread ${threadTag(threadId)}: the CLI is running a turn of its own ahead of this turn's message ` +
             `(${String(frame.type)}${subtype}); dropping its frames`,
@@ -1497,6 +1499,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
+        // every stream-json frame is an object; anything else says nothing
+        if (o === null || typeof o !== "object") return;
         const meta = FrameMeta.parse(o);
         if (o.type === "command_lifecycle") {
           onLifecycle(o, meta);
@@ -1511,7 +1515,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // answers; a result is judged by the messages it consumed.
           if (meta.user_message_uuid !== undefined && session.turn.sends.has(meta.user_message_uuid)) engage(meta.user_message_uuid);
           else if (o.type !== "result") {
-            dropForeign(o);
+            dropForeign(o, meta);
             return;
           }
         }
