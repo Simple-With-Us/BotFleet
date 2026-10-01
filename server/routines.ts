@@ -1241,10 +1241,18 @@ export class RoutineManager {
           //  no thread and no destination, so judging a hold there put the
           //  local spend ceiling and the local credential gate in front of
           //  CLOUD runs.
-          run.holdReason = this.options.dispatchHoldReason?.(run.botId, threadId, run.runOn)
+          const reason = this.options.dispatchHoldReason?.(run.botId, threadId, run.runOn)
             ?? "Its engine is not available right now";
-          this.save();
-          this.emitRun(run);
+          // Persist and emit only on a CHANGE. The scheduler ticks every ten
+          // seconds, so an unchanged hold was writing the whole state file and
+          // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
+          // writes a day for one sustained hold, scaling with queue depth.
+          // A client that already has this run is already showing this reason.
+          if (reason !== run.holdReason) {
+            run.holdReason = reason;
+            this.save();
+            this.emitRun(run);
+          }
           continue;
         }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1304,6 +1312,11 @@ export class RoutineManager {
         for (const folded of waiting) {
           folded.status = "running";
           folded.coalescedInto = run.id;
+          // This child is about to run on the owner's turn, so a hold reason
+          // left on it would be a lie by the time its receipt says
+          // "completed" — and `copyCombinedOutcome` does not overwrite the
+          // field. Cleared where the fold happens.
+          folded.holdReason = undefined;
           folded.threadId = threadId;
           folded.startedAt = run.startedAt;
           folded.finishedAt = undefined;
