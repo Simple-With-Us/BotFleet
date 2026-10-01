@@ -1732,6 +1732,69 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     }
   });
 
+  it("never answers a fresh request from a sweep that started in the same millisecond before it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const gate = deferred<void>();
+      const fake = makeFakeDriver({
+        snapshotImpl: async (_input, call) => {
+          if (call === 2) await gate.promise;
+          return { state: "available", version: `v${call}` };
+        },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      await registry.describe();
+      vi.setSystemTime(Date.now() + 1_000);
+      // A passive sweep starts, and "Check again" arrives in the same
+      // millisecond (the clock is frozen).
+      void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+      const fresh = registry.describe();
+      gate.resolve();
+      expect((await fresh)[0].snapshot.version).toBe("v3");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never stamps a describe from engine-cache.json later than now", async () => {
+    const tmpDir = join(tmpdir(), `botfleet-future-cache-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const cachePath = join(tmpDir, "engine-cache.json");
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(cachePath, JSON.stringify({
+      // Written before the clock was set back an hour.
+      at: Date.now() + 60 * 60_000,
+      instances: [{
+        instanceId: "a",
+        driverKind: "fake",
+        displayName: "A",
+        enabled: true,
+        snapshot: { state: "available", version: "cached" } as const,
+        models: { default: "m1", options: [{ id: "m1", label: "Model 1" }] },
+        capabilities: { computerMcp: false, agentsMcp: false, localComputerMcp: false },
+        computerReach: { local: false, box: false, vps: false },
+        access: "subscription",
+        cliCandidates: [],
+        fullAuto: false,
+      }],
+    }));
+    try {
+      const fake = makeFakeDriver({ snapshotImpl: () => ({ state: "available", version: "live" }) });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      registry.setDiskCachePath(cachePath);
+      const cached = await registry.describe({ maxAgeMs: 60 * 60_000 * 2 });
+      expect(cached[0].snapshot.version).toBe("cached");
+      expect(registry.describedAtOf(cached)!).toBeLessThanOrEqual(Date.now());
+      const live = await registry.describe();
+      expect(live[0].snapshot.version).toBe("live");
+      // The client keeps whichever has the later stamp: the live answer.
+      expect(registry.describedAtOf(live)!).toBeGreaterThan(registry.describedAtOf(cached)!);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("looks again on its own at an engine it could only report as checking", async () => {
     const fake = makeFakeDriver({
       snapshotImpl: (_input, call) =>

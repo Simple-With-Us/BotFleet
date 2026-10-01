@@ -451,8 +451,19 @@ export class ProviderRegistry {
    *  will wait (see DEFAULT_TRANSIENT_RECHECK_MS). */
   private recheckTimer: ReturnType<typeof setTimeout> | null = null;
   private recheckDelayMs = 0;
-  /** The describedAt of the last commit (see commit()). */
-  private lastDescribedAt = 0;
+  /** The last value stamp() handed out. */
+  private lastStamp = 0;
+
+  /** A strictly increasing clock (ms since epoch, nudged forward on a tie)
+   * for everything this registry orders: when a sweep or probe started, when
+   * a caller asked, and each commit's describedAt.  Two events in the same
+   * millisecond never compare equal, so "started no earlier than the
+   * request" is never met by work that began before it. */
+  private stamp(atLeast: number = Date.now()): number {
+    const at = Math.max(atLeast, this.lastStamp + 1);
+    this.lastStamp = at;
+    return at;
+  }
 
   /** Subscribe to completed describes that changed the answer — a finished
    * background sweep, a single-engine refresh, a slow probe landing late. */
@@ -493,7 +504,10 @@ export class ProviderRegistry {
       // without staleWhileRevalidate does not treat a cache written minutes
       // or hours ago as if it just landed.
       const legacy = Array.isArray(parsed);
-      const at = legacy ? Date.now() : typeof parsed?.at === "number" ? parsed.at : Date.now();
+      // Never from the future (a clock corrected since, a restored VM): a
+      // later stamp than now would outrank every live answer on the client
+      // until the clock caught up, and never age out of a maxAgeMs memo.
+      const at = Math.min(legacy ? Date.now() : typeof parsed?.at === "number" ? parsed.at : Date.now(), Date.now());
       const instances = legacy ? parsed : parsed?.instances;
       if (Array.isArray(instances) && instances.length > 0) {
         const seeded = (instances as DescribedInstance[]).map(seedFromDisk);
@@ -570,7 +584,7 @@ export class ProviderRegistry {
     // No memo at all: the user's own action ("Check again", a just-created
     // or just-deleted engine) must never be served a sweep that started
     // before it.
-    return this.freshSweep(now);
+    return this.freshSweep(this.stamp());
   }
 
   /** Join the running sweep of the current fleet, or start one. */
@@ -588,7 +602,7 @@ export class ProviderRegistry {
     if (!running || running.generation !== this.sweepKey()) return this.startSweep(requestedAt);
     if (running.startedAt >= requestedAt) return running.promise;
     if (!this.trailing) {
-      const createdAt = Date.now();
+      const createdAt = this.stamp();
       const promise: Promise<DescribedInstance[]> = running.promise
         .then(() => undefined, () => undefined)
         .then(() => {
@@ -606,7 +620,7 @@ export class ProviderRegistry {
 
   private startSweep(notBefore: number): Promise<DescribedInstance[]> {
     const generation = this.sweepKey();
-    const startedAt = Date.now();
+    const startedAt = this.stamp();
     // notBefore 0: this caller accepts any answer still being produced, so a
     // slow engine's probe left running by an earlier sweep is joined rather
     // than spawned a second time.
@@ -637,8 +651,7 @@ export class ProviderRegistry {
     // Strictly increasing, so two different answers never share a stamp and
     // the client's describedAt guard is a total order: the last commit wins
     // wherever its REST response and SSE push arrive in between.
-    const at = Math.max(answeredAt, this.lastDescribedAt + 1);
-    this.lastDescribedAt = at;
+    const at = this.stamp(answeredAt);
     const previous = this.lastDone;
     this.lastDone = { at, result };
     this.describedAtByResult.set(result, at);
@@ -699,7 +712,7 @@ export class ProviderRegistry {
    * engine's last definitive snapshot, persist, and return the list.  Public
    * for tests; callers go through describe(). */
   async describeFresh(opts?: { notBefore?: number }): Promise<DescribedInstance[]> {
-    const notBefore = opts?.notBefore ?? Date.now();
+    const notBefore = opts?.notBefore ?? this.stamp();
     const sweepKeyAtStart = this.sweepKey();
     // Multiple instances may share a driver. Scan each default binary once
     // per response instead of repeating filesystem work for every row.
@@ -750,7 +763,7 @@ export class ProviderRegistry {
     const id = entry.instanceId;
     const running = this.entryProbes.get(id);
     if (running && running.gen === gen && running.startedAt >= notBefore) return running.promise;
-    const startedAt = Date.now();
+    const startedAt = this.stamp();
     const seq = ++this.probeSeq;
     const promise = this.describeEntry(entry, candidatesByName).then((raw) => this.settleEntry(raw, gen, seq));
     const slot = { startedAt, seq, gen, promise };
@@ -1254,7 +1267,7 @@ export class ProviderRegistry {
 
     // A probe that starts now: the caller just changed this engine.
     const gen = this.genOf(instanceId);
-    const freshInfo = await this.probeEntryWithDeadline(entry, new Map(), Date.now(), gen);
+    const freshInfo = await this.probeEntryWithDeadline(entry, new Map(), this.stamp(), gen);
 
     // No completed describe to patch yet, but one is running: it will pick
     // this answer up (newestFor), so wait for it rather than starting a
