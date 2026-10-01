@@ -13,27 +13,46 @@ describe("effectiveFallbackTiers", () => {
     });
   });
 
-  it("names a fallback that is a second copy of the primary", () => {
-    // The state two live bots were in: a third fallback configured as the
-    // primary itself. The runtime skips it — `sameEngine()` drops any
-    // candidate equal to the engine that just failed — so the chain has two
-    // real tiers, not three, and the settings panel said three.
+  it("does NOT call a trailing repeat of the primary redundant", () => {
+    // A correction to an earlier reading of this code, and the reason the
+    // original analysis was wrong. `selectTurnFallback` compares a candidate
+    // with `input.current` — the engine that JUST failed — and not with
+    // everything walked. So in A -> f1 -> A the trailing A is compared with f1,
+    // differs, and is selected. Three hops, all reachable.
+    //
+    // Two live bots are configured exactly this way and I had reported them as
+    // broken. They are not. Only an ADJACENT repeat is dead weight.
     const primary = at("grok", "grok-4.6");
     const chain = [at("minimax", "MiniMax-M3"), primary];
-    const verdict = effectiveFallbackTiers(primary, chain);
-    expect(verdict.total).toBe(3);
-    expect(verdict.effective).toBe(2);
-    expect(verdict.redundant).toEqual([{ instanceId: "grok", model: "grok-4.6", reason: "same-as-primary" }]);
+    expect(effectiveFallbackTiers(primary, chain)).toMatchObject({ total: 3, effective: 3, redundant: [] });
   });
 
-  it("also names a fallback that repeats an earlier fallback", () => {
-    // `sameEngine` skips those too, for the same reason and at the same moment.
+  it("names an ADJACENT repeat, and only an adjacent one", () => {
+    // `selectTurnFallback` compares a candidate with the engine that just
+    // failed, not with everything seen. So B after B is dead weight, while A
+    // after B is a real hop: the first failure picks B, B then fails, and the
+    // trailing A is exactly what the walk reaches next.
     const primary = at("antigravity", "gemini-3.1-pro");
-    const chain = [at("dsh", "MiniMax-M3"), at("dsh", "MiniMax-M3"), at("grok", "grok-4.7")];
-    const verdict = effectiveFallbackTiers(primary, chain);
-    expect(verdict.total).toBe(4);
-    expect(verdict.effective).toBe(3);
-    expect(verdict.redundant).toEqual([{ instanceId: "dsh", model: "MiniMax-M3", reason: "duplicate" }]);
+    expect(effectiveFallbackTiers(primary, [at("dsh", "MiniMax-M3"), at("dsh", "MiniMax-M3"), at("grok", "grok-4.7")]))
+      .toMatchObject({ total: 4, effective: 3 });
+  });
+
+  it("counts A -> B -> A as fully reachable", () => {
+    // A regression this caught: an earlier, global dedup reported this as two
+    // usable tiers out of four, which would have told the owner to fix a chain
+    // the runtime walks end to end.
+    const primary = at("grok", "grok-4.6");
+    const chain = [at("dsh", "MiniMax-M3"), primary];
+    expect(effectiveFallbackTiers(primary, chain)).toMatchObject({ total: 3, effective: 3, redundant: [] });
+  });
+
+  it("reports the primary repeated straight after itself", () => {
+    const primary = at("grok", "grok-4.6");
+    expect(effectiveFallbackTiers(primary, [primary])).toMatchObject({
+      total: 2,
+      effective: 1,
+      redundant: [{ instanceId: "grok", model: "grok-4.6", reason: "same-as-primary" }],
+    });
   });
 
   it("treats a different model on one engine as a real tier", () => {

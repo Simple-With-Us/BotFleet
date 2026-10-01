@@ -211,7 +211,7 @@ export interface RoutineManagerOptions {
   /** Why this bot's work is being held, for a run that stays QUEUED rather
    *  than being dispatched or failed.  Optional: without it a held run says
    *  only that its engine is unavailable, which is true and useless. */
-  dispatchHoldReason?: (botId: string) => string | undefined;
+  dispatchHoldReason?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => string | undefined;
   /** Minutes this run's trigger must stay quiet after it activates.  Absent
    * or 0 runs every delivery as it lands. */
   minGapMinutes?: (run: RoutineRun) => number | undefined;
@@ -1025,16 +1025,6 @@ export class RoutineManager {
           this.failRun(run, "The assigned Bot no longer exists");
           continue;
         }
-        if (state === "blocked") {
-          // Held, not failed.  The engine that refused is the bot's own
-          // problem, not this run's: a half-finished check or a missing CLI
-          // will still be there in fifteen minutes, and failing the run would
-          // throw away work that is one good tick from landing.  The reason
-          // goes on the run so the receipt and the diagnostics list can say
-          // why it is waiting instead of the run looking stuck.
-          run.holdReason = this.options.dispatchHoldReason?.(run.botId) ?? "Its engine is not available right now";
-          continue;
-        }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
         // and the whole batch goes into one turn when the gap closes, which
@@ -1107,7 +1097,25 @@ export class RoutineManager {
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
         // retries must not mint duplicate empty tasks as a side effect.
-        if (this.options.canStart?.(run.botId, threadId, run.runOn) === false) continue;
+        if (this.options.canStart?.(run.botId, threadId, run.runOn) === false) {
+          // Held, not failed.  The engine that refused is the bot's own problem,
+          // not this run's: a missing CLI will still be missing in fifteen
+          // minutes, and failing the run would throw away work that is one good
+          // tick from landing.  The reason goes on the run, and is saved and
+          // emitted so the receipt can say why it is waiting — a run that sits
+          // QUEUED with no explanation is indistinguishable from a stuck
+          // scheduler, which is the whole reason this exists.
+          //
+          //  Evaluated HERE rather than from `botState` because that call has
+          //  no thread and no destination, so judging a hold there put the
+          //  local spend ceiling and the local credential gate in front of
+          //  CLOUD runs.
+          run.holdReason = this.options.dispatchHoldReason?.(run.botId, threadId, run.runOn)
+            ?? "Its engine is not available right now";
+          this.save();
+          this.emitRun(run);
+          continue;
+        }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
         if (!threadId) {
           const task = this.options.createTask(

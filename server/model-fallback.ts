@@ -400,20 +400,25 @@ export function effectiveFallbackTiers(
   fallbacks: readonly { instanceId: string; model: string }[] | null | undefined,
 ): { total: number; effective: number; redundant: RedundantFallback[] } {
   const redundant: RedundantFallback[] = [];
-  const seen = new Set<string>([sameEngine.key(primary)]);
+  // `previous` is the engine the runtime would have just failed, which is the
+  // only thing `selectTurnFallback` compares against. It is NOT everything seen
+  // so far: an earlier, global dedup reported A -> B -> A as two tiers when the
+  // runtime walks all three.
+  let previous = primary;
   let effective = 1;
   for (const candidate of fallbacks ?? []) {
-    const key = sameEngine.key(candidate);
-    const reason = sameEngine(primary, candidate)
-      ? "same-as-primary" as const
-      : seen.has(key)
-        ? "duplicate" as const
-        : null;
-    if (reason) {
-      redundant.push({ instanceId: candidate.instanceId, model: candidate.model, reason });
+    if (sameEngine(previous, candidate)) {
+      redundant.push({
+        instanceId: candidate.instanceId,
+        model: candidate.model,
+        reason: sameEngine(primary, candidate) ? "same-as-primary" : "duplicate",
+      });
+      // `previous` deliberately does NOT advance: a skipped entry was never a
+      // hop, so the next candidate is still being weighed against the engine
+      // that actually failed.
       continue;
     }
-    seen.add(key);
+    previous = candidate;
     effective++;
   }
   return { total: (fallbacks?.length ?? 0) + 1, effective, redundant };

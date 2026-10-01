@@ -123,6 +123,9 @@ export interface DoomedPair {
   openedAt: number;
   lastFailureAt: number;
   lastError?: string;
+  /** Whether this entry is refusing dispatches right now.  Absent on a server
+   *  that predates the flag — treated as open, which is the old behaviour. */
+  open?: boolean;
 }
 
 /** One bot whose configured fallback chain is longer than the runtime will
@@ -351,6 +354,11 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     const quotaInterval = setInterval(fetchQuotas, 30_000);
     return () => clearInterval(quotaInterval);
   }, []);
+  // `doomed` also carries sub-threshold counters and expired half-open
+  // entries, both of which dispatch normally. Rendering every row of it as
+  // "held" would report a healthy engine as held after one transient failure,
+  // so only the entries that are actually refusing are shown.
+  const heldPairs = doomed.filter((pair) => pair.open !== false);
   const badge = telemetryBadge(telemetryStatus, telemetryFetchError);
   // Whatever host the operator pointed this at — never a built-in name.
   const host = telemetryHost(telemetryStatus);
@@ -708,18 +716,18 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
             {localQuotaNotice}
           </div>
         )}
-        {doomed.length > 0 && (
+        {heldPairs.length > 0 && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
             <div className="font-medium text-ink">
-              {doomed.length === 1 ? "1 bot is being held" : `${doomed.length} bots are being held`}
+              {heldPairs.length === 1 ? "1 bot is being held" : `${heldPairs.length} bots are being held`}
             </div>
             <div className="mt-1">
-              These bots cannot start their engine, so their scheduled work is queued rather than failed — it
-              runs on its own once the engine comes back. Each attempt is being counted, so this is not a
-              stuck scheduler.
+              These bots cannot start their engine, so their scheduled work is queued rather than failed
+              &#8212; it runs on its own once the engine comes back.  Each attempt is being counted, so this
+              is not a stuck scheduler.
             </div>
             <ul className="mt-1.5 space-y-0.5">
-              {doomed.map((pair) => (
+              {heldPairs.map((pair) => (
                 <li key={`${pair.botId}:${pair.instanceId}`}>
                   <span className="font-mono">{pair.instanceId}</span> for bot{" "}
                   <span className="font-mono">{pair.botId.slice(0, 8)}</span> — failed to start{" "}

@@ -1,10 +1,9 @@
-import { BotDispatchState } from "../shared/bot-profile.ts";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { nextOccurrence, RoutineManager, type RoutineManagerOptions } from "./routines.ts";
+import { nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn } from "./routines.ts";
 
 const dirs: string[] = [];
 
@@ -1801,17 +1800,15 @@ describe("acknowledge one trigger without touching another", () => {
 });
 
 describe("a held run explains itself", () => {
-  it("records WHY a run is queued instead of sitting there looking stuck", async () => {
-    // The failure this fixes, end to end. A dead engine made `canStart` return
-    // false, the scheduler did `continue`, and the run sat QUEUED with no
-    // explanation anywhere: the receipt said "queued", the roster said
-    // "ready", and the only symptom was automation that had stopped. Fifteen
-    // minutes of a run refusing to start with nothing to read.
+  /** A routine that is due, with canStart refusing and a reason to give.
+   *  Accepts either a fixed string or the real three-argument signature, so a
+   *  test can assert on the thread and destination it was handed. */
+  async function held(
+    reason?: string | RoutineManagerOptions["dispatchHoldReason"],
+  ) {
     const h = harness();
-    let hold = "DeepSeek Harness could not start 3 times in a row";
-    h.options.botState = () => "blocked" as BotDispatchState;
-    h.options.dispatchHoldReason = () => hold;
-
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = typeof reason === "function" ? reason : () => reason;
     const routine = h.manager.create({
       name: "Compile gates",
       prompt: "Run the gate",
@@ -1820,22 +1817,52 @@ describe("a held run explains itself", () => {
     });
     h.setNow(routine.nextRunAt!);
     await h.manager.tick();
+    return h;
+  }
 
+  it("records WHY a run is queued instead of sitting there looking stuck", async () => {
+    // The failure this fixes, end to end. A dead engine made canStart return
+    // false, the scheduler did `continue`, and the run sat QUEUED with nothing
+    // to read: the receipt said "queued", nothing said the engine was dead, and
+    // the only symptom was automation that had stopped.
+    const h = await held("DeepSeek Harness could not start 3 times in a row");
     const [run] = h.manager.listRuns();
     expect(run.status).toBe("queued");
-    expect(run.holdReason).toBe(hold);
+    expect(run.holdReason).toBe("DeepSeek Harness could not start 3 times in a row");
     expect(h.started).toHaveLength(0);
+    expect(h.failed).toHaveLength(0);
+  });
+
+  it("emits and persists the reason, so a client can read it", async () => {
+    // A reason set in memory only is not a reason: on restart it is gone, and
+    // the receipt a person opens never saw it.
+    const h = await held("Grok is waiting on a credential");
+    expect(h.emitted.some((event) => (event as { run?: { holdReason?: string } }).run?.holdReason))
+      .toBe(true);
+    h.manager.flushNow();
+    expect(new RoutineManager(h.options).listRuns()[0].holdReason).toBe("Grok is waiting on a credential");
+  });
+
+  it("passes the run's own destination, so a cloud run is judged as cloud", async () => {
+    // The P1 this replaced. botState has no runOn, so evaluating the hold there
+    // hardcoded "bot" and put the local spend ceiling in front of CLOUD runs.
+    const seen: string[] = [];
+    const h = await held((_botId: string, _threadId: string | undefined, runOn: RoutineRunOn) => {
+      seen.push(runOn);
+      return `held for ${runOn}`;
+    });
+    expect(seen).toContain("bot");
+    expect(h.manager.listRuns()[0].holdReason).toBe("held for bot");
   });
 
   it("keeps the reason current as the cause changes", async () => {
     // A stale reason is worse than none: it names an engine that is fine now
     // and sends the reader to reinstall a working CLI.
     const h = harness();
-    const reasons: string[] = ["dsh-agent could not start 3 times in a row", "Grok is waiting on a credential"];
+    const reasons = ["dsh-agent could not start 3 times in a row", "Grok is waiting on a credential"];
     let call = 0;
-    h.options.botState = () => "blocked" as BotDispatchState;
+    h.setCanStart(false);
     h.options.dispatchHoldReason = () => reasons[Math.min(call++, reasons.length - 1)];
-
     const routine = h.manager.create({
       name: "Compile gates",
       prompt: "Run the gate",
@@ -1847,24 +1874,13 @@ describe("a held run explains itself", () => {
     expect(h.manager.listRuns()[0].holdReason).toBe(reasons[0]);
     h.setNow(routine.nextRunAt! + 1_000);
     await h.manager.tick();
-    expect(h.manager.listRuns()[0].holdReason).toBe(reasons.at(-1));
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[1]);
   });
 
   it("falls back to a plain statement when no reason is available", async () => {
-    // A reason is better than silence, but a wrong-looking one is not required
-    // to be present: the option is optional, so the run must still read
-    // sensibly without it.
-    const h = harness();
-    h.options.botState = () => "blocked" as BotDispatchState;
-    h.options.dispatchHoldReason = undefined;
-    const routine = h.manager.create({
-      name: "Compile gates",
-      prompt: "Run the gate",
-      botId: "maus-1",
-      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
-    });
-    h.setNow(routine.nextRunAt!);
-    await h.manager.tick();
+    // A reason is better than silence, but it is not required to be present:
+    // the option is optional, so the run must still read sensibly without it.
+    const h = await held(undefined);
     const [run] = h.manager.listRuns();
     expect(run.status).toBe("queued");
     expect(run.holdReason).toMatch(/engine is not available/i);
@@ -1873,47 +1889,13 @@ describe("a held run explains itself", () => {
   it("clears the reason once the run finally dispatches", async () => {
     // Otherwise the first successful run carries the previous failure's
     // explanation forever.
-    const h = harness();
-    h.options.botState = () => "blocked" as BotDispatchState;
-    h.options.dispatchHoldReason = () => "dsh-agent could not start";
-    const routine = h.manager.create({
-      name: "Compile gates",
-      prompt: "Run the gate",
-      botId: "maus-1",
-      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
-    });
-    h.setNow(routine.nextRunAt!);
-    await h.manager.tick();
+    const h = await held("dsh-agent could not start");
     expect(h.manager.listRuns()[0].holdReason).toBeTruthy();
-
-    h.options.botState = () => "ready" as BotDispatchState;
-    h.setNow(routine.nextRunAt! + 1_000);
+    h.setCanStart(true);
+    h.setNow(h.manager.listRuns()[0].scheduledFor + 1_000);
     await h.manager.tick();
     const [run] = h.manager.listRuns();
     expect(run.status).toBe("running");
     expect(run.holdReason).toBeUndefined();
-  });
-
-  it("does NOT treat blocked as busy or missing", async () => {
-    // The specific reason the fourth value was worth adding. The loop reads
-    // `if (busy) continue; if (missing) failRun(...)` and then dispatches, so
-    // a `blocked` value that fell through reached the dispatch attempt and was
-    // refused further down by the very gate that produced it — looking like a
-    // fix while changing nothing, and failing the run would have thrown away
-    // work one good tick from landing.
-    const h = harness();
-    h.options.botState = () => "blocked" as BotDispatchState;
-    h.options.dispatchHoldReason = () => "held";
-    const routine = h.manager.create({
-      name: "Compile gates",
-      prompt: "Run the gate",
-      botId: "maus-1",
-      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
-    });
-    h.setNow(routine.nextRunAt!);
-    await h.manager.tick();
-    expect(h.manager.listRuns()).toMatchObject([{ status: "queued" }]);
-    expect(h.failed).toHaveLength(0);
-    expect(h.started).toHaveLength(0);
   });
 });
