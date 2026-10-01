@@ -41,6 +41,15 @@ const instances: Record<string, FixtureInstance> = {
   codexNewer: { driverKind: "codex", models: CODEX_LIVE_NEWER },
   grok: { driverKind: "grokAgent", models: STATIC_GROK_MODELS },
   grokApi: { driverKind: "grok", models: { default: "grok-4.7", options: [{ id: "grok-4.7", label: "Grok 4.7" }] } },
+  // A Claude engine whose operator added a custom row under an id that reads
+  // like an official, newer Sonnet (a proxy that serves its own "sonnet-6").
+  claudeCustom: {
+    driverKind: "claudeAgent",
+    models: {
+      default: STATIC_CLAUDE_MODELS.default,
+      options: [...STATIC_CLAUDE_MODELS.options, { id: "claude-sonnet-6", label: "Proxy Sonnet 6", custom: true }],
+    },
+  },
   // A Grok CLI whose config.toml adds its own row under a retired id.
   grokCustom: {
     driverKind: "grokAgent",
@@ -398,17 +407,62 @@ describe("checkLineageWrite", () => {
     expect(write({ instanceId: "codex", model: "gpt-5.6-luna", latest: "sonnet" }).ok).toBe(false);
   });
 
-  it("accepts a Latest that fits: a member of the class, a retired id on its successor, a custom id, a saved leftover", () => {
+  it("accepts a Latest that fits: a member of the class, a retired id on its successor, a saved leftover", () => {
     expect(write({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }).ok).toBe(true);
     expect(write({ instanceId: "claude", model: "claude-3-7-sonnet", latest: "sonnet" }).ok).toBe(true);
     expect(write({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }).ok).toBe(true);
-    expect(write({ instanceId: "grokCustom", model: "grok-3-mini", latest: "grok" }).ok).toBe(true);
     // A saved entry the write merely re-sends is not judged again, so a
     // leftover cannot block editing another slot.
     const leftover: ModelSelection = { instanceId: "claude", model: "claude-opus-5-5", latest: "sonnet" };
     expect(write({ ...leftover, effort: "high" }, leftover).ok).toBe(true);
     // An engine the harness does not know has nothing to check against.
     expect(write({ instanceId: "ghost", model: "whatever", latest: "sonnett" }).ok).toBe(true);
+  });
+
+  describe("a custom catalog row never floats", () => {
+    it("refuses latest on a custom row that reads like an official class member, naming the slot", () => {
+      const primary = write({ instanceId: "claudeCustom", model: "claude-sonnet-6", latest: "sonnet" });
+      expect(primary).toEqual({
+        ok: false,
+        error:
+          'modelSelection.latest "sonnet" in primary cannot apply to custom model "claude-sonnet-6" on instance "claudeCustom" ' +
+          "(a custom catalog row stays pinned — drop the latest field)",
+      });
+      const inFallback = write({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        fallbacks: [{ instanceId: "claudeCustom", model: "claude-sonnet-6", latest: "sonnet" }],
+      });
+      expect(inFallback.ok).toBe(false);
+      expect(!inFallback.ok && inFallback.error).toMatch(/in fallback 1 cannot apply to custom model "claude-sonnet-6"/);
+      // A custom row reading like a retired id (the Grok CLI's own row) is no exception.
+      expect(write({ instanceId: "grokCustom", model: "grok-3-mini", latest: "grok" }).ok).toBe(false);
+    });
+
+    it("still saves the custom row pinned, whether latest is absent or null", () => {
+      expect(write({ instanceId: "claudeCustom", model: "claude-sonnet-6" })).toMatchObject({
+        ok: true,
+        selection: { instanceId: "claudeCustom", model: "claude-sonnet-6" },
+      });
+      const nulled = write({ instanceId: "claudeCustom", model: "claude-sonnet-6" }, undefined, {
+        instanceId: "claudeCustom",
+        model: "claude-sonnet-6",
+        latest: null,
+      });
+      expect(nulled.ok).toBe(true);
+      expect(nulled.ok && nulled.selection.latest).toBeUndefined();
+    });
+
+    it("lets an entry the saved chain already holds through, so a leftover cannot block editing another slot", () => {
+      const leftover: ModelSelection = { instanceId: "claudeCustom", model: "claude-sonnet-6", latest: "sonnet" };
+      expect(write({ ...leftover, effort: "high" }, leftover).ok).toBe(true);
+      // Only that exact entry: the same custom id with a different class is a new float.
+      expect(write({ ...leftover, latest: "opus" }, leftover).ok).toBe(false);
+    });
+
+    it("keeps the official id floating: the same model on an engine with no such custom row is accepted", () => {
+      expect(write({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }).ok).toBe(true);
+    });
   });
 
   describe("a stale write of a model the float has since moved past", () => {

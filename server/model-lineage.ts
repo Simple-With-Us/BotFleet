@@ -290,17 +290,29 @@ function carryLatestChain(
  *  field must name a class this engine has and the model must belong to it
  *  (a retired id counts for its successor class); anything else would be
  *  dropped by the reconcile and saved as a pinned slot, turning a typo into
- *  a successful write with different meaning.  Left alone: an engine the
- *  harness does not know (nothing to check against), the operator's own
- *  custom ids, and an entry the saved chain already holds exactly (a
- *  leftover must not block editing another slot). */
+ *  a successful write with different meaning.
+ *
+ *  An operator's own custom catalog row never floats: reconcile leaves a
+ *  custom id alone, so a `latest` saved on one is a latent float that would
+ *  redirect the bot onto the newest OFFICIAL class member the day the custom
+ *  row is removed (an id that reads like an official one then counts as a
+ *  member), and the picker would label the custom route "Latest <Class>" in
+ *  the meantime.  The write is refused rather than saved with a meaning the
+ *  person did not pick.
+ *
+ *  Left alone: an engine the harness does not know (nothing to check
+ *  against), and an entry the saved chain already holds exactly (a leftover
+ *  must not block editing another slot, custom row or not). */
 function latestProblem(
   entry: ModelSelection,
   context: LineageContext | undefined,
   saved: readonly ModelSelection[],
 ): string | null {
-  if (!entry.latest || !context || context.customIds?.includes(entry.model)) return null;
+  if (!entry.latest || !context) return null;
   if (saved.some((candidate) => sameTarget(candidate, entry) && candidate.latest === entry.latest)) return null;
+  if (context.customIds?.includes(entry.model)) {
+    return `cannot apply to custom model "${entry.model}" on instance "${entry.instanceId}" (a custom catalog row stays pinned — drop the latest field)`;
+  }
   const classes = lineageClasses(context.driverKind).map((cls) => cls.key);
   if (!classes.includes(entry.latest)) {
     return `is not a model class on instance "${entry.instanceId}"${
@@ -321,8 +333,8 @@ export type LineageWriteResult =
 
 /** The lineage half of a modelSelection write.
  *
- *  - Refuses an explicit `latest` that names no class on the engine or does
- *    not match the model.
+ *  - Refuses an explicit `latest` that names no class on the engine, does
+ *    not match the model, or sits on an operator's custom catalog row.
  *  - Carries `latest` forward for clients that do not send it, including a
  *    stale copy of a model the float has since moved past.
  *  - Refuses a retired id with no successor, but only when this write
