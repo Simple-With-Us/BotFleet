@@ -749,6 +749,14 @@ final class Session: ObservableObject {
                     if case .updateStatus = frame.frame {
                         pollMacUpdateWhileRunning()
                     }
+                    if case let .instances(fetched) = frame.frame {
+                        // A pushed roster replaces the cached one, the same as a fetch.
+                        cachedInstances = fetched
+                        instanceDriverKinds = Dictionary(
+                            fetched.map { ($0.instanceId, $0.driverKind) },
+                            uniquingKeysWith: { _, latest in latest }
+                        )
+                    }
                 }
                 // the stream ended without an error — the harness went away
                 log.notice("stream ended without an error")
