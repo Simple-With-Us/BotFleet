@@ -364,6 +364,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     "FAKE_ACP_REASONING_EFFORTS",
     "FAKE_ACP_REASONING_MODELS",
     "FAKE_ACP_REASONING_STICKS",
+    "FAKE_ACP_REASONING_ERROR_CODE",
     "FAKE_ACP_CONFIG_REPLY_BARE",
   ];
   let instance: ProviderInstance | undefined;
@@ -423,7 +424,9 @@ describe("MiniMax Code reasoning effort over ACP", () => {
 
   const runTurn = async (input: { threadId: string; model: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" | "none" }) => {
     await instance!.adapter.sendTurn({ text: "reason about this", ...input });
-    return recorder!.until((event) => event.type === "turn.completed");
+    // Match on the thread: `until` also returns events already seen, so a test
+    // that runs two turns would otherwise read the first turn's completion.
+    return recorder!.until((event) => event.type === "turn.completed" && event.threadId === input.threadId);
   };
 
   const errorMessage = () => recorder!.events.find((event) => event.type === "runtime.error")?.message;
@@ -527,17 +530,110 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('no effort "none"'));
   });
 
-  it("does not fail a no-effort turn when mcode refuses `default`, only logs it", async () => {
-    // An older mcode that advertises no `thinkingEffort` for M3.1 answers the
-    // set with -32602.  Default must not turn that into a failed turn.
+  it("runs at the CLI's own level when the session advertises no thinkingEffort, for Default and for a pick", async () => {
+    // An older mcode, or a login whose catalog has no effort options: after the
+    // model switch the reply lists the session's options and `thinkingEffort` is
+    // not among them.  There is nothing to set and nothing to be stuck at, and
+    // the server stamps Low on unattended runs, so the turn must still run.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     process.env.FAKE_ACP_REASONING_MODELS = M27;
+    const dump = dumpTo("no-effort-option.json");
+    const rpcDump = join(scratch, "rpc-no-effort-option.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
     await create();
 
-    const done = await runTurn({ threadId: "mcode-effort-default-refused", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    const picked = await runTurn({ threadId: "mcode-effort-absent-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    const plain = await runTurn({ threadId: "mcode-effort-absent-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(picked).toMatchObject({ ok: true });
+    expect(plain).toMatchObject({ ok: true });
+    expect(configCalls(dump).some((call) => call.params.configId === "thinkingEffort")).toBe(false);
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).toContain("session/prompt");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option (asked for high)"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option; running"));
+  });
+
+  it("reads the session/new option list when no model switch ran", async () => {
+    // M3.1 is first, so core runs no switch and the list is session/new's.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([M31, M27]);
+    process.env.FAKE_ACP_REASONING_MODELS = M27;
+    const dump = dumpTo("no-effort-option-no-switch.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-absent-noswitch", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" });
 
     expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option"));
+  });
+
+  it("still tolerates a refused `default` when the session's option list is unknown, but not a refused pick", async () => {
+    // A bare ACK after the model switch means no current option list, so the
+    // session's capability cannot be read.  A -32602 for `default` then means
+    // "no such option" and there is no level to be stuck at; a refused explicit
+    // pick is still a failed turn.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_REASONING_MODELS = M27;
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create();
+
+    const plain = await runTurn({ threadId: "mcode-effort-unknown-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    expect(plain).toMatchObject({ ok: true });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not accept thinking effort default"));
+
+    const picked = await runTurn({ threadId: "mcode-effort-unknown-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    expect(picked).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort high/);
+  });
+
+  it("fails a no-effort turn on a reset failure that is not a refusal, instead of billing a stale level", async () => {
+    // Anything but -32602 (a timeout carries no code at all) leaves the session
+    // at whatever level it was resumed at, so the Default turn must not run.
+    const rpcDump = join(scratch, "rpc-reset-error.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_ERROR_CODE = "-32603";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-reset-error", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: effort set failed: default/,
+    );
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fails a no-effort turn on a non-refusal reset failure even when the option list is unknown", async () => {
+    const rpcDump = join(scratch, "rpc-reset-error-unknown.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_ERROR_CODE = "-32603";
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-reset-error-unknown", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fails a no-effort turn on a refused `default` when the session did advertise thinkingEffort", async () => {
+    // The option exists but its list lacks `default`: the -32602 is a real
+    // refusal of the value, and a resumed session could still sit at a pick.
+    const rpcDump = join(scratch, "rpc-default-missing.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_EFFORTS = "low,medium,high,xhigh,max";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-default-missing", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
   });
 
   it("accepts a bare acknowledgement that reports no option state", async () => {

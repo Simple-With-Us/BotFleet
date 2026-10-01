@@ -1047,6 +1047,25 @@ describe("unattendedModelDowngrade", () => {
     ).toEqual(m27);
   });
 
+  it("replaces a bot's own saved effort with low on an unattended run, since only a caller-supplied selection is exempt", () => {
+    // Documents the behaviour the M3.1 rollout note describes: a bot saved at
+    // Max still runs automated turns at Low, and there is no per-bot opt-out.
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const saved: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" };
+    expect(
+      unattendedModelDowngrade(saved, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...saved, effort: "low" });
+    expect(
+      unattendedModelDowngrade(saved, {
+        unattended: true,
+        hasExplicitSelection: true,
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual(saved);
+  });
+
   it("never overrides an explicit caller modelSelection", () => {
     expect(
       unattendedModelDowngrade(gemini, {

@@ -23,7 +23,9 @@ What does not ship, and why, is in the sections below: no context-window control
 - A model switch resets the effort to `default`.  ACP core already runs the model switch before `configureSession`, so the driver sends the effort after it.
 - The change is session-scoped and never writes `config.yaml`.
 - The driver sends the picked level, or mcode's own literal `default` when none is picked.  `default` goes out **every turn**, so a level picked earlier in a reused or resumed session never sticks, and the owner's MiniMax Code TUI default never leaks into a bot that chose Default.
-- A rejected explicit level (mcode answers -32602), or a reply that reports a different current value, fails the turn with "MiniMax Code did not accept thinking effort `<x>` for `<model>`".  That includes Default: a reply that still reports an earlier level (a resumed session that kept `high`) proves the reset failed, and running anyway would bill the turn at that level.  Only a refused `default` (-32602, meaning the session advertises no effort option for the model) logs a warning and continues, since there is no level for it to be stuck at.
+- The driver first reads the session's own option list, which core hands it after the model switch (the switch reply's `configOptions`, or `session/new`'s when no switch ran).  A list that is known, non-empty and has no `thinkingEffort` belongs to a CLI that cannot set one for this model, for example an older mcode or a login whose catalog has no effort options.  The turn then runs at the CLI's own level with a logged warning, for Default and for an explicit pick alike.  There is no level for it to be stuck at, and failing it would break every unattended, webhook and resource run, because the server stamps Low on those (see "Behaviour Change" below).  The cost: an explicit pick on such a CLI is ignored, visible only in the log, until MiniMax Code is updated.  A bare `{}` acknowledgement after a switch leaves the earlier list stale, so core withholds it and the capability is treated as unknown.
+- When the session does advertise `thinkingEffort`, anything that goes wrong setting it fails the turn with "MiniMax Code did not accept thinking effort `<x>` for `<model>`".  That is a rejected value (-32602), a timeout, any other error, or a reply that reports a different current value.  It holds for Default too: a reply that still reports an earlier level (a resumed session that kept `high`), or a reset that errored, leaves the session at that level, and running anyway would bill the turn there.
+- The one tolerated failure is a refused `default` (-32602) while the option list is unknown.  There it means "no such option", so there is no level to be stuck at, and the driver logs a warning and continues.  An explicit pick, a timeout, or any other error code still fails the turn.
 - `none` (and any level the model lacks) is treated as Default with a warning.  M3.1 has no off switch.
 
 ### Direct HTTP Wire
@@ -81,7 +83,9 @@ M3 is out of every picker since #729.  "No effort picker, thinking always on" is
 
 ## Behaviour Change: Unattended Runs Start At Low
 
-`unattendedModelDowngrade` (`server/model-fallback.ts`) stamps effort Low on unattended, webhook and resource-triggered runs whenever the selected model offers Low.  M3.1 now offers it on MiniMax Code and the direct engine, so those automated runs start at **Low** instead of MiniMax's default of max, like every other effort engine.  Attended turns and explicit selections are unaffected.  A bot whose unattended runs need full effort should name its model selection explicitly.
+`unattendedModelDowngrade` (`server/model-fallback.ts`) stamps effort Low on unattended, webhook and resource-triggered runs whenever the selected model offers Low.  M3.1 now offers it on MiniMax Code and the direct engine, so those automated runs start at **Low** instead of MiniMax's default of max, like every other effort engine.  Attended turns are unaffected, and so is any run whose caller supplies its own model selection (`opts.modelSelection`).
+
+The stamp **replaces a bot's own saved effort**: a bot set to Max in Settings still runs unattended, webhook and resource turns at Low.  This is how `unattendedModelDowngrade` already behaves on every effort engine, so it is not new, but M3.1 on mcode and the direct engine now joins it, and M3.1 is the default model on both.  There is no per-bot opt-out today, so the advice to "name the selection explicitly" is not available from Settings.  If that matters, the fix is a bot-level setting that exempts a bot from the unattended downgrade, which is a separate change.
 
 ## Overlap With PR #742
 
@@ -91,10 +95,11 @@ PR #742 (`ag/minimax-engine-updates`) also edits `STATIC_MCODE_MODELS`.  It adds
 
 All tests use the fake ACP CLI and a stubbed `fetch`.  No live MiniMax request was made, no mcode turn was run with a prompt, and nothing read `~/.minimax/config.yaml` values or `~/.botfleet`.
 
-- `server/drivers/acp/mcode.test.ts`: M3.1 sends the picked level after the model switch, Default sends `default` every turn, M2.7 sends no call, a session that keeps another level fails the turn, an unadvertised level fails with the level named, `none` degrades to Default, a session that reports it kept an earlier level fails a Default turn too, and a refused `default` only logs.
+- `server/drivers/acp/mcode.test.ts`: M3.1 sends the picked level after the model switch, Default sends `default` every turn, M2.7 sends no call, a session that keeps another level fails the turn, an unadvertised level fails with the level named, `none` degrades to Default, a session that reports it kept an earlier level fails a Default turn too, a reset that errors with anything but a refusal fails a Default turn, a session that advertises no `thinkingEffort` (older mcode) runs at the CLI's own level for Default and for a pick, and a refused `default` only logs when the option list is unknown.
 - `server/drivers/minimax.test.ts`: `reasoning_effort` on every round including a tool round, absent for Default, `none`, M2.7 and the utility call, `refreshModels` keeps M3.1's levels and gives an unknown id none.
 - `src/lib/model-effort.test.ts` and `server/model-fallback.test.ts`: picker levels for both engines, DSH MiniMax rule unchanged, unattended runs stamp Low.
-- The fake ACP CLI gained `FAKE_ACP_REASONING_CONFIG_ID` and `FAKE_ACP_REASONING_MODELS`, backward compatible (documented in its header).
+- The fake ACP CLI gained `FAKE_ACP_REASONING_CONFIG_ID`, `FAKE_ACP_REASONING_MODELS` and `FAKE_ACP_REASONING_ERROR_CODE`, backward compatible (documented in its header).
+- `server/drivers/acp/core.ts` gained an optional `sessionConfigOptions` field on the `configureSession` context, passed only when a current option list is known.  Other ACP drivers ignore it.
 
 ## Owner Questions
 

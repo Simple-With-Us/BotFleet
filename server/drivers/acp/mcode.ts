@@ -30,6 +30,10 @@ export const MCODE_EFFORT_CONFIG_ID = "thinkingEffort";
  *  of `thinkingEffort` and accepted by `session/set_config_option`. */
 const MCODE_DEFAULT_EFFORT = "default";
 
+/** JSON-RPC "invalid params": what mcode answers for an unknown config option
+ *  and for a value the session does not advertise. */
+const MCODE_INVALID_PARAMS = -32602;
+
 export const STATIC_MCODE_MODELS: ModelCatalog = {
   default: "MiniMax-M3.1-Flash-Preview-thinking",
   options: [
@@ -244,7 +248,7 @@ const support: AcpSupport = {
   // is MiniMax Code's own /model setting (config.yaml
   // `defaultModelContextWindow`), which a session inherits and BotFleet does
   // not write.
-  async configureSession({ request, sessionId, turn }) {
+  async configureSession({ request, sessionId, turn, sessionConfigOptions }) {
     const model = turn.model?.trim();
     if (!model) return;
     const levels = STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels ?? [];
@@ -252,6 +256,27 @@ const support: AcpSupport = {
     // know): mcode advertises no `thinkingEffort`, so setting one would only
     // earn a -32602.
     if (levels.length === 0) return;
+
+    // The session's own option list is the authority on whether it can take an
+    // effort at all.  mcode builds `thinkingEffort` only when the current model
+    // carries effort options, so a list that is known, non-empty, and has no
+    // `thinkingEffort` belongs to a CLI that cannot set one for this model, for
+    // instance an older mcode.  There is no level for such a session to be
+    // stuck at and no option to fail on, so the turn runs at the CLI's own level
+    // exactly as it did before this driver offered efforts.  Failing it instead
+    // would break every unattended, webhook and resource run, because the
+    // server stamps Low on those whenever the catalog offers it.
+    // SAFETY: the list is verbatim agent output typed `unknown[]`; the cast only
+    // reads `id`, and the `?.` tolerates a null or non-object entry.
+    const effortAdvertised = Array.isArray(sessionConfigOptions)
+      && sessionConfigOptions.some((option) => (option as { id?: unknown } | null)?.id === MCODE_EFFORT_CONFIG_ID);
+    if (Array.isArray(sessionConfigOptions) && sessionConfigOptions.length > 0 && !effortAdvertised) {
+      console.warn(
+        `[mcode] ${model}: this MiniMax Code session offers no thinking effort option`
+        + `${turn.effort ? ` (asked for ${turn.effort})` : ""}; running at the CLI's own level`,
+      );
+      return;
+    }
 
     const requested = turn.effort;
     const explicit = requested && levels.includes(requested) ? requested : undefined;
@@ -272,11 +297,18 @@ const support: AcpSupport = {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // An explicit pick the CLI refuses must not quietly run at another level:
-      // that is a paid turn the person did not ask for.  A refused `default` is
-      // different: -32602 means this session advertises no effort option for
-      // the model, so there is no level for it to be stuck at.
-      if (explicit) throw new Error(refused(message));
+      // Anything that fails the set must not quietly run the turn at another
+      // level: that is a paid turn the person did not ask for, and on a resumed
+      // session a stale `high` would be billed as Default.  That covers a
+      // timeout and every other error, not only an explicit pick.  The one
+      // exception is a refused `default` while the session's option list is
+      // unknown: -32602 then means the session has no effort option for the
+      // model, so there is no level for it to be stuck at.  When the session
+      // DID advertise `thinkingEffort`, a refusal is a real failure.
+      // SAFETY: core attaches `code` to a JSON-RPC error with Object.assign; any
+      // other thrown value has none, and the `?.` tolerates a non-object.
+      const code = (error as { code?: unknown } | null)?.code;
+      if (explicit || effortAdvertised || code !== MCODE_INVALID_PARAMS) throw new Error(refused(message));
       console.warn(`[mcode] ${model}: ${refused(message)}`);
       return;
     }

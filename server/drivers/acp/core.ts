@@ -301,6 +301,16 @@ export interface AcpSupport {
      * driver that only knows the argv slug cannot form a valid set_model
      * without this. Empty when the agent advertised none. */
     sessionModels: Array<{ modelId?: string; name?: string }>;
+    /** The session's `configOptions` as they stand after this turn's model
+     * selection, verbatim, for a driver that must know which options the
+     * session offers before it sets one (an older CLI may lack an option the
+     * current one has).  It is the `session/new` or `session/load` list when no
+     * model switch ran, and the switch reply's list when one did, since an
+     * option list can change with the model.  `undefined` when no current list
+     * is known, for example a switch the agent acknowledged with a bare `{}`:
+     * the earlier list predates the switch, so it is withheld rather than
+     * trusted. */
+    sessionConfigOptions?: unknown[] | undefined;
   }): Promise<void>;
 }
 
@@ -1398,6 +1408,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               });
             };
 
+            // What configureSession is told the session offers.  Starts as the
+            // list session/new or session/load returned and is replaced when the
+            // model switch below changes it.
+            let currentConfigOptions: unknown[] | undefined = Array.isArray(sessionResult?.configOptions)
+              ? sessionResult.configOptions
+              : undefined;
             try {
               if (support.selectModel) {
                 const { configId, valueForModel, modelForValue } = support.selectModel;
@@ -1420,13 +1436,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     : (mappedValue ?? cliTurn.model)
                   : null;
                 if (requestedValue && requestedValue !== selectedValue) {
-                  const applied = reportedValue(
-                    await request(
-                      "session/set_config_option",
-                      { sessionId, configId, value: requestedValue },
-                      INIT_TIMEOUT,
-                    ),
+                  const switchReply = await request(
+                    "session/set_config_option",
+                    { sessionId, configId, value: requestedValue },
+                    INIT_TIMEOUT,
                   );
+                  const applied = reportedValue(switchReply);
+                  // The option list can change with the model.  Only a reply
+                  // that carries one is current; a bare ACK leaves the earlier
+                  // list stale, so it is dropped rather than kept.
+                  currentConfigOptions = Array.isArray(switchReply?.configOptions)
+                    ? switchReply.configOptions
+                    : undefined;
                   // an agent that answers OK but keeps its old model is worse than
                   // one that errors: it burns a paid turn on the wrong thing.  Only
                   // a *reported* mismatch proves that, though — a bare ACK that
@@ -1456,6 +1477,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionModels: Array.isArray(sessionResult?.models?.availableModels)
                     ? sessionResult.models.availableModels
                     : [],
+                  sessionConfigOptions: currentConfigOptions,
                 });
                 // initialize's currentModelId is the CLI default (grok-4.7),
                 // not the model this turn asked for. After a successful pin,
