@@ -2094,8 +2094,6 @@ describe("acknowledge one trigger without touching another", () => {
     expect(h.emitted).toHaveLength(0);
   });
 });
-import { describe, expect, it } from "vitest";
-import { BotDispatchState } from "./bot-profile";
 
 describe("a held run explains itself", () => {
   it("records WHY a run is queued instead of sitting there looking stuck", async () => {
