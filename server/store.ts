@@ -2251,8 +2251,23 @@ export class Store {
     // not described) cannot be classified, so the directive did not really
     // apply to it: the marker stays unset and the next boot pass retries.
     let directiveIncomplete = false;
-    const lacksContext = (entry: ModelSelection): boolean =>
-      opts.contextFor(entry.instanceId) === undefined || Boolean(entry.fallbacks?.some(lacksContext));
+    const lacksContext = (entry: ModelSelection): boolean => {
+      const context = opts.contextFor(entry.instanceId);
+      // A shadow context only names the driver: it has no catalog, so nothing
+      // could be classified against it either.
+      return context === undefined || context.catalogPending === true || Boolean(entry.fallbacks?.some(lacksContext));
+    };
+    // A native Codex session resumes by thread id alone and takes its model
+    // only at thread/start, so a rewritten model must not resume the old one.
+    const dropStaleCursors = (
+      cursors: Record<string, unknown> | undefined,
+      changes: readonly LineageChange[],
+    ) => {
+      if (!cursors) return;
+      for (const change of changes) {
+        if (change.from !== change.to && driverKindFor(change.instanceId) === "codex") delete cursors[change.instanceId];
+      }
+    };
     const pass = (selection: ModelSelection, directive: boolean) => {
       if (directive && lacksContext(selection)) directiveIncomplete = true;
       const flagged = directive ? applyOwnerDirective(selection, driverKindFor, opts.contextFor) : { selection, flagged: [] };
@@ -2271,6 +2286,11 @@ export class Store {
         const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
         if (notice) notices.push(notice);
         bot.modelSelection = next.selection;
+        dropStaleCursors(bot.resumeCursors, next.changes);
+        // Tasks without a selection of their own run on the bot's.
+        for (const task of bot.tasks ?? []) {
+          if (!task.modelSelection?.instanceId) dropStaleCursors(task.resumeCursors, next.changes);
+        }
       }
       if (bot.activeModelSelection?.instanceId) {
         bot.activeModelSelection = pass(bot.activeModelSelection, false).selection;
@@ -2283,6 +2303,8 @@ export class Store {
           const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
           if (notice) notices.push(`${notice} (task “${task.title}”)`);
           task.modelSelection = next.selection;
+          dropStaleCursors(task.resumeCursors, next.changes);
+          if (task.threadId === bot.threadId) dropStaleCursors(bot.resumeCursors, next.changes);
         }
         if (task.activeModelSelection?.instanceId) {
           task.activeModelSelection = pass(task.activeModelSelection, false).selection;

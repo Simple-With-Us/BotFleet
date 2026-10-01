@@ -367,6 +367,18 @@ describe("quota and session-limit failover", () => {
 });
 
 describe("selectTurnFallback", () => {
+  it("keeps a floating fallback's latest class on the pick", () => {
+    const pick = selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }],
+      used: 0,
+    });
+    expect(pick).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" });
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();

@@ -563,7 +563,7 @@ export function selectTurnFallback(input: {
     // A model the provider already said it does not have would only spend
     // another spawn to hear it again, and end the walk there.
     if (botId && isRejected?.(botId, next.instanceId, next.model, now)) continue;
-    return { instanceId: next.instanceId, model: next.model, effort: next.effort, nextUsed: i + 1 };
+    return { instanceId: next.instanceId, model: next.model, effort: next.effort, ...(next.latest ? { latest: next.latest } : {}), nextUsed: i + 1 };
   }
   return undefined;
 }

@@ -1108,7 +1108,7 @@ function lineageContextForInstance(instanceId: string): LineageContext | undefin
   const instance = registry.get(instanceId);
   if (!instance) {
     const shadow = registry.entries().find((entry) => entry.instanceId === instanceId)?.shadow;
-    return shadow ? { driverKind: shadow.driverKind, offeredIds: [], authoritative: false } : undefined;
+    return shadow ? { driverKind: shadow.driverKind, offeredIds: [], authoritative: false, catalogPending: true } : undefined;
   }
   const context = lineageContextFor(instance, (model) =>
     modelEffortLevels(
@@ -2748,7 +2748,12 @@ async function launchFallbackTurn(input: {
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name, ok: true, kind: "notice" } });
 
   const launch = async (pick: TurnFallbackPick): Promise<void> => {
-    const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.model, effort: pick.effort };
+    const selection: ModelSelection = {
+      instanceId: pick.instanceId,
+      model: pick.model,
+      effort: pick.effort,
+      ...(pick.latest ? { latest: pick.latest } : {}),
+    };
     // Both failure shapes arrive here once.  Whichever reports first wins, so a
     // dispatch error that also throws cannot advance the walk twice.
     let advanced = false;
@@ -6148,7 +6153,9 @@ async function runGroupMemberTurn(
     queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
     return true;
   }
-  if (!turnSelection) reconcileModelLineage({ botIds: [bot.id] });
+  // A busy bot is queued below and reconciled when its turn replays; its saved
+  // chain is not rewritten from here.
+  if (!turnSelection) reconcileModelLineage({ botIds: [bot.id], skipBusy: true });
   // A per-turn override (a fallback or retry pick, possibly queued earlier)
   // goes through the same lineage reconciliation startTurn gives the 1:1 lane,
   // so a retired or superseded id is never dispatched or recorded.

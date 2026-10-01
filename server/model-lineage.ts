@@ -178,9 +178,16 @@ function rawFallback(raw: unknown, index: number): unknown {
   return Array.isArray(fallbacks) ? fallbacks[index] : undefined;
 }
 
-function chainEntries(selection: ModelSelection | undefined): ModelSelection[] {
-  if (!selection) return [];
-  return [selection, ...(selection.fallbacks ?? [])];
+/** The raw request body for every entry of `selection`, in walkChain order, so
+ *  "did the client send `latest`" is answered for nested fallbacks too. */
+function rawChain(raw: unknown, selection: ModelSelection): unknown[] {
+  const out: unknown[] = [];
+  const visit = (node: ModelSelection, rawNode: unknown) => {
+    out.push(rawNode);
+    (node.fallbacks ?? []).forEach((fallback, index) => visit(fallback, rawFallback(rawNode, index)));
+  };
+  visit(selection, raw);
+  return out;
 }
 
 /** Every entry of the chain, nested descendants included, depth first, each
@@ -264,12 +271,21 @@ export function checkLineageWrite(
   current: ModelSelection | undefined,
   contextFor: (instanceId: string) => LineageContext | undefined,
 ): LineageWriteResult {
-  const saved = chainEntries(current);
-  const raws = [raw, ...(selection.fallbacks ?? []).map((_, index) => rawFallback(raw, index))];
-  const carried = carryLatestChain(chainEntries(selection), raws, saved);
-  const incoming: ModelSelection = { ...carried[0]! };
-  delete incoming.fallbacks;
-  if (selection.fallbacks) incoming.fallbacks = carried.slice(1);
+  // Nested fallbacks carry their floating state too: flatten the whole tree
+  // (depth first, the same order walkChain uses), carry, and write it back.
+  const saved = walkChain(current).map((item) => item.entry);
+  const flatIncoming = walkChain(selection).map((item) => item.entry);
+  const raws = rawChain(raw, selection);
+  const carried = carryLatestChain(flatIncoming, raws, saved);
+  let at = 0;
+  const rebuild = (node: ModelSelection): ModelSelection => {
+    const { fallbacks, ...rest } = node;
+    const out: ModelSelection = { ...rest, ...(carried[at]?.latest !== undefined ? { latest: carried[at]!.latest } : {}) };
+    at += 1;
+    if (fallbacks) out.fallbacks = fallbacks.map(rebuild);
+    return out;
+  };
+  const incoming = rebuild(selection);
   const unclaimed = walkChain(current).map((item) => item.entry);
   for (const { entry, slot } of walkChain(incoming)) {
     const driverKind = contextFor(entry.instanceId)?.driverKind;

@@ -460,6 +460,10 @@ export interface LineageContext {
    *  fallback that may not match the account is not: nothing is moved or
    *  resolved against it. */
   authoritative: boolean;
+  /** The instance is known only by its driver (a shadow entry whose engine is
+   *  not loaded): no catalog or custom ids are available yet, so a pass that
+   *  needed them has not really applied. */
+  catalogPending?: boolean;
   /** Effort levels the given model accepts; an effort it does not accept
    *  is dropped when a rewrite changes the model.  Omit to keep effort. */
   effortLevels?: (model: string) => readonly string[] | undefined;

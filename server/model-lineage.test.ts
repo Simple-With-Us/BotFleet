@@ -274,6 +274,24 @@ describe("checkLineageWrite", () => {
     });
   });
 
+  it("carries Latest on a nested fallback when a client that predates it re-sends the chain", () => {
+    const saved: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+      fallbacks: [
+        {
+          instanceId: "codex",
+          model: "gpt-5.6-luna",
+          fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
+        },
+      ],
+    };
+    const ios = JSON.parse(JSON.stringify(saved)) as ModelSelection;
+    delete ios.fallbacks![0]!.fallbacks![0]!.latest;
+    const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
+    expect(result).toMatchObject({ ok: true, selection: { fallbacks: [{ fallbacks: [{ model: "claude-sonnet-5-5", latest: "sonnet" }] }] } });
+  });
+
   it("keeps a float when an older client removes the fallback in front of it", () => {
     // The shipped iOS app removes a fallback by index and re-sends the rest
     // without `latest`, so the floating Fallback 2 arrives as Fallback 1.

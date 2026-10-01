@@ -157,6 +157,36 @@ describe("Store.reconcileModelLineage", () => {
     expect(JSON.parse(readFileSync(markerPath, "utf8")).applied).toEqual([OWNER_DIRECTED_LATEST.id]);
   });
 
+  it("leaves the owner-directed marker unset while an engine is known only as a shadow", () => {
+    seedBots([{ id: "plumber", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    const markerPath = join(DATA_DIR, "model-lineage.json");
+    store.reconcileModelLineage({
+      contextFor: () => ({ driverKind: "claudeAgent", offeredIds: [], authoritative: false, catalogPending: true }),
+      nameFor: (id, model) => modelNameFor(instance(id)?.models, model),
+      ownerDirective: true,
+    });
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it("drops the native Codex resume cursor when a reconcile rewrites that engine's model", () => {
+    seedBots([
+      {
+        id: "b",
+        modelSelection: { instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" },
+        resumeCursors: { codex: "thread-old", claude: "keep" },
+        tasks: [{ threadId: "thread-b", title: "Main", createdAt: 1_000, resumeCursors: { codex: "thread-old", claude: "keep" } }],
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    codexModels = { ...CODEX_LIVE, options: [...CODEX_LIVE.options, { id: "gpt-6-luna", label: "GPT-6 Luna" }] };
+    reconcile(store);
+    const bot = store.bot("b")!;
+    expect(bot.modelSelection.model).toBe("gpt-6-luna");
+    expect(bot.resumeCursors).toEqual({ claude: "keep" });
+    expect(bot.tasks![0]!.resumeCursors).toEqual({ claude: "keep" });
+  });
+
   it("resolves Latest Luna only once the live catalog offers a newer Luna", () => {
     seedBots([{ id: "b", modelSelection: { instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" } }]);
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
