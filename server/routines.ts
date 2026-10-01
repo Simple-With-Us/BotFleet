@@ -1026,12 +1026,12 @@ export class RoutineManager {
         // attempt" rather than "true at some point in the past"; the next tick
         // that reaches canStart sets it again if it still holds.
         if (this.isBotSnoozed(run.botId)) {
-          run.holdReason = undefined;
+          this.clearHoldReason(run);
           continue;
         }
         const state = this.options.botState(run.botId);
         if (state === "busy") {
-          run.holdReason = undefined;
+          this.clearHoldReason(run);
           continue;
         }
         if (state === "missing") {
@@ -1334,6 +1334,20 @@ export class RoutineManager {
       orphaned.push({ ...run });
     }
     return orphaned;
+  }
+
+  /** Drop a stale hold reason and PUBLISH that, which is the whole point.
+   *
+   *  Clearing the field in memory leaves the persisted receipt and every
+   *  attached client showing the obsolete reason for as long as the skip lasts
+   *  — which is the symptom this exists to remove, just with a quieter
+   *  mechanism.  A no-op when there was nothing to clear, so a run that was
+   *  never held does not emit on every tick. */
+  private clearHoldReason(run: RoutineRun): void {
+    if (run.holdReason === undefined) return;
+    run.holdReason = undefined;
+    this.save();
+    this.emitRun(run);
   }
 
   /** Move a run out of `queued` and drop the reason it was being held.
