@@ -155,20 +155,20 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   );
 
   const say = useCallback(
-    async (text: string, member?: Bot) => {
+    async (text: string, member?: Bot, messageId?: string) => {
       if (!alive.current || currentCall() !== group.id) return false;
       const mine = ++sayGeneration.current;
       move("speaking");
       setSpeakingMemberId(member?.id ?? null);
       hush();
-      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice });
+      await speaker.speak(text, { botId: member?.id, voiceId: member?.voice, ...(messageId ? { messageId, threadId: group.threadId } : {}) });
       return alive.current && currentCall() === group.id && sayGeneration.current === mine;
     },
-    [group.id, hush, move],
+    [group.id, group.threadId, hush, move],
   );
 
   const enqueueSpeech = useCallback(
-    (text: string, member?: Bot, answerAfter = false) => {
+    (text: string, member?: Bot, answerAfter = false, messageId?: string) => {
       const generation = queueGeneration.current;
       const jobId = ++nextJobId.current;
       queuedJobs.current.add(jobId);
@@ -177,7 +177,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
         .catch(() => {})
         .then(async () => {
           if (generation !== queueGeneration.current) return;
-          await say(text, member);
+          await say(text, member, messageId);
         })
         .finally(() => {
           if (generation !== queueGeneration.current) return;
@@ -455,7 +455,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     );
     for (const reply of replies) {
       const member = members.find((candidate) => candidate.id === reply.from?.botId);
-      enqueueSpeech(spokenReply(reply.text!), member);
+      enqueueSpeech(spokenReply(reply.text!), member, false, reply.id);
     }
     if (!replies.length) {
       const chip = [...fresh].reverse().find((message) => message.kind === "activity" && message.tool?.spoken);

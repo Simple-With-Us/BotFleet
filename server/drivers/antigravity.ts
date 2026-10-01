@@ -38,7 +38,15 @@
 // box / Local VM / VPS / local computer) is mounted by upserting keys into the
 // global `~/.gemini/config/mcp_config.json` before each spawn — see
 // ensureAntigravityMcp below.
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -1496,26 +1504,34 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       return { turnId };
     };
 
-    let lastKnownVersion: string | null = null;
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      let version = await new Promise<string | null>((resolve) => {
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
         execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
-          const trimmed = err ? null : stdout.trim();
-          if (trimmed) {
-            lastKnownVersion = trimmed;
-            resolve(trimmed);
-          } else if (lastKnownVersion) {
-            resolve(lastKnownVersion);
-          } else {
-            resolve(null);
-          }
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
         });
       });
-      if (!version) {
-        if (lastKnownVersion) {
-          version = lastKnownVersion;
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "Antigravity", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or crashing binary is a verdict.
+          version = remembered;
         } else {
-          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
       }
       // No auth field: agy auth is keyring-backed with no reliable file marker

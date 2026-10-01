@@ -694,7 +694,13 @@ public struct CompanionClient: Sendable {
     }
 
     public func instances() async throws -> [Instance] {
-        try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self).instances
+        try await instanceList().instances
+    }
+
+    /// The roster with the harness's `describedAt` stamp, for callers that order
+    /// competing answers.
+    public func instanceList() async throws -> InstanceList {
+        try await send(try makeRequest("GET", "/api/instances"), as: InstanceList.self)
     }
 
     public func config() async throws -> ConfigStatus {

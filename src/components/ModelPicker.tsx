@@ -23,6 +23,7 @@ import {
 import { selectionForPick } from "@/lib/model-pick";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { formatDualQuotaBadge } from "@/lib/quota-display";
@@ -65,14 +66,59 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
   );
 }
 
-function engineStatus(instance: InstanceInfo): string {
+export function engineStatus(instance: InstanceInfo): string {
   if (instance.snapshot.quota?.capped) return "Quota Cap";
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
-  if (needsCli(instance)) return "Not installed";
+  // The last probe gave no answer: a slow Mac, not a missing CLI or a
+  // sign-out.  Never "Not installed" or "Sign-in required" for it.
+  if (isCheckingEngine(instance)) return "Checking";
+  if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
+}
+
+/** Whether the picker shows the engine's setup card instead of its models.
+ *  An engine whose probe did not answer in time is blocked too: it has no
+ *  models to list yet, and EngineSetup draws its "Checking" card rather than
+ *  leaving an empty pane. */
+export function pickerBlocked(instance: InstanceInfo, pane: "main" | "custom"): boolean {
+  if (isCheckingEngine(instance)) return true;
+  return pane === "custom" ? needsCli(instance) : needsCli(instance) || needsSignIn(instance);
+}
+
+/** Whether an unusable engine's CLI is actually absent.  One that is on this
+ *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
+ *  own check failed) is unavailable, not "not installed" — the reason says
+ *  what to do.  So is an engine that has no CLI at all (MiniMax,
+ *  OpenAI-compatible and other API-key engines): a missing key is not a
+ *  missing install. */
+function isCliMissing(instance: InstanceInfo): boolean {
+  if (/CLI not found/i.test(instance.snapshot.reason ?? "")) return true;
+  if (instance.cliDefault === undefined && instance.cli === undefined) return false;
+  return (instance.cliCandidates?.length ?? 0) === 0;
+}
+
+/** The engines the picker's rail offers.  The selected engine always stays
+ *  so the picker can explain it; otherwise turned-off engines, uninstalled
+ *  custom ones, and optional integrations nobody set up (the ASCII.dev Box engine with no Box
+ *  token) are left out. */
+export function railEngines(instances: InstanceInfo[], selectedInstanceId: string): InstanceInfo[] {
+  return instances.filter((i) => {
+    if (i.enabled === false) return false;
+    const selected = i.instanceId === selectedInstanceId;
+    if (isHiddenEngine(i) && !selected) return false;
+    // A configured `cli` override counts: the registry lists only copies of
+    // the default command, so an absolute override leaves candidates empty.
+    const isInstalledOrSubscription =
+      i.access !== "custom" || Boolean(i.cli) || (i.cliCandidates?.length ?? 0) > 0;
+    if (i.snapshot.state === "unavailable" && !selected && !isInstalledOrSubscription) {
+      return false;
+    }
+    if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && !selected) return false;
+    return true;
+  });
 }
 
 function ModelRow({
@@ -354,11 +400,8 @@ export function ModelPicker({
   // in Codex, an extra from Claude's settings) stay in their own engine's list.
   // The local ones are on the Local Models entry.
   const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
-  const blocked = railInstance
-    ? pane === "custom"
-      ? needsCli(railInstance)
-      : needsCli(railInstance) || needsSignIn(railInstance)
-    : false;
+  const blocked = railInstance ? pickerBlocked(railInstance, pane) : false;
+  const checking = isCheckingEngine(railInstance);
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -449,16 +492,7 @@ export function ModelPicker({
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
-              const availableInstances = state.instances.filter((i) => {
-                if (i.enabled === false) return false;
-                const isInstalledOrSubscription =
-                  i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId && !isInstalledOrSubscription) {
-                  return false;
-                }
-                if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
-                return true;
-              });
+              const availableInstances = railEngines(state.instances, selection.instanceId);
               const { subscription, custom: local } = splitEngineRail(availableInstances);
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
@@ -537,6 +571,8 @@ export function ModelPicker({
                         "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
                         railInstance.snapshot.quota?.capped
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          : checking
+                          ? "bg-inset text-ink-secondary"
                           : blocked
                           ? "bg-warning/10 text-warning"
                           : "bg-success/10 text-success",
@@ -569,7 +605,9 @@ export function ModelPicker({
                     <WhyThisEngineCallout instance={railInstance} />
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
-                      {pane === "main" && official.length > 0
+                      {checking
+                        ? "Models will appear as soon as the check finishes."
+                        : pane === "main" && official.length > 0
                         ? `${official.length} ${official.length === 1 ? "model" : "models"} will appear after setup.`
                         : "Local models will appear as soon as the engine is installed."}
                     </p>

@@ -603,12 +603,22 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     public var reason: String?
     public var authenticated: Bool?
     public var version: String?
+    /// An optional integration nobody has set up (the ASCII.dev Box engine with
+    /// no Box token): the harness keeps it registered but out of every engine list.
+    public var hidden: Bool?
+    /// The probe gave no answer yet (a slow CLI on a busy Mac) and nothing
+    /// definitive stood in: the engine is being checked, not missing or signed out.
+    public var transient: Bool?
 
     public var isAvailable: Bool { state == "available" }
+    public var isHidden: Bool { hidden == true }
+    public var isChecking: Bool { transient == true }
 
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
     public var engineStatusLabel: String {
+        // A probe still in flight is neither "Unavailable" nor "Sign in": say so.
+        if isChecking { return "Checking" }
         if isAvailable, authenticated == false { return "Sign in" }
         if !isAvailable { return "Unavailable" }
         return "Ready"
@@ -723,6 +733,9 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
 
 public struct InstanceList: Codable, Sendable {
     public var instances: [Instance]
+    /// When the harness's describe finished; a later push or fetch with a smaller
+    /// value is older than what the phone already holds.
+    public var describedAt: Double?
 }
 
 /// Which engine actually speaks — `VoiceProvider` in `server/tts/index.ts`.

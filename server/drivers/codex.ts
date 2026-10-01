@@ -16,7 +16,15 @@ import { z } from "zod";
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 
 import type {
@@ -144,6 +152,16 @@ function mountMcpServer(
     "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
     "-c", `${prefix}.default_tools_approval_mode="auto"`,
   );
+}
+
+/** What `codex login status` said, or undefined when it said nothing
+ * recognizable.  A signed-out CLI exits 1 with "Not logged in" on stderr, so
+ * the text decides regardless of the exit code; a probe that timed out or
+ * printed nothing is inconclusive, never a sign-out. */
+export function codexLoginAnswer(output: string): boolean | undefined {
+  if (/\bnot logged in\b/i.test(output)) return false;
+  if (/^logged in\b/im.test(output)) return true;
+  return undefined;
 }
 
 export const CodexDriver: ProviderDriver<CodexConfig> = {
@@ -870,40 +888,58 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     return { turnId };
   };
 
-  let lastKnownVersion: string | null = null;
+  // Last definitive answers: one probe that runs out of time on a busy Mac
+  // must not flip a working, signed-in Codex to "not installed" or
+  // "sign-in required".
+  const lastKnownVersion = new LastKnownAnswer<string>();
+  const lastKnownAuth = new LastKnownAnswer<boolean>();
+  const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
     const env = childEnv();
-    let version = await new Promise<string | null>((resolve) => {
+    // Its place among overlapping probes: taken before the process starts,
+    // so a slow older probe cannot replace what a newer one remembered.
+    const versionOrder = lastKnownVersion.begin();
+    const startedAt = Date.now();
+    const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
       execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
-        const trimmed = err ? null : stdout.trim();
-        if (trimmed) {
-          lastKnownVersion = trimmed;
-          resolve(trimmed);
-        } else if (lastKnownVersion) {
-          resolve(lastKnownVersion);
-        } else {
-          resolve(null);
-        }
+        resolve({ version: err ? null : stdout.trim() || null, error: err });
       });
     });
-    if (!version) {
-      if (lastKnownVersion) {
-        version = lastKnownVersion;
+    let version = probed.version;
+    if (version) {
+      lastKnownVersion.record(version, versionOrder);
+    } else {
+      const elapsed = Date.now() - startedAt;
+      logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+      const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+      const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+      if (remembered) {
+        // Only a probe that gave no answer may stand on the last good
+        // version.  A missing or crashing binary is a verdict.
+        version = remembered;
       } else {
-        return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+        if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+        return failure.kind === "transient"
+          ? { state: "unavailable", transient: true, reason: failure.reason }
+          : { state: "unavailable", reason: failure.reason };
       }
     }
     const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
     if (match && (parseInt(match[1]) === 0 && parseInt(match[2]) < 151)) {
       return { state: "unavailable", reason: `Codex CLI is out of date (needs 0.151.0+). Run \`npm install -g @openai/codex\`` };
     }
-    const authenticated = await new Promise<boolean>((resolve) => {
-      execCli(config.cli, ["login", "status"], { timeout: 20000, env }, (err, stdout, stderr) =>
-        resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
-      );
+    const authOrder = lastKnownAuth.begin();
+    const authStartedAt = Date.now();
+    const probedAuth = await new Promise<boolean | undefined>((resolve) => {
+      execCli(config.cli, ["login", "status"], { timeout: 20000, env }, (err, stdout, stderr) => {
+        const answer = codexLoginAnswer(`${stdout ?? ""}\n${stderr ?? ""}`);
+        if (answer === undefined) logProbeFailure(instanceId, `${config.cli} login status`, err, Date.now() - authStartedAt);
+        resolve(answer);
+      });
     });
+    if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
     // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
-    return { state: "available", version, authenticated, billing: "subscription" };
+    return { state: "available", version, authenticated: probedAuth ?? lastKnownAuth.get() ?? undefined, billing: "subscription" };
   };
 
   return {
