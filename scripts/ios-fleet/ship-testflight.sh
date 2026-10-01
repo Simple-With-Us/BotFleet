@@ -370,7 +370,7 @@ asc_latest_seq() {
     return 1
   fi
   set +e
-  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" 2>/dev/null)
+  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>/dev/null)
   rc=$?
   set -e
   if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
@@ -415,7 +415,7 @@ resolve_seq_floor() {
   Shipping now would very likely reuse a build number and be rejected as a duplicate.
   Fix one of these, then re-run:
     1) restore ASC access: check ${SECRETS_ENV} and that 'node' is on PATH, then
-       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix}
+       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix} ${PLATFORM} ${APPLE_ID}
      2) or pass the number explicitly:  --version ${prefix}.<N>   (NOT --build <N>:
         --version picks the marketing version and lets CFBundleVersion stay an
         auto UTC timestamp, which is always higher than every build already
@@ -670,6 +670,7 @@ REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 DISPLAY_NAME="$(json_get "$APP_KEY" displayName)"
 BUNDLE_ID="$(json_get "$APP_KEY" bundleId)"
+APPLE_ID="$(json_get "$APP_KEY" appleId || true)"
 PLATFORM="$(json_get "$APP_KEY" platform)"
 SCHEME="$(json_get "$APP_KEY" scheme)"
 PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
@@ -691,6 +692,14 @@ if [[ "$BUNDLE_ID" == "me.grok.dealdex" ]]; then
 fi
 if [[ "$APP_KEY" == "dealdex" && "$BUNDLE_ID" != "net.dealdex" ]]; then
   die "DealDex live bundle is net.dealdex, not ${BUNDLE_ID}"
+fi
+
+# BotFleet ASC App ID for app.botfleet.ios was never created (owner action from
+# the 2026-09-22 bundle rename). Ships must stay on the live ASC record
+# app.botfleet / appleId 6806379515 or the asc-seq gate fails with rc=2
+# (observed schedule run 36839653889).
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet" ]]; then
+  die "BotFleet ASC app is app.botfleet (appleId 6806379515); refusing bundleId=${BUNDLE_ID} until that App ID exists in App Store Connect"
 fi
 
 if [[ -z "$UPLOAD_ONLY_IPA" && "$DRY_RUN" -eq 0 ]]; then

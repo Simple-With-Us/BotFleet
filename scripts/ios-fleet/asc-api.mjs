@@ -11,7 +11,7 @@
  *   node asc-api.mjs GET /v1/apps
  *   node asc-api.mjs GET "/v1/apps?filter[bundleId]=trade.socratic.app"
  *   node asc-api.mjs PATCH /v1/betaAppReviewDetails/<id> '{"data":{...}}'
- *   node asc-api.mjs latest-build-seq <bundleId> <prefix>   # e.g. ... trade.congress.ios 1.0
+ *   node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]
  *
  * Prints the raw JSON response to stdout. Caller is responsible for not
  * echoing anything secret-shaped from the response (ASC responses don't
@@ -325,11 +325,11 @@ async function main() {
   const privateKeyPem = readFileSync(keyPath, "utf8");
   const token = signJwt({ keyId, issuerId, privateKeyPem });
 
-  const [method, path, body, arg4] = process.argv.slice(2);
+  const [method, path, body, arg4, arg5] = process.argv.slice(2);
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
     console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion]");
-    console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix>");
+    console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
     process.exit(1);
   }
 
@@ -379,15 +379,58 @@ async function main() {
     const bundleId = path;
     const prefix = body;
     if (!bundleId || !prefix) {
-      console.error("Usage: node asc-api.mjs latest-build-seq <bundleId> <prefix>");
+      console.error("Usage: node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
       process.exit(2);
     }
-    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
-    if (!apps.ok || !apps.parsed.data?.[0]) {
+
+    // Resolve the ASC app record.
+    // filter[bundleId] is a PREFIX match on Apple's side (app.botfleet also
+    // returns app.botfleet.macos), so we always exact-match attributes.bundleId.
+    // When the registry still points at a not-yet-registered bundle (e.g. the
+    // premature app.botfleet.ios rename) but appleId is known, fall back to
+    // GET /v1/apps/<appleId> so the seq gate can still verify.
+    const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
+    let appId = null;
+    let resolvedBundle = null;
+
+    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=50`);
+    if (apps.ok) {
+      const exact = (apps.parsed.data || []).find(
+        (a) => a?.attributes?.bundleId === bundleId
+      );
+      if (exact) {
+        appId = exact.id;
+        resolvedBundle = exact.attributes.bundleId;
+      } else if ((apps.parsed.data || []).length) {
+        console.error(
+          `latest-build-seq: filter[bundleId]=${bundleId} returned ${apps.parsed.data.length} row(s) but no exact match` +
+          ` (${apps.parsed.data.map((a) => a.attributes?.bundleId).join(", ")})`
+        );
+      }
+    } else {
+      console.error(`latest-build-seq: apps query failed (HTTP ${apps.status})`);
+      process.exit(2);
+    }
+
+    if (!appId && appleIdHint) {
+      const byId = await api("GET", `/v1/apps/${encodeURIComponent(appleIdHint)}`);
+      if (byId.ok && byId.parsed.data?.id) {
+        appId = byId.parsed.data.id;
+        resolvedBundle = byId.parsed.data.attributes?.bundleId || "(unknown)";
+        console.error(
+          `latest-build-seq: bundle ${bundleId} not in ASC; using appleId ${appleIdHint} (${resolvedBundle})`
+        );
+      } else {
+        console.error(
+          `latest-build-seq: appleId fallback ${appleIdHint} failed (HTTP ${byId.status})`
+        );
+      }
+    }
+
+    if (!appId) {
       console.error(`latest-build-seq: app not found for bundle (HTTP ${apps.status})`);
       process.exit(2);
     }
-    const appId = apps.parsed.data[0].id;
 
     // Escape the prefix so "1.0" cannot match "120" via the regex dot.
     const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

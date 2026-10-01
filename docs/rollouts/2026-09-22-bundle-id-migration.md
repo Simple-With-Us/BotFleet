@@ -1,5 +1,12 @@
 # 2026-09-22 — Bundle Identifier Migration
 
+
+## 2026-10-01 — iOS ship IDs stay on `app.botfleet` until ASC App ID exists
+
+Schedule run [36839653889](https://github.com/jaywedgeworth22/BotFleet/actions/runs/36839653889) failed the asc-seq gate (`rc=2`) because `scripts/ios-fleet/apps.json` asked for `app.botfleet.ios`, which has **no** App Store Connect app record. Live ASC iOS app remains `app.botfleet` / appleId `6806379515`.
+
+Until the owner registers `app.botfleet.ios` (and widgets) in App Store Connect, hosted ios-ship keeps `bundleId: app.botfleet` so `latest-build-seq` can verify the floor. `asc-api.mjs` now exact-matches `filter[bundleId]` results and can fall back to `appleId` when provided.
+
 Issue raised on the macOS signing-cert change window, where the owner approved a fleet-wide bundle rename to `app.<name>.<platform>` plus a fresh app group (`app.<name>`) and associated domain (`<name>.app`).  This document covers **BotFleet only**; the rest of the fleet (Autorotate, ContactLogo, DealDex, HogHunter, Socratic.Trade, Congress.Trade, Usage-Monitor, the MiniMax-ios companion) is on separate lanes owned by other seats.  The fleet-wide context lives in `/Users/jay/.minimax/sessions/mvs_0bdfe8c73c1046a986df888aa99dcb2e/workspace/fleet-bundle-id-plan.md`.
 
 ## Previous → New
