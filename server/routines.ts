@@ -1,4 +1,5 @@
 import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-retention.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -129,6 +130,9 @@ export interface RoutineRun {
    *  way.  Carried on the run so it survives from the `runtime.error` to the
    *  `turn.completed` that closes it. */
   setupFailed?: boolean;
+  /** Why this run is sitting QUEUED instead of dispatching.  Set by the
+   *  scheduler when `botState` reports `blocked`; cleared on dispatch. */
+  holdReason?: string;
   engineId?: string;
   driver?: string;
   model?: string;
@@ -198,12 +202,16 @@ export interface RoutineManagerOptions {
   /** Keyed frames only: every payload on this bus is `{ kind, … }`, which
    * is what lets the server number and replay them. */
   emit?: (payload: Record<string, unknown>) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
+  /** Why this bot's work is being held, for a run that stays QUEUED rather
+   *  than being dispatched or failed.  Optional: without it a held run says
+   *  only that its engine is unavailable, which is true and useless. */
+  dispatchHoldReason?: (botId: string) => string | undefined;
   /** Minutes this run's trigger must stay quiet after it activates.  Absent
    * or 0 runs every delivery as it lands. */
   minGapMinutes?: (run: RoutineRun) => number | undefined;
@@ -1017,6 +1025,16 @@ export class RoutineManager {
           this.failRun(run, "The assigned Bot no longer exists");
           continue;
         }
+        if (state === "blocked") {
+          // Held, not failed.  The engine that refused is the bot's own
+          // problem, not this run's: a half-finished check or a missing CLI
+          // will still be there in fifteen minutes, and failing the run would
+          // throw away work that is one good tick from landing.  The reason
+          // goes on the run so the receipt and the diagnostics list can say
+          // why it is waiting instead of the run looking stuck.
+          run.holdReason = this.options.dispatchHoldReason?.(run.botId) ?? "Its engine is not available right now";
+          continue;
+        }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
         // and the whole batch goes into one turn when the gap closes, which
@@ -1122,6 +1140,7 @@ export class RoutineManager {
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
+        run.holdReason = undefined;
         this.lastStartedByKey.set(key, run.startedAt);
         // A genuine recurring firing, not "Run now" or a webhook/resource
         // trigger riding the same dispatch path — those have no calendar
