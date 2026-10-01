@@ -58,6 +58,8 @@
 //                        model switch leaves it alone.
 //   FAKE_ACP_REASONING_STICKS  a set of the effort option succeeds but leaves
 //                        the effort where it was, like FAKE_ACP_MODEL_STICKS
+//   FAKE_ACP_EFFORT_ERROR_CODE  a set of the effort option fails with this JSON-RPC
+//                        error code (e.g. -32603 internal error)
 //   FAKE_ACP_CONFIG_REPLY_BARE  session/set_config_option applies the value but
 //                        answers with a bare `{}`, the shape stock dsh used:
 //                        no configOptions, so nothing to confirm against
@@ -473,6 +475,10 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === reasoningConfigId && process.env.FAKE_ACP_EFFORT_ERROR_CODE) {
+        out({ jsonrpc: "2.0", id: msg.id, error: { code: Number(process.env.FAKE_ACP_EFFORT_ERROR_CODE), message: "Internal error" } });
+        break;
+      }
       if (configId === reasoningConfigId && reasoningModels.length > 0 && !reasoningAdvertised()) {
         out({
           jsonrpc: "2.0",

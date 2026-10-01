@@ -277,8 +277,14 @@ const support: AcpSupport = {
       // different: -32602 means this session advertises no effort option for
       // the model, so there is no level for it to be stuck at.
       if (explicit) throw new Error(refused(message));
-      console.warn(`[mcode] ${model}: ${refused(message)}`);
-      return;
+      // Only -32602 means "no such option for this model". Any other failure
+      // (a transport or internal error) leaves the session's level unknown,
+      // so it fails the turn instead of billing it at whatever was set.
+      if ((error as { code?: unknown }).code === -32602) {
+        console.warn(`[mcode] ${model}: ${refused(message)}`);
+        return;
+      }
+      throw new Error(refused(message));
     }
 
     // Only a *reported* mismatch means it did not take: a bare `{}` ACK reports

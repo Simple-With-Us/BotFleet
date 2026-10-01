@@ -363,6 +363,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     "FAKE_ACP_REASONING_CONFIG_ID",
     "FAKE_ACP_REASONING_EFFORTS",
     "FAKE_ACP_REASONING_MODELS",
+    "FAKE_ACP_EFFORT_ERROR_CODE",
     "FAKE_ACP_REASONING_STICKS",
     "FAKE_ACP_CONFIG_REPLY_BARE",
   ];
@@ -538,6 +539,17 @@ describe("MiniMax Code reasoning effort over ACP", () => {
 
     expect(done).toMatchObject({ ok: true });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not accept thinking effort default"));
+  });
+
+  it("fails a no-effort turn when the Default reset errors with anything but -32602", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_EFFORT_ERROR_CODE = "-32603";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-default-internal", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/did not accept thinking effort default/);
   });
 
   it("accepts a bare acknowledgement that reports no option state", async () => {
