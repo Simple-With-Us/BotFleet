@@ -780,7 +780,7 @@ export const ENGINE_DISPLAY_ORDER: string[] = [
  *    "dshAgent"    → "deepseek-harness"
  *    "antigravityAgent" → "antigravity"
  *    "deepseekAgent" → "deepseek-harness"  (legacy alias — the old
- *    `deepseekAgent` driver predates the Harness bridge and ships on
+ *    `deepseekAgent` driver predates the Clutch bridge and ships on
  *    users who haven't updated)
  *  Unknown driver kinds return `null` so the caller can decide whether to
  *  fall back to a generic entry instead of crashing on `undefined`. */
