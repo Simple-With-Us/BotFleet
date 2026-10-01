@@ -67,6 +67,7 @@ import {
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
 import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
+import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
 import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
@@ -11700,6 +11701,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // is the live registry including half-open entries, so the half-open
         // "we let one probe through" state is visible here too.
         doomed: doomedDispatches.list(),
+        // Bots whose fallback chain is longer on the picker than it is at
+        // runtime. `selectTurnFallback` skips a candidate that is the primary
+        // again, or one it already walked, so a chain that reads as three tiers
+        // in Settings can be two — silently, because the picker counts what was
+        // typed. Two live bots were configured that way. Reported per bot here
+        // rather than corrected in the record: repeating the primary at the end
+        // of a chain is a defensible thing for an owner to mean.
+        fallbackChains: store.bots.map((bot) => ({
+          botId: bot.id,
+          name: bot.name,
+          ...effectiveFallbackTiers(bot.modelSelection, bot.modelSelection.fallbacks),
+        })).filter((entry) => entry.redundant.length > 0),
         antigravity: lastAntigravityQuotaSnapshot(),
         grok: lastGrokQuotaSnapshot(),
         windows: usageQuotaPoller.getWindows(),
