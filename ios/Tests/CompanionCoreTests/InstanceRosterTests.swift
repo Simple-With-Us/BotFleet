@@ -11,10 +11,12 @@ final class InstanceRosterTests: XCTestCase {
         driver: String = "claudeAgent",
         state: String = "available",
         hidden: Bool? = nil,
+        transient: Bool? = nil,
         version: String? = nil
     ) throws -> Instance {
         var snapshot = #"{"state":"\#(state)""#
         if let hidden { snapshot += #","hidden":\#(hidden)"# }
+        if let transient { snapshot += #","transient":\#(transient)"# }
         if let version { snapshot += #","version":"\#(version)""# }
         snapshot += "}"
         let json = """
@@ -116,6 +118,21 @@ final class InstanceRosterTests: XCTestCase {
         XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
     }
 
+    func testForgetOrderKeepsTheRosterButNotTheMark() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 1_790_000_000_000)
+        roster.forgetOrder()
+        // The pickers keep their engines while the next roster is on its way...
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["claude"])
+        // ...and a restarted harness, whose clock sits below the old process's
+        // last stamp, is no longer judged against it.
+        XCTAssertTrue(roster.apply([try instance("codex")], describedAt: 1_789_999_000_000))
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
+        // Ordering holds again from that stamp on.
+        XCTAssertFalse(roster.apply([try instance("claude")], describedAt: 1_789_998_000_000))
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
+    }
+
     func testAPushedFrameAndAFetchAreOrderedByTheSameMark() throws {
         var roster = InstanceRoster()
         let frameJSON = """
@@ -146,6 +163,19 @@ final class InstanceRosterTests: XCTestCase {
             describedAt: 1
         )
         XCTAssertEqual(roster.driverKinds, ["claude": "claudeAgent", "computer": "boxAgent"])
+    }
+
+    // MARK: - Checking
+
+    func testASlowProbeReadsAsCheckingNotUnavailable() throws {
+        let slow = try instance("claude", state: "unavailable", transient: true)
+        XCTAssertTrue(slow.snapshot.isChecking)
+        XCTAssertEqual(slow.snapshot.engineStatusLabel, "Checking")
+        // A real answer is never "Checking", and an older harness sends no flag.
+        let answered = try instance("claude", state: "unavailable", transient: false)
+        XCTAssertEqual(answered.snapshot.engineStatusLabel, "Unavailable")
+        XCTAssertEqual(try instance("claude", state: "unavailable").snapshot.engineStatusLabel, "Unavailable")
+        XCTAssertEqual(try instance("claude").snapshot.engineStatusLabel, "Ready")
     }
 
     // MARK: - Hidden engines

@@ -704,6 +704,11 @@ final class Session: ObservableObject {
                         // the request dies halfway through replay/hydration,
                         // reconnecting must still ask for the missing gap.
                         if !resumed {
+                            // A stream that cannot resume is usually a restarted
+                            // harness, whose describedAt clock owes nothing to
+                            // the last process's.  Keep the roster, drop the
+                            // mark, so the next fetch is not judged against it.
+                            instanceRoster.forgetOrder()
                             coldHydration: while true {
                                 switch try await hydrateSnapshot(using: client) {
                                 case .applied:

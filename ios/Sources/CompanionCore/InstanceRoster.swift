@@ -40,6 +40,18 @@ public struct InstanceRoster: Equatable, Sendable {
         describedAt = -.infinity
     }
 
+    /// Forgets only the high-water mark, keeping the roster on screen.
+    ///
+    /// `describedAt` is the harness's clock, and each harness process starts its
+    /// own: after a restart (the stream says so with `resumed == false`) its
+    /// stamps can sit below the old process's last one, for instance when the
+    /// Mac's clock was corrected backwards meanwhile.  Holding the old mark
+    /// would then drop every fetch and push until the clock caught up.  The
+    /// roster itself stays, so pickers do not go empty before the next one lands.
+    public mutating func forgetOrder() {
+        describedAt = -.infinity
+    }
+
     /// instanceId -> driverKind for the held roster, so a bot's saved selection
     /// resolves to a provider mark without a lookup per render.  Hidden
     /// engines are included: a selection that points at one still resolves.

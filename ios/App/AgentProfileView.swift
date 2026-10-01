@@ -245,9 +245,10 @@ struct AgentProfileView: View {
                     if fallbacks.count < Self.maximumFallbacks {
                         Section {
                             Button("Add Fallback", systemImage: "plus.circle") {
-                                // Never a hidden engine that is only here because a saved
-                                // selection points at it.
-                                let firstInst = instances.first(where: { $0.isListed() })
+                                // An engine the fallback picker would offer, never a hidden
+                                // one that is only here because a saved selection points at it.
+                                let firstInst = fallbackAvailableInstances(for: "").first
+                                    ?? instances.first(where: { $0.isListed() })
                                 let instId = firstInst?.id ?? instanceId
                                 let mdl = firstInst?.models.default ?? modelId
                                 fallbacks.append(ModelSelection(instanceId: instId, model: mdl))
@@ -358,6 +359,12 @@ struct AgentProfileView: View {
                     speechDevices.removeAll()
                 }
             }
+            .onChange(of: session.cachedInstances) { _, roster in
+                // A pushed roster (a background probe settled) replaces the
+                // engines this form was opened with.
+                guard !roster.isEmpty else { return }
+                instances = profileEngines(from: roster)
+            }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
                 Task { await upload(item) }
@@ -391,8 +398,10 @@ struct AgentProfileView: View {
         let saved = current.modelSelection
         let savedIds = Set([saved.instanceId] + (saved.fallbacks ?? []).map(\.instanceId))
         let listed = raw.listed(keeping: savedIds)
+        // A saved fallback stays like the saved primary: dropping it would leave
+        // its row with a provider no option matches.
         let usable = listed.filter { inst in
-            inst.snapshot.isAvailable || inst.id == saved.instanceId
+            inst.snapshot.isAvailable || savedIds.contains(inst.id)
         }
         return usable.isEmpty ? listed : usable
     }

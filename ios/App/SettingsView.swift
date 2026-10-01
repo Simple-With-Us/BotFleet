@@ -321,6 +321,12 @@ struct SettingsView: View {
         .onChange(of: session.connection?.id) { _, _ in
             Task { await loadSettingsExtras() }
         }
+        .onChange(of: session.cachedInstances) { _, roster in
+            // A background probe settled and the harness pushed the new roster:
+            // an engine shown as "Checking" now says what it found.
+            guard session.connection != nil, !roster.isEmpty else { return }
+            engines = settingsEngines(from: roster)
+        }
         .onChange(of: focusedProfileField) { previous, next in
             // Save when a profile field loses focus (return key, tapping
             // elsewhere, keyboard dismissal, or moving to the other field)
@@ -464,8 +470,13 @@ struct SettingsView: View {
         } else if !settingsLoaded {
             settingsLoadFailed = true
         }
-        let fetched = await session.instances()
-        engines = fetched.filter { inst in
+        engines = settingsEngines(from: await session.instances())
+        loadingEngines = false
+    }
+
+    /// The engines Settings lists.
+    private func settingsEngines(from fetched: [Instance]) -> [Instance] {
+        fetched.filter { inst in
             // DeepSeek is Harness only: filter out standalone/legacy direct deepseek driver
             if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || inst.id == "deepseek" {
                 return false
@@ -473,7 +484,6 @@ struct SettingsView: View {
             // An optional integration nobody has set up stays out of the list, as on the Mac.
             return inst.isEnabled && inst.isListed()
         }
-        loadingEngines = false
     }
 
     private var roomTerm: String { session.config?.roomTerminologyLabel ?? "Channel" }
