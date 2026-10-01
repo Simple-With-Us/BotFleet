@@ -1,9 +1,9 @@
 // Build the global-input observer as a real macOS app bundle. A stable bundle
 // identity is required for Accessibility/Input Monitoring consent to persist.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const electronDir = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.dirname(electronDir);
@@ -37,6 +37,17 @@ export function buildRecorderHelper() {
   );
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   buildRecorderHelper();
 }

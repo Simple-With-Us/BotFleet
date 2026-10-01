@@ -1,5 +1,5 @@
-import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /** Reject an existing tag unless its peeled commit is the pinned build source. */
 export async function verifyReleaseTag({ repo, tag, sha, request }) {
@@ -27,7 +27,18 @@ export async function verifyReleaseTag({ repo, tag, sha, request }) {
   throw new Error("Release tag chain is too deep");
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   try {
     const token = process.env.GH_TOKEN;
     if (!token) throw new Error("GH_TOKEN is required to verify the release tag");

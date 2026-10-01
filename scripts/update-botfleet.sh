@@ -9,10 +9,17 @@
 # script is invoked.
 #
 # `ubf` is a no-op when the local BotFleet checkout is already at origin/main.
-# Override with BOTFLEET_FORCE=1 to reinstall anyway.  The transaction inside
-# update-botfleet-mac.mjs has no built-in "already current" short circuit; the
-# skip happens here so a second `ubf` an hour later is sub-second instead of a
-# 2-minute interruption.
+# Override with BOTFLEET_FORCE=1 (or --force / -f) to reinstall anyway.  The
+# transaction inside update-botfleet-mac.mjs has no built-in "already current"
+# short circuit; the skip happens here so a second `ubf` an hour later is
+# sub-second instead of a 2-minute interruption.
+#
+# WARNING:  force is not only "reinstall anyway".  The updater also treats it as
+# permission to update while work is active: it skips the idle requirement and
+# POSTs /api/runtime/quiesce?force=true, which interrupts busy bots and running
+# or queued routines.  Their work is saved to pending-update-resume.json and
+# resumed after the update, and a live room turn still refuses the forced
+# update.  Do not use it casually while bots are working.
 set -euo pipefail
 
 # Extend PATH with every place node is commonly found on macOS (Homebrew Apple
@@ -68,8 +75,9 @@ fi
 
 # Skip the close / rebuild / relaunch dance when the local BotFleet checkout is
 # already at origin/main.  Override the check with BOTFLEET_FORCE=1 or by
-# passing --force / -f.  Override the checkout location with BOTFLEET_CHECKOUT
-# (defaults to the parent of the tracked implementation).
+# passing --force / -f (which also interrupts busy bots and routines; see the
+# warning at the top of this file).  Override the checkout location with
+# BOTFLEET_CHECKOUT (defaults to the parent of the tracked implementation).
 # --force / -f mirrors the env-var override; recognised here so the documented
 # flag does what its name says.
 if [[ -z "${BOTFLEET_FORCE:-}" ]]; then
@@ -140,14 +148,14 @@ for arg in "$@"; do
 done
 [[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0
 if [[ "${BOTFLEET_FORCE:-}" == "1" ]]; then
-  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main."
+  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines (they resume after the update)."
 elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main 2>/dev/null; then
     LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)
     REMOTE_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse origin/main)
     if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
       CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
-      echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway.)"
+      echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
       exit 0
     fi
   else
@@ -251,6 +259,17 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/botfleet-updater.XXXXXX")"
   cleanup_bootstrap() { rm -rf "$BOOTSTRAP_DIR"; }
   trap cleanup_bootstrap EXIT
+  # Canonicalize the directory.  On macOS TMPDIR is under /var/folders and /var
+  # is a symlink to /private/var, so the unresolved path differs from the one
+  # Node's ESM loader reports for the entry module.  The updater compares
+  # physical paths itself, but hand it the physical one anyway.  The trap above
+  # is already armed, so a failure here still removes the directory.
+  if BOOTSTRAP_PHYSICAL="$(cd "$BOOTSTRAP_DIR" && pwd -P)" && [[ -n "$BOOTSTRAP_PHYSICAL" ]]; then
+    BOOTSTRAP_DIR="$BOOTSTRAP_PHYSICAL"
+  else
+    echo "BotFleet updater: could not resolve the bootstrap directory $BOOTSTRAP_DIR." >&2
+    exit 1
+  fi
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF" 2>/dev/null; then
     # Enforce resolveTarget()'s origin/main ancestry rule BEFORE any code from
     # the target is archived or executed: an unmerged ref must never supply
