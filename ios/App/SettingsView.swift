@@ -471,7 +471,7 @@ struct SettingsView: View {
                 return false
             }
             // An optional integration nobody has set up stays out of the list, as on the Mac.
-            return inst.isEnabled && !inst.snapshot.isHidden
+            return inst.isEnabled && inst.isListed()
         }
         loadingEngines = false
     }

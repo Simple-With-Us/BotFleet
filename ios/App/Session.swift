@@ -93,8 +93,10 @@ final class Session: ObservableObject {
     /// transient sheet dismissals and cancelled tasks so the profile model picker
     /// never empties spuriously.
     @Published private(set) var cachedInstances: [Instance] = []
-    /// `describedAt` of the roster in `cachedInstances`; reset with it on pair / sign-out.
-    private var instancesDescribedAt: Double = -.infinity
+    /// The roster behind `cachedInstances` and the `describedAt` high-water mark
+    /// every fetch and push is ordered by (`InstanceRoster`).  Reset with them
+    /// on pair / sign-out: another computer's stamps share nothing with this one's.
+    private var instanceRoster = InstanceRoster()
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
@@ -372,7 +374,7 @@ final class Session: ObservableObject {
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         cachedInstances = []
-        instancesDescribedAt = -.infinity
+        instanceRoster.reset()
         status = .connecting
     }
 
@@ -452,7 +454,7 @@ final class Session: ObservableObject {
         self.state = CompanionState()
         instanceDriverKinds = [:]
         cachedInstances = []
-        instancesDescribedAt = -.infinity
+        instanceRoster.reset()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
         restorePending = false
@@ -525,7 +527,7 @@ final class Session: ObservableObject {
         pushSenderHealthNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
-        instancesDescribedAt = -.infinity
+        instanceRoster.reset()
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         resetAvatarCache()
@@ -2467,18 +2469,14 @@ final class Session: ObservableObject {
 
     /// Replaces the cached roster unless the harness already described a newer
     /// one: a slow fetch must not overwrite a fresher push, or the reverse.
-    /// An answer without a stamp (an older harness) is applied as before.
+    /// Every path that installs a roster goes through here, so one high-water
+    /// mark orders them all.  An answer without a stamp (an older harness) is
+    /// applied as before.
     @discardableResult
     private func applyInstances(_ fetched: [Instance], describedAt: Double?) -> Bool {
-        if let describedAt {
-            guard describedAt >= instancesDescribedAt else { return false }
-            instancesDescribedAt = describedAt
-        }
-        cachedInstances = fetched
-        instanceDriverKinds = Dictionary(
-            fetched.map { ($0.instanceId, $0.driverKind) },
-            uniquingKeysWith: { _, latest in latest }
-        )
+        guard instanceRoster.apply(fetched, describedAt: describedAt) else { return false }
+        cachedInstances = instanceRoster.instances
+        instanceDriverKinds = instanceRoster.driverKinds
         return true
     }
 

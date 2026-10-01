@@ -245,7 +245,9 @@ struct AgentProfileView: View {
                     if fallbacks.count < Self.maximumFallbacks {
                         Section {
                             Button("Add Fallback", systemImage: "plus.circle") {
-                                let firstInst = instances.first
+                                // Never a hidden engine that is only here because a saved
+                                // selection points at it.
+                                let firstInst = instances.first(where: { $0.isListed() })
                                 let instId = firstInst?.id ?? instanceId
                                 let mdl = firstInst?.models.default ?? modelId
                                 fallbacks.append(ModelSelection(instanceId: instId, model: mdl))
@@ -338,11 +340,7 @@ struct AgentProfileView: View {
             .overlay { if busy { ProgressView().controlSize(.large) } }
             .task {
                 if !session.cachedInstances.isEmpty {
-                    let cached = session.cachedInstances
-                    let usable = cached.filter { inst in
-                        inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-                    }
-                    instances = usable.isEmpty ? cached : usable
+                    instances = profileEngines(from: session.cachedInstances)
                     instancesLoaded = true
                 }
                 async let status = session.configStatus()
@@ -353,13 +351,7 @@ struct AgentProfileView: View {
                 voices = await options
                 let rawInstances = await fetchedInstances
                 if !rawInstances.isEmpty || instances.isEmpty {
-                    let usable = rawInstances.filter { inst in
-                        inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-                    }
-                    // Offering only healthy engines is right, but never at the cost
-                    // of an empty picker: if the computer reports none as available
-                    // the person should still see the list and be able to choose.
-                    instances = usable.isEmpty ? rawInstances : usable
+                    instances = profileEngines(from: rawInstances)
                 }
                 instancesLoaded = true
                 if let loadedConfig, !loadedConfig.canSpeak(agentVoice: voice) {
@@ -384,12 +376,25 @@ struct AgentProfileView: View {
     /// Re-fetch the engine list after a slow or failed load.
     private func reloadInstances() async {
         instancesLoaded = false
-        let raw = await session.instances()
-        let usable = raw.filter { inst in
-            inst.snapshot.isAvailable || inst.id == current.modelSelection.instanceId
-        }
-        instances = usable.isEmpty ? raw : usable
+        instances = profileEngines(from: await session.instances())
         instancesLoaded = true
+    }
+
+    /// The engines this form works from.  Offering only healthy engines is
+    /// right, but never at the cost of an empty picker: if the computer
+    /// reports none as available the person should still see the list and be
+    /// able to choose.  A hidden engine (an integration nobody has set up) is
+    /// left out unless the bot's saved model or one of its fallbacks already
+    /// points at it, so that selection still resolves but nothing new is
+    /// offered it.
+    private func profileEngines(from raw: [Instance]) -> [Instance] {
+        let saved = current.modelSelection
+        let savedIds = Set([saved.instanceId] + (saved.fallbacks ?? []).map(\.instanceId))
+        let listed = raw.listed(keeping: savedIds)
+        let usable = listed.filter { inst in
+            inst.snapshot.isAvailable || inst.id == saved.instanceId
+        }
+        return usable.isEmpty ? listed : usable
     }
 
     @ViewBuilder
@@ -848,7 +853,8 @@ struct AgentProfileView: View {
             if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || (inst.id == "deepseek" && inst.driverKind != "dshAgent") {
                 return inst.id == instanceId
             }
-            return (inst.snapshot.state == "available" || inst.id == instanceId) &&
+            return inst.isListed(keeping: [instanceId]) &&
+                (inst.snapshot.state == "available" || inst.id == instanceId) &&
                 inst.snapshot.reason != "Disabled in settings" &&
                 (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
         }
@@ -859,7 +865,8 @@ struct AgentProfileView: View {
             if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || (inst.id == "deepseek" && inst.driverKind != "dshAgent") {
                 return inst.id == currentFallbackInstanceId
             }
-            return (inst.snapshot.state == "available" || inst.id == currentFallbackInstanceId) &&
+            return inst.isListed(keeping: [currentFallbackInstanceId]) &&
+                (inst.snapshot.state == "available" || inst.id == currentFallbackInstanceId) &&
                 inst.snapshot.reason != "Disabled in settings" &&
                 (inst.id != "kimi" || (inst.snapshot.state == "available" && inst.snapshot.authenticated != false))
         }
