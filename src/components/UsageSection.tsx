@@ -116,6 +116,40 @@ export interface EngineSpend {
   unpricedTurns7d?: number;
 }
 
+/** One `(bot, engine)` pair the dispatcher is refusing to start. */
+export interface DoomedPair {
+  botId: string;
+  instanceId: string;
+  consecutiveFailures: number;
+  openedAt: number;
+  lastFailureAt: number;
+  lastError?: string;
+  /** Whether this entry is refusing dispatches right now.  Absent on a server
+   *  that predates the flag — treated as open, which is the old behaviour. */
+  open?: boolean;
+  /** Whether an OPEN breaker here is actually holding this bot, i.e. the
+   *  engine it names is one this bot's work could be on.  An open breaker on
+   *  an engine no run is waiting on outlives recovery and holds nothing.
+   *
+   *  Absent on a server that predates it, and absent means OPEN — the same
+   *  compatibility contract as `open` above.  Showing the entry is the safe
+   *  direction: an over-warning costs a glance, a hidden one loses a stop. */
+  holds?: boolean;
+}
+
+/** One bot whose configured fallback chain is longer than the runtime will
+ *  actually walk. */
+export interface RedundantChain {
+  botId: string;
+  name: string;
+  /** "bot" for the bot-level chain, "task" for a Projects task's own chain. */
+  scope?: "bot" | "task";
+  threadId?: string | null;
+  total: number;
+  effective: number;
+  redundant: { instanceId: string; model: string; reason: "same-as-primary" | "duplicate" }[];
+}
+
 /** Whether an engine row has enough to be worth showing.
  *
  *  Dollars OR unpriced turns.  An engine that settled work but reported no
@@ -192,6 +226,12 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   const [grokQuota, setGrokQuota] = React.useState<GrokUsageSnapshot | null>(null);
   const [deepseekBalance, setDeepSeekBalance] = React.useState<DeepSeekBalanceView | null>(null);
   const [engineSpend, setEngineSpend] = React.useState<Record<string, EngineSpend>>({});
+  // Engines the dispatcher is refusing to start, and chains that are longer in
+  // the picker than at runtime.  Both have been on this payload since they were
+  // added with nothing rendering them, which is the same defect a dead field is:
+  // a fact recorded for someone and read by no one.
+  const [doomed, setDoomed] = React.useState<DoomedPair[]>([]);
+  const [redundantChains, setRedundantChains] = React.useState<RedundantChain[]>([]);
   const [quotaWindows, setQuotaWindows] = React.useState<Array<{
     id: string;
     provider: string;
@@ -327,6 +367,8 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           if (data?.engineSpend && typeof data.engineSpend === "object") {
             setEngineSpend(data.engineSpend);
           }
+          if (Array.isArray(data?.doomed)) setDoomed(data.doomed);
+          if (Array.isArray(data?.fallbackChains)) setRedundantChains(data.fallbackChains);
         })
         .catch(() => {});
     };
@@ -334,6 +376,20 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
     const quotaInterval = setInterval(fetchQuotas, 30_000);
     return () => clearInterval(quotaInterval);
   }, []);
+  // `doomed` also carries sub-threshold counters and expired half-open
+  // entries, both of which dispatch normally. Rendering every row of it as
+  // "held" would report a healthy engine as held after one transient failure,
+  // so only the entries that are actually refusing are shown.
+  // `holds`, not `open`. An open breaker on a FALLBACK engine does not hold the
+  // bot — the primary still dispatches, and the dispatcher only consults the
+  // engine the run would actually use. The server answers that with the same
+  // question the dispatcher asks, so the panel does not have to re-derive it
+  // from a list that knows nothing about a bot's selection.
+  const heldPairs = doomed.filter((pair) => pair.holds ?? pair.open ?? true);
+  // Count BOTS, not pairs. One bot whose primary and fallback both opened
+  // breakers is one bot being held, and a heading that says otherwise sends the
+  // reader looking for a bot that does not exist.
+  const heldBotCount = new Set(heldPairs.map((pair) => pair.botId)).size;
   const badge = telemetryBadge(telemetryStatus, telemetryFetchError);
   // Whatever host the operator pointed this at — never a built-in name.
   const host = telemetryHost(telemetryStatus);
@@ -689,6 +745,73 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         {localQuotaNotice && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
             {localQuotaNotice}
+          </div>
+        )}
+        {heldPairs.length > 0 && (
+          <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
+            <div className="font-medium text-ink">
+              {heldBotCount === 1 ? "1 Bot Is Being Held" : `${heldBotCount} Bots Are Being Held`}
+            </div>
+            <div className="mt-1">
+              These bots cannot start their engine, so their scheduled work is queued rather than failed
+              &#8212; it runs on its own once the engine comes back.  Each attempt is being counted, so this
+              is not a stuck scheduler.
+            </div>
+            <ul className="mt-1.5 space-y-0.5">
+              {heldPairs.map((pair) => (
+                <li key={`${pair.botId}:${pair.instanceId}`}>
+                  <span className="font-mono">{pair.instanceId}</span> for bot{" "}
+                  <span className="font-mono">{pair.botId.slice(0, 8)}</span> — failed to start{" "}
+                  {pair.consecutiveFailures} times
+                  {pair.lastError ? `: ${pair.lastError}` : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {redundantChains.length > 0 && (
+          <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
+            {(() => {
+              // Count BOTS, matching the held-engines notice: one bot with a
+              // redundant bot-level chain and two redundant task overrides is
+              // one bot, not three.
+              const bots = new Set(redundantChains.map((chain) => chain.botId)).size;
+              return bots === 1
+                ? "1 Bot's Fallback Chain Is Shorter Than It Looks"
+                : `${bots} Bots' Fallback Chains Are Shorter Than They Look`;
+            })()}
+            <ul className="mt-1.5 space-y-0.5">
+              {redundantChains.map((chain) => (
+                // A bot legitimately returns several rows — its own chain plus
+                // one per task that overrides it — so keying by botId alone
+                // collided, and counting rows claimed several bots where there
+                // was one.
+                <li key={`${chain.botId}:${chain.scope ?? "bot"}:${chain.threadId ?? "-"}`}>
+                  <span className="font-medium text-ink">{chain.name}</span>
+                  {/* Without this, a Projects bot with task overrides shows one
+                      unnamed row per task and the operator cannot tell which
+                      chain to fix. */}
+                  {chain.scope === "task" && (
+                    <>
+                      {"\u00a0\u00a0"}
+                      <span className="font-mono text-ink-secondary">
+                        task {chain.threadId ? chain.threadId.slice(0, 8) : "?"}
+                      </span>
+                    </>
+                  )}
+                  {" — "}
+                  {chain.total} configured,{" "}
+                  {chain.effective} usable
+                  {chain.redundant.map((entry) => (
+                    <span key={`${entry.instanceId}:${entry.model}`}>
+                      {" "}
+                      (<span className="font-mono">{entry.model}</span>{" "}
+                      {entry.reason === "same-as-primary" ? "is the primary again" : "repeats an earlier entry"})
+                    </span>
+                  ))}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         <div className="flex flex-col divide-y divide-hairline/20">
