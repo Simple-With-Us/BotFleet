@@ -2283,8 +2283,11 @@ export class Store {
     const pendingBefore = new Set(wantDirective && !firstDirectivePass ? pendingById[directiveId] ?? [] : []);
     const runDirective = firstDirectivePass || pendingBefore.size > 0;
     const pendingAfter = new Set<string>();
-    const pendingKey = (botId: string, scope: string, entry: ModelSelection) =>
-      JSON.stringify([botId, scope, entry.instanceId, entry.model]);
+    // Keyed by where the entry sits, never by its model: a regular pass can
+    // move a pinned id forward (superseded, retired) before the next boot
+    // gets to apply the directive, and the entry must still be found.
+    const pendingKey = (botId: string, scope: string, slot: string, entry: ModelSelection) =>
+      JSON.stringify([botId, scope, slot, entry.instanceId]);
     const visited = new Set<string>();
     const wanted = opts.botIds ? new Set(opts.botIds) : null;
     const results: Array<{ botId: string; notice: string | null }> = [];
@@ -2302,12 +2305,17 @@ export class Store {
     const dropStaleCursors = (
       cursors: Record<string, unknown> | undefined,
       changes: readonly LineageChange[],
+      primaryInstanceId: string,
     ) => {
       if (!cursors) return;
       for (const change of changes) {
-        if (change.from !== change.to && resumeKeepsStartedModel(driverKindFor(change.instanceId))) {
-          delete cursors[change.instanceId];
-        }
+        if (change.from === change.to || !resumeKeepsStartedModel(driverKindFor(change.instanceId))) continue;
+        // A cursor is kept per engine instance.  A fallback on the primary's
+        // own instance shares the primary's cursor, which resumes the thread
+        // the primary started whatever the fallback asks for, so only the
+        // primary's move makes it stale.
+        if (change.slot !== "primary" && change.instanceId === primaryInstanceId) continue;
+        delete cursors[change.instanceId];
       }
     };
     /** `directive` names the saved selection (bot and scope) when the
@@ -2315,8 +2323,8 @@ export class Store {
     const pass = (selection: ModelSelection, directive?: { botId: string; scope: string }) => {
       let flagged: { selection: ModelSelection; flagged: LineageChange[] } = { selection, flagged: [] };
       if (directive && runDirective) {
-        flagged = applyOwnerDirective(selection, driverKindFor, opts.contextFor, (entry) => {
-          const key = pendingKey(directive.botId, directive.scope, entry as ModelSelection);
+        flagged = applyOwnerDirective(selection, driverKindFor, opts.contextFor, (entry, slot) => {
+          const key = pendingKey(directive.botId, directive.scope, slot, entry as ModelSelection);
           if (!firstDirectivePass && !pendingBefore.has(key)) return false;
           const context = opts.contextFor(entry.instanceId);
           if (context && !context.catalogPending) return true;
@@ -2346,10 +2354,10 @@ export class Store {
         const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
         if (notice) notices.push(notice);
         bot.modelSelection = next.selection;
-        dropStaleCursors(bot.resumeCursors, next.changes);
+        dropStaleCursors(bot.resumeCursors, next.changes, saved.instanceId);
         // Tasks without a selection of their own run on the bot's.
         for (const task of bot.tasks ?? []) {
-          if (!task.modelSelection?.instanceId) dropStaleCursors(task.resumeCursors, next.changes);
+          if (!task.modelSelection?.instanceId) dropStaleCursors(task.resumeCursors, next.changes, saved.instanceId);
         }
       }
       if (bot.activeModelSelection?.instanceId) {
@@ -2363,8 +2371,8 @@ export class Store {
           const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
           if (notice) notices.push(`${notice} (task “${task.title}”)`);
           task.modelSelection = next.selection;
-          dropStaleCursors(task.resumeCursors, next.changes);
-          if (task.threadId === bot.threadId) dropStaleCursors(bot.resumeCursors, next.changes);
+          dropStaleCursors(task.resumeCursors, next.changes, saved.instanceId);
+          if (task.threadId === bot.threadId) dropStaleCursors(bot.resumeCursors, next.changes, saved.instanceId);
         }
         if (task.activeModelSelection?.instanceId) {
           task.activeModelSelection = pass(task.activeModelSelection).selection;

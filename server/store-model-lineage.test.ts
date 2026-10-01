@@ -152,12 +152,92 @@ describe("Store.reconcileModelLineage", () => {
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
     expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({
       applied: [OWNER_DIRECTED_LATEST.id],
-      pending: { [OWNER_DIRECTED_LATEST.id]: [JSON.stringify(["plumber", "bot", "claude", "claude-sonnet-5"])] },
+      pending: { [OWNER_DIRECTED_LATEST.id]: [JSON.stringify(["plumber", "bot", "primary", "claude"])] },
     });
     claudeLoaded = true;
     reconcile(store, true);
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
     expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({ applied: [OWNER_DIRECTED_LATEST.id] });
+  });
+
+  it("still floats a pending entry that a regular pass moved forward before the next boot", () => {
+    // The Claude engine failed to load at boot, then loaded without a
+    // restart: the regular pass moves the pinned id to 5.5, and the next
+    // boot must still find the entry and float it.
+    seedBots([
+      {
+        id: "plumber",
+        modelSelection: {
+          instanceId: "dsh",
+          model: "DeepSeek-V4.1-Flash",
+          fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }],
+        },
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    const markerPath = join(DATA_DIR, "model-lineage.json");
+    claudeLoaded = false;
+    reconcile(store, true);
+    expect(JSON.parse(readFileSync(markerPath, "utf8")).pending[OWNER_DIRECTED_LATEST.id]).toEqual([
+      JSON.stringify(["plumber", "bot", "fallback 1", "claude"]),
+    ]);
+
+    claudeLoaded = true;
+    reconcile(store);
+    expect(store.bot("plumber")!.modelSelection.fallbacks).toEqual([{ instanceId: "claude", model: "claude-sonnet-5-5" }]);
+
+    reconcile(store, true);
+    expect(store.bot("plumber")!.modelSelection.fallbacks).toEqual([
+      { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+    ]);
+    expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({ applied: [OWNER_DIRECTED_LATEST.id] });
+  });
+
+  it("keeps the Codex cursor when only a fallback on the same instance moves, and drops it when the primary does", () => {
+    const cursors = () => ({ codex: "thread-old", claude: "keep" });
+    seedBots([
+      {
+        id: "b",
+        modelSelection: {
+          instanceId: "codex",
+          model: "gpt-5.5",
+          fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }],
+        },
+        resumeCursors: cursors(),
+        tasks: [{ threadId: "thread-b", title: "Main", createdAt: 1_000, resumeCursors: cursors() }],
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    codexModels = { ...CODEX_LIVE, options: [...CODEX_LIVE.options, { id: "gpt-6-luna", label: "GPT-6 Luna" }] };
+    reconcile(store);
+    const bot = store.bot("b")!;
+    expect(bot.modelSelection.fallbacks![0]!.model).toBe("gpt-6-luna");
+    expect(bot.modelSelection.model).toBe("gpt-5.5");
+    expect(bot.resumeCursors).toEqual(cursors());
+    expect(bot.tasks![0]!.resumeCursors).toEqual(cursors());
+
+    // A fallback on its own Codex instance keeps its own cursor, and that
+    // one is dropped when it moves.
+    const other = () => ({ codex: "thread-primary", codex2: "thread-fallback" });
+    seedBots([
+      {
+        id: "c",
+        modelSelection: {
+          instanceId: "codex",
+          model: "gpt-5.5",
+          fallbacks: [{ instanceId: "codex2", model: "gpt-5.6-luna", latest: "luna" }],
+        },
+        resumeCursors: other(),
+        tasks: [{ threadId: "thread-c", title: "Main", createdAt: 1_001, resumeCursors: other() }],
+      },
+    ]);
+    const second = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    second.reconcileModelLineage({
+      contextFor: (id) => lineageContextFor(id === "codex2" ? instance("codex") : instance(id)),
+      nameFor: (id, model) => modelNameFor(instance(id === "codex2" ? "codex" : id)?.models, model),
+    });
+    expect(second.bot("c")!.modelSelection.fallbacks![0]!.model).toBe("gpt-6-luna");
+    expect(second.bot("c")!.resumeCursors).toEqual({ codex: "thread-primary" });
   });
 
   it("never flags an id on a shadow engine, and judges it against the real catalog once it loads", () => {
@@ -183,7 +263,7 @@ describe("Store.reconcileModelLineage", () => {
     run(shadow);
     expect(store.bot("custom")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
     expect(JSON.parse(readFileSync(markerPath, "utf8")).pending[OWNER_DIRECTED_LATEST.id]).toEqual([
-      JSON.stringify(["custom", "bot", "claude", "claude-sonnet-5"]),
+      JSON.stringify(["custom", "bot", "primary", "claude"]),
     ]);
 
     run(withCustomRow);

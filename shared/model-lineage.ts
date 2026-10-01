@@ -244,9 +244,13 @@ export const PRICE_BAND = 0.25;
 /** Whether a driver's native resume keeps the model its session started
  *  with, so a saved selection whose model moved must start a fresh session
  *  (the harness drops that engine's resume cursor and replays the visible
- *  history instead).  Codex's app-server takes a model only at thread/start;
- *  thread/resume and turn/start carry none (server/drivers/codex.ts).  The
- *  other lineage engines apply the model on every turn of a resumed session:
+ *  history instead).  Codex's app-server takes a model at thread/start, and
+ *  the driver (server/drivers/codex.ts) sends none on thread/resume or
+ *  turn/start, so a resumed thread runs the model it started with.  The
+ *  protocol's turn/start does accept a model, so passing it there would let
+ *  a move keep the native session; until the driver does, the cursor goes.
+ *  The other lineage engines apply the model on every turn of a resumed
+ *  session:
  *  Claude passes --model beside --resume, and the ACP engines (Grok,
  *  Droid) send session/set_model after session/load. */
 export function resumeKeepsStartedModel(driverKind: string | undefined): boolean {
@@ -630,17 +634,18 @@ export function reconcileChain<S extends LineageSelection>(
  *  operator's own and are never classified or flagged.  `applies` lets the
  *  caller leave an entry out (its engine's catalog is not known yet, so a
  *  custom id cannot be told from an official one); it is asked about every
- *  entry that has no `latest` of its own. */
+ *  entry that has no `latest` of its own, with the slot it sits in
+ *  ("primary", "fallback 1", ...). */
 export function applyOwnerDirective<S extends LineageSelection>(
   selection: S,
   driverKindFor: (instanceId: string) => string | undefined,
   contextFor?: (instanceId: string) => LineageContext | undefined,
-  applies?: (entry: LineageSelection) => boolean,
+  applies?: (entry: LineageSelection, slot: string) => boolean,
 ): { selection: S; flagged: LineageChange[] } {
   const flagged: LineageChange[] = [];
   const flag = <E extends LineageSelection>(entry: E, slot: string): E => {
     if (entry.latest !== undefined) return entry;
-    if (applies && !applies(entry)) return entry;
+    if (applies && !applies(entry, slot)) return entry;
     if (contextFor?.(entry.instanceId)?.customIds?.includes(entry.model)) return entry;
     const hit = classifyModel(driverKindFor(entry.instanceId), entry.model);
     if (!hit || !OWNER_DIRECTED_LATEST.classKeys.includes(hit.classKey)) return entry;
