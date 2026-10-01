@@ -55,6 +55,17 @@ export const AUTOMATION_LANE_TITLE: Record<AutomationLane, string> = {
  *
  * Manual runs share the routine's thread deliberately: "Run now" is the same
  * work as the schedule, done impatiently. */
+
+/** Prompt stamp for a delivery that replaced earlier busy-deferred ones. */
+export const BUSY_DEFER_NOTE =
+  "[Earlier deliveries for this trigger while the bot was busy were superseded by this latest one.]";
+
+export function busyDeferPrompt(prompt: string): string {
+  const trimmed = prompt.trimEnd();
+  if (trimmed.endsWith(BUSY_DEFER_NOTE)) return trimmed;
+  return `${trimmed}\n\n${BUSY_DEFER_NOTE}`;
+}
+
 export function automationThreadKey(run: {
   routineId: string;
   webhookId?: string;
@@ -788,6 +799,41 @@ export class RoutineManager {
     return { ...run };
   }
 
+  /**
+   * When the bot is busy, fold a new webhook/resource delivery into the one
+   * already-queued deferred slot for the same automation key (latest prompt
+   * wins) instead of stacking runs that sit until stop/cancel.  Returns the
+   * updated receipt, or null when there is nothing to coalesce into (caller
+   * creates a fresh queued run).  Idle bots and gap-waiting multi-queues keep
+   * the prior create-then-fold-at-admit path.
+   */
+  private coalesceIntoBusyDefer(input: {
+    botId: string;
+    key: string;
+    prompt: string;
+    deliveryId: string;
+    name: string;
+  }): RoutineRun | null {
+    if (this.options.botState(input.botId) !== "busy") return null;
+    const existing = this.runs.find(
+      (run) =>
+        run.status === "queued" &&
+        !run.coalescedInto &&
+        run.botId === input.botId &&
+        automationThreadKey(run) === input.key,
+    );
+    if (!existing) return null;
+    // Latest wins: UI-pass / check_run storms care about the newest event, not
+    // a growing fold of superseded payloads.  Keep the earliest scheduledFor
+    // so the calendar still shows when the backlog began.
+    existing.prompt = busyDeferPrompt(input.prompt);
+    existing.deliveryId = input.deliveryId;
+    existing.routineName = input.name;
+    this.save();
+    this.emitRun(existing);
+    return { ...existing };
+  }
+
   /** Queue an event-driven job without inventing a calendar schedule. Webhook
    * definitions live in their own store; the execution receipt deliberately
    * reuses this manager so busy-bot ordering, task creation and VM routing stay
@@ -805,6 +851,20 @@ export class RoutineManager {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
+    if (!snoozed) {
+      const deferred = this.coalesceIntoBusyDefer({
+        botId: input.botId,
+        key: automationThreadKey({
+          routineId: input.webhookId,
+          webhookId: input.webhookId,
+          triggerSource: "webhook",
+        }),
+        prompt: input.prompt,
+        deliveryId: input.deliveryId,
+        name: input.webhookName,
+      });
+      if (deferred) return deferred;
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.webhookId,
@@ -847,6 +907,20 @@ export class RoutineManager {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
+    if (!snoozed) {
+      const deferred = this.coalesceIntoBusyDefer({
+        botId: input.botId,
+        key: automationThreadKey({
+          routineId: input.triggerId,
+          webhookId: input.triggerId,
+          triggerSource: "resource",
+        }),
+        prompt: input.prompt,
+        deliveryId: input.deliveryId,
+        name: input.triggerName,
+      });
+      if (deferred) return deferred;
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.triggerId,
