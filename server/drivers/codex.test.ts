@@ -9,7 +9,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
@@ -143,6 +143,19 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
     const threadStart = seen.calls.find((c: { method: string }) => c.method === "thread/start");
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
+  });
+
+  it("files a step's own input (not its outcome fields) for the side store", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1")!;
+    const input = JSON.parse(started.io!.input!.text) as Record<string, unknown>;
+    expect(input).toEqual({ type: "commandExecution", command: "ls -la" });
+    // the headline is unchanged
+    expect(started).toMatchObject({ title: "ls -la", target: "ls -la" });
+    // this fake reports no output, so the completion captures none
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemId === "i1")?.io).toBeUndefined();
   });
 
   it("keeps the full command when a Windows interpreter prefix is long", async () => {
@@ -390,6 +403,61 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(methods).toContain("turn/start");
     const turnStart = JSON.parse(readFileSync(dump, "utf8")).calls.find((c: { method: string }) => c.method === "turn/start");
     expect(JSON.stringify(turnStart.params)).toContain("my dog is Biscuit");
+  });
+
+  it("tells the harness once when it sends the replay in place of the turn", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback.json");
+    let called = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-callback",
+      text: "what now?",
+      resumeCursor: "gone-thread",
+      recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+    expect(called).toBe(1);
+  });
+
+  it("does not report a replay when there was nothing to rebuild from", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-none.json");
+    let called = 0;
+    // no recoveryText: the resume failure is terminal and nothing is replayed
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-none",
+      text: "go",
+      resumeCursor: "gone-thread",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(called).toBe(0);
+  });
+
+  it("recovers the turn even when the callback throws", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-throws.json");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-replay-throws",
+        text: "what now?",
+        resumeCursor: "gone-thread",
+        recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+        onReplayRecovered: () => {
+          throw new Error("recorder down");
+        },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("keeps the rebuilt prompt across a transient failure after missing-session recovery", async () => {

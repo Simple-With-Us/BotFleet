@@ -47,6 +47,8 @@ let fakeRejectCli: string;
 let fakeQuotaProseCli: string;
 /** happy CLI whose canned reply carries a fake API key - drives the SSE secret-redaction test */
 let fakeSecretEchoCli: string;
+/** happy CLI whose tool step carries real arguments and a real (secret-bearing) result */
+let fakeToolIoCli: string;
 /** successful subscription CLI that reports an API-equivalent cost */
 let fakePricedClaudeCli: string;
 /** quota CLI held behind a file gate so work can queue before completion */
@@ -70,6 +72,17 @@ const api = async (method: string, path: string, body?: unknown): Promise<{ stat
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
+};
+
+/** Poll `read` until `ok` accepts what it returned (the event log is written
+ * off the publish path, so it trails the stream by a moment). */
+const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutMs = 10_000): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 };
 
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
@@ -118,7 +131,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 const writeFakeClaudeWrapper = (
   file: string,
   mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
-  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string } = {},
+  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean } = {},
 ): string => {
   const lines = [
     "#!/usr/bin/env node",
@@ -137,6 +150,7 @@ const writeFakeClaudeWrapper = (
   if (options.replyText) {
     lines.push(`process.env.FAKE_CLAUDE_REPLY = ${JSON.stringify(options.replyText)};`);
   }
+  if (options.toolIo) lines.push('process.env.FAKE_CLAUDE_TOOL_IO = "1";');
   lines.push(`await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`, "");
   writeFileSync(file, lines.join("\n"), { mode: 0o755 });
   return file;
@@ -162,6 +176,7 @@ beforeAll(async () => {
   fakeSecretEchoCli = writeFakeClaudeWrapper(join(home, "fake-claude-secret-echo"), "happy", {
     replyText: "the key is api_key=ak9999999999999999999999999999999 as requested",
   });
+  fakeToolIoCli = writeFakeClaudeWrapper(join(home, "fake-claude-tool-io"), "happy", { toolIo: true });
   fakePricedClaudeCli = join(home, "fake-claude-priced");
   writeFileSync(
     fakePricedClaudeCli,
@@ -254,6 +269,7 @@ beforeAll(async () => {
         rejector: { driver: "claudeAgent", displayName: "Fixture Rejector", enabled: false, config: { cli: fakeRejectCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
         secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
+        toolIo: { driver: "claudeAgent", displayName: "Fixture Tool IO", enabled: false, config: { cli: fakeToolIoCli } },
         pricedClaude: { driver: "claudeAgent", displayName: "Fixture Priced Claude", enabled: false, config: { cli: fakePricedClaudeCli } },
         gatedQuota: { driver: "claudeAgent", displayName: "Fixture Gated Quota", enabled: false, config: { cli: fakeGatedQuotaCli } },
         slowProbe: { driver: "claudeAgent", displayName: "Fixture Slow Probe", enabled: false, config: { cli: fakeSlowProbeCli } },
@@ -4665,7 +4681,7 @@ describe("harness HTTP API", () => {
 describe("transcript logs on delete", () => {
   /** Both generations plus a killed trim's leftovers, for one thread. */
   const logFiles = (threadId: string) =>
-    ["events", "native"].flatMap((dir) => [
+    ["events", "native", "item-io"].flatMap((dir) => [
       join(home, ".botfleet", dir, `${threadId}.ndjson`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.1`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.4242.123e4567-e89b-42d3-a456-426614174000.tmp`),
@@ -8418,6 +8434,223 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
+});
+
+describe("a step's full input and output, and injected context, over HTTP", () => {
+  type Tool = { name: string; itemId?: string; turnId?: string; detail?: string; target?: string };
+  type Msg = { id: string; role: string; kind: string; text?: string; tool?: Tool; contextInjections?: Array<{ id: string; source: string; preview: string; bytes: number }> };
+  const transcript = async (threadId: string) =>
+    (await api("GET", `/api/threads/${threadId}/messages?limit=200`)).body.messages as Msg[];
+  const eventsLog = (threadId: string) => {
+    const file = join(home, ".botfleet", "events", `${threadId}.ndjson`);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+  const SECRET = "ak9999999999999999999999999999999"; // the fake CLI prints it inside its tool result
+
+  /** One bot on the tool-IO engine, one finished turn, and the thread's ids. */
+  const runTurn = async (text: string, bot: { id: string }, extra: Record<string, unknown> = {}) => {
+    const sse = await openSse(`${BASE}/api/events`);
+    try {
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text, ...extra })).status).toBe(202);
+      await sse.until((f: any) => f.kind === "runtime" && f.event?.type === "turn.completed", 20_000);
+      return sse.frames;
+    } finally {
+      sse.close();
+    }
+  };
+  const selectToolIoEngine = async (botId: string) => {
+    expect((await api("PATCH", "/api/instances/toolIo", { enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+    const patch = await api("PATCH", `/api/bots/${botId}`, { modelSelection: { instanceId: "toolIo", model: instance?.models?.default }, computers: [] });
+    expect(patch.status).toBe(200);
+  };
+
+  it("serves a step's whole input and output on demand, redacted, and keeps them off the wire, the event log and the transcript", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const frames = await runTurn("run the thing", bot);
+
+      // the transcript row carries the keys and the clipped headline, never the payload
+      const messages = await transcript(bot.threadId);
+      const row = messages.find((m) => m.tool?.name === "Bash")!;
+      expect(row.tool?.itemId).toBe("tu-1");
+      expect(typeof row.tool?.turnId).toBe("string");
+      expect(row.tool?.target).toBe("echo hi");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // the wire never carries an `io` capture or the tail of a result
+      expect(JSON.stringify(frames)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(frames)).not.toContain("TAIL-OUTPUT-MARKER");
+      expect(frames.some((f: any) => f.kind === "runtime" && "io" in (f.event ?? {}))).toBe(false);
+      // nor does the canonical event log
+      const logged = await vi_waitFor(() => eventsLog(bot.threadId), (log) => log.includes('"type":"turn.completed"'));
+      expect(logged).toContain("tu-1");
+      expect(logged).not.toContain("TAIL-INPUT-MARKER");
+      expect(logged).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // opening the row reads the whole thing
+      const turnId = row.tool!.turnId!;
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=${turnId}`);
+      expect(io.status).toBe(200);
+      expect(io.body.itemId).toBe("tu-1");
+      expect(io.body.input.text).toBe('{\n  "command": "echo hi",\n  "stdin": "TAIL-INPUT-MARKER"\n}');
+      expect(io.body.output.text).toContain("TAIL-OUTPUT-MARKER");
+      expect(io.body.output.text).toContain("p".repeat(400));
+      expect(io.body.output.truncated).toBe(false);
+      // redacted with the wire's own pass, at write and at read
+      expect(io.body.output.text).toContain("redacted");
+      expect(JSON.stringify(io.body)).not.toContain(SECRET);
+      // the side store on disk never held it either
+      const stored = readFileSync(join(home, ".botfleet", "item-io", `${bot.threadId}.ndjson`), "utf8");
+      expect(stored).not.toContain(SECRET);
+
+      // an id shared across turns narrows by turn; a different turn finds nothing
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io`)).status).toBe(200);
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=some-other-turn`)).status).toBe(404);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 40_000);
+
+  it("holds the route to the events route's gate and validates what it is given", async () => {
+    const bot = (await api("GET", "/api/bots")).body.bots[0];
+    const unknownThread = await api("GET", "/api/threads/not-a-thread/items/tu-1/io");
+    expect(unknownThread.status).toBe(404);
+    expect(unknownThread.body.error).toBe("no such thread");
+    // a step that was never recorded is a 404 that says so, not an empty 200
+    const missing = await api("GET", `/api/threads/${bot.threadId}/items/never-ran/io`);
+    expect(missing.status).toBe(404);
+    expect(missing.body.error).toContain("no input or output was recorded");
+    // a malformed id or turn is refused before any file is opened
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/%E0%A4%A/io`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=a%20b`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/${"i".repeat(300)}/io`)).status).toBe(400);
+    // read-only
+    expect((await api("POST", `/api/threads/${bot.threadId}/items/tu-1/io`, {})).status).not.toBe(200);
+    // a path that tries to leave the thread's folder is not a thread id
+    expect((await api("GET", "/api/threads/..%2F..%2Fconfig/items/tu-1/io")).status).toBe(404);
+  });
+
+  it("records what the harness injected into a turn, without putting its text on the message", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const memoryFile = join(home, ".botfleet", "workspaces", bot.id, "MEMORY.md");
+      mkdirSync(dirname(memoryFile), { recursive: true });
+      writeFileSync(memoryFile, `likes tea\nhates meetings\n${"m".repeat(300)}\nINJECTED-TAIL-MARKER\n`);
+
+      const frames = await runTurn("hello", bot);
+      const first = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      const memory = first.contextInjections?.find((c) => c.source === "memory");
+      expect(memory).toBeDefined();
+      expect(memory!.preview.startsWith("likes tea hates meetings")).toBe(true);
+      expect(memory!.preview.length).toBeLessThanOrEqual(160);
+      expect(memory!.bytes).toBeGreaterThan(300);
+      // the message holds a one-line preview and a size, never the text
+      expect(JSON.stringify(first)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // the Trajectory's door: a runtime event with the preview and no full text
+      const event = frames.find((f: any) => f.kind === "runtime" && f.event?.type === "context.injected")?.event;
+      expect(event).toMatchObject({ source: "memory", itemId: memory!.id, bytes: memory!.bytes });
+      expect(JSON.stringify(frames)).not.toContain("INJECTED-TAIL-MARKER");
+      expect(eventsLog(bot.threadId)).toContain('"type":"context.injected"');
+      expect(eventsLog(bot.threadId)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // and it survives the trip back: a reload reads history from the events
+      // route, and both the Trajectory read and the Inspector read must return it
+      for (const query of ["view=trajectory&limit=200", "limit=200"]) {
+        const history = await api("GET", `/api/threads/${bot.threadId}/events?${query}`);
+        expect(history.status).toBe(200);
+        const injected = history.body.entries.find(
+          (entry: any) => entry.kind === "runtime" && entry.data?.type === "context.injected" && entry.data.itemId === memory!.id,
+        );
+        expect(injected?.data).toMatchObject({ source: "memory", bytes: memory!.bytes });
+        // the runtime records hold the preview only.  The Inspector read also
+        // carries the provider's own native tee, which is the real prompt.
+        const runtimeOnly = history.body.entries.filter((entry: { kind: string }) => entry.kind === "runtime");
+        expect(JSON.stringify(runtimeOnly)).not.toContain("INJECTED-TAIL-MARKER");
+      }
+
+      // opening the row reads the full text the model was given
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${memory!.id}/io`);
+      expect(io.status).toBe(200);
+      expect(io.body.text.text).toContain("INJECTED-TAIL-MARKER");
+      expect(io.body.text.text.startsWith("likes tea\nhates meetings")).toBe(true);
+
+      // memory that has not changed is not re-announced on every message...
+      await runTurn("and again", bot);
+      const second = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      expect(second.contextInjections?.some((c) => c.source === "memory") ?? false).toBe(false);
+      // ...but is when it changes
+      writeFileSync(memoryFile, "likes coffee now\n");
+      await runTurn("once more", bot);
+      const third = (await transcript(bot.threadId)).filter((m) => m.role === "user")[2]!;
+      expect(third.contextInjections?.find((c) => c.source === "memory")?.preview).toBe("likes coffee now");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records the quoted message a reply adds to the prompt", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      await runTurn("the launch is on Friday", bot);
+      const earlier = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      await runTurn("are you sure?", bot, { replyToId: earlier.id });
+      const reply = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      const quote = reply.contextInjections?.find((c) => c.source === "reply");
+      expect(quote).toBeDefined();
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${quote!.id}/io`);
+      expect(io.body.text.text).toContain("the launch is on Friday");
+      // what the person typed is not part of what was injected
+      expect(io.body.text.text).not.toContain("are you sure?");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records a message's injections once when a model fallback dispatches it again", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      // the primary crashes before it says anything, so the same message is
+      // dispatched again on the fallback and its prompt is assembled a second
+      // time — selecting the same skill, which a trigger term in the text picks
+      const instances = (await api("GET", "/api/instances")).body.instances;
+      const crasher = instances.find((i: { instanceId: string }) => i.instanceId === "crasher");
+      const toolIo = instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: crasher.models.default,
+          fallbacks: [{ instanceId: "toolIo", model: toolIo.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "use adb on my phone to list the apps" })).status).toBe(202);
+      await expect.poll(async () =>
+        (await transcript(bot.threadId)).some((m) => typeof m.tool?.name === "string" && m.tool.name.startsWith("Fell over to")), { timeout: 30_000 }).toBe(true);
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 30_000 }).toBe(false);
+
+      const sent = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      expect(sent.contextInjections?.filter((c) => c.source === "skill")).toHaveLength(1);
+      // and the Trajectory's history lists the step once as well
+      const history = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=500`);
+      const injected = history.body.entries.filter(
+        (entry: any) => entry.data?.type === "context.injected" && entry.data.source === "skill",
+      );
+      expect(injected).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 90_000);
 });
 
 describe("CSRF security hardening", () => {

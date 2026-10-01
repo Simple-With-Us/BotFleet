@@ -649,6 +649,23 @@ describe("runTurnLoop — tool results are real", () => {
     expect(started.map((e) => e.itemId)).toEqual(["c2"]);
   });
 
+  it("attaches the whole result the model was told to a finished tool, beside the clipped detail", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    const whole = `first line\n${"r".repeat(600)}\nlast line`;
+    await h.run({ toolHost: hostReturning({ kind: "result", content: whole, detail: "first line" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ itemId: "c1", ok: true, detail: "first line" });
+    expect(done.io?.output).toEqual({ text: whole, truncated: false, length: whole.length });
+  });
+
+  it("files a failing tool's message the same way", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    await h.run({ toolHost: hostReturning({ kind: "error", content: "Tool bash failed: boom", detail: "boom" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ ok: false, detail: "boom" });
+    expect(done.io?.output?.text).toBe("Tool bash failed: boom");
+  });
+
   it("closes the chips of tools that never finished when the turn is stopped", async () => {
     const h = harness([wantsTools([call("c1"), call("c2")])]);
     await h.run({

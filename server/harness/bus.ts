@@ -8,6 +8,7 @@ import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { EVENTS_DIR } from "../config.ts";
+import { captureInput, textSignature, type ItemIoCapture } from "../../shared/item-io.ts";
 import { redactSecretsForLog } from "../redact.ts";
 import { appendBoundedAsync, EVENTS_LOG_MAX_BYTES, type AppendWriter } from "../transcript-retention.ts";
 import { newId, type ProviderInstance, type RuntimeEvent, type RuntimeEventListener } from "../contracts.ts";
@@ -20,6 +21,20 @@ const INCOMPLETE_LOG_MESSAGE =
  * bound, not a lifetime: the check exists to catch a driver bug within the
  * same conversation, not to keep a ledger. */
 const SETTLED_TURN_MEMORY = 512;
+
+/** How many tool calls the bus remembers the announced arguments of, so the
+ * settled `item.completed` of a call whose arguments did not change is not
+ * filed a second time.  A bound, not a lifetime: an entry normally lives from a
+ * call's `item.started` to its `item.completed`, and a call that never
+ * completes (an interrupted turn) is evicted by newer ones. */
+const ANNOUNCED_ARGUMENTS_MEMORY = 512;
+
+/** Where a step's full input and output go.  The bus only ever calls this; the
+ * store behind it is `server/item-io-store.ts`.  Structural so a test can hand
+ * in a recorder. */
+export interface ItemIoSink {
+  record(threadId: string, write: { itemId: string; turnId?: string; at?: string; io: ItemIoCapture }): void;
+}
 
 /** What the tee queue hands back when an entry settles.  The event is what
  * names the thread a gap belongs to; the flag says whether this entry was the
@@ -41,11 +56,17 @@ export class EventBus {
   /** `threadId:turnId` of every turn that has already produced a terminal
    * event.  Insertion-ordered, so the oldest entry is the one evicted. */
   private settledTurns = new Set<string>();
+  /** `threadId:itemId` -> fingerprint of the `arguments` string a tool step's
+   * `item.started` already filed in the side store.  Insertion-ordered. */
+  private announcedArguments = new Map<string, string>();
   private readonly appendLog: AppendWriter;
   private readonly writes: BoundedAppendQueue<TeeEntry>;
 
-  constructor(appendLog: AppendWriter = appendFile, options: { maxQueuedBytes?: number } = {}) {
+  private readonly itemIo: ItemIoSink | undefined;
+
+  constructor(appendLog: AppendWriter = appendFile, options: { maxQueuedBytes?: number; itemIo?: ItemIoSink } = {}) {
     this.appendLog = appendLog;
+    this.itemIo = options.itemIo;
     this.writes = new BoundedAppendQueue<TeeEntry>(
       (file, data) => appendBoundedAsync(file, data, EVENTS_LOG_MAX_BYTES, { mode: 0o600 }, this.appendLog),
       {
@@ -124,7 +145,64 @@ export class EventBus {
     return false;
   }
 
-  publish(event: RuntimeEvent) {
+  /** The event without its `io` capture, after the capture has gone to the
+   * side store.  `io` is capture-only (contracts.ts `RuntimeEventBase.io`):
+   * whole tool results are exactly what the event log's per-string cap and the
+   * wire were built to keep off their paths, so it is stripped here whether or
+   * not a store is attached.
+   *
+   * A tool step on an HTTP engine already carries its full JSON `arguments` on
+   * the event itself, so the input is derived from those when the driver did
+   * not attach a capture — the settled arguments on `item.completed` replace
+   * the first fragment `item.started` may have held. */
+  private routeIo(event: RuntimeEvent): RuntimeEvent {
+    let io = event.io;
+    let clean = event;
+    if (io !== undefined) {
+      const { io: _io, ...rest } = event;
+      clean = rest as RuntimeEvent;
+    }
+    if (!this.itemIo || !event.itemId) return clean;
+    if (
+      io?.input === undefined &&
+      (clean.type === "item.started" || (clean.type === "item.completed" && clean.itemType === "tool")) &&
+      typeof clean.arguments === "string"
+    ) {
+      // The chat-completions loop puts the same settled string on a step's
+      // `item.started` and its `item.completed`; filing it twice would write two
+      // copies of up to 32 KB and run the redaction twice.  Only a CHANGED
+      // string (a streamed first fragment, settled when the step completes) is
+      // worth a second record.
+      const key = `${event.threadId}:${event.itemId}`;
+      const signature = textSignature(clean.arguments);
+      const unchanged = this.announcedArguments.get(key) === signature;
+      if (clean.type === "item.completed") {
+        this.announcedArguments.delete(key);
+      } else {
+        this.announcedArguments.delete(key);
+        this.announcedArguments.set(key, signature);
+        while (this.announcedArguments.size > ANNOUNCED_ARGUMENTS_MEMORY) {
+          this.announcedArguments.delete(this.announcedArguments.keys().next().value!);
+        }
+      }
+      if (!unchanged) {
+        const derived = captureInput(clean.arguments).io;
+        if (derived) io = { ...io, ...derived };
+      }
+    }
+    if (io !== undefined && (io.input || io.output || io.text)) {
+      try {
+        this.itemIo.record(event.threadId, { itemId: event.itemId, turnId: event.turnId, at: event.createdAt, io });
+      } catch (e) {
+        // the store is a convenience; it must never cost an event its delivery
+        console.error("bus: item I/O sink threw", e);
+      }
+    }
+    return clean;
+  }
+
+  publish(incoming: RuntimeEvent) {
+    const event = this.routeIo(incoming);
     // Two destinations, and only one of them is ever redacted.  Live
     // subscribers — the SSE fan-out, the inspector, the server-side message
     // folder — have always received the event object itself, whole; the

@@ -30,6 +30,7 @@ import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
+import { captureInput, captureOutput } from "../../shared/item-io.ts";
 import {
   classifyVersionProbeFailure,
   describeSpawnFailure,
@@ -740,6 +741,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemId: evt.toolCallId,
               title: String(evt.toolName ?? "tool").slice(0, 80),
               ...toolFields(evt.toolName, evt.args ?? evt.input ?? evt.arguments),
+              ...captureInput(evt.args ?? evt.input ?? evt.arguments),
             });
             return;
           }
@@ -751,6 +753,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
               itemId: evt.toolCallId,
               ok: !evt.isError,
               detail: describeResult(evt.result ?? evt.output ?? evt.content ?? evt.error),
+              ...captureOutput(evt.result ?? evt.output ?? evt.content ?? evt.error),
             });
             return;
           }

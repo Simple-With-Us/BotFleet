@@ -1,6 +1,8 @@
 // What is attached to the next message: text too long for the input or a
 // file dropped onto the window. Chips fold back into a normal prompt on
 // send, so every driver receives the same message shape.
+import { formatByteSize as formatSize } from "../../shared/text-format.ts";
+
 export type PasteAttachment = {
   kind: "paste";
   id: string;
@@ -423,11 +425,7 @@ export function pasteSummary(a: { lines: number; size: number }): string {
   return `${a.lines} lines, ${formatSize(a.size)}`;
 }
 
-export function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+export { formatSize };
 
 /** The prompt the bot receives: what was typed, then one block per
  * attachment. Tagged blocks rather than fences — pasted code and markdown

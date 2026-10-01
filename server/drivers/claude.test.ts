@@ -175,6 +175,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.FAKE_CLAUDE_TRANSIENTS;
     delete process.env.FAKE_CLAUDE_PARTIAL_FAILS;
     delete process.env.FAKE_CLAUDE_TOOL_FAILS;
+    delete process.env.FAKE_CLAUDE_TOOL_IO;
     delete process.env.FAKE_CLAUDE_STATE;
     delete process.env.FAKE_CLAUDE_RETRY_SCALE;
     delete process.env.FAKE_CLAUDE_HELP;
@@ -228,6 +229,40 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       usage: { input: 12, output: 5, cachedInput: 2 },
     });
     expect(instance.adapter.hasSession("t-happy")).toBe(false);
+  });
+
+  it("attaches a step's whole input and output to its events, and leaves the headline the row shows alone", async () => {
+    process.env.FAKE_CLAUDE_TOOL_IO = "1";
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemType === "tool")!;
+    // the headline is what it always was: one clipped target
+    expect(started).toMatchObject({ itemId: "tu-1", title: "Bash", target: "echo hi" });
+    // the capture is the whole argument object, pretty-printed
+    const pretty = '{\n  "command": "echo hi",\n  "stdin": "TAIL-INPUT-MARKER"\n}';
+    expect(started.io?.input).toEqual({ text: pretty, truncated: false, length: pretty.length });
+    expect(started.io?.output).toBeUndefined();
+
+    const done = recorder.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    // one clipped line for the row; the whole text, past the clip, for the store
+    if (done.type !== "item.completed" || done.itemType !== "tool") throw new Error("not a tool completion");
+    expect(done.detail!.length).toBeLessThanOrEqual(240);
+    expect(done.detail).not.toContain("TAIL-OUTPUT-MARKER");
+    expect(done.io?.output?.text).toContain("TAIL-OUTPUT-MARKER");
+    expect(done.io?.output?.text.startsWith("head line\n")).toBe(true);
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("captures nothing for a step that carried no input and returned no text", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-no-io", text: "hi", model: "claude-sonnet-5" });
+    await recorder.until((e) => e.type === "turn.completed");
+    for (const event of recorder.events.filter((e) => e.type === "item.started" || e.type === "item.completed")) {
+      if (event.type === "item.completed" && event.itemType === "assistant_text") continue;
+      expect(event.io).toBeUndefined();
+    }
   });
 
   it("reports the CLI's terminal_reason, not a stale stop_reason, on a failed turn", async () => {

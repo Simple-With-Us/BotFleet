@@ -18,6 +18,7 @@
 import { closeSync, fstatSync, openSync, readSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import { clipRuntimeEvent } from "../shared/clip-runtime-event.ts";
+import { isContextSource } from "../shared/context-injection.ts";
 import type { RuntimeEvent } from "./contracts.ts";
 import { rotatedPath } from "./transcript-retention.ts";
 
@@ -501,6 +502,13 @@ function isRuntimeEvent(value: unknown): value is RuntimeEvent {
       );
     case "runtime.error":
       return typeof value.message === "string" && (value.setup === undefined || typeof value.setup === "boolean");
+    case "context.injected":
+      return (
+        isContextSource(value.source) &&
+        typeof value.preview === "string" &&
+        typeof value.bytes === "number" &&
+        Number.isFinite(value.bytes)
+      );
     default:
       return false;
   }

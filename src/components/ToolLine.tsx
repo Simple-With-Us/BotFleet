@@ -30,6 +30,8 @@ import type { LucideIcon } from "lucide-react";
 import { classifyTool, toolVerb, type ToolKind } from "../../shared/tool-activity";
 import type { Message } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { itemIoRefOf } from "@/lib/item-io";
+import { ItemIoBlocks, useItemIo } from "./ItemIoBlocks";
 
 const ICONS: Record<ToolKind, LucideIcon> = {
   read: FileText,
@@ -52,9 +54,28 @@ export function formatStepDuration(ms: number | undefined): string | null {
   return seconds ? `${minutes}m${seconds}s` : `${minutes}m`;
 }
 
-export function ToolLine({ message, actor }: { message: Message; actor?: string }) {
+export function ToolLine({
+  message,
+  actor,
+  threadId,
+  defaultOpen = false,
+}: {
+  message: Message;
+  actor?: string;
+  /** The thread this row belongs to.  With it, opening the row reads the
+   * step's full input and output from the harness; without it (a view that
+   * does not know its thread) the row shows the headline it has always shown. */
+  threadId?: string;
+  /** Start opened.  The chat never passes this; tests render the open row. */
+  defaultOpen?: boolean;
+}) {
   const tool = message.tool;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
+  // The step's key in the harness's side store.  Null for a row recorded before
+  // the harness kept one, which then says so when opened.
+  const ioRef = itemIoRefOf(threadId, tool);
+  // A step still running has written no output yet: show what is there, keep nothing.
+  const io = useItemIo(ioRef, open, tool?.ok !== undefined);
   if (!tool) return null;
 
   const running = tool.ok === undefined;
@@ -72,14 +93,41 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
   const named = verb !== tool.name ? tool.name : undefined;
   const line = failed ? (tool.detail ?? tool.target ?? named) : (tool.target ?? named);
   const duration = formatStepDuration(tool.durationMs);
-  // Expandable whenever there is detail OR a target (like a command or file path) to view
+  // Expandable whenever there is detail OR a target (like a command or file path) to view,
+  // or the harness may hold the step's whole input and output
   const hasTarget = Boolean(tool.target && tool.target !== tool.name);
   const hasDetail = Boolean(tool.detail);
-  const expandable = hasDetail || hasTarget;
+  const expandable = hasDetail || hasTarget || ioRef !== null;
   const time = new Date(message.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   const title = `${actor ? `${actor} · ` : ""}${tool.name}${
     tool.target ? ` · ${tool.target}` : ""
   } · ${time}${failed ? " · failed" : running ? " · running" : ""}`;
+
+  // The clipped headline the row has always had: what the step acted on and
+  // one line of what came back.  The fallback whenever the full payload is not
+  // there, and the whole of it for a row with no key.
+  const targetBlock = tool.target ? (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-secondary/70">
+        {kind === "execute" ? "Command" : kind === "read" || kind === "edit" ? "File" : "Target"}
+      </span>
+      <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink font-medium select-text">
+        {tool.target}
+      </pre>
+    </div>
+  ) : null;
+  const detailBlock = tool.detail ? (
+    <div className="flex flex-col gap-0.5">
+      {tool.target && (
+        <span className={cn("text-[10px] font-semibold uppercase tracking-wider", failed ? "text-danger/90" : "text-ink-secondary/70")}>
+          {failed ? "Error Details" : "Output"}
+        </span>
+      )}
+      <pre className={cn("whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed select-text", failed ? "text-danger" : "text-ink-secondary")}>
+        {tool.detail}
+      </pre>
+    </div>
+  ) : null;
 
   return (
     <div className="flex w-full flex-col">
@@ -147,28 +195,32 @@ export function ToolLine({ message, actor }: { message: Message; actor?: string 
         )}
       </div>
       {open && (
-        <div className="mb-1 ml-7 flex flex-col gap-1.5 max-h-64 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 p-2.5">
-          {tool.target && (
-            <div className="flex flex-col gap-0.5">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-secondary/70">
-                {kind === "execute" ? "Command" : kind === "read" || kind === "edit" ? "File" : "Target"}
-              </span>
-              <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed text-ink font-medium select-text">
-                {tool.target}
-              </pre>
-            </div>
+        <div
+          className={cn(
+            "mb-1 ml-7 flex flex-col gap-1.5 overflow-auto rounded-lg border border-hairline/40 bg-panel/70 p-2.5",
+            ioRef ? "max-h-[32rem]" : "max-h-64",
           )}
-          {tool.detail && (
-            <div className="flex flex-col gap-0.5">
-              {tool.target && (
-                <span className={cn("text-[10px] font-semibold uppercase tracking-wider", failed ? "text-danger/90" : "text-ink-secondary/70")}>
-                  {failed ? "Error Details" : "Output"}
-                </span>
-              )}
-              <pre className={cn("whitespace-pre-wrap break-words font-mono text-[11.5px] leading-relaxed select-text", failed ? "text-danger" : "text-ink-secondary")}>
-                {tool.detail}
-              </pre>
-            </div>
+        >
+          {threadId ? (
+            <ItemIoBlocks
+              state={ioRef ? io.state : { status: "unavailable" }}
+              failed={failed}
+              subject={tool.name}
+              onRetry={io.retry}
+              headline={targetBlock}
+              fallback={
+                <>
+                  {targetBlock}
+                  {detailBlock}
+                </>
+              }
+              outputFallback={detailBlock}
+            />
+          ) : (
+            <>
+              {targetBlock}
+              {detailBlock}
+            </>
           )}
         </div>
       )}

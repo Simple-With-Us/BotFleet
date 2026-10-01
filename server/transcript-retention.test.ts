@@ -12,12 +12,14 @@ import {
   removeTranscriptLogs,
   EVENTS_LOG_MAX_BYTES,
   NATIVE_LOG_MAX_BYTES,
+  ITEM_IO_LOG_MAX_BYTES,
   ORPHAN_MAX_AGE_MS,
   describeOrphanSweep,
   describeSweep,
   rotatedPath,
   sweepOrphanedTranscripts,
   sweepTranscriptLogs,
+  sweepTranscriptRetention,
   transcriptLogPaths,
   trimToTail,
 } from "./transcript-retention.ts";
@@ -378,6 +380,28 @@ describe("caps and paths", () => {
   });
 });
 
+describe("the tool input/output cap", () => {
+  it("is the smallest of the three: each field is already cut to 32 KB", () => {
+    expect(ITEM_IO_LOG_MAX_BYTES).toBe(6 * 1024 * 1024);
+    expect(ITEM_IO_LOG_MAX_BYTES).toBeLessThan(EVENTS_LOG_MAX_BYTES);
+  });
+
+  it("trims an oversized item-io log at boot along with the other two directories", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const big = "{\"n\":\"x\"}\n".repeat(ITEM_IO_LOG_MAX_BYTES / 10 + 100);
+    writeFileSync(join(ioDir, "t.ndjson"), big);
+    const result = sweepTranscriptRetention({ eventsDir, nativeDir, ioDir });
+    expect(result.trimmed).toBe(1);
+    expect(statSync(join(ioDir, "t.ndjson")).size).toBeLessThanOrEqual(ITEM_IO_LOG_MAX_BYTES);
+  });
+
+  it("still takes the two-directory pair older callers build by hand", () => {
+    expect(sweepTranscriptRetention({ eventsDir: tmp(), nativeDir: tmp() }).scanned).toBe(0);
+  });
+});
+
 describe("sweepOrphanedTranscripts", () => {
   const OLD = Date.now() - ORPHAN_MAX_AGE_MS - 24 * 60 * 60 * 1000; // 8 days ago
   const RECENT = Date.now();
@@ -492,6 +516,35 @@ describe("sweepOrphanedTranscripts", () => {
     const result = sweepOrphanedTranscripts({ eventsDir, nativeDir }, new Set(), { dryRun: true });
     expect(result).toEqual({ ids: 1, files: 1, bytesReclaimed: 5, dryRun: true });
     expect(existsSync(file)).toBe(true);
+  });
+
+  it("sweeps the tool input/output directory with the others when it is given one", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const files = [join(eventsDir, "orphan.ndjson"), join(ioDir, "orphan.ndjson"), join(ioDir, "orphan.ndjson.1")];
+    for (const file of files) {
+      writeFileSync(file, "x".repeat(10));
+      age(file, OLD);
+    }
+    const result = sweepOrphanedTranscripts({ eventsDir, nativeDir, ioDir }, new Set());
+    expect(result).toEqual({ ids: 1, files: 3, bytesReclaimed: 30, dryRun: false });
+    for (const file of files) expect(existsSync(file)).toBe(false);
+  });
+
+  it("a recent write in the tool input/output directory keeps the thread out of the age check", () => {
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const ioDir = tmp();
+    const old = join(eventsDir, "busy.ndjson");
+    const fresh = join(ioDir, "busy.ndjson");
+    writeFileSync(old, "x");
+    writeFileSync(fresh, "x");
+    age(old, OLD);
+    age(fresh, RECENT);
+    expect(sweepOrphanedTranscripts({ eventsDir, nativeDir, ioDir }, new Set()).ids).toBe(0);
+    expect(existsSync(old)).toBe(true);
+    expect(existsSync(fresh)).toBe(true);
   });
 
   it("ignores threads not old enough while removing the ones that are, in the same pass", () => {

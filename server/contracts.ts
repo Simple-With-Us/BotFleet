@@ -7,6 +7,8 @@
 
 import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { ContextSource } from "../shared/context-injection.ts";
+import type { ItemIoCapture } from "../shared/item-io.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -91,6 +93,15 @@ export interface RuntimeEventBase {
   itemId?: string;
   requestId?: string;
   raw?: { source: string; payload: unknown };
+  /** The full input or output of this step, for the side store
+   * (`server/item-io-store.ts`).  Capture-only: `EventBus.publish` moves it
+   * into the store and strips it, so no subscriber, no wire frame and no
+   * event-log line ever carries it.  Already bounded by the driver
+   * (`shared/item-io.ts`); the bus does not redact it — the store does, with
+   * the wire's pass.  A structured input was already redacted as a tree when
+   * the driver captured it, so a `{name, value}` env entry is masked by its
+   * name before it is flattened to text. */
+  io?: ItemIoCapture;
 }
 
 export type TurnBillingMode = "actual" | "estimated";
@@ -202,6 +213,10 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    /** The harness put content in front of the model that the person did not
+     * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
+     * side store; `preview` is one redacted, clipped line. */
+    | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -233,6 +248,14 @@ export interface SendTurnInput {
    * resume cursor (it carries an update from outside the session). A driver
    * that rebuilds only some lost sessions may also rebuild this one. */
   recoveryIsReplay?: boolean;
+  /** Called once by a driver that, after the provider lost its session, sends
+   * `recoveryText` in place of the turn it was handed.  The replay is content
+   * the model received that the person did not type, and only the driver knows
+   * it happened, so this is how the harness records it
+   * (shared/context-injection.ts, source "handoff").  Never required: a driver
+   * that cannot rebuild does not call it, and a throw here must not fail the
+   * turn. */
+  onReplayRecovered?: () => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
