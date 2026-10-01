@@ -120,12 +120,25 @@ describe("Settings Models layout", () => {
     expect(models!.text).not.toContain("grid-cols-[minmax(0,1.1fr)");
     expect(models!.text).not.toContain("&nbsp;");
     expect(picker!.text).toContain('contained && !label && "w-full min-w-0 justify-between"');
-    // picking a new primary keeps the bot's fallback chain: the picker builds the
-    // selection with selectionForPick, which copies the fallbacks across
+    // picking a new primary keeps the bot's fallback chain: the picker commits
+    // pickedSelection, which builds on selectionForPick and copies the
+    // fallbacks across. The behavior itself is covered in model-pick.test.ts
+    // (pickedSelection "keeps the chain"); these only pin that the picker
+    // still goes through it.
     const pick = FILES.find((entry) => entry.rel === "lib/model-pick.ts");
     expect(pick, "model-pick.ts is missing").toBeDefined();
-    expect(picker!.text).toContain("selectionForPick(selection, instance, model)");
+    expect(picker!.text).toContain("pickedSelection(selection, instance, model, latest)");
+    expect(pick!.text).toContain("...selectionForPick(current, instance, model)");
     expect(pick!.text).toContain("if (current.fallbacks?.length) next.fallbacks = current.fallbacks");
+  });
+
+  it("seeds Add Fallback through slotFromPick so a floating primary's class carries over", () => {
+    for (const rel of ["components/FleetModelsSection.tsx", "components/BotFallbackModels.tsx"]) {
+      const file = FILES.find((entry) => entry.rel === rel);
+      expect(file, `${rel} is missing`).toBeDefined();
+      expect(file!.text).toContain("slotFromPick(bot.modelSelection)");
+      expect(file!.text).not.toMatch(/\{ instanceId: bot\.modelSelection\.instanceId, model: bot\.modelSelection\.model \}/);
+    }
   });
 
   it("stacks iOS primary and fallback pickers on their own rows", () => {

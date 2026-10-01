@@ -218,10 +218,11 @@ describe("Local Models panel", () => {
 
   it("hands the picker the same pick() every engine's list uses", () => {
     // The panel is given ModelPicker's own pick(), which builds the selection
-    // with selectionForPick and either calls onChange or updates the bot.
+    // with pickedSelection (selectionForPick plus the Latest flag) and either
+    // calls onChange or updates the bot.
     const source = readFileSync(join(__dirname, "ModelPicker.tsx"), "utf8");
     expect(source).toMatch(/<LocalModelsPanel[\s\S]*?onPick=\{pick\}/);
-    expect(source).toContain("selectionForPick(selection, instance, model)");
+    expect(source).toContain("pickedSelection(selection, instance, model, latest)");
   });
 
   it("marks the bot's current model", () => {

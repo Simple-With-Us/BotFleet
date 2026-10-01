@@ -36,8 +36,20 @@ export function hasDefaults(primary: DefaultModelSlot, fallbacks: readonly Defau
   return primary !== null || fallbacks.some((slot) => slot !== null);
 }
 
-const wire = (slot: DefaultModelSlot): { instanceId: string; model: string } | null =>
-  slot ? { instanceId: slot.instanceId, model: slot.model } : null;
+/** One place as the route reads it.  `latest` rides along only when the
+ *  slot floats ("Latest Sonnet"), so every bot it lands on floats too; a
+ *  pinned slot sends no `latest` and the route pins it. */
+export type DefaultSlotWire = { instanceId: string; model: string; latest?: string };
+
+/** The picker's pick as a slot: instance, model and a floating class, never
+ *  effort or fallbacks, which belong to each bot rather than to the default. */
+export function slotFromPick(selection: ModelSelection): DefaultSlotWire {
+  const slot: DefaultSlotWire = { instanceId: selection.instanceId, model: selection.model };
+  if (selection.latest) slot.latest = selection.latest;
+  return slot;
+}
+
+const wire = (slot: DefaultModelSlot): DefaultSlotWire | null => (slot ? slotFromPick(slot) : null);
 
 /** The body for POST /api/bots/apply-model-defaults.
  *
@@ -47,7 +59,7 @@ const wire = (slot: DefaultModelSlot): { instanceId: string; model: string } | n
 export function applyDefaultsBody(
   primary: DefaultModelSlot,
   fallbacks: readonly DefaultModelSlot[],
-): { slots: { primary: { instanceId: string; model: string } | null; fallbacks: ({ instanceId: string; model: string } | null)[] } } {
+): { slots: { primary: DefaultSlotWire | null; fallbacks: (DefaultSlotWire | null)[] } } {
   return {
     slots: {
       primary: wire(primary),

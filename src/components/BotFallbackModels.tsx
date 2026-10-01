@@ -6,6 +6,7 @@
 // see it.  Only the Add control is gated on the cap, through the same shared
 // constant the Models page and the iOS profile read.
 import type { Bot, ModelSelection } from "@/state/store";
+import { slotFromPick } from "@/lib/default-model-slots";
 import { canAddFallback } from "../../shared/model-limits";
 import { ModelPicker } from "./ModelPicker";
 
@@ -53,10 +54,8 @@ export function BotFallbackModels({
       {canAddFallback(fallbacks.length) && (
         <button
           onClick={() =>
-            save([
-              ...fallbacks,
-              { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model },
-            ])
+            // slotFromPick carries a floating primary's class, as Set Default does.
+            save([...fallbacks, slotFromPick(bot.modelSelection)])
           }
           className="mt-2 text-left text-[13px] text-blue-500 hover:underline"
         >
