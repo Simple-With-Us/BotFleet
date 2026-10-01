@@ -977,6 +977,31 @@ function executionInstanceFor(
   return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
 }
 
+/** Every engine a turn for this bot could execute on.
+ *
+ *  A superset on purpose: the diagnostics panel needs to know whether an open
+ *  breaker is holding a bot, and answering that per (bot, engine) with one
+ *  selection is how a task-scoped or Box-backed hold gets reported as nothing
+ *  happening.  Each entry is an engine the scheduler might legitimately be
+ *  holding a run for, so membership is the honest question.
+ *
+ *  Bounded by the bot's own task count — it is a diagnostics read on a
+ *  thirty-second poll, not the dispatch path. */
+function executableInstancesFor(
+  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null; tasks?: { modelSelection?: ModelSelection }[] },
+): Set<string> {
+  const instances = new Set<string>();
+  instances.add(executionInstanceFor(bot, bot.modelSelection, "bot"));
+  for (const task of bot.tasks ?? []) {
+    if (task.modelSelection) instances.add(executionInstanceFor(bot, task.modelSelection, "bot"));
+  }
+  if (cloudRunUsesBoxAgent("cloud", bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)) {
+    const box = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
+    if (box) instances.add(box.instanceId);
+  }
+  return instances;
+}
+
 /** Why this bot's work must not go out right now, or undefined if it can.
  *
  *  One function, three callers: the dispatch gate answers yes/no, the scheduler
@@ -13139,10 +13164,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // bot would actually use, which is the same question dispatchHoldFor
           // asks — so it is answered here, once, instead of guessed at in the
           // panel from a list that knows nothing about the bot's selection.
+          // The engines a HELD run could actually be on for this bot: its own
+          // selection, every task that overrides it (the scheduler prefers the
+          // task), and boxAgent when the bot has cloud automation. Answering
+          // with the bot-level selection alone reported a task-held routine and
+          // a Box-backed cloud routine as NOT held, because neither uses the
+          // bot's engine — the same "judged on the wrong selection" mistake as
+          // the two earlier P1s, in a diagnostic.
           const holds = Boolean(
-            bot
-            && open
-            && executionInstanceFor(bot, bot.modelSelection, "bot") === entry.instanceId,
+            bot && open && executableInstancesFor(bot).has(entry.instanceId),
           );
           return {
             ...entry,

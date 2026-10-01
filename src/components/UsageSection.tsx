@@ -128,8 +128,12 @@ export interface DoomedPair {
    *  that predates the flag — treated as open, which is the old behaviour. */
   open?: boolean;
   /** Whether an OPEN breaker here is actually holding this bot, i.e. the
-   *  engine it names is the one the bot would use.  An open breaker on a
-   *  fallback engine outlives the primary's recovery and holds nothing. */
+   *  engine it names is one this bot's work could be on.  An open breaker on
+   *  an engine no run is waiting on outlives recovery and holds nothing.
+   *
+   *  Absent on a server that predates it, and absent means OPEN — the same
+   *  compatibility contract as `open` above.  Showing the entry is the safe
+   *  direction: an over-warning costs a glance, a hidden one loses a stop. */
   holds?: boolean;
 }
 
@@ -381,7 +385,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   // engine the run would actually use. The server answers that with the same
   // question the dispatcher asks, so the panel does not have to re-derive it
   // from a list that knows nothing about a bot's selection.
-  const heldPairs = doomed.filter((pair) => pair.holds ?? pair.open === true);
+  const heldPairs = doomed.filter((pair) => pair.holds ?? pair.open ?? true);
   // Count BOTS, not pairs. One bot whose primary and fallback both opened
   // breakers is one bot being held, and a heading that says otherwise sends the
   // reader looking for a bot that does not exist.
