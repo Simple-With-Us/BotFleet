@@ -22,7 +22,8 @@ import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
-import { modelEffortLevels } from "@/lib/model-effort";
+import { effortLabel } from "@/lib/model-effort";
+import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
 import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
 
 function Field({
@@ -602,8 +603,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           </div>
 
           {(() => {
-            const selectedOpt = engine?.models.options.find((o) => o.id === bot.modelSelection.model);
-            const effortLevels = modelEffortLevels(engine, selectedOpt, bot.modelSelection.model);
+            const effortLevels = selectionEffortLevels(engine, bot.modelSelection);
             if (!effortLevels.length && !bot.modelSelection.effort) return null;
             return (
               <div className="rounded-xl bg-card p-4">
@@ -624,23 +624,22 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                       <button
                         key={level ?? "default"}
                         aria-pressed={bot.modelSelection.effort === level}
-                        onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: level } })}
+                        onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, level) })}
                         className={cn(
-                          "flex-1 py-1.5 text-[13px] capitalize",
+                          "flex-1 py-1.5 text-[13px]",
                           i > 0 && "border-l border-hairline/40",
                           bot.modelSelection.effort === level
                             ? "bg-control text-ink"
                             : "text-ink-secondary hover:bg-control/60 hover:text-ink",
                         )}
                       >
-                        {/* the others capitalize cleanly; "xhigh" would read "X-High" */}
-                        {level === "xhigh" ? "X-High" : (level ?? "Default")}
+                        {effortLabel(level)}
                       </button>
                     ))}
                   </div>
                 ) : (
                   <button
-                    onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: undefined } })}
+                    onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, undefined) })}
                     className="mt-3 rounded-lg border border-hairline/40 bg-control px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-control/80"
                   >
                     Clear Saved Reasoning ({bot.modelSelection.effort})
