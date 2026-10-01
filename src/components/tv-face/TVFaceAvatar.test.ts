@@ -35,15 +35,10 @@ describe("tvFaceSkinDir", () => {
     expect(tvFaceSkinDir("default")).toBe("default");
   });
 
-  it("maps shipped named colors to their folders when listed in SHIPPED_SKINS", () => {
-    // Packs land via scripts/tv-face-build-color-skins.py / tv-face-fetch-skins.sh.
-    // Until then SHIPPED_SKINS is orange-only and every other color falls back.
+  it("maps every shipped BotColor to its own directory", () => {
     for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral"] as const) {
-      if (SHIPPED_SKINS.has(color)) {
-        expect(tvFaceSkinDir(color)).toBe(color);
-      } else {
-        expect(tvFaceSkinDir(color)).toBe("default");
-      }
+      expect(SHIPPED_SKINS.has(color), `${color} should be shipped`).toBe(true);
+      expect(tvFaceSkinDir(color)).toBe(color);
     }
   });
 

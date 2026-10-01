@@ -64,7 +64,21 @@ export interface TVFaceAvatarProps {
 /** Expand this set when color packs are present under public/tv-face/skins/{color}.
  *  Build with scripts/tv-face-build-color-skins.py or fetch from FleetLink
  *  (scripts/tv-face-fetch-skins.sh).  Tests assert this set matches on-disk dirs. */
-export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>(["orange"]);
+/** Expand when packs are present under public/tv-face/skins/{color}.
+ *  Packs: blue green purple pink red cyan yellow teal coral (enter/return = 1000ms).
+ *  Tests assert this set matches on-disk directories. */
+export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
+  "orange",
+  "blue",
+  "green",
+  "purple",
+  "pink",
+  "red",
+  "cyan",
+  "yellow",
+  "teal",
+  "coral",
+]);
 
 /** The skins directory a color renders from.  `orange` IS the default skin. */
 export function tvFaceSkinDir(color: TVFaceSkin): string {
