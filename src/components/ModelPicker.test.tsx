@@ -28,7 +28,7 @@ vi.mock("@/state/store", () => ({
 }));
 
 // Imported after the mock is registered (vitest hoists vi.mock above imports).
-import { LocalModelsPanel, ModelPicker } from "./ModelPicker";
+import { EffortSection, LocalModelsPanel, ModelPicker } from "./ModelPicker";
 
 type Option = InstanceInfo["models"]["options"][number];
 
@@ -67,7 +67,7 @@ const BOT = {
 
 function render(
   instances: InstanceInfo[],
-  props: { initialRailId?: string | null; selection?: Bot["modelSelection"] } = {},
+  props: { initialRailId?: string | null; selection?: Bot["modelSelection"]; contained?: boolean } = {},
 ): string {
   store.instances = instances;
   return renderToStaticMarkup(
@@ -289,5 +289,183 @@ describe("ASCII.dev Box engine", () => {
     const localButton = html.match(/<button[^>]*aria-label="Local Models"[^>]*>.*?<\/button>/s)?.[0] ?? "";
     expect(boxButton).toContain("lucide-box");
     expect(localButton).toContain("lucide-monitor");
+  });
+});
+
+// ── Effort in the chat model menu ─────────────────────────────────────────
+// The chat header's picker (not `contained`) offers the effort the bot's own
+// model takes, as Settings' Reasoning control does.  The fixtures need engine
+// `capabilities`: without them no model offers any level.
+
+const withEffort = (levels: Array<"none" | "low" | "medium" | "high" | "xhigh" | "max">): Partial<InstanceInfo> =>
+  ({ capabilities: { effortLevels: levels } }) as Partial<InstanceInfo>;
+
+const effortClaude = (options: Option[] = [], levels: Array<"low" | "medium" | "high" | "xhigh" | "max"> = ["low", "medium", "high"]) =>
+  engine("claude", "claudeAgent", "Claude", [{ id: "sonnet", label: "Claude Sonnet" }, ...options], withEffort(levels));
+const effortCodex = () =>
+  engine("codex", "codex", "Codex", [{ id: "gpt-5.4", label: "GPT-5.4" }], withEffort(["low", "medium", "high"]));
+
+/** The Effort radio group's markup, or "" when the menu has none. */
+function effortSection(html: string): string {
+  const start = html.indexOf("data-effort-section");
+  if (start === -1) return "";
+  return html.slice(start, html.indexOf("</div></div>", start));
+}
+
+/** Each choice's visible label and whether it carries the check. */
+function effortChoices(html: string): Array<{ label: string; checked: boolean }> {
+  return [...effortSection(html).matchAll(/<button[^>]*aria-checked="(true|false)"[^>]*>([\s\S]*?)<\/button>/g)].map(
+    (match) => ({ label: words(match[2]), checked: match[1] === "true" }),
+  );
+}
+
+describe("Effort section in the chat model menu", () => {
+  const chat = { contained: false } as const;
+
+  it("lists Default and the model's levels with a check on the bot's current one", () => {
+    const html = render([effortClaude()], {
+      ...chat,
+      selection: { instanceId: "claude", model: "sonnet", effort: "high" },
+    });
+    expect(words(menu(html))).toContain("Effort");
+    expect(effortChoices(html)).toEqual([
+      { label: "Default", checked: false },
+      { label: "Low", checked: false },
+      { label: "Medium", checked: false },
+      { label: "High", checked: true },
+    ]);
+    expect(effortSection(html).match(/lucide-check/g)).toHaveLength(1);
+  });
+
+  it("checks Default when the bot has no saved effort", () => {
+    const choices = effortChoices(render([effortClaude()], chat));
+    expect(choices.find((choice) => choice.checked)?.label).toBe("Default");
+  });
+
+  it("labels levels the way Settings' Reasoning control does", () => {
+    const html = render([effortClaude([], ["low", "xhigh", "max"])], {
+      ...chat,
+      selection: { instanceId: "claude", model: "sonnet", effort: "xhigh" },
+    });
+    expect(effortChoices(html)).toEqual([
+      { label: "Default", checked: false },
+      { label: "Low", checked: false },
+      { label: "X-High", checked: true },
+      { label: "Max", checked: false },
+    ]);
+    const none = engine("codex", "codex", "Codex", [{ id: "gpt-5.4", label: "GPT-5.4" }], withEffort(["none", "low"]));
+    expect(effortChoices(render([none], { ...chat, selection: { instanceId: "codex", model: "gpt-5.4" } })).map((c) => c.label)).toEqual([
+      "Default",
+      "None",
+      "Low",
+    ]);
+  });
+
+  it("is a footer outside the scrolling model list, so Show All never pushes it away", () => {
+    const html = menu(render([effortClaude()], chat));
+    expect(html.indexOf("overflow-y-auto px-2 pb-2")).toBeGreaterThan(-1);
+    expect(html.indexOf("data-effort-section")).toBeGreaterThan(html.lastIndexOf("Claude Sonnet"));
+    expect(effortSection(html)).not.toBe("");
+  });
+
+  it("is absent for a model that takes no effort", () => {
+    const html = render(
+      [effortClaude([{ id: "plain", label: "Plain Model", effortLevels: [] }])],
+      { ...chat, selection: { instanceId: "claude", model: "plain" } },
+    );
+    expect(html).not.toContain("data-effort-section");
+    expect(words(menu(html))).not.toContain("Effort");
+  });
+
+  it("is absent for a Claude Haiku model, which has no extended thinking", () => {
+    const html = render(
+      [effortClaude([{ id: "claude-haiku-4-5", label: "Claude Haiku 4.5" }])],
+      { ...chat, selection: { instanceId: "claude", model: "claude-haiku-4-5" } },
+    );
+    expect(html).not.toContain("data-effort-section");
+  });
+
+  it("is absent when the engine declares no effort levels at all", () => {
+    expect(render([claude()], chat)).not.toContain("data-effort-section");
+  });
+
+  it("is absent from Settings pickers, where the Reasoning control sits beside them", () => {
+    const html = render([effortClaude()], {
+      contained: true,
+      selection: { instanceId: "claude", model: "sonnet", effort: "high" },
+    });
+    expect(html).not.toContain("data-effort-section");
+  });
+
+  it("is absent while browsing an engine other than the bot's own", () => {
+    // The bot is on Claude; Codex's panel must not show Claude's effort.
+    const html = render([effortClaude(), effortCodex()], { ...chat, initialRailId: "codex" });
+    expect(words(menu(html))).toContain("GPT-5.4");
+    expect(html).not.toContain("data-effort-section");
+  });
+
+  it("is absent while the bot's engine needs setup", () => {
+    const blocked = engine(
+      "claude",
+      "claudeAgent",
+      "Claude",
+      [{ id: "sonnet", label: "Claude Sonnet" }],
+      { ...withEffort(["low", "high"]), snapshot: { state: "unavailable", reason: "Sign-in required" } } as Partial<InstanceInfo>,
+    );
+    expect(render([blocked], chat)).not.toContain("data-effort-section");
+  });
+
+  it("is offered to a Latest selection, with its saved effort checked", () => {
+    const html = render([effortClaude()], {
+      ...chat,
+      selection: { instanceId: "claude", model: "sonnet", latest: "sonnet", effort: "medium" },
+    });
+    expect(effortChoices(html).find((choice) => choice.checked)?.label).toBe("Medium");
+  });
+
+  it("is offered on Local Models when the bot is on a local model that takes effort", () => {
+    const selection = { instanceId: "claude", model: QWEN.id, effort: "low" as const };
+    const html = render([effortClaude([QWEN])], { ...chat, selection });
+    expect(words(menu(html))).toContain("Local Models");
+    expect(effortChoices(html).find((choice) => choice.checked)?.label).toBe("Low");
+    // …and not when the local row declares it takes none.
+    const none = render([effortClaude([{ ...QWEN, effortLevels: [] }])], { ...chat, selection });
+    expect(none).not.toContain("data-effort-section");
+  });
+
+  it("is absent on Local Models while the bot is on a cloud model", () => {
+    const html = render([effortClaude([QWEN])], { ...chat, initialRailId: LOCAL_MODELS_RAIL_ID });
+    expect(words(menu(html))).toContain("Local Models");
+    expect(html).not.toContain("data-effort-section");
+  });
+
+  it("names the level in the chip's tooltip, in the chat header only", () => {
+    const selection = { instanceId: "claude", model: "sonnet", effort: "high" as const };
+    expect(render([effortClaude()], { ...chat, selection })).toContain("High effort");
+    expect(render([effortClaude()], { contained: true, selection })).not.toContain("High effort");
+    // …and nothing is said when the bot has none saved.
+    expect(render([effortClaude()], chat)).not.toMatch(/title="[^"]*effort/);
+  });
+
+  it("hands each choice's level to onPick, Default as undefined", () => {
+    const onPick = vi.fn();
+    const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
+    const choices = findElements(tree, (element) => (element.props as { role?: string }).role === "radio");
+    expect(choices).toHaveLength(3);
+    for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
+    expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
+  });
+
+  it("renders nothing for a model with no levels", () => {
+    expect(EffortSection({ levels: [], current: undefined, onPick: () => {} })).toBeNull();
+  });
+
+  it("saves through the picker's own commit, as an effort-only change", () => {
+    // pickEffort must not go through pickedSelection, which writes
+    // `latest: null` and would un-float a "Latest <Class>" bot.
+    const source = readFileSync(join(__dirname, "ModelPicker.tsx"), "utf8");
+    expect(source).toContain("commit(selectionWithEffort(selection, level))");
+    expect(source).toMatch(/<EffortSection[^>]*onPick=\{pickEffort\}/);
+    expect(source).not.toMatch(/pickEffort[^\n]*pickedSelection/);
   });
 });

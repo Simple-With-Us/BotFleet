@@ -77,3 +77,13 @@ export function modelSupportsEffort(
 ): boolean {
   return modelEffortLevels(engine, modelOption, modelId).length > 0;
 }
+
+/** The word a person reads for an effort level, shared by every control that
+ *  offers one so the chat picker and Settings cannot drift.  No level means the
+ *  bot sends none and the engine uses its own default. */
+export function effortLabel(level: EffortLevel | undefined): string {
+  if (level === undefined) return "Default";
+  // "xhigh" would otherwise read "Xhigh".
+  if (level === "xhigh") return "X-High";
+  return level.charAt(0).toUpperCase() + level.slice(1);
+}

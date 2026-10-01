@@ -20,7 +20,9 @@ import {
   opensOnLocalModels,
   type LocalModelGroup,
 } from "@/lib/local-models";
-import { pickedSelection } from "@/lib/model-pick";
+import { pickedSelection, selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import { effortLabel } from "@/lib/model-effort";
+import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
 import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
@@ -87,6 +89,57 @@ export function LatestModelRows({
       })}
       <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
     </>
+  );
+}
+
+/** "Effort": how hard the selected model thinks.  Default plus the levels the
+ *  model offers, a check on the one the bot has now.  A model with no levels
+ *  gets no section at all. */
+export function EffortSection({
+  levels,
+  current,
+  onPick,
+  className,
+}: {
+  levels: readonly EffortLevel[];
+  /** The bot's saved effort; undefined is Default. */
+  current: EffortLevel | undefined;
+  onPick: (level: EffortLevel | undefined) => void;
+  className?: string;
+}) {
+  if (!levels.length) return null;
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Effort"
+      data-effort-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Effort</EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {([undefined, ...levels] as const).map((level) => {
+          const checked = current === level;
+          return (
+            <button
+              key={level ?? "default"}
+              type="button"
+              role="radio"
+              aria-checked={checked}
+              onClick={() => onPick(level)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px]",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {effortLabel(level)}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -494,6 +547,12 @@ export function ModelPicker({
     setOpen(false);
   };
 
+  /** Effort changes only the effort: the rest of the selection rides along, so
+   *  a "Latest <Class>" bot keeps floating and its fallbacks stay.  The menu
+   *  stays open so the check visibly moves.  Same save as Settings' Reasoning
+   *  control (`selectionWithEffort`). */
+  const pickEffort = (level: EffortLevel | undefined) => commit(selectionWithEffort(selection, level));
+
   // Superseded rows are hidden: within a model class only the newest member
   // is offered, beside the "Latest <Class>" rows.
   const official = offeredOptions(railInstance).filter((option) => !option.custom);
@@ -514,6 +573,22 @@ export function ModelPicker({
   const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
   const blocked = railInstance ? pickerBlocked(railInstance, pane) : false;
   const checking = isCheckingEngine(railInstance);
+
+  // The chat picker's Effort section belongs to the model the bot is on, so
+  // it appears only on the panel that lists that model: the bot's own engine,
+  // or Local Models when the bot is on one of those.  Browsing another engine
+  // never shows the current model's effort under that engine's name.  Settings
+  // pickers (`contained`) have the Reasoning control beside them.
+  const effortLevels = contained ? [] : selectionEffortLevels(active, selection);
+  const effortApplies = localView
+    ? opensOnLocalModels(localGroups, active, selection)
+    : !blocked && railInstance?.instanceId === selection.instanceId;
+  const effortSection =
+    effortApplies && effortLevels.length > 0 ? (
+      <EffortSection levels={effortLevels} current={selection.effort} onPick={pickEffort} />
+    ) : null;
+  const chipEffort =
+    !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -564,7 +639,7 @@ export function ModelPicker({
       )}
       title={
         active
-          ? `${active.displayName} · ${selectionChipLabel(active, selection, { showLatest: true })} (${selection.model})`
+          ? `${active.displayName} · ${selectionChipLabel(active, selection, { showLatest: true })} (${selection.model})${chipEffort ? ` · ${effortLabel(chipEffort)} effort` : ""}`
           : selection.model
       }
     >
@@ -685,13 +760,16 @@ export function ModelPicker({
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             {localView ? (
-              <LocalModelsPanel
-                groups={localGroups}
-                selection={selection}
-                query={query}
-                onQueryChange={setQuery}
-                onPick={pick}
-              />
+              <>
+                <LocalModelsPanel
+                  groups={localGroups}
+                  selection={selection}
+                  query={query}
+                  onQueryChange={setQuery}
+                  onPick={pick}
+                />
+                {effortSection}
+              </>
             ) : railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
@@ -842,6 +920,7 @@ export function ModelPicker({
                         </>
                       )}
                     </div>
+                    {effortSection}
                   </>
                 )}
               </>
