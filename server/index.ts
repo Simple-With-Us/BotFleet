@@ -117,6 +117,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -369,6 +370,10 @@ import { recallPromptFor } from "./recall-prompt.ts";
 import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import {
+  automationRolloverCaps,
+  shouldRolloverAutomationThread,
+} from "./automation-rollover.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -1304,6 +1309,17 @@ function checkedModelSelection(
     }
     if (parsedFallbacks.length > 0) {
       selection.fallbacks = parsedFallbacks;
+    }
+  }
+  // Heal retired MiniMax/DSH picker ids before lineage and availability
+  // checks so a PATCH cannot re-introduce them.  model-lineage deliberately
+  // omits those engines; Claude/Grok retired ids still move via lineage below.
+  {
+    const rewritten = rewriteModelSelection(selection);
+    if (rewritten.changed) {
+      selection.model = rewritten.selection.model;
+      if (rewritten.selection.fallbacks) selection.fallbacks = rewritten.selection.fallbacks;
+      else delete selection.fallbacks;
     }
   }
   // A fallback entry is only parsed here.  Availability and effort are checked
@@ -5099,6 +5115,21 @@ routines = new RoutineManager({
   taskForKey: (botId, automationKey) => store.taskByAutomationKey(botId, automationKey)?.threadId,
   stampKey: (botId, threadId, automationKey) => {
     store.stampAutomationKey(botId, threadId, automationKey);
+  },
+  automationThreadSize: (botId, threadId) => {
+    const task = store.taskByThread(botId, threadId);
+    return {
+      turns: task?.usage?.turns ?? 0,
+      messages: store.messageCountFor(threadId),
+    };
+  },
+  shouldRolloverAutomation: (_botId, _threadId, size) =>
+    shouldRolloverAutomationThread(size, automationRolloverCaps()),
+  rolloverAutomationTask: (botId, automationKey, title, activate) => {
+    const task = store.rolloverAutomationTask(botId, automationKey, { title, activate });
+    const bot = store.bot(botId);
+    if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+    return task;
   },
   startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
     startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),

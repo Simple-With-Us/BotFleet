@@ -18,6 +18,9 @@ export {
   writeDshMcpPatch,
 } from "clutch/dsh/mcp-patch";
 
+/** @deprecated Prefer {@link isDshEngineCli} (Clutch rename). */
+export const isStockDshCli = isDshEngineCli;
+
 export function dshWrapSpawn(
   cli: string,
   args: string[],

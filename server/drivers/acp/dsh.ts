@@ -31,7 +31,7 @@ import { parse as parseYaml } from "yaml";
 import { createAcpDriver, type AcpConfig, type AcpSupport } from "./core.ts";
 import { dshWrapSpawn } from "./dsh-mcp.ts";
 
-export { dshWrapSpawn, isDshEngineCli } from "./dsh-mcp.ts";
+export { dshWrapSpawn, isDshEngineCli, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Clutch package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
  * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */

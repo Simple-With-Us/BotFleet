@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { nextOccurrence, RoutineManager, type RoutineManagerOptions } from "./routines.ts";
+import { BUSY_DEFER_NOTE, nextOccurrence, RoutineManager, type RoutineManagerOptions } from "./routines.ts";
 
 const dirs: string[] = [];
 
@@ -297,11 +297,13 @@ describe("RoutineManager", () => {
 
   it.each([true, false])("keeps combined receipts pending until their owning execution settles (ok=%s)", async (ok) => {
     const h = harness();
-    h.setBot("busy");
+    // Fence admission so multiple same-key deliveries stay queued (busy would
+    // coalesce them into one deferred slot at enqueue time).
+    h.setAdmitting(false);
     for (let i = 0; i < 3; i++) h.manager.enqueueWebhook({ webhookId: "combined-fixture", webhookName: "Combined fixture",
       prompt: `Synthetic delivery ${i}`, botId: "maus-1", runOn: "bot", deliveryId: `delivery-${i}`, receivedAt: 1000 + i });
-    await h.manager.tick();
-    h.setBot("ready");
+    expect(h.manager.listRuns()).toHaveLength(3);
+    h.setAdmitting(true);
     await h.manager.tick();
     h.setBot("busy");
     const pending = h.manager.listRuns();
@@ -348,17 +350,137 @@ describe("RoutineManager", () => {
 
   it("cancels the owning execution and all combined deliveries when any combined receipt is cancelled", async () => {
     const h = harness();
-    h.setBot("busy");
+    h.setAdmitting(false);
     for (let i = 0; i < 2; i++) h.manager.enqueueWebhook({ webhookId: "combined-cancel", webhookName: "Cancel fixture",
       prompt: "Synthetic delivery", botId: "maus-1", runOn: "bot", deliveryId: `cancel-${i}`, receivedAt: i });
-    await h.manager.tick();
-    h.setBot("ready");
+    h.setAdmitting(true);
     await h.manager.tick();
     const child = h.manager.listRuns().find((run) => run.coalescedInto)!;
     await h.manager.cancelRun(child.id);
     expect(h.manager.listRuns().every((run) => run.status === "cancelled" && run.outcomeCode === "cancelled")).toBe(true);
     expect(h.failed).toHaveLength(0);
   });
+  it("coalesces webhook deliveries into one deferred slot while the bot is busy", async () => {
+    const h = harness();
+    h.setBot("busy");
+    const first = h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #1",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "d0",
+      receivedAt: 1000,
+    });
+    const second = h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #2",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "d1",
+      receivedAt: 1001,
+    });
+    const third = h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #3",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "d2",
+      receivedAt: 1002,
+    });
+    expect(second.id).toBe(first.id);
+    expect(third.id).toBe(first.id);
+    const queued = h.manager.listRuns();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      id: first.id,
+      status: "queued",
+      deliveryId: "d2",
+      scheduledFor: 1000,
+    });
+    expect(queued[0]!.prompt).toContain("Review PR #3");
+    expect(queued[0]!.prompt).toContain(BUSY_DEFER_NOTE);
+    expect(h.started).toHaveLength(0);
+    // A different trigger still gets its own deferred slot.
+    const other = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "check_run failed",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "c0",
+      receivedAt: 1003,
+    });
+    expect(other.id).not.toBe(first.id);
+    expect(h.manager.listRuns()).toHaveLength(2);
+  });
+
+  it("flushes the busy-deferred webhook slot when the bot becomes idle", async () => {
+    const h = harness();
+    h.setBot("busy");
+    h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #1",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "d0",
+      receivedAt: 1000,
+    });
+    h.manager.enqueueWebhook({
+      webhookId: "ui-pass",
+      webhookName: "GitHub UI Pass",
+      prompt: "Review PR #9",
+      botId: "designer",
+      runOn: "bot",
+      deliveryId: "d9",
+      receivedAt: 1009,
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns()).toHaveLength(1);
+
+    h.setBot("ready");
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.started[0]!.prompt).toContain("Review PR #9");
+    expect(h.started[0]!.prompt).toContain(BUSY_DEFER_NOTE);
+    expect(h.manager.listRuns()).toMatchObject([{ status: "running", deliveryId: "d9" }]);
+  });
+
+  it("coalesces resource-trigger deliveries the same way while busy", async () => {
+    const h = harness();
+    h.setBot("busy");
+    const first = h.manager.enqueueResource({
+      triggerId: "disk-pressure",
+      triggerName: "Disk pressure",
+      prompt: "Disk at 90%",
+      botId: "housekeeper",
+      runOn: "bot",
+      deliveryId: "r0",
+      receivedAt: 2000,
+    });
+    const second = h.manager.enqueueResource({
+      triggerId: "disk-pressure",
+      triggerName: "Disk pressure",
+      prompt: "Disk at 95%",
+      botId: "housekeeper",
+      runOn: "bot",
+      deliveryId: "r1",
+      receivedAt: 2001,
+    });
+    expect(second.id).toBe(first.id);
+    expect(h.manager.listRuns()).toHaveLength(1);
+    expect(h.manager.listRuns()[0]!.prompt).toContain("Disk at 95%");
+    h.setBot("ready");
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.started[0]!.prompt).toContain("Disk at 95%");
+  });
+
+
 
   it("preserves due work while scheduler admission is fenced", async () => {
     const h = harness();
@@ -740,6 +862,126 @@ describe("RoutineManager", () => {
     expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-1", "thread-1"]);
     // and only the first delivery had to mint a task
     expect(h.taskActivations).toEqual([true]);
+  });
+
+
+  it("rolls an oversized automation thread onto a fresh task under the same key", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    // First delivery mints thread-1 and stamps webhook:hook-1.
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 1",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-1",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+
+    const sizes = new Map<string, { turns: number; messages: number }>([
+      ["thread-1", { turns: 400, messages: 50 }],
+    ]);
+    const rolledFrom: string[] = [];
+    h.options.automationThreadSize = (_botId, threadId) => sizes.get(threadId) ?? { turns: 0, messages: 0 };
+    h.options.shouldRolloverAutomation = (_botId, _threadId, size) => size.turns >= 300;
+    h.options.rolloverAutomationTask = (_botId, automationKey, title, activate) => {
+      rolledFrom.push(automationKey);
+      // Mimic store.rolloverAutomationTask: clear key, mint, restamp.
+      const prev = (h.options.taskForKey as any)(_botId, automationKey) as string | undefined;
+      if (prev) {
+        // Clear by rewriting the harness key map through stamp on a new id.
+      }
+      const created = h.options.createTask(_botId, title, activate, undefined)!;
+      // Re-bind the key to the new thread (createTask without key + stamp).
+      h.options.stampKey!(_botId, created.threadId, automationKey);
+      sizes.set(created.threadId, { turns: 0, messages: 1 });
+      return created;
+    };
+
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 2",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d2",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+
+    expect(rolledFrom).toEqual(["webhook:hook-1"]);
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-2"]);
+    // Subsequent delivery without oversized size stays on the rolled task.
+    sizes.set("thread-2", { turns: 1, messages: 2 });
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-2",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 3",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d3",
+      receivedAt: new Date(2026, 7, 17, 8, 4).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-2", "thread-2"]);
+    expect(rolledFrom).toEqual(["webhook:hook-1"]);
+  });
+
+  it("does not rollover while thresholds are unmet", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.automationThreadSize = () => ({ turns: 10, messages: 20 });
+    h.options.shouldRolloverAutomation = () => false;
+    let rolled = 0;
+    h.options.rolloverAutomationTask = () => {
+      rolled += 1;
+      return null;
+    };
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Small",
+      prompt: "ping",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-1",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Small",
+      prompt: "pong",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d2",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+    expect(rolled).toBe(0);
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-1"]);
   });
 
   it("gives two different webhooks two different threads", async () => {
