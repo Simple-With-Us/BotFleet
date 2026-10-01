@@ -47,7 +47,14 @@ across turns).
   served.
 - The write path is the event log's bounded append queue: it drops its oldest
   entries before it grows, never blocks the publisher, and a failed write costs
-  one step its expanded view, never a turn.
+  one step its expanded view, never a turn.  A failing disk is reported once
+  per outage (the first failure, with its reason), counted while it lasts, and
+  summarised when a write next lands, so a full disk does not flood the log.
+- An ACP agent may announce a call with an empty or partial `rawInput` and send
+  the arguments on a later `tool_call_update`.  The driver files them as soon as
+  they are new text for that call: on an `item.updated` while the call runs, or
+  on the `item.completed` when they only settle there.  The store keeps the
+  newest input per step.
 
 `GET /api/threads/:id/items/:itemId/io[?turnId=]` answers `{ itemId, turnId?,
 at, input?, output?, text? }` where each field is `{ text, truncated, length }`,
@@ -71,9 +78,21 @@ What the harness adds to a prompt that the person did not type, found by reading
 | `playbook` | installed playbook instructions the message selected | every turn it applies |
 | `automation` | the note naming which automation fired the turn | every turn it applies |
 | `mention` | the nudge to bring in a tagged teammate | every turn it applies |
-| `handoff` | the conversation replayed to an engine that joined mid-thread | every turn it applies |
+| `handoff` | the conversation replayed to an engine with no session of its own: one that joined mid-thread, or (Codex) whose native session was lost and was rebuilt from the replay | every turn it applies |
 | `rewind` | the surviving conversation replayed after an edit or version switch | every turn it applies |
 | `reply` | the earlier message a reply quotes | every turn it applies |
+| `continuation` | the note the harness sends as the whole turn when a card is finished (a connector connected, a credential provided or declined) | every continuation turn |
+
+A message dispatched more than once (a model fallback hands it to the next
+engine) records a draft only the first time: one that matches a recorded one by
+source, size and preview is dropped before it is published, so neither the chat
+nor the Trajectory shows it twice.  A draft that differs, such as a replay the
+second engine alone needed, is kept.
+
+A card continuation has no stored message, so its rows hang under the last
+message on the active path (the card the person just finished, or the bot's last
+reply).  The Codex lost-session replay is only known to the driver, which calls
+`onReplayRecovered` on the turn it was handed so the harness can record it.
 
 Not recorded, on purpose:
 

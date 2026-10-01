@@ -66,6 +66,11 @@ export function clipRuntimeEvent(event: RuntimeEvent, limit: number = TRAJECTORY
       const reason = cut(withoutRaw.reason, limit);
       return reason === withoutRaw.reason ? withoutRaw : { ...withoutRaw, reason };
     }
+    case "context.injected": {
+      // built one clipped line already; a record read back from disk is held to it too
+      const preview = cut(withoutRaw.preview, limit);
+      return preview === withoutRaw.preview ? withoutRaw : { ...withoutRaw, preview };
+    }
     default:
       return withoutRaw;
   }

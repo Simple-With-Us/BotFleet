@@ -13,6 +13,26 @@ describe("IoBlock", () => {
     expect(html).toContain(">hello<");
     expect(html).not.toContain("Truncated");
   });
+
+  it("is a named group, not a landmark, and names its step", () => {
+    const f = { text: "hello", truncated: false, length: 5 };
+    const named = renderToStaticMarkup(createElement(IoBlock, { label: "OUT", field: f, subject: "Read" }));
+    expect(named).toContain('role="group"');
+    expect(named).not.toContain('role="region"');
+    expect(named).toContain('aria-label="Output of Read"');
+    expect(named).toContain('aria-label="Copy output of Read"');
+    // without a subject it still says what it is
+    const bare = renderToStaticMarkup(createElement(IoBlock, { label: "IN", field: f }));
+    expect(bare).toContain('aria-label="Input"');
+    expect(bare).toContain('aria-label="Copy input"');
+    // the failure label is spoken as an error
+    expect(renderToStaticMarkup(createElement(IoBlock, { label: "ERROR", field: f, subject: "Bash" }))).toContain('aria-label="Copy error of Bash"');
+  });
+
+  it("does not dim its label with an alpha", () => {
+    const html = renderToStaticMarkup(createElement(IoBlock, { label: "IN", field: { text: "x", truncated: false, length: 1 } }));
+    expect(html).not.toMatch(/text-ink-secondary\/\d+/);
+  });
 });
 
 describe("ItemIoBlocks", () => {
@@ -49,6 +69,22 @@ describe("ItemIoBlocks", () => {
     expect(html).toContain('data-io="in"');
     expect(html).toContain('data-io="out"');
     expect(html).toContain('data-io="text"');
+  });
+
+  it("shows the headline in place of the IN block when the step had no arguments", () => {
+    const f = (text: string) => ({ text, truncated: false, length: text.length });
+    const html = render({
+      state: { status: "loaded", io: { itemId: "a", at: "x", output: f("o") } },
+      headline: createElement("p", null, "the-target"),
+    });
+    expect(html).toContain("the-target");
+    expect(html.indexOf("the-target")).toBeLessThan(html.indexOf('data-io="out"'));
+    // and not alongside a real IN block
+    const withInput = render({
+      state: { status: "loaded", io: { itemId: "a", at: "x", input: f("i"), output: f("o") } },
+      headline: createElement("p", null, "the-target"),
+    });
+    expect(withInput).not.toContain("the-target");
   });
 
   it("uses the sentences the rows promise", () => {

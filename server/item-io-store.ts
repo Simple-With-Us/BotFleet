@@ -137,11 +137,39 @@ export class ItemIoStore {
         maxQueuedBytes: options.maxQueuedBytes ?? MAX_QUEUED_BYTES,
         report: options.report,
         label: "tool input/output store",
-        // a failed write costs one step its expanded view; say so once in the
-        // server log and move on — never retry, never throw at the bus
-        onWriteError: (_context, error) => console.error("item-io: could not write a record", error),
+        // a failed write costs one step its expanded view; say so once per
+        // outage and move on — never retry, never throw at the bus
+        onWriteError: (_context, error) => this.writeFailed(error),
+        onWritten: () => this.writeSucceeded(),
       },
     );
+    this.say = options.report ?? ((line) => console.error(line));
+  }
+
+  /** Where the outage notices go: the same seam the queue's drop summary uses. */
+  private readonly say: (line: string) => void;
+  /** Records that failed to write since the last one that landed.  A disk that
+   * is full or unwritable fails EVERY record, and a line per record is a log
+   * that floods exactly when the disk is already in trouble. */
+  private failedSinceLastWrite = 0;
+
+  /** The first failure of an outage is reported; the rest are only counted. */
+  private writeFailed(error: unknown): void {
+    this.failedSinceLastWrite += 1;
+    if (this.failedSinceLastWrite > 1) return;
+    const reason = error instanceof Error ? error.message : String(error);
+    this.say(
+      `item-io: could not write a record (${reason}).  Tool input and output for the affected steps will be missing; ` +
+        "further failures are counted and summarised when writing recovers.",
+    );
+  }
+
+  /** One summary when writes work again, so a quiet log never reads as "never failed". */
+  private writeSucceeded(): void {
+    if (this.failedSinceLastWrite === 0) return;
+    const failed = this.failedSinceLastWrite;
+    this.failedSinceLastWrite = 0;
+    this.say(`item-io: writing recovered after ${failed === 1 ? "1 failed record" : `${failed} failed records`}.`);
   }
 
   private ensureDir(): Promise<void> {

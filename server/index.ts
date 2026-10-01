@@ -264,12 +264,14 @@ import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queued
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
-import { MAX_CONTEXT_INJECTIONS_PER_TURN } from "../shared/context-injection.ts";
 import {
   draftFromReplay,
   draftFromReply,
   draftsFromPromptSections,
+  dropRecorded,
+  injectionTarget,
   MemoryChangeGate,
+  mergeInjectionRefs,
   recordContextInjections,
   type InjectionDraft,
 } from "./context-injection.ts";
@@ -4164,8 +4166,10 @@ async function startTurn(
   const fresh =
     !rewound &&
     engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+  // the message with a reply's framing and quoted excerpt, as the model gets it
+  const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
   const { turnText, resume } = buildTurnContext({
-    text: promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User"),
+    text: replyBase,
     transcript,
     rewound,
     fresh,
@@ -4187,7 +4191,7 @@ async function startTurn(
   // classifyResumeFailure / mayReplay before using it — never error-text regexes.
   const recoveryText = resume
     ? buildTurnContext({
-        text: promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User"),
+        text: replyBase,
         transcript,
         rewound: false,
         fresh: true,
@@ -4603,6 +4607,37 @@ async function startTurn(
         },
       ]);
       turnPromptBytes.set(threadId, prompt.bytes);
+      // Where a turn's context-injection records go: a `context.injected` event
+      // for the Trajectory, and a short list on the message the chat hangs the
+      // rows under.  Drafts a message already recorded are dropped first — a
+      // model fallback dispatches the same message again.  A card continuation
+      // has no stored message, so its rows go under the last one on the active
+      // path (server/context-injection.ts `injectionTarget`).
+      const recordInjections = (drafts: readonly InjectionDraft[]) => {
+        const target = () =>
+          injectionTarget({
+            stored: store.messagesFor(threadId),
+            userMessageId: userMessage.id,
+            unstored: opts?.cardContinuation === true,
+            activePath: store.activePath(threadId),
+          });
+        recordContextInjections(
+          {
+            publish: (event) => bus.publish(event),
+            attach: (refs) => {
+              const held = target();
+              if (!held) return;
+              store.patchMessage(threadId, held.id, { contextInjections: mergeInjectionRefs(held.contextInjections, refs) });
+            },
+          },
+          {
+            threadId,
+            provider: instance.driverKind,
+            providerInstanceId: instance.instanceId,
+            drafts: dropRecorded(drafts, target()?.contextInjections),
+          },
+        );
+      };
       const turnInput = {
         threadId,
         text: turnText,
@@ -4614,6 +4649,13 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         recoveryText,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
+        // A driver whose provider lost its session sends `recoveryText` in place
+        // of the turn: the replay it adds in front of the message is a handoff
+        // the person never typed, and only the driver knows it happened.
+        onReplayRecovered: () => {
+          const replay = recoveryText === undefined ? null : draftFromReplay(recoveryText, replyBase, "handoff");
+          if (replay) recordInjections([replay]);
+        },
         transcript: driverTranscript,
         // `buildTurnTools` only returns tool surfaces the harness can
         // actually execute in-process: agents, host computer, fleet
@@ -4713,9 +4755,12 @@ async function startTurn(
       // What the harness put in front of the model that the person did not
       // type: the bot's memory, the skills and playbooks this message
       // selected, the automation note, a teammate nudge, a quoted reply, and
-      // a replayed conversation when the engine joined mid-thread.  Recorded
-      // BEFORE the turn starts so the transcript row lands under the message
-      // that caused it, ahead of anything the bot does.
+      // a replayed conversation when the engine joined mid-thread, and the
+      // note a card continuation sends as its whole prompt.  Recorded BEFORE
+      // the turn starts so the transcript row lands under the message that
+      // caused it, ahead of anything the bot does.  A replay only the DRIVER
+      // knows it sent — Codex rebuilding a session the provider lost — is
+      // recorded later, through `onReplayRecovered` above.
       //
       // Deliberately not recorded: the standing sections (identity, computer,
       // connected apps, recall, tool budget, team, credentials, routines,
@@ -4728,7 +4773,6 @@ async function startTurn(
       // the person.  Compaction is the provider CLI's own and never passes
       // through the harness.
       {
-        const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
         const drafts: InjectionDraft[] = draftsFromPromptSections(prompt.sections).filter(
           (draft) => draft.source !== "memory" || memoryChangeGate.changed(threadId, draft.text),
         );
@@ -4736,20 +4780,9 @@ async function startTurn(
         if (replay) drafts.push(replay);
         const quoted = draftFromReply(replyBase, text);
         if (quoted) drafts.push(quoted);
-        recordContextInjections(
-          {
-            publish: (event) => bus.publish(event),
-            attach: (refs) => {
-              // accumulate: a model fallback dispatches the same message
-              // again, and what the first engine was given still happened
-              const earlier = store.messagesFor(threadId).find((m) => m.id === userMessage.id)?.contextInjections ?? [];
-              store.patchMessage(threadId, userMessage.id, {
-                contextInjections: [...earlier, ...refs].slice(-MAX_CONTEXT_INJECTIONS_PER_TURN),
-              });
-            },
-          },
-          { threadId, provider: instance.driverKind, providerInstanceId: instance.instanceId, drafts },
-        );
+        // the card continuation's whole prompt is the harness's own note
+        if (opts?.cardContinuation && text.trim()) drafts.push({ source: "continuation", text });
+        recordInjections(drafts);
       }
       // Bind before sendTurn so assistant_text emitted during the launch
       // still has a chat id.  The pending key is migrated onto the

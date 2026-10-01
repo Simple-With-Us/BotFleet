@@ -177,7 +177,9 @@ function StepPayload({ row, threadId }: { row: TrajectoryRow; threadId?: string 
       <ItemIoBlocks
         state={io.state}
         failed={row.status === "error"}
+        subject={row.title}
         onRetry={io.retry}
+        headline={clippedArguments}
         fallback={
           <>
             {clippedArguments}

@@ -15,9 +15,12 @@
 //   playbook     installed playbook instructions this message selected
 //   automation   the note naming which automation fired THIS turn
 //   mention      the nudge to bring in a teammate THIS message tagged
-//   handoff      the conversation replayed to an engine that joined mid-thread
+//   handoff      the conversation replayed to an engine with no session of its
+//                own: one that joined mid-thread, or whose session was lost
 //   rewind       the surviving conversation replayed after an edit or switch
 //   reply        the earlier message THIS message quotes
+//   continuation the note the harness sent as the whole turn when a card was
+//                finished (a connector connected, a credential provided)
 //
 // Not recorded, and why, is written up beside the call site in index.ts.
 //
@@ -96,6 +99,62 @@ export function draftFromReply(replied: string, typed: string): InjectionDraft |
 /** One redacted, clipped line of what was injected. */
 export function injectionPreview(text: string): string {
   return describeResult(text, CONTEXT_PREVIEW_LIMIT) ?? "";
+}
+
+/** The drafts a message has not already recorded.
+ *
+ * One message can be dispatched more than once: a model fallback hands the same
+ * message to the next engine, and each dispatch re-assembles the same prompt.
+ * Two rows reading the same skill at the same size say nothing the first did
+ * not, and the Trajectory would list the step twice too, so a draft that
+ * matches a recorded one — same source, same size, same preview — is dropped
+ * BEFORE it is published, which also keeps the side store from holding the text
+ * twice.  A draft that differs (the second engine joined mid-thread and was
+ * handed a replay the first never saw) is new and kept. */
+export function dropRecorded(
+  drafts: readonly InjectionDraft[],
+  recorded: readonly ContextInjectionRef[] | undefined,
+): InjectionDraft[] {
+  if (!recorded || recorded.length === 0) return [...drafts];
+  const seen = new Set(recorded.map((ref) => `${ref.source}\u0000${ref.bytes}\u0000${ref.preview}`));
+  const kept: InjectionDraft[] = [];
+  for (const draft of drafts) {
+    const key = `${draft.source}\u0000${Buffer.byteLength(draft.text, "utf8")}\u0000${injectionPreview(draft.text)}`;
+    // a repeat within one batch is the same duplicate
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(draft);
+  }
+  return kept;
+}
+
+/** A message's injections with `added` appended, newest last, and the list held
+ * to what one turn may record. */
+export function mergeInjectionRefs(
+  earlier: readonly ContextInjectionRef[] | undefined,
+  added: readonly ContextInjectionRef[],
+): ContextInjectionRef[] {
+  return [...(earlier ?? []), ...added].slice(-MAX_CONTEXT_INJECTIONS_PER_TURN);
+}
+
+/** The message the chat hangs a turn's injection rows under.
+ *
+ * Normally the stored message that started the turn.  A card continuation has
+ * none: the harness wrote the prompt, nothing was appended to the transcript,
+ * and the message object the turn carries was never stored.  Its rows go under
+ * the last message on the active path — the card the person just finished, or
+ * whatever the bot said last — which is where the turn began.  Null when the
+ * thread has nothing to hang them on; the Trajectory still lists them. */
+export function injectionTarget<M extends { id: string }>(input: {
+  stored: readonly M[];
+  userMessageId: string;
+  /** the turn's own message was never stored (a card continuation) */
+  unstored: boolean;
+  activePath: readonly M[];
+}): M | null {
+  const own = input.stored.find((message) => message.id === input.userMessageId);
+  if (own) return own;
+  return input.unstored ? (input.activePath.at(-1) ?? null) : null;
 }
 
 /** Remembers the last memory text recorded per thread, so MEMORY.md — which

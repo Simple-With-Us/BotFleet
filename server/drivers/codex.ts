@@ -748,6 +748,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               failure,
             });
             rebuiltFromReplay = rebuild.replayed;
+            if (rebuild.replayed) {
+              // the replay is in the prompt now; let the harness say so
+              try {
+                turn.onReplayRecovered?.();
+              } catch (error) {
+                console.error("codex: onReplayRecovered threw", error);
+              }
+            }
             promptText = turn.system ? `${turn.system}\n\n${rebuild.text}` : rebuild.text;
           }
         }

@@ -22,7 +22,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
-import { captureInput, captureOutput } from "../../../shared/item-io.ts";
+import { captureBoth, captureInput, inputText } from "../../../shared/item-io.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -747,6 +747,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // A long quiet build is work, not a wedge — the idle guard consults
         // this the same way it consults `asks`.
         const openToolCalls = new Set<string>();
+        // The input each open call last had recorded, as text.  A streaming
+        // agent announces a call with an empty or partial `rawInput` and sends
+        // the whole of it on a later `tool_call_update`, so the update has to
+        // be compared with what is already filed.  Dropped as the call ends.
+        const toolInputs = new Map<string, string>();
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1134,7 +1139,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
-              if (typeof u.toolCallId === "string") openToolCalls.add(u.toolCallId);
+              if (typeof u.toolCallId === "string") {
+                openToolCalls.add(u.toolCallId);
+                const announced = u.rawInput === undefined ? undefined : inputText(u.rawInput);
+                if (announced !== undefined) toolInputs.set(u.toolCallId, announced);
+              }
               flushAssistantText();
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
@@ -1156,8 +1165,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call_update": {
+              // The schema lets a call's input arrive or settle on an update,
+              // at any status: take it when it is new text for this call.
+              const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? inputText(u.rawInput) : undefined;
+              const newInput = settled !== undefined && toolInputs.get(u.toolCallId) !== settled ? settled : undefined;
+              if (newInput !== undefined) toolInputs.set(u.toolCallId, newInput);
               if (u.status === "completed" || u.status === "failed") {
                 openToolCalls.delete(u.toolCallId);
+                if (typeof u.toolCallId === "string") toolInputs.delete(u.toolCallId);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
@@ -1165,7 +1180,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   itemId: u.toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
-                  ...captureOutput(u.content ?? u.rawOutput),
+                  ...captureBoth(newInput, u.content ?? u.rawOutput),
+                });
+              } else if (newInput !== undefined) {
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.updated",
+                  itemType: "tool",
+                  itemId: u.toolCallId,
+                  ...captureInput(newInput),
                 });
               }
               break;

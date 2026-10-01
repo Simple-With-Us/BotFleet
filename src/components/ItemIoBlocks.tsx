@@ -67,6 +67,23 @@ export function useItemIo(
   return { state, retry };
 }
 
+/** What each block is called out loud.  The visible label stays the terse
+ * "IN" / "OUT"; a screen reader hears the word and, when the row knows it,
+ * which step the block belongs to. */
+const BLOCK_NOUN: Record<string, string> = { in: "input", out: "output", error: "error", text: "text" };
+
+function blockNoun(label: string): string {
+  return BLOCK_NOUN[label.toLowerCase()] ?? label.toLowerCase();
+}
+
+/** "Output of Read": the name a block, or its Copy button, goes by.  Several
+ * rows open at once would otherwise announce the same bare "OUT" over and over. */
+function blockName(label: string, subject: string | undefined, verb?: string): string {
+  const noun = blockNoun(label);
+  const named = subject ? `${noun} of ${subject}` : noun;
+  return verb ? `${verb} ${named}` : `${named.charAt(0).toUpperCase()}${named.slice(1)}`;
+}
+
 function CopyTextButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -104,35 +121,44 @@ function CopyTextButton({ text, label }: { text: string; label: string }) {
   );
 }
 
-/** One labelled, scrollable, copyable block of captured text. */
+/** One labelled, scrollable, copyable block of captured text.
+ *
+ * A named group rather than a landmark: with several steps open, a landmark
+ * list of identical "IN" and "OUT" regions says nothing, and a group is not
+ * listed there.  The scrollable well is focusable so the keyboard can scroll it. */
 export function IoBlock({
   label,
   field,
   tone = "normal",
+  subject,
   className,
 }: {
   label: string;
   field: BoundedText;
   tone?: "normal" | "danger";
+  /** What the block belongs to — the tool's name, or the injection's label —
+   * so its accessible name, and its Copy button's, can say which step. */
+  subject?: string;
   className?: string;
 }) {
   return (
-    <div className={cn("flex flex-col gap-0.5", className)} data-io={label.toLowerCase()}>
+    <div className={cn("flex flex-col gap-0.5", className)} data-io={label.toLowerCase()} role="group" aria-label={blockName(label, subject)}>
       <div className="flex items-center justify-between gap-2">
         <span
           className={cn(
             "text-[10px] font-semibold uppercase tracking-wider",
-            tone === "danger" ? "text-danger/90" : "text-ink-secondary/70",
+            // full-strength secondary ink: the label is information, and an
+            // alpha over the panel drops it under the contrast floor
+            tone === "danger" ? "text-danger" : "text-ink-secondary",
           )}
+          aria-hidden="true"
         >
           {label}
         </span>
-        <CopyTextButton text={field.text} label={`Copy ${label.toLowerCase()}`} />
+        <CopyTextButton text={field.text} label={blockName(label, subject, "Copy")} />
       </div>
       <pre
         tabIndex={0}
-        role="region"
-        aria-label={label}
         className={cn(
           // recessed into whatever panel opened it: the same well the
           // Trajectory's clipped blocks use, so it reads in every skin
@@ -153,16 +179,25 @@ export function IoBlock({
 export function ItemIoBlocks({
   state,
   failed = false,
+  subject,
   fallback,
+  headline,
   outputFallback,
   onRetry,
 }: {
   state: ItemIoState;
   /** the step failed: its output block is labelled, and coloured, as an error */
   failed?: boolean;
+  /** what the blocks belong to (the tool's name), for their accessible names */
+  subject?: string;
   /** the clipped headline the row already had, shown whenever the full
    * payload is not (yet) there */
   fallback?: ReactNode;
+  /** the clipped target (a command, a path), shown in place of the IN block
+   * when the step was recorded without arguments — an engine can report what a
+   * call acted on without ever sending the arguments, and the row's own line
+   * truncates it */
+  headline?: ReactNode;
   /** the clipped result line, shown under a loaded input when no output was
    * recorded for the step */
   outputFallback?: ReactNode;
@@ -173,10 +208,14 @@ export function ItemIoBlocks({
     if (input || output || text) {
       return (
         <>
-          {input && <IoBlock label="IN" field={input} />}
-          {output ? <IoBlock label={failed ? "ERROR" : "OUT"} field={output} tone={failed ? "danger" : "normal"} /> : outputFallback}
+          {input ? <IoBlock label="IN" field={input} subject={subject} /> : headline}
+          {output ? (
+            <IoBlock label={failed ? "ERROR" : "OUT"} field={output} tone={failed ? "danger" : "normal"} subject={subject} />
+          ) : (
+            outputFallback
+          )}
           {/* the full text of an injected-context record, which has no IN or OUT */}
-          {text && <IoBlock label="Text" field={text} />}
+          {text && <IoBlock label="Text" field={text} subject={subject} />}
         </>
       );
     }

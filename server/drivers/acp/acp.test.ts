@@ -298,6 +298,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_LATE_INPUT_AT;
     delete process.env.FAKE_ACP_STATE;
     delete process.env.FAKE_ACP_RETRY_SCALE;
     delete process.env.FAKE_ACP_INIT_DELAY_MS;
@@ -498,6 +499,36 @@ describe("ACP turns (fake CLI)", () => {
     expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
     const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
     expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
+  it("files the arguments a streaming agent sends on a later tool_call_update", async () => {
+    // announced with an empty rawInput; the real arguments settle mid-run
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "late-input-1")!;
+    // an empty object is not an input worth filing
+    expect(started.io?.input).toBeUndefined();
+    const updates = recorder.events.filter((event) => event.type === "item.updated" && event.itemId === "late-input-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.output?.text).toBe("total 0");
+    // already filed on the update, so the completion does not file it twice
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("files the arguments that only settle on the completing tool_call_update", async () => {
+    process.env.FAKE_ACP_LATE_INPUT_AT = "completion";
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input-end", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    expect(recorder.events.some((event) => event.type === "item.updated" && event.itemId === "late-input-1")).toBe(false);
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    expect(done.io?.output?.text).toBe("total 0");
   });
 
   it("still enforces the hard ceiling even while the agent keeps streaming", async () => {

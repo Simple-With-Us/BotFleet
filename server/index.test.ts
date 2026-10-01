@@ -8168,6 +8168,18 @@ describe("a step's full input and output, and injected context, over HTTP", () =
       expect(eventsLog(bot.threadId)).toContain('"type":"context.injected"');
       expect(eventsLog(bot.threadId)).not.toContain("INJECTED-TAIL-MARKER");
 
+      // and it survives the trip back: a reload reads history from the events
+      // route, and both the Trajectory read and the Inspector read must return it
+      for (const query of ["view=trajectory&limit=200", "limit=200"]) {
+        const history = await api("GET", `/api/threads/${bot.threadId}/events?${query}`);
+        expect(history.status).toBe(200);
+        const injected = history.body.entries.find(
+          (entry: any) => entry.kind === "runtime" && entry.data?.type === "context.injected" && entry.data.itemId === memory!.id,
+        );
+        expect(injected?.data).toMatchObject({ source: "memory", bytes: memory!.bytes });
+        expect(JSON.stringify(history.body)).not.toContain("INJECTED-TAIL-MARKER");
+      }
+
       // opening the row reads the full text the model was given
       const io = await api("GET", `/api/threads/${bot.threadId}/items/${memory!.id}/io`);
       expect(io.status).toBe(200);

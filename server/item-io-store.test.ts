@@ -2,6 +2,7 @@
 // rotated.  Every test hands the store its own small directory and small caps,
 // so the behaviour is pinned without writing megabytes.
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -233,6 +234,37 @@ describe("keys and failures", () => {
     await store.flush();
     expect(await store.read("t", "a")).toBeNull();
     expect(error).toHaveBeenCalled();
+  });
+
+  it("reports an outage once, counts the rest, and says so when writing recovers", async () => {
+    const lines: string[] = [];
+    let failing = true;
+    const store = makeStore({
+      dir: tmp(),
+      report: (line) => lines.push(line),
+      append: async (file, data, options) => {
+        if (failing) throw new Error("ENOSPC: no space left on device");
+        await appendFile(file, data, options);
+      },
+    });
+    for (let i = 0; i < 25; i += 1) store.record("t", { itemId: `step-${i}`, io: { output: boundText("x") } });
+    await store.flush();
+    // twenty-five failed records, one line, naming the reason and no stack
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("ENOSPC");
+    expect(lines[0]).not.toContain("    at ");
+
+    failing = false;
+    store.record("t", { itemId: "after", io: { output: boundText("back") } });
+    await store.flush();
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("recovered after 25 failed records");
+    expect((await store.read("t", "after"))?.output?.text).toBe("back");
+
+    // a healthy store stays silent
+    store.record("t", { itemId: "again", io: { output: boundText("fine") } });
+    await store.flush();
+    expect(lines).toHaveLength(2);
   });
 
   it("recreates its directory if it was removed under it", async () => {

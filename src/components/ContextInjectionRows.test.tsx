@@ -18,8 +18,13 @@ describe("the closed row", () => {
     expect(html).toContain("likes tea and quiet");
     expect(html).toContain("412 B");
     expect(html).toContain('aria-expanded="false"');
-    // dimmer than a tool row
-    expect(html).toContain("text-ink-secondary/70");
+    // quiet by size, never by alpha: the label and the preview are information,
+    // and an alpha over the panel takes them under the 4.5:1 contrast floor
+    const button = html.slice(html.indexOf("<button"), html.indexOf("</button>"));
+    expect(button).toContain("text-ink-secondary");
+    expect(button).not.toContain("text-ink-secondary/70");
+    // only the decorative chevron is dimmed
+    expect(button.match(/text-ink-secondary\/\d+/g)).toEqual(["text-ink-secondary/50"]);
     expect(html).not.toContain("data-io");
   });
 
@@ -53,6 +58,9 @@ describe("the opened row", () => {
     expect(html).toContain('data-io="text"');
     expect(html).toContain("likes tea\nand quiet\nhates meetings");
     expect(html).toContain(">Copy<");
+    // the Copy button and the block say which injection they belong to
+    expect(html).toContain('aria-label="Copy text of Context injection · memory"');
+    expect(html).toContain('aria-label="Text of Context injection · memory"');
     expect(html).toContain("The bot&#x27;s own MEMORY.md, added to its prompt.");
     expect(html).toContain('aria-expanded="true"');
   });

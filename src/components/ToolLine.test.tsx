@@ -58,8 +58,14 @@ describe("an opened tool row with its full input and output", () => {
     expect(html).toContain("a.ts\nb.ts\nc.ts");
     expect(html).toContain("font-mono");
     expect(html.match(/>Copy</g)).toHaveLength(2);
-    expect(html).toContain('aria-label="Copy in"');
-    expect(html).toContain('aria-label="Copy out"');
+    // each block and its Copy button name the step, so several open rows do
+    // not announce the same bare "IN" and "OUT"
+    expect(html).toContain('aria-label="Copy input of Bash"');
+    expect(html).toContain('aria-label="Copy output of Bash"');
+    expect(html).toContain('aria-label="Input of Bash"');
+    expect(html).toContain('aria-label="Output of Bash"');
+    // a group, not a landmark: a landmark list would fill with identical names
+    expect(html).not.toContain('role="region"');
   });
 
   it("bounds each block's height and lets it scroll", () => {
@@ -114,6 +120,27 @@ describe("an opened tool row with its full input and output", () => {
     const html = render(message());
     expect(html).not.toContain('data-io="in"');
     expect(html).toContain('data-io="out"');
+  });
+
+  it("keeps the clipped target above the output when the step was recorded without arguments", () => {
+    // an engine can report what a call acted on without sending its arguments;
+    // the row's own line truncates a long path or command, so the open row must
+    // still show it whole
+    primeItemIo(ref, { status: "loaded", io: payload({ input: undefined }) });
+    const long = "/Users/someone/projects/an-extremely-long-directory-name/src/deeply/nested/file.ts";
+    const html = render(message({ target: long, kind: "read" }));
+    expect(html).not.toContain('data-io="in"');
+    expect(html).toContain('data-io="out"');
+    expect(html).toContain(">File<");
+    expect(html.indexOf(long)).toBeGreaterThan(-1);
+    // the headline comes before the output, as the input block would have
+    expect(html.indexOf(">File<")).toBeLessThan(html.indexOf('data-io="out"'));
+  });
+
+  it("does not repeat the clipped target when the full input is shown", () => {
+    primeItemIo(ref, { status: "loaded", io: payload() });
+    const html = render(message({ target: "ls -la", kind: "execute" }));
+    expect(html).not.toContain(">Command<");
   });
 
   it("keeps the one-line result under a recorded input when no output was recorded", () => {

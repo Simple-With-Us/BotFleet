@@ -205,7 +205,9 @@ export function ToolLine({
             <ItemIoBlocks
               state={ioRef ? io.state : { status: "unavailable" }}
               failed={failed}
+              subject={tool.name}
               onRetry={io.retry}
+              headline={targetBlock}
               fallback={
                 <>
                   {targetBlock}

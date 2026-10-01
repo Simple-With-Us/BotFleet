@@ -9,7 +9,10 @@ import {
   draftFromReplay,
   draftFromReply,
   draftsFromPromptSections,
+  dropRecorded,
   injectionPreview,
+  injectionTarget,
+  mergeInjectionRefs,
   recordContextInjections,
 } from "./context-injection.ts";
 import type { RuntimeEvent } from "./contracts.ts";
@@ -17,7 +20,11 @@ import { promptWithReply } from "./replies.ts";
 import type { Message } from "./store.ts";
 import { buildTurnContext } from "./turn-context.ts";
 import { MEMORY_CONTENT_HEADING } from "./workspace.ts";
-import { CONTEXT_PREVIEW_LIMIT, MAX_CONTEXT_INJECTIONS_PER_TURN } from "../shared/context-injection.ts";
+import {
+  CONTEXT_PREVIEW_LIMIT,
+  MAX_CONTEXT_INJECTIONS_PER_TURN,
+  type ContextInjectionRef,
+} from "../shared/context-injection.ts";
 
 const SECRET = `sk-proj-${"c".repeat(24)}`;
 
@@ -237,5 +244,106 @@ describe("recordContextInjections", () => {
     expect(refs).toEqual([]);
     expect(error).toHaveBeenCalled();
     error.mockRestore();
+  });
+});
+
+describe("a message dispatched more than once", () => {
+  const ref = (source: ContextInjectionRef["source"], text: string, id = "ctx-1"): ContextInjectionRef => ({
+    id,
+    source,
+    preview: injectionPreview(text),
+    bytes: Buffer.byteLength(text, "utf8"),
+  });
+
+  it("drops a draft the message already recorded, and keeps one that differs", () => {
+    // a model fallback hands the same message to the next engine: the skill and
+    // the quoted reply it selected come out of the prompt builder a second time
+    const recorded = [ref("skill", "Use the phone skill."), ref("reply", "Replying to Ada: it is Friday")];
+    const kept = dropRecorded(
+      [
+        { source: "skill", text: "Use the phone skill." },
+        { source: "reply", text: "Replying to Ada: it is Friday" },
+        // the second engine joined mid-thread: a replay the first never saw
+        { source: "handoff", text: "User: hi\nAssistant: hello" },
+        // same source, different text
+        { source: "skill", text: "Use the calendar skill." },
+      ],
+      recorded,
+    );
+    expect(kept.map((draft) => draft.source)).toEqual(["handoff", "skill"]);
+    expect(kept[1]!.text).toBe("Use the calendar skill.");
+  });
+
+  it("matches on source, size and preview together", () => {
+    const recorded = [ref("memory", "likes tea")];
+    // the same words under another source, or at another size, are not a repeat
+    expect(dropRecorded([{ source: "skill", text: "likes tea" }], recorded)).toHaveLength(1);
+    expect(dropRecorded([{ source: "memory", text: "likes tea and quiet" }], recorded)).toHaveLength(1);
+    expect(dropRecorded([{ source: "memory", text: "likes tea" }], recorded)).toHaveLength(0);
+  });
+
+  it("keeps everything when nothing was recorded, and does not repeat itself within a batch", () => {
+    const drafts = [{ source: "skill" as const, text: "a" }, { source: "skill" as const, text: "a" }, { source: "skill" as const, text: "b" }];
+    expect(dropRecorded(drafts, undefined)).toHaveLength(3);
+    expect(dropRecorded(drafts, [])).toHaveLength(3);
+    expect(dropRecorded(drafts, [ref("memory", "x")]).map((draft) => draft.text)).toEqual(["a", "b"]);
+  });
+
+  it("never publishes, or stores the text of, a draft it dropped", () => {
+    const events: RuntimeEvent[] = [];
+    const recorded = [ref("skill", "Use the phone skill.")];
+    recordContextInjections(
+      { publish: (event) => void events.push(event), attach: () => undefined },
+      {
+        threadId: "t",
+        provider: "p",
+        drafts: dropRecorded([{ source: "skill", text: "Use the phone skill." }], recorded),
+      },
+    );
+    expect(events).toEqual([]);
+  });
+
+  it("appends the new refs and holds the list to one turn's worth", () => {
+    const earlier = [ref("skill", "a", "ctx-1")];
+    expect(mergeInjectionRefs(earlier, [ref("reply", "b", "ctx-2")]).map((r) => r.id)).toEqual(["ctx-1", "ctx-2"]);
+    expect(mergeInjectionRefs(undefined, [ref("reply", "b", "ctx-2")]).map((r) => r.id)).toEqual(["ctx-2"]);
+    const many = Array.from({ length: MAX_CONTEXT_INJECTIONS_PER_TURN + 3 }, (_, i) => ref("skill", `s${i}`, `ctx-${i}`));
+    const merged = mergeInjectionRefs(many.slice(0, 5), many.slice(5));
+    expect(merged).toHaveLength(MAX_CONTEXT_INJECTIONS_PER_TURN);
+    // newest kept
+    expect(merged.at(-1)!.id).toBe(`ctx-${MAX_CONTEXT_INJECTIONS_PER_TURN + 2}`);
+  });
+});
+
+describe("where a turn's rows hang", () => {
+  const messages = [{ id: "m1" }, { id: "m2" }, { id: "m3" }];
+
+  it("is the stored message that started the turn", () => {
+    expect(injectionTarget({ stored: messages, userMessageId: "m2", unstored: false, activePath: messages })?.id).toBe("m2");
+    // a stored message wins even for a continuation that happens to name one
+    expect(injectionTarget({ stored: messages, userMessageId: "m1", unstored: true, activePath: messages })?.id).toBe("m1");
+  });
+
+  it("is the last message on the active path for a card continuation, whose own message was never stored", () => {
+    const target = injectionTarget({ stored: messages, userMessageId: "card-9", unstored: true, activePath: [messages[0]!, messages[2]!] });
+    expect(target?.id).toBe("m3");
+  });
+
+  it("is nothing for a message that is not stored and not a continuation, rather than a wrong one", () => {
+    expect(injectionTarget({ stored: messages, userMessageId: "gone", unstored: false, activePath: messages })).toBeNull();
+    expect(injectionTarget({ stored: [], userMessageId: "card-9", unstored: true, activePath: [] })).toBeNull();
+  });
+});
+
+describe("a card continuation", () => {
+  it("is recorded as the harness's own note, in full", () => {
+    const events: RuntimeEvent[] = [];
+    const note = "BotFleet connection update: the user securely connected Gmail. Continue the task that paused for this connection.";
+    const [recorded] = recordContextInjections(
+      { publish: (event) => void events.push(event), attach: () => undefined },
+      { threadId: "t", provider: "p", drafts: [{ source: "continuation", text: note }] },
+    );
+    expect(recorded).toMatchObject({ source: "continuation", bytes: Buffer.byteLength(note, "utf8") });
+    expect(events[0]).toMatchObject({ type: "context.injected", source: "continuation", io: { text: { text: note } } });
   });
 });

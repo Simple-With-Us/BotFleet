@@ -577,6 +577,35 @@ describe("readThreadEvents", () => {
     });
   });
 
+  it("reads a context.injected record back in both the Trajectory and the Inspector reads", () => {
+    // the guard is a closed switch over the record type, so a type it was never
+    // taught is dropped silently and its history never reaches either view
+    const eventsDir = tmp();
+    const nativeDir = tmp();
+    const injected = runtime({
+      eventId: "c1",
+      type: "context.injected",
+      createdAt: "000001",
+      itemId: "ctx-1",
+      source: "memory",
+      preview: "likes tea",
+      bytes: 9,
+    });
+    writeFileSync(
+      join(eventsDir, "t1.ndjson"),
+      line(injected) +
+        line(runtime({ eventId: "c2", type: "turn.started", createdAt: "000002" })) +
+        // a record with a source the harness never writes, or no size, is not an injection
+        line({ ...injected, eventId: "bad-source", source: "elsewhere", createdAt: "000003" }) +
+        line({ ...injected, eventId: "bad-bytes", bytes: "9", createdAt: "000004" }),
+    );
+    for (const runtimeOnly of [true, false]) {
+      const page = readThreadEvents({ eventsDir, nativeDir, threadId: "t1", runtimeOnly });
+      expect(page.entries.map((e) => (e.data as { eventId: string }).eventId)).toEqual(["c1", "c2"]);
+      expect(page.entries[0]!.data).toMatchObject({ type: "context.injected", source: "memory", preview: "likes tea", bytes: 9 });
+    }
+  });
+
   // The scan cuts its buffer at newlines and joins the held-back first line to
   // the next older chunk.  Compare it with a plain parse of the whole file over
   // lines of mixed width (multi-byte text that straddles 64 KB boundaries),

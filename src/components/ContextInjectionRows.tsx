@@ -8,7 +8,7 @@
 // the work it did are what a reader came for; this is the footnote that
 // explains why the bot behaved as it did — the memory it was handed, the skill
 // a word in the message triggered, the conversation replayed to it when it
-// joined mid-thread.  Closed it costs one line; opened it shows the full text
+// joined mid-thread or lost its own session.  Closed it costs one line; opened it shows the full text
 // the model was given, fetched from the harness only then.
 //
 // `ContextInjectionRow` is the renderer (what the tests render);
@@ -21,6 +21,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  CornerDownRight,
   ListChecks,
   Quote,
   RotateCcw,
@@ -47,6 +48,7 @@ const ICONS: Record<ContextSource, LucideIcon> = {
   handoff: ArrowRightLeft,
   rewind: RotateCcw,
   reply: Quote,
+  continuation: CornerDownRight,
 };
 
 /** A plain-words line for what each source is, shown when a row is opened. */
@@ -56,9 +58,10 @@ const EXPLANATION: Record<ContextSource, string> = {
   playbook: "Installed playbook instructions your message selected.",
   automation: "The note naming which automation started this turn.",
   mention: "A nudge to bring in the teammate you tagged.",
-  handoff: "The conversation so far, replayed because this engine joined mid-thread.",
+  handoff: "The conversation so far, replayed because the engine had no session of its own to continue.",
   rewind: "The surviving conversation, replayed after an edit or a version switch.",
   reply: "The earlier message your reply quotes.",
+  continuation: "The note BotFleet sent so the bot could carry on once you finished a card.",
 };
 
 export function ContextInjectionRow({
@@ -89,7 +92,11 @@ export function ContextInjectionRow({
         title={entry.preview ? `${label} · ${entry.preview}` : label}
         className={cn(
           "group/context flex w-full items-baseline gap-2 rounded-md px-1.5 py-[2px] text-left text-[12px] leading-6",
-          "text-ink-secondary/70 hover:bg-raised/60 hover:text-ink-secondary",
+          // Quiet by size and weight, never by alpha: the label and the preview
+          // are the information, and an alpha over the panel takes them under
+          // the 4.5:1 floor the skins are held to.  Only the decorative chevron
+          // is dimmed.
+          "text-ink-secondary hover:bg-raised/60 hover:text-ink",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus",
         )}
       >
@@ -99,7 +106,7 @@ export function ContextInjectionRow({
         <span className="shrink-0 font-medium">{label}</span>
         {entry.preview && <span className="min-w-0 flex-1 truncate">{entry.preview}</span>}
         {!entry.preview && <span className="flex-1" />}
-        {size && <span className="shrink-0 font-mono text-[11px] tabular-nums text-ink-secondary/50">{size}</span>}
+        {size && <span className="shrink-0 font-mono text-[11px] tabular-nums">{size}</span>}
         <span
           className={cn(
             "shrink-0 text-ink-secondary/50 transition-opacity",
@@ -118,6 +125,7 @@ export function ContextInjectionRow({
           <p className="text-[11px] text-ink-secondary">{EXPLANATION[entry.source]}</p>
           <ItemIoBlocks
             state={io.state}
+            subject={label}
             onRetry={io.retry}
             fallback={
               entry.preview ? (

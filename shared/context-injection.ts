@@ -29,12 +29,16 @@ export type ContextSource =
   | "automation"
   /** the nudge to bring in a teammate the message tagged */
   | "mention"
-  /** the conversation so far, replayed to an engine that joined mid-thread */
+  /** the conversation so far, replayed to an engine with no session of its own
+   * to continue: one that joined mid-thread, or whose native session was lost */
   | "handoff"
   /** the surviving conversation, replayed after an edit or a version switch */
   | "rewind"
   /** the earlier message a reply quotes */
-  | "reply";
+  | "reply"
+  /** the note the harness sent as the whole turn when a card was finished
+   * (a connector connected, a credential provided or declined) */
+  | "continuation";
 
 export const CONTEXT_SOURCES: readonly ContextSource[] = [
   "memory",
@@ -45,6 +49,7 @@ export const CONTEXT_SOURCES: readonly ContextSource[] = [
   "handoff",
   "rewind",
   "reply",
+  "continuation",
 ];
 
 /** The word after "Context injection ·".  Lowercase on purpose: it is a value
@@ -58,6 +63,7 @@ export const CONTEXT_SOURCE_LABEL: Record<ContextSource, string> = {
   handoff: "handoff",
   rewind: "rewind",
   reply: "reply quote",
+  continuation: "continuation",
 };
 
 /** What the chat persists on the user message for one injection.  Short by
