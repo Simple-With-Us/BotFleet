@@ -97,8 +97,10 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  /** A "Job Finished" row: a background job of the bot's ended. */
+  job?: import("../../shared/jobs").JobRowData;
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
@@ -816,6 +818,9 @@ export type AppSettingsSection =
 export interface AppState {
   bots: Bot[];
   groups: Group[];
+  /** Background jobs per thread, as the harness's last `jobs` frame (or the
+   *  hydrate's `GET /api/jobs`) gave them: running first, then finished. */
+  jobsByThread: Record<string, import("../../shared/jobs").JobSnapshot[]>;
   instances: InstanceInfo[];
   /** When the server produced `instances` (its `describedAt`), so an older
    *  answer arriving late — a slow GET, the hydrate racing the `instances`
@@ -921,6 +926,10 @@ function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string
 export type BotAnnouncement = Omit<Bot, "messages"> & { messages?: Message[] };
 
 export type Action =
+  /** Every job the harness knows, from `GET /api/jobs` at hydrate. */
+  | { type: "jobsHydrated"; jobs: import("../../shared/jobs").JobSnapshot[] }
+  /** One thread's full set, from a `jobs` frame. */
+  | { type: "jobsFrame"; threadId: string; jobs: import("../../shared/jobs").JobSnapshot[] }
   | {
       type: "hydrate";
       bots: Bot[];
@@ -1315,6 +1324,13 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     case "resourceTriggersHydrated":
       return { ...state, resourceTriggers: action.triggers };
+    case "jobsHydrated": {
+      const jobsByThread: AppState["jobsByThread"] = {};
+      for (const job of action.jobs) (jobsByThread[job.threadId] ??= []).push(job);
+      return { ...state, jobsByThread };
+    }
+    case "jobsFrame":
+      return { ...state, jobsByThread: { ...state.jobsByThread, [action.threadId]: action.jobs } };
     case "resourceTriggerPatched": {
       const exists = state.resourceTriggers.some((trigger) => trigger.id === action.trigger.id);
       return {
@@ -1963,6 +1979,7 @@ const MAX_KEPT_SCREEN_FRAMES = 8;
 export const initialState: AppState = {
   bots: [],
   groups: [],
+  jobsByThread: {},
   instances: [],
   instancesDescribedAt: 0,
   config: null,
@@ -2738,6 +2755,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           request: api("/api/resource-triggers")
             .then(({ triggers }) => alive && rawDispatch({ type: "resourceTriggersHydrated", triggers: triggers ?? [] })),
         },
+        // Background jobs: the full set, so a reconnect that could not
+        // replay the frames it missed is right again at once.
+        {
+          label: "jobs",
+          request: api("/api/jobs").then(({ jobs }) => alive && rawDispatch({ type: "jobsHydrated", jobs: jobs ?? [] })),
+        },
       ];
       await runHydrationRequests(requests);
     };
@@ -2926,6 +2949,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "resource-trigger.deleted":
           rawDispatch({ type: "resourceTriggerDeleted", triggerId: frame.triggerId });
+          break;
+        // a thread's whole job set (debounced on the server); never output
+        case "jobs":
+          if (typeof frame.threadId === "string" && Array.isArray(frame.jobs)) {
+            rawDispatch({ type: "jobsFrame", threadId: frame.threadId, jobs: frame.jobs });
+          }
           break;
         case "runtime": {
           const event = frame.event;

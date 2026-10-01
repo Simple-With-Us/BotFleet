@@ -78,6 +78,7 @@ import { BUBBLE_EDITOR_WIDTH, BUBBLE_WIDTH, bubbleRow } from "@/lib/bubble-metri
 import { useFocusMessage } from "@/lib/focus-message";
 import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { ToolLine } from "./ToolLine";
 import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
@@ -963,6 +964,8 @@ const MessagesList = memo(function MessagesList({
                   />
                 );
               }
+              // a job's end is news, not a step: shown whatever the setting
+              if (m.job) return <JobFinishedRow job={m.job} />;
               if (!showToolCalls && !m.comm) return null;
               return <ActivityChip bot={bot} message={m} />;
             }
@@ -1588,6 +1591,8 @@ export function ChatView({ bot }: { bot: Bot }) {
           >
             <Search size={18} />
           </button>
+          {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
+          <JobsMenu threadId={bot.threadId} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}

@@ -20,6 +20,8 @@ function foldable(message: Message): boolean {
   const tool = message.tool;
   if (message.kind !== "activity" || !tool) return false;
   if (message.comm) return false;
+  // a job's "Job Finished" row is news, not a step: never folded away
+  if (message.job) return false;
   if (tool.ok !== true) return false;
   return !tool.name.startsWith("error:");
 }
