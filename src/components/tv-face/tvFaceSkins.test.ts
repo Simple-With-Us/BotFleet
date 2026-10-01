@@ -23,6 +23,45 @@ const SKINS_DIR = join(process.cwd(), "public", "tv-face", "skins");
 const GIFS = join(SKINS_DIR, "default", "gifs");
 const STILLS = join(SKINS_DIR, "default", "stills");
 
+/** Walk a GIF's blocks: frame count, summed frame delay, and how many frames
+ * carry a transparent color.  A real block walk, not a byte search, so image
+ * data that happens to contain an extension header is not miscounted. */
+function readGif(buf: Buffer): { frames: number; totalMs: number; transparentFrames: number } {
+  let pos = 13;
+  if (buf[10] & 0x80) pos += 3 * (1 << ((buf[10] & 7) + 1));
+  let frames = 0;
+  let totalMs = 0;
+  let transparentFrames = 0;
+  let pendingTransparent = false;
+  const skipSubBlocks = () => {
+    while (buf[pos] !== 0) pos += buf[pos] + 1;
+    pos += 1;
+  };
+  while (pos < buf.length && buf[pos] !== 0x3b) {
+    if (buf[pos] === 0x21) {
+      const label = buf[pos + 1];
+      if (label === 0xf9) {
+        pendingTransparent = (buf[pos + 3] & 1) === 1;
+        totalMs += (buf[pos + 4] | (buf[pos + 5] << 8)) * 10;
+      }
+      pos += 2;
+      skipSubBlocks();
+    } else if (buf[pos] === 0x2c) {
+      frames += 1;
+      if (pendingTransparent) transparentFrames += 1;
+      pendingTransparent = false;
+      const flags = buf[pos + 9];
+      pos += 10;
+      if (flags & 0x80) pos += 3 * (1 << ((flags & 7) + 1));
+      pos += 1; // LZW minimum code size
+      skipSubBlocks();
+    } else {
+      break;
+    }
+  }
+  return { frames, totalMs, transparentFrames };
+}
+
 const skinsOnDisk = (): string[] =>
   existsSync(SKINS_DIR) ? readdirSync(SKINS_DIR, { withFileTypes: true })
     .filter((e) => e.isDirectory())
@@ -129,27 +168,31 @@ describe("every reachable asset path exists", () => {
   });
 
   it("keeps the transition constant aligned with the pack's enter length", () => {
-    // The player waits TVFACE_TRANSITION_MS before swapping enter to hold. If
-    // an enter is much shorter the last frame freezes for the remainder.
-    const short = [...TVFACE_HAS_ENTER_RETURN].filter((e) => {
-      const f = join(GIFS, `${e}_enter.gif`);
-      if (!existsSync(f)) return false;
-      // GIF frame delays are in 1/100s; crude but enough to catch a 2s vs 1s gap.
-      const buf = readFileSync(f);
-      let i = 13;
-      while (i < buf.length - 1) {
-        const w = buf[i] * 256 + buf[i + 1];
-        if (w === 0) break;
-        if (buf[i] & 0x80) {
-          const size = buf[i + 1] & 0x7f;
-          i += 2 + size;
-        } else i += 2 + w;
-        return true;
+    // The player waits TVFACE_TRANSITION_MS before swapping enter to hold (or
+    // return to the resting still).  Longer and the animation is cut off
+    // mid-motion; shorter and its last frame freezes for the remainder.
+    const checked: string[] = [];
+    for (const e of TVFACE_HAS_ENTER_RETURN) {
+      for (const kind of ["enter", "return"]) {
+        const file = join(GIFS, `${e}_${kind}.gif`);
+        if (!existsSync(file)) continue;
+        checked.push(`${e}_${kind}`);
+        const { totalMs } = readGif(readFileSync(file));
+        expect(Math.abs(totalMs - TVFACE_TRANSITION_MS), `${e}_${kind}.gif runs ${totalMs}ms`).toBeLessThanOrEqual(20);
       }
-      return false;
-    });
-    expect(short.length, "unexpected enter layout").toBeGreaterThanOrEqual(0);
-    expect(TVFACE_TRANSITION_MS).toBeGreaterThan(0);
+    }
+    expect(checked.length, "no enter/return GIFs found").toBeGreaterThan(0);
+  });
+
+  it("ships every GIF with a transparent background, like the stills", () => {
+    // The stills are the TV on a transparent background; an opaque black GIF
+    // swapped in for one shows as a black box on any non-black UI.
+    const files = readdirSync(GIFS).filter((f) => f.endsWith(".gif"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) {
+      const { frames, transparentFrames } = readGif(readFileSync(join(GIFS, f)));
+      expect(transparentFrames, `${f} has opaque frames`).toBe(frames);
+    }
   });
 });
 
