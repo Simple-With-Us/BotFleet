@@ -37,14 +37,22 @@ across turns).
   runner and the HTTP tool loop).  The headline fields are unchanged.
 - `EventBus.publish` moves the capture into the store and strips it, so the wire,
   the subscribers and the event log never carry it.  An HTTP engine's full
-  `arguments` are filed as the input with no driver change.
+  `arguments` are filed as the input with no driver change, once when the step
+  starts and again at completion only if the string changed (a streamed first
+  fragment, settled later).
 - Each field is cut to 32 KB with a `truncated` flag and the original length.
   A thread keeps one live file and one rotated generation of 6 MB each
   (`ITEM_IO_LOG_MAX_BYTES`), trimmed at boot, swept when the thread is orphaned
   for a week, and deleted with the bot, task or room.
 - Redaction is the wire's pass (`redactSecretsInText`), run before the cut when a
   record is written and again when one is read.  Nothing the wire would hide is
-  served.
+  served.  A structured input also gets the event log's TREE pass when it is
+  captured (`prepareInput` in `shared/item-io.ts`), before it is flattened to
+  text: that is what masks a `{"name": "OMB_COMMS_TOKEN", "value": "…"}` env
+  entry by its name, which no text pass can see once the object is a string.
+  The same walk cuts each long string leaf to the capture limit before the
+  regexes or `JSON.stringify` see it, so capturing a `write_file` with a
+  multi-megabyte body costs a bounded amount of work on the harness's one thread.
 - The write path is the event log's bounded append queue: it drops its oldest
   entries before it grows, never blocks the publisher, and a failed write costs
   one step its expanded view, never a turn.  A failing disk is reported once
