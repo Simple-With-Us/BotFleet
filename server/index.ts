@@ -4619,7 +4619,8 @@ async function startTurn(
             stored: store.messagesFor(threadId),
             userMessageId: userMessage.id,
             unstored: opts?.cardContinuation === true,
-            activePath: store.activePath(threadId),
+            // only a card continuation reads it; skip the walk for every other turn
+            activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
           });
         recordContextInjections(
           {

@@ -8177,7 +8177,10 @@ describe("a step's full input and output, and injected context, over HTTP", () =
           (entry: any) => entry.kind === "runtime" && entry.data?.type === "context.injected" && entry.data.itemId === memory!.id,
         );
         expect(injected?.data).toMatchObject({ source: "memory", bytes: memory!.bytes });
-        expect(JSON.stringify(history.body)).not.toContain("INJECTED-TAIL-MARKER");
+        // the runtime records hold the preview only.  The Inspector read also
+        // carries the provider's own native tee, which is the real prompt.
+        const runtimeOnly = history.body.entries.filter((entry: { kind: string }) => entry.kind === "runtime");
+        expect(JSON.stringify(runtimeOnly)).not.toContain("INJECTED-TAIL-MARKER");
       }
 
       // opening the row reads the full text the model was given
@@ -8220,6 +8223,43 @@ describe("a step's full input and output, and injected context, over HTTP", () =
       await api("PATCH", "/api/instances/toolIo", { enabled: false });
     }
   }, 60_000);
+
+  it("records a message's injections once when a model fallback dispatches it again", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      // the primary crashes before it says anything, so the same message is
+      // dispatched again on the fallback and its prompt is assembled a second
+      // time — selecting the same skill, which a trigger term in the text picks
+      const instances = (await api("GET", "/api/instances")).body.instances;
+      const crasher = instances.find((i: { instanceId: string }) => i.instanceId === "crasher");
+      const toolIo = instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: crasher.models.default,
+          fallbacks: [{ instanceId: "toolIo", model: toolIo.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "use adb on my phone to list the apps" })).status).toBe(202);
+      await expect.poll(async () =>
+        (await transcript(bot.threadId)).some((m) => typeof m.tool?.name === "string" && m.tool.name.startsWith("Fell over to")), { timeout: 30_000 }).toBe(true);
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 30_000 }).toBe(false);
+
+      const sent = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      expect(sent.contextInjections?.filter((c) => c.source === "skill")).toHaveLength(1);
+      // and the Trajectory's history lists the step once as well
+      const history = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=500`);
+      const injected = history.body.entries.filter(
+        (entry: any) => entry.data?.type === "context.injected" && entry.data.source === "skill",
+      );
+      expect(injected).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 90_000);
 });
 
 describe("CSRF security hardening", () => {

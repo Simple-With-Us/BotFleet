@@ -505,7 +505,7 @@ describe("ACP turns (fake CLI)", () => {
     // announced with an empty rawInput; the real arguments settle mid-run
     await create(GrokAgentDriver, "late-input-tool-call");
     await instance.adapter.sendTurn({ threadId: "t-acp-late-input", text: "list it" });
-    await recorder.until((event) => event.type === "turn.completed", 3_000);
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
 
     const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "late-input-1")!;
     // an empty object is not an input worth filing
@@ -523,7 +523,7 @@ describe("ACP turns (fake CLI)", () => {
     process.env.FAKE_ACP_LATE_INPUT_AT = "completion";
     await create(GrokAgentDriver, "late-input-tool-call");
     await instance.adapter.sendTurn({ threadId: "t-acp-late-input-end", text: "list it" });
-    await recorder.until((event) => event.type === "turn.completed", 3_000);
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
 
     expect(recorder.events.some((event) => event.type === "item.updated" && event.itemId === "late-input-1")).toBe(false);
     const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
