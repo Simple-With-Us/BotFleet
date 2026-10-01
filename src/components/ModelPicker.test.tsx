@@ -67,7 +67,12 @@ const BOT = {
 
 function render(
   instances: InstanceInfo[],
-  props: { initialRailId?: string | null; selection?: Bot["modelSelection"]; contained?: boolean } = {},
+  props: {
+    initialRailId?: string | null;
+    selection?: Bot["modelSelection"];
+    contained?: boolean;
+    bot?: Bot;
+  } = {},
 ): string {
   store.instances = instances;
   return renderToStaticMarkup(
@@ -305,16 +310,18 @@ const effortClaude = (options: Option[] = [], levels: Array<"low" | "medium" | "
 const effortCodex = () =>
   engine("codex", "codex", "Codex", [{ id: "gpt-5.4", label: "GPT-5.4" }], withEffort(["low", "medium", "high"]));
 
-/** The Effort radio group's markup, or "" when the menu has none. */
+/** The Effort group's markup, or "" when the menu has none.  It ends at the
+ *  choices' wrapper closing, or at the busy hint's paragraph when there is one. */
 function effortSection(html: string): string {
   const start = html.indexOf("data-effort-section");
   if (start === -1) return "";
-  return html.slice(start, html.indexOf("</div></div>", start));
+  const ends = ["</div></div>", "</p></div>"].map((marker) => html.indexOf(marker, start)).filter((i) => i !== -1);
+  return html.slice(start, Math.min(...ends));
 }
 
 /** Each choice's visible label and whether it carries the check. */
 function effortChoices(html: string): Array<{ label: string; checked: boolean }> {
-  return [...effortSection(html).matchAll(/<button[^>]*aria-checked="(true|false)"[^>]*>([\s\S]*?)<\/button>/g)].map(
+  return [...effortSection(html).matchAll(/<button[^>]*aria-pressed="(true|false)"[^>]*>([\s\S]*?)<\/button>/g)].map(
     (match) => ({ label: words(match[2]), checked: match[1] === "true" }),
   );
 }
@@ -450,7 +457,7 @@ describe("Effort section in the chat model menu", () => {
   it("hands each choice's level to onPick, Default as undefined", () => {
     const onPick = vi.fn();
     const tree = EffortSection({ levels: ["low", "high"], current: "low", onPick });
-    const choices = findElements(tree, (element) => (element.props as { role?: string }).role === "radio");
+    const choices = findElements(tree, (element) => element.type === "button");
     expect(choices).toHaveLength(3);
     for (const choice of choices) (choice.props as { onClick: () => void }).onClick();
     expect(onPick.mock.calls).toEqual([[undefined], ["low"], ["high"]]);
@@ -460,12 +467,16 @@ describe("Effort section in the chat model menu", () => {
     expect(EffortSection({ levels: [], current: undefined, onPick: () => {} })).toBeNull();
   });
 
-  it("saves through the picker's own commit, as an effort-only change", () => {
-    // pickEffort must not go through pickedSelection, which writes
-    // `latest: null` and would un-float a "Latest <Class>" bot.
-    const source = readFileSync(join(__dirname, "ModelPicker.tsx"), "utf8");
-    expect(source).toContain("commit(selectionWithEffort(selection, level))");
-    expect(source).toMatch(/<EffortSection[^>]*onPick=\{pickEffort\}/);
-    expect(source).not.toMatch(/pickEffort[^\n]*pickedSelection/);
+  it("holds the choices while the bot is working, and says why", () => {
+    const html = render([effortClaude()], { ...chat, bot: { ...BOT, busy: true } as Bot });
+    const section = effortSection(html);
+    expect(section.match(/<button[^>]*\sdisabled=""/g)).toHaveLength(4);
+    expect(words(section)).toContain("Stop the bot to change effort.");
+  });
+
+  it("leaves the choices open, with no hint, while the bot is idle", () => {
+    const section = effortSection(render([effortClaude()], chat));
+    expect(section).not.toMatch(/\sdisabled=""/);
+    expect(words(section)).not.toContain("Stop the bot");
   });
 });

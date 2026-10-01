@@ -94,23 +94,29 @@ export function LatestModelRows({
 
 /** "Effort": how hard the selected model thinks.  Default plus the levels the
  *  model offers, a check on the one the bot has now.  A model with no levels
- *  gets no section at all. */
+ *  gets no section at all.  The choices are plain `aria-pressed` buttons, as in
+ *  Settings' Reasoning control, so each is its own tab stop and a screen reader
+ *  announces the two controls the same way. */
 export function EffortSection({
   levels,
   current,
   onPick,
+  disabled = false,
   className,
 }: {
   levels: readonly EffortLevel[];
   /** The bot's saved effort; undefined is Default. */
   current: EffortLevel | undefined;
   onPick: (level: EffortLevel | undefined) => void;
+  /** The harness refuses a selection change while the bot is working, so the
+   *  choices are held until it stops rather than flipping and snapping back. */
+  disabled?: boolean;
   className?: string;
 }) {
   if (!levels.length) return null;
   return (
     <div
-      role="radiogroup"
+      role="group"
       aria-label="Effort"
       data-effort-section
       className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
@@ -123,14 +129,14 @@ export function EffortSection({
             <button
               key={level ?? "default"}
               type="button"
-              role="radio"
-              aria-checked={checked}
+              aria-pressed={checked}
+              disabled={disabled}
               onClick={() => onPick(level)}
               className={cn(
-                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px]",
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
                 checked
                   ? "border-accent/40 bg-control text-ink"
-                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink",
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
               )}
             >
               {checked && <Check size={12} className="shrink-0 text-accent" />}
@@ -139,6 +145,7 @@ export function EffortSection({
           );
         })}
       </div>
+      {disabled && <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">Stop the bot to change effort.</p>}
     </div>
   );
 }
@@ -585,7 +592,12 @@ export function ModelPicker({
     : !blocked && railInstance?.instanceId === selection.instanceId;
   const effortSection =
     effortApplies && effortLevels.length > 0 ? (
-      <EffortSection levels={effortLevels} current={selection.effort} onPick={pickEffort} />
+      <EffortSection
+        levels={effortLevels}
+        current={selection.effort}
+        onPick={pickEffort}
+        disabled={Boolean(bot.busy)}
+      />
     ) : null;
   const chipEffort =
     !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
