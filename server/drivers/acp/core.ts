@@ -182,11 +182,11 @@ export interface AcpSupport {
   /** Per-model reasoning-effort budgets, keyed by model id.  A model listed
    * here gets its entry as the catalog option's `effortLevels`, which the
    * client prefers over the driver-wide list; models absent from the map
-   * fall back to `effortLevels`.  Mirrors the Harness
-   * `AcpSupport.perModelEffortLevels` shape so a Harness-published map can
+   * fall back to `effortLevels`.  Mirrors the Clutch
+   * `AcpSupport.perModelEffortLevels` shape so a Clutch-published map can
    * be passed straight through. */
   perModelEffortLevels?: Readonly<Record<string, readonly EffortLevel[]>>;
-  /** Harness's model-specific image truth; explicit catalog values take priority. */
+  /** Clutch's model-specific image truth; explicit catalog values take priority. */
   perModelImages?: Readonly<Record<string, boolean>>;
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;

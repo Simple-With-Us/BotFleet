@@ -74,7 +74,7 @@ export async function fetchProviderModels(input: ModelDiscoveryInput): Promise<M
 export interface MergeModelsOptions {
   /** Ids to drop even when the provider still lists them.  This is how a
    *  product decision is expressed (see `acp/dsh.ts` dropping
-   *  `MiniMax-M2.7` from the Harness catalog). */
+   *  `MiniMax-M2.7` from the Clutch catalog). */
   excludeIds?: readonly string[];
   /** Keep `known.default` when it survived the refresh instead of
    *  resetting to the first row, so a refresh does not silently move a
