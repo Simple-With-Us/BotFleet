@@ -12,6 +12,7 @@ import {
   pricesWithinBand,
   reconcileChain,
   reconcileEntry,
+  resumeKeepsStartedModel,
   retiredModel,
   withinPriceBand,
   type LineageContext,
@@ -305,24 +306,18 @@ describe("reconcileChain", () => {
     });
   });
 
-  it("reconciles nested descendants, not just immediate fallbacks", () => {
-    const result = reconcileChain(
-      {
-        instanceId: "claude",
-        model: "claude-opus-5",
-        fallbacks: [
-          { instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }] },
-        ],
-      },
-      contextFor,
-    );
-    expect(result.selection.fallbacks?.[0].fallbacks?.[0].model).toBe("claude-sonnet-5-5");
-    expect(result.changes.map((c) => c.slot)).toContain("fallback 1.1");
-  });
-
   it("leaves unknown instances and engines without lineage untouched", () => {
     const selection = { instanceId: "minimax", model: "MiniMax-M3", fallbacks: [{ instanceId: "gone", model: "x" }] };
     expect(reconcileChain(selection, contextFor)).toEqual({ selection, changes: [] });
+  });
+});
+
+describe("resumeKeepsStartedModel", () => {
+  it("is true only for Codex, whose thread/resume carries no model", () => {
+    expect(resumeKeepsStartedModel("codex")).toBe(true);
+    for (const kind of ["claudeAgent", "grokAgent", "droidAgent", "grok", "antigravity", undefined]) {
+      expect(resumeKeepsStartedModel(kind)).toBe(false);
+    }
   });
 });
 
@@ -354,14 +349,14 @@ describe("applyOwnerDirective", () => {
     expect(flagged.map((f) => f.slot)).toEqual(["primary", "fallback 1"]);
   });
 
-  it("never flags a custom id that looks like an official Sonnet, at any depth", () => {
-    const custom = (id: string) =>
+  it("never flags a custom id that looks like an official Sonnet, on the primary or a fallback", () => {
+    const custom = () =>
       ({ driverKind: "claudeAgent", offeredIds: [], customIds: ["claude-sonnet-5"], authoritative: true }) as const;
     const { selection, flagged } = applyOwnerDirective(
       {
         instanceId: "claude",
         model: "claude-sonnet-5",
-        fallbacks: [{ instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }] }],
+        fallbacks: [{ instanceId: "claude", model: "claude-opus-5" }, { instanceId: "claude", model: "claude-sonnet-5" }],
       },
       () => "claudeAgent",
       custom,
@@ -370,18 +365,27 @@ describe("applyOwnerDirective", () => {
     expect(JSON.stringify(selection)).not.toContain("latest");
   });
 
-  it("flags nested fallbacks", () => {
+  it("leaves out an entry the caller says the directive cannot judge yet", () => {
+    const asked: string[] = [];
     const { selection, flagged } = applyOwnerDirective(
       {
         instanceId: "claude",
-        model: "claude-opus-5",
-        fallbacks: [{ instanceId: "claude", model: "claude-opus-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }] }],
+        model: "claude-sonnet-5",
+        fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna" }, { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
       },
-      () => "claudeAgent",
+      (id) => (id === "codex" ? "codex" : "claudeAgent"),
+      undefined,
+      (entry) => {
+        asked.push(entry.instanceId);
+        return entry.instanceId !== "codex";
+      },
     );
-    expect(flagged.map((f) => f.slot)).toEqual(["fallback 1.1"]);
-    expect(selection.fallbacks?.[0].fallbacks?.[0].latest).toBe("sonnet");
+    // Only entries without a `latest` of their own are asked about.
+    expect(asked).toEqual(["claude", "codex"]);
+    expect(flagged.map((f) => f.slot)).toEqual(["primary"]);
+    expect(selection.fallbacks?.[0]).toEqual({ instanceId: "codex", model: "gpt-5.6-luna" });
   });
+
 });
 
 describe("lineageStatus", () => {

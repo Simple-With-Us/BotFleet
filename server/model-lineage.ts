@@ -11,6 +11,8 @@ import {
   hasLineage,
   presentCatalog,
   reconcileChain,
+  reconcileEntry,
+  resumeKeepsStartedModel,
   retiredModel,
   type LineageChange,
   type LineageContext,
@@ -164,7 +166,6 @@ export function modelNameFor(models: CatalogLike | undefined, id: string): strin
   return models?.options.find((option) => option.id === id)?.label ?? anyLineageLabel(id) ?? id;
 }
 
-
 function rawLatest(raw: unknown): { present: boolean; value: unknown } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { present: false, value: undefined };
   return Object.hasOwn(raw, "latest")
@@ -178,32 +179,16 @@ function rawFallback(raw: unknown, index: number): unknown {
   return Array.isArray(fallbacks) ? fallbacks[index] : undefined;
 }
 
-/** The raw request body for every entry of `selection`, in walkChain order, so
- *  "did the client send `latest`" is answered for nested fallbacks too. */
-function rawChain(raw: unknown, selection: ModelSelection): unknown[] {
-  const out: unknown[] = [];
-  const visit = (node: ModelSelection, rawNode: unknown) => {
-    out.push(rawNode);
-    (node.fallbacks ?? []).forEach((fallback, index) => visit(fallback, rawFallback(rawNode, index)));
-  };
-  visit(selection, raw);
-  return out;
+/** The primary and its fallbacks.  A chain is one flat list (the write path
+ *  refuses a fallback's own fallbacks and the store drops any on load,
+ *  shared/model-limits.ts), so this is every entry there is. */
+function chainEntries(selection: ModelSelection | undefined): ModelSelection[] {
+  if (!selection) return [];
+  return [selection, ...(selection.fallbacks ?? [])];
 }
 
-/** Every entry of the chain, nested descendants included, depth first, each
- *  with its slot name ("primary", "fallback 1", "fallback 1.2"). */
-function walkChain(selection: ModelSelection | undefined): Array<{ entry: ModelSelection; slot: string }> {
-  if (!selection) return [];
-  const out: Array<{ entry: ModelSelection; slot: string }> = [{ entry: selection, slot: "primary" }];
-  const visit = (node: ModelSelection, path: string) => {
-    (node.fallbacks ?? []).forEach((fallback, index) => {
-      const name = path ? `${path}.${index + 1}` : String(index + 1);
-      out.push({ entry: fallback, slot: `fallback ${name}` });
-      visit(fallback, name);
-    });
-  };
-  visit(selection, "");
-  return out;
+function slotFor(index: number): string {
+  return index === 0 ? "primary" : `fallback ${index}`;
 }
 
 function sameTarget(a: ModelSelection, b: ModelSelection): boolean {
@@ -271,25 +256,22 @@ export function checkLineageWrite(
   current: ModelSelection | undefined,
   contextFor: (instanceId: string) => LineageContext | undefined,
 ): LineageWriteResult {
-  // Nested fallbacks carry their floating state too: flatten the whole tree
-  // (depth first, the same order walkChain uses), carry, and write it back.
-  const saved = walkChain(current).map((item) => item.entry);
-  const flatIncoming = walkChain(selection).map((item) => item.entry);
-  const raws = rawChain(raw, selection);
-  const carried = carryLatestChain(flatIncoming, raws, saved);
-  let at = 0;
-  const rebuild = (node: ModelSelection): ModelSelection => {
-    const { fallbacks, ...rest } = node;
-    const out: ModelSelection = { ...rest, ...(carried[at]?.latest !== undefined ? { latest: carried[at]!.latest } : {}) };
-    at += 1;
-    if (fallbacks) out.fallbacks = fallbacks.map(rebuild);
-    return out;
-  };
-  const incoming = rebuild(selection);
-  const unclaimed = walkChain(current).map((item) => item.entry);
-  for (const { entry, slot } of walkChain(incoming)) {
-    const driverKind = contextFor(entry.instanceId)?.driverKind;
-    const retired = retiredModel(driverKind, entry.model);
+  const saved = chainEntries(current);
+  const raws = [raw, ...(selection.fallbacks ?? []).map((_, index) => rawFallback(raw, index))];
+  const carried = carryLatestChain(chainEntries(selection), raws, saved);
+  const incoming: ModelSelection = { ...carried[0]! };
+  delete incoming.fallbacks;
+  if (selection.fallbacks) incoming.fallbacks = carried.slice(1);
+  const unclaimed = [...saved];
+  const entries = chainEntries(incoming);
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!;
+    const context = contextFor(entry.instanceId);
+    // A custom catalog row is the operator's own id, even when its text
+    // matches a retired official one: reconcile leaves it alone, so the
+    // write does too.
+    if (context?.customIds?.includes(entry.model)) continue;
+    const retired = retiredModel(context?.driverKind, entry.model);
     if (!retired || retired.successorClass !== null) continue;
     // Each saved slot grandfathers ONE incoming copy: a single saved dead
     // target must not cover a second copy of it added in this write.
@@ -298,11 +280,28 @@ export function checkLineageWrite(
     else {
       return {
         ok: false,
-        error: `retired model "${entry.model}" in ${slot} — choose another model`,
+        error: `retired model "${entry.model}" in ${slotFor(index)} — choose another model`,
       };
     }
   }
   const reconciled = reconcileChain(incoming, contextFor);
   const reconciledCurrent = current ? reconcileChain(current, contextFor).selection : undefined;
   return { ok: true, selection: reconciled.selection, current: reconciledCurrent, changes: reconciled.changes };
+}
+
+/** A per-turn override (a fallback or retry pick) reconciled the way a saved
+ *  chain is, so a retired or superseded id is never dispatched or recorded.
+ *  `freshSession` is true when the reconcile moved the model on an engine
+ *  whose native resume keeps the model its session started with (Codex):
+ *  resuming the task's old session there would run the old model while the
+ *  turn is recorded under the new one. */
+export function reconcileTurnOverride(
+  selection: ModelSelection,
+  context: LineageContext | undefined,
+): { selection: ModelSelection; freshSession: boolean } {
+  const reconciled = reconcileEntry(selection, context).entry;
+  return {
+    selection: reconciled,
+    freshSession: reconciled.model !== selection.model && resumeKeepsStartedModel(context?.driverKind),
+  };
 }

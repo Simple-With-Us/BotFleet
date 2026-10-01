@@ -7643,6 +7643,42 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
     });
   });
 
+  it("moves an idle bot forward in the same answer when an engine PATCH changes what it offers", async () => {
+    // claude2 runs the fixture CLI (2.1.232, too old for Opus 5.5).  Pointed
+    // at a CLI that reports 2.1.284 it offers Opus 5.5, and the PATCH that
+    // made that change moves the pinned Opus 5 forward before it answers.
+    const newerCli = join(home, "fake-claude-newer");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    await withBot("Lineage Engine Patch", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude2", model: "claude-opus-5" },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5" });
+      try {
+        const patched = await api("PATCH", "/api/instances/claude2", { cli: newerCli });
+        expect(patched.status).toBe(200);
+        const claude2 = patched.body.instances.find(
+          (instance: { instanceId: string }) => instance.instanceId === "claude2",
+        );
+        expect(claude2.models.options.map((option: { id: string }) => option.id)).toContain("claude-opus-5-5");
+        // No GET /api/instances in between: the PATCH itself reconciled.
+        expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5-5" });
+      } finally {
+        await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+      }
+    });
+  });
+
   it("saves a retired id as Latest of its successor class, with the real slug in model", async () => {
     await withBot("Lineage Retired", async (bot) => {
       const saved = await api("PATCH", `/api/bots/${bot.id}`, {
@@ -7768,31 +7804,28 @@ describe("fallback cap: at most three, growth refused, existing chains left alon
     return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
   };
 
-  it("judges a fallback's own fallbacks like the rest of the chain", async () => {
+  it("refuses a fallback that carries fallbacks of its own, and accepts an empty list there", async () => {
     const bot = (await api("POST", "/api/bots", { name: "Nested Gate" })).body.bot;
     const claude = (await api("GET", "/api/instances")).body.instances.find(
       (instance: { instanceId: string }) => instance.instanceId === "claude",
     );
     const good = { instanceId: "claude", model: claude.models.default };
-    const nope = { instanceId: "no-such-instance-anywhere", model: "m" };
     try {
-      const flat = await api("PATCH", `/api/bots/${bot.id}`, {
-        requireAvailableModel: true,
-        modelSelection: { ...good, fallbacks: [nope] },
-      });
       const nested = await api("PATCH", `/api/bots/${bot.id}`, {
-        requireAvailableModel: true,
-        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [nope] }] },
-      });
-      const fine = await api("PATCH", `/api/bots/${bot.id}`, {
-        requireAvailableModel: true,
         modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [good] }] },
       });
-      expect(flat.status).toBe(400);
-      // The same verdict for the same bad entry, one level down.
       expect(nested.status).toBe(400);
-      expect(nested.body.error).toContain("no-such-instance-anywhere");
-      expect(fine.status).toBe(200);
+      expect(nested.body.error).toMatch(/cannot have fallbacks of its own/);
+      expect(await fallbacksOf(bot.id)).toEqual([]);
+
+      // A client that serializes an empty list on every entry still saves.
+      const empty = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [] }] },
+      });
+      expect(empty.status).toBe(200);
+      const saved = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id);
+      expect(saved.modelSelection.fallbacks).toHaveLength(1);
+      expect(saved.modelSelection.fallbacks[0].fallbacks).toBeUndefined();
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }

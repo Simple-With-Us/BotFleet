@@ -241,6 +241,18 @@ export const OWNER_DIRECTED_LATEST = {
  *  most this fraction. */
 export const PRICE_BAND = 0.25;
 
+/** Whether a driver's native resume keeps the model its session started
+ *  with, so a saved selection whose model moved must start a fresh session
+ *  (the harness drops that engine's resume cursor and replays the visible
+ *  history instead).  Codex's app-server takes a model only at thread/start;
+ *  thread/resume and turn/start carry none (server/drivers/codex.ts).  The
+ *  other lineage engines apply the model on every turn of a resumed session:
+ *  Claude passes --model beside --resume, and the ACP engines (Grok,
+ *  Droid) send session/set_model after session/load. */
+export function resumeKeepsStartedModel(driverKind: string | undefined): boolean {
+  return driverKind === "codex";
+}
+
 export function hasLineage(driverKind: string | undefined): boolean {
   return Boolean(driverKind && DRIVER_LINEAGE[driverKind]);
 }
@@ -574,82 +586,72 @@ function sameTarget(a: LineageSelection, b: LineageSelection): boolean {
 /** Reconcile a whole chain: the primary and every fallback.  A fallback
  *  that the pass made identical to the primary is dropped; one that already
  *  matched it (the settings UI seeds a new fallback from the primary as a
- *  placeholder) is left alone. */
+ *  placeholder) is left alone.  A chain is one flat list: the harness
+ *  refuses a fallback's own fallbacks on write and drops any on load
+ *  (shared/model-limits.ts), so there is nothing below a fallback to walk. */
 export function reconcileChain<S extends LineageSelection>(
   selection: S,
   contextFor: (instanceId: string) => LineageContext | undefined,
 ): { selection: S; changes: LineageChange[] } {
   const changes: LineageChange[] = [];
-  // Reconciles one node and, recursively, every descendant fallback.  A
-  // descendant that became identical to its parent is dropped.
-  const walk = <N extends LineageSelection>(node: N, slot: string, path: string): N => {
-    const self = reconcileEntry({ ...node, fallbacks: undefined }, contextFor(node.instanceId), slot);
-    if (self.change) changes.push(self.change);
-    const next = { ...self.entry } as N;
-    delete next.fallbacks;
-    if (node.fallbacks) {
-      const kept: LineageSelection[] = [];
-      node.fallbacks.forEach((fallback, index) => {
-        const name = path ? `${path}.${index + 1}` : String(index + 1);
-        const label = `fallback ${name}`;
-        const before = changes.length;
-        const child = walk(fallback, label, name);
-        const childChange = changes.slice(before).find((c) => c.slot === label);
-        const becameDuplicate =
-          sameTarget(child, next) &&
-          !sameTarget(fallback, node) &&
-          (Boolean(childChange) || Boolean(self.change));
-        if (becameDuplicate) {
-          changes.push({
-            slot: label,
-            instanceId: fallback.instanceId,
-            from: fallback.model,
-            to: "",
-            reason: childChange?.reason ?? "superseded",
-          });
-          return;
-        }
-        kept.push(child);
-      });
-      if (kept.length) next.fallbacks = kept as N["fallbacks"];
-    }
-    return next;
-  };
-  return { selection: walk(selection, "primary", ""), changes };
+  const primary = reconcileEntry({ ...selection, fallbacks: undefined }, contextFor(selection.instanceId), "primary");
+  if (primary.change) changes.push(primary.change);
+  const next = { ...primary.entry } as S;
+  delete next.fallbacks;
+  if (selection.fallbacks) {
+    const fallbacks: LineageSelection[] = [];
+    selection.fallbacks.forEach((fallback, index) => {
+      const result = reconcileEntry(fallback, contextFor(fallback.instanceId), slotName(index));
+      if (result.change) changes.push(result.change);
+      const becameDuplicate =
+        sameTarget(result.entry, next) &&
+        !sameTarget(fallback, selection) &&
+        (Boolean(result.change) || Boolean(primary.change));
+      if (becameDuplicate) {
+        changes.push({
+          slot: slotName(index),
+          instanceId: fallback.instanceId,
+          from: fallback.model,
+          to: "",
+          reason: result.change?.reason ?? "superseded",
+        });
+        return;
+      }
+      fallbacks.push(result.entry);
+    });
+    if (fallbacks.length) next.fallbacks = fallbacks as S["fallbacks"];
+  }
+  return { selection: next, changes };
 }
 
 /** The owner-directed flags: every entry in an OWNER_DIRECTED_LATEST class
  *  starts floating.  `model` is left for reconcileChain to resolve against
  *  the instance's catalog.  Custom ids (`contextFor(...).customIds`) are the
- *  operator's own and are never classified or flagged. */
+ *  operator's own and are never classified or flagged.  `applies` lets the
+ *  caller leave an entry out (its engine's catalog is not known yet, so a
+ *  custom id cannot be told from an official one); it is asked about every
+ *  entry that has no `latest` of its own. */
 export function applyOwnerDirective<S extends LineageSelection>(
   selection: S,
   driverKindFor: (instanceId: string) => string | undefined,
   contextFor?: (instanceId: string) => LineageContext | undefined,
+  applies?: (entry: LineageSelection) => boolean,
 ): { selection: S; flagged: LineageChange[] } {
   const flagged: LineageChange[] = [];
-  const flag = <E extends LineageSelection>(entry: E, slot: string, path: string): E => {
-    let out: E = entry;
-    if (entry.latest === undefined && !contextFor?.(entry.instanceId)?.customIds?.includes(entry.model)) {
-      const driverKind = driverKindFor(entry.instanceId);
-      const hit = classifyModel(driverKind, entry.model);
-      if (hit && OWNER_DIRECTED_LATEST.classKeys.includes(hit.classKey)) {
-        flagged.push({ slot, instanceId: entry.instanceId, from: entry.model, to: entry.model, latest: hit.classKey, reason: "owner" });
-        out = { ...entry, latest: hit.classKey };
-      }
-    }
-    if (entry.fallbacks) {
-      out = {
-        ...out,
-        fallbacks: entry.fallbacks.map((fallback, index) => {
-          const name = path ? `${path}.${index + 1}` : String(index + 1);
-          return flag({ ...fallback }, `fallback ${name}`, name);
-        }),
-      } as E;
-    }
-    return out;
+  const flag = <E extends LineageSelection>(entry: E, slot: string): E => {
+    if (entry.latest !== undefined) return entry;
+    if (applies && !applies(entry)) return entry;
+    if (contextFor?.(entry.instanceId)?.customIds?.includes(entry.model)) return entry;
+    const hit = classifyModel(driverKindFor(entry.instanceId), entry.model);
+    if (!hit || !OWNER_DIRECTED_LATEST.classKeys.includes(hit.classKey)) return entry;
+    flagged.push({ slot, instanceId: entry.instanceId, from: entry.model, to: entry.model, latest: hit.classKey, reason: "owner" });
+    return { ...entry, latest: hit.classKey };
   };
-  return { selection: flag({ ...selection }, "primary", ""), flagged };
+  const next = flag({ ...selection }, "primary");
+  if (selection.fallbacks) {
+    next.fallbacks = selection.fallbacks.map((fallback, index) => flag({ ...fallback }, slotName(index))) as S["fallbacks"];
+  }
+  return { selection: next, flagged };
 }
 
 export type LineageStatusKind = "ok" | "retired" | "superseded" | "not-in-catalog";

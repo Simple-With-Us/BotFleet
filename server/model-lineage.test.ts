@@ -12,6 +12,7 @@ import {
   matchesStaticFallback,
   parseCliVersion,
   presentDescribedInstances,
+  reconcileTurnOverride,
 } from "./model-lineage.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { STATIC_GROK_MODELS } from "./drivers/acp/grok.ts";
@@ -32,6 +33,17 @@ const instances: Record<string, FixtureInstance> = {
   codex: { driverKind: "codex", models: CODEX_LIVE },
   grok: { driverKind: "grokAgent", models: STATIC_GROK_MODELS },
   grokApi: { driverKind: "grok", models: { default: "grok-4.7", options: [{ id: "grok-4.7", label: "Grok 4.7" }] } },
+  // A Grok CLI whose config.toml adds its own row under a retired id.
+  grokCustom: {
+    driverKind: "grokAgent",
+    models: {
+      default: "grok-4.7",
+      options: [
+        { id: "grok-4.7", label: "Grok 4.7" },
+        { id: "grok-3-mini", label: "My Mini", custom: true },
+      ],
+    },
+  },
   minimax: { driverKind: "minimax", models: { default: "MiniMax-M3", options: [{ id: "MiniMax-M3", label: "MiniMax M3" }] } },
 };
 
@@ -150,6 +162,31 @@ describe("Claude CLI version gate", () => {
   });
 });
 
+describe("reconcileTurnOverride", () => {
+  it("resolves a floating override and asks for a fresh Codex session only when the model moved", () => {
+    const codexNewer = lineageContextFor({
+      driverKind: "codex",
+      models: { ...CODEX_LIVE, options: [...CODEX_LIVE.options, { id: "gpt-6-luna", label: "GPT-6 Luna" }] },
+    });
+    expect(reconcileTurnOverride({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }, codexNewer)).toEqual({
+      selection: { instanceId: "codex", model: "gpt-6-luna", latest: "luna" },
+      freshSession: true,
+    });
+    expect(reconcileTurnOverride({ instanceId: "codex", model: "gpt-6-luna", latest: "luna" }, codexNewer).freshSession).toBe(false);
+    // A pinned override with no newer member in the band stays as it is.
+    expect(reconcileTurnOverride({ instanceId: "codex", model: "gpt-5.6-luna" }, contextFor("codex"))).toEqual({
+      selection: { instanceId: "codex", model: "gpt-5.6-luna" },
+      freshSession: false,
+    });
+  });
+
+  it("never asks for a fresh session on an engine that applies the model on resume", () => {
+    const moved = reconcileTurnOverride({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }, contextFor("claude"));
+    expect(moved.selection.model).toBe("claude-sonnet-5-5");
+    expect(moved.freshSession).toBe(false);
+  });
+});
+
 describe("checkLineageWrite", () => {
   const write = (selection: ModelSelection, current?: ModelSelection, raw: unknown = selection) =>
     checkLineageWrite(selection, raw, current, contextFor);
@@ -188,14 +225,20 @@ describe("checkLineageWrite", () => {
     expect(result).toEqual({ ok: false, error: 'retired model "grok-3-mini" in fallback 2 — choose another model' });
   });
 
-  it("refuses a newly introduced retired id nested below a fallback, and grandfathers a saved one", () => {
-    const nested: ModelSelection = {
+  it("accepts a retired-looking id that the engine's catalog lists as the operator's own custom row", () => {
+    const custom: ModelSelection = {
       instanceId: "claude",
       model: "claude-sonnet-5-5",
-      fallbacks: [{ instanceId: "codex", model: "gpt-5.5", fallbacks: [{ instanceId: "grokApi", model: "grok-3-mini" }] }],
+      fallbacks: [{ instanceId: "grokCustom", model: "grok-3-mini" }],
     };
-    expect(write(nested)).toEqual({ ok: false, error: 'retired model "grok-3-mini" in fallback 1.1 — choose another model' });
-    expect(write({ ...nested, model: "claude-opus-5-5" }, nested).ok).toBe(true);
+    const result = write(custom);
+    expect(result).toMatchObject({ ok: true, selection: { fallbacks: [{ instanceId: "grokCustom", model: "grok-3-mini" }] } });
+    expect(result.ok && result.selection.fallbacks?.[0]?.latest).toBeFalsy();
+    // The same id on an engine that does not list it is still refused.
+    expect(write({ ...custom, fallbacks: [{ instanceId: "grok", model: "grok-3-mini" }] })).toEqual({
+      ok: false,
+      error: 'retired model "grok-3-mini" in fallback 1 — choose another model',
+    });
   });
 
   it("lets a saved retired leftover through so another slot can still be edited", () => {
@@ -272,24 +315,6 @@ describe("checkLineageWrite", () => {
       ok: true,
       selection: { latest: "sonnet", effort: "high", fallbacks: [{ latest: "luna" }] },
     });
-  });
-
-  it("carries Latest on a nested fallback when a client that predates it re-sends the chain", () => {
-    const saved: ModelSelection = {
-      instanceId: "claude",
-      model: "claude-opus-5-5",
-      fallbacks: [
-        {
-          instanceId: "codex",
-          model: "gpt-5.6-luna",
-          fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
-        },
-      ],
-    };
-    const ios = JSON.parse(JSON.stringify(saved)) as ModelSelection;
-    delete ios.fallbacks![0]!.fallbacks![0]!.latest;
-    const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
-    expect(result).toMatchObject({ ok: true, selection: { fallbacks: [{ fallbacks: [{ model: "claude-sonnet-5-5", latest: "sonnet" }] }] } });
   });
 
   it("keeps a float when an older client removes the fallback in front of it", () => {

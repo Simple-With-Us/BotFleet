@@ -5,6 +5,7 @@ import {
   fallbackCountAllowed,
   fallbackSlotCount,
   MAX_MODEL_FALLBACKS,
+  withoutNestedFallbacks,
 } from "./model-limits";
 
 describe("MAX_MODEL_FALLBACKS", () => {
@@ -61,5 +62,44 @@ describe("fallbackCountAllowed", () => {
     expect(fallbackCountAllowed(3, 5)).toBe(true);
     expect(fallbackCountAllowed(4, 5)).toBe(true);
     expect(fallbackCountAllowed(6, 5)).toBe(false);
+  });
+});
+
+describe("withoutNestedFallbacks", () => {
+  type Entry = { instanceId: string; model: string; latest?: string; fallbacks?: Entry[] };
+
+  it("returns a flat chain unchanged, the same object", () => {
+    const flat: Entry = { instanceId: "a", model: "m", fallbacks: [{ instanceId: "b", model: "n", latest: "x" }] };
+    const result = withoutNestedFallbacks(flat);
+    expect(result.dropped).toBe(0);
+    expect(result.selection).toBe(flat);
+  });
+
+  it("drops every level below a fallback and counts each dropped entry", () => {
+    const tree: Entry = {
+      instanceId: "a",
+      model: "m",
+      fallbacks: [
+        {
+          instanceId: "b",
+          model: "n",
+          latest: "x",
+          fallbacks: [{ instanceId: "c", model: "o", fallbacks: [{ instanceId: "d", model: "p" }] }],
+        },
+        { instanceId: "e", model: "q" },
+      ],
+    };
+    const result = withoutNestedFallbacks(tree);
+    expect(result.dropped).toBe(2);
+    expect(result.selection).toEqual({
+      instanceId: "a",
+      model: "m",
+      fallbacks: [
+        { instanceId: "b", model: "n", latest: "x" },
+        { instanceId: "e", model: "q" },
+      ],
+    });
+    // The input is left as it was.
+    expect(tree.fallbacks![0]!.fallbacks).toHaveLength(1);
   });
 });

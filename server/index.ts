@@ -105,6 +105,7 @@ import {
   quotaCooldowns,
   quotaOrCapFromErrorCode,
   selectTurnFallback,
+  selectionForFallbackPick,
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
   sliceIsShortProviderError,
@@ -210,13 +211,14 @@ import { cliProbeEnvironment } from "./cli-probe-env.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
-import { reconcileEntry, type LineageContext } from "../shared/model-lineage.ts";
+import type { LineageContext } from "../shared/model-lineage.ts";
 import {
   checkLineageWrite,
   gateLineageByCliVersion,
   lineageContextFor,
   modelNameFor,
   presentDescribedInstances,
+  reconcileTurnOverride,
 } from "./model-lineage.ts";
 import {
   isEffortLevel,
@@ -1096,12 +1098,19 @@ function recordCliVersions(described: ReadonlyArray<{ instanceId: string; snapsh
 }
 
 /** Every describe goes through here on its way to a picker, so the version
- *  cache follows the engines' own answers. */
+ *  cache follows the engines' own answers.  Each one is also a catalog
+ *  refresh (a describe, a CLI or key change, an engine added or removed), so
+ *  saved selections are moved forward against it before the answer goes
+ *  out: an idle bot on Latest never disagrees with the catalog the same
+ *  response carries.  Working bots wait for their next dispatch, which
+ *  reconciles them first. */
 function presentInstances<T extends Parameters<typeof presentDescribedInstances>[0][number] & { instanceId: string }>(
   described: T[],
 ): T[] {
   recordCliVersions(described);
-  return presentDescribedInstances(described);
+  const presented = presentDescribedInstances(described);
+  reconcileModelLineage({ skipBusy: true });
+  return presented;
 }
 
 function lineageContextForInstance(instanceId: string): LineageContext | undefined {
@@ -1180,8 +1189,9 @@ function checkedModelSelection(
   raw: unknown,
   current?: { selection: ModelSelection; busy: boolean },
   requireAvailableModel = false,
-  /** A fallback entry parsed by the recursion below; the chain-level
-   *  lineage check runs once, on the whole chain. */
+  /** A fallback entry parsed by the recursion below.  It may not carry
+   *  fallbacks of its own, and the chain-level lineage check runs once, on
+   *  the whole chain. */
   nested = false,
 ): { ok: true; selection: ModelSelection } | { ok: false; status: number; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -1212,7 +1222,17 @@ function checkedModelSelection(
     selection.latest = value.latest;
   }
   
-  if ("fallbacks" in value && Array.isArray(value.fallbacks)) {
+  if (nested && "fallbacks" in value && Array.isArray(value.fallbacks) && value.fallbacks.length > 0) {
+    // One flat chain (shared/model-limits.ts, withoutNestedFallbacks): a
+    // fallback's own fallbacks would never run, so they are refused rather
+    // than saved as configuration nobody can see take effect.
+    return {
+      ok: false,
+      status: 400,
+      error: "a fallback model cannot have fallbacks of its own — list every fallback on the primary",
+    };
+  }
+  if (!nested && "fallbacks" in value && Array.isArray(value.fallbacks)) {
     // Refuse a chain that GROWS past the cap, never one that merely keeps the
     // length it already has: a bot written before the cap existed re-sends its
     // whole chain whenever only its primary changes, and that must still save.
@@ -1255,13 +1275,7 @@ function checkedModelSelection(
   if (current?.busy && changed) {
     return { ok: false, status: 409, error: "the bot is working — stop it before changing models" };
   }
-  // Every accepted entry, including a fallback's own fallbacks: a nested
-  // chain is parsed above, so it is judged here like the rest.
-  const everyEntry = (entry: ModelSelection): ModelSelection[] => [
-    entry,
-    ...(entry.fallbacks ?? []).flatMap(everyEntry),
-  ];
-  for (const entry of everyEntry(selection)) {
+  for (const entry of [selection, ...(selection.fallbacks ?? [])]) {
     const problem = checkSelectionEntry(entry, requireAvailableModel);
     if (problem) return problem;
   }
@@ -2748,12 +2762,7 @@ async function launchFallbackTurn(input: {
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name, ok: true, kind: "notice" } });
 
   const launch = async (pick: TurnFallbackPick): Promise<void> => {
-    const selection: ModelSelection = {
-      instanceId: pick.instanceId,
-      model: pick.model,
-      effort: pick.effort,
-      ...(pick.latest ? { latest: pick.latest } : {}),
-    };
+    const selection = selectionForFallbackPick(pick);
     // Both failure shapes arrive here once.  Whichever reports first wins, so a
     // dispatch error that also throws cannot advance the walk twice.
     let advanced = false;
@@ -3497,10 +3506,11 @@ bus.subscribe((event: RuntimeEvent) => {
           fallingOver: Boolean(next && fallbackUserMessage && typeof fallbackUserMessage.text === "string"),
         }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
-          const { nextUsed, instanceId, model, effort } = next;
           fallbackPick = next;
-          fallbackAttemptByTurn.set(fallbackKey, nextUsed);
-          fallbackSelection = { instanceId, model, effort };
+          fallbackAttemptByTurn.set(fallbackKey, next.nextUsed);
+          // A room member's fallback is replayed from this selection, so it
+          // keeps a floating pick's class (selectionForFallbackPick).
+          fallbackSelection = selectionForFallbackPick(next);
           store.patchBot(fallbackBot.id, { activeModelSelection: fallbackSelection });
           store.patchTask(fallbackBot.id, event.threadId, { activeModelSelection: fallbackSelection });
           broadcast({ kind: "bot", bot: wireBot(store.bot(fallbackBot.id)!) });
@@ -4090,7 +4100,11 @@ async function startTurn(
   let selection = opts?.modelSelection
     ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
   if (opts?.modelSelection) {
-    selection = reconcileEntry(selection, lineageContextForInstance(selection.instanceId)).entry;
+    const override = reconcileTurnOverride(selection, lineageContextForInstance(selection.instanceId));
+    // A Codex thread keeps the model it started with, so an override the
+    // reconcile moved must not resume this task's old thread there.
+    if (override.freshSession) store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
+    selection = override.selection;
   }
 
   const downgradeInstance = registry.get(selection.instanceId);
@@ -6159,8 +6173,10 @@ async function runGroupMemberTurn(
   // A per-turn override (a fallback or retry pick, possibly queued earlier)
   // goes through the same lineage reconciliation startTurn gives the 1:1 lane,
   // so a retired or superseded id is never dispatched or recorded.
+  // Room turns pass no resume cursor, so only the reconciled selection is
+  // used here.
   const selection = turnSelection
-    ? reconcileEntry(turnSelection, lineageContextForInstance(turnSelection.instanceId)).entry
+    ? reconcileTurnOverride(turnSelection, lineageContextForInstance(turnSelection.instanceId)).selection
     : bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
@@ -12098,11 +12114,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const described = await registry.describe(
         fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
-      // A describe is the catalog refresh: move saved selections forward
-      // against what the engines offer now.  Working bots wait for their
-      // next dispatch, which reconciles them first.
+      // presentInstances moves saved selections forward against what the
+      // engines offer now.
       const instances = presentInstances(described);
-      reconcileModelLineage({ skipBusy: true });
       return json(res, 200, { instances });
     }
 

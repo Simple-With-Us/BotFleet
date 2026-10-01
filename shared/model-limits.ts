@@ -41,3 +41,26 @@ export function canAddFallback(stored: number): boolean {
 export function fallbackCountAllowed(next: number, current: number = 0): boolean {
   return next <= Math.max(MAX_MODEL_FALLBACKS, current);
 }
+
+/** A bot's fallbacks are one flat list on its primary.  A fallback's own
+ *  `fallbacks` has never run: dispatch, the quota cooldown walk and the
+ *  fail-over walk all read the primary's list and nothing below it, and no
+ *  client builds one (the desktop and iOS settings add a fallback as engine
+ *  plus model, and Apply to All Bots reads only engine, model and class).
+ *  The harness therefore refuses one on write and drops any it finds on
+ *  load, so nothing downstream has to walk a tree.
+ *
+ *  Returns `selection` with every fallback's own `fallbacks` removed, and how
+ *  many entries that took out (every level below a fallback counts). */
+export function withoutNestedFallbacks<S extends { fallbacks?: S[] }>(selection: S): { selection: S; dropped: number } {
+  const count = (entries: readonly S[] | undefined): number =>
+    (entries ?? []).reduce((sum, entry) => sum + 1 + count(entry.fallbacks), 0);
+  const nested = (selection.fallbacks ?? []).reduce((sum, fallback) => sum + count(fallback.fallbacks), 0);
+  if (nested === 0) return { selection, dropped: 0 };
+  const fallbacks = selection.fallbacks!.map((fallback) => {
+    const flat = { ...fallback };
+    delete flat.fallbacks;
+    return flat;
+  });
+  return { selection: { ...selection, fallbacks }, dropped: nested };
+}

@@ -16,14 +16,17 @@ import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import {
   applyOwnerDirective,
+  classifyModel,
   lineageNotice,
   OWNER_DIRECTED_LATEST,
   reconcileChain,
+  resumeKeepsStartedModel,
   type LineageChange,
   type LineageContext,
 } from "../shared/model-lineage.ts";
@@ -914,6 +917,28 @@ export class Store {
       if (b.avatarCrop !== undefined && avatar.avatarCrop !== b.avatarCrop) {
         delete b.avatarCrop;
         botsMigrated = true;
+      }
+      // Fallbacks are one flat list on the primary.  A fallback's own
+      // fallbacks (only ever written through the API by hand) never ran, so
+      // they are dropped once here, with a line naming what went, and the
+      // write path refuses new ones (shared/model-limits.ts).
+      const flatten = (selection: ModelSelection | undefined, where: string): ModelSelection | undefined => {
+        if (!selection) return selection;
+        const flat = withoutNestedFallbacks(selection);
+        if (flat.dropped === 0) return selection;
+        botsMigrated = true;
+        console.log(
+          `store: ${b.name} (${b.id}) ${where} dropped ${flat.dropped} nested fallback ${flat.dropped === 1 ? "entry" : "entries"} that never ran`,
+        );
+        return flat.selection;
+      };
+      b.modelSelection = flatten(b.modelSelection, "modelSelection")!;
+      if (b.activeModelSelection) b.activeModelSelection = flatten(b.activeModelSelection, "activeModelSelection");
+      for (const task of b.tasks ?? []) {
+        if (task.modelSelection) task.modelSelection = flatten(task.modelSelection, `task ${task.threadId} modelSelection`);
+        if (task.activeModelSelection) {
+          task.activeModelSelection = flatten(task.activeModelSelection, `task ${task.threadId} activeModelSelection`);
+        }
       }
       // A snooze IS durable — unlike busy, it is a decision the person made,
       // and a relaunch must not wake every thread they put to sleep.  Only
@@ -2209,9 +2234,13 @@ export class Store {
    *
    * `ownerDirective` also applies the one-time owner-directed flags (every
    * Sonnet and every Luna becomes Latest), gated on a marker file so a
-   * later explicit pin is never re-floated.  Idempotent: a second pass with
-   * the same catalogs changes nothing.  Each bot whose chain moved gets one
-   * notice in its active thread, and every move is logged. */
+   * later explicit pin is never re-floated.  An entry whose engine is not
+   * loaded (no context, or a shadow with no catalog) cannot be told from a
+   * custom id, so it is left as it is and listed in the marker as pending;
+   * later boot passes apply the directive to those entries alone, once
+   * their engine is back.  Idempotent: a second pass with the same catalogs
+   * changes nothing.  Each bot whose chain moved gets one notice in its
+   * active thread, and every move is logged. */
   reconcileModelLineage(opts: {
     contextFor: (instanceId: string) => LineageContext | undefined;
     nameFor: (instanceId: string, model: string) => string;
@@ -2222,20 +2251,36 @@ export class Store {
   }): Array<{ botId: string; notice: string | null }> {
     const driverKindFor = (instanceId: string) => opts.contextFor(instanceId)?.driverKind;
     const markerFile = join(DATA_DIR, MODEL_LINEAGE_MARKER);
+    const directiveId = OWNER_DIRECTED_LATEST.id;
     let applied: string[] = [];
+    let pendingById: Record<string, string[]> = {};
     // Only the boot pass asks for the one-time move, so the per-dispatch and
     // per-refresh passes never touch the marker file.  A roster that failed
     // to parse is not a roster to migrate.
     const wantDirective = Boolean(opts.ownerDirective) && !this.botsLoadFailed;
     if (wantDirective) {
       try {
-        const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown };
+        const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown; pending?: unknown };
         if (Array.isArray(parsed.applied)) applied = parsed.applied.filter((id): id is string => typeof id === "string");
+        if (parsed.pending && typeof parsed.pending === "object" && !Array.isArray(parsed.pending)) {
+          for (const [id, keys] of Object.entries(parsed.pending)) {
+            if (Array.isArray(keys)) pendingById[id] = keys.filter((key): key is string => typeof key === "string");
+          }
+        }
       } catch {
         applied = [];
+        pendingById = {};
       }
     }
-    const runDirective = wantDirective && !applied.includes(OWNER_DIRECTED_LATEST.id);
+    // The first pass applies the directive to every entry; later passes only
+    // to the entries an earlier pass had to leave for later.
+    const firstDirectivePass = wantDirective && !applied.includes(directiveId);
+    const pendingBefore = new Set(wantDirective && !firstDirectivePass ? pendingById[directiveId] ?? [] : []);
+    const runDirective = firstDirectivePass || pendingBefore.size > 0;
+    const pendingAfter = new Set<string>();
+    const pendingKey = (botId: string, scope: string, entry: ModelSelection) =>
+      JSON.stringify([botId, scope, entry.instanceId, entry.model]);
+    const visited = new Set<string>();
     const wanted = opts.botIds ? new Set(opts.botIds) : null;
     const results: Array<{ botId: string; notice: string | null }> = [];
     let dirty = false;
@@ -2247,16 +2292,6 @@ export class Store {
         );
       }
     };
-    // An entry whose instance has no context yet (engine not loaded, catalog
-    // not described) cannot be classified, so the directive did not really
-    // apply to it: the marker stays unset and the next boot pass retries.
-    let directiveIncomplete = false;
-    const lacksContext = (entry: ModelSelection): boolean => {
-      const context = opts.contextFor(entry.instanceId);
-      // A shadow context only names the driver: it has no catalog, so nothing
-      // could be classified against it either.
-      return context === undefined || context.catalogPending === true || Boolean(entry.fallbacks?.some(lacksContext));
-    };
     // A native Codex session resumes by thread id alone and takes its model
     // only at thread/start, so a rewritten model must not resume the old one.
     const dropStaleCursors = (
@@ -2265,23 +2300,43 @@ export class Store {
     ) => {
       if (!cursors) return;
       for (const change of changes) {
-        if (change.from !== change.to && driverKindFor(change.instanceId) === "codex") delete cursors[change.instanceId];
+        if (change.from !== change.to && resumeKeepsStartedModel(driverKindFor(change.instanceId))) {
+          delete cursors[change.instanceId];
+        }
       }
     };
-    const pass = (selection: ModelSelection, directive: boolean) => {
-      if (directive && lacksContext(selection)) directiveIncomplete = true;
-      const flagged = directive ? applyOwnerDirective(selection, driverKindFor, opts.contextFor) : { selection, flagged: [] };
+    /** `directive` names the saved selection (bot and scope) when the
+     *  owner-directed flags may apply to it. */
+    const pass = (selection: ModelSelection, directive?: { botId: string; scope: string }) => {
+      let flagged: { selection: ModelSelection; flagged: LineageChange[] } = { selection, flagged: [] };
+      if (directive && runDirective) {
+        flagged = applyOwnerDirective(selection, driverKindFor, opts.contextFor, (entry) => {
+          const key = pendingKey(directive.botId, directive.scope, entry as ModelSelection);
+          if (!firstDirectivePass && !pendingBefore.has(key)) return false;
+          const context = opts.contextFor(entry.instanceId);
+          if (context && !context.catalogPending) return true;
+          // A shadow still names its driver: an id outside every directed
+          // class would not be flagged whatever the catalog says.
+          if (context) {
+            const hit = classifyModel(context.driverKind, entry.model);
+            if (!hit || !OWNER_DIRECTED_LATEST.classKeys.includes(hit.classKey)) return true;
+          }
+          pendingAfter.add(key);
+          return false;
+        });
+      }
       const reconciled = reconcileChain(flagged.selection, opts.contextFor);
       return { selection: reconciled.selection, flagged: flagged.flagged, changes: reconciled.changes };
     };
     for (const bot of this.bots) {
       if (wanted && !wanted.has(bot.id)) continue;
       if (opts.skipBusy && bot.busy) continue;
+      visited.add(bot.id);
       const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]);
       const notices: string[] = [];
       if (bot.modelSelection?.instanceId) {
         const saved = bot.modelSelection;
-        const next = pass(saved, runDirective);
+        const next = pass(saved, { botId: bot.id, scope: "bot" });
         log(bot, "bot", [...next.flagged, ...next.changes]);
         const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
         if (notice) notices.push(notice);
@@ -2293,12 +2348,12 @@ export class Store {
         }
       }
       if (bot.activeModelSelection?.instanceId) {
-        bot.activeModelSelection = pass(bot.activeModelSelection, false).selection;
+        bot.activeModelSelection = pass(bot.activeModelSelection).selection;
       }
       for (const task of bot.tasks ?? []) {
         if (task.modelSelection?.instanceId) {
           const saved = task.modelSelection;
-          const next = pass(saved, runDirective);
+          const next = pass(saved, { botId: bot.id, scope: `task ${task.threadId}` });
           log(bot, `task ${task.threadId}`, [...next.flagged, ...next.changes]);
           const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
           if (notice) notices.push(`${notice} (task “${task.title}”)`);
@@ -2307,7 +2362,7 @@ export class Store {
           if (task.threadId === bot.threadId) dropStaleCursors(bot.resumeCursors, next.changes);
         }
         if (task.activeModelSelection?.instanceId) {
-          task.activeModelSelection = pass(task.activeModelSelection, false).selection;
+          task.activeModelSelection = pass(task.activeModelSelection).selection;
         }
       }
       if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]) === before) continue;
@@ -2328,11 +2383,35 @@ export class Store {
       this.saveBots();
       this.flushBotsNow();
     }
-    if (runDirective && !directiveIncomplete) {
-      try {
-        writeFileAtomic(markerFile, `${JSON.stringify({ applied: [...applied, OWNER_DIRECTED_LATEST.id] }, null, 2)}\n`);
-      } catch (error) {
-        console.error("model-lineage: could not record the owner-directed migration", error);
+    if (runDirective) {
+      // A bot this pass skipped keeps whatever it still had pending; a bot
+      // that no longer exists has nothing left to migrate.
+      for (const key of pendingBefore) {
+        let botId: unknown;
+        try {
+          [botId] = JSON.parse(key) as unknown[];
+        } catch {
+          continue;
+        }
+        if (typeof botId === "string" && !visited.has(botId) && this.bots.some((bot) => bot.id === botId)) {
+          pendingAfter.add(key);
+        }
+      }
+      const pendingChanged =
+        pendingAfter.size !== pendingBefore.size || [...pendingAfter].some((key) => !pendingBefore.has(key));
+      if (firstDirectivePass || pendingChanged) {
+        const pending = { ...pendingById };
+        if (pendingAfter.size) pending[directiveId] = [...pendingAfter];
+        else delete pending[directiveId];
+        const marker = {
+          applied: firstDirectivePass ? [...applied, directiveId] : applied,
+          ...(Object.keys(pending).length ? { pending } : {}),
+        };
+        try {
+          writeFileAtomic(markerFile, `${JSON.stringify(marker, null, 2)}\n`);
+        } catch (error) {
+          console.error("model-lineage: could not record the owner-directed migration", error);
+        }
       }
     }
     return results;

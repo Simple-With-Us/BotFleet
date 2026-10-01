@@ -143,30 +143,81 @@ describe("Store.reconcileModelLineage", () => {
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5" });
   });
 
-  it("leaves the owner-directed marker unset while a selection's engine has no context, and applies once it does", () => {
+  it("records a selection whose engine has no context as pending, and floats it once the engine is back", () => {
     seedBots([{ id: "plumber", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }]);
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
     const markerPath = join(DATA_DIR, "model-lineage.json");
     claudeLoaded = false;
     reconcile(store, true);
-    expect(existsSync(markerPath)).toBe(false);
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
+    expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({
+      applied: [OWNER_DIRECTED_LATEST.id],
+      pending: { [OWNER_DIRECTED_LATEST.id]: [JSON.stringify(["plumber", "bot", "claude", "claude-sonnet-5"])] },
+    });
     claudeLoaded = true;
     reconcile(store, true);
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
-    expect(JSON.parse(readFileSync(markerPath, "utf8")).applied).toEqual([OWNER_DIRECTED_LATEST.id]);
+    expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({ applied: [OWNER_DIRECTED_LATEST.id] });
   });
 
-  it("leaves the owner-directed marker unset while an engine is known only as a shadow", () => {
-    seedBots([{ id: "plumber", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }]);
+  it("never flags an id on a shadow engine, and judges it against the real catalog once it loads", () => {
+    // "claude-sonnet-5" is this operator's own row on the Claude engine,
+    // which failed to load on the first upgraded boot.
+    seedBots([
+      { id: "custom", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } },
+      { id: "other", modelSelection: { instanceId: "dsh", model: "DeepSeek-V4.1-Flash" } },
+    ]);
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
     const markerPath = join(DATA_DIR, "model-lineage.json");
-    store.reconcileModelLineage({
-      contextFor: () => ({ driverKind: "claudeAgent", offeredIds: [], authoritative: false, catalogPending: true }),
-      nameFor: (id, model) => modelNameFor(instance(id)?.models, model),
-      ownerDirective: true,
-    });
-    expect(existsSync(markerPath)).toBe(false);
+    const shadow = (id: string) =>
+      id === "claude"
+        ? { driverKind: "claudeAgent", offeredIds: [], authoritative: false, catalogPending: true }
+        : lineageContextFor(instance(id));
+    const withCustomRow = (id: string) => {
+      const context = lineageContextFor(instance(id));
+      return id === "claude" && context ? { ...context, customIds: ["claude-sonnet-5"] } : context;
+    };
+    const run = (contextFor: typeof shadow) =>
+      store.reconcileModelLineage({ contextFor, nameFor: (id, model) => modelNameFor(instance(id)?.models, model), ownerDirective: true });
+
+    run(shadow);
+    expect(store.bot("custom")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
+    expect(JSON.parse(readFileSync(markerPath, "utf8")).pending[OWNER_DIRECTED_LATEST.id]).toEqual([
+      JSON.stringify(["custom", "bot", "claude", "claude-sonnet-5"]),
+    ]);
+
+    run(withCustomRow);
+    expect(store.bot("custom")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
+    expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual({ applied: [OWNER_DIRECTED_LATEST.id] });
+  });
+
+  it("never re-floats a migrated selection pinned while another engine is still pending", () => {
+    seedBots([
+      { id: "plumber", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } },
+      { id: "coder", modelSelection: { instanceId: "codex", model: "gpt-5.6-luna" } },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    const codexShadow = (id: string) =>
+      id === "codex"
+        ? { driverKind: "codex", offeredIds: [], authoritative: false, catalogPending: true }
+        : lineageContextFor(instance(id));
+    const run = (contextFor: (id: string) => ReturnType<typeof lineageContextFor>) =>
+      store.reconcileModelLineage({ contextFor, nameFor: (id, model) => modelNameFor(instance(id)?.models, model), ownerDirective: true });
+
+    run(codexShadow);
+    expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+    expect(store.bot("coder")!.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-luna" });
+
+    // The person pins Sonnet 5.5; Codex is still not loaded at the next boot.
+    store.patchBot("plumber", { modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" } });
+    run(codexShadow);
+    expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5" });
+
+    // Codex is back: only the entry that was waiting on it floats.
+    run((id) => lineageContextFor(instance(id)));
+    expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5" });
+    expect(store.bot("coder")!.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" });
+    expect(JSON.parse(readFileSync(join(DATA_DIR, "model-lineage.json"), "utf8"))).toEqual({ applied: [OWNER_DIRECTED_LATEST.id] });
   });
 
   it("drops the native Codex resume cursor when a reconcile rewrites that engine's model", () => {
@@ -185,6 +236,34 @@ describe("Store.reconcileModelLineage", () => {
     expect(bot.modelSelection.model).toBe("gpt-6-luna");
     expect(bot.resumeCursors).toEqual({ claude: "keep" });
     expect(bot.tasks![0]!.resumeCursors).toEqual({ claude: "keep" });
+  });
+
+  it("drops a task's Codex cursor when its own selection moves, and keeps a Claude cursor across a Claude move", () => {
+    seedBots([
+      {
+        id: "b",
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
+        resumeCursors: { codex: "thread-old", claude: "claude-session" },
+        tasks: [
+          {
+            threadId: "thread-b",
+            title: "Main",
+            createdAt: 1_000,
+            modelSelection: { instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" },
+            resumeCursors: { codex: "thread-old", claude: "claude-session" },
+          },
+        ],
+      },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    codexModels = { ...CODEX_LIVE, options: [...CODEX_LIVE.options, { id: "gpt-6-luna", label: "GPT-6 Luna" }] };
+    reconcile(store);
+    const bot = store.bot("b")!;
+    expect(bot.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+    expect(bot.tasks![0]!.modelSelection).toEqual({ instanceId: "codex", model: "gpt-6-luna", latest: "luna" });
+    expect(bot.tasks![0]!.resumeCursors).toEqual({ claude: "claude-session" });
+    // The bot's legacy mirror follows the task shown in chat.
+    expect(bot.resumeCursors).toEqual({ claude: "claude-session" });
   });
 
   it("resolves Latest Luna only once the live catalog offers a newer Luna", () => {
@@ -293,5 +372,67 @@ describe("Store.reconcileModelLineage", () => {
     const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
     reconcile(store, true);
     expect(existsSync(join(DATA_DIR, "model-lineage.json"))).toBe(false);
+  });
+});
+
+describe("Store load: one flat fallback chain", () => {
+  it("drops a fallback's own fallbacks once, with a log line, and leaves a flat chain alone", () => {
+    const log = vi.mocked(console.log);
+    seedBots([
+      {
+        id: "nested",
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [
+            {
+              instanceId: "codex",
+              model: "gpt-5.6-luna",
+              latest: "luna",
+              fallbacks: [{ instanceId: "claude", model: "claude-opus-5-5", fallbacks: [{ instanceId: "grok", model: "grok-4.7" }] }],
+            },
+            { instanceId: "grok", model: "grok-4.7" },
+          ],
+        },
+        tasks: [
+          {
+            threadId: "thread-nested",
+            title: "Main",
+            createdAt: 1_000,
+            resumeCursors: {},
+            modelSelection: {
+              instanceId: "codex",
+              model: "gpt-5.6-luna",
+              fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", fallbacks: [{ instanceId: "grok", model: "grok-4.7" }] }],
+            },
+          },
+        ],
+      },
+      { id: "flat", modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", fallbacks: [{ instanceId: "grok", model: "grok-4.7" }] } },
+    ]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    expect(store.bot("nested")!.modelSelection).toEqual({
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [
+        { instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" },
+        { instanceId: "grok", model: "grok-4.7" },
+      ],
+    });
+    expect(store.bot("nested")!.tasks![0]!.modelSelection).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5" }],
+    });
+    expect(store.bot("flat")!.modelSelection).toEqual({
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }],
+    });
+    const lines = log.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("nested fallback"));
+    expect(lines).toEqual([
+      "store: nested (nested) modelSelection dropped 2 nested fallback entries that never ran",
+      "store: nested (nested) task thread-nested modelSelection dropped 1 nested fallback entry that never ran",
+    ]);
   });
 });
