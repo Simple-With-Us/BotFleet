@@ -31,13 +31,24 @@ describe("readClaudeModelCatalog", () => {
     );
 
     expect(readClaudeModelCatalog({ HOME: home })).toEqual({
-      default: "claude-sonnet-5",
+      default: STATIC_CLAUDE_MODELS.default,
       options: [
         ...STATIC_CLAUDE_MODELS.options,
         { id: "my-local-opus", label: "Local Opus", custom: true },
         { id: "hosted-qwen", label: "hosted-qwen", custom: true },
       ],
     });
+  });
+
+  it("offers Sonnet 5.5 and Opus 5.5 as untagged official rows, with Sonnet 5.5 the default", () => {
+    const catalog = readClaudeModelCatalog({ HOME: join(tmpdir(), "omb-claude-missing-home") });
+    expect(catalog.default).toBe("claude-sonnet-5-5");
+    for (const id of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+      const row = catalog.options.find((option) => option.id === id);
+      // Untagged: a `custom` row would land behind "Use a Local Model".
+      expect(row).toMatchObject({ supportsEffort: true, effortLevels: ["low", "medium", "high", "xhigh", "max"] });
+      expect(row?.custom).toBeUndefined();
+    }
   });
 
   it("does not list settings.model as a Custom leftover", () => {

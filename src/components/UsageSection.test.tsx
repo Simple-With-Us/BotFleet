@@ -128,6 +128,12 @@ describe("modelDisplayName", () => {
   it("falls back gracefully for unknown models", () => {
     expect(modelDisplayName("unknown-provider-model")).toBe("unknown-provider-model");
   });
+
+  it("labels retired Claude and Grok ids from their model class, not a stale table", () => {
+    expect(modelDisplayName("claude-3-7-sonnet")).toBe("Claude Sonnet 3.7");
+    expect(modelDisplayName("grok-4.6")).toBe("Grok 4.6");
+    expect(modelDisplayName("gpt-5.6-luna")).toBe("GPT-5.6 Luna");
+  });
 });
 
 describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
