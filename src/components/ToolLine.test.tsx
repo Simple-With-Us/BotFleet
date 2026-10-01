@@ -215,3 +215,18 @@ describe("a closed tool row", () => {
     expect(html).toContain("disabled");
   });
 });
+
+describe("a helper's step (jobs P0)", () => {
+  it("nests under the row that started the helper", () => {
+    const html = render(message({ parentItemId: "task-1" }), { threadId: THREAD });
+    expect(html).toContain('data-helper-step="task-1"');
+    expect(html).toContain("border-l");
+    expect(html).toContain("helper · Bash");
+  });
+
+  it("leaves the bot's own steps at the margin", () => {
+    const html = render(message(), { threadId: THREAD });
+    expect(html).not.toContain("data-helper-step");
+    expect(html).not.toContain("helper · ");
+  });
+});

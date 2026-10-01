@@ -305,7 +305,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        // Jobs matrix: remote, opaque and without MCP — neither jobs nor
+        // helpers reach this engine.
+        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none" },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.cancel(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer

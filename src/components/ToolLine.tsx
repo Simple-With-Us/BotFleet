@@ -99,7 +99,11 @@ export function ToolLine({
   const hasDetail = Boolean(tool.detail);
   const expandable = hasDetail || hasTarget || ioRef !== null;
   const time = new Date(message.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  const title = `${actor ? `${actor} · ` : ""}${tool.name}${
+  // A helper's (native subagent's) step hangs under the row that started the
+  // helper: indented, with a rule down its left edge, so parallel helpers'
+  // work reads as theirs and not as the bot's own (full Helper cards: P3).
+  const helperStep = Boolean(tool.parentItemId);
+  const title = `${actor ? `${actor} · ` : ""}${helperStep ? "helper · " : ""}${tool.name}${
     tool.target ? ` · ${tool.target}` : ""
   } · ${time}${failed ? " · failed" : running ? " · running" : ""}`;
 
@@ -130,7 +134,10 @@ export function ToolLine({
   ) : null;
 
   return (
-    <div className="flex w-full flex-col">
+    <div
+      className={cn("flex w-full flex-col", helperStep && "ml-4 w-[calc(100%-1rem)] border-l border-hairline/70 pl-1.5")}
+      data-helper-step={helperStep ? tool.parentItemId : undefined}
+    >
       <div
         className={cn(
           "group/step flex w-full items-baseline gap-2 rounded-md px-1.5 py-[3px] text-[13px] leading-6",

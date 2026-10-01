@@ -8,11 +8,13 @@
 //   - Composio Sessions (connected apps → tools) over streamable HTTP
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { createServer as createNetServer } from "node:net";
+import { createServer as createNetServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+
+import { z } from "zod";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
@@ -164,6 +166,86 @@ export function claudeSignedIn(
   });
 }
 
+/** Engine-native work that outlives a turn, switched off (background jobs P0,
+ * docs/plans/2026-10-01-background-jobs-and-subagents-decision.md).
+ *
+ * A Claude bot could start a background shell or helper, end its turn, and
+ * have the CLI start a NEW turn on its own when that work finished.  That turn
+ * reached the transcript as a ghost message: no turn record, no watchdog, no
+ * spend accounting, and its approvals auto-denied.  Every name below was read
+ * out of the Claude Code 2.1.284 binary, not guessed, and the tool-list
+ * effects were checked against that build's `init` frame:
+ *
+ * - `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` drops `run_in_background` from the
+ *   Bash and Agent schemas and turns off auto-backgrounding of slow commands.
+ *   It removes no tool from the list.
+ * - `CLAUDE_CODE_DISABLE_CRON` stops the headless runner's scheduler, and
+ *   removes CronCreate, CronDelete and CronList from the tool list.  It does
+ *   NOT remove ScheduleWakeup, Monitor or Workflow: the deny list below does.
+ * - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` (default 3; the main thread is
+ *   depth 0 and a spawn is refused once depth >= the cap) holds native
+ *   helpers to one level.  2.1.284 enforces it as set.
+ * - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) asks for at most 3
+ *   helpers at once.  It is ADVISORY: 2.1.284 skips the check when a
+ *   server-side feature gate (`tengu_amber_kestrel`) or ultracode mode is
+ *   on, and nothing outside the CLI can turn either off.  A hard bound
+ *   belongs with the typed Helper cards (P3).
+ *
+ * Forced over any inherited value: these are a safety floor, not defaults. */
+export const CLAUDE_CONTAINMENT_ENV = {
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+  CLAUDE_CODE_DISABLE_CRON: "1",
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
+  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
+} as const satisfies Record<string, string>;
+
+/** Settings every turn launches with (`--settings`, which outranks user and
+ * project settings; managed policy may only tighten it).
+ *
+ * `crossSessionInbound: "refuse"`: every Claude Code session on this machine
+ * listens on a messaging socket, and any other local session can send it a
+ * message (SendMessage).  In a headless process that message starts a turn
+ * of its own, with `origin.kind: "peer"`, and in a bypassPermissions
+ * (full-auto) bot it is delivered without any approval.  Probed on 2.1.284:
+ * a peer message to a bypass-mode stream-json process started a turn; the
+ * same message to one launched with this setting started nothing.  A bot
+ * takes work from its owner through BotFleet, never from a stranger's
+ * session. */
+export const CLAUDE_CONTAINMENT_SETTINGS = { crossSessionInbound: "refuse" } as const;
+
+/** Built-ins whose whole job is to start a turn later, with nobody's message
+ * behind it, denied outright:
+ *
+ * - ScheduleWakeup and CronCreate enqueue a prompt into the running process
+ *   when they fire (the headless runner's cron scheduler); CronList and
+ *   CronDelete only manage those jobs.  `CLAUDE_CODE_DISABLE_CRON` already
+ *   removes the three Cron tools; they stay here so a CLI that ignores the
+ *   switch still cannot reach them.
+ * - Monitor streams a background command's output back as notifications, and
+ *   is not gated by the background-tasks switch.
+ * - Workflow runs as a background task that reports back on completion, and
+ *   spawns helpers outside the cap above.
+ *
+ * BotFleet's own job tools (P1) replace all of this with turns it owns. */
+export const CLAUDE_CONTAINMENT_DISALLOWED_TOOLS: readonly string[] = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "Monitor",
+  "Workflow",
+];
+
+/** The `--disallowedTools` list a turn launches with: the bot's own denials,
+ * then the whole containment set, always.  Filtering the set by the bot's
+ * `tools` list would trust that list to be literal names, and it is not:
+ * the CLI reads `--tools default` as every built-in.  Denying a tool the
+ * list does not offer is harmless (checked on 2.1.284 with `--tools ""` and
+ * `--tools Read`). */
+export function claudeDisallowedTools(config: Pick<ClaudeConfig, "disallowedTools">): string[] {
+  return [...new Set([...(config.disallowedTools ?? []), ...CLAUDE_CONTAINMENT_DISALLOWED_TOOLS])];
+}
+
 /** The CLI environment shared by auth probes and real turns.
  *
  * Subscription users can be billed pay-as-you-go if an inherited API key
@@ -178,13 +260,93 @@ function claudeEnvironment(
   const env: NodeJS.ProcessEnv = { ...source, PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" };
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
+  // A harness started from inside a Claude Code session inherits that
+  // session's messaging inbox.  A bot's CLI is not that session.
+  delete env.CLAUDE_CODE_MESSAGING_SOCKET;
+  delete env.CLAUDE_CODE_MESSAGING_TOKEN;
   // The harness process may hold workspace credentials (xai/box/voice keys,
   // env-injected at boot); none of them are this CLI's to see.
   stripWorkspaceCredentialEnv(env);
   const applied = applyClaudeInject(env, model);
   if (!applied.injected) delete env.ANTHROPIC_API_KEY;
+  Object.assign(env, CLAUDE_CONTAINMENT_ENV);
   return env;
 }
+
+/** Frames and turns containment kept out of BotFleet's turns, counted for
+ * the harness's lifetime so a test, or a person reading logs, can see that
+ * it fired; never reset.
+ *
+ * - `dropped`: frames of a CLI turn BotFleet did not start.
+ * - `turns`: such turns that began with no BotFleet turn on the process
+ *   (each one stops the process).
+ * - `foreignResults`: such turns that ended while a BotFleet turn waited
+ *   behind them. */
+const unsolicitedFrames = { dropped: 0, turns: 0, foreignResults: 0 };
+export function claudeUnsolicitedFrameStats(): Readonly<typeof unsolicitedFrames> {
+  return { ...unsolicitedFrames };
+}
+
+/** The frames that mean the CLI is running a turn of its own.  Other system
+ * frames (hook progress, state changes, prompt suggestions) and the terminal
+ * lifecycle states of a command that already ran can legitimately follow a
+ * result and say nothing about a new turn. */
+function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown; state?: unknown }): boolean {
+  if (frame.type === "stream_event" || frame.type === "assistant" || frame.type === "user") return true;
+  if (frame.type === "command_lifecycle") return frame.state === "started";
+  return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
+}
+
+type TurnUsage = { input: number; output: number; cachedInput?: number };
+
+/** Two reported usages as one, keeping the cache share when either has it. */
+function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
+  if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  return usage;
+}
+
+/** A short tag for a log line: enough to tell threads apart, never the id. */
+function threadTag(threadId: string): string {
+  return createHash("sha256").update(threadId).digest("hex").slice(0, 8);
+}
+
+/** The few fields containment reads off a raw stream-json frame, each
+ * dropped to undefined when the CLI sent something else.
+ *
+ * - `origin.kind` says where a result came from: `human` for a message on
+ *   stdin, anything else for a turn the CLI started itself
+ *   (`task-notification`, `peer`, `channel`, ...).  Absent on CLIs before
+ *   the field.
+ * - `queued_turn_count` counts user sends still waiting behind a result.
+ * - `total_cost_usd` is the PROCESS's running total, not the turn's.
+ * - `command_uuid` and `state` are a `command_lifecycle` frame's: the uuid
+ *   BotFleet stamped on a message it wrote, and how far the CLI got with it
+ *   (`queued`, `started` when a turn takes it, then one of `completed`,
+ *   `cancelled`, `discarded`, `refused`).
+ * - `user_message_uuid(s)` on a result (and on the first reply frame) name
+ *   the stamped messages that CLI turn consumed.
+ * - `parent_tool_use_id` names the Task/Agent call a helper frame belongs to. */
+const FrameMeta = z
+  .object({
+    subtype: z.string().optional().catch(undefined),
+    origin: z.object({ kind: z.string() }).optional().catch(undefined),
+    queued_turn_count: z.number().optional().catch(undefined),
+    total_cost_usd: z.number().optional().catch(undefined),
+    command_uuid: z.string().min(1).optional().catch(undefined),
+    state: z.string().optional().catch(undefined),
+    user_message_uuid: z.string().min(1).optional().catch(undefined),
+    user_message_uuids: z.array(z.string()).optional().catch(undefined),
+    parent_tool_use_id: z.string().min(1).optional().catch(undefined),
+  })
+  // a frame that is not an object at all carries none of them
+  .catch({});
+
+/** Lifecycle states after which a command will never run (it may have run
+ * already, for `completed`). */
+const COMMAND_ENDED_STATES = new Set(["completed", "cancelled", "discarded", "refused"]);
 
 const DRIVER_KIND = "claudeAgent";
 const CLAUDE_ISOLATION_REASON = "Update Claude Code to a version supporting --strict-mcp-config and refresh engines; CLI isolation support could not be verified.";
@@ -332,11 +494,21 @@ export function permissionSocketPath(threadId: string) {
   return brokerSocketPath(DATA_DIR, `${prefix}${digest}`);
 }
 
+/** How long an ask may wait for the turn it arrived in to show it is the
+ * BotFleet turn's own work (see `isActive`'s `"wait"`).  The turn's own
+ * frames are written seconds before any tool it calls asks, so this only
+ * covers an event-loop stall that delivers both in one tick. */
+const ASK_ADMISSION_WAIT_MS = 5_000;
+
 function createPermissionBroker(opts: {
   socketPath: string;
   onAsk: (ask: Ask) => void;
   onResolve: (resolved: Ask & { behavior: AskBehavior; source: AskResolutionSource }) => void;
-  isActive?: () => boolean;
+  /** Whether an ask arriving now belongs to a running BotFleet turn: `true`
+   *  opens a card, `false` answers it as ended, and `"wait"` holds it until
+   *  `recheck()` (or ASK_ADMISSION_WAIT_MS) decides — the CLI is running a
+   *  turn, but nothing has shown yet that it is the BotFleet turn's. */
+  isActive?: () => boolean | "wait";
   timeoutMs?: number;
 }) {
   const timeoutMs = opts.timeoutMs ?? 15 * 60_000;
@@ -344,6 +516,8 @@ function createPermissionBroker(opts: {
     string,
     { ask: Ask; finish: (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => void }
   >();
+  /** Asks waiting for a `"wait"` verdict to resolve, in arrival order. */
+  const held: Array<{ conn: Socket; msg: any; askId: string; kind: Ask["kind"]; timer: ReturnType<typeof setTimeout> }> = [];
   // server.close() only stops accepting NEW connections — it does not touch
   // a connection that's already open. A still-alive child's MCP proxy can
   // keep sending asks on such a connection after the turn has ended, and
@@ -355,6 +529,60 @@ function createPermissionBroker(opts: {
   try {
     unlinkSync(opts.socketPath);
   } catch {}
+  const answerEnded = (conn: Socket, askId: string, kind: Ask["kind"]) => {
+    try {
+      conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
+    } catch {}
+  };
+  const admit = (conn: Socket, msg: any, askId: string, kind: Ask["kind"]) => {
+    // `pending` is server-scoped, not per-connection: two asks with the
+    // same id — a buggy/adversarial client, never a legitimate retry
+    // (permission-proxy mints a fresh randomUUID per ask) — would
+    // otherwise let the second `pending.set` silently overwrite the
+    // first, orphaning it as an unanswerable card once the first
+    // resolves and deletes the shared key. Reject before either ask
+    // becomes visible to onAsk.
+    if (pending.has(askId)) {
+      // askId is client-controlled; JSON.stringify escapes newlines and
+      // control characters so it can't corrupt the log line or terminal.
+      console.error(`permission broker on ${opts.socketPath}: duplicate ask id ${JSON.stringify(askId)} — denying`);
+      try {
+        conn.write(JSON.stringify({ t: "answer", id: askId, behavior: "deny", message: DUPLICATE_ASK_ID_NOTE }) + "\n");
+      } catch {}
+      return;
+    }
+    const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
+    const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
+      if (!pending.delete(askId)) return;
+      clearTimeout(timer);
+      try {
+        conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
+      } catch {}
+      opts.onResolve({ ...ask, behavior, source });
+    };
+    const timer = setTimeout(
+      () =>
+        kind === "question"
+          ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
+          : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
+      timeoutMs,
+    );
+    timer.unref?.();
+    pending.set(askId, { ask, finish });
+    opts.onAsk(ask);
+  };
+  /** Settle every held ask whose verdict is no longer `"wait"`; `force`
+   *  answers the rest as ended. */
+  const recheck = (force = false) => {
+    for (const entry of [...held]) {
+      const verdict = force || closed ? false : opts.isActive ? opts.isActive() : true;
+      if (verdict === "wait") continue;
+      held.splice(held.indexOf(entry), 1);
+      clearTimeout(entry.timer);
+      if (verdict) admit(entry.conn, entry.msg, entry.askId, entry.kind);
+      else answerEnded(entry.conn, entry.askId, entry.kind);
+    }
+  };
   const server = createNetServer((conn) => {
     conn.on("error", () => {});
     let buf = "";
@@ -379,55 +607,31 @@ function createPermissionBroker(opts: {
           // entry or notify onAsk, but always answer an existing connection:
           // permission-proxy.ts only resolves on an explicit answer (or a
           // connection error/close), so a silent drop would hang the tool.
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
-          } catch {}
+          answerEnded(conn, askId, kind);
           continue;
         }
         // A retained Claude process keeps its proxy connection between
         // turns. Late/background asks must still fail closed without opening
-        // a card for a turn that has already settled.
-        if (opts.isActive && !opts.isActive()) {
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, ...systemEndedReply(kind) }) + "\n");
-          } catch {}
+        // a card for a turn that has already settled — and an ask from a
+        // turn the CLI started on its own, while a BotFleet turn waits behind
+        // it, must not become a card on the person's turn.
+        const verdict = opts.isActive ? opts.isActive() : true;
+        if (verdict === false) {
+          answerEnded(conn, askId, kind);
           continue;
         }
-        // `pending` is server-scoped, not per-connection: two asks with the
-        // same id — a buggy/adversarial client, never a legitimate retry
-        // (permission-proxy mints a fresh randomUUID per ask) — would
-        // otherwise let the second `pending.set` silently overwrite the
-        // first, orphaning it as an unanswerable card once the first
-        // resolves and deletes the shared key. Reject before either ask
-        // becomes visible to onAsk.
-        if (pending.has(askId)) {
-          // askId is client-controlled; JSON.stringify escapes newlines and
-          // control characters so it can't corrupt the log line or terminal.
-          console.error(`permission broker on ${opts.socketPath}: duplicate ask id ${JSON.stringify(askId)} — denying`);
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, behavior: "deny", message: DUPLICATE_ASK_ID_NOTE }) + "\n");
-          } catch {}
+        if (verdict === "wait") {
+          const entry = { conn, msg, askId, kind, timer: setTimeout(() => {
+            const at = held.indexOf(entry);
+            if (at === -1) return;
+            held.splice(at, 1);
+            answerEnded(conn, askId, kind);
+          }, ASK_ADMISSION_WAIT_MS) };
+          entry.timer.unref?.();
+          held.push(entry);
           continue;
         }
-        const ask: Ask = { id: askId, kind, tool: msg.tool ?? "tool", input: msg.input ?? {}, at: Date.now() };
-        const finish = (behavior: AskBehavior, message: string | undefined, source: AskResolutionSource) => {
-          if (!pending.delete(askId)) return;
-          clearTimeout(timer);
-          try {
-            conn.write(JSON.stringify({ t: "answer", id: askId, behavior, message }) + "\n");
-          } catch {}
-          opts.onResolve({ ...ask, behavior, source });
-        };
-        const timer = setTimeout(
-          () =>
-            kind === "question"
-              ? finish("answer", QUESTION_TIMEOUT_NOTE, "timeout")
-              : finish("deny", DENY_TIMEOUT_NOTE, "timeout"),
-          timeoutMs,
-        );
-        timer.unref?.();
-        pending.set(askId, { ask, finish });
-        opts.onAsk(ask);
+        admit(conn, msg, askId, kind);
       }
     });
   });
@@ -439,6 +643,7 @@ function createPermissionBroker(opts: {
   });
   server.listen(opts.socketPath);
   const drain = () => {
+    recheck(true);
     for (const p of [...pending.values()]) {
       const { behavior, message } = systemEndedReply(p.ask.kind);
       p.finish(behavior, message, "system");
@@ -451,6 +656,10 @@ function createPermissionBroker(opts: {
       if (p.ask.kind === "question" ? behavior !== "answer" : behavior === "answer") return false;
       p.finish(behavior, message, "user");
       return true;
+    },
+    /** Decide the asks held on `"wait"` now that the turn's state moved. */
+    recheck() {
+      recheck();
     },
     pause() {
       drain();
@@ -619,6 +828,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
          *  message already surfaced as an error, and the result frame that
          *  follows settles the turn `unknown_model`. */
         modelRejection?: string;
+        /** Every message BotFleet wrote for this turn — its own and each
+         *  steer — by the uuid stamped on it.  A CLI turn that takes one of
+         *  these is this turn's work; any other CLI turn is not. */
+        sends: Set<string>;
+        /** This turn's share of the process's running cost, summed over its
+         *  own CLI results: undefined before the first, null once any share
+         *  is unknown. */
+        cost?: number | null;
+        /** Usage summed over this turn's own CLI results (each result's
+         *  usage is that CLI turn's alone). */
+        usage?: TurnUsage;
+        /** How this turn's latest own CLI turn ended: what the settle
+         *  reports, once nothing more of the turn is still to run. */
+        outcome?: { ok: boolean; stopReason: string | null };
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -626,7 +849,38 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       idleTimer: ReturnType<typeof setTimeout> | null;
       closing: boolean;
       stderr: string;
+      /** The CLI reports `command_lifecycle` frames (2.1.284 does), so a
+       *  frame's turn is KNOWN: it belongs to the BotFleet turn only once a
+       *  CLI turn has taken one of that turn's messages (`engaged`).  An
+       *  older CLI is trusted the old way — every frame while a turn runs is
+       *  that turn's. */
+      lifecycle: boolean;
+      /** The CLI turn running now has taken one of the BotFleet turn's
+       *  messages.  Cleared by every result. */
+      engaged: boolean;
+      /** Messages written into this process that no CLI turn has taken yet.
+       *  The BotFleet turn stays open while any is left: each one still gets
+       *  a CLI turn, and that reply is this turn's. */
+      unconsumed: Set<string>;
+      /** The process's running `total_cost_usd` as last reported, or null
+       *  when unknown (a resumed session whose earlier total this harness
+       *  never saw).  A turn's cost is how far its results move it. */
+      costTotal: number | null;
+      /** The CLI started a turn of its own with no BotFleet turn on the
+       *  process (a peer message, a scheduled prompt): its frames are
+       *  dropped and the process is being stopped. */
+      unsolicited: boolean;
+      /** Frames dropped for the unsolicited turn in progress, for its log line. */
+      unsolicitedFrames: number;
+      /** A turn the CLI started on its own is running ahead of the BotFleet
+       *  turn's message; set once per such turn, for its log line. */
+      foreignRunning: boolean;
     }
+    /** The running cost total each CLI session last reported, by the CLI's
+     *  session id.  A process resumed with `--resume` starts from the total
+     *  its transcript saved, so its first result carries every earlier turn:
+     *  this is what that result is measured against. */
+    const cliCostTotals = new Map<string, number>();
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
     const configuredIdleMinimum = Number(process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS);
@@ -663,17 +917,33 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       s.idleTimer = setTimeout(() => closeSession(threadId, "idle"), SESSION_IDLE_MS);
       s.idleTimer.unref?.();
     };
+    /** Write a user message for the running turn.  It is stamped with a uuid
+     *  the CLI reports back (`command_lifecycle`, `user_message_uuids`), and
+     *  recorded as this turn's and as not yet taken BEFORE the write: the
+     *  CLI's answer can only be read after it. */
     const writeUser = (s: Session, threadId: string, text: string): Promise<boolean> => {
-      const promptMsg = { type: "user", message: { role: "user", content: text } };
+      const uuid = randomUUID();
+      const promptMsg = { type: "user", uuid, message: { role: "user", content: text } };
       if (!s.child.stdin.writable || s.child.stdin.destroyed) return Promise.resolve(false);
+      const turn = s.turn;
+      turn?.sends.add(uuid);
+      s.unconsumed.add(uuid);
+      const forget = () => {
+        turn?.sends.delete(uuid);
+        s.unconsumed.delete(uuid);
+      };
       return new Promise((resolve) => {
         try {
           s.child.stdin.write(JSON.stringify(promptMsg) + "\n", (error) => {
-            if (error) return resolve(false);
+            if (error) {
+              forget();
+              return resolve(false);
+            }
             appendNative(threadId, { dir: "out", source: "claude.sdk.message", msg: promptMsg });
             resolve(true);
           });
         } catch {
+          forget();
           resolve(false);
         }
       });
@@ -764,9 +1034,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         "--permission-mode", permissionMode === "auto" ? "acceptEdits" : permissionMode,
       ];
       if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
-      if (config.disallowedTools?.length) {
-        args.push("--disallowedTools", config.disallowedTools.join(","));
-      }
+      args.push("--disallowedTools", claudeDisallowedTools(config).join(","));
+      args.push("--settings", JSON.stringify(CLAUDE_CONTAINMENT_SETTINGS));
       const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
@@ -906,9 +1175,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
       const live = sessions.get(threadId);
-      if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
+      if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
-        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort };
+        live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort };
+        live.engaged = false;
+        live.foreignRunning = false;
         // stderr feeds the crash message; a warm process still holds turn
         // 1's buffer, which would mislabel turn 2's failure
         live.stderr = "";
@@ -942,7 +1213,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
         return { turnId };
       }
-      if (live) closeSession(threadId, "spawn contract changed");
+      if (live) closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
@@ -952,7 +1223,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const askTools = new Map<string, string | undefined>();
         broker = createPermissionBroker({
           socketPath,
-          isActive: () => Boolean(sessions.get(threadId)?.turn),
+          // A turn the CLI started on its own may be running ahead of this
+          // BotFleet turn's message: its asks are not the person's to answer
+          // (see Session.lifecycle), so they wait until the CLI shows which
+          // turn is running, and are refused if it never shows it is ours.
+          isActive: () => {
+            const s = sessions.get(threadId);
+            if (!s?.turn) return false;
+            return !s.lifecycle || s.engaged ? true : "wait";
+          },
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
             askTools.set(ask.id, typeof ask.tool === "string" ? ask.tool : undefined);
@@ -1000,24 +1279,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         argsKey,
         sessionId: sessionId ?? newSessionId,
         pendingReceipt: null,
-        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort },
+        turn: { turnId, settled: false, sawStreamDelta: false, producedOutput: false, sends: new Set(), input: turn, retry, retryAbort },
         idleTimer: null,
         closing: false,
         stderr: "",
+        lifecycle: false,
+        engaged: false,
+        unconsumed: new Set(),
+        // A fresh session starts at zero; a resumed one from the total its
+        // transcript saved, which is the last one this harness saw, if any.
+        costTotal: sessionId ? (cliCostTotals.get(sessionId) ?? null) : 0,
+        unsolicited: false,
+        unsolicitedFrames: 0,
+        foreignRunning: false,
       };
       sessions.set(threadId, session);
 
       // settles the TURN, not the process: the CLI stays for the next
-      // message until it has been quiet for SESSION_IDLE_MS
-      const settle = (
-        ok: boolean,
-        stopReason: string | null,
-        cost: number | null = null,
-        usage?: { input: number; output: number; cachedInput?: number },
-      ) => {
+      // message until it has been quiet for SESSION_IDLE_MS.  The cost and
+      // usage are what the turn's own CLI results added up to.
+      const settle = (ok: boolean, stopReason: string | null) => {
         const t = session.turn;
         if (!t || t.settled) return;
         t.settled = true;
+        const cost = t.cost ?? null;
+        const usage = t.usage;
         // Resolve any ask still open for this turn, but keep the broker
         // listening for the next turn on the retained process. Between turns
         // isActive() rejects late background asks without creating cards.
@@ -1032,6 +1318,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
         active.delete(threadId);
         session.turn = null;
+        session.engaged = false;
+        session.foreignRunning = false;
+        // Normally empty by now; a turn that ended any other way (a crash, a
+        // Stop) leaves nothing a later turn should wait on.
+        session.unconsumed.clear();
         // A settled turn owns no retry budget. Retained CLI sessions may run
         // many later turns on this thread, and each must start fresh.
         retryState.delete(threadId);
@@ -1048,7 +1339,157 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         });
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
+      /** The running BotFleet turn's id.  Only called with a turn running:
+       *  handleLine drops every frame that arrives without one, and the
+       *  process handlers check before they emit.  Falling back to the id
+       *  this process was spawned with is what used to stamp an engine's
+       *  own turn with a settled turn's id. */
       const currentTurnId = () => session.turn?.turnId ?? turnId;
+
+      /** Move the process's running cost total to `total` and return how far
+       *  it moved: what the CLI turn that just ended cost, or null when that
+       *  is unknown.  `total_cost_usd` is cumulative for the process (and a
+       *  resumed process starts from its transcript's total), so summing it
+       *  across results would bill every earlier turn again. */
+      const advanceCost = (total: number | undefined): number | null => {
+        if (total === undefined) return null;
+        const previous = session.costTotal;
+        // A crash or startup-error result can carry a zeroed total: it says
+        // nothing about what was spent, and must not reset the baseline.
+        if (total === 0 && previous !== null && previous > 0) return null;
+        session.costTotal = total;
+        if (session.sessionId) cliCostTotals.set(session.sessionId, total);
+        if (previous === null) return null;
+        // A mid-session /clear restarts the running total from zero.
+        return total >= previous ? total - previous : total;
+      };
+      const costLabel = (share: number | null) => (share === null ? "" : `, cost ${share.toFixed(4)}`);
+
+      /** The CLI's turn now running took one of the BotFleet turn's
+       *  messages: what it says from here on is that turn's. */
+      const engage = (uuid?: string) => {
+        if (uuid !== undefined) session.unconsumed.delete(uuid);
+        session.engaged = true;
+        session.foreignRunning = false;
+        session.broker?.recheck();
+      };
+
+      /** The CLI started a turn of its own with no BotFleet turn on this
+       *  process.  Hiding it is not enough: it would run its tools to the end
+       *  — in a full-auto bot with no approval at all — with no turn record,
+       *  watchdog or spend.  The process is stopped; the next turn relaunches
+       *  with --resume. */
+      const stopUnsolicited = (frame: { type?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        session.unsolicited = true;
+        unsolicitedFrames.turns++;
+        const subtype = meta.subtype ?? meta.state;
+        console.warn(
+          `[claude] thread ${threadTag(threadId)}: the CLI started a turn of its own ` +
+            `(${String(frame.type)}${subtype === undefined ? "" : `/${subtype}`}); dropping it and stopping the process`,
+        );
+        if (sessions.get(threadId) === session) closeSession(threadId, "the CLI started a turn of its own");
+        killCliTree(session.child);
+      };
+
+      /** A frame that arrived with no BotFleet turn on this process.  It is
+       *  never transcript text, never stamped with a settled turn's id, and
+       *  never settles or pauses anything: the turn that owned the broker and
+       *  the thread is gone, and the next one has not been written yet. */
+      const dropUnsolicited = (frame: { type?: unknown; subtype?: unknown; state?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        if (frame.type === "result") {
+          unsolicitedFrames.dropped++;
+          // its cost is the CLI's, not the next turn's: move the baseline
+          const share = advanceCost(meta.total_cost_usd);
+          console.warn(
+            `[claude] thread ${threadTag(threadId)}: dropped a turn the CLI started on its own ` +
+              `(${session.unsolicitedFrames + 1} frames, origin ${meta.origin?.kind ?? "unknown"}${costLabel(share)})`,
+          );
+          session.unsolicitedFrames = 0;
+          return;
+        }
+        // Hook progress, state changes, prompt suggestions and the end
+        // states of a command that already ran may trail a result; they
+        // start nothing and are nothing to drop.
+        if (!startsUnsolicitedTurn(frame)) return;
+        unsolicitedFrames.dropped++;
+        session.unsolicitedFrames++;
+        if (!session.unsolicited) stopUnsolicited(frame, meta);
+      };
+
+      /** A frame of a CLI turn that has not taken any of the BotFleet turn's
+       *  messages (a turn the CLI started on its own, still running when this
+       *  turn's message arrived): the message waits in the CLI's queue, and
+       *  nothing said before the CLI takes it is this turn's. */
+      const dropForeign = (frame: { type?: unknown; subtype?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        // a status or hook frame of an idle CLI says nothing about a turn
+        if (!startsUnsolicitedTurn(frame)) return;
+        unsolicitedFrames.dropped++;
+        if (session.foreignRunning) return;
+        session.foreignRunning = true;
+        const subtype = meta.subtype === undefined ? "" : `/${meta.subtype}`;
+        console.warn(
+          `[claude] thread ${threadTag(threadId)}: the CLI is running a turn of its own ahead of this turn's message ` +
+            `(${String(frame.type)}${subtype}); dropping its frames`,
+        );
+      };
+
+      /** Settle once nothing of the turn is left to run: a message of its
+       *  own ended without any CLI turn taking it. */
+      const settleIfDone = (state: string | undefined) => {
+        const t = session.turn;
+        if (!t || session.engaged || session.unconsumed.size > 0) return;
+        if (t.outcome) {
+          settle(t.outcome.ok, t.outcome.stopReason);
+          return;
+        }
+        emit({ ...base(threadId, t.turnId), type: "runtime.error", message: `Claude Code did not run this message (${state ?? "ended"}).` });
+        settle(false, `message_${state ?? "ended"}`);
+      };
+
+      // The CLI accepted the turn just written: this native session now
+      // carries the halves that turn delivered.  Committed on the first
+      // frame after submission, never at write time — a CLI that dies
+      // before reading stdin has carried nothing, and the next turn must
+      // deliver the volatile half again.  Keyed on the id the CLI reports,
+      // which is what the harness resumes with.
+      const commitReceipt = (o?: { type?: unknown; subtype?: unknown; session_id?: unknown }) => {
+        if (!session.pendingReceipt) return;
+        const { key, receipt } = session.pendingReceipt;
+        session.pendingReceipt = null;
+        if (o?.type === "system" && o.subtype === "init" && typeof o.session_id === "string") session.sessionId = o.session_id;
+        try {
+          writePromptSplitReceipt(DRIVER_KIND, session.sessionId ?? key, receipt);
+        } catch {
+          /* the next turn re-delivers the note; nothing else depends on it */
+        }
+      };
+
+      /** `command_lifecycle`: how far the CLI got with a message on stdin.
+       *  For a message BotFleet stamped, `started` (or a fold's `completed`)
+       *  is the moment a CLI turn takes it — from there the CLI's frames are
+       *  the BotFleet turn's. */
+      const onLifecycle = (frame: { type?: unknown; state?: unknown }, meta: z.infer<typeof FrameMeta>) => {
+        session.lifecycle = true;
+        const id = meta.command_uuid;
+        const state = meta.state;
+        const t = session.turn;
+        if (id !== undefined && t?.sends.has(id)) {
+          commitReceipt();
+          if (state === "queued") return;
+          const waiting = session.unconsumed.delete(id);
+          // a fold into a running turn may report `completed` before that
+          // turn's result, with no `started` of its own
+          if (state === "started" || (state === "completed" && waiting)) {
+            engage();
+            return;
+          }
+          if (waiting && state !== undefined && COMMAND_ENDED_STATES.has(state)) settleIfDone(state);
+          return;
+        }
+        // a command BotFleet did not write: with no turn here, a `started`
+        // is the CLI starting a turn of its own
+        if (!t) dropUnsolicited(frame, meta);
+      };
 
       const handleLine = (line: string) => {
         let o: any;
@@ -1058,22 +1499,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
-        // The CLI accepted the turn just written: this native session now
-        // carries the halves that turn delivered.  Committed on the first
-        // frame after submission, never at write time — a CLI that dies
-        // before reading stdin has carried nothing, and the next turn must
-        // deliver the volatile half again.  Keyed on the id the CLI reports,
-        // which is what the harness resumes with.
-        if (session.pendingReceipt) {
-          const { key, receipt } = session.pendingReceipt;
-          session.pendingReceipt = null;
-          if (o.type === "system" && o.subtype === "init" && typeof o.session_id === "string") session.sessionId = o.session_id;
-          try {
-            writePromptSplitReceipt(DRIVER_KIND, session.sessionId ?? key, receipt);
-          } catch {
-            /* the next turn re-delivers the note; nothing else depends on it */
+        // every stream-json frame is an object; anything else says nothing
+        if (o === null || typeof o !== "object") return;
+        const meta = FrameMeta.parse(o);
+        if (o.type === "command_lifecycle") {
+          onLifecycle(o, meta);
+          return;
+        }
+        if (!session.turn) {
+          dropUnsolicited(o, meta);
+          return;
+        }
+        if (session.lifecycle && !session.engaged) {
+          // The first reply frame of a CLI turn names the message it
+          // answers; a result is judged by the messages it consumed.
+          if (meta.user_message_uuid !== undefined && session.turn.sends.has(meta.user_message_uuid)) engage(meta.user_message_uuid);
+          else if (o.type !== "result") {
+            dropForeign(o, meta);
+            return;
           }
         }
+        if (!session.lifecycle) commitReceipt(o);
+        // A helper (native subagent) frame names the Task/Agent call that
+        // started it.  Its steps nest under that row; its own prose is the
+        // helper talking to its parent, not the bot answering anyone.
+        const helperOf = meta.parent_tool_use_id;
         switch (o.type) {
           case "system":
             if (o.subtype === "init") {
@@ -1086,7 +1536,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "stream_event": {
             // subagent narration is dropped — N parallel Tasks would
             // interleave their prose into one bubble (upstream-verified bug)
-            if (o.parent_tool_use_id) break;
+            if (helperOf) break;
             const ev = o.event ?? {};
             if (ev.type !== "content_block_delta") break;
             const d = ev.delta ?? {};
@@ -1104,7 +1554,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
-            if (session.turn && isModelRejectionFrame(o, text)) {
+            if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
               // Not an assistant reply: an error the turn failed on.  It must
               // reach the transcript as an error row, never as bot text, so
               // the failover reads "nothing produced" and walks on, and the
@@ -1116,12 +1566,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             if (text.trim()) {
               if (session.turn) session.turn.producedOutput = true;
-              // fallback delta for CLIs/paths that never streamed the block
-              if (!session.turn?.sawStreamDelta) {
-                emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+              if (!helperOf) {
+                // fallback delta for CLIs/paths that never streamed the block
+                if (!session.turn?.sawStreamDelta) {
+                  emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+                }
+                if (session.turn) session.turn.sawStreamDelta = false;
+                emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
               }
-              if (session.turn) session.turn.sawStreamDelta = false;
-              emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
@@ -1136,12 +1588,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemType: "tool",
                   itemId: b.id,
                   title: b.name,
+                  parentItemId: helperOf,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
                   ...captureInput(b.input),
                 });
               }
             }
-            if (msg.usage) {
+            // A helper's usage is ITS context, not the bot's: reported as the
+            // bot's it would swing the context meter on every helper step.
+            // The turn's result frame carries the whole bill either way.
+            if (msg.usage && !helperOf) {
               emit({
                 ...base(threadId, currentTurnId()),
                 type: "thread.token-usage.updated",
@@ -1171,8 +1627,44 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
-            // result.usage is this invocation's total — one process per turn,
-            // so it is the turn's figure. cache reads count as input: they
+            const resultUsage: TurnUsage | undefined = o.usage
+              ? {
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  output: o.usage.output_tokens || 0,
+                  ...(typeof o.usage.cache_read_input_tokens === "number"
+                    ? { cachedInput: o.usage.cache_read_input_tokens }
+                    : {}),
+                }
+              : undefined;
+            const t = session.turn;
+            // Whose CLI turn just ended?  With lifecycle frames: one that took
+            // a message of this turn's (engaged), or whose result says it
+            // consumed one.  Without them (an older CLI), any human-origin
+            // result is this turn's — and a result the CLI's own turn wrote
+            // (`origin` task-notification, peer, ...) never is, whatever the
+            // queue count says.
+            const consumed = [...(meta.user_message_uuids ?? []), ...(meta.user_message_uuid === undefined ? [] : [meta.user_message_uuid])];
+            const claimsOurs = consumed.some((id) => t.sends.has(id));
+            for (const id of consumed) if (t.sends.has(id)) session.unconsumed.delete(id);
+            const origin = meta.origin?.kind;
+            const ours = session.lifecycle
+              ? session.engaged || claimsOurs
+              : claimsOurs || origin === undefined || origin === "human";
+            session.engaged = false;
+            const share = advanceCost(meta.total_cost_usd);
+            if (!ours) {
+              unsolicitedFrames.foreignResults++;
+              session.foreignRunning = false;
+              console.warn(
+                `[claude] thread ${threadTag(threadId)}: a ${origin ?? "foreign"} turn the CLI started on its own ended ` +
+                  `ahead of this turn's message${costLabel(share)}; waiting for this turn's own`,
+              );
+              break;
+            }
+            t.usage = sumUsage(t.usage, resultUsage);
+            t.cost = t.cost === null || share === null ? null : (t.cost ?? 0) + share;
+            // result.usage is this CLI turn's own figure (the CLI resets it per
+            // turn, unlike total_cost_usd). cache reads count as input: they
             // are billed (at the cache rate) and they fill the window — but
             // they are reported separately too, so the UI can show how much
             // of the figure was context re-read rather than new text.
@@ -1194,7 +1686,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // alone reports a 404 before any output.  `unknown_model` is what
             // retry.ts already classifies as terminal, and what the failover
             // reads to mark this (bot, model) pair as rejected.
-            const liveTurn = session.turn;
+            const liveTurn = t;
             const modelRejected =
               Boolean(liveTurn?.modelRejection) ||
               (isError && o.api_error_status === 404 && !liveTurn?.producedOutput);
@@ -1212,20 +1704,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               : isError
                 ? (o.terminal_reason ?? o.stop_reason ?? null)
                 : (o.stop_reason ?? o.terminal_reason ?? null);
-            settle(
-              !isError && !modelRejected,
-              stopReason,
-              o.total_cost_usd ?? null,
-              o.usage
-                ? {
-                    input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
-                    output: o.usage.output_tokens || 0,
-                    ...(typeof o.usage.cache_read_input_tokens === "number"
-                      ? { cachedInput: o.usage.cache_read_input_tokens }
-                      : {}),
-                  }
-                : undefined,
-            );
+            t.outcome = { ok: !isError && !modelRejected, stopReason };
+            // More of this turn is still to run: a message of its own that no
+            // CLI turn has taken yet — a steer that landed after the last
+            // model call, or one written after the CLI wrote this result but
+            // before the harness read it.  Each gets a CLI turn and a result
+            // of its own, and that reply is this turn's: settling here would
+            // drop it.  An older CLI only reports how many sends are queued.
+            const more = session.lifecycle ? session.unconsumed.size > 0 : (meta.queued_turn_count ?? 0) > 0;
+            if (more) break;
+            settle(t.outcome.ok, t.outcome.stopReason);
             break;
           }
         }
@@ -1251,6 +1739,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
 
       child.on("error", (e) => {
+        // Between turns there is nothing to fail: the close that follows
+        // ends the session, and the next turn spawns a fresh process.
+        if (!session.turn) {
+          console.warn(`[claude] thread ${threadTag(threadId)}: the CLI process failed between turns (${e.message})`);
+          return;
+        }
         emit({ ...base(threadId, currentTurnId()), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
@@ -1614,6 +2108,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // Offered in every mode: a bypass instance runs a host-control turn
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,
+          // Native background work is switched off (CLAUDE_CONTAINMENT_ENV);
+          // BotFleet's own job tools reach Claude over MCP in P2.
+          backgroundJobs: "none",
+          // Every helper frame carries parent_tool_use_id, and its steps nest
+          // under the Task/Agent row that started it.  One level deep; the
+          // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).
+          helpers: "typed",
         },
         sendTurn,
         steer,

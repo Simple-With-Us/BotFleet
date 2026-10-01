@@ -1574,6 +1574,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           composioMcp: true,
           phoneMcp: true,
           qdrantMcp: true,
+          // Jobs matrix: BotFleet jobs are gated until their fixtures pass
+          // (P2b); `invoke_subagent` rows come with named helpers in P3.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

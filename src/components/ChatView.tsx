@@ -76,7 +76,7 @@ import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
 import { BUBBLE_EDITOR_WIDTH, BUBBLE_WIDTH, bubbleRow } from "@/lib/bubble-metrics";
 import { useFocusMessage } from "@/lib/focus-message";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { ToolLine } from "./ToolLine";
 import { ContextInjectionRows } from "./ContextInjectionRows";
@@ -886,10 +886,11 @@ const MessagesList = memo(function MessagesList({
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
   // Fold finished tool chips into runs when summarizeToolCalls is enabled, so a stretch of them cannot bury
   // what the bot actually said. If summarizeToolCalls is false, show each step individually.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;

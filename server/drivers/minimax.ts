@@ -941,6 +941,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           toolLoop: true,
           replaysTranscript: true,
           localComputerMcp: true,
+          // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+          // stay `delegate_bot`.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),

@@ -895,6 +895,14 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     }
   } finally {
     clearTimeout(wallTimer);
+    // Whatever a tool started and left running ends with the turn
+    // (server/tools/process-group.ts).  Before the terminal event, so a
+    // queued turn that dispatches from it never inherits this turn's work.
+    try {
+      deps.toolHost?.settle?.();
+    } catch (error) {
+      console.error("tool host settle failed", error);
+    }
     // Drop the driver's active entry BEFORE the terminal event: the fold
     // that handles turn.completed drains queued sends synchronously, and a
     // fresh dispatch must not find this thread still busy.

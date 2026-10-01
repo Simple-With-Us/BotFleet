@@ -175,6 +175,11 @@ export type RuntimeEvent = RuntimeEventBase &
          * run the tool call themselves, the executor never sees the
          * event for a CLI driver that stopped on tool calls. */
         arguments?: string;
+        /** The `itemId` of the helper (native subagent) call this step ran
+         * inside — Claude's `parent_tool_use_id`.  Absent for the bot's own
+         * steps.  The transcript nests the row under its parent instead of
+         * interleaving parallel helpers' steps with the bot's. */
+        parentItemId?: string;
       }
     | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
     | {
@@ -459,6 +464,11 @@ export interface TurnToolHost {
      *  instead of leaving a card nobody can answer. */
     signal?: AbortSignal;
   }): Promise<RequestOutcome>;
+  /** Called once when the turn ends, however it ends, before its terminal
+   *  event: stops any process a tool started that is still running, so no
+   *  work outlives the turn that nothing will report on.  Never throws.
+   *  HTTP tool lane only; a CLI engine's own shells are its own (P2). */
+  settle?(): void;
 }
 
 export interface TurnStartResult {
@@ -468,6 +478,9 @@ export interface TurnStartResult {
    * bookkeeping such as cursor freshness.  Omitted means dispatched. */
   dispatched?: boolean;
 }
+
+export type BackgroundJobsSupport = "none" | "emulated" | "native";
+export type HelperSupport = "none" | "named" | "typed";
 
 export interface ProviderAdapter {
   readonly provider: DriverKind;
@@ -526,6 +539,20 @@ export interface ProviderAdapter {
      * default); a driver that sets this and also inlines the transcript
      * would send it twice. */
     replaysTranscript?: boolean;
+    /** Long-running work this engine can run past the end of a turn, and
+     * who owns it (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md).
+     * `"none"`: nothing outlives the turn — the engine has no background
+     * work, or BotFleet switches it off (Claude since jobs P0).
+     * `"emulated"`: BotFleet's own job tools are mounted (from P1).
+     * `"native"`: the engine's own background tasks are passed through
+     * (a later phase).  Absent reads as `"none"`. */
+    backgroundJobs?: BackgroundJobsSupport;
+    /** The engine's own helpers (native subagents), as BotFleet shows them.
+     * `"none"`: unsupported, or not shown — a helper's events are kept out
+     * of the turn.  `"named"`: recognised by tool name only.  `"typed"`:
+     * every helper event names the call that started it, so its steps nest
+     * under that row.  Absent reads as `"none"`. */
+    helpers?: HelperSupport;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

@@ -1050,6 +1050,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
+          // Jobs matrix: BotFleet jobs arrive through pi-mcp-extension in P2,
+          // once it is shown to proxy them; helpers are unverified.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),

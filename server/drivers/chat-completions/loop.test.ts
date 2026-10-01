@@ -384,6 +384,44 @@ describe("runTurnLoop — the turn is settled by exactly one place", () => {
     expect(h.roundsSeen).toHaveLength(0);
     expect(terminals(h.events)).toHaveLength(1);
   });
+
+  it("settles the tool host once, before the terminal event, on a clean finish and on Stop (jobs P0)", async () => {
+    // The host's settle is the lost-job detector: whatever a tool started and
+    // left running is stopped with the turn, before anything can dispatch
+    // the next one from its turn.completed.
+    for (const stop of [false, true]) {
+      const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+      const settledAt: number[] = [];
+      await h.run({
+        toolHost: {
+          execute: async () => {
+            if (stop) h.abort.abort();
+            return { kind: "result", content: "ok" } as TurnToolOutcome;
+          },
+          settle: () => {
+            settledAt.push(h.events.length);
+          },
+        },
+      });
+      expect(settledAt).toHaveLength(1);
+      const terminalIndex = h.events.findIndex((e) => e.type === "turn.completed");
+      expect(settledAt[0]).toBeLessThanOrEqual(terminalIndex);
+    }
+  });
+
+  it("still emits its one terminal event when the tool host's settle throws", async () => {
+    const h = harness([answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "unused" }),
+        settle: () => {
+          throw new Error("settle exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+    expect(terminals(h.events)).toHaveLength(1);
+  });
 });
 
 describe("runTurnLoop — usage", () => {

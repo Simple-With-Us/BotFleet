@@ -377,6 +377,10 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,
+          // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+          // stay `delegate_bot`.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
