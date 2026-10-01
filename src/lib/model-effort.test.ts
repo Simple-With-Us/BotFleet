@@ -43,6 +43,38 @@ describe("modelEffortLevels", () => {
     expect(modelSupportsEffort(dsh, { id: "DeepSeek-V4.1-Flash" })).toBe(true);
   });
 
+  describe("MiniMax M3.1 effort on mcode and the direct MiniMax engine", () => {
+    // Both drivers declare M3.1's list as their engine-wide gate and give every
+    // catalog row its own explicit list, which is what the picker reads.
+    const levels = ["low", "medium", "high", "xhigh", "max"] as const;
+    const engines = [
+      { name: "mcode", engine: { driverKind: "mcodeAgent", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash-Preview-thinking", m27: "MiniMax-M2.7-highspeed-thinking" },
+      { name: "minimax", engine: { driverKind: "minimax", capabilities: { effortLevels: levels } }, m31: "MiniMax-M3.1-Flash-Preview", m27: "MiniMax-M2.7-highspeed" },
+    ];
+
+    it.each(engines)("offers M3.1's levels and none for M2.7 on $name", ({ engine, m31, m27 }) => {
+      expect(modelEffortLevels(engine, { id: m31, effortLevels: levels })).toEqual(levels);
+      expect(modelSupportsEffort(engine, { id: m31, effortLevels: levels })).toBe(true);
+      // An explicit `[]` wins over the engine-wide list: no picker for M2.7.
+      expect(modelEffortLevels(engine, { id: m27, effortLevels: [] })).toEqual([]);
+      expect(modelSupportsEffort(engine, { id: m27, effortLevels: [] })).toBe(false);
+    });
+
+    it.each(engines)("would hand a row with no list the engine-wide levels on $name, which is why drivers declare [] explicitly", ({ engine, m27 }) => {
+      expect(modelEffortLevels(engine, { id: m27 })).toEqual(levels);
+    });
+  });
+
+  it("keeps DSH MiniMax rows without effort, including M3.1", () => {
+    // Harness declares no M3.1 yet, so its MiniMax rows stay hidden.
+    const dsh = {
+      driverKind: "dsh",
+      capabilities: { effortLevels: ["none", "high", "max"] as const },
+    };
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview" })).toEqual([]);
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M2.7-highspeed" })).toEqual([]);
+  });
+
   it("gates Claude haiku models from effort", () => {
     const claude = {
       driverKind: "claude",

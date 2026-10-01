@@ -33,6 +33,7 @@ import {
 import { eligibleAutoFallbackChain, type AutoFallbackCandidate } from "./turn-safety.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { MODEL_REJECTION_TTL_MS, ModelRejectionRegistry, modelRejections } from "./model-rejections.ts";
+import { STATIC_MCODE_MODELS } from "./drivers/acp/mcode.ts";
 
 const fallbacks: ModelSelection[] = [
   { instanceId: "grok", model: "grok-4" },
@@ -1013,6 +1014,37 @@ describe("unattendedModelDowngrade", () => {
         unattendedModelDowngrade(gemini, { automationSource, effortLevels: ["low"] }),
       ).toEqual(gemini);
     }
+  });
+
+  it("stamps low on an unattended MiniMax M3.1 run over mcode, like every other effort engine", () => {
+    // M3.1's effort list came to mcode and the direct MiniMax API on
+    // 2026-09-30, so webhook, resource and unattended M3.1 runs now start at
+    // Low rather than at MiniMax's own default of max.  M2.7 Highspeed
+    // declares no levels, so it is left alone.
+    const levelsFor = (model: string) =>
+      STATIC_MCODE_MODELS.options.find((option) => option.id === model)?.effortLevels;
+    const m31: ModelSelection = { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" };
+    expect(
+      unattendedModelDowngrade(m31, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...m31, effort: "low" });
+    expect(
+      unattendedModelDowngrade(m31, { automationSource: "webhook", driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual({ ...m31, effort: "low" });
+    // an attended turn, or an explicit selection, still runs at Default
+    expect(unattendedModelDowngrade(m31, { driverKind: "mcodeAgent", effortLevels: levelsFor })).toEqual(m31);
+    expect(
+      unattendedModelDowngrade(m31, {
+        unattended: true,
+        hasExplicitSelection: true,
+        driverKind: "mcodeAgent",
+        effortLevels: levelsFor,
+      }),
+    ).toEqual(m31);
+
+    const m27: ModelSelection = { instanceId: "mcode", model: "MiniMax-M2.7-highspeed-thinking" };
+    expect(
+      unattendedModelDowngrade(m27, { unattended: true, driverKind: "mcodeAgent", effortLevels: levelsFor }),
+    ).toEqual(m27);
   });
 
   it("never overrides an explicit caller modelSelection", () => {
