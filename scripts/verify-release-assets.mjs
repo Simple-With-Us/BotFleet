@@ -3,7 +3,7 @@
 // hashes without installing the Electron packaging dependency tree.
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -195,7 +195,18 @@ export function verifyReleaseAssets(directory, version) {
   console.log(`release ${version}: every updater feed and stable download is complete`);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   const [, , directory, version] = process.argv;
   if (!directory || !version) {
     throw new Error("usage: node scripts/verify-release-assets.mjs <directory> <version>");
