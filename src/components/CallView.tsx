@@ -311,22 +311,24 @@ function Call({ bot }: { bot: Bot }) {
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
   const say = useCallback(
-    async (text: string) => {
+    async (text: string, messageId?: string) => {
       if (!alive.current || currentCall() !== bot.id) return false;
       const mine = ++sayGeneration.current;
       // Move first. stopSpeech() finishes asynchronously, and its close must
       // never observe an old "listening" phase and reopen the mic.
       move("speaking");
       hush();
-      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice });
+      // A bot reply goes through the server's message audio route so the voice
+      // summary mode and clip cache apply; other prompts are spoken as written.
+      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice, ...(messageId ? { messageId, threadId: bot.threadId } : {}) });
       return alive.current && currentCall() === bot.id && sayGeneration.current === mine;
     },
-    [bot.id, bot.voice, hush, move],
+    [bot.id, bot.voice, bot.threadId, hush, move],
   );
 
   const sayThenListen = useCallback(
-    async (text: string) => {
-      const stillMine = await say(text);
+    async (text: string, messageId?: string) => {
+      const stillMine = await say(text, messageId);
       if (stillMine && phaseRef.current === "speaking") listen();
     },
     [listen, say],
@@ -573,7 +575,7 @@ function Call({ bot }: { bot: Bot }) {
     for (const m of fresh) spokenIds.current.add(m.id);
 
     if (reply?.text) {
-      void sayThenListen(spokenReply(reply.text));
+      void sayThenListen(spokenReply(reply.text), reply.id);
     } else if (chip?.tool?.spoken && phase === "working") {
       void say(chip.tool.spoken).then((stillMine) => {
         if (stillMine && phaseRef.current === "speaking") move("working");
