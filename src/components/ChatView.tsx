@@ -48,7 +48,7 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { splitVoiceSummary } from "../../shared/voice-summary";
+import { splitVoiceSummary, stripVoiceSummaryTags } from "../../shared/voice-summary";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -320,10 +320,11 @@ function Bubble({
   };
   const text = message.text ?? "";
   const voiceSections = message.role === "bot" && message.kind === "text" ? splitVoiceSummary(text) : null;
-  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(text) : null;
+  const cleanWritten = message.role === "bot" && message.kind === "text" ? stripVoiceSummaryTags(text) : text;
+  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(cleanWritten) : null;
   const attachedImages = humanTyped ? splitAttachedImages(text) : null;
-  const visibleText = attachedImages?.display ?? text;
-  const copyContent = humanTyped ? visibleText : (toImessageBody ?? text);
+  const visibleText = attachedImages?.display ?? cleanWritten;
+  const copyContent = humanTyped ? visibleText : (toImessageBody ?? cleanWritten);
   const requestId = message.card?.requestId;
   const collapsible =
     humanTyped && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
@@ -617,7 +618,7 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? text} />
+              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
               {voiceSections && (
                 <details className="mt-2 border-t border-hairline/40 pt-2" onClick={(event) => event.stopPropagation()}>
                   <summary className="cursor-pointer text-[12px] text-ink-secondary">Spoken Summary</summary>

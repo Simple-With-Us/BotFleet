@@ -288,6 +288,7 @@ import {
 import * as tts from "./tts/index.ts";
 import { speechUsageTotals } from "./tts/usage.ts";
 import { VOICE_SUMMARY_PROMPT, spokenReply } from "../shared/voice-summary.ts";
+import { summarizeForVoice } from "./tts/speech-summary.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
 import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
@@ -2779,12 +2780,24 @@ bus.subscribe((event: RuntimeEvent) => {
       if (event.itemType === "assistant_text") {
         const activeOwner = activeTurnOwners.current(event.threadId);
         const resolvedSelection = activeOwner?.selection ?? (bot?.modelSelection ? { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model } : undefined);
-        pushMessage({
+        const appended = pushMessage({
           role: "bot",
           kind: "text",
           text: event.text,
           ...(resolvedSelection ? { modelSelection: { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model } } : {}),
         });
+        if (bot?.voiceSummaryMode === "always" && event.text?.trim()) {
+          void (async () => {
+            try {
+              const summary = await summarizeForVoice(event.text, cfg.deepseek?.key);
+              if (summary && summary !== event.text) {
+                store.patchMessage(event.threadId, appended.id, { voiceText: summary });
+              }
+            } catch {
+              // Background pre-warm non-critical
+            }
+          })();
+        }
         if (bot) {
           void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text, event.turnId).then((r) => {
             if (r.sent) console.log(`[linq-outbound] delivered thread=${event.threadId}`);
@@ -13350,14 +13363,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return res.end(audio.bytes);
       }
       if (clipIndex !== undefined) return json(res, 405, { error: "POST the message audio route" });
-      if (message.audio?.length && message.audio.length === toUtterances(spokenReply(message.text)).length && message.audio.every((clip) => {
-        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-        return name && attachmentExists(name);
-      })) return json(res, 200, { audio: message.audio });
       const owner = message.from?.botId ? store.bot(message.from.botId) : store.botByThread(threadId);
       if (!owner) return json(res, 404, { error: "no voice owner" });
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
-      const utterances = toUtterances(spokenReply(message.text));
+      let textToSpeak = spokenReply(message.text);
+      const shouldSummarize = owner.voiceSummaryMode === "always" || owner.voiceSummaryMode === "on_demand" || (owner.voiceSummaryMode === undefined && cfg.tts?.optimizedSummary);
+      if (shouldSummarize && message.voiceText) {
+        textToSpeak = message.voiceText;
+      } else if (shouldSummarize) {
+        textToSpeak = await summarizeForVoice(message.text, cfg.deepseek?.key);
+      }
+      const utterances = toUtterances(textToSpeak);
+      if (message.audio?.length && message.audio.length === utterances.length && message.audio.every((clip) => {
+        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+        return name && attachmentExists(name);
+      })) return json(res, 200, { audio: message.audio });
       if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000) return json(res, 413, { error: "reply exceeds voice clip limit" });
       const key = `${threadId}:${messageId}`;
       let job = voiceJobs.get(key);
@@ -13369,13 +13389,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             if (!name || !attachmentExists(name)) break;
             clips.push(clip);
           }
-          if (clips.length !== (message.audio?.length ?? 0)) store.patchMessage(threadId, messageId, { audio: [...clips] });
+          if (clips.length !== (message.audio?.length ?? 0)) store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
           for (const utterance of utterances.slice(clips.length)) {
             const audio = await tts.speak(cfg, utterance, owner.voice);
             if (!["audio/mpeg", "audio/wav"].includes(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
             const saved = saveAttachment(Buffer.from(audio.bytes), audio.mime);
             clips.push({ path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime });
-            store.patchMessage(threadId, messageId, { audio: [...clips] });
+            store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
           }
           return clips;
         })();

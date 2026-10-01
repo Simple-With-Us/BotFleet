@@ -9,20 +9,17 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
 import { cn } from "@/lib/cn";
+import { TtsBenchmarkModal } from "./TtsBenchmarkModal";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 const MINIMAX_KEY_URL = "https://platform.minimax.io/user/basic-information/interface-key";
-const cnSwitch = (on: boolean) =>
-  `relative h-6 w-11 shrink-0 rounded-full transition-colors ${on ? "bg-accent" : "bg-control"}`;
-const cnKnob = (on: boolean) =>
-  `absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white transition-all ${on ? "left-[21px]" : "left-[3px]"}`;
 
 export function VoiceSettings({
   bot,
   onPatch,
 }: {
   bot: Bot;
-  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices">>) => void;
+  onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">>) => void;
 }) {
   const { state, dispatch } = useStore();
   const tts = state.config?.tts;
@@ -32,6 +29,7 @@ export function VoiceSettings({
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [benchmarkModalOpen, setBenchmarkModalOpen] = useState(false);
 
   // ── custom voice identifier state ───────────────────────────────────
   const [customOpen, setCustomOpen] = useState(false);
@@ -491,28 +489,86 @@ export function VoiceSettings({
         </div>
       </div>
 
-      {/* ── Speech-Friendly Summaries ── */}
-      <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline/40 pt-4">
-        <div>
-          <div className="text-[13px] font-medium text-ink">Speech-Friendly Summaries</div>
-          <p className="text-[11.5px] text-ink-secondary">Ask every bot to write a short spoken summary and a full written answer.  The summary appears when a message is expanded and is used for speech.</p>
+      {/* ── Per-Bot Voice Summary Mode (DeepSeek V4.1 Flash) ── */}
+      <div className="mt-4 border-t border-hairline/40 pt-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-medium text-ink">Voice Summary (DeepSeek V4.1 Flash)</span>
+              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">Default</span>
+            </div>
+            <p className="mt-1 text-[11.5px] text-ink-secondary">
+              Condenses code, links, and markdown into a conversational 1–2 sentence verbal update before synthesis with MiniMax.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setBenchmarkModalOpen(true)}
+            className="flex shrink-0 items-center gap-1 rounded-md border border-hairline px-2.5 py-1 text-[11.5px] font-medium text-ink-secondary transition-colors hover:bg-raised hover:text-ink"
+          >
+            <span>View Benchmark Findings</span>
+            <ExternalLink size={12} />
+          </button>
         </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={Boolean(tts.optimizedSummary)}
-          aria-label="Speech-Friendly Summaries"
-          onClick={() => {
-            api("/api/config", { method: "PUT", body: JSON.stringify({ tts: { optimizedSummary: !tts.optimizedSummary } }) })
-              .then((status: ConfigStatus) => dispatch({ type: "configStatus", config: status }))
-              .catch((cause: Error) => setError(cause.message));
-          }}
-          className={cnSwitch(Boolean(tts.optimizedSummary))}
-        >
-          <span className={cnKnob(Boolean(tts.optimizedSummary))} />
-        </button>
+
+        {/* 3-way Mode Selector */}
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          {(
+            [
+              {
+                id: "on_demand",
+                title: "On-Demand",
+                desc: "Summarize only when playing/speaking (saves tokens)",
+              },
+              {
+                id: "always",
+                title: "All Messages",
+                desc: "Auto-summarize every response from this bot",
+              },
+              {
+                id: "off",
+                title: "Off",
+                desc: "Speak raw written output directly",
+              },
+            ] as const
+          ).map((mode) => {
+            const currentMode = bot.voiceSummaryMode ?? "on_demand";
+            const isSelected = currentMode === mode.id;
+            return (
+              <button
+                key={mode.id}
+                type="button"
+                onClick={() => onPatch({ voiceSummaryMode: mode.id })}
+                className={cn(
+                  "flex flex-col items-start rounded-lg border p-2.5 text-left transition-colors",
+                  isSelected
+                    ? "border-accent bg-accent/5 text-ink"
+                    : "border-hairline bg-surface text-ink-secondary hover:bg-raised/40 hover:text-ink",
+                )}
+              >
+                <div className="flex items-center gap-1.5 font-medium text-[12px]">
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-full",
+                      isSelected ? "bg-accent" : "bg-hairline",
+                    )}
+                  />
+                  <span>{mode.title}</span>
+                </div>
+                <span className="mt-1 text-[10.5px] leading-snug opacity-80">
+                  {mode.desc}
+                </span>
+              </button>
+            );
+          })}
+        </div>
       </div>
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
+
+      <TtsBenchmarkModal
+        open={benchmarkModalOpen}
+        onClose={() => setBenchmarkModalOpen(false)}
+      />
     </div>
   );
 }
