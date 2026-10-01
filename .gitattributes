@@ -6,3 +6,12 @@
 # have written by hand is what git does automatically.  A duplicate row is harmless and visible;
 # a missing row is not.
 docs/EFFORT-LOG.md merge=union
+public/tv-face/skins/blue/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/green/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/purple/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/pink/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/red/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/cyan/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/yellow/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/teal/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/coral/** filter=lfs diff=lfs merge=lfs -text
