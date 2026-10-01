@@ -22,6 +22,8 @@ if (process.argv[2] === "--version") {
   process.exit(0);
 }
 if (process.argv[2] === "login" && process.argv[3] === "status") {
+  // A probe that gets no answer it can read (what a timed-out one sees).
+  if (mode === "login-silent") process.exit(0);
   if (mode === "logged-out") {
     process.stderr.write("Not logged in\n");
     process.exit(1);

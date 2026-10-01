@@ -12,6 +12,7 @@ import { GroupView } from "@/components/GroupView";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
+import { noEngineCanRun } from "@/lib/engine-status";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -87,11 +88,9 @@ function Shell() {
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
   // /api/instances response before deciding: an empty list means "not asked
-  // yet", and flashing the setup screen at every launch would be worse.
-  const noEngines =
-    state.connected &&
-    state.instances.length > 0 &&
-    !state.instances.some((i) => i.snapshot.state === "available");
+  // yet", and flashing the setup screen at every launch would be worse.  An
+  // engine whose probe has not answered yet is not proof of an empty Mac.
+  const noEngines = state.connected && noEngineCanRun(state.instances);
 
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.

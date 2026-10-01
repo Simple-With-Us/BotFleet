@@ -327,7 +327,7 @@ public struct CompanionState: Sendable {
         switch frame {
         case .message, .messagePatch, .thread, .bot, .botDeleted, .room, .roomDeleted:
             hydrationRevision &+= 1
-        case .hello, .notify, .screen, .computer, .config, .runtime, .updateStatus, .unknown:
+        case .hello, .notify, .screen, .computer, .config, .instances, .runtime, .updateStatus, .unknown:
             break
         }
         switch frame {
@@ -460,7 +460,7 @@ public struct CompanionState: Sendable {
 
         // Nothing to fold: config and provisioning state are not part of
         // this client's job yet.
-        case .computer, .config, .unknown:
+        case .computer, .config, .instances, .unknown:
             break
         }
     }

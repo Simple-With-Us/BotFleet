@@ -1575,6 +1575,29 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(readFileSync(probes, "utf8")).toBe("probe\n");
   });
 
+  // C2: a `--help` that only ran out of time on a busy Mac says nothing about
+  // the CLI's age, so the turn must not tell the user to update Claude Code.
+  it("fails a turn whose capability check timed out as a slow check, not as an outdated CLI", async () => {
+    process.env.FAKE_CLAUDE_HELP = "hang";
+    process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS = "1500";
+    const dump = join(scratch, "unverified-must-not-dispatch.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    try {
+      await create();
+      await expect(instance.adapter.sendTurn({ threadId: "t-help-timeout", text: "go" })).resolves.toMatchObject({
+        dispatched: false,
+      });
+      const errors = recorder.events.filter((e) => e.type === "runtime.error") as Array<{ message?: string; setup?: unknown }>;
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toMatch(/did not answer in time/);
+      expect(errors[0].message).not.toMatch(/Update Claude Code/);
+      expect(errors[0].setup).not.toBe(true);
+      expect(existsSync(dump)).toBe(false);
+    } finally {
+      delete process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS;
+    }
+  }, 60_000);
+
   it("reuses a successful capability probe across turns and helpers", async () => {
     const probes = join(scratch, "supported-help-probes");
     process.env.FAKE_CLAUDE_HELP_PROBES = probes;
@@ -1642,6 +1665,7 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
 
   afterEach(async () => {
     delete process.env.FAKE_CLAUDE_AUTH;
+    delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
     delete process.env.FAKE_CLAUDE_HELP;
     delete process.env.FAKE_CLAUDE_HELP_PROBES;
     delete process.env.FAKE_CLAUDE_VERSION;
@@ -1698,4 +1722,93 @@ describe("ClaudeDriver snapshot auth (fake CLI)", () => {
     process.env.ANTHROPIC_API_KEY = "sk-should-not-leak";
     expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: false });
   });
+
+  // The owner's "Sign in to Claude" callout on a signed-in Mac: `auth status`
+  // ran past its budget under load, and the timeout read as a sign-out.
+  it("keeps the last known sign-in when an auth probe runs out of time", async () => {
+    await create();
+    process.env.FAKE_CLAUDE_AUTH = "in";
+    expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: true });
+
+    // Only the hanging probe gets the short budget: on a loaded machine the
+    // fake CLI itself can take seconds to start.
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
+    process.env.FAKE_CLAUDE_AUTH = "hang";
+    const slow = await instance.snapshot();
+    expect(slow).toMatchObject({ state: "available", authenticated: true });
+
+    // A definitive answer still wins over the remembered one.
+    delete process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS;
+    process.env.FAKE_CLAUDE_AUTH = "out";
+    expect(await instance.snapshot()).toMatchObject({ state: "available", authenticated: false });
+  }, 60_000);
+
+  it("reports sign-in as unknown, never false, when the first auth probe gets no answer", async () => {
+    process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS = "1500";
+    process.env.FAKE_CLAUDE_AUTH = "hang";
+    await create();
+    const snapshot = await instance.snapshot();
+    expect(snapshot.state).toBe("available");
+    expect(snapshot.authenticated).toBeUndefined();
+  }, 60_000);
+});
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash), so a test can take an engine
+ *  from working to broken between two snapshots. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("Claude version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await ClaudeDriver.create({
+        instanceId: `switch-${mode}`,
+        displayName: undefined,
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, permissionMode: "acceptEdits" },
+      });
+      cli.setWorking(true);
+      await instance.snapshot();
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      // The verdict is the failed version probe itself, not a later step run on a stale version.
+      expect(second.reason).toMatch(/--version/);
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });
