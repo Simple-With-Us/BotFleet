@@ -407,7 +407,11 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     return dump;
   };
 
-  const configCalls = (dump: string): unknown[] => {
+  interface ConfigCall {
+    method: string;
+    params: { sessionId: string; configId: string; value: string };
+  }
+  const configCalls = (dump: string): ConfigCall[] => {
     const file = `${dump}.config.json`;
     return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : [];
   };
@@ -451,8 +455,7 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     const done = await runTurn({ threadId: "mcode-effort-m27", model: "MiniMax-M2.7-highspeed-thinking", effort: "high" });
 
     expect(done).toMatchObject({ ok: true });
-    const calls = configCalls(dump) as Array<{ params: { configId: string } }>;
-    expect(calls.some((call) => call.params.configId === "thinkingEffort")).toBe(false);
+    expect(configCalls(dump).some((call) => call.params.configId === "thinkingEffort")).toBe(false);
   });
 
   it("fails the turn before prompting when mcode acknowledges a level but keeps another", async () => {
@@ -467,7 +470,8 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     expect(errorMessage()).toMatch(
       /MiniMax Code did not accept thinking effort high for MiniMax-M3\.1-Flash-Preview-thinking/,
     );
-    expect(JSON.parse(readFileSync(rpcDump, "utf8")) as string[]).not.toContain("session/prompt");
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
   });
 
   it("still completes a no-effort turn when the session keeps its level, since `default` is where it already sits", async () => {

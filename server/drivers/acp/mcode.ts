@@ -163,17 +163,19 @@ export function readMcodeModelCatalog(
   return withMcodeEffortLevels({ default: defaultModel, options });
 }
 
+/** The slice of a `session/set_config_option` reply this driver reads: the
+ *  session's option list, each entry with its current value.  A bare `{}` ACK
+ *  carries no option state at all. */
+interface ConfigOptionReply {
+  configOptions?: Array<{ id?: string; currentValue?: string } | null>;
+}
+
 /** The value a reply reports for one session config option, or `undefined`
- *  when it reports nothing (a bare `{}` ACK carries no option state, so there
- *  is nothing to compare against). */
-function reportedConfigValue(result: unknown, configId: string): unknown {
-  if (!result || typeof result !== "object") return undefined;
-  const options = (result as { configOptions?: unknown }).configOptions;
-  if (!Array.isArray(options)) return undefined;
-  const option = options.find(
-    (candidate) => candidate && typeof candidate === "object" && (candidate as { id?: unknown }).id === configId,
-  );
-  return option && typeof option === "object" ? (option as { currentValue?: unknown }).currentValue : undefined;
+ *  when it reports nothing, so a bare ACK is never held to a comparison it
+ *  cannot make. */
+function reportedConfigValue(reply: ConfigOptionReply | null | undefined, configId: string): string | undefined {
+  const options = reply?.configOptions;
+  return Array.isArray(options) ? options.find((option) => option?.id === configId)?.currentValue : undefined;
 }
 
 const support: AcpSupport = {
@@ -261,7 +263,7 @@ const support: AcpSupport = {
     const value = explicit ?? MCODE_DEFAULT_EFFORT;
     const refused = (detail: string) => `MiniMax Code did not accept thinking effort ${value} for ${model}: ${detail}`;
 
-    let result: unknown;
+    let result: ConfigOptionReply | undefined;
     try {
       result = await request("session/set_config_option", {
         sessionId,
@@ -282,7 +284,7 @@ const support: AcpSupport = {
     // no option state to compare against.
     const confirmed = reportedConfigValue(result, MCODE_EFFORT_CONFIG_ID);
     if (confirmed !== undefined && confirmed !== value) {
-      const detail = `still ${String(confirmed)}`;
+      const detail = `still ${confirmed}`;
       if (explicit) throw new Error(refused(detail));
       console.warn(`[mcode] ${model}: ${refused(detail)}`);
     }

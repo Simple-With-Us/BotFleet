@@ -474,7 +474,8 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // `thinking: {type: "disabled"}` on M3.1, and treats an omitted field
         // as `max`.  Default therefore sends nothing.  Docs:
         // https://platform.minimax.io/docs/api-reference/text-openai-api
-        ...(opts.reasoningEffort ? { reasoning_effort: opts.reasoningEffort } : {}),
+        // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
+        reasoning_effort: opts.reasoningEffort,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
