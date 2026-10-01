@@ -37,6 +37,8 @@ An older client that re-sends a floating entry without `latest` keeps it floatin
 - The pass covers bot and task `modelSelection` (primary and fallbacks) and `activeModelSelection`.  A fallback the pass made identical to the primary is dropped; a placeholder fallback that already matched it is kept.
 - Each moved bot gets one notice in its active thread, and each move is logged (`model-lineage: …`).
 - A write that introduces a retired id with no successor gets `400 retired model "…" in <slot>`.  A saved leftover does not block editing another slot, on a bot or on a task override, and custom or local ids no catalog lists still pass.
+- A write that puts `latest` on an operator's custom catalog row gets `400 … cannot apply to custom model`: a custom row stays pinned.  A saved `latest` on a custom row that the chain already holds is left alone so it never blocks editing another slot.
+- A task's own override is held to the 3-fallback cap even when the bot behind it keeps an older, longer chain.  Only an override the task already holds is grandfathered when re-sent unchanged.
 - A client that never sends `latest` (the shipped iOS app) keeps a floating entry floating when it re-sends the same engine and model, even after removing a fallback in front of it.  The desktop picker sends `latest: null` for a pinned pick.
 - Apply to All Bots sends a Latest slot's class, so every bot it lands on floats; a pinned slot pins.
 - Availability (with `requireAvailableModel`, the MCP tool) and effort are checked on every entry of the chain after the lineage pass, so a retired fallback is judged by the model it becomes.
