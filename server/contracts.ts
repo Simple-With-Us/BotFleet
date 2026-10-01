@@ -464,6 +464,10 @@ export interface TurnToolHost {
      *  instead of leaving a card nobody can answer. */
     signal?: AbortSignal;
   }): Promise<RequestOutcome>;
+  /** Called once when the turn ends, however it ends, before its terminal
+   *  event: stops any process a tool started that is still running, so no
+   *  work outlives the turn that nothing will report on.  Never throws. */
+  settle?(): void;
 }
 
 export interface TurnStartResult {

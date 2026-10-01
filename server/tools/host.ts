@@ -42,6 +42,7 @@ import {
   type AgentToolExecutor,
 } from "./agents.ts";
 import { createComputerTools } from "./computer.ts";
+import { TurnProcessGroups } from "./process-group.ts";
 import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
 import { createRecallTools } from "./recall.ts";
@@ -171,7 +172,10 @@ function approvalArgs(
  *  caller's identity, so nothing downstream can forge it. */
 export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   // A Map, not the record itself: `call.name` is whatever the model said.
-  const computerTools = createComputerTools({ cwd: ctx.cwd, confinement: ctx.confinement });
+  // Every process group this turn's `bash` calls start; what is still alive
+  // when the turn ends is stopped by `settle` below.
+  const processGroups = new TurnProcessGroups();
+  const computerTools = createComputerTools({ cwd: ctx.cwd, confinement: ctx.confinement, processGroups });
   const executors = new Map<string, AgentToolExecutor>([
     ...Object.entries(createAgentTools(ctx.deps)),
     ...Object.entries(computerTools),
@@ -242,6 +246,12 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   return {
     maxRounds: ctx.maxRounds,
     requestApproval: ctx.requestApproval,
+    settle() {
+      // The lost-job detector: a command that returned, or was stopped,
+      // while something it started kept running.  Nothing will report on
+      // that process once the turn is over, so it does not outlive it.
+      void processGroups.reap();
+    },
     async execute(call: TurnToolCall, runtime: TurnToolRuntime): Promise<TurnToolOutcome> {
       try {
         const executor = available.has(call.name) ? executors.get(call.name) : undefined;
