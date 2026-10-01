@@ -361,8 +361,11 @@ describe("native DSH ACP turns", () => {
     const done = await recorder!.until((event) => event.type === "turn.completed");
 
     expect(done).toMatchObject({ ok: false });
+    // Engine-neutral wording: this row is DeepSeek today, but the same error
+    // reaches MiniMax rows, and the retired "DeepSeek Harness" name must not
+    // come back on a user-visible message.
     expect(recorder!.events.find((event) => event.type === "runtime.error")?.message).toMatch(
-      /did not switch reasoning effort to max/,
+      /^Engine did not switch reasoning effort to max \(still /,
     );
     const methods = JSON.parse(readFileSync(rpcDump, "utf8")) as string[];
     expect(methods).not.toContain("session/prompt");
@@ -769,10 +772,11 @@ describe("readDshModelCatalog", () => {
   it("honors DSH_HOME over HOME", () => {
     const alt = mkdtempSync(join(tmpdir(), "dsh-alt-home-"));
     try {
-      // DSH_HOME is a home dir, so settings.yaml lives under its .dsh/.
-      mkdirSync(join(alt, "elsewhere", ".dsh"), { recursive: true });
+      // DSH_HOME is dsh's engine home itself (the same directory that holds
+      // .credentials.yaml), so settings.yaml sits directly inside it.
+      mkdirSync(join(alt, "elsewhere"), { recursive: true });
       writeFileSync(
-        join(alt, "elsewhere", ".dsh", "settings.yaml"),
+        join(alt, "elsewhere", "settings.yaml"),
         "llm-pi-ai:\n  providers:\n    minimax:\n      models:\n        - id: MiniMax-M9\n",
         "utf8",
       );
@@ -907,6 +911,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
   const CONFIGURED =
     "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n" +
     "          compat: { forceAdaptiveThinking: true }\n";
+  const ADAPTIVE = "          compat: { forceAdaptiveThinking: true }\n";
 
   describe("live catalog", () => {
     let home: string;
@@ -939,19 +944,39 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
     });
 
     it("offers no M3.1 level when the entry has no reasoningEfforts, so dsh never refuses a pick", () => {
-      expect(levelsOf(catalogWith(m31Entry()), M31)).toEqual([]);
-      expect(levelsOf(catalogWith(m31Entry("          reasoningEfforts: false\n")), M31)).toEqual([]);
+      // The adaptive flag is set in both, so reasoningEfforts is what is missing.
+      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31)).toEqual([]);
+    });
+
+    it("offers no M3.1 level unless the entry forces adaptive thinking", () => {
+      // Without compat.forceAdaptiveThinking pi-ai sends fixed budgets, clamps
+      // xhigh and max to high, and sends no output_config.effort, so most of
+      // the levels would run the same request.
+      const efforts = "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n";
+      expect(levelsOf(catalogWith(m31Entry(efforts)), M31)).toEqual([]);
+      expect(
+        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31),
+      ).toEqual([]);
     });
 
     it("offers no M3.1 level without a settings file", () => {
       expect(levelsOf(catalogWith(null), M31)).toEqual([]);
     });
 
+    it("reads the entry from the engine home when DSH_HOME is set", () => {
+      // DSH_HOME is dsh's engine home itself, with no .dsh folder inside it.
+      const engineHome = join(home, "engine-home");
+      mkdirSync(engineHome, { recursive: true });
+      writeFileSync(join(engineHome, "settings.yaml"), m31Entry(CONFIGURED), "utf8");
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31)).toEqual(M31_LEVELS);
+      // The old lookup went one .dsh too deep and found nothing.
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31)).toEqual([]);
+    });
+
     it("keeps only the levels the entry maps", () => {
-      expect(levelsOf(catalogWith(m31Entry("          reasoningEfforts: { high: high, max: max }\n")), M31)).toEqual([
-        "high",
-        "max",
-      ]);
+      const subset = "          reasoningEfforts: { high: high, max: max }\n";
+      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31)).toEqual(["high", "max"]);
     });
   });
 
@@ -992,6 +1017,28 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       expect(calls).toEqual([
         { method: "session/set_config_option", params: { sessionId: "s1", configId: "reasoning_effort", value: "" } },
       ]);
+    });
+
+    it("swallows only dsh's invalid-params refusal of the provider default", async () => {
+      const refuse = Object.assign(new Error("Invalid params: unknown reasoning effort"), { code: -32602 });
+      const failing = (error: Error) =>
+        dshSupport.configureSession({
+          request: async (method: string, params: unknown) => {
+            calls.push({ method, params });
+            throw error;
+          },
+          sessionId: "s1",
+          config: { cli: "dsh" } as never,
+          turn: { threadId: "t1", text: "hi", model: M31 },
+          sessionModels: [],
+        });
+      await expect(failing(refuse)).resolves.toBeUndefined();
+      // A timeout carries no wire code and an internal error carries -32603: neither is a refusal.
+      const timeout = new Error("session/set_config_option timed out after 20 s");
+      await expect(failing(timeout)).rejects.toBe(timeout);
+      const internal = Object.assign(new Error("Internal error"), { code: -32603 });
+      await expect(failing(internal)).rejects.toBe(internal);
+      expect(calls).toHaveLength(3);
     });
 
     it("still sends nothing for Default on DeepSeek and on DSH MiniMax rows without levels", async () => {
@@ -1061,8 +1108,22 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
       // The fake refuses "" (it is not in its list), the shape of a route that
       // declares its own default effort.  Default is best effort, so the turn
       // runs at the session's level instead of failing.
-      const done = await run("dsh-m31-default");
-      expect(done).toMatchObject({ ok: true });
+      const rpcDump = join(scratch, "rpc.json");
+      process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+      try {
+        const done = await run("dsh-m31-default");
+        expect(done).toMatchObject({ ok: true });
+      } finally {
+        delete process.env.FAKE_ACP_RPC_DUMP;
+      }
+      // The fake's config dump only records accepted sets, so a turn that
+      // never sent "" would look identical there.  The RPC dump records every
+      // request: the model switch and then the refused "" both arrive, before
+      // the prompt.
+      const methods = JSON.parse(readFileSync(rpcDump, "utf8")) as string[];
+      const sets = methods.flatMap((method, index) => (method === "session/set_config_option" ? [index] : []));
+      expect(sets).toHaveLength(2);
+      expect(sets[1]).toBeLessThan(methods.indexOf("session/prompt"));
       expect(configCalls()).toEqual([
         { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: m31Value } },
       ]);

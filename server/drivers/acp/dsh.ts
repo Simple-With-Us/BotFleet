@@ -127,14 +127,17 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
  *  provider still leaves the DeepSeek rows reachable, so this unions rather
  *  than replaces.  See `readDshModelCatalog` and the note there. */
 function readDshSettingsPath(environment: Record<string, string | undefined>): string {
-  // `environment.HOME` first, not `homedir()`: the ACP core hands this the
-  // child environment it will actually spawn the CLI with, so a relocated or
+  // `$DSH_HOME` is dsh's engine home itself (credentials live at
+  // `$DSH_HOME/.credentials.yaml`, see `dshCredentialCandidates`), not a user
+  // home that holds a `.dsh/`.  Only the default, `~/.dsh`, adds the folder.
+  //
+  // `environment.HOME` before `homedir()`: the ACP core hands this the child
+  // environment it will actually spawn the CLI with, so a relocated or
   // test-scoped home has to be honored.  `homedir()` reads the real process
   // home and would silently ignore both.
-  const home = environment.DSH_HOME?.trim()
-    || environment.HOME?.trim()
-    || homedir();
-  return join(home, ".dsh", "settings.yaml");
+  const dshHome = environment.DSH_HOME?.trim()
+    || join(environment.HOME?.trim() || homedir(), ".dsh");
+  return join(dshHome, "settings.yaml");
 }
 
 /** The only slice of `settings.yaml` this driver reads.  Parsed once at the

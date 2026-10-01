@@ -31,8 +31,8 @@ importers:
         specifier: ^2.1.1
         version: 2.1.1
       clutch:
-        specifier: github:jaywedgeworth22/Clutch#2d57ec508399c782537fcd7e79e174c514710e24
-        version: https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/2d57ec508399c782537fcd7e79e174c514710e24(fa0ef49c8cbc14680f36a6f0a75be232)
+        specifier: github:jaywedgeworth22/Clutch#7fbd88d89625402a8b47631dd207045482236837
+        version: https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(fa0ef49c8cbc14680f36a6f0a75be232)
       lucide-react:
         specifier: ^0.539.0
         version: 0.539.0(react@19.2.8)
@@ -4695,8 +4695,8 @@ packages:
     resolution: {integrity: sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA==}
     engines: {node: '>=6'}
 
-  clutch@https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/2d57ec508399c782537fcd7e79e174c514710e24:
-    resolution: {tarball: https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/2d57ec508399c782537fcd7e79e174c514710e24}
+  clutch@https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837:
+    resolution: {tarball: https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837}
     version: 0.4.0
     engines: {node: '>=22.0.0'}
     hasBin: true
@@ -12588,7 +12588,7 @@ snapshots:
 
   clsx@2.1.1: {}
 
-  clutch@https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/2d57ec508399c782537fcd7e79e174c514710e24(fa0ef49c8cbc14680f36a6f0a75be232):
+  clutch@https://codeload.github.com/jaywedgeworth22/Clutch/tar.gz/7fbd88d89625402a8b47631dd207045482236837(fa0ef49c8cbc14680f36a6f0a75be232):
     optionalDependencies:
       '@deepseek-ai/dsh': 0.1.5-rc.2(fa0ef49c8cbc14680f36a6f0a75be232)
     transitivePeerDependencies:
