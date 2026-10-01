@@ -334,6 +334,7 @@ export class ProviderRegistry {
     // A new fleet: nothing completed before this describes it, and a sweep
     // still running against the old instances must not become the answer.
     this.generation++;
+    this.disposed = false;
     this.lastDone = null;
     this.latestSettled.clear();
     // The definitive baselines describe the old fleet too: a config change
@@ -453,6 +454,8 @@ export class ProviderRegistry {
   private recheckDelayMs = 0;
   /** The last value stamp() handed out. */
   private lastStamp = 0;
+  /** Between disposeAll() and the next load(): nothing commits or persists. */
+  private disposed = false;
 
   /** A strictly increasing clock (ms since epoch, nudged forward on a tie)
    * for everything this registry orders: when a sweep or probe started, when
@@ -648,6 +651,7 @@ export class ProviderRegistry {
   /** Make `result` the last completed describe and tell listeners if it
    * changed anything. */
   private commit(result: DescribedInstance[], answeredAt: number, persist: boolean): void {
+    if (this.disposed) return;
     // Strictly increasing, so two different answers never share a stamp and
     // the client's describedAt guard is a total order: the last commit wins
     // wherever its REST response and SSE push arrive in between.
@@ -674,7 +678,7 @@ export class ProviderRegistry {
    * time; the delay doubles while engines stay unanswered and resets once
    * every engine has answered. */
   private scheduleRecheck(result: DescribedInstance[]): void {
-    if (this.transientRecheckMs <= 0) return;
+    if (this.transientRecheckMs <= 0 || this.disposed) return;
     const waiting = result.some((info) => info.snapshot.transient && !info.snapshot.hidden);
     if (!waiting) {
       this.recheckDelayMs = this.transientRecheckMs;
@@ -736,7 +740,7 @@ export class ProviderRegistry {
     const merged = probed.map((info) => this.newestFor(info));
     const at = Date.now();
     // An obsolete sweep (the fleet was reloaded meanwhile) never persists.
-    if (sweepKeyAtStart === this.sweepKey()) this.saveDiskCache(merged, at);
+    if (sweepKeyAtStart === this.sweepKey() && !this.disposed) this.saveDiskCache(merged, at);
     this.describedAtByResult.set(merged, at);
     return merged;
   }
@@ -1294,6 +1298,14 @@ export class ProviderRegistry {
   }
 
   async disposeAll() {
+    // Shutdown, or the first half of a full reload: whatever is still in
+    // flight (a sweep, a background re-check) describes engines that are
+    // going away.  Nothing commits, persists or pushes until the next load(),
+    // so a probe landing now can neither overwrite engine-cache.json with an
+    // empty fleet nor send clients an empty list.
+    this.disposed = true;
+    this.generation++;
+    this.entryProbes.clear();
     if (this.recheckTimer) clearTimeout(this.recheckTimer);
     this.recheckTimer = null;
     await Promise.allSettled(this.instances().map((i) => i.dispose()));

@@ -1795,6 +1795,42 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     }
   });
 
+  it("leaves engine-cache.json and clients alone when a probe lands after disposeAll", async () => {
+    const tmpDir = join(tmpdir(), `botfleet-dispose-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const cachePath = join(tmpDir, "engine-cache.json");
+    mkdirSync(tmpDir, { recursive: true });
+    try {
+      const gate = deferred<void>();
+      let block = false;
+      const fake = makeFakeDriver({
+        snapshotImpl: async () => {
+          if (block) await gate.promise;
+          return { state: "available", version: "1.0.0" };
+        },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      registry.setDiskCachePath(cachePath);
+      await registry.describe();
+      const pushed: number[] = [];
+      registry.onDescribed((instances) => pushed.push(instances.length));
+
+      // A background re-check is probing when the harness shuts down.
+      block = true;
+      const refresh = registry.describeWithFreshInstance("a");
+      await tick();
+      await registry.disposeAll();
+      gate.resolve();
+      await refresh;
+      await tick(20);
+      const saved = JSON.parse(readFileSync(cachePath, "utf8"));
+      expect(saved.instances.map((row: { instanceId: string }) => row.instanceId)).toEqual(["a"]);
+      expect(pushed).not.toContain(0);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("looks again on its own at an engine it could only report as checking", async () => {
     const fake = makeFakeDriver({
       snapshotImpl: (_input, call) =>
