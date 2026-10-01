@@ -368,6 +368,10 @@ import { recallPromptFor } from "./recall-prompt.ts";
 import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import {
+  automationRolloverCaps,
+  shouldRolloverAutomationThread,
+} from "./automation-rollover.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -5123,6 +5127,21 @@ routines = new RoutineManager({
   taskForKey: (botId, automationKey) => store.taskByAutomationKey(botId, automationKey)?.threadId,
   stampKey: (botId, threadId, automationKey) => {
     store.stampAutomationKey(botId, threadId, automationKey);
+  },
+  automationThreadSize: (botId, threadId) => {
+    const task = store.taskByThread(botId, threadId);
+    return {
+      turns: task?.usage?.turns ?? 0,
+      messages: store.messageCountFor(threadId),
+    };
+  },
+  shouldRolloverAutomation: (_botId, _threadId, size) =>
+    shouldRolloverAutomationThread(size, automationRolloverCaps()),
+  rolloverAutomationTask: (botId, automationKey, title, activate) => {
+    const task = store.rolloverAutomationTask(botId, automationKey, { title, activate });
+    const bot = store.bot(botId);
+    if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+    return task;
   },
   startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
     startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),

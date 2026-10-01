@@ -229,6 +229,24 @@ export interface RoutineManagerOptions {
   /** Durable lookup by `automationThreadKey`, independent of run history. */
   taskForKey?: (botId: string, automationKey: string) => string | undefined;
   stampKey?: (botId: string, threadId: string, automationKey: string) => void;
+  /** Size of a task used to decide forever-thread rollover.  Absent disables
+   * rollover (tests that omit it keep the historical reuse-only behavior). */
+  automationThreadSize?: (botId: string, threadId: string) => { turns: number; messages: number };
+  /** True when the thread should be replaced under the same automationKey
+   * before the next wake starts.  See `server/automation-rollover.ts`. */
+  shouldRolloverAutomation?: (
+    botId: string,
+    threadId: string,
+    size: { turns: number; messages: number },
+  ) => boolean;
+  /** Move `automationKey` onto a fresh task; return its threadId.  Called
+   * only between turns (bot is not busy) at admission time. */
+  rolloverAutomationTask?: (
+    botId: string,
+    automationKey: string,
+    title: string,
+    activate: boolean,
+  ) => { threadId: string } | null;
   startTurn: (
     botId: string,
     threadId: string,
@@ -1062,6 +1080,7 @@ export class RoutineManager {
           return id;
         };
         let threadId: string | undefined = acceptReuse(this.options.taskForKey?.(run.botId, key));
+        let foundByAutomationKey = Boolean(threadId);
         let stampResolvedThread = false;
         if (!threadId) {
           const previous = [...this.runs].reverse().find(
@@ -1085,6 +1104,33 @@ export class RoutineManager {
         if (!threadId && !allowsMultipleBotThreads(mode)) {
           this.failRun(run, "Could not find this bot's conversation");
           continue;
+        }
+        // Forever-thread rollover: when a task that already owns this
+        // automationKey is past the size threshold, mint a fresh task under
+        // the SAME key between turns.  Bot is not busy here (admission
+        // already skipped busy seats).  History stays on the old task; only
+        // the key moves.
+        if (
+          threadId &&
+          this.options.rolloverAutomationTask &&
+          this.options.shouldRolloverAutomation &&
+          this.options.automationThreadSize
+        ) {
+          const size = this.options.automationThreadSize(run.botId, threadId);
+          // Only roll a thread that already owns this key.  Stamping a key
+          // onto a large interactive chat for the first time must not yank
+          // the user into a fresh task mid-conversation; the next wake
+          // (key lookup hits) will roll then.
+          if (foundByAutomationKey && this.options.shouldRolloverAutomation(run.botId, threadId, size)) {
+            const activate =
+              run.triggerSource === "webhook" || run.triggerSource === "resource";
+            const rolled = this.options.rolloverAutomationTask(run.botId, key, title, activate);
+            if (rolled) {
+              threadId = rolled.threadId;
+              stampResolvedThread = false;
+              foundByAutomationKey = true;
+            }
+          }
         }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those

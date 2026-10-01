@@ -1084,6 +1084,51 @@ describe("Store task working folder", () => {
     expect(store.stampAutomationKey(bot.id, bot.threadId, "routine:other")?.automationKey).toBe("webhook:wh_1");
   });
 
+  it("rolloverAutomationTask mints a fresh task under the same automationKey and keeps history", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const first = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.appendMessage(first.threadId, { role: "system", kind: "text", text: "old wake", automationSource: "webhook" });
+    store.appendMessage(first.threadId, { role: "bot", kind: "text", text: "old reply" });
+
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_compile", {
+      title: "Compile gates",
+      activate: true,
+    })!;
+    expect(rolled.threadId).not.toBe(first.threadId);
+    expect(rolled.automationKey).toBe("webhook:wh_compile");
+    expect(store.taskByThread(bot.id, first.threadId)?.automationKey).toBeUndefined();
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_compile")?.threadId).toBe(rolled.threadId);
+    // Old history stays put.
+    expect(store.messagesFor(first.threadId).some((m) => m.text === "old wake")).toBe(true);
+    // New task starts thin with a pointer, not the old transcript.
+    const seed = store.messagesFor(rolled.threadId);
+    expect(seed).toHaveLength(1);
+    expect(seed[0]?.role).toBe("system");
+    expect(seed[0]?.text).toContain(first.threadId);
+    expect(seed[0]?.text).not.toContain("old wake");
+    // createTask still reunites on the NEW owner.
+    const again = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    expect(again.threadId).toBe(rolled.threadId);
+  });
+
+  it("rolloverAutomationTask clears the key from aliases so lookup cannot stick on a merged source", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const home = store.taskByThread(bot.id, bot.threadId)!;
+    home.automationKey = "webhook:keep";
+    home.automationKeyAliases = ["webhook:wh_alias"];
+    store.flushBotsNow();
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_alias", { title: "Alias", activate: false })!;
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_alias")?.threadId).toBe(rolled.threadId);
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKeyAliases ?? []).not.toContain("webhook:wh_alias");
+    // Unrelated primary key on the old task is untouched.
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKey).toBe("webhook:keep");
+  });
+
+
   it("pins the default (null) when the bot has no folder, so a later folder can't move a live session", () => {
     const store = new Store(selection);
     const bot = store.createBot();

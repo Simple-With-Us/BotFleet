@@ -742,6 +742,126 @@ describe("RoutineManager", () => {
     expect(h.taskActivations).toEqual([true]);
   });
 
+
+  it("rolls an oversized automation thread onto a fresh task under the same key", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    // First delivery mints thread-1 and stamps webhook:hook-1.
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 1",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-1",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+
+    const sizes = new Map<string, { turns: number; messages: number }>([
+      ["thread-1", { turns: 400, messages: 50 }],
+    ]);
+    const rolledFrom: string[] = [];
+    h.options.automationThreadSize = (_botId, threadId) => sizes.get(threadId) ?? { turns: 0, messages: 0 };
+    h.options.shouldRolloverAutomation = (_botId, _threadId, size) => size.turns >= 300;
+    h.options.rolloverAutomationTask = (_botId, automationKey, title, activate) => {
+      rolledFrom.push(automationKey);
+      // Mimic store.rolloverAutomationTask: clear key, mint, restamp.
+      const prev = (h.options.taskForKey as any)(_botId, automationKey) as string | undefined;
+      if (prev) {
+        // Clear by rewriting the harness key map through stamp on a new id.
+      }
+      const created = h.options.createTask(_botId, title, activate, undefined)!;
+      // Re-bind the key to the new thread (createTask without key + stamp).
+      h.options.stampKey!(_botId, created.threadId, automationKey);
+      sizes.set(created.threadId, { turns: 0, messages: 1 });
+      return created;
+    };
+
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 2",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d2",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+
+    expect(rolledFrom).toEqual(["webhook:hook-1"]);
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-2"]);
+    // Subsequent delivery without oversized size stays on the rolled task.
+    sizes.set("thread-2", { turns: 1, messages: 2 });
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-2",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Compile gates",
+      prompt: "Handle check 3",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d3",
+      receivedAt: new Date(2026, 7, 17, 8, 4).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-2", "thread-2"]);
+    expect(rolledFrom).toEqual(["webhook:hook-1"]);
+  });
+
+  it("does not rollover while thresholds are unmet", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.automationThreadSize = () => ({ turns: 10, messages: 20 });
+    h.options.shouldRolloverAutomation = () => false;
+    let rolled = 0;
+    h.options.rolloverAutomationTask = () => {
+      rolled += 1;
+      return null;
+    };
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Small",
+      prompt: "ping",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d1",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-1",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Small",
+      prompt: "pong",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d2",
+      receivedAt: new Date(2026, 7, 17, 8, 3).getTime(),
+    });
+    await h.manager.tick();
+    expect(rolled).toBe(0);
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-1", "thread-1"]);
+  });
+
   it("gives two different webhooks two different threads", async () => {
     // an uptime alert and a Sentry incident are not the same conversation,
     // which a single shared "Triggers" lane could not express

@@ -33,6 +33,7 @@ import {
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
 import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { automationRolloverSeedText } from "./automation-rollover.ts";
 
 export type BotColor =
   | "green"
@@ -2187,6 +2188,78 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+
+  /** Durable message count for a thread without forcing a full transcript
+   * load when the thread is not already cached. */
+  messageCountFor(threadId: string): number {
+    const cached = this.threads.get(threadId);
+    if (cached) return cached.messages.length;
+    return mdb.countMessages(threadId);
+  }
+
+  /** Drop `automationKey` (and matching aliases) from every task on this
+   * bot so a rollover can stamp the key onto a fresh task without
+   * `taskByAutomationKey` still resolving the bloated predecessor. */
+  clearAutomationKey(botId: string, automationKey: string): void {
+    if (!automationKey) return;
+    const bot = this.bot(botId);
+    if (!bot?.tasks) return;
+    let changed = false;
+    for (const task of bot.tasks) {
+      if (task.automationKey === automationKey) {
+        delete task.automationKey;
+        changed = true;
+      }
+      if (task.automationKeyAliases?.includes(automationKey)) {
+        const next = task.automationKeyAliases.filter((key) => key !== automationKey);
+        task.automationKeyAliases = next.length > 0 ? next : undefined;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+  }
+
+  /** Mint a fresh task that takes `automationKey` from any prior owner on
+   * this bot.  The old task keeps its transcript; the new one starts with
+   * a thin system pointer.  Used when a forever automation thread has
+   * grown past the rollover threshold (see `server/automation-rollover.ts`).
+   * Does not delete history. */
+  rolloverAutomationTask(
+    botId: string,
+    automationKey: string,
+    opts?: { title?: string; activate?: boolean; previousThreadId?: string },
+  ): TaskRecord | null {
+    const bot = this.bot(botId);
+    if (!bot || !automationKey) return null;
+    const previous =
+      (opts?.previousThreadId ? this.taskByThread(botId, opts.previousThreadId) : undefined) ??
+      this.taskByAutomationKey(botId, automationKey);
+    const previousThreadId = previous?.threadId ?? opts?.previousThreadId;
+    const turns = previous?.usage?.turns ?? 0;
+    const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
+    this.clearAutomationKey(botId, automationKey);
+    const title = opts?.title?.trim() || previous?.title || "Automation";
+    const activate = opts?.activate ?? true;
+    // createTask reunites on a matching key — we already cleared it.
+    const neu = this.createTask(botId, title, activate, automationKey);
+    if (!neu) return null;
+    if (previousThreadId) {
+      this.appendMessage(neu.threadId, {
+        role: "system",
+        kind: "text",
+        text: automationRolloverSeedText({
+          previousThreadId,
+          previousTitle: previous?.title,
+          turns,
+          messages,
+        }),
+      });
+    }
+    return neu;
   }
 
   /** A fresh context on the same bot: new thread, new session, same
