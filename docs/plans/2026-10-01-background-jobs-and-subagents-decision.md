@@ -178,3 +178,13 @@ Questions for you:
 - Thread telemetry `78129d55` (completed): PRs #730 and #773.
 - P0 containment `670389e9` (P1, open).
 - Jobs program `01d09729` (P2, open).
+
+## Owner Rulings (2026-10-01)
+
+The owner answered the open questions on Oct 1, 2026.  These rulings override the recommendations above where they differ.
+
+- **(a) Order:** build P0, then P1, now.
+- **(b) Wake turns are unattended:** a job wake turn counts as unattended.  It goes through spend-ceiling accounting and sits inside the same untrusted-data boundary webhooks use.  It keeps the bot's same model: there is no cheaper-model fallback for job wakes.
+- **(c) Job approval:** a bot set to full-auto (its Auto mode) starts jobs without asking.  Every other bot gets an approval card for every `job_start`, and an abandoned ask counts as a deny.  `job_start` has its own `job:<program>` approval namespace and never inherits bash approvals.
+- **(d) iPhone (P4):** the phone may stop jobs and read job output.
+- **(e) On by default:** jobs are on by default for HTTP-lane bots at P1.
