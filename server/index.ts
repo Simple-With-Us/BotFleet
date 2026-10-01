@@ -117,6 +117,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -1294,6 +1295,17 @@ function checkedModelSelection(
     }
     if (parsedFallbacks.length > 0) {
       selection.fallbacks = parsedFallbacks;
+    }
+  }
+  // Heal retired MiniMax/DSH picker ids before lineage and availability
+  // checks so a PATCH cannot re-introduce them.  model-lineage deliberately
+  // omits those engines; Claude/Grok retired ids still move via lineage below.
+  {
+    const rewritten = rewriteModelSelection(selection);
+    if (rewritten.changed) {
+      selection.model = rewritten.selection.model;
+      if (rewritten.selection.fallbacks) selection.fallbacks = rewritten.selection.fallbacks;
+      else delete selection.fallbacks;
     }
   }
   // A fallback entry is only parsed here.  Availability and effort are checked

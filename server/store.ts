@@ -32,6 +32,7 @@ import {
   type LineageContext,
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 
 export type BotColor =
   | "green"
@@ -964,6 +965,39 @@ export class Store {
       // read and are swept by `wakeExpiredThreadSnoozes`.
       for (const task of b.tasks ?? []) {
         if (task.snoozedUntil === SNOOZE_UNTIL_ACTIVITY) this.threadsAwaitingActivity.add(task.threadId);
+      }
+      // Retired picker ids (MiniMax-M3, plain M2.7, deepseek-v4-flash) stay in
+      // bots.json after the catalog drops them; rewrite onto the live replacement
+      // so the next turn does not burn a spawn on "unknown model option".
+      if (b.modelSelection) {
+        const rewritten = rewriteModelSelection(b.modelSelection);
+        if (rewritten.changed) {
+          b.modelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      if (b.activeModelSelection) {
+        const rewritten = rewriteModelSelection(b.activeModelSelection);
+        if (rewritten.changed) {
+          b.activeModelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      for (const task of b.tasks ?? []) {
+        if (task.modelSelection) {
+          const rewritten = rewriteModelSelection(task.modelSelection);
+          if (rewritten.changed) {
+            task.modelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
+        if (task.activeModelSelection) {
+          const rewritten = rewriteModelSelection(task.activeModelSelection);
+          if (rewritten.changed) {
+            task.activeModelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
       }
     }
     for (const b of this.bots) {

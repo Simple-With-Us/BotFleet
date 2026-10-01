@@ -68,7 +68,7 @@ describe("DSH vision route migration", () => {
       fallbacks: [
         { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Pro", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     };
     expect(dshVisionSelection(original)).toEqual({
@@ -76,7 +76,7 @@ describe("DSH vision route migration", () => {
       fallbacks: [
         { instanceId: "claude", model: "DeepSeek-V4.1-Pro" },
         { instanceId: "dsh", model: "DeepSeek-V4.1-Flash", effort: "none" },
-        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
       ],
     });
     expect(original.model).toBe("DeepSeek-V4.1-Pro");
@@ -458,7 +458,7 @@ describe("structured provider-error code feeds selectTurnFallback exactly as ind
   // "error" are kept off the auto-failover path, not inside
   // selectTurnFallback's own produced/quotaOrCap gate (that gate only
   // matters once a chain has already been handed to it).
-  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3" }) => {
+  const compose = (stopReason: string, current = { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }) => {
     const code = providerErrorCodeFromStopReason(stopReason);
     const quotaOrCap = quotaOrCapFromErrorCode(code) ?? false;
     const chain = quotaOrCap ? [{ instanceId: "claude", model: "claude-sonnet-5" }] : undefined;
@@ -1238,7 +1238,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
   const doomed = (...instances: string[]) => (botId: string, instanceId: string) =>
@@ -1306,7 +1306,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       isDoomed: doomed("grok"),
       now: T0,
     });
-    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+    expect(next).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
     // nextUsed still points past the entry that was chosen, so the second
     // failure of the same turn walks on to the third rather than re-offering
     // the dead first entry.
@@ -1369,7 +1369,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
           botId: "bot2",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1382,7 +1382,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
       model: "gemini-3.8-pro-high",
       fallbacks: [
         { instanceId: "grok", model: "grok-4.7" },
-        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
         { instanceId: "claude", model: "claude-sonnet-5" },
       ],
     };
@@ -1407,7 +1407,7 @@ describe("a setup-dead engine is not a fallback candidate", () => {
 
     // Nothing dead: the first usable entry, untouched.
     expect(registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: () => false }).selection)
-      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3" });
+      .toMatchObject({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" });
 
     // dsh cannot start for this bot, so the next saved engine is the third.
     const skipped = registry.resolveModel("bot1", primary, T0 + 1_000, { isDoomed: doomed("dsh") });
@@ -1439,7 +1439,7 @@ describe("the default doomed gate is live, not a stub", () => {
   const T0 = 1_780_000_000_000;
   const CHAIN: ModelSelection[] = [
     { instanceId: "grok", model: "grok-4.7" },
-    { instanceId: "dsh", model: "MiniMax-M3" },
+    { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" },
     { instanceId: "claude", model: "claude-sonnet-5" },
   ];
 
@@ -1481,7 +1481,7 @@ describe("the default doomed gate is live, not a stub", () => {
           botId: "bot-default-gate-clean",
           now: T0,
         }),
-      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3", nextUsed: 2 });
+      ).toEqual({ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", nextUsed: 2 });
     } finally {
       doomedDispatches.clear();
     }
@@ -1492,7 +1492,7 @@ describe("the default doomed gate is live, not a stub", () => {
     const primary: ModelSelection = {
       instanceId: "antigravity",
       model: "gemini-3.8-pro-high",
-      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3" }],
+      fallbacks: [{ instanceId: "grok", model: "grok-4.7" }, { instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview" }],
     };
     registry.record({
       botId: "bot-default-gate",
@@ -1523,7 +1523,7 @@ describe("a rejected model id does not end the fallback walk", () => {
   const CHAIN: ModelSelection[] = [
     { instanceId: "claude", model: "claude-3-7-sonnet" },
     { instanceId: "codex", model: "gpt-5.6-luna" },
-    { instanceId: "minimax", model: "MiniMax-M3" },
+    { instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" },
   ];
   const DEAD_TEXT =
     "There's an issue with the selected model (claude-3-7-sonnet). It may not exist or you may not have access to it.";
@@ -1858,5 +1858,40 @@ describe("launchFallbackTurn and a stopped turn", () => {
     // and no failThread outside those two gates
     const sites = launcher.split("\n").filter((line) => /routines\?\.failThread/.test(line));
     expect(sites).toHaveLength(2);
+  });
+});
+
+describe("retired MiniMax-M3 ids are rewritten before failover", () => {
+  it("selectTurnFallback returns the live Flash Preview id for a MiniMax-M3 entry", () => {
+    const next = selectTurnFallback({
+      ok: false,
+      produced: false,
+      fallbacks: [
+        { instanceId: "dsh", model: "MiniMax-M3" },
+        { instanceId: "grok", model: "grok-4.7" },
+      ],
+      used: 0,
+      current: { instanceId: "mcode", model: "MiniMax-M3.1-Flash-Preview-thinking" },
+    });
+    expect(next).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-Preview",
+      nextUsed: 1,
+    });
+  });
+
+  it("resolveModel heals a Director-shaped MiniMax-M3 primary without waiting for rejection", () => {
+    const registry = new QuotaCooldownRegistry();
+    const resolved = registry.resolveModel("director", {
+      instanceId: "dsh",
+      model: "MiniMax-M3",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3" }],
+    });
+    expect(resolved.isFallback).toBe(false);
+    expect(resolved.selection).toEqual({
+      instanceId: "dsh",
+      model: "MiniMax-M3.1-Flash-Preview",
+      fallbacks: [{ instanceId: "minimax", model: "MiniMax-M3.1-Flash-Preview" }],
+    });
   });
 });
