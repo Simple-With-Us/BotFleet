@@ -12,6 +12,7 @@ import {
   DSH_MINIMAX_PROVIDER_ID,
   classifyDshError,
   dshCredentialCandidates,
+  dshInstalledEffortLevels,
   dshModelIdFromOptionValue,
   DshModelNotOfferedError,
   dshModelOptionValue,
@@ -126,14 +127,17 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
  *  provider still leaves the DeepSeek rows reachable, so this unions rather
  *  than replaces.  See `readDshModelCatalog` and the note there. */
 function readDshSettingsPath(environment: Record<string, string | undefined>): string {
-  // `environment.HOME` first, not `homedir()`: the ACP core hands this the
-  // child environment it will actually spawn the CLI with, so a relocated or
+  // `$DSH_HOME` is dsh's engine home itself (credentials live at
+  // `$DSH_HOME/.credentials.yaml`, see `dshCredentialCandidates`), not a user
+  // home that holds a `.dsh/`.  Only the default, `~/.dsh`, adds the folder.
+  //
+  // `environment.HOME` before `homedir()`: the ACP core hands this the child
+  // environment it will actually spawn the CLI with, so a relocated or
   // test-scoped home has to be honored.  `homedir()` reads the real process
   // home and would silently ignore both.
-  const home = environment.DSH_HOME?.trim()
-    || environment.HOME?.trim()
-    || homedir();
-  return join(home, ".dsh", "settings.yaml");
+  const dshHome = environment.DSH_HOME?.trim()
+    || join(environment.HOME?.trim() || homedir(), ".dsh");
+  return join(dshHome, "settings.yaml");
 }
 
 /** The only slice of `settings.yaml` this driver reads.  Parsed once at the
@@ -240,9 +244,11 @@ export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
   const options = STATIC_DSH_MODELS.options.map((option) => ({ ...option }));
+  let settings: DshSettings | undefined;
   let discovered: ModelCatalog["options"] = [];
   try {
-    discovered = modelRowsFromSettings(parseDshSettings(readFileSync(readDshSettingsPath(environment), "utf8")));
+    settings = parseDshSettings(readFileSync(readDshSettingsPath(environment), "utf8"));
+    discovered = modelRowsFromSettings(settings);
   } catch {
     // No settings file, unreadable, or unparseable YAML: the static catalog
     // stands.  A discovery miss is never fatal.
@@ -265,6 +271,18 @@ export function readDshModelCatalog(
     const merged = options[index];
     if (row.contextWindow) merged.contextWindow = row.contextWindow;
     options[index] = merged;
+  }
+  // Per-model effort levels (MiniMax M3.1) exist only when this install's
+  // settings entry declares them: stock dsh does not catalog M3.1, so without
+  // `reasoningEfforts` on its entry dsh refuses every level.  Clutch answers
+  // for every per-model row, and an explicit `[]` here wins over the static
+  // `perModelEffortLevels` core folds on afterwards, so the picker never
+  // offers a level this dsh would refuse.  A missing or unreadable file
+  // answers `[]` for those rows too.
+  const installedLevels = dshInstalledEffortLevels(settings);
+  for (const option of options) {
+    const levels = installedLevels[option.id];
+    if (levels) option.effortLevels = [...levels];
   }
   // The static default is always in the union, so a refresh cannot move a
   // selection out from under the user.
@@ -299,16 +317,6 @@ function dshClassifyError(error: unknown): ProviderErrorCode | undefined {
   return code === "unknown" ? undefined : code;
 }
 
-function currentConfigValue(result: unknown, configId: string): unknown {
-  if (!result || typeof result !== "object") return undefined;
-  const options = (result as { configOptions?: unknown }).configOptions;
-  if (!Array.isArray(options)) return undefined;
-  const option = options.find(
-    (candidate) => candidate && typeof candidate === "object" && (candidate as { id?: unknown }).id === configId,
-  );
-  return option && typeof option === "object" ? (option as { currentValue?: unknown }).currentValue : undefined;
-}
-
 /** DSH's `initialize` base deadline.  `dsh --profile acp` answers only after
  * its Cordis host has loaded ~200 plugin packages: about 3.5 s of CPU, which
  * the shared 60 s default was cutting off once host load stretched it (p99
@@ -331,23 +339,12 @@ export const dshSupport = {
     clutchDshSupport.isAuthenticated?.(env) ?? false,
   authFailure: "continue" as const,
   buildPromptText: (turn: SendTurnInput) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
+  // Effort semantics are engine shape and live in Clutch: an explicit level
+  // is sent and must take, and Default on a row with per-model levels (MiniMax
+  // M3.1) sends dsh's provider-default value so a level a resumed session kept
+  // from an earlier turn clears.  DeepSeek rows still send nothing for Default.
   async configureSession({ request, sessionId, turn }) {
-    if (!turn.effort) return;
-    const requested = turn.effort === "none" ? "off" : turn.effort;
-    const result = await request("session/set_config_option", {
-      sessionId,
-      configId: "reasoning_effort",
-      value: requested,
-    });
-    const confirmed = currentConfigValue(result, "reasoning_effort");
-    // Only a *reported* mismatch means the setting did not take.  A reply that
-    // carries no option state (stock `dsh` answered `{}`) reports nothing to
-    // compare, and failing on that refused every effort-pinned turn.
-    if (confirmed !== undefined && confirmed !== requested) {
-      throw new Error(
-        `Engine did not switch reasoning effort to ${requested} (still ${String(confirmed ?? "unknown")})`,
-      );
-    }
+    await clutchDshSupport.configureSession?.({ request, sessionId, turn });
   },
 } satisfies AcpSupport;
 
