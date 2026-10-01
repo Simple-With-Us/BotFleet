@@ -32,6 +32,10 @@ describe("recallAvailableForTurn", () => {
     // presence must not change this.
     expect(recallAvailableForTurn(settings({ url: "https://r.example", collection: "c" }), true, true)).toBe(true);
     expect(recallAvailableForTurn(settings({ url: "https://r.example" }), true, false)).toBe(true);
+    // A configured service short-circuits: the probe is never called.
+    let probed = false;
+    expect(recallAvailableForTurn(settings({ url: "https://r.example" }), true, () => { probed = true; return "/x"; })).toBe(true);
+    expect(probed).toBe(false);
   });
 
   it("is true for a bare local CLI, and that is the case that hid itself", () => {
@@ -42,6 +46,9 @@ describe("recallAvailableForTurn", () => {
     // therefore NOT a statement about WHICH corpus — that is what
     // `configuredTarget` on the status exists to say.
     expect(recallAvailableForTurn(settings(), true, true)).toBe(true);
+    // A thunk works identically, and is what the call site passes so the
+    // binary is not probed when recall is off.
+    expect(recallAvailableForTurn(settings(), true, () => "/usr/local/bin/recall")).toBe(true);
   });
 
   it("is false when nothing can answer — no URL and no CLI", () => {
@@ -50,6 +57,7 @@ describe("recallAvailableForTurn", () => {
     // handed the tools. This expression was inline in index.ts and untested,
     // which is how the misconfigured-but-\"configured\" state went unnoticed.
     expect(recallAvailableForTurn(settings(), true, false)).toBe(false);
+    expect(recallAvailableForTurn(settings(), true, () => null)).toBe(false);
     expect(recallAvailableForTurn(undefined, true, false)).toBe(false);
   });
 
