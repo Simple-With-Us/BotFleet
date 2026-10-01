@@ -116,7 +116,14 @@ describe("presentDescribedInstances", () => {
     );
     const minimax = described[3];
     const presented = presentDescribedInstances(described);
-    expect(presented[0]!.models.options.map((o) => o.id)).toEqual(["grok-4.7", "grok-4.7-build-fast"]);
+    // Grok Build 0.1 and Composer 2.5 sit in no Grok class, so the lineage
+    // leaves them as listed; only the retired 4.5 and 4.6 rows disappear.
+    expect(presented[0]!.models.options.map((o) => o.id)).toEqual([
+      "grok-4.7",
+      "grok-4.7-build-fast",
+      "composer-2.5",
+      "grok-build-0.1",
+    ]);
     expect(presented[1]!.models.options.map((o) => o.id)).toEqual([
       "claude-fable-5-1",
       "claude-opus-5-5",

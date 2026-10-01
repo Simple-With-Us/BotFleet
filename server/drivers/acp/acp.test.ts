@@ -352,6 +352,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
     delete process.env.FAKE_ACP_MODELS;
+    delete process.env.FAKE_ACP_SESSION_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
@@ -770,6 +771,28 @@ describe("ACP turns (fake CLI)", () => {
       args: ["/tmp/connector-proxy.js"],
       env: [{ name: "OMB_CONNECTOR_UPSTREAM_URL", value: "http://127.0.0.1:8799/api/internal/connectors/mcp" }],
     });
+  });
+
+  it("grok names what the account is offered when the CLI rejects a picked model", async () => {
+    // Composer 2.5 and Grok Build 0.1 are in the picker but only some accounts
+    // are served them.  A rejected session/set_model must end the turn with the
+    // CLI's own offered list and the command that prints it, not a version hint.
+    process.env.FAKE_ACP_MODE = "set-model-invalid-params";
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.7|Grok 4.7,grok-4.7-build-fast|Grok 4.7 Fast,grok-4.6|Grok 4.6";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-composer", text: "go", model: "composer-2.5" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    const err = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(err).toHaveLength(1);
+    const message = err[0]!.message as string;
+    expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
+    expect(message).toContain("Invalid params");
+    expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
+    expect(message).toContain("`grok models`");
+    expect(message).not.toContain("1.0.6");
   });
 
   it("droid takes model and autonomy over the wire, never through argv", async () => {
