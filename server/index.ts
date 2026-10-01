@@ -418,7 +418,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
-import { findRecallCli, recallStatus } from "./recall-transport.ts";
+import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
@@ -5226,9 +5226,7 @@ async function startTurn(
       // dispatch for a CLI/ACP-lane bot, which is never eligible anyway.
       const recallSettingsForTurn =
         usesDriverToolLoop && cfg.qdrant?.enabled !== false ? recallSettings() : undefined;
-      const hasRecall = Boolean(
-        recallSettingsForTurn && (recallSettingsForTurn.url || findRecallCli()),
-      );
+      const hasRecall = recallAvailableForTurn(recallSettingsForTurn, usesDriverToolLoop, Boolean(findRecallCli()));
       // Same reasoning as `phoneEligible` above: the skill selection already
       // decided whether this message is phone-related, using the SAME
       // toolLoop eligibility.  Re-deriving that here would just risk the
