@@ -21,3 +21,16 @@ export function selectionForPick(
   if (current.fallbacks?.length) next.fallbacks = current.fallbacks;
   return next;
 }
+
+/** What a picker click commits.  `latest` is set when the person picked a
+ *  "Latest <Class>" row.  A pinned pick sends an explicit `null`: the harness
+ *  carries a saved float forward for clients that never send the field (the
+ *  shipped iOS app), and `null` is how a person says "pin this one" instead. */
+export function pickedSelection(
+  current: ModelSelection,
+  instance: InstanceInfo,
+  model: string,
+  latest?: string,
+): ModelSelection {
+  return { ...selectionForPick(current, instance, model), latest: latest ?? null };
+}

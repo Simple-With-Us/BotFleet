@@ -166,6 +166,18 @@ export interface TurnFallbackPick extends ModelSelection {
   nextUsed: number;
 }
 
+/** The selection a fallback pick dispatches and records as active.  A
+ *  floating pick keeps its `latest` class, so the dispatch-time reconcile
+ *  resolves it as Latest rather than as a pinned older slug. */
+export function selectionForFallbackPick(pick: ModelSelection): ModelSelection {
+  return {
+    instanceId: pick.instanceId,
+    model: pick.model,
+    effort: pick.effort,
+    ...(pick.latest ? { latest: pick.latest } : {}),
+  };
+}
+
 const SHORT_PROVIDER_ERROR =
   /^(?:error:\s*)?(?:internal server error|bad gateway|service unavailable|account_inactive|resource_exhausted|too many requests|(?:server|service|provider) (?:is )?(?:overloaded|at capacity)|capacity (?:reached|exceeded|unavailable))\b/i;
 
@@ -563,7 +575,7 @@ export function selectTurnFallback(input: {
     // A model the provider already said it does not have would only spend
     // another spawn to hear it again, and end the walk there.
     if (botId && isRejected?.(botId, next.instanceId, next.model, now)) continue;
-    return { instanceId: next.instanceId, model: next.model, effort: next.effort, nextUsed: i + 1 };
+    return { ...selectionForFallbackPick(next), nextUsed: i + 1 };
   }
   return undefined;
 }

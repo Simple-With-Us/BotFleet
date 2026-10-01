@@ -5,6 +5,7 @@ import {
   applyDefaultsBody,
   emptyFallbackSlots,
   hasDefaults,
+  slotFromPick,
   withSlot,
   type DefaultModelSlot,
 } from "./default-model-slots";
@@ -81,10 +82,35 @@ describe("applyDefaultsBody", () => {
     expect(applyDefaultsBody(null, tooMany).slots.fallbacks).toHaveLength(MAX_MODEL_FALLBACKS);
   });
 
-  it("strips anything but instance and model from a slot", () => {
-    const withEffort = { instanceId: "codex", model: "a", effort: "high" as const };
+  it("strips effort and fallbacks from a slot", () => {
+    const withEffort = { instanceId: "codex", model: "a", effort: "high" as const, fallbacks: [{ instanceId: "x", model: "y" }] };
     const body = applyDefaultsBody(withEffort, [withEffort, null, null]);
     expect(body.slots.primary).toEqual({ instanceId: "codex", model: "a" });
     expect(body.slots.fallbacks[0]).toEqual({ instanceId: "codex", model: "a" });
+  });
+  it("keeps a Latest class on the wire and sends nothing for a pinned pick", () => {
+    const floating = { instanceId: "claude", model: "sonnet-5", latest: "sonnet" };
+    const pinned = { instanceId: "claude", model: "sonnet-4", latest: null };
+    const body = applyDefaultsBody(floating, [pinned, floating, null]);
+    expect(body.slots.primary).toEqual({ instanceId: "claude", model: "sonnet-5", latest: "sonnet" });
+    expect(body.slots.fallbacks).toEqual([
+      { instanceId: "claude", model: "sonnet-4" },
+      { instanceId: "claude", model: "sonnet-5", latest: "sonnet" },
+      null,
+    ]);
+  });
+});
+
+describe("slotFromPick", () => {
+  it("keeps a Latest pick floating and drops a pinned pick's null", () => {
+    expect(slotFromPick({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet", effort: "high" })).toEqual({
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      latest: "sonnet",
+    });
+    expect(slotFromPick({ instanceId: "claude", model: "claude-opus-5-5", latest: null })).toEqual({
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+    });
   });
 });
