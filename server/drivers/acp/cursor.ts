@@ -9,7 +9,7 @@
 // `acp` subcommand. `session/set_model` is attempted when the CLI supports it;
 // a missing method falls back to the argv `--model` pin.
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
-import { execCli } from "../../procs.ts";
+import { execCli, isProbeTimeout } from "../../procs.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 /** Translate an argv `--model` slug into the id this ACP session will accept.
@@ -279,6 +279,27 @@ function execText(
   });
 }
 
+/** Like execText, but keeps what the CLI printed even when it exits
+ * non-zero: a signed-out `cursor-agent status` may say so AND exit 1, and
+ * that answer is as definitive as a zero exit.  Null only when there is
+ * nothing to read (a timeout, a kill, a spawn failure).  `timedOut` says the
+ * probe ran out of time, so text it printed before that (a warning, half a
+ * document) is only an answer if it actually decodes. */
+function execAnswer(
+  run: typeof execCli,
+  cli: string,
+  args: string[],
+  env: Record<string, string | undefined>,
+): Promise<{ text: string; timedOut: boolean } | null> {
+  return new Promise((resolve) => {
+    run(cli, args, { timeout: EXEC_TIMEOUT_MS, env: env as NodeJS.ProcessEnv }, (err, stdout, stderr) => {
+      const text = `${String(stdout ?? "")}\n${String(stderr ?? "")}`.trim();
+      if (err && !text) return resolve(null);
+      resolve({ text, timedOut: isProbeTimeout(err) });
+    });
+  });
+}
+
 const CURSOR_PROBE_TTL_MS = 5 * 60 * 1000;
 
 interface CacheEntry<T> {
@@ -286,7 +307,7 @@ interface CacheEntry<T> {
   result: Promise<T>;
 }
 
-const authProbeCache = new Map<string, CacheEntry<boolean>>();
+const authProbeCache = new Map<string, CacheEntry<boolean | undefined>>();
 const modelProbeCache = new Map<string, CacheEntry<ModelCatalog>>();
 
 export function resetCursorCache() {
@@ -306,11 +327,15 @@ function cursorProbeCacheKey(cli: string, env: Record<string, string | undefined
   ].join("::");
 }
 
+/** Whether cursor-agent is signed in: true, false, or undefined when neither
+ * status probe gave a readable answer (both timed out on a busy Mac).  Only
+ * a decoded answer is cached; an undetermined one is asked again next time
+ * instead of reading as "signed out" for five minutes. */
 export async function probeCursorAuth(
   cli: string,
   env: Record<string, string | undefined>,
   run: typeof execCli = execCli,
-): Promise<boolean> {
+): Promise<boolean | undefined> {
   if (nonBlank(env.CURSOR_API_KEY) || nonBlank(env.CURSOR_AUTH_TOKEN)) return true;
   const cacheKey = cursorProbeCacheKey(cli, env);
   const cached = authProbeCache.get(cacheKey);
@@ -318,17 +343,26 @@ export async function probeCursorAuth(
 
   const entry = {
     expiresAt: Number.POSITIVE_INFINITY,
-    result: (async () => {
+    result: (async (): Promise<boolean | undefined> => {
+      let answered = false;
       for (const args of [["status", "--format", "json"], ["status"]] as const) {
-        const stdout = await execText(run, cli, [...args], env);
-        if (stdout == null) continue;
-        const decoded = decodeCursorAuthStatus(firstJsonValue(stdout)) ?? decodeCursorAuthText(stdout);
+        const reply = await execAnswer(run, cli, [...args], env);
+        if (reply == null) continue;
+        const decoded = decodeCursorAuthStatus(firstJsonValue(reply.text)) ?? decodeCursorAuthText(reply.text);
         if (decoded !== null) return decoded;
+        // Undecodable words from a probe that ran out of time are not an
+        // answer either — only a CLI that finished and said something
+        // neither decoder knows counts as one.
+        if (!reply.timedOut) answered = true;
       }
-      return false;
+      // The CLI answered but in words neither decoder knows: keep failing
+      // closed, as before.  No answer at all is undetermined.
+      return answered ? false : undefined;
     })().then(
       (res) => {
-        entry.expiresAt = Date.now() + CURSOR_PROBE_TTL_MS;
+        if (res === undefined) {
+          if (authProbeCache.get(cacheKey) === entry) authProbeCache.delete(cacheKey);
+        } else entry.expiresAt = Date.now() + CURSOR_PROBE_TTL_MS;
         return res;
       },
       (err) => {

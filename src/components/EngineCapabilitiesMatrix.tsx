@@ -92,10 +92,11 @@ const CELL_TONE = {
  *  from fields the runtime actually provides — `snapshot.state`,
  *  `snapshot.authenticated`, and the presence of the instance — so a row
  *  never invents a reason string nobody reported. */
-export type EngineAvailability = "ready" | "signed-out" | "cli-missing" | "absent";
+export type EngineAvailability = "ready" | "checking" | "signed-out" | "cli-missing" | "absent";
 
 const AVAILABILITY_TONE = {
   ready: "bg-emerald-500",
+  checking: "border border-hairline/60 bg-inset",
   "signed-out": "bg-amber-500",
   "cli-missing": "bg-ink-secondary/50",
   absent: "border border-dashed border-hairline/60 bg-transparent",
@@ -103,6 +104,7 @@ const AVAILABILITY_TONE = {
 
 const AVAILABILITY_LABEL = {
   ready: "Ready",
+  checking: "Checking",
   "signed-out": "Not signed in",
   "cli-missing": "Command-line app not found",
   absent: "Not on this computer",
@@ -119,6 +121,8 @@ export function engineAvailability(
   if (!instances) return "absent";
   const match = instances.find((instance) => engineIdFor(instance) === entry.id);
   if (!match) return "absent";
+  // The last probe did not answer in time: not proof the app is missing.
+  if (match.snapshot.transient === true) return "checking";
   if (match.snapshot.state !== "available") return "cli-missing";
   if (match.snapshot.authenticated === false) return "signed-out";
   return "ready";
