@@ -96,4 +96,3 @@ describe("modelEffortLevels", () => {
     expect(modelEffortLevels(dsh, { id: "DeepSeek-V4.1-Flash" })).toEqual(["none", "high", "max"]);
   });
 });
-
