@@ -115,6 +115,26 @@ export interface EngineSpend {
   unpricedTurns7d?: number;
 }
 
+/** One `(bot, engine)` pair the dispatcher is refusing to start. */
+export interface DoomedPair {
+  botId: string;
+  instanceId: string;
+  consecutiveFailures: number;
+  openedAt: number;
+  lastFailureAt: number;
+  lastError?: string;
+}
+
+/** One bot whose configured fallback chain is longer than the runtime will
+ *  actually walk. */
+export interface RedundantChain {
+  botId: string;
+  name: string;
+  total: number;
+  effective: number;
+  redundant: { instanceId: string; model: string; reason: "same-as-primary" | "duplicate" }[];
+}
+
 /** Whether an engine row has enough to be worth showing.
  *
  *  Dollars OR unpriced turns.  An engine that settled work but reported no
@@ -181,6 +201,12 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   const [grokQuota, setGrokQuota] = React.useState<GrokUsageSnapshot | null>(null);
   const [deepseekBalance, setDeepSeekBalance] = React.useState<DeepSeekBalanceView | null>(null);
   const [engineSpend, setEngineSpend] = React.useState<Record<string, EngineSpend>>({});
+  // Engines the dispatcher is refusing to start, and chains that are longer in
+  // the picker than at runtime.  Both have been on this payload since they were
+  // added with nothing rendering them, which is the same defect a dead field is:
+  // a fact recorded for someone and read by no one.
+  const [doomed, setDoomed] = React.useState<DoomedPair[]>([]);
+  const [redundantChains, setRedundantChains] = React.useState<RedundantChain[]>([]);
   const [quotaWindows, setQuotaWindows] = React.useState<Array<{
     id: string;
     provider: string;
@@ -316,6 +342,8 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           if (data?.engineSpend && typeof data.engineSpend === "object") {
             setEngineSpend(data.engineSpend);
           }
+          if (Array.isArray(data?.doomed)) setDoomed(data.doomed);
+          if (Array.isArray(data?.fallbackChains)) setRedundantChains(data.fallbackChains);
         })
         .catch(() => {});
     };
@@ -678,6 +706,50 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         {localQuotaNotice && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
             {localQuotaNotice}
+          </div>
+        )}
+        {doomed.length > 0 && (
+          <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
+            <div className="font-medium text-ink">
+              {doomed.length === 1 ? "1 bot is being held" : `${doomed.length} bots are being held`}
+            </div>
+            <div className="mt-1">
+              These bots cannot start their engine, so their scheduled work is queued rather than failed — it
+              runs on its own once the engine comes back. Each attempt is being counted, so this is not a
+              stuck scheduler.
+            </div>
+            <ul className="mt-1.5 space-y-0.5">
+              {doomed.map((pair) => (
+                <li key={`${pair.botId}:${pair.instanceId}`}>
+                  <span className="font-mono">{pair.instanceId}</span> for bot{" "}
+                  <span className="font-mono">{pair.botId.slice(0, 8)}</span> — failed to start{" "}
+                  {pair.consecutiveFailures} times
+                  {pair.lastError ? `: ${pair.lastError}` : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {redundantChains.length > 0 && (
+          <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
+            {redundantChains.length === 1
+              ? "1 bot's fallback chain is shorter than it looks"
+              : `${redundantChains.length} bots' fallback chains are shorter than they look`}
+            <ul className="mt-1.5 space-y-0.5">
+              {redundantChains.map((chain) => (
+                <li key={chain.botId}>
+                  <span className="font-medium text-ink">{chain.name}</span> — {chain.total} configured,{" "}
+                  {chain.effective} usable
+                  {chain.redundant.map((entry) => (
+                    <span key={`${entry.instanceId}:${entry.model}`}>
+                      {" "}
+                      (<span className="font-mono">{entry.model}</span>{" "}
+                      {entry.reason === "same-as-primary" ? "is the primary again" : "repeats an earlier entry"})
+                    </span>
+                  ))}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         <div className="flex flex-col divide-y divide-hairline/20">

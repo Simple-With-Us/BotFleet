@@ -12,6 +12,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
 import { hasEngineSpendActivity, unpricedTurnCount } from "./UsageSection.tsx";
+import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
   it("maps unique model ids and leaves shared ids unmapped", () => {
@@ -284,5 +285,38 @@ describe("engine spend activity", () => {
   it("sums both windows for the coverage note", () => {
     expect(unpricedTurnCount({ spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 7, unpricedTurns7d: 31 })).toBe(38);
     expect(unpricedTurnCount(undefined)).toBe(0);
+  });
+});
+
+describe("held-engine and redundant-chain payloads", () => {
+  it("accepts the shapes the server sends and tolerates their absence", () => {
+    // Both fields have been on /api/quotas since they were added, with nothing
+    // rendering them — a fact recorded for someone and read by no one, which is
+    // the same defect a dead field is. The component must not assume they exist.
+    const doomed: DoomedPair[] = [
+      {
+        botId: "bot-abcdef12",
+        instanceId: "dsh",
+        consecutiveFailures: 3,
+        openedAt: 1_780_000_000_000,
+        lastFailureAt: 1_780_000_000_000,
+        lastError: "spawn dsh-agent ENOENT",
+      },
+    ];
+    const chains: RedundantChain[] = [
+      {
+        botId: "bot-abcdef12",
+        name: "Designer",
+        total: 3,
+        effective: 2,
+        redundant: [{ instanceId: "grok", model: "grok-4.6", reason: "same-as-primary" }],
+      },
+    ];
+    // A server that predates either field sends neither, and the panel must
+    // render rather than throw — which is why both start as [].
+    expect(doomed[0].instanceId).toBe("dsh");
+    expect(doomed[0].consecutiveFailures).toBe(3);
+    expect(chains[0].redundant[0].reason).toBe("same-as-primary");
+    expect(chains[0].effective).toBeLessThan(chains[0].total);
   });
 });
