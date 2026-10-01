@@ -544,7 +544,7 @@ export class RoutineManager {
     const cancelled: RoutineRun[] = [];
     for (const run of this.runs) {
       if (!run.coalescedInto && run.botId === botId && ["queued", "running", "waiting"].includes(run.status)) {
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.outcomeCode = "cancelled";
         run.failurePhase = "lifecycle";
         run.finishedAt = this.now();
@@ -697,7 +697,7 @@ export class RoutineManager {
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
-          run.status = "cancelled";
+          this.leaveQueued(run, "cancelled");
           run.finishedAt = this.now();
           run.error = "The routine was paused before this run started";
           cancelledRuns.push(run);
@@ -724,7 +724,7 @@ export class RoutineManager {
       this.routines.splice(at, 1);
       for (const run of this.runs) {
         if (run.routineId !== id || run.status !== "queued") continue;
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.finishedAt = this.now();
         cancelledRuns.push(run);
       }
@@ -747,7 +747,7 @@ export class RoutineManager {
     }
     for (const run of this.runs) {
       if (run.botId !== botId || !["queued", "running", "waiting"].includes(run.status)) continue;
-      run.status = "cancelled";
+      this.leaveQueued(run, "cancelled");
       run.finishedAt = this.now();
       run.error = "The assigned Bot was deleted";
       this.emitRun(run);
@@ -874,7 +874,7 @@ export class RoutineManager {
     let changed = false;
     for (const run of this.runs) {
       if (run.webhookId !== webhookId || run.status !== "queued") continue;
-      run.status = "cancelled";
+      this.leaveQueued(run, "cancelled");
       run.finishedAt = this.now();
       run.error = message.slice(0, 500);
       this.emitRun(run);
@@ -887,7 +887,7 @@ export class RoutineManager {
     let run = this.runs.find((r) => r.id === id);
     if (run?.coalescedInto) run = this.runs.find((r) => r.id === run!.coalescedInto);
     if (!run || !["queued", "running", "waiting"].includes(run.status)) return null;
-    run.status = "cancelled";
+    this.leaveQueued(run, "cancelled");
     run.outcomeCode = "cancelled";
     run.failurePhase = "lifecycle";
     run.finishedAt = this.now();
@@ -1266,7 +1266,7 @@ export class RoutineManager {
       const reason = event.stopReason ?? run.error;
       const code = routineFailureCode(reason, run.setupFailed === true, Boolean(event.denials?.length));
       if (code === "cancelled") {
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.outcomeCode = "cancelled";
         run.failurePhase = "lifecycle";
         run.finishedAt = this.now();
@@ -1323,8 +1323,21 @@ export class RoutineManager {
     return orphaned;
   }
 
+  /** Move a run out of `queued` and drop the reason it was being held.
+   *
+   *  The reason is only true while the run is waiting. Every terminal path —
+   *  cancelled by a user, a sweep, a deleted bot or a schedule edit, or failed
+   *  by `failRun` — has to clear it, or a persisted receipt ends up claiming
+   *  "cancelled" and "waiting because its engine is dead" at the same time.
+   *  Centralised because there are seven cancel sites and forgetting one is
+   *  silent. */
+  private leaveQueued(run: RoutineRun, status: "cancelled" | "failed"): void {
+    run.status = status;
+    run.holdReason = undefined;
+  }
+
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {
-    run.status = "failed";
+    this.leaveQueued(run, "failed");
     run.error = message.slice(0, 500);
     run.outcomeCode = code;
     run.failurePhase = routineFailurePhase(code);

@@ -753,6 +753,31 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
   }
 }
 
+/** The engine a turn will ACTUALLY execute on, which is not always the engine
+ *  its `modelSelection` names.
+ *
+ *  A Box-backed `runOn: "cloud"` routine is switched to the boxAgent instance
+ *  before it runs. Asking about `selection.instanceId` instead asks about an
+ *  engine the turn never touches — which is how a local setup-dead breaker
+ *  queued healthy Box work, how a boxAgent breaker went unseen, and, in the
+ *  first attempt at this fix, how a run was admitted by one gate and rejected
+ *  by the other.
+ *
+ *  One function, called by every gate that has to reason about the engine a
+ *  run will use. A second caller computing it differently is exactly how the
+ *  two gates came to disagree. */
+function executionInstanceFor(
+  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null },
+  policy: ModelSelection,
+  runOn: RoutineRunOn,
+): string {
+  if (cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)) {
+    const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
+    if (boxCloud) return boxCloud.instanceId;
+  }
+  return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+}
+
 /** Why this bot's work must not go out right now, or undefined if it can.
  *
  *  One function, three callers: the dispatch gate answers yes/no, the scheduler
@@ -780,12 +805,7 @@ function dispatchHoldFor(
   // setup-dead, and never consulted a breaker that had opened on boxAgent.
   // This is the engine the turn will actually reach, which is the only one a
   // hold can honestly be about.
-  const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
-  const cloudInstanceId = cloudRunUsesBoxAgent(runOn, bot.cloudBackend, cfg.botDefaults?.cloudBackend)
-    ? boxCloud?.instanceId
-    : undefined;
-  const instanceId = cloudInstanceId
-    ?? quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+  const instanceId = executionInstanceFor(bot, policy, runOn);
   // The registry's own display name where it has one, so the reason says
   // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
   // start" is no easier to act on than the boolean it replaced.
@@ -3868,8 +3888,13 @@ async function startTurn(
       : undefined,
     isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)),
   });
-  if (turnExternalCredentialPending(bot, selection.instanceId, opts?.runOn)) {
-    throw externalCredentialPendingError(selection.instanceId);
+  // The engine this turn will run on, not merely the one the selection names —
+  // see `executionInstanceFor`. Asking the credential gate about a Box-backed
+  // cloud run's LOCAL model rejects work whose Box credentials are perfectly
+  // ready, which is the mirror of the breaker bug.
+  const executingInstance = executionInstanceFor(bot, selection, opts?.runOn ?? "bot");
+  if (turnExternalCredentialPending(bot, executingInstance, opts?.runOn)) {
+    throw externalCredentialPendingError(executingInstance);
   }
   // A fresh user turn re-arms both the saved chain and the stop latch; the
   // fallback dispatch (which carries modelSelection) is a continuation of the
@@ -11752,15 +11777,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               threadId: null as string | null,
               ...effectiveFallbackTiers(bot.modelSelection, bot.modelSelection.fallbacks),
             };
-            const perTask = (bot.tasks ?? []).map((task) => ({
+            // Only tasks that OVERRIDE the bot selection. A task without one
+            // inherits it, so emitting a row for it duplicated the bot-level
+            // finding — eleven rows for one redundant chain, which the panel
+            // then read as eleven bots.
+            const perTask = (bot.tasks ?? [])
+              .filter((task) => task.modelSelection)
+              .map((task) => ({
               botId: bot.id,
               name: bot.name,
               scope: "task" as const,
               threadId: task.threadId ?? null,
-              ...effectiveFallbackTiers(
-                task.modelSelection ?? bot.modelSelection,
-                (task.modelSelection ?? bot.modelSelection).fallbacks,
-              ),
+              ...effectiveFallbackTiers(task.modelSelection!, task.modelSelection!.fallbacks),
             }));
             return [botLevel, ...perTask];
           })
