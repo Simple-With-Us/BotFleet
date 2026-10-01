@@ -774,7 +774,18 @@ function dispatchHoldFor(
   if (!bot) return undefined;
   const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
   const policy = task?.modelSelection ?? bot.modelSelection;
-  const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+  // A Box-backed cloud run does NOT execute on the bot's model engine:
+  // `startTurn` switches it to the boxAgent instance. Judging the hold against
+  // the local engine queued healthy cloud work whenever the local engine was
+  // setup-dead, and never consulted a breaker that had opened on boxAgent.
+  // This is the engine the turn will actually reach, which is the only one a
+  // hold can honestly be about.
+  const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
+  const cloudInstanceId = cloudRunUsesBoxAgent(runOn, bot.cloudBackend, cfg.botDefaults?.cloudBackend)
+    ? boxCloud?.instanceId
+    : undefined;
+  const instanceId = cloudInstanceId
+    ?? quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
   // The registry's own display name where it has one, so the reason says
   // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
   // start" is no easier to act on than the boolean it replaced.
@@ -11728,11 +11739,32 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // typed. Two live bots were configured that way. Reported per bot here
         // rather than corrected in the record: repeating the primary at the end
         // of a chain is a defensible thing for an owner to mean.
-        fallbackChains: store.bots.map((bot) => ({
-          botId: bot.id,
-          name: bot.name,
-          ...effectiveFallbackTiers(bot.modelSelection, bot.modelSelection.fallbacks),
-        })).filter((entry) => entry.redundant.length > 0),
+        // Bot-level AND per-task, because in Projects mode a task carries its
+        // own modelSelection and fallback chain and the runtime prefers it. A
+        // bot-only view reported chains that never run and missed the ones
+        // that do — including the thread an automation is actually holding.
+        fallbackChains: store.bots
+          .flatMap((bot) => {
+            const botLevel = {
+              botId: bot.id,
+              name: bot.name,
+              scope: "bot" as const,
+              threadId: null as string | null,
+              ...effectiveFallbackTiers(bot.modelSelection, bot.modelSelection.fallbacks),
+            };
+            const perTask = (bot.tasks ?? []).map((task) => ({
+              botId: bot.id,
+              name: bot.name,
+              scope: "task" as const,
+              threadId: task.threadId ?? null,
+              ...effectiveFallbackTiers(
+                task.modelSelection ?? bot.modelSelection,
+                (task.modelSelection ?? bot.modelSelection).fallbacks,
+              ),
+            }));
+            return [botLevel, ...perTask];
+          })
+          .filter((entry) => entry.redundant.length > 0),
         antigravity: lastAntigravityQuotaSnapshot(),
         grok: lastGrokQuotaSnapshot(),
         windows: usageQuotaPoller.getWindows(),

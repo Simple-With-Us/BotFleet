@@ -133,6 +133,9 @@ export interface DoomedPair {
 export interface RedundantChain {
   botId: string;
   name: string;
+  /** "bot" for the bot-level chain, "task" for a Projects task's own chain. */
+  scope?: "bot" | "task";
+  threadId?: string | null;
   total: number;
   effective: number;
   redundant: { instanceId: string; model: string; reason: "same-as-primary" | "duplicate" }[];
@@ -359,6 +362,10 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
   // "held" would report a healthy engine as held after one transient failure,
   // so only the entries that are actually refusing are shown.
   const heldPairs = doomed.filter((pair) => pair.open !== false);
+  // Count BOTS, not pairs. One bot whose primary and fallback both opened
+  // breakers is one bot being held, and a heading that says otherwise sends the
+  // reader looking for a bot that does not exist.
+  const heldBotCount = new Set(heldPairs.map((pair) => pair.botId)).size;
   const badge = telemetryBadge(telemetryStatus, telemetryFetchError);
   // Whatever host the operator pointed this at — never a built-in name.
   const host = telemetryHost(telemetryStatus);
@@ -719,7 +726,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         {heldPairs.length > 0 && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
             <div className="font-medium text-ink">
-              {heldPairs.length === 1 ? "1 bot is being held" : `${heldPairs.length} bots are being held`}
+              {heldBotCount === 1 ? "1 bot is being held" : `${heldBotCount} bots are being held`}
             </div>
             <div className="mt-1">
               These bots cannot start their engine, so their scheduled work is queued rather than failed
