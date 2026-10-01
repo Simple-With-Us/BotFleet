@@ -18,6 +18,35 @@ export function findRecallCli(): string | null {
   return candidates.find((candidate): candidate is string => Boolean(candidate && existsSync(candidate))) ?? null;
 }
 
+/** Can a turn actually be given the recall tools?
+ *
+ *  This was `Boolean(settings && (settings.url || findRecallCli()))` inline at
+ *  the dispatch site, which meant the rule that decides whether a bot is
+ *  handed a memory tool had no test at all — and the state it produces is the
+ *  one that hid itself.  With `url` and `collection` both empty and a `recall`
+ *  binary on this computer, the tools went live and answered from a corpus the
+ *  owner never pointed the app at, while `/api/qdrant/status` said
+ *  `configured: true`.
+ *
+ *  Being able to serve the tools is deliberately NOT a statement about WHICH
+ *  corpus.  Availability is the transport; `configuredTarget` on the status is
+ *  the corpus, and only one of the two is an answer to "is this set up the way
+ *  I meant".
+ *
+ *  Parameters are passed rather than probed so the rule is testable without a
+ *  binary on the machine running the tests — `findRecallCli()` reads PATH and
+ *  $HOME, which is exactly the kind of environment truth that makes a test
+ *  pass on one laptop and fail on another. */
+export function recallAvailableForTurn(
+  settings: { url?: string; collection?: string } | null | undefined,
+  usesDriverToolLoop: boolean,
+  cliAvailable: boolean,
+): boolean {
+  if (!usesDriverToolLoop) return false;
+  if (!settings) return false;
+  return Boolean(settings.url || cliAvailable);
+}
+
 /** An explicitly selected service is never bypassed by another local corpus. */
 export function selectRecallTransport(url: string, cli: string | null): RecallStatus["source"] {
   return url ? "recall-service" : cli ? "recall-cli" : "unconfigured";
