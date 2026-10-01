@@ -133,6 +133,62 @@ final class InstanceRosterTests: XCTestCase {
         XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
     }
 
+    func testAFetchStartedBeforeTheOrderWasForgottenIsRefused() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 1_790_000_000_000)
+        // A fetch goes out, then the stream reconnects cold and forgets the order.
+        let startedAt = roster.orderEpoch
+        roster.forgetOrder()
+        // The new process's clock sits below the old one's last stamp, and its
+        // first answer lands.
+        XCTAssertTrue(roster.apply([try instance("codex")], describedAt: 1_789_999_000_000))
+        // The old process's answer, with the higher stamp, arrives afterwards.
+        // Installed, it would put the mark back and shut the new process out.
+        XCTAssertFalse(roster.apply([try instance("claude")], describedAt: 1_790_000_000_500, startedAt: startedAt))
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
+        XCTAssertEqual(roster.describedAt, 1_789_999_000_000)
+        // The new process's next push still gets through.
+        XCTAssertTrue(roster.apply([try instance("codex", version: "2")], describedAt: 1_789_999_000_100))
+        XCTAssertEqual(roster.instances.first?.snapshot.version, "2")
+    }
+
+    func testARefusedStaleFetchDoesNotMoveTheMark() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 10)
+        let startedAt = roster.orderEpoch
+        roster.forgetOrder()
+        XCTAssertFalse(roster.apply([try instance("codex")], describedAt: 50, startedAt: startedAt))
+        XCTAssertEqual(roster.describedAt, -.infinity)
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["claude"])
+    }
+
+    func testAFetchStartedAfterTheOrderWasForgottenIsInstalled() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 1_790_000_000_000)
+        roster.forgetOrder()
+        let startedAt = roster.orderEpoch
+        XCTAssertTrue(roster.apply([try instance("codex")], describedAt: 5, startedAt: startedAt))
+        XCTAssertEqual(roster.instances.map(\.instanceId), ["codex"])
+    }
+
+    func testAFetchWithNoEpochIsOrderedByTheMarkAlone() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 10)
+        roster.forgetOrder()
+        // A push carries no epoch: it comes over the live stream, never from before the reset.
+        XCTAssertTrue(roster.apply([try instance("codex")], describedAt: 3))
+        XCTAssertFalse(roster.apply([try instance("claude")], describedAt: 2))
+    }
+
+    func testResetAlsoRefusesAFetchThatWasOnTheWire() throws {
+        var roster = InstanceRoster()
+        roster.apply([try instance("claude")], describedAt: 10)
+        let startedAt = roster.orderEpoch
+        roster.reset()
+        XCTAssertFalse(roster.apply([try instance("claude")], describedAt: 10, startedAt: startedAt))
+        XCTAssertTrue(roster.instances.isEmpty)
+    }
+
     func testAPushedFrameAndAFetchAreOrderedByTheSameMark() throws {
         var roster = InstanceRoster()
         let frameJSON = """

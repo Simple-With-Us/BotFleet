@@ -874,6 +874,30 @@ export function shouldHydrateAfterHello(resumed: boolean, previousHydrationFaile
   return !resumed || previousHydrationFailed;
 }
 
+/** Orders engine-list fetches against a reset of the ordering mark.
+ *
+ * `instancesOrderReset` forgets `instancesDescribedAt` because a stream that
+ * could not resume may front a new harness process whose `describedAt` clock
+ * owes nothing to the last one's.  A fetch already on the wire when that
+ * happens can still be answered by the old process, and its higher stamp would
+ * put the mark back where the reset took it from, shutting the new process out
+ * until its clock caught up.  A fetch takes a ticket before it starts and drops
+ * its answer once the reset has run.  Stream pushes arrive after the hello that
+ * triggered the reset, so they take none. */
+export function createRosterEpoch() {
+  let epoch = 0;
+  return {
+    reset: () => {
+      epoch += 1;
+    },
+    /** Take the ticket before the request goes out; true while it still counts. */
+    begin: () => {
+      const startedAt = epoch;
+      return () => startedAt === epoch;
+    },
+  };
+}
+
 export async function runHydrationRequests(
   requests: Array<{ label: string; request: Promise<unknown> }>,
 ): Promise<void> {
@@ -2145,6 +2169,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Engine-list fetches in flight are dropped when the stream forgets the
+  // ordering mark (see createRosterEpoch).
+  const [rosterEpoch] = useState(createRosterEpoch);
   // per-frame stream-delta batching (see the "runtime" SSE case); stream
   // state is intentionally OUTSIDE the reducer so token frames re-render
   // only StreamContext consumers
@@ -2665,6 +2692,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     const loadAll = async (botEpochAtFetch: Record<string, number>, groupEpochAtFetch: Record<string, number>) => {
+      const rosterCurrent = rosterEpoch.begin();
       const requests = [
         {
           label: "bots",
@@ -2689,7 +2717,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         {
           label: "engines",
           request: api("/api/instances")
-            .then(({ instances, describedAt }) => alive && rawDispatch({ type: "instances", instances, describedAt })),
+            .then(({ instances, describedAt }) => alive && rosterCurrent() && rawDispatch({ type: "instances", instances, describedAt })),
         },
         {
           label: "settings",
@@ -2948,15 +2976,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         // a key changed and the fleet hot-reloaded — refresh the picker so
         // newly available providers un-dim immediately
-        case "config":
+        case "config": {
           rawDispatch({
             type: "configStatus",
             config: configStatusFromFrame(frame),
           });
+          const rosterCurrent = rosterEpoch.begin();
           api("/api/instances")
-            .then(({ instances, describedAt }) => rawDispatch({ type: "instances", instances, describedAt }))
+            .then(({ instances, describedAt }) => rosterCurrent() && rawDispatch({ type: "instances", instances, describedAt }))
             .catch(() => {});
           break;
+        }
         // A describe finished on the server (a background sweep behind a
         // stale answer, or a slow engine's probe landing late).  Applied
         // directly — re-fetching here would only start another sweep.
@@ -2996,6 +3026,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // stamp.  Keep the engine list, drop the mark, so the hydrate's
           // fetch (and later pushes) are not discarded as "older".
           rawDispatch({ type: "instancesOrderReset" });
+          rosterEpoch.reset();
         }
         if (shouldHydrateAfterHello(frame.resumed === true, hydrationFailed)) hydrate();
         return;
@@ -3023,13 +3054,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // just changed something the memo wouldn't know about yet — an explicit
   // "Check again"/"Refresh" click, or a just-saved CLI/fullAuto override.
   const refreshInstances = useCallback(async (opts?: { fresh?: boolean }) => {
+    const rosterCurrent = rosterEpoch.begin();
     try {
       const { instances, describedAt } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
-      rawDispatch({ type: "instances", instances, describedAt });
+      if (rosterCurrent()) rawDispatch({ type: "instances", instances, describedAt });
     } catch {
       /* offline or server down — the existing list stays */
     }
-  }, []);
+  }, [rosterEpoch]);
 
   // Installing a CLI or signing one in happens in a terminal, outside this
   // window — so the moment the user comes back is exactly when our engine

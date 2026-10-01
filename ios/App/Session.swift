@@ -708,6 +708,8 @@ final class Session: ObservableObject {
                             // harness, whose describedAt clock owes nothing to
                             // the last process's.  Keep the roster, drop the
                             // mark, so the next fetch is not judged against it.
+                            // A fetch already on the wire is refused instead, or
+                            // it would bring the old mark back.
                             instanceRoster.forgetOrder()
                             coldHydration: while true {
                                 switch try await hydrateSnapshot(using: client) {
@@ -2477,9 +2479,13 @@ final class Session: ObservableObject {
     /// Every path that installs a roster goes through here, so one high-water
     /// mark orders them all.  An answer without a stamp (an older harness) is
     /// applied as before.
+    ///
+    /// A fetch passes the `orderEpoch` it read before it started: one that was
+    /// already in flight when a cold reconnect forgot the order is refused (see
+    /// `InstanceRoster.apply`).  A push passes none.
     @discardableResult
-    private func applyInstances(_ fetched: [Instance], describedAt: Double?) -> Bool {
-        guard instanceRoster.apply(fetched, describedAt: describedAt) else { return false }
+    private func applyInstances(_ fetched: [Instance], describedAt: Double?, startedAt epoch: Int? = nil) -> Bool {
+        guard instanceRoster.apply(fetched, describedAt: describedAt, startedAt: epoch) else { return false }
         cachedInstances = instanceRoster.instances
         instanceDriverKinds = instanceRoster.driverKinds
         return true
@@ -2488,11 +2494,15 @@ final class Session: ObservableObject {
     func instances() async -> [Instance] {
         guard let client else { return [] }
         let generation = pairingGeneration
+        let orderEpoch = instanceRoster.orderEpoch
         do {
             let list = try await client.instanceList()
             guard pairingGeneration == generation else { return list.instances }
-            // A fetch older than the roster already held answers with the newer one.
-            return applyInstances(list.instances, describedAt: list.describedAt) ? list.instances : cachedInstances
+            // A fetch older than the roster already held, or one that was on the
+            // wire when a cold reconnect forgot the order, answers with the roster held.
+            return applyInstances(list.instances, describedAt: list.describedAt, startedAt: orderEpoch)
+                ? list.instances
+                : cachedInstances
         } catch {
             recordActionError(error)
             if pairingGeneration == generation && !cachedInstances.isEmpty {
@@ -2510,10 +2520,11 @@ final class Session: ObservableObject {
     func warmInstanceDriverKinds() async {
         guard let client else { return }
         let generation = pairingGeneration
+        let orderEpoch = instanceRoster.orderEpoch
         do {
             let list = try await client.instanceList()
             guard pairingGeneration == generation else { return }
-            applyInstances(list.instances, describedAt: list.describedAt)
+            applyInstances(list.instances, describedAt: list.describedAt, startedAt: orderEpoch)
         } catch {
             // Quiet: connectivity / cancel while the roster is open.
         }

@@ -18,13 +18,28 @@ public struct InstanceRoster: Equatable, Sendable {
     public private(set) var instances: [Instance] = []
     /// `describedAt` of that roster; `-infinity` until a stamped one lands.
     public private(set) var describedAt: Double = -.infinity
+    /// Counts the times the ordering was thrown away (`forgetOrder`, `reset`).
+    /// A fetch notes it when it starts and hands it back to `apply`, so an answer
+    /// that was already on the wire when the order was reset is not installed.
+    public private(set) var orderEpoch = 0
 
     public init() {}
 
     /// Installs `instances` unless the harness already described a newer roster.
     /// Returns whether it was installed.
+    ///
+    /// `startedAt` is the `orderEpoch` read before the request went out.  If the
+    /// order was reset since, the answer may come from the process whose clock
+    /// the reset gave up on, and its stamp (higher than the new process's) would
+    /// put the mark back where the reset took it from: it is refused.  Pushes
+    /// arrive on the live stream, so they never pass one.
     @discardableResult
-    public mutating func apply(_ instances: [Instance], describedAt stamp: Double?) -> Bool {
+    public mutating func apply(
+        _ instances: [Instance],
+        describedAt stamp: Double?,
+        startedAt epoch: Int? = nil
+    ) -> Bool {
+        if let epoch, epoch != orderEpoch { return false }
         if let stamp {
             guard stamp >= describedAt else { return false }
             describedAt = stamp
@@ -38,6 +53,7 @@ public struct InstanceRoster: Equatable, Sendable {
     public mutating func reset() {
         instances = []
         describedAt = -.infinity
+        orderEpoch += 1
     }
 
     /// Forgets only the high-water mark, keeping the roster on screen.
@@ -50,6 +66,7 @@ public struct InstanceRoster: Equatable, Sendable {
     /// roster itself stays, so pickers do not go empty before the next one lands.
     public mutating func forgetOrder() {
         describedAt = -.infinity
+        orderEpoch += 1
     }
 
     /// instanceId -> driverKind for the held roster, so a bot's saved selection

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  createRosterEpoch,
   getRoomTerminology,
   initialState,
   isHarnessUnreachableError,
@@ -1040,5 +1041,52 @@ describe("instances ordering guard", () => {
     // Ordering holds again from that stamp on.
     const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
     expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
+
+  it("drops a fetch that was on the wire when the mark was forgotten", () => {
+    // The old process answers after the stream reset the mark and the new
+    // process's own answer landed.  Applied, its higher stamp would put the
+    // mark back and shut the new process out until its clock caught up.
+    const roster = createRosterEpoch();
+    const held = reducer(initialState, { type: "instances", instances: [engine("held")], describedAt: 9_000 });
+    const staleFetchCurrent = roster.begin();
+    // The stream cannot resume: the reducer forgets the mark, the epoch moves on.
+    roster.reset();
+    const reset = reducer(held, { type: "instancesOrderReset" });
+    const freshFetchCurrent = roster.begin();
+    expect(freshFetchCurrent()).toBe(true);
+    const restarted = reducer(reset, { type: "instances", instances: [engine("restarted")], describedAt: 4_000 });
+    // What the store does with the old process's late answer.
+    expect(staleFetchCurrent()).toBe(false);
+    let afterStale = restarted;
+    if (staleFetchCurrent()) afterStale = reducer(restarted, { type: "instances", instances: [engine("old")], describedAt: 9_500 });
+    expect(afterStale.instances[0].snapshot.version).toBe("restarted");
+    expect(afterStale.instancesDescribedAt).toBe(4_000);
+    // The new process's next push still gets through.
+    const pushed = reducer(afterStale, { type: "instances", instances: [engine("pushed")], describedAt: 4_100 });
+    expect(pushed.instances[0].snapshot.version).toBe("pushed");
+  });
+});
+
+describe("createRosterEpoch", () => {
+  it("counts a fetch as current until the mark is forgotten after it started", () => {
+    const roster = createRosterEpoch();
+    const first = roster.begin();
+    const second = roster.begin();
+    expect(first()).toBe(true);
+    expect(second()).toBe(true);
+    roster.reset();
+    expect(first()).toBe(false);
+    expect(second()).toBe(false);
+  });
+
+  it("counts a fetch started after the reset as current, and each reset retires the ones before it", () => {
+    const roster = createRosterEpoch();
+    roster.reset();
+    const afterFirst = roster.begin();
+    expect(afterFirst()).toBe(true);
+    roster.reset();
+    expect(afterFirst()).toBe(false);
+    expect(roster.begin()()).toBe(true);
   });
 });
