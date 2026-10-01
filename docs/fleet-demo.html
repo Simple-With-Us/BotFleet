@@ -3,224 +3,213 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>TV-Face Fleet Demo — 6 bots live</title>
+<title>BotFleet TV-Face — Live fleet demo</title>
 <meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"/>
 <style>
-  :root { --bg:#07070b; --card:#12121a; --line:#2a2a36; --text:#eef0f6; --muted:#9aa0b2; --accent:#4fd1c5; }
+  :root { --bg:#0b0b0f; --card:#14141c; --line:#2a2a36; --text:#e8e8ef; --muted:#9aa0b2; --accent:#4fd1c5; }
   * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background: radial-gradient(1200px 600px at 50% -10%, #1a1a28, var(--bg)); color: var(--text); min-height:100vh; }
-  header { max-width: 1100px; margin: 0 auto; padding: 1.25rem 1rem 0.5rem; }
-  h1 { margin:0 0 .35rem; font-size:1.45rem; letter-spacing:-.02em; }
-  .sub { color: var(--muted); margin:0 0 1rem; line-height:1.45; }
-  .bar { display:flex; flex-wrap:wrap; gap:.75rem 1.25rem; align-items:center; margin-bottom:1rem; color:var(--muted); font-size:.9rem; }
-  a { color: var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
-  button { background:#1c1c28; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:.55rem 1rem; cursor:pointer; font:inherit; }
-  button:hover { border-color: var(--accent); }
-  button.primary { background: #1a3a36; border-color:#2d6b63; }
-  .grid { max-width:1100px; margin:0 auto; padding:0 1rem 2.5rem; display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:1rem; }
-  .bot { background: var(--card); border:1px solid var(--line); border-radius:16px; padding:1rem 1rem 1.1rem; display:flex; flex-direction:column; gap:.65rem; min-height: 280px; }
-  .bot .face-wrap { display:flex; justify-content:center; align-items:center; background:#000; border-radius:14px; min-height: 180px; position:relative; overflow:hidden; }
-  .bot img.face { width: 160px; height:160px; object-fit:contain; }
-  .meta { display:flex; justify-content:space-between; align-items:baseline; gap:.5rem; }
-  .name { font-weight:650; }
-  .state { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.82rem; }
-  .role { color: var(--muted); font-size:.86rem; line-height:1.35; }
-  .timeline { height:4px; background:#1a1a24; border-radius:99px; overflow:hidden; }
-  .timeline > i { display:block; height:100%; width:0; background: linear-gradient(90deg, #4fd1c5, #8057C8); border-radius:99px; transition: width .25s linear; }
-  footer { max-width:1100px; margin:0 auto 2rem; padding:0 1rem; color:var(--muted); font-size:.85rem; line-height:1.45; }
-  .chip { display:inline-block; padding:.15rem .45rem; border-radius:6px; background:#1a1a24; border:1px solid var(--line); font-size:.75rem; color:var(--muted); }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
+         min-height:100vh; padding:1.25rem 1rem 3rem; }
+  h1 { margin:0 0 .35rem; font-size:1.45rem; }
+  .sub { color:var(--muted); margin:0 0 1rem; max-width:52rem; line-height:1.45; }
+  .bar { display:flex; flex-wrap:wrap; gap:.75rem 1.25rem; margin:0 0 1.25rem; font-size:.9rem; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1rem; max-width:960px; }
+  .bot { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1rem .9rem 1.1rem;
+         text-align:center; position:relative; overflow:hidden; }
+  .bot .face { width:128px; height:128px; margin:0 auto .65rem; display:block; object-fit:contain; background:transparent; }
+  .bot .name { font-weight:650; font-size:.95rem; }
+  .bot .role { color:var(--muted); font-size:.8rem; margin-top:.15rem; }
+  .bot .state { margin-top:.55rem; display:inline-block; font-size:.72rem; letter-spacing:.04em; text-transform:uppercase;
+                padding:.25rem .55rem; border-radius:999px; background:#1a1a22; color:var(--accent); border:1px solid #2a2a36; }
+  .clock { color:var(--muted); font-size:.85rem; margin:0 0 1rem; }
+  .note { max-width:960px; margin-top:1.5rem; color:var(--muted); font-size:.88rem; line-height:1.5; }
 </style>
 </head>
 <body>
-<header>
-  <h1>TV-Face fleet demo</h1>
-  <p class="sub">Six bots at once, each on its own casing color, cycling through the super-specific TV-Face sheet expressions (git, tools, crash, memory, webhook, computer, fleet, orbit, radar, progress, uploading, sneaking, and the emotion set).  About one minute, then they settle to rest.  Assets load live from FleetLink.</p>
+  <h1>Live fleet — six bots at once</h1>
+  <p class="sub">Each card is a real BotFleet TV-Face skin cycling enter → hold → return for about a minute, then looping.  Bookends stay on the resting face.</p>
   <div class="bar">
-    <button class="primary" id="replay">Replay 60s</button>
-    <span id="clock" class="chip">0s / 60s</span>
     <a href="/TV-Face/botfleet/colors.html">All colors</a>
     <a href="/TV-Face/botfleet/COLORS.md">COLORS.md</a>
-    <a href="/TV-Face/botfleet/">Orange pack</a>
+    <a href="/TV-Face/botfleet/">Default orange pack</a>
   </div>
-</header>
-<div class="grid" id="grid"></div>
-<footer>
-  Bookend contract: every enter starts and every return ends on the same resting face (MAE 0).  Green uses red mouth glyphs.  white / black are first-class skins.  Sheet faces like orbit, radar, progress, uploading, and sneaking stay distinct (not remapped).  This page is a pure client demo of the same GIF packs the BotFleet web + iOS TV-Face players use.
-</footer>
+  <p class="clock" id="clock">t = 0s / 60s</p>
+  <div class="grid" id="grid"></div>
+  <p class="note">Assets load from FleetLink transparent packs.  Hold GIFs loop while a bot stays in an active state.  Green uses red mouth glyphs.</p>
 <script>
-const BASE = 'https://fleetlink.online/TV-Face/botfleet';
-const TRANSITION_MS = 1000;
-const HAS_ENTER_RETURN = new Set([
-  'listening','thinking','typing','speaking','computer','fleet','crash','memory','tools','routine','screen','git','webhook'
-]);
-// 1:1 sheet mapping — keep super-specific faces distinct
-const MANIFEST = {
-  idle: 'resting', sleeping: 'sleeping', waking: 'waking', listening: 'listening',
-  thinking: 'thinking', searching: 'searching', working: 'working',
-  excited: 'excited', surprised: 'surprised', suspicious: 'suspicious', angry: 'angry',
-  drowsy: 'drowsy', happy: 'happy', curious: 'curious', confused: 'confused',
-  bored: 'bored', proud: 'proud', shy: 'shy', sad: 'sad', laughing: 'laughing',
-  scared: 'scared', playful: 'playful', celebrate: 'celebrate',
-  loading: 'loading', notifying: 'notifying', alerting: 'alerting',
-  typing: 'typing', speaking: 'speaking', fleet: 'fleet', crash: 'crash',
-  memory: 'memory', tools: 'tools', routine: 'routine', screen: 'screen',
-  git: 'git', webhook: 'webhook', computer: 'computer', sending: 'sending',
-  receiving: 'receiving', powering_down: 'powering_down',
-  orbit: 'orbit', radar: 'radar', progress: 'progress', uploading: 'uploading',
-  sneaking: 'sneaking', spawning: 'spawning',
-};
-function skinPath(color) { return color === 'orange' ? BASE : BASE + '/' + color; }
-function asset(color, expr, kind) {
-  const root = skinPath(color);
-  if (kind === 'still') return root + '/stills/' + expr + '.png';
-  return root + '/gifs/' + expr + '_' + kind + '.gif';
-}
-function planFrame(prev, next) {
-  if (prev === next) return [{ expression: next, kind: 'hold', delayAfterMs: 0 }];
-  if (next === 'resting') {
-    if (!HAS_ENTER_RETURN.has(prev)) return [{ expression: 'resting', kind: 'still', delayAfterMs: 0 }];
-    return [
-      { expression: prev, kind: 'return', delayAfterMs: TRANSITION_MS },
-      { expression: 'resting', kind: 'still', delayAfterMs: 0 },
-    ];
-  }
-  if (prev === 'resting') {
-    if (!HAS_ENTER_RETURN.has(next)) return [{ expression: next, kind: 'hold', delayAfterMs: 0 }];
-    return [
-      { expression: next, kind: 'enter', delayAfterMs: TRANSITION_MS },
-      { expression: next, kind: 'hold', delayAfterMs: 0 },
-    ];
-  }
-  return [{ expression: next, kind: 'hold', delayAfterMs: 0 }];
-}
-const BOTS = [
-  { name: 'Compiler', color: 'orange', role: 'CI + TestFlight builds',
+const CDN = "https://fleetlink.online/TV-Face/botfleet";
+const CDN_SKINS = "https://fleetlink.online/TV-Face/botfleet-skins";
+
+// Six bots with distinct colors + state scripts over ~60s
+const bots = [
+  { name: "Director",  color: "blue",   role: "coordinates the fleet",
     script: [
-      ['idle',900],['thinking',2200],['git',3000],['computer',2800],['typing',2600],
-      ['tools',2400],['progress',2000],['celebrate',1800],['proud',1400],
-      ['idle',1000],['working',2200],['git',2800],['happy',1400],['idle',1200],
+      { t:0,  state:"resting", kind:"still" },
+      { t:2,  state:"thinking", kind:"enter" },
+      { t:3,  state:"thinking", kind:"hold" },
+      { t:14, state:"thinking", kind:"return" },
+      { t:15, state:"resting", kind:"still" },
+      { t:18, state:"speaking", kind:"enter" },
+      { t:19, state:"speaking", kind:"hold" },
+      { t:28, state:"speaking", kind:"return" },
+      { t:29, state:"resting", kind:"still" },
+      { t:32, state:"fleet", kind:"enter" },
+      { t:33, state:"fleet", kind:"hold" },
+      { t:45, state:"fleet", kind:"return" },
+      { t:46, state:"resting", kind:"still" },
+      { t:50, state:"happy", kind:"hold" },
+      { t:58, state:"resting", kind:"still" },
     ]},
-  { name: 'Publisher', color: 'blue', role: 'Congress.Trade review queue',
+  { name: "Compiler", color: "orange", role: "builds & TestFlight",
     script: [
-      ['idle',700],['searching',2000],['screen',2600],['memory',2800],['typing',2600],
-      ['uploading',2000],['sending',1600],['receiving',1600],['curious',1400],
-      ['suspicious',1600],['celebrate',1800],['proud',1400],['idle',1200],
+      { t:0,  state:"resting", kind:"still" },
+      { t:1,  state:"working", kind:"hold" },
+      { t:12, state:"typing", kind:"enter" },
+      { t:13, state:"typing", kind:"hold" },
+      { t:24, state:"typing", kind:"return" },
+      { t:25, state:"celebrate", kind:"hold" },
+      { t:32, state:"resting", kind:"still" },
+      { t:35, state:"computer", kind:"enter" },
+      { t:36, state:"computer", kind:"hold" },
+      { t:50, state:"computer", kind:"return" },
+      { t:51, state:"resting", kind:"still" },
     ]},
-  { name: 'Monitor', color: 'green', role: 'Spend, ups, and downs',
+  { name: "Monitor",  color: "green",  role: "spend & uptime",
     script: [
-      ['radar',2000],['alerting',2000],['scared',1400],['webhook',2600],['notifying',1600],
-      ['searching',2000],['routine',2600],['orbit',2200],['tools',2200],
-      ['happy',1400],['idle',1000],['alerting',1800],['proud',1400],['idle',1200],
+      { t:0,  state:"searching", kind:"hold" },
+      { t:10, state:"alerting", kind:"hold" },
+      { t:16, state:"resting", kind:"still" },
+      { t:18, state:"tools", kind:"enter" },
+      { t:19, state:"tools", kind:"hold" },
+      { t:30, state:"tools", kind:"return" },
+      { t:31, state:"notifying", kind:"hold" },
+      { t:40, state:"resting", kind:"still" },
+      { t:42, state:"thinking", kind:"enter" },
+      { t:43, state:"thinking", kind:"hold" },
+      { t:55, state:"thinking", kind:"return" },
+      { t:56, state:"resting", kind:"still" },
     ]},
-  { name: 'Fixer', color: 'purple', role: 'Bugs + Sentry pages',
+  { name: "Fixer",    color: "red",    role: "bugs & Sentry",
     script: [
-      ['idle',600],['crash',2800],['angry',1400],['computer',2800],['tools',2400],
-      ['thinking',2200],['git',2600],['surprised',1400],['memory',2400],
-      ['celebrate',1800],['happy',1400],['idle',1000],['crash',2200],['idle',1200],
+      { t:0,  state:"resting", kind:"still" },
+      { t:3,  state:"crash", kind:"enter" },
+      { t:4,  state:"crash", kind:"hold" },
+      { t:12, state:"crash", kind:"return" },
+      { t:13, state:"angry", kind:"hold" },
+      { t:18, state:"working", kind:"hold" },
+      { t:30, state:"git", kind:"enter" },
+      { t:31, state:"git", kind:"hold" },
+      { t:42, state:"git", kind:"return" },
+      { t:43, state:"proud", kind:"hold" },
+      { t:50, state:"resting", kind:"still" },
     ]},
-  { name: 'Director', color: 'white', role: 'Fleet coordination',
+  { name: "Designer", color: "black", role: "UI & UX",
     script: [
-      ['idle',800],['fleet',3000],['orbit',2200],['listening',2000],['speaking',2400],
-      ['routine',2400],['screen',2000],['webhook',2400],['notifying',1600],
-      ['sneaking',1800],['celebrate',1800],['proud',1400],['idle',1200],
+      { t:0,  state:"curious", kind:"hold" },
+      { t:8,  state:"screen", kind:"enter" },
+      { t:9,  state:"screen", kind:"hold" },
+      { t:20, state:"screen", kind:"return" },
+      { t:21, state:"playful", kind:"hold" },
+      { t:28, state:"memory", kind:"enter" },
+      { t:29, state:"memory", kind:"hold" },
+      { t:40, state:"memory", kind:"return" },
+      { t:41, state:"happy", kind:"hold" },
+      { t:50, state:"resting", kind:"still" },
     ]},
-  { name: 'Housekeeper', color: 'black', role: 'Disk, RAM, inodes',
+  { name: "Housekeeper", color: "white", role: "disk & RAM",
     script: [
-      ['sleeping',1800],['waking',1400],['drowsy',1600],['computer',2600],['loading',1800],
-      ['progress',2000],['tools',2400],['working',2200],['powering_down',1800],
-      ['bored',1400],['shy',1400],['sad',1400],['happy',1400],['sleeping',1800],
+      { t:0,  state:"sleeping", kind:"hold" },
+      { t:8,  state:"waking", kind:"hold" },
+      { t:12, state:"resting", kind:"still" },
+      { t:14, state:"routine", kind:"enter" },
+      { t:15, state:"routine", kind:"hold" },
+      { t:28, state:"routine", kind:"return" },
+      { t:29, state:"loading", kind:"hold" },
+      { t:40, state:"webhook", kind:"enter" },
+      { t:41, state:"webhook", kind:"hold" },
+      { t:52, state:"webhook", kind:"return" },
+      { t:53, state:"resting", kind:"still" },
     ]},
 ];
-const grid = document.getElementById('grid');
-const players = [];
-function makeBot(bot) {
-  const el = document.createElement('div');
-  el.className = 'bot';
-  el.innerHTML =
-    '<div class="meta"><span class="name">' + bot.name + '</span><span class="state" data-state>idle</span></div>' +
-    '<div class="role">' + bot.role + ' · <span class="chip">' + bot.color + '</span></div>' +
-    '<div class="face-wrap"><img class="face" alt="' + bot.name + '" src="' + asset(bot.color, 'resting', 'still') + '"/></div>' +
-    '<div class="timeline"><i data-bar></i></div>';
-  grid.appendChild(el);
-  const img = el.querySelector('img.face');
-  const stateEl = el.querySelector('[data-state]');
-  const bar = el.querySelector('[data-bar]');
-  let prevExpr = 'resting';
-  let timer = null;
-  let cancelled = false;
-  function show(step) {
-    if (step.kind === 'still') img.src = asset(bot.color, step.expression, 'still');
-    else img.src = asset(bot.color, step.expression, step.kind) + '?t=' + Date.now();
-    // on missing gif, fall back to still
-    img.onerror = function() {
-      img.onerror = null;
-      img.src = asset(bot.color, step.expression, 'still');
-    };
-    stateEl.textContent = step.expression + (step.kind === 'enter' || step.kind === 'return' ? ' · ' + step.kind : '');
-  }
-  function playState(stateName, holdMs) {
-    return new Promise((resolve) => {
-      if (cancelled) return resolve();
-      const nextExpr = MANIFEST[stateName] || stateName || 'resting';
-      const steps = planFrame(prevExpr, nextExpr);
-      let i = 0;
-      const advance = () => {
-        if (cancelled) return resolve();
-        const step = steps[i];
-        show(step);
-        i += 1;
-        if (i < steps.length) {
-          timer = setTimeout(advance, steps[i - 1].delayAfterMs);
-        } else {
-          const wait = (step.kind === 'hold' || step.kind === 'still') ? holdMs : 0;
-          timer = setTimeout(() => { prevExpr = nextExpr; resolve(); }, wait);
-        }
-      };
-      advance();
-    });
-  }
-  async function runScript(onProgress) {
-    cancelled = false;
-    for (let i = 0; i < bot.script.length; i++) {
-      if (cancelled) break;
-      const pair = bot.script[i];
-      await playState(pair[0], pair[1]);
-      if (onProgress) onProgress((i + 1) / bot.script.length);
+
+function packBase(color) {
+  if (color === "orange") return CDN;
+  // Transparent recolored packs live on botfleet-skins; botfleet/{color} is the
+  // iOS + COLORS.md mirror. Prefer skins, fall back to botfleet.
+  return `${CDN_SKINS}/${color}`;
+}
+function packBaseFallback(color) {
+  if (color === "orange") return CDN;
+  return `${CDN}/${color}`;
+}
+
+function assetUrl(color, state, kind) {
+  const base = packBase(color);
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+
+function fallbackUrl(color, state, kind) {
+  const base = packBaseFallback(color);
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+
+const grid = document.getElementById("grid");
+const cards = bots.map((b) => {
+  const el = document.createElement("div");
+  el.className = "bot";
+  el.innerHTML = `
+    <img class="face" alt="${b.name}" src="${assetUrl(b.color, "resting", "still")}" />
+    <div class="name">${b.name}</div>
+    <div class="role">${b.role} · ${b.color}</div>
+    <div class="state">resting</div>`;
+  const img = el.querySelector("img");
+  img.onerror = () => {
+    // try alternate path once
+    const st = el.dataset.state || "resting";
+    const k = el.dataset.kind || "still";
+    if (!img.dataset.tried) {
+      img.dataset.tried = "1";
+      img.src = fallbackUrl(b.color, st, k);
     }
-    await playState('idle', 800);
-    bar.style.width = '100%';
-  }
-  function stop() { cancelled = true; if (timer) clearTimeout(timer); }
-  return { el, runScript, stop, bar, bot };
-}
-BOTS.forEach(function(b) { players.push(makeBot(b)); });
-const clock = document.getElementById('clock');
-let demoTimer = null;
-let demoStart = 0;
-async function runDemo() {
-  players.forEach(function(p) { p.stop(); });
-  demoStart = Date.now();
-  if (demoTimer) clearInterval(demoTimer);
-  demoTimer = setInterval(function() {
-    const s = Math.min(60, Math.floor((Date.now() - demoStart) / 1000));
-    clock.textContent = s + 's / 60s';
-  }, 250);
-  await Promise.all(players.map(function(p, idx) {
-    return new Promise(function(resolve) {
-      setTimeout(async function() {
-        await p.runScript(function(t) { p.bar.style.width = Math.round(t * 100) + '%'; });
-        resolve();
-      }, idx * 350);
-    });
-  }));
-  clearInterval(demoTimer);
-  clock.textContent = '60s / 60s · done';
-}
-document.getElementById('replay').addEventListener('click', function() {
-  players.forEach(function(p) { p.bar.style.width = '0'; });
-  runDemo();
+  };
+  grid.appendChild(el);
+  return { bot: b, el, img, stateEl: el.querySelector(".state"), cur: null };
 });
-runDemo();
+
+function apply(card, step) {
+  const key = step.state + ":" + step.kind;
+  if (card.cur === key) return;
+  card.cur = key;
+  card.el.dataset.state = step.state;
+  card.el.dataset.kind = step.kind;
+  card.img.dataset.tried = "";
+  // cache-bust hold loops so the browser restarts the GIF
+  const bust = step.kind === "hold" ? `?t=${Date.now()}` : "";
+  card.img.src = assetUrl(card.bot.color, step.state, step.kind) + bust;
+  card.stateEl.textContent = step.state + (step.kind === "hold" ? " · loop" : step.kind === "still" ? "" : " · " + step.kind);
+}
+
+const PERIOD = 60; // seconds
+const clock = document.getElementById("clock");
+const t0 = performance.now();
+
+function tick() {
+  const elapsed = ((performance.now() - t0) / 1000) % PERIOD;
+  clock.textContent = `t = ${elapsed.toFixed(1)}s / ${PERIOD}s · looping`;
+  for (const card of cards) {
+    // pick latest script step with t <= elapsed
+    let step = card.bot.script[0];
+    for (const s of card.bot.script) {
+      if (s.t <= elapsed) step = s; else break;
+    }
+    apply(card, step);
+  }
+  requestAnimationFrame(tick);
+}
+tick();
 </script>
 </body>
 </html>

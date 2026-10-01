@@ -104,7 +104,7 @@ const bots = [
       { t:43, state:"proud", kind:"hold" },
       { t:50, state:"resting", kind:"still" },
     ]},
-  { name: "Designer", color: "purple", role: "UI & UX",
+  { name: "Designer", color: "black", role: "UI & UX",
     script: [
       { t:0,  state:"curious", kind:"hold" },
       { t:8,  state:"screen", kind:"enter" },
@@ -135,7 +135,8 @@ const bots = [
 
 function packBase(color) {
   if (color === "orange") return CDN;
-  // Prefer transparent packs on botfleet-skins; white/black also under botfleet/
+  // Transparent recolored packs live on botfleet-skins; botfleet/{color} is the
+  // iOS + COLORS.md mirror. Prefer skins, fall back to botfleet.
   return `${CDN_SKINS}/${color}`;
 }
 function packBaseFallback(color) {
