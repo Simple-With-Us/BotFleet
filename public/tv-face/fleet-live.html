@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BotFleet TV-Face — Live fleet demo</title>
+<meta name="apple-itunes-app" content="app-clip-bundle-id=online.fleetlink.Clip, app-clip-display=card"/>
+<style>
+  :root { --bg:#0b0b0f; --card:#14141c; --line:#2a2a36; --text:#e8e8ef; --muted:#9aa0b2; --accent:#4fd1c5; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
+         min-height:100vh; padding:1.25rem 1rem 3rem; }
+  h1 { margin:0 0 .35rem; font-size:1.45rem; }
+  .sub { color:var(--muted); margin:0 0 1rem; max-width:52rem; line-height:1.45; }
+  .bar { display:flex; flex-wrap:wrap; gap:.75rem 1.25rem; margin:0 0 1.25rem; font-size:.9rem; }
+  a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1rem; max-width:960px; }
+  .bot { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:1rem .9rem 1.1rem;
+         text-align:center; position:relative; overflow:hidden; }
+  .bot .face { width:128px; height:128px; margin:0 auto .65rem; display:block; object-fit:contain; background:transparent; }
+  .bot .name { font-weight:650; font-size:.95rem; }
+  .bot .role { color:var(--muted); font-size:.8rem; margin-top:.15rem; }
+  .bot .state { margin-top:.55rem; display:inline-block; font-size:.72rem; letter-spacing:.04em; text-transform:uppercase;
+                padding:.25rem .55rem; border-radius:999px; background:#1a1a22; color:var(--accent); border:1px solid #2a2a36; }
+  .clock { color:var(--muted); font-size:.85rem; margin:0 0 1rem; }
+  .note { max-width:960px; margin-top:1.5rem; color:var(--muted); font-size:.88rem; line-height:1.5; }
+</style>
+</head>
+<body>
+  <h1>Live fleet — six bots at once</h1>
+  <p class="sub">Each card is a real BotFleet TV-Face skin cycling enter → hold → return for about a minute, then looping.  Bookends stay on the resting face.</p>
+  <div class="bar">
+    <a href="/TV-Face/botfleet/colors.html">All colors</a>
+    <a href="/TV-Face/botfleet/COLORS.md">COLORS.md</a>
+    <a href="/TV-Face/botfleet/">Default orange pack</a>
+  </div>
+  <p class="clock" id="clock">t = 0s / 60s</p>
+  <div class="grid" id="grid"></div>
+  <p class="note">Assets load from FleetLink transparent packs.  Hold GIFs loop while a bot stays in an active state.  Green uses red mouth glyphs.</p>
+<script>
+const CDN = "https://fleetlink.online/TV-Face/botfleet";
+const CDN_SKINS = "https://fleetlink.online/TV-Face/botfleet-skins";
+
+// Six bots with distinct colors + state scripts over ~60s
+const bots = [
+  { name: "Director",  color: "blue",   role: "coordinates the fleet",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:2,  state:"thinking", kind:"enter" },
+      { t:3,  state:"thinking", kind:"hold" },
+      { t:14, state:"thinking", kind:"return" },
+      { t:15, state:"resting", kind:"still" },
+      { t:18, state:"speaking", kind:"enter" },
+      { t:19, state:"speaking", kind:"hold" },
+      { t:28, state:"speaking", kind:"return" },
+      { t:29, state:"resting", kind:"still" },
+      { t:32, state:"fleet", kind:"enter" },
+      { t:33, state:"fleet", kind:"hold" },
+      { t:45, state:"fleet", kind:"return" },
+      { t:46, state:"resting", kind:"still" },
+      { t:50, state:"happy", kind:"hold" },
+      { t:58, state:"resting", kind:"still" },
+    ]},
+  { name: "Compiler", color: "orange", role: "builds & TestFlight",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:1,  state:"working", kind:"hold" },
+      { t:12, state:"typing", kind:"enter" },
+      { t:13, state:"typing", kind:"hold" },
+      { t:24, state:"typing", kind:"return" },
+      { t:25, state:"celebrate", kind:"hold" },
+      { t:32, state:"resting", kind:"still" },
+      { t:35, state:"computer", kind:"enter" },
+      { t:36, state:"computer", kind:"hold" },
+      { t:50, state:"computer", kind:"return" },
+      { t:51, state:"resting", kind:"still" },
+    ]},
+  { name: "Monitor",  color: "green",  role: "spend & uptime",
+    script: [
+      { t:0,  state:"searching", kind:"hold" },
+      { t:10, state:"alerting", kind:"hold" },
+      { t:16, state:"resting", kind:"still" },
+      { t:18, state:"tools", kind:"enter" },
+      { t:19, state:"tools", kind:"hold" },
+      { t:30, state:"tools", kind:"return" },
+      { t:31, state:"notifying", kind:"hold" },
+      { t:40, state:"resting", kind:"still" },
+      { t:42, state:"thinking", kind:"enter" },
+      { t:43, state:"thinking", kind:"hold" },
+      { t:55, state:"thinking", kind:"return" },
+      { t:56, state:"resting", kind:"still" },
+    ]},
+  { name: "Fixer",    color: "red",    role: "bugs & Sentry",
+    script: [
+      { t:0,  state:"resting", kind:"still" },
+      { t:3,  state:"crash", kind:"enter" },
+      { t:4,  state:"crash", kind:"hold" },
+      { t:12, state:"crash", kind:"return" },
+      { t:13, state:"angry", kind:"hold" },
+      { t:18, state:"working", kind:"hold" },
+      { t:30, state:"git", kind:"enter" },
+      { t:31, state:"git", kind:"hold" },
+      { t:42, state:"git", kind:"return" },
+      { t:43, state:"proud", kind:"hold" },
+      { t:50, state:"resting", kind:"still" },
+    ]},
+  { name: "Designer", color: "purple", role: "UI & UX",
+    script: [
+      { t:0,  state:"curious", kind:"hold" },
+      { t:8,  state:"screen", kind:"enter" },
+      { t:9,  state:"screen", kind:"hold" },
+      { t:20, state:"screen", kind:"return" },
+      { t:21, state:"playful", kind:"hold" },
+      { t:28, state:"memory", kind:"enter" },
+      { t:29, state:"memory", kind:"hold" },
+      { t:40, state:"memory", kind:"return" },
+      { t:41, state:"happy", kind:"hold" },
+      { t:50, state:"resting", kind:"still" },
+    ]},
+  { name: "Housekeeper", color: "white", role: "disk & RAM",
+    script: [
+      { t:0,  state:"sleeping", kind:"hold" },
+      { t:8,  state:"waking", kind:"hold" },
+      { t:12, state:"resting", kind:"still" },
+      { t:14, state:"routine", kind:"enter" },
+      { t:15, state:"routine", kind:"hold" },
+      { t:28, state:"routine", kind:"return" },
+      { t:29, state:"loading", kind:"hold" },
+      { t:40, state:"webhook", kind:"enter" },
+      { t:41, state:"webhook", kind:"hold" },
+      { t:52, state:"webhook", kind:"return" },
+      { t:53, state:"resting", kind:"still" },
+    ]},
+];
+
+function packBase(color) {
+  if (color === "orange") return CDN;
+  // Prefer transparent packs on botfleet-skins; white/black also under botfleet/
+  return `${CDN_SKINS}/${color}`;
+}
+function packBaseFallback(color) {
+  if (color === "orange") return CDN;
+  return `${CDN}/${color}`;
+}
+
+function assetUrl(color, state, kind) {
+  const base = packBase(color);
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+
+function fallbackUrl(color, state, kind) {
+  const base = packBaseFallback(color);
+  if (kind === "still") return `${base}/stills/${state}.png`;
+  return `${base}/gifs/${state}_${kind}.gif`;
+}
+
+const grid = document.getElementById("grid");
+const cards = bots.map((b) => {
+  const el = document.createElement("div");
+  el.className = "bot";
+  el.innerHTML = `
+    <img class="face" alt="${b.name}" src="${assetUrl(b.color, "resting", "still")}" />
+    <div class="name">${b.name}</div>
+    <div class="role">${b.role} · ${b.color}</div>
+    <div class="state">resting</div>`;
+  const img = el.querySelector("img");
+  img.onerror = () => {
+    // try alternate path once
+    const st = el.dataset.state || "resting";
+    const k = el.dataset.kind || "still";
+    if (!img.dataset.tried) {
+      img.dataset.tried = "1";
+      img.src = fallbackUrl(b.color, st, k);
+    }
+  };
+  grid.appendChild(el);
+  return { bot: b, el, img, stateEl: el.querySelector(".state"), cur: null };
+});
+
+function apply(card, step) {
+  const key = step.state + ":" + step.kind;
+  if (card.cur === key) return;
+  card.cur = key;
+  card.el.dataset.state = step.state;
+  card.el.dataset.kind = step.kind;
+  card.img.dataset.tried = "";
+  // cache-bust hold loops so the browser restarts the GIF
+  const bust = step.kind === "hold" ? `?t=${Date.now()}` : "";
+  card.img.src = assetUrl(card.bot.color, step.state, step.kind) + bust;
+  card.stateEl.textContent = step.state + (step.kind === "hold" ? " · loop" : step.kind === "still" ? "" : " · " + step.kind);
+}
+
+const PERIOD = 60; // seconds
+const clock = document.getElementById("clock");
+const t0 = performance.now();
+
+function tick() {
+  const elapsed = ((performance.now() - t0) / 1000) % PERIOD;
+  clock.textContent = `t = ${elapsed.toFixed(1)}s / ${PERIOD}s · looping`;
+  for (const card of cards) {
+    // pick latest script step with t <= elapsed
+    let step = card.bot.script[0];
+    for (const s of card.bot.script) {
+      if (s.t <= elapsed) step = s; else break;
+    }
+    apply(card, step);
+  }
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>

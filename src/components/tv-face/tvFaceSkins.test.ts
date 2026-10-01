@@ -17,7 +17,7 @@ import {
   tvFaceSkinDir,
   TVFACE_TRANSITION_MS,
 } from "./TVFaceAvatar";
-import { TVFACE_HAS_ENTER_RETURN, TVFACE_MANIFEST } from "./manifest";
+import { TVFACE_HAS_ENTER_RETURN, TVFACE_MANIFEST, TVFACE_SHEET_EXPRESSIONS } from "./manifest";
 
 const SKINS_DIR = join(process.cwd(), "public", "tv-face", "skins");
 const GIFS = join(SKINS_DIR, "default", "gifs");
@@ -102,7 +102,7 @@ describe("SHIPPED_SKINS matches the directory listing", () => {
 
   it("routes every color to a directory that exists", () => {
     const onDisk = skinsOnDisk();
-    for (const color of ["orange", "blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral"] as const) {
+    for (const color of ["orange", "blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral", "white", "black"] as const) {
       expect(onDisk, `tvFaceSkinDir("${color}") resolved to a missing directory`).toContain(tvFaceSkinDir(color));
     }
   });
@@ -217,3 +217,35 @@ describe("the expression contract", () => {
 });
 
 
+
+
+describe("TV-Face sheet expressions", () => {
+  it("ships a still for every face on the expression sheet", () => {
+    // The owner wants bots to be able to use the super-specific sheet faces
+    // (git, webhook, orbit, sneaking, …). A missing still means the player
+    // can never show that face even as a static fallback.
+    const missing = TVFACE_SHEET_EXPRESSIONS.filter(
+      (e) => !existsSync(join(STILLS, `${e}.png`)),
+    );
+    expect(missing, `sheet faces with no still: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("keeps orbit/radar/progress/uploading/sneaking as distinct expressions", () => {
+    // Regression: these used to be remapped away (orbit→fleet, radar→searching,
+    // progress→routine, uploading→sending) so the sheet faces were unreachable.
+    expect(TVFACE_MANIFEST.orbit).toBe("orbit");
+    expect(TVFACE_MANIFEST.radar).toBe("radar");
+    expect(TVFACE_MANIFEST.progress).toBe("progress");
+    expect(TVFACE_MANIFEST.uploading).toBe("uploading");
+    expect(TVFACE_MANIFEST.sneaking).toBe("sneaking");
+  });
+
+  it("maps every Grok action to its own sheet face", () => {
+    for (const action of [
+      "fleet", "crash", "memory", "tools", "routine", "screen",
+      "git", "webhook", "computer", "typing", "speaking", "sneaking",
+    ] as const) {
+      expect(TVFACE_MANIFEST[action], action).toBe(action);
+    }
+  });
+});
