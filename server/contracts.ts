@@ -466,7 +466,8 @@ export interface TurnToolHost {
   }): Promise<RequestOutcome>;
   /** Called once when the turn ends, however it ends, before its terminal
    *  event: stops any process a tool started that is still running, so no
-   *  work outlives the turn that nothing will report on.  Never throws. */
+   *  work outlives the turn that nothing will report on.  Never throws.
+   *  HTTP tool lane only; a CLI engine's own shells are its own (P2). */
   settle?(): void;
 }
 

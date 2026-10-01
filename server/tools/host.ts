@@ -250,6 +250,12 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
       // The lost-job detector: a command that returned, or was stopped,
       // while something it started kept running.  Nothing will report on
       // that process once the turn is over, so it does not outlive it.
+      //
+      // It covers the HTTP tool lane only, where BotFleet starts the shell.
+      // A CLI engine (Claude, Codex, ACP) runs its shell inside its own
+      // process tree, beside MCP servers that must outlive the turn, so a
+      // sweep there cannot tell a lost job from a live server; CLI lanes get
+      // BotFleet's own job tools, and their stop rules, in P2.
       void processGroups.reap();
     },
     async execute(call: TurnToolCall, runtime: TurnToolRuntime): Promise<TurnToolOutcome> {

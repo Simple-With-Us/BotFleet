@@ -235,6 +235,8 @@ import {
 } from "./contracts.ts";
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
+import { adoptGroupLedger } from "./tools/process-group.ts";
+import { completedToolRow, startedToolRow } from "./tool-row.ts";
 import { createPermissionBroker, type ApprovalAnswerSource } from "./tools/approvals.ts";
 import { listAgentsResponse } from "./tools/agents.ts";
 import { toolsFor } from "./tools/registry.ts";
@@ -519,6 +521,14 @@ const interruptedAtLastStop = takeInterruptedTurns(DATA_DIR);
 const rememberedResumeFailures = new Set(
   interruptedAtLastStop.failures.map((failure) => `${failure.botId}:${failure.threadId}`),
 );
+
+// Shell commands an HTTP-lane bot ran each lead a process group of their own
+// (server/tools/process-group.ts), so they no longer die with this process
+// the way launchd's job cleanup used to make them.  Groups a crashed or
+// killed run recorded and never saw end are stopped now, before any turn.
+void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
+  console.error("could not stop process groups an earlier run left running", error);
+});
 
 // "Is there a newer BotFleet, and install it" — asked from this Mac or from
 // a paired phone.  The updater it starts stops this harness partway through,
@@ -3016,20 +3026,7 @@ bus.subscribe((event: RuntimeEvent) => {
           toolName = existing?.name ?? "tool";
           const startedAt = toolStartedAt.get(itemKey);
           store.patchMessage(event.threadId, messageId, {
-            tool: {
-              name: toolName,
-              ok: event.ok,
-              spoken: existing?.spoken,
-              target: existing?.target,
-              kind: existing?.kind,
-              itemId: existing?.itemId,
-              turnId: existing?.turnId,
-              parentItemId: existing?.parentItemId,
-              // a step's own words about what came back; only worth the row
-              // when it failed, or when nothing named the target
-              detail: event.detail ?? existing?.detail,
-              durationMs: startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt),
-            },
+            tool: completedToolRow(existing, event, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
@@ -3063,19 +3060,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const message = pushMessage({
           role: "bot",
           kind: "activity",
-          tool: {
-            name,
-            spoken: narrateTool(name) ?? undefined,
-            target: event.target,
-            kind: event.toolKind,
-            // the keys that find this step's full input and output in the
-            // side store when its row is opened (server/item-io-store.ts);
-            // short ids, never the payload
-            ...(event.itemId ? { itemId: event.itemId } : {}),
-            ...(event.turnId ? { turnId: event.turnId } : {}),
-            // a helper's step names the row it nests under (jobs P0)
-            parentItemId: event.parentItemId,
-          },
+          tool: startedToolRow(event, narrateTool(name) ?? undefined),
         });
         if (event.itemId) {
           const key = `${event.threadId}:${event.itemId}`;
