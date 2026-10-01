@@ -7985,6 +7985,28 @@ describe("fallback cap: at most three, growth refused, existing chains left alon
     }
   });
 
+  it("holds a task override to the cap too: a task with none of its own gets no grandfathering", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Task" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
+      const four = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(four.status).toBe(400);
+      expect(four.body.error).toMatch(/at most 3 fallback/);
+      const three = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      });
+      expect(three.status).toBe(200);
+      expect(three.body.task.modelSelection.fallbacks).toHaveLength(3);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("applies the cap to a new bot's chain too", async () => {
     const over = await api("POST", "/api/bots", {
       name: "Cap Create Four",

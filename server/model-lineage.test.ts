@@ -13,10 +13,12 @@ import {
   parseCliVersion,
   presentDescribedInstances,
   reconcileTurnOverride,
+  taskWriteBaseline,
 } from "./model-lineage.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { STATIC_GROK_MODELS } from "./drivers/acp/grok.ts";
 import { reconcileEntry, type LineageContext } from "../shared/model-lineage.ts";
+import { fallbackCountAllowed, MAX_MODEL_FALLBACKS } from "../shared/model-limits.ts";
 
 const CODEX_LIVE = {
   default: "gpt-5.6-luna",
@@ -568,5 +570,40 @@ describe("checkLineageWrite", () => {
     const saved: ModelSelection = { instanceId: "claude", model: "claude-3-7-sonnet" };
     const result = write({ instanceId: "claude", model: "claude-3-7-sonnet" }, saved);
     expect(result.ok && result.current).toEqual(result.ok && result.selection);
+  });
+});
+
+describe("taskWriteBaseline", () => {
+  const chain = (count: number): ModelSelection => ({
+    instanceId: "claude",
+    model: "claude-sonnet-5-5",
+    fallbacks: Array.from({ length: count }, (_, index) => ({ instanceId: "codex", model: `m${index}` })),
+  });
+  const overCap = MAX_MODEL_FALLBACKS + 1;
+
+  it("holds a brand-new task override to the cap even when the bot keeps an older, longer chain", () => {
+    const base = taskWriteBaseline(undefined, chain(overCap));
+    // The bot's selection still feeds the lineage check and the float carry.
+    expect(base?.selection).toEqual(chain(overCap));
+    // The cap grandfathers nothing: a task with no override replaces no chain.
+    expect(base?.storedFallbacks).toBe(0);
+    expect(fallbackCountAllowed(overCap, base?.storedFallbacks)).toBe(false);
+    expect(fallbackCountAllowed(MAX_MODEL_FALLBACKS, base?.storedFallbacks)).toBe(true);
+  });
+
+  it("grandfathers a task's own over-cap override, so re-sending it unchanged still saves", () => {
+    const own = chain(overCap);
+    const base = taskWriteBaseline(own, chain(1));
+    expect(base?.selection).toBe(own);
+    expect(base?.storedFallbacks).toBe(overCap);
+    expect(fallbackCountAllowed(overCap, base?.storedFallbacks)).toBe(true);
+    expect(fallbackCountAllowed(overCap + 1, base?.storedFallbacks)).toBe(false);
+  });
+
+  it("prefers the task's override over the bot's selection, and is empty when neither is saved", () => {
+    const task = chain(1);
+    expect(taskWriteBaseline(task, chain(2))?.selection).toBe(task);
+    expect(taskWriteBaseline(undefined, undefined)).toBeUndefined();
+    expect(taskWriteBaseline({ instanceId: "claude", model: "claude-sonnet-5-5" }, chain(2))?.storedFallbacks).toBe(0);
   });
 });

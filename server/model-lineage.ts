@@ -327,6 +327,27 @@ function latestProblem(
   return null;
 }
 
+/** What a write to ONE TASK's modelSelection is checked against.
+ *
+ *  A task without an override of its own runs on its bot's selection, so that
+ *  selection is the `selection` the lineage check carries a float forward from
+ *  and judges "was this id already in the chain?" against.  The fallback cap is
+ *  a different question: it grandfathers a chain that is already over the cap
+ *  only for the chain being REPLACED, and a task with no override replaces
+ *  nothing.  `storedFallbacks` is therefore the task's own override length
+ *  (zero when it has none), so a brand-new task override is held to the cap
+ *  even when the bot behind it keeps an older, longer chain.
+ *
+ *  Returns undefined when there is nothing saved to compare with. */
+export function taskWriteBaseline(
+  taskOverride: ModelSelection | undefined,
+  botSelection: ModelSelection | undefined,
+): { selection: ModelSelection; busy: false; storedFallbacks: number } | undefined {
+  const selection = taskOverride ?? botSelection;
+  if (!selection) return undefined;
+  return { selection, busy: false, storedFallbacks: taskOverride?.fallbacks?.length ?? 0 };
+}
+
 export type LineageWriteResult =
   | { ok: true; selection: ModelSelection; current: ModelSelection | undefined; changes: LineageChange[] }
   | { ok: false; error: string };

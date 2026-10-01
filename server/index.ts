@@ -219,6 +219,7 @@ import {
   modelNameFor,
   presentDescribedInstances,
   reconcileTurnOverride,
+  taskWriteBaseline,
   withoutModelsTooNewForCli,
 } from "./model-lineage.ts";
 import {
@@ -1202,7 +1203,12 @@ function checkSelectionEntry(
 
 function checkedModelSelection(
   raw: unknown,
-  current?: { selection: ModelSelection; busy: boolean },
+  /** The saved selection this write replaces.  `storedFallbacks` is how many
+   *  fallbacks the cap may grandfather; it defaults to `selection`'s own
+   *  count, and a task write passes its OWN override's count instead (see
+   *  taskWriteBaseline), because a task with no override is not replacing the
+   *  bot's chain. */
+  current?: { selection: ModelSelection; busy: boolean; storedFallbacks?: number },
   requireAvailableModel = false,
   /** A fallback entry parsed by the recursion below.  It may not carry
    *  fallbacks of its own, and the chain-level lineage check runs once, on
@@ -1251,7 +1257,7 @@ function checkedModelSelection(
     // Refuse a chain that GROWS past the cap, never one that merely keeps the
     // length it already has: a bot written before the cap existed re-sends its
     // whole chain whenever only its primary changes, and that must still save.
-    if (!fallbackCountAllowed(value.fallbacks.length, current?.selection.fallbacks?.length ?? 0)) {
+    if (!fallbackCountAllowed(value.fallbacks.length, current?.storedFallbacks ?? current?.selection.fallbacks?.length ?? 0)) {
       return {
         ok: false,
         status: 400,
@@ -11596,12 +11602,13 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // The task's saved chain (or the bot's, which a task without an
         // override runs on) lets the lineage check tell a retired id this
         // edit introduces from one the chain already held, and carry a float
-        // an older client re-sends without `latest`.  No busy gate: a task
-        // override applies from that thread's next turn.
-        const savedTask = store.taskByThread(m[1], m[2])?.modelSelection ?? store.bot(m[1])?.modelSelection;
+        // an older client re-sends without `latest`.  The fallback cap looks
+        // only at the task's OWN override, so a new override is never
+        // grandfathered onto the bot's over-cap chain (taskWriteBaseline).
+        // No busy gate: a task override applies from that thread's next turn.
         const checked = checkedModelSelection(
           body.modelSelection,
-          savedTask ? { selection: savedTask, busy: false } : undefined,
+          taskWriteBaseline(store.taskByThread(m[1], m[2])?.modelSelection, store.bot(m[1])?.modelSelection),
         );
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
         const updated = store.patchTask(m[1], m[2], { modelSelection: checked.selection });
