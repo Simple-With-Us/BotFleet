@@ -166,7 +166,7 @@ describe("every reachable asset path exists", () => {
   });
 });
 
-describe.skip("color skin packs mirror the default asset set (enable when packs ship)", () => {
+describe("color skin packs mirror the default asset set", () => {
   const named = skinsOnDisk().filter((d) => d !== "default");
 
   it("each named skin has the same enter/return files as default", () => {

@@ -63,7 +63,10 @@ export interface TVFaceAvatarProps {
  * is listed here; unlisted colors fall back to default so they never 404.
  *
  * Asserted against the real directory listing in tvFaceSkins.test.ts.
+ * Packs: blue green purple pink red cyan yellow teal coral (enter/return = 1000ms).
+ * Build with scripts/tv-face-build-color-skins.py or scripts/tv-face-fetch-skins.sh.
  */
+
 export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
   "orange",
   "blue",
