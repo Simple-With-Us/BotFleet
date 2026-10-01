@@ -121,6 +121,22 @@ describe("augmentedPath", () => {
     expect(parts).not.toContain(join(homedir(), ".volta", "bin"));
   });
 
+  const posixIt2 = it.skipIf(process.platform === "win32");
+
+  posixIt2("puts a canonical installer dir ahead of the ~/.local/bin symlink farm", () => {
+    // The MiniMax Code installer drops a ~/.local/bin/mcode symlink to a
+    // launcher that is not symlink-safe: it resolves its data dir from the
+    // parent of its own path, so through the symlink it exits non-zero.  A GUI
+    // launch inherits a PATH with no mcode in it, so this ordering is the only
+    // thing that decides whether the engine can start.
+    resetPathCacheForTests();
+    const parts = augmentedPath().split(delimiter);
+    const installer = parts.findIndex((p) => p === join(homedir(), ".minimax-code", "bin"));
+    const symlinks = parts.findIndex((p) => p === join(homedir(), ".local", "bin"));
+    if (installer === -1) return; // not installed here; nothing to order
+    expect(symlinks === -1 || installer < symlinks).toBe(true);
+  });
+
   it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {
     const previous = process.env.LOCALAPPDATA;
     const localAppData = mkdtempSync(join(tmpdir(), "omb-localappdata-"));

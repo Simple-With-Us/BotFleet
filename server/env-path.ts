@@ -31,10 +31,17 @@ function nvmBinDirs(): string[] {
 function knownDirs(): string[] {
   const home = homedir();
   return [
+    // Canonical installer dirs FIRST, before the ~/.local/bin symlink farm.
+    // The MiniMax Code installer drops a `~/.local/bin/mcode` symlink, but the
+    // launcher it points at resolves its own data dir from the parent of its
+    // own path — so invoked through the symlink it looks for `~/.local/current`
+    // and exits non-zero.  The canonical copy under `~/.minimax-code/bin` is
+    // the one that runs, and a GUI launch inherits a PATH with no mcode in it,
+    // so knownDirs order is the only thing that decides which one gets picked.
+    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
+    join(home, ".kimi-code", "bin"), // kimi-code installer
     join(home, ".local", "bin"), // claude installer default
     join(home, ".npm-global", "bin"), // npm prefix ~/.npm-global (claude, opencode)
-    join(home, ".kimi-code", "bin"), // kimi-code installer
-    join(home, ".minimax-code", "bin"), // MiniMax Code CLI installer (mcode)
     join(home, ".grok", "bin"), // x.ai installer
     join(home, ".opencode", "bin"), // opencode installer
     join(home, ".claude", "local"), // claude "local install"
