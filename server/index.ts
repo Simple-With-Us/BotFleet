@@ -3024,6 +3024,7 @@ bus.subscribe((event: RuntimeEvent) => {
               kind: existing?.kind,
               itemId: existing?.itemId,
               turnId: existing?.turnId,
+              parentItemId: existing?.parentItemId,
               // a step's own words about what came back; only worth the row
               // when it failed, or when nothing named the target
               detail: event.detail ?? existing?.detail,
@@ -3072,6 +3073,8 @@ bus.subscribe((event: RuntimeEvent) => {
             // short ids, never the payload
             ...(event.itemId ? { itemId: event.itemId } : {}),
             ...(event.turnId ? { turnId: event.turnId } : {}),
+            // a helper's step names the row it nests under (jobs P0)
+            parentItemId: event.parentItemId,
           },
         });
         if (event.itemId) {
