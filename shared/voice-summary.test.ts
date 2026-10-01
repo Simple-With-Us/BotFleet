@@ -24,3 +24,11 @@ describe("voice summary", () => {
     expect(spokenReply(streaming)).toBe("Summary here.");
   });
 });
+
+describe("literal delimiters inside the written answer", () => {
+  it("does not truncate the written answer at a quoted closing tag", () => {
+    const text = "[voice_summary]Short.[/voice_summary]\n[written_answer]Use the tag [/written_answer] to end it, then continue with more detail.[/written_answer]";
+    expect(stripVoiceSummaryTags(text)).toContain("then continue with more detail.");
+    expect(splitVoiceSummary(text)?.written).toContain("then continue with more detail.");
+  });
+});

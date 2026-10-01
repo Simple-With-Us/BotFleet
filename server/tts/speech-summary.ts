@@ -1,28 +1,17 @@
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 
-/** Read DEEPSEEK key from ~/.secrets/global-api-keys if not present in env */
+const DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com";
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+/** Explicit config key first, then the environment. Never reads credential files:
+ * with no key the caller gets the deterministic spoken text instead. */
 function resolveDeepSeekKey(providedKey?: string): string {
-  if (providedKey) return providedKey;
-  if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY;
-  try {
-    const secretsPath = join(homedir(), ".secrets", "global-api-keys");
-    const content = readFileSync(secretsPath, "utf8");
-    for (const line of content.split("\n")) {
-      const match = line.match(/^([A-Z0-9_]+)=(.*)$/);
-      if (match) {
-        const [name, val] = [match[1], match[2].trim().replace(/^["']|["']$/g, "")];
-        if (name === "SHELLULAR2_DEEPSEEK_API_KEY" || name === "DEEPSEEK_API_KEY_AGENT_BAR" || name === "DEEPSEEK_API_KEY") {
-          return val;
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return "";
+  return providedKey?.trim() || process.env.DEEPSEEK_API_KEY?.trim() || "";
+}
+
+function completionsUrl(base?: string): string {
+  const root = (base?.trim() || DEFAULT_DEEPSEEK_BASE).replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+  return `${root}/chat/completions`;
 }
 
 export const DEEPSEEK_FLASH_TTS_PROMPT = `<system_prompt>
@@ -65,6 +54,7 @@ export async function summarizeForVoice(
   rawText: string,
   deepseekKey?: string,
   signal?: AbortSignal,
+  options: { url?: string; timeoutMs?: number } = {},
 ): Promise<string> {
   const cleanInput = stripVoiceSummaryTags(rawText);
   if (!cleanInput.trim()) return "";
@@ -79,8 +69,13 @@ export async function summarizeForVoice(
     return spokenReply(rawText);
   }
 
+  const endpoint = completionsUrl(options.url);
+  // One deadline covers both attempts so a stalled provider cannot hold a voice job open.
+  const deadline = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+
   try {
-    const response = await fetch("https://api.deepseek.com/chat/completions", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -96,7 +91,7 @@ export async function summarizeForVoice(
         temperature: 0.3,
         thinking: { type: "disabled" },
       }),
-      signal,
+      signal: combined,
     });
 
     if (response.ok) {
@@ -111,7 +106,7 @@ export async function summarizeForVoice(
     }
 
     // Fallback: try deepseek-chat if deepseek-flash returned empty or non-200
-    const fallbackResponse = await fetch("https://api.deepseek.com/chat/completions", {
+    const fallbackResponse = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -126,7 +121,7 @@ export async function summarizeForVoice(
         max_tokens: 300,
         temperature: 0.3,
       }),
-      signal,
+      signal: combined,
     });
 
     if (fallbackResponse.ok) {

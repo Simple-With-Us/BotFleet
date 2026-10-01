@@ -81,6 +81,35 @@ describe("summarizeForVoice", () => {
     expect(result).toBe("The fallback written text.");
   });
 
+  const LONG = "This is a longer message that describes the deployment of multiple services and contains details about commit hashes and technical jargon that needs summarization for voice playback.";
+
+  it("without an explicit or environment key it never calls the provider", async () => {
+    const saved = process.env.DEEPSEEK_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    try {
+      globalThis.fetch = vi.fn();
+      const res = await summarizeForVoice(LONG);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      expect(res).toContain("deployment of multiple services");
+    } finally {
+      if (saved !== undefined) process.env.DEEPSEEK_API_KEY = saved;
+    }
+  });
+
+  it("uses the configured endpoint instead of the hardcoded host", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [{ message: { content: "Spoken." } }] }) });
+    await summarizeForVoice(LONG, "k", undefined, { url: "https://proxy.example.test/" });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toBe("https://proxy.example.test/chat/completions");
+  });
+
+  it("gives up after the request deadline and falls back to the deterministic text", async () => {
+    globalThis.fetch = vi.fn((_url, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const res = await summarizeForVoice(LONG, "k", undefined, { timeoutMs: 20 });
+    expect(res).toContain("deployment of multiple services");
+  });
+
   it("prompt contains expected negative constraints and XML tags", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<core_directive>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<rules_for_spoken_prose>");

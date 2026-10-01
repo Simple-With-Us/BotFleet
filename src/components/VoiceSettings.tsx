@@ -532,7 +532,8 @@ export function VoiceSettings({
               },
             ] as const
           ).map((mode) => {
-            const currentMode = bot.voiceSummaryMode ?? "on_demand";
+            // An unset mode follows the workspace flag the server consults, so the UI never shows On-Demand while the server stays off.
+            const currentMode = bot.voiceSummaryMode ?? (tts.optimizedSummary ? "on_demand" : "off");
             const isSelected = currentMode === mode.id;
             return (
               <button

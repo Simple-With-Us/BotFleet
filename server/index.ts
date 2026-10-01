@@ -2786,17 +2786,13 @@ bus.subscribe((event: RuntimeEvent) => {
           text: event.text,
           ...(resolvedSelection ? { modelSelection: { instanceId: resolvedSelection.instanceId, model: resolvedSelection.model } } : {}),
         });
-        if (bot?.voiceSummaryMode === "always" && event.text?.trim()) {
-          void (async () => {
-            try {
-              const summary = await summarizeForVoice(event.text, cfg.deepseek?.key);
-              if (summary && summary !== event.text) {
-                store.patchMessage(event.threadId, appended.id, { voiceText: summary });
-              }
-            } catch {
-              // Background pre-warm non-critical
-            }
-          })();
+        // The speaker owns the voice setting: in a room that is the member who
+        // replied, not whichever bot the thread lookup returns (none).
+        const voiceOwner = bot ?? (speaker?.botId ? store.bot(speaker.botId) : undefined);
+        if (voiceOwner?.voiceSummaryMode === "always" && event.text?.trim()) {
+          void voiceSummaryFor(event.threadId, appended.id, event.text).catch(() => {
+            // Background pre-warm non-critical
+          });
         }
         if (bot) {
           void deliverLinqOutboundIfNeeded(event.threadId, bot.id, event.text, event.turnId).then((r) => {
@@ -8476,6 +8472,25 @@ function endRuntimeQuiesce() {
 // A concurrent Mac/iPhone request must never bill twice for the same reply.
 // The lock is process-local; the persisted message's audio list survives restarts.
 const voiceJobs = new Map<string, Promise<Array<{ path: string; mime: string }>>>();
+// One paid summary request per message: the background prewarm and the audio
+// route share this promise instead of each asking the provider.
+const voiceSummaryJobs = new Map<string, Promise<string>>();
+function voiceSummaryFor(threadId: string, messageId: string, text: string): Promise<string> {
+  const key = `${threadId}:${messageId}`;
+  let job = voiceSummaryJobs.get(key);
+  if (!job) {
+    job = (async () => {
+      const existing = store.messagesFor(threadId).find((row) => row.id === messageId)?.voiceText;
+      if (existing) return existing;
+      const summary = await summarizeForVoice(text, cfg.deepseek?.key, undefined, { url: cfg.deepseek?.url });
+      if (summary && summary !== text) store.patchMessage(threadId, messageId, { voiceText: summary });
+      return summary;
+    })();
+    voiceSummaryJobs.set(key, job);
+    void job.finally(() => voiceSummaryJobs.delete(key)).catch(() => {});
+  }
+  return job;
+}
 handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   let url: URL;
   try {
@@ -13367,17 +13382,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!owner) return json(res, 404, { error: "no voice owner" });
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
       let textToSpeak = spokenReply(message.text);
-      const shouldSummarize = owner.voiceSummaryMode === "always" || owner.voiceSummaryMode === "on_demand" || (owner.voiceSummaryMode === undefined && cfg.tts?.optimizedSummary);
+      const shouldSummarize = owner.voiceSummaryMode === "always" || owner.voiceSummaryMode === "on_demand" || (owner.voiceSummaryMode === undefined && cfg.tts?.optimizedSummary === true);
+      const audioIntact = () => !!message.audio?.length && message.audio.every((clip) => {
+        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
+        return name && attachmentExists(name);
+      });
+      // Finished clips are served before any provider is asked to summarize again.
+      if (audioIntact() && toUtterances(message.voiceText ?? textToSpeak).length === message.audio!.length) return json(res, 200, { audio: message.audio });
       if (shouldSummarize && message.voiceText) {
         textToSpeak = message.voiceText;
       } else if (shouldSummarize) {
-        textToSpeak = await summarizeForVoice(message.text, cfg.deepseek?.key);
+        textToSpeak = await voiceSummaryFor(threadId, messageId, message.text);
       }
       const utterances = toUtterances(textToSpeak);
-      if (message.audio?.length && message.audio.length === utterances.length && message.audio.every((clip) => {
-        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-        return name && attachmentExists(name);
-      })) return json(res, 200, { audio: message.audio });
+      if (audioIntact() && message.audio!.length === utterances.length) return json(res, 200, { audio: message.audio });
       if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000) return json(res, 413, { error: "reply exceeds voice clip limit" });
       const key = `${threadId}:${messageId}`;
       let job = voiceJobs.get(key);

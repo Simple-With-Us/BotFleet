@@ -10,7 +10,9 @@ export function stripVoiceSummaryTags(text: string): string {
   if (!text) return "";
   let clean = text;
   // If [written_answer] exists, prioritize everything after [written_answer]
-  const writtenMatch = /\[written_answer\]([\s\S]*?)(\[\/written_answer\]|$)/i.exec(clean);
+  // The section runs to the final closing tag, so a literal "[/written_answer]" quoted
+  // inside the answer does not cut the rest of it off.
+  const writtenMatch = /\[written_answer\]([\s\S]*?)(?:\[\/written_answer\]\s*)?$/i.exec(clean);
   if (writtenMatch) {
     clean = writtenMatch[1];
   } else {
@@ -27,7 +29,7 @@ export function stripVoiceSummaryTags(text: string): string {
 
 export function splitVoiceSummary(text: string): { voice: string; written: string } | null {
   if (!text) return null;
-  const match = /\[voice_summary\]\s*([\s\S]*?)\s*\[\/voice_summary\]\s*\[written_answer\]\s*([\s\S]*?)(?:\[\/written_answer\]|\s*$)/i.exec(text);
+  const match = /\[voice_summary\]\s*([\s\S]*?)\s*\[\/voice_summary\]\s*\[written_answer\]\s*([\s\S]*?)(?:\[\/written_answer\])?\s*$/i.exec(text);
   if (!match?.[1]?.trim() || !match[2]?.trim()) return null;
   const voice = match[1].replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();
   const written = match[2].replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();

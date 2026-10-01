@@ -178,8 +178,10 @@ async function callModel(modelConfig) {
         temperature: 0.3,
       }),
     });
+    if (!res.ok) throw new Error(`${modelConfig.provider} HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
     const data = await res.json();
     content = data?.choices?.[0]?.message?.content?.trim() || "";
+    if (!content) throw new Error(`${modelConfig.provider} returned no content for ${modelConfig.id}`);
     inTokens = data?.usage?.prompt_tokens || 0;
     outTokens = data?.usage?.completion_tokens || 0;
   } else if (modelConfig.provider === "openrouter") {
@@ -197,8 +199,10 @@ async function callModel(modelConfig) {
         temperature: 0.3,
       }),
     });
+    if (!res.ok) throw new Error(`${modelConfig.provider} HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
     const data = await res.json();
     content = data?.choices?.[0]?.message?.content?.trim() || "";
+    if (!content) throw new Error(`${modelConfig.provider} returned no content for ${modelConfig.id}`);
     inTokens = data?.usage?.prompt_tokens || 0;
     outTokens = data?.usage?.completion_tokens || 0;
   }
