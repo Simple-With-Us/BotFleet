@@ -1,19 +1,19 @@
-// Postinstall: compile the `harness` dependency from TypeScript to JavaScript.
+// Postinstall: compile the `clutch` dependency from TypeScript to JavaScript.
 //
-// The `harness` package (github:jaywedgeworth22/Harness) ships TypeScript
+// The `clutch` package (github:jaywedgeworth22/Clutch) ships TypeScript
 // sources only.  Node's native type-stripping refuses to load `.ts` files
 // under `node_modules/` (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), which
 // breaks every `node server/index.ts` execution — notably the e2e fixtures
 // that spawn the real server.  Vitest/esbuild handle it fine, which is why
 // unit tests pass but spawned-server tests fail.
 //
-// This script transpiles `harness/src/**/*.ts` to `harness/dist/**/*.js` once
+// This script transpiles `clutch/src/**/*.ts` to `clutch/dist/**/*.js` once
 // per install and rewrites the package's `exports` so the `default` condition
 // resolves to the compiled JS while `types` still resolves to the original
 // `.ts` sources (so `pnpm typecheck` keeps full type information).
 //
-// Idempotent: safe to re-run.  If the harness package is absent or already
-// compiled, it exits quietly.
+// Idempotent: safe to re-run.  If the clutch package or its src/ is missing the
+// script fails loudly (exit 1) instead of leaving an uncompiled dependency.
 
 import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -21,9 +21,9 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
-function findHarnessDir() {
+function findClutchDir() {
   try {
-    const pkgPath = require.resolve("harness/package.json");
+    const pkgPath = require.resolve("clutch/package.json");
     return dirname(pkgPath);
   } catch {
     return null;
@@ -43,30 +43,30 @@ function collectTsFiles(dir, out = []) {
   return out;
 }
 
-// Rewrite relative `.ts` import specifiers to `.js`: the harness source uses
+// Rewrite relative `.ts` import specifiers to `.js`: the clutch source uses
 // explicit `.ts` extensions, but the compiled output files are `.js`.
 function rewriteTsImports(code) {
   return code.replace(/from\s*(["'])(\.{1,2}\/[^"']*)\.ts\1/g, (_m, q, p) => `from ${q}${p}.js${q}`);
 }
 
-const harnessDir = findHarnessDir();
-if (!harnessDir) {
-  console.log("[compile-harness-dep] harness package not found, skipping.");
-  process.exit(0);
+const clutchDir = findClutchDir();
+if (!clutchDir) {
+  console.error("[compile-clutch-dep] clutch package not found; run the install so the clutch dependency resolves.");
+  process.exit(1);
 }
 
-const srcDir = join(harnessDir, "src");
-const distDir = join(harnessDir, "dist");
+const srcDir = join(clutchDir, "src");
+const distDir = join(clutchDir, "dist");
 if (!existsSync(srcDir)) {
-  console.log("[compile-harness-dep] harness src/ not found, skipping.");
-  process.exit(0);
+  console.error("[compile-clutch-dep] clutch src/ not found.");
+  process.exit(1);
 }
 
 let esbuild;
 try {
   esbuild = require("esbuild");
 } catch {
-  console.error("[compile-harness-dep] esbuild not available; cannot compile harness.");
+  console.error("[compile-clutch-dep] esbuild not available; cannot compile clutch.");
   process.exit(1);
 }
 
@@ -89,13 +89,13 @@ for (const tsFile of tsFiles) {
 
 // Rewrite exports: "./dsh/acp": "./src/dsh/acp/driver.ts"
 // becomes "./dsh/acp": { types: "./src/dsh/acp/driver.ts", default: "./dist/dsh/acp/driver.js" }
-const pkgPath = join(harnessDir, "package.json");
+const pkgPath = join(clutchDir, "package.json");
 const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
 let patched = 0;
 if (pkg.exports && typeof pkg.exports === "object") {
   for (const [key, value] of Object.entries(pkg.exports)) {
     if (typeof value === "string" && value.startsWith("./src/") && value.endsWith(".ts")) {
-      const srcTarget = join(harnessDir, value);
+      const srcTarget = join(clutchDir, value);
       if (existsSync(srcTarget)) {
         const jsPath = value.replace("./src/", "./dist/").replace(/\.ts$/, ".js");
         pkg.exports[key] = { types: value, default: jsPath };
@@ -109,4 +109,4 @@ if (pkg.exports && typeof pkg.exports === "object") {
   writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
 }
 
-console.log(`[compile-harness-dep] compiled ${compiled} files, patched ${patched} exports.`);
+console.log(`[compile-clutch-dep] compiled ${compiled} files, patched ${patched} exports.`);

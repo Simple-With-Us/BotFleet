@@ -110,12 +110,12 @@ macOS signing uses `build/entitlements.mac.plist` for the main app and `build/en
 
 `.claude/skills/` carries the fleet skills a seat should use here: `session-start`, `board-ops`, `closeout`, `land-lane`, `deploy-verify`, `codex-triage`, `unstick-pr`, `pickup-seat`, `fleet-coordination`, `fleet-infra`, `secret-handoff`, `owner-copy`, `sentence-gap`, `apple-notes`, `dns-and-registrars`, `drive-grok-tui`, `mac-cleanup`, `windows-release`.  Load `session-start` at the beginning of a session and `closeout` at the end of a lane.
 
-## Harness package
+## Clutch Package
 
 DSH engine shape (catalog, version gate, error classifier, model-id
-round-trip, credentials) lives in `jaywedgeworth22/Harness` and is
-imported as `harness/dsh/acp`.  **Never edit that shape in
-`server/drivers/acp/dsh.ts`.**  Edit Harness, then bump the git
+round-trip, credentials) lives in `jaywedgeworth22/Clutch` and is
+imported as `clutch/dsh/acp`.  **Never edit that shape in
+`server/drivers/acp/dsh.ts`.**  Edit Clutch, then bump the git
 dependency.  ACP runtime (`acp/core.ts`, `dshWrapSpawn`, the Node
 `dsh-acp-bridge`) stays in this repo.
 
@@ -127,7 +127,7 @@ Never submit, post, comment, file an issue, open a PR, create a fork,
 or otherwise initiate any communication to a third-party repository,
 organization, or service on the owner's behalf without explicit
 per-case approval from the owner.  Reading public repositories and
-pinning upstream packages is fine.  Canonical: Harness
+pinning upstream packages is fine.  Canonical: Clutch
 `docs/decisions/0003-no-external-contact-and-no-forks.md`.
 
 ### No forks of other repositories
