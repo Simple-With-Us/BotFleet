@@ -16,7 +16,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
-import { ClaudeDriver, permissionSocketPath, withVolatileNote, type ClaudeConfig } from "./claude.ts";
+import {
+  CLAUDE_CONTAINMENT_ENV,
+  ClaudeDriver,
+  claudeDisallowedTools,
+  claudeUnsolicitedFrameStats,
+  permissionSocketPath,
+  withVolatileNote,
+  type ClaudeConfig,
+} from "./claude.ts";
 import { VOLATILE_CONTEXT_CLEARED_NOTE, VOLATILE_CONTEXT_NOTE_PREFIX } from "./prompt-split.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 
@@ -1671,6 +1679,145 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.effortLevels).toEqual([
       "low", "medium", "high", "xhigh", "max",
     ]);
+  });
+
+  describe("containment of engine-started work (jobs P0)", () => {
+    /** Resolves once the driver itself has dropped `count` more unsolicited
+     * frames — the point at which the next sendTurn is guaranteed to see
+     * them, which a marker file written by the fake cannot promise. */
+    const untilDropped = async (before: number, count: number) => {
+      const deadline = Date.now() + 10_000;
+      while (claudeUnsolicitedFrameStats().dropped - before < count) {
+        if (Date.now() > deadline) throw new Error(`only ${claudeUnsolicitedFrameStats().dropped - before} of ${count} unsolicited frames dropped`);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    const textOf = (events: readonly unknown[]) => JSON.stringify(events);
+
+    it("launches with native background work off, helpers capped, and self-starting tools denied", async () => {
+      // an inherited opt-out must not survive: these are a floor, not defaults
+      await create(undefined, { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "0", CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "20" });
+      const dump = join(scratch, "containment.json");
+      process.env.FAKE_CLAUDE_DUMP = dump;
+
+      await instance.adapter.sendTurn({ threadId: "t-contain-env", text: "hi" });
+      await recorder.until((e) => e.type === "turn.completed");
+
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.env).toMatchObject(CLAUDE_CONTAINMENT_ENV);
+      expect(seen.env).toMatchObject({
+        CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+        CLAUDE_CODE_DISABLE_CRON: "1",
+        CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
+        CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
+      });
+      const denied = String(seen.argv[seen.argv.indexOf("--disallowedTools") + 1]).split(",");
+      expect(denied).toEqual(["ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "Workflow"]);
+    });
+
+    it("denies only the self-starting tools a bot's own tool list makes reachable", () => {
+      expect(claudeDisallowedTools({ tools: ["Read", "Monitor"], disallowedTools: ["Edit"] })).toEqual(["Edit", "Monitor"]);
+      expect(claudeDisallowedTools({ tools: [] })).toEqual([]);
+      expect(claudeDisallowedTools({ disallowedTools: ["Monitor"] })).toEqual([
+        "Monitor", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Workflow",
+      ]);
+    });
+
+    it("reports background jobs off and typed helpers", async () => {
+      await create();
+      expect(instance.adapter.capabilities.backgroundJobs).toBe("none");
+      expect(instance.adapter.capabilities.helpers).toBe("typed");
+    });
+
+    it("drops a turn the CLI starts on its own after the turn settled, and keeps the warm process", async () => {
+      await create("ghost-turn");
+      const prompts = join(scratch, "ghost-prompts.jsonl");
+      process.env.FAKE_CLAUDE_PROMPTS = prompts;
+      const before = claudeUnsolicitedFrameStats();
+
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost", text: "start the build" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      // task_notification, init, delta, assistant, tool_result, result
+      await untilDropped(before.dropped, 6);
+      expect(claudeUnsolicitedFrameStats().turns).toBe(before.turns + 1);
+      const afterGhost = recorder.events.length;
+
+      const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost", text: "and now?", resumeCursor: announced });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      // nothing the CLI said on its own reached the event stream, under any id
+      expect(textOf(recorder.events)).not.toContain("GHOST");
+      expect(textOf(recorder.events)).not.toContain("ghost-tu-1");
+      // and no event between the two turns: the settled turn's id was never reused
+      const between = recorder.events.slice(0, afterGhost).filter((e) => e.turnId !== first.turnId);
+      expect(between).toEqual([]);
+      expect(recorder.events.every((e) => e.turnId === first.turnId || e.turnId === second.turnId)).toBe(true);
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+      // the CLI's own turn ended with its result, so the process is reused
+      expect(new Set(promptsSent(prompts).map((p) => p.pid)).size).toBe(1);
+    });
+
+    it("never writes the next message into a process that is still running a turn of its own", async () => {
+      await create("ghost-running");
+      const prompts = join(scratch, "ghost-running-prompts.jsonl");
+      const dump = join(scratch, "ghost-running-dump.json");
+      process.env.FAKE_CLAUDE_PROMPTS = prompts;
+      const before = claudeUnsolicitedFrameStats();
+
+      const first = await instance.adapter.sendTurn({ threadId: "t-ghost-running", text: "start the build" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+      // task_notification, init, delta, assistant, tool_result — and no result
+      await untilDropped(before.dropped, 5);
+
+      process.env.FAKE_CLAUDE_DUMP = dump;
+      const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+      const second = await instance.adapter.sendTurn({ threadId: "t-ghost-running", text: "and now?", resumeCursor: announced });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+
+      const pids = promptsSent(prompts).map((p) => p.pid);
+      expect(pids).toHaveLength(2);
+      expect(pids[0]).not.toBe(pids[1]);
+      const relaunch = JSON.parse(readFileSync(dump, "utf8"));
+      expect(relaunch.argv[relaunch.argv.indexOf("--resume") + 1]).toBe(announced);
+      expect(textOf(recorder.events)).not.toContain("GHOST");
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
+    });
+
+    it("does not settle a turn on the result of the CLI's own turn while its message is still queued", async () => {
+      await create("ghost-queued");
+      const before = claudeUnsolicitedFrameStats();
+      const { turnId } = await instance.adapter.sendTurn({ threadId: "t-ghost-queued", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+
+      expect(done).toMatchObject({ turnId, ok: true, cost: 0.01 });
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+      // this turn's own reply landed, before its own settle
+      const reply = recorder.events.findIndex((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(reply).toBeGreaterThan(-1);
+      expect(reply).toBeLessThan(recorder.events.indexOf(done));
+      expect(claudeUnsolicitedFrameStats().foreignResults).toBe(before.foreignResults + 1);
+    });
+
+    it("nests a helper's steps under the call that started it and keeps its prose out of the reply", async () => {
+      await create("helpers");
+      await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });
+      await recorder.until((e) => e.type === "turn.completed");
+
+      const started = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
+      expect(started.map((e) => (e as { itemId?: string }).itemId)).toEqual(["task-1", "helper-read-1"]);
+      expect(started[0]).not.toHaveProperty("parentItemId");
+      expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1" });
+      // the helper's step still completes like any other
+      expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);
+      // the helper talking to its parent is not the bot talking to anyone
+      const replies = recorder.events.filter((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(replies.map((e) => (e as { text: string }).text)).toEqual(["all done"]);
+      expect(textOf(recorder.events)).not.toContain("HELPER NARRATION");
+      // nor is the helper's context the bot's: no usage report carries it
+      const usage = recorder.events.filter((e) => e.type === "thread.token-usage.updated");
+      expect(usage.some((e) => (e as { input: number }).input === 999)).toBe(false);
+    });
   });
 });
 

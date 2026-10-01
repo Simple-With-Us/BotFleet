@@ -164,6 +164,66 @@ export function claudeSignedIn(
   });
 }
 
+/** Engine-native work that outlives a turn, switched off (background jobs P0,
+ * docs/plans/2026-10-01-background-jobs-and-subagents-decision.md).
+ *
+ * A Claude bot could start a background shell or helper, end its turn, and
+ * have the CLI start a NEW turn on its own when that work finished.  That turn
+ * reached the transcript as a ghost message: no turn record, no watchdog, no
+ * spend accounting, and its approvals auto-denied.  Every name below was read
+ * out of the Claude Code 2.1.284 binary, not guessed:
+ *
+ * - `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` drops `run_in_background` from the
+ *   Bash and Agent schemas and turns off auto-backgrounding of slow commands.
+ * - `CLAUDE_CODE_DISABLE_CRON` stops the headless runner's scheduler.  That
+ *   scheduler is what fires ScheduleWakeup and CronCreate prompts into the
+ *   live process as turns of their own.
+ * - `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (default 20) and
+ *   `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` (default 3; the main thread is
+ *   depth 0 and a spawn is refused once depth >= the cap) hold native helpers
+ *   to 3 at once, one level deep.
+ *
+ * Forced over any inherited value: these are a safety floor, not defaults. */
+export const CLAUDE_CONTAINMENT_ENV: Readonly<Record<string, string>> = {
+  CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
+  CLAUDE_CODE_DISABLE_CRON: "1",
+  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
+  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
+};
+
+/** Built-ins whose whole job is to start a turn later, with nobody's message
+ * behind it.  The environment above does not remove any of them from the
+ * CLI's tool list (checked against 2.1.284's `init` frame), so they are denied
+ * outright:
+ *
+ * - ScheduleWakeup and CronCreate enqueue a prompt into the running process
+ *   when they fire (the headless runner's cron scheduler); CronList and
+ *   CronDelete only manage those jobs.
+ * - Monitor streams a background command's output back as notifications, and
+ *   is not gated by the background-tasks switch.
+ * - Workflow runs as a background task that reports back on completion, and
+ *   spawns helpers outside the cap above.
+ *
+ * BotFleet's own job tools (P1) replace all of this with turns it owns. */
+export const CLAUDE_CONTAINMENT_DISALLOWED_TOOLS: readonly string[] = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "Monitor",
+  "Workflow",
+];
+
+/** The `--disallowedTools` list a turn launches with: the bot's own denials,
+ * then the containment set.  A bot that names its available built-ins can
+ * only reach the containment tools it listed, so only those are denied — a
+ * bot with no built-ins at all gets no flag. */
+export function claudeDisallowedTools(config: Pick<ClaudeConfig, "tools" | "disallowedTools">): string[] {
+  const available = config.tools === undefined ? null : new Set(config.tools);
+  const containment = CLAUDE_CONTAINMENT_DISALLOWED_TOOLS.filter((tool) => available === null || available.has(tool));
+  return [...new Set([...(config.disallowedTools ?? []), ...containment])];
+}
+
 /** The CLI environment shared by auth probes and real turns.
  *
  * Subscription users can be billed pay-as-you-go if an inherited API key
@@ -183,7 +243,39 @@ function claudeEnvironment(
   stripWorkspaceCredentialEnv(env);
   const applied = applyClaudeInject(env, model);
   if (!applied.injected) delete env.ANTHROPIC_API_KEY;
+  Object.assign(env, CLAUDE_CONTAINMENT_ENV);
   return env;
+}
+
+/** Frames the CLI wrote while BotFleet had no turn running on that process.
+ * Counted for the process's lifetime so a test, or a person reading logs, can
+ * see that containment fired; never reset. */
+const unsolicitedFrames = { dropped: 0, turns: 0, foreignResults: 0 };
+export function claudeUnsolicitedFrameStats(): Readonly<typeof unsolicitedFrames> {
+  return { ...unsolicitedFrames };
+}
+
+/** The frames that mean the CLI is running a turn of its own.  Other system
+ * frames (hook progress, state changes, prompt suggestions) can legitimately
+ * follow a result and say nothing about a new turn. */
+function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown }): boolean {
+  if (frame.type === "stream_event" || frame.type === "assistant" || frame.type === "user") return true;
+  return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
+}
+
+/** A short tag for a log line: enough to tell threads apart, never the id. */
+function threadTag(threadId: string): string {
+  return createHash("sha256").update(threadId).digest("hex").slice(0, 8);
+}
+
+/** Where a result came from, when the CLI says: `human` for the message
+ * BotFleet wrote, anything else for a turn the CLI started itself
+ * (`task-notification`, `peer`, `channel`, ...).  Absent on CLIs before
+ * the `origin` field, which only ever ran turns BotFleet asked for. */
+function resultOrigin(frame: { origin?: unknown }): string | undefined {
+  const origin = frame.origin;
+  if (typeof origin !== "object" || origin === null || !("kind" in origin)) return undefined;
+  return typeof origin.kind === "string" ? origin.kind : undefined;
 }
 
 const DRIVER_KIND = "claudeAgent";
@@ -626,6 +718,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       idleTimer: ReturnType<typeof setTimeout> | null;
       closing: boolean;
       stderr: string;
+      /** The CLI is running a turn BotFleet did not start (a background
+       *  task's notification, a scheduled wakeup, a peer message): set by
+       *  its first frame, cleared by its own `result`.  Its frames are
+       *  dropped, and while it runs this process is never reused — a user
+       *  message written into it would fold into the CLI's own turn. */
+      unsolicited: boolean;
+      /** Frames dropped for the unsolicited turn in progress, for its log line. */
+      unsolicitedFrames: number;
     }
     const sessions = new Map<string, Session>();
     sweepReceiptsOnce();
@@ -764,9 +864,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         "--permission-mode", permissionMode === "auto" ? "acceptEdits" : permissionMode,
       ];
       if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
-      if (config.disallowedTools?.length) {
-        args.push("--disallowedTools", config.disallowedTools.join(","));
-      }
+      const disallowedTools = claudeDisallowedTools(config);
+      if (disallowedTools.length) args.push("--disallowedTools", disallowedTools.join(","));
       const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
       const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
@@ -906,7 +1005,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
       const live = sessions.get(threadId);
-      if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
+      if (live && !live.turn && !live.unsolicited && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
         live.turn = { turnId, settled: false, sawStreamDelta: false, producedOutput: false, input: turn, retry, retryAbort };
         // stderr feeds the crash message; a warm process still holds turn
@@ -942,7 +1041,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
         return { turnId };
       }
-      if (live) closeSession(threadId, "spawn contract changed");
+      if (live) closeSession(threadId, live.unsolicited ? "engine is running its own turn" : "spawn contract changed");
 
       // Only create a broker for a new process. A compatible retained process
       // keeps its existing proxy connection and broker across turns.
@@ -1004,6 +1103,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         idleTimer: null,
         closing: false,
         stderr: "",
+        unsolicited: false,
+        unsolicitedFrames: 0,
       };
       sessions.set(threadId, session);
 
@@ -1048,7 +1149,42 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         });
         if (session.child.exitCode === null && !session.closing) armIdle(threadId);
       };
+      /** The running BotFleet turn's id.  Only called with a turn running:
+       *  handleLine drops every frame that arrives without one, and the
+       *  process handlers check before they emit.  Falling back to the id
+       *  this process was spawned with is what used to stamp an engine's
+       *  own turn with a settled turn's id. */
       const currentTurnId = () => session.turn?.turnId ?? turnId;
+
+      /** A frame that arrived with no BotFleet turn on this process.  It is
+       *  never transcript text, never stamped with a settled turn's id, and
+       *  never settles or pauses anything: the turn that owned the broker and
+       *  the thread is gone, and the next one has not been written yet. */
+      const dropUnsolicited = (frame: any) => {
+        if (frame.type === "result") {
+          unsolicitedFrames.dropped++;
+          const cost = typeof frame.total_cost_usd === "number" ? `, cost ${frame.total_cost_usd.toFixed(4)}` : "";
+          console.warn(
+            `[claude] thread ${threadTag(threadId)}: dropped a turn the CLI started on its own ` +
+              `(${session.unsolicitedFrames + 1} frames, origin ${resultOrigin(frame) ?? "unknown"}${cost})`,
+          );
+          session.unsolicited = false;
+          session.unsolicitedFrames = 0;
+          return;
+        }
+        // Hook progress, state changes and prompt suggestions may trail a
+        // result; they start nothing and are nothing to drop.
+        if (!startsUnsolicitedTurn(frame)) return;
+        unsolicitedFrames.dropped++;
+        session.unsolicitedFrames++;
+        if (session.unsolicited) return;
+        session.unsolicited = true;
+        unsolicitedFrames.turns++;
+        const subtype = typeof frame.subtype === "string" ? `/${frame.subtype}` : "";
+        console.warn(
+          `[claude] thread ${threadTag(threadId)}: the CLI started a turn of its own (${String(frame.type)}${subtype}); dropping its frames`,
+        );
+      };
 
       const handleLine = (line: string) => {
         let o: any;
@@ -1058,6 +1194,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return;
         }
         appendNative(threadId, { dir: "in", source: "claude.sdk.message", msg: o });
+        if (!session.turn) {
+          dropUnsolicited(o);
+          return;
+        }
         // The CLI accepted the turn just written: this native session now
         // carries the halves that turn delivered.  Committed on the first
         // frame after submission, never at write time — a CLI that dies
@@ -1074,6 +1214,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             /* the next turn re-delivers the note; nothing else depends on it */
           }
         }
+        // A helper (native subagent) frame names the Task/Agent call that
+        // started it.  Its steps nest under that row; its own prose is the
+        // helper talking to its parent, not the bot answering anyone.
+        const helperOf = typeof o.parent_tool_use_id === "string" && o.parent_tool_use_id ? o.parent_tool_use_id : null;
         switch (o.type) {
           case "system":
             if (o.subtype === "init") {
@@ -1086,7 +1230,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "stream_event": {
             // subagent narration is dropped — N parallel Tasks would
             // interleave their prose into one bubble (upstream-verified bug)
-            if (o.parent_tool_use_id) break;
+            if (helperOf) break;
             const ev = o.event ?? {};
             if (ev.type !== "content_block_delta") break;
             const d = ev.delta ?? {};
@@ -1104,7 +1248,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
-            if (session.turn && isModelRejectionFrame(o, text)) {
+            if (!helperOf && session.turn && isModelRejectionFrame(o, text)) {
               // Not an assistant reply: an error the turn failed on.  It must
               // reach the transcript as an error row, never as bot text, so
               // the failover reads "nothing produced" and walks on, and the
@@ -1116,12 +1260,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             if (text.trim()) {
               if (session.turn) session.turn.producedOutput = true;
-              // fallback delta for CLIs/paths that never streamed the block
-              if (!session.turn?.sawStreamDelta) {
-                emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+              if (!helperOf) {
+                // fallback delta for CLIs/paths that never streamed the block
+                if (!session.turn?.sawStreamDelta) {
+                  emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+                }
+                if (session.turn) session.turn.sawStreamDelta = false;
+                emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
               }
-              if (session.turn) session.turn.sawStreamDelta = false;
-              emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
@@ -1136,12 +1282,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemType: "tool",
                   itemId: b.id,
                   title: b.name,
+                  ...(helperOf ? { parentItemId: helperOf } : {}),
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
                   ...captureInput(b.input),
                 });
               }
             }
-            if (msg.usage) {
+            // A helper's usage is ITS context, not the bot's: reported as the
+            // bot's it would swing the context meter on every helper step.
+            // The turn's result frame carries the whole bill either way.
+            if (msg.usage && !helperOf) {
               emit({
                 ...base(threadId, currentTurnId()),
                 type: "thread.token-usage.updated",
@@ -1171,6 +1321,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
+            // A result for a turn the CLI started itself, while this turn's
+            // message still waits in the CLI's queue behind it.  Settling on
+            // it would end this turn early and orphan its real reply, which
+            // follows with its own result.  (A message folded INTO the
+            // CLI's turn leaves nothing queued, and that turn's result is
+            // the only one this turn will get, so it settles below.)
+            const origin = resultOrigin(o);
+            if (origin !== undefined && origin !== "human" && Number(o.queued_turn_count) > 0) {
+              unsolicitedFrames.foreignResults++;
+              console.warn(
+                `[claude] thread ${threadTag(threadId)}: a ${origin} turn ended ahead of this turn's queued message; waiting for its own result`,
+              );
+              break;
+            }
             // result.usage is this invocation's total — one process per turn,
             // so it is the turn's figure. cache reads count as input: they
             // are billed (at the cache rate) and they fill the window — but
@@ -1251,6 +1415,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
 
       child.on("error", (e) => {
+        // Between turns there is nothing to fail: the close that follows
+        // ends the session, and the next turn spawns a fresh process.
+        if (!session.turn) {
+          console.warn(`[claude] thread ${threadTag(threadId)}: the CLI process failed between turns (${e.message})`);
+          return;
+        }
         emit({ ...base(threadId, currentTurnId()), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         settle(false, "spawn_error");
       });
@@ -1614,6 +1784,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // Offered in every mode: a bypass instance runs a host-control turn
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,
+          // Native background work is switched off (CLAUDE_CONTAINMENT_ENV);
+          // BotFleet's own job tools reach Claude over MCP in P2.
+          backgroundJobs: "none",
+          // Every helper frame carries parent_tool_use_id, and its steps nest
+          // under the Task/Agent row that started it.
+          helpers: "typed",
         },
         sendTurn,
         steer,

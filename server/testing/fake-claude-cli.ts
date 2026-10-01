@@ -27,6 +27,14 @@
 //                      | model-lookalike (a REAL reply, with real usage, whose
 //                        prose opens with the rejection words: a success that
 //                        must stay an ordinary assistant message)
+//                      | ghost-turn (after the first turn settles, the CLI
+//                        starts a turn of its own: a background task's
+//                        notification, text, a tool step, a second result)
+//                      | ghost-running (the same, still running: no result)
+//                      | ghost-queued (a result for the CLI's own turn
+//                        arrives first, with this turn's message still queued)
+//                      | helpers (a native subagent's frames, each carrying
+//                        parent_tool_use_id)
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -158,6 +166,50 @@ const promptText = (prompt: JsonValue): string => {
 
 const finishIfDone = () => {
   if (stdinEnded && !turnRunning) process.exit(0);
+};
+
+// A turn the CLI starts on its own once the first turn has settled, in the
+// shape the jobs panel's live probe of 2.1.284 recorded: a task_notification,
+// a second init, the model's text and a tool step, then a second result whose
+// origin is the notification.  `ghost-running` stops before that result — the
+// CLI is still busy with its own turn when the next message would arrive.
+let ghostPlayed = false;
+const playGhostTurn = () => {
+  out({
+    type: "system",
+    subtype: "task_notification",
+    task_id: "bg-task-1",
+    tool_use_id: "tu-bg-1",
+    status: "completed",
+    output_file: "/tmp/bg-task-1.output",
+    summary: 'Background command "sleep 4; echo bgdone" completed (exit code 0)',
+  });
+  out({ type: "system", subtype: "init", session_id: sessionId, model, tools: ["Bash", "Task"] });
+  out({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "GHOST DELTA" } } });
+  out({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "GHOST TEXT" },
+        { type: "tool_use", id: "ghost-tu-1", name: "Bash", input: { command: "cat /tmp/bg-task-1.output" } },
+      ],
+      usage: { input_tokens: 40, cache_read_input_tokens: 0, output_tokens: 6 },
+    },
+  });
+  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "ghost-tu-1", is_error: false, content: "bgdone" }] } });
+  if (mode === "ghost-turn") {
+    out({
+      type: "result",
+      is_error: false,
+      stop_reason: "end_turn",
+      result: "finished",
+      total_cost_usd: 0.02,
+      origin: { kind: "task-notification", producer: "session-task" },
+      queued_turn_count: 0,
+      result_index: 1,
+      usage: { input_tokens: 40, cache_read_input_tokens: 0, output_tokens: 6 },
+    });
+  }
 };
 
 const playTurn = (prompt: JsonValue) => {
@@ -324,6 +376,58 @@ const playTurn = (prompt: JsonValue) => {
     return;
   }
 
+  if (mode === "helpers") {
+    // A native helper (subagent) at work, shaped like 2.1.284's stream: the
+    // bot calls Task, every helper frame carries parent_tool_use_id naming
+    // that call, and the Task's own tool_result comes back at the top level.
+    out({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", id: "task-1", name: "Task", input: { description: "Survey files", prompt: "look around", subagent_type: "Explore" } }],
+        usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 4 },
+      },
+    });
+    out({
+      type: "assistant",
+      parent_tool_use_id: "task-1",
+      message: {
+        content: [
+          { type: "text", text: "HELPER NARRATION" },
+          { type: "tool_use", id: "helper-read-1", name: "Read", input: { file_path: "/tmp/helper-target.txt" } },
+        ],
+        usage: { input_tokens: 999, cache_read_input_tokens: 0, output_tokens: 99 },
+      },
+    });
+    out({
+      type: "user",
+      parent_tool_use_id: "task-1",
+      message: { content: [{ type: "tool_result", tool_use_id: "helper-read-1", is_error: false, content: "file body" }] },
+    });
+    out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "task-1", is_error: false, content: "helper report" }] } });
+    out({ type: "assistant", message: { content: [{ type: "text", text: "all done" }], usage: { input_tokens: 12, cache_read_input_tokens: 0, output_tokens: 3 } } });
+    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.02, usage: { input_tokens: 22, cache_read_input_tokens: 0, output_tokens: 7 } });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "ghost-queued") {
+    // The race the driver must survive: the CLI had started a turn of its
+    // own (a background task's notification) when this message arrived, so
+    // the message waits in its queue and the CLI's own result comes first.
+    out({
+      type: "result",
+      is_error: false,
+      stop_reason: "end_turn",
+      result: "ghost reply",
+      total_cost_usd: 0.03,
+      origin: { kind: "task-notification" },
+      queued_turn_count: 1,
+      result_index: 0,
+      usage: { input_tokens: 50, cache_read_input_tokens: 0, output_tokens: 9 },
+    });
+  }
+
   if (mode === "stream") {
     const delta = (d: unknown) => out({ type: "stream_event", event: { type: "content_block_delta", delta: d } });
     delta({ type: "thinking_delta", thinking: "hmm" });
@@ -367,8 +471,21 @@ const playTurn = (prompt: JsonValue) => {
   });
 
   const finish = () => {
-    out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01, usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 } });
+    out({
+      type: "result",
+      is_error: false,
+      stop_reason: "end_turn",
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
+      // 2.1.284 names where each turn came from; the ghost modes need the
+      // newer shape, every other mode keeps the older one with no origin.
+      ...(mode.startsWith("ghost-") ? { origin: { kind: "human" }, queued_turn_count: 0 } : {}),
+    });
     turnRunning = false;
+    if (!ghostPlayed && (mode === "ghost-turn" || mode === "ghost-running")) {
+      ghostPlayed = true;
+      setTimeout(playGhostTurn, 50);
+    }
     finishIfDone();
   };
   if (mode === "slow") {
