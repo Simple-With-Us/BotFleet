@@ -9,7 +9,8 @@ import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
 import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
-import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { classifyError } from "../retry.ts";
+import { AcpModelRejectedError, createAcpDriver, type AcpSupport } from "./core.ts";
 
 /** Hover text for the "If offered" chip on the rows below.  The Grok Build
  *  CLI answers `session/set_model` only for the models its own account lists
@@ -312,7 +313,15 @@ const support: AcpSupport = {
     try {
       await request("session/set_model", { sessionId, modelId: turn.model });
     } catch (e) {
-      throw new Error(grokRejectedModelMessage(turn.model, grokRpcReason(e), sessionModels));
+      const reason = grokRpcReason(e);
+      const message = grokRejectedModelMessage(turn.model, reason, sessionModels);
+      // Only the CLI's own refusal of the id settles the turn `unknown_model`,
+      // which marks the model rejected for later turns and fail-overs.  A
+      // timeout or a crash during set_model says nothing about the model, so
+      // it must not hide a working one for hours.
+      throw classifyError({ text: reason }).reason === "unknown_model"
+        ? new AcpModelRejectedError(message)
+        : new Error(message);
     }
   },
 
