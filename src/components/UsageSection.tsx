@@ -737,7 +737,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         {heldPairs.length > 0 && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
             <div className="font-medium text-ink">
-              {heldBotCount === 1 ? "1 bot is being held" : `${heldBotCount} bots are being held`}
+              {heldBotCount === 1 ? "1 Bot Is Being Held" : `${heldBotCount} Bots Are Being Held`}
             </div>
             <div className="mt-1">
               These bots cannot start their engine, so their scheduled work is queued rather than failed
@@ -758,12 +758,22 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         )}
         {redundantChains.length > 0 && (
           <div className="mb-2 rounded-lg border border-hairline/25 bg-inset/30 px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
-            {redundantChains.length === 1
-              ? "1 bot's fallback chain is shorter than it looks"
-              : `${redundantChains.length} bots' fallback chains are shorter than they look`}
+            {(() => {
+              // Count BOTS, matching the held-engines notice: one bot with a
+              // redundant bot-level chain and two redundant task overrides is
+              // one bot, not three.
+              const bots = new Set(redundantChains.map((chain) => chain.botId)).size;
+              return bots === 1
+                ? "1 Bot's Fallback Chain Is Shorter Than It Looks"
+                : `${bots} Bots' Fallback Chains Are Shorter Than They Look`;
+            })()}
             <ul className="mt-1.5 space-y-0.5">
               {redundantChains.map((chain) => (
-                <li key={chain.botId}>
+                // A bot legitimately returns several rows — its own chain plus
+                // one per task that overrides it — so keying by botId alone
+                // collided, and counting rows claimed several bots where there
+                // was one.
+                <li key={`${chain.botId}:${chain.scope ?? "bot"}:${chain.threadId ?? "-"}`}>
                   <span className="font-medium text-ink">{chain.name}</span> — {chain.total} configured,{" "}
                   {chain.effective} usable
                   {chain.redundant.map((entry) => (

@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  PauseCircle,
   Cloud,
   ExternalLink,
   Gauge,
@@ -513,6 +514,19 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
           {run?.coalescedInto && <p className="text-[12px] text-ink-secondary">Combined with another delivery in this turn.{'\u00a0 '}All combined deliveries share its final outcome and cancellation.</p>}
           {outcome && outcome !== "completed" && <p className="text-[12px] font-medium text-ink">{ROUTINE_OUTCOME_LABELS[outcome]}{run?.failurePhase ? ` · ${run.failurePhase}` : ""}</p>}
           {run?.engineId && <p className="text-[12px] text-ink-secondary">Engine: {run.engineId}{run.model ? ` · ${run.model}` : ""}</p>}
+          {run?.holdReason && (
+            // The reason is only rendered while it is true, and it is cleared
+            // wherever the run stops being queued, so this cannot outlive the
+            // wait it describes.  A run still showing "queued" with nothing
+            // under it is the exact state this whole change set removed.
+            <div className="flex items-start gap-2 rounded-xl border border-hairline/25 bg-inset/40 px-3.5 py-3 text-[13px] leading-relaxed text-ink-secondary">
+              <PauseCircle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <span className="font-medium text-ink">Holding</span>{"\u00a0\u00a0"}
+                {run.holdReason}
+              </span>
+            </div>
+          )}
           {run?.error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{run.error}</span></div>}
           {routine && (
             <div className="grid grid-cols-2 gap-3">
