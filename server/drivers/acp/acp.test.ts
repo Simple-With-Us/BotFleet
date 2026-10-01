@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
@@ -789,7 +790,10 @@ describe("ACP turns (fake CLI)", () => {
     expect(err).toHaveLength(1);
     const message = err[0]!.message as string;
     expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
-    expect(message).toContain("Invalid params");
+    // The reason rides in the RPC error's `data`; core.ts keeps it off the
+    // Error message, so the driver has to fold it back in.
+    expect(message).toContain("via session/set_model: Invalid params: unknown model id.");
+    expect(classifyError(new Error(message))).toEqual({ transient: false, reason: "unknown_model" });
     expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
     expect(message).toContain("`grok models`");
     expect(message).not.toContain("1.0.6");

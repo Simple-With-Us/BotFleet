@@ -215,11 +215,24 @@ export function ensureGrokInjectSlug(
 /** At most this many offered ids are named in the rejected-model error. */
 const OFFERED_IDS_IN_ERROR = 12;
 
+/** The reason an RPC failed.  ACP carries the specific reason in the error's
+ *  `data`, and acp/core.ts keeps it off `Error.message`: grok 1.0.46 answers a
+ *  model it does not serve with -32602, message "Invalid params", data
+ *  "unknown model id".  Without the data the text says only "Invalid params",
+ *  and drivers/retry.ts cannot read the failure as an unknown model. */
+export function grokRpcReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const data = (error as { data?: unknown } | null | undefined)?.data;
+  const detail = typeof data === "string" ? data.trim().slice(0, 200) : "";
+  return detail && !message.includes(detail) ? `${message}: ${detail}` : message;
+}
+
 /** The error a rejected `session/set_model` becomes.  Two rules:
- *   - It keeps the CLI's own wording (`cause`) verbatim.  The retry classifier
- *     (drivers/retry.ts) reads "unknown model id" out of it to mark the failure
- *     terminal `unknown_model` instead of retrying; nothing here may add a
- *     phrase that an earlier arm of that classifier (auth, quota) would claim.
+ *   - It keeps the CLI's own wording (`cause`, see grokRpcReason) verbatim.
+ *     The retry classifier (drivers/retry.ts) reads "unknown model id" out of
+ *     it to mark the failure terminal `unknown_model` instead of `unknown`;
+ *     nothing here may add a phrase that an earlier arm of that classifier
+ *     (auth, quota) would claim.
  *   - It names what the signed-in account IS offered.  `sessionModels` is the
  *     `session/new` model list, verbatim, so the answer is the CLI's own and
  *     needs no second probe.  Some models in this picker (Composer 2.5, Grok
@@ -299,7 +312,7 @@ const support: AcpSupport = {
     try {
       await request("session/set_model", { sessionId, modelId: turn.model });
     } catch (e) {
-      throw new Error(grokRejectedModelMessage(turn.model, (e as Error).message, sessionModels));
+      throw new Error(grokRejectedModelMessage(turn.model, grokRpcReason(e), sessionModels));
     }
   },
 
