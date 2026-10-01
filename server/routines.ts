@@ -55,6 +55,17 @@ export const AUTOMATION_LANE_TITLE: Record<AutomationLane, string> = {
  *
  * Manual runs share the routine's thread deliberately: "Run now" is the same
  * work as the schedule, done impatiently. */
+
+/** Prompt stamp for a delivery that replaced earlier busy-deferred ones. */
+export const BUSY_DEFER_NOTE =
+  "[Earlier deliveries for this trigger while the bot was busy were superseded by this latest one.]";
+
+export function busyDeferPrompt(prompt: string): string {
+  const trimmed = prompt.trimEnd();
+  if (trimmed.endsWith(BUSY_DEFER_NOTE)) return trimmed;
+  return `${trimmed}\n\n${BUSY_DEFER_NOTE}`;
+}
+
 export function automationThreadKey(run: {
   routineId: string;
   webhookId?: string;
@@ -229,6 +240,24 @@ export interface RoutineManagerOptions {
   /** Durable lookup by `automationThreadKey`, independent of run history. */
   taskForKey?: (botId: string, automationKey: string) => string | undefined;
   stampKey?: (botId: string, threadId: string, automationKey: string) => void;
+  /** Size of a task used to decide forever-thread rollover.  Absent disables
+   * rollover (tests that omit it keep the historical reuse-only behavior). */
+  automationThreadSize?: (botId: string, threadId: string) => { turns: number; messages: number };
+  /** True when the thread should be replaced under the same automationKey
+   * before the next wake starts.  See `server/automation-rollover.ts`. */
+  shouldRolloverAutomation?: (
+    botId: string,
+    threadId: string,
+    size: { turns: number; messages: number },
+  ) => boolean;
+  /** Move `automationKey` onto a fresh task; return its threadId.  Called
+   * only between turns (bot is not busy) at admission time. */
+  rolloverAutomationTask?: (
+    botId: string,
+    automationKey: string,
+    title: string,
+    activate: boolean,
+  ) => { threadId: string } | null;
   startTurn: (
     botId: string,
     threadId: string,
@@ -770,6 +799,41 @@ export class RoutineManager {
     return { ...run };
   }
 
+  /**
+   * When the bot is busy, fold a new webhook/resource delivery into the one
+   * already-queued deferred slot for the same automation key (latest prompt
+   * wins) instead of stacking runs that sit until stop/cancel.  Returns the
+   * updated receipt, or null when there is nothing to coalesce into (caller
+   * creates a fresh queued run).  Idle bots and gap-waiting multi-queues keep
+   * the prior create-then-fold-at-admit path.
+   */
+  private coalesceIntoBusyDefer(input: {
+    botId: string;
+    key: string;
+    prompt: string;
+    deliveryId: string;
+    name: string;
+  }): RoutineRun | null {
+    if (this.options.botState(input.botId) !== "busy") return null;
+    const existing = this.runs.find(
+      (run) =>
+        run.status === "queued" &&
+        !run.coalescedInto &&
+        run.botId === input.botId &&
+        automationThreadKey(run) === input.key,
+    );
+    if (!existing) return null;
+    // Latest wins: UI-pass / check_run storms care about the newest event, not
+    // a growing fold of superseded payloads.  Keep the earliest scheduledFor
+    // so the calendar still shows when the backlog began.
+    existing.prompt = busyDeferPrompt(input.prompt);
+    existing.deliveryId = input.deliveryId;
+    existing.routineName = input.name;
+    this.save();
+    this.emitRun(existing);
+    return { ...existing };
+  }
+
   /** Queue an event-driven job without inventing a calendar schedule. Webhook
    * definitions live in their own store; the execution receipt deliberately
    * reuses this manager so busy-bot ordering, task creation and VM routing stay
@@ -787,6 +851,20 @@ export class RoutineManager {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
+    if (!snoozed) {
+      const deferred = this.coalesceIntoBusyDefer({
+        botId: input.botId,
+        key: automationThreadKey({
+          routineId: input.webhookId,
+          webhookId: input.webhookId,
+          triggerSource: "webhook",
+        }),
+        prompt: input.prompt,
+        deliveryId: input.deliveryId,
+        name: input.webhookName,
+      });
+      if (deferred) return deferred;
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.webhookId,
@@ -829,6 +907,20 @@ export class RoutineManager {
       throw Object.assign(new Error("The assigned Bot no longer exists"), { status: 410 });
     }
     const snoozed = this.isBotSnoozed(input.botId);
+    if (!snoozed) {
+      const deferred = this.coalesceIntoBusyDefer({
+        botId: input.botId,
+        key: automationThreadKey({
+          routineId: input.triggerId,
+          webhookId: input.triggerId,
+          triggerSource: "resource",
+        }),
+        prompt: input.prompt,
+        deliveryId: input.deliveryId,
+        name: input.triggerName,
+      });
+      if (deferred) return deferred;
+    }
     const run: RoutineRun = {
       id: randomUUID(),
       routineId: input.triggerId,
@@ -1062,6 +1154,7 @@ export class RoutineManager {
           return id;
         };
         let threadId: string | undefined = acceptReuse(this.options.taskForKey?.(run.botId, key));
+        let foundByAutomationKey = Boolean(threadId);
         let stampResolvedThread = false;
         if (!threadId) {
           const previous = [...this.runs].reverse().find(
@@ -1085,6 +1178,33 @@ export class RoutineManager {
         if (!threadId && !allowsMultipleBotThreads(mode)) {
           this.failRun(run, "Could not find this bot's conversation");
           continue;
+        }
+        // Forever-thread rollover: when a task that already owns this
+        // automationKey is past the size threshold, mint a fresh task under
+        // the SAME key between turns.  Bot is not busy here (admission
+        // already skipped busy seats).  History stays on the old task; only
+        // the key moves.
+        if (
+          threadId &&
+          this.options.rolloverAutomationTask &&
+          this.options.shouldRolloverAutomation &&
+          this.options.automationThreadSize
+        ) {
+          const size = this.options.automationThreadSize(run.botId, threadId);
+          // Only roll a thread that already owns this key.  Stamping a key
+          // onto a large interactive chat for the first time must not yank
+          // the user into a fresh task mid-conversation; the next wake
+          // (key lookup hits) will roll then.
+          if (foundByAutomationKey && this.options.shouldRolloverAutomation(run.botId, threadId, size)) {
+            const activate =
+              run.triggerSource === "webhook" || run.triggerSource === "resource";
+            const rolled = this.options.rolloverAutomationTask(run.botId, key, title, activate);
+            if (rolled) {
+              threadId = rolled.threadId;
+              stampResolvedThread = false;
+              foundByAutomationKey = true;
+            }
+          }
         }
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those

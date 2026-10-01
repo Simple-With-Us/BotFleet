@@ -23,6 +23,7 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ContextInjectionRef } from "../../shared/context-injection";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -129,7 +130,23 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
+    /** The helper (native subagent) step this one ran inside: the parent
+     * row's `itemId`.  The chat nests the row under that parent instead of
+     * interleaving parallel helpers' steps with the bot's own. */
+    parentItemId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */
@@ -220,8 +237,13 @@ export interface GroupTask {
 
 export interface ModelSelection {
   instanceId: string;
+  /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
+   *  shared/model-lineage.ts.  The picker sends `null` when a person picks
+   *  a pinned model, so the harness does not carry an older float forward. */
+  latest?: string | null;
   fallbacks?: ModelSelection[];
 }
 
@@ -717,6 +739,9 @@ export interface InstanceInfo {
   };
   models: {
     default: string;
+    /** Set when the provider itself just listed this catalog, so a saved id
+     *  missing from it can honestly be called "Not in catalog". */
+    live?: boolean;
     options: Array<{
       id: string;
       label: string;

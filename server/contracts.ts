@@ -7,6 +7,8 @@
 
 import type { ComputerMount } from "./computer-grants.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { ContextSource } from "../shared/context-injection.ts";
+import type { ItemIoCapture } from "../shared/item-io.ts";
 
 export type DriverKind = string;
 export type InstanceId = string;
@@ -50,6 +52,13 @@ export interface ModelSelection {
   model: string;
   /** Optional: no effort means no flag, and the CLI keeps its own default. */
   effort?: EffortLevel;
+  /** Optional: a model class this entry floats on ("Latest Sonnet" is
+   *  `latest: "sonnet"`).  `model` is still the real slug that runs — the
+   *  harness keeps it pointed at the newest member of the class the
+   *  instance's catalog offers (shared/model-lineage.ts), so drivers,
+   *  recorded usage, and clients that ignore this field all see the actual
+   *  model. */
+  latest?: string;
   /** Optional: engines to try if this one fails (e.g. quota/rate limit) */
   fallbacks?: ModelSelection[];
 }
@@ -84,6 +93,15 @@ export interface RuntimeEventBase {
   itemId?: string;
   requestId?: string;
   raw?: { source: string; payload: unknown };
+  /** The full input or output of this step, for the side store
+   * (`server/item-io-store.ts`).  Capture-only: `EventBus.publish` moves it
+   * into the store and strips it, so no subscriber, no wire frame and no
+   * event-log line ever carries it.  Already bounded by the driver
+   * (`shared/item-io.ts`); the bus does not redact it — the store does, with
+   * the wire's pass.  A structured input was already redacted as a tree when
+   * the driver captured it, so a `{name, value}` env entry is masked by its
+   * name before it is flattened to text. */
+  io?: ItemIoCapture;
 }
 
 export type TurnBillingMode = "actual" | "estimated";
@@ -157,6 +175,11 @@ export type RuntimeEvent = RuntimeEventBase &
          * run the tool call themselves, the executor never sees the
          * event for a CLI driver that stopped on tool calls. */
         arguments?: string;
+        /** The `itemId` of the helper (native subagent) call this step ran
+         * inside — Claude's `parent_tool_use_id`.  Absent for the bot's own
+         * steps.  The transcript nests the row under its parent instead of
+         * interleaving parallel helpers' steps with the bot's. */
+        parentItemId?: string;
       }
     | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
     | {
@@ -195,6 +218,10 @@ export type RuntimeEvent = RuntimeEventBase &
     // `setup: true` marks a failure the user fixes by installing or
     // configuring something, not by retrying — the UI offers setup instead.
     | { type: "runtime.error"; message: string; setup?: boolean }
+    /** The harness put content in front of the model that the person did not
+     * type (`shared/context-injection.ts`).  `itemId` keys the full text in the
+     * side store; `preview` is one redacted, clipped line. */
+    | { type: "context.injected"; source: ContextSource; preview: string; bytes: number }
   );
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
@@ -226,6 +253,14 @@ export interface SendTurnInput {
    * resume cursor (it carries an update from outside the session). A driver
    * that rebuilds only some lost sessions may also rebuild this one. */
   recoveryIsReplay?: boolean;
+  /** Called once by a driver that, after the provider lost its session, sends
+   * `recoveryText` in place of the turn it was handed.  The replay is content
+   * the model received that the person did not type, and only the driver knows
+   * it happened, so this is how the harness records it
+   * (shared/context-injection.ts, source "handoff").  Never required: a driver
+   * that cannot rebuild does not call it, and a throw here must not fail the
+   * turn. */
+  onReplayRecovered?: () => void;
   /** Prior turns for transcript-replay providers (API-backed drivers).
    *  Each entry may carry tool call and result metadata so the executor
    *  can replay a multi-step turn that has already been settled: the
@@ -429,6 +464,11 @@ export interface TurnToolHost {
      *  instead of leaving a card nobody can answer. */
     signal?: AbortSignal;
   }): Promise<RequestOutcome>;
+  /** Called once when the turn ends, however it ends, before its terminal
+   *  event: stops any process a tool started that is still running, so no
+   *  work outlives the turn that nothing will report on.  Never throws.
+   *  HTTP tool lane only; a CLI engine's own shells are its own (P2). */
+  settle?(): void;
 }
 
 export interface TurnStartResult {
@@ -438,6 +478,9 @@ export interface TurnStartResult {
    * bookkeeping such as cursor freshness.  Omitted means dispatched. */
   dispatched?: boolean;
 }
+
+export type BackgroundJobsSupport = "none" | "emulated" | "native";
+export type HelperSupport = "none" | "named" | "typed";
 
 export interface ProviderAdapter {
   readonly provider: DriverKind;
@@ -496,6 +539,20 @@ export interface ProviderAdapter {
      * default); a driver that sets this and also inlines the transcript
      * would send it twice. */
     replaysTranscript?: boolean;
+    /** Long-running work this engine can run past the end of a turn, and
+     * who owns it (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md).
+     * `"none"`: nothing outlives the turn — the engine has no background
+     * work, or BotFleet switches it off (Claude since jobs P0).
+     * `"emulated"`: BotFleet's own job tools are mounted (from P1).
+     * `"native"`: the engine's own background tasks are passed through
+     * (a later phase).  Absent reads as `"none"`. */
+    backgroundJobs?: BackgroundJobsSupport;
+    /** The engine's own helpers (native subagents), as BotFleet shows them.
+     * `"none"`: unsupported, or not shown — a helper's events are kept out
+     * of the turn.  `"named"`: recognised by tool name only.  `"typed"`:
+     * every helper event names the call that started it, so its steps nest
+     * under that row.  Absent reads as `"none"`. */
+    helpers?: HelperSupport;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

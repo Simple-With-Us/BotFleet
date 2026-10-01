@@ -22,6 +22,7 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 import { toolFields } from "../tool-fields.ts";
+import { captureInput } from "../../shared/item-io.ts";
 
 const DRIVER_KIND = "boxAgent";
 const BOX_API = "https://ascii.dev/api/box/v1";
@@ -210,6 +211,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                     itemId: id,
                     title: String(ev.title ?? ev.command ?? kind).slice(0, 80),
                     ...toolFields(ev.title ?? kind, ev.command ?? ev.input ?? ev.args),
+                    ...captureInput(ev.command ?? ev.input ?? ev.args),
                   });
                 }
               }
@@ -303,7 +305,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        // Jobs matrix: remote, opaque and without MCP — neither jobs nor
+        // helpers reach this engine.
+        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none" },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.cancel(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer

@@ -352,6 +352,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
     delete process.env.FAKE_ACP_MODELS;
+    delete process.env.FAKE_ACP_SESSION_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
@@ -359,6 +360,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_LATE_INPUT_AT;
     delete process.env.FAKE_ACP_STATE;
     delete process.env.FAKE_ACP_RETRY_SCALE;
     delete process.env.FAKE_ACP_INIT_DELAY_MS;
@@ -548,6 +550,49 @@ describe("ACP turns (fake CLI)", () => {
     expect(recorder.events.some((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1" && "ok" in event && event.ok === true)).toBe(true);
   });
 
+  it("files a tool call's raw input and its content for the side store, beside the clipped headline", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "50";
+    await create(GrokAgentDriver, "quiet-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-tool-io", text: "build it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")!;
+    expect(started).toMatchObject({ title: "pnpm build", target: "pnpm build" });
+    expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
+    expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
+  it("files the arguments a streaming agent sends on a later tool_call_update", async () => {
+    // announced with an empty rawInput; the real arguments settle mid-run
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "late-input-1")!;
+    // an empty object is not an input worth filing
+    expect(started.io?.input).toBeUndefined();
+    const updates = recorder.events.filter((event) => event.type === "item.updated" && event.itemId === "late-input-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.output?.text).toBe("total 0");
+    // already filed on the update, so the completion does not file it twice
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("files the arguments that only settle on the completing tool_call_update", async () => {
+    process.env.FAKE_ACP_LATE_INPUT_AT = "completion";
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input-end", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    expect(recorder.events.some((event) => event.type === "item.updated" && event.itemId === "late-input-1")).toBe(false);
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    expect(done.io?.output?.text).toBe("total 0");
+  });
+
   it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
     process.env.FAKE_ACP_DRIP_MS = "20";
     // no FAKE_ACP_DRIP_COUNT: drips forever, so the idle guard (5 s, never
@@ -726,6 +771,28 @@ describe("ACP turns (fake CLI)", () => {
       args: ["/tmp/connector-proxy.js"],
       env: [{ name: "OMB_CONNECTOR_UPSTREAM_URL", value: "http://127.0.0.1:8799/api/internal/connectors/mcp" }],
     });
+  });
+
+  it("grok names what the account is offered when the CLI rejects a picked model", async () => {
+    // Composer 2.5 and Grok Build 0.1 are in the picker but only some accounts
+    // are served them.  A rejected session/set_model must end the turn with the
+    // CLI's own offered list and the command that prints it, not a version hint.
+    process.env.FAKE_ACP_MODE = "set-model-invalid-params";
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.7|Grok 4.7,grok-4.7-build-fast|Grok 4.7 Fast,grok-4.6|Grok 4.6";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-composer", text: "go", model: "composer-2.5" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    const err = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(err).toHaveLength(1);
+    const message = err[0]!.message as string;
+    expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
+    expect(message).toContain("Invalid params");
+    expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
+    expect(message).toContain("`grok models`");
+    expect(message).not.toContain("1.0.6");
   });
 
   it("droid takes model and autonomy over the wire, never through argv", async () => {

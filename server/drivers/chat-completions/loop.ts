@@ -57,6 +57,7 @@ import type {
 import { ProviderError } from "../../contracts.ts";
 import { DEFAULT_MAX_TOOL_ROUNDS } from "../../../shared/bot-profile.ts";
 import { parseToolArguments, toolFields } from "../../tool-fields.ts";
+import { captureOutput } from "../../../shared/item-io.ts";
 import { RETRY_MAX_ATTEMPTS, classifyError, computeBackoff, interruptibleDelay } from "../retry.ts";
 import { UNHINTED_RATE_LIMIT_ATTEMPTS, httpFailureOf, httpRetryPolicy, isPrematureCloseError } from "./errors.ts";
 
@@ -598,6 +599,9 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
           itemId: call.id,
           ok: outcome.kind !== "error",
           arguments: call.function.arguments,
+          // the text the model is told the tool returned, whole — the bus
+          // files it in the side store, never on the event
+          ...captureOutput(outcome.content),
         };
         deps.emit(outcome.detail ? { ...row, detail: outcome.detail } : row);
       }
@@ -891,6 +895,14 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
     }
   } finally {
     clearTimeout(wallTimer);
+    // Whatever a tool started and left running ends with the turn
+    // (server/tools/process-group.ts).  Before the terminal event, so a
+    // queued turn that dispatches from it never inherits this turn's work.
+    try {
+      deps.toolHost?.settle?.();
+    } catch (error) {
+      console.error("tool host settle failed", error);
+    }
     // Drop the driver's active entry BEFORE the terminal event: the fold
     // that handles turn.completed drains queued sends synchronously, and a
     // fresh dispatch must not find this thread still busy.

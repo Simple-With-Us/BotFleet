@@ -24,6 +24,7 @@
 // first step as the thread's first.
 import type { RuntimeEvent } from "../../server/contracts.ts";
 import type { ToolKind } from "../../shared/tool-activity";
+import { contextInjectionLabel, formatContextBytes } from "../../shared/context-injection";
 import { formatDuration } from "./thread-stats";
 
 export type Lane = "input" | "model" | "tools";
@@ -111,6 +112,11 @@ export interface TrajectoryRow {
   toolCallOnly?: boolean;
   status?: SpanStatus;
   toolKind?: ToolKind;
+  /** Where this step's full input and output (or an injection's full text)
+   *  live in the harness's side store — `GET /api/threads/:id/items/:itemId/io`.
+   *  Fetched only when the row is opened; absent for rows with nothing behind
+   *  them. */
+  ioRef?: { itemId: string; turnId?: string };
   detail: RowDetail;
   /** Lowercased haystack the search box matches against. */
   searchText: string;
@@ -649,6 +655,7 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
       args,
       status: "running",
       toolKind: e.toolKind,
+      ...(e.itemId ? { ioRef: { itemId: e.itemId, turnId: e.turnId } } : {}),
       detail: {
         target: e.target,
         arguments: prettyArguments(e.arguments),
@@ -714,6 +721,7 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
         title: "tool",
         result: compactResult(e.detail),
         status: e.ok ? "ok" : "error",
+        ...(e.itemId ? { ioRef: { itemId: e.itemId, turnId: e.turnId } } : {}),
         detail: { arguments: prettyArguments(e.arguments), result: e.detail, meta: [["Note", "The start of this step is not in the log"]] },
       });
       if (!e.ok && turn) turn.errors += 1;
@@ -956,6 +964,27 @@ export function buildTrajectory(rawEvents: readonly RuntimeEvent[], options: Bui
           text: clipLine(e.message, ROW_TEXT_LIMIT),
           status: "error",
           detail: { text: e.message, meta: [] },
+        });
+        break;
+      }
+      case "context.injected": {
+        // What the harness put in front of the model that the person did not
+        // type.  It is published just BEFORE the turn it belongs to starts, so
+        // it carries no turn of its own and travels with the turn that follows
+        // (groupByTurn) — `turnFor` is deliberately not asked: a stray open
+        // turn would claim it.
+        const turn = e.turnId ? turnsById.get(e.turnId) : undefined;
+        pushRow({
+          id: `context:${e.eventId}`,
+          kind: "context",
+          at,
+          turnId: turn?.id,
+          turnIndex: turn?.index,
+          title: contextInjectionLabel(e.source),
+          args: formatContextBytes(e.bytes) || undefined,
+          text: e.preview ? clipLine(e.preview, ROW_TEXT_LIMIT) : undefined,
+          ...(e.itemId ? { ioRef: { itemId: e.itemId, turnId: e.turnId } } : {}),
+          detail: { text: e.preview, meta: [["Source", e.source], ["Size", formatContextBytes(e.bytes)]] },
         });
         break;
       }

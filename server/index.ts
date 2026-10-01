@@ -105,6 +105,7 @@ import {
   quotaCooldowns,
   quotaOrCapFromErrorCode,
   selectTurnFallback,
+  selectionForFallbackPick,
   shouldReplayPersistedStarter,
   bootRecoveryTurnOpts,
   sliceIsShortProviderError,
@@ -116,6 +117,7 @@ import {
   type TurnFallbackPick,
 } from "./model-fallback.ts";
 import { enableModelRejectionPersist, modelRejections } from "./model-rejections.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
 import * as box from "./box.ts";
 import { cloudBackendChangeError, vpsAliasChangeError } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
@@ -194,6 +196,7 @@ import {
   autoUpdateDue,
   DATA_DIR,
   EVENTS_DIR,
+  ITEM_IO_DIR,
   NATIVE_DIR,
 } from "./config.ts";
 import {
@@ -210,6 +213,17 @@ import { cliProbeEnvironment } from "./cli-probe-env.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { modelEffortLevels } from "../src/lib/model-effort.ts";
+import type { LineageContext } from "../shared/model-lineage.ts";
+import {
+  checkLineageWrite,
+  gateLineageByCliVersion,
+  lineageContextFor,
+  modelNameFor,
+  presentDescribedInstances,
+  reconcileTurnOverride,
+  taskWriteBaseline,
+  withoutModelsTooNewForCli,
+} from "./model-lineage.ts";
 import {
   isEffortLevel,
   type CloudBackend,
@@ -222,6 +236,8 @@ import {
 } from "./contracts.ts";
 import { buildTurnTools } from "./turn-tools.ts";
 import { createTurnToolHost } from "./tools/host.ts";
+import { adoptGroupLedger } from "./tools/process-group.ts";
+import { completedToolRow, startedToolRow } from "./tool-row.ts";
 import { createPermissionBroker, type ApprovalAnswerSource } from "./tools/approvals.ts";
 import { listAgentsResponse } from "./tools/agents.ts";
 import { toolsFor } from "./tools/registry.ts";
@@ -262,6 +278,18 @@ import { _loadPending, discardDelegations, drainDelegations, pendingDelegationSn
 import { cancelSteeredMessage, drainSteeredMessages, queueSteeredMessage, queuedMessageCount } from "./steer-queue.ts";
 import { cancelRoomRounds, drainRoomRounds, hasQueuedRoomRound, queueRoomRound, _queuedRoomCount } from "./room-queue.ts";
 import { EventBus } from "./harness/bus.ts";
+import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
+import {
+  draftFromReplay,
+  draftFromReply,
+  draftsFromPromptSections,
+  dropRecorded,
+  injectionTarget,
+  MemoryChangeGate,
+  mergeInjectionRefs,
+  recordContextInjections,
+  type InjectionDraft,
+} from "./context-injection.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
 import { formatListenInUse, isListenInUse, listenErrorDisposition } from "./harness-ports.ts";
 import { getSentry, isSentryActive } from "./sentry.ts";
@@ -342,6 +370,10 @@ import { recallPromptFor } from "./recall-prompt.ts";
 import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import {
+  automationRolloverCaps,
+  shouldRolloverAutomationThread,
+} from "./automation-rollover.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -495,6 +527,14 @@ const rememberedResumeFailures = new Set(
   interruptedAtLastStop.failures.map((failure) => `${failure.botId}:${failure.threadId}`),
 );
 
+// Shell commands an HTTP-lane bot ran each lead a process group of their own
+// (server/tools/process-group.ts), so they no longer die with this process
+// the way launchd's job cleanup used to make them.  Groups a crashed or
+// killed run recorded and never saw end are stopped now, before any turn.
+void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
+  console.error("could not stop process groups an earlier run left running", error);
+});
+
 // "Is there a newer BotFleet, and install it" — asked from this Mac or from
 // a paired phone.  The updater it starts stops this harness partway through,
 // so it can never be our child: it is launched detached and reports through
@@ -520,7 +560,16 @@ const updateControl = createUpdateControl({
 // reads the newest few hundred lines.  Synchronous, behind the ownership
 // fence and long before `server.listen`, so no request ever waits on it, and
 // a stat-only no-op on every boot after the first.
-const transcriptDirs = { eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR };
+const transcriptDirs = { eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, ioDir: ITEM_IO_DIR };
+// Every per-thread log directory, for the places that delete a thread's logs.
+const TRANSCRIPT_LOG_DIRS = [EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR] as const;
+// What a step actually took and returned, and what the harness injected into
+// a prompt.  Bounded and fetched lazily (server/item-io-store.ts); the bus
+// files each driver's `io` capture here instead of forwarding it.
+const itemIoStore = new ItemIoStore({ dir: ITEM_IO_DIR });
+// MEMORY.md rides every turn; it is recorded as an injection when it first
+// appears and when it changes (server/context-injection.ts).
+const memoryChangeGate = new MemoryChangeGate();
 // HS7: errors.log's own cap, matching decision-log.ts's rotation so this
 // append-only audit file cannot grow forever like it used to.
 const ERRORS_LOG_MAX_BYTES = 4 * 1024 * 1024;
@@ -635,7 +684,7 @@ utilityParentPort?.on("message", (event) => {
   }
 });
 
-const bus = new EventBus();
+const bus = new EventBus(undefined, { itemIo: itemIoStore });
 export { bus };
 bus.attach(registry.instances());
 // The in-process permission broker.  A CLI engine asks for permission over
@@ -1077,22 +1126,143 @@ async function defaultSelection(excludeInstanceId?: string) {
   return { instanceId: "", model: "" };
 }
 
+// ── model lineage (shared/model-lineage.ts) ─────────────────────────────
+// What a lineage pass knows about one live instance: its driver, the ids its
+// full (unhidden) catalog offers, whether that catalog is authoritative, and
+// which efforts each model takes.  An instance that is not registered has no
+// context, so nothing on it is moved.  An engine that failed to start is
+// still known by its driver kind: the owner-directed Latest flags can land on
+// it, but nothing is resolved until its catalog is back.
+// The CLI version each engine last reported, from the latest describe.  The
+// Claude gate (server/model-lineage.ts) reads it synchronously: until an
+// engine has reported one, nothing on a Claude engine is moved.
+const cliVersionByInstance = new Map<string, string | null | undefined>();
+
+function recordCliVersions(described: ReadonlyArray<{ instanceId: string; snapshot?: { version?: string | null } }>): void {
+  for (const instance of described) cliVersionByInstance.set(instance.instanceId, instance.snapshot?.version);
+}
+
+/** Every describe goes through here on its way to a picker, so the version
+ *  cache follows the engines' own answers.  Each one is also a catalog
+ *  refresh (a describe, a CLI or key change, an engine added or removed), so
+ *  saved selections are moved forward against it before the answer goes
+ *  out: an idle bot on Latest never disagrees with the catalog the same
+ *  response carries.  Working bots wait for their next dispatch, which
+ *  reconciles them first. */
+function presentInstances<T extends Parameters<typeof presentDescribedInstances>[0][number] & { instanceId: string }>(
+  described: T[],
+): T[] {
+  recordCliVersions(described);
+  const presented = presentDescribedInstances(described);
+  reconcileModelLineage({ skipBusy: true });
+  return presented;
+}
+
+function lineageContextForInstance(instanceId: string): LineageContext | undefined {
+  const instance = registry.get(instanceId);
+  if (!instance) {
+    const shadow = registry.entries().find((entry) => entry.instanceId === instanceId)?.shadow;
+    return shadow ? { driverKind: shadow.driverKind, offeredIds: [], authoritative: false, catalogPending: true } : undefined;
+  }
+  const context = lineageContextFor(instance, (model) =>
+    modelEffortLevels(
+      { driverKind: instance.driverKind, capabilities: instance.adapter.capabilities },
+      instance.models.options.find((option) => option.id === model),
+      model,
+    ),
+  );
+  return gateLineageByCliVersion(context, cliVersionByInstance.get(instanceId));
+}
+
+/** Reconcile saved selections against the engines' current catalogs.  The
+ *  store posts one notice per bot it moved and emits the bot frames. */
+function reconcileModelLineage(opts: { botIds?: readonly string[]; ownerDirective?: boolean; skipBusy?: boolean } = {}) {
+  try {
+    store.reconcileModelLineage({
+      contextFor: lineageContextForInstance,
+      nameFor: (instanceId, model) => modelNameFor(registry.get(instanceId)?.models, model),
+      ...opts,
+    });
+  } catch (error) {
+    console.error("model-lineage: reconcile failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Engine-level checks for one entry of a RECONCILED selection: the engine
+ *  exists and offers the model (only when the caller asks for that), and the
+ *  effort is one the model serves.  Runs on the primary and on every fallback,
+ *  after the lineage reconcile so a retired id has already moved forward. */
+function checkSelectionEntry(
+  entry: ModelSelection,
+  requireAvailableModel: boolean,
+): { ok: false; status: number; error: string } | null {
+  const target = registry.get(entry.instanceId);
+  // Model IDs remain free-form at the app's general API boundary. Custom
+  // engines can accept IDs that are not in their discovery catalog, and
+  // several drivers only learn the final catalog when a turn starts. The
+  // MCP tool applies a stricter discovered-model policy for its own calls.
+  if (requireAvailableModel) {
+    if (!target) {
+      return { ok: false, status: 400, error: `model instance "${entry.instanceId}" is unavailable` };
+    }
+    // The catalog the pickers show, not the registry's full one: a Claude CLI
+    // too old for a model does not list it (and the lineage context above
+    // already leaves it out), so a strict write must not persist it either.
+    const runnable = withoutModelsTooNewForCli(
+      target.driverKind,
+      target.models,
+      cliVersionByInstance.get(entry.instanceId),
+    );
+    const offered =
+      entry.model === runnable.default ||
+      runnable.options.some((option) => option.id === entry.model);
+    if (!offered) {
+      return {
+        ok: false,
+        status: 400,
+        error: `model "${entry.model}" is not offered by instance "${entry.instanceId}"`,
+      };
+    }
+  }
+  const targetOption = target?.models.options.find((option) => option.id === entry.model);
+  const allowed: readonly string[] = target
+    ? modelEffortLevels(
+        { driverKind: target.driverKind, capabilities: target.adapter.capabilities },
+        targetOption,
+        entry.model,
+      )
+    : [];
+  if (target && entry.effort !== undefined && !allowed.includes(entry.effort)) {
+    return { ok: false, status: 400, error: `effort "${entry.effort}" is not offered by model "${entry.model}"` };
+  }
+  return null;
+}
+
 function checkedModelSelection(
   raw: unknown,
-  current?: { selection: ModelSelection; busy: boolean },
+  /** The saved selection this write replaces.  `storedFallbacks` is how many
+   *  fallbacks the cap may grandfather; it defaults to `selection`'s own
+   *  count, and a task write passes its OWN override's count instead (see
+   *  taskWriteBaseline), because a task with no override is not replacing the
+   *  bot's chain. */
+  current?: { selection: ModelSelection; busy: boolean; storedFallbacks?: number },
   requireAvailableModel = false,
+  /** A fallback entry parsed by the recursion below.  It may not carry
+   *  fallbacks of its own, and the chain-level lineage check runs once, on
+   *  the whole chain. */
+  nested = false,
 ): { ok: true; selection: ModelSelection } | { ok: false; status: number; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, status: 400, error: "modelSelection must be an object" };
   }
-  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown };
+  const value = raw as { instanceId?: unknown; model?: unknown; effort?: unknown; latest?: unknown };
   if (typeof value.instanceId !== "string" || !value.instanceId.trim()) {
     return { ok: false, status: 400, error: "modelSelection.instanceId is required" };
   }
   if (typeof value.model !== "string" || !value.model.trim()) {
     return { ok: false, status: 400, error: "modelSelection.model is required" };
   }
-  const selection: ModelSelection = {
+  let selection: ModelSelection = {
     instanceId: value.instanceId.trim(),
     model: value.model.trim(),
   };
@@ -1102,12 +1272,29 @@ function checkedModelSelection(
     }
     selection.effort = value.effort;
   }
+  // "Latest <Class>": `null` means pinned (see checkLineageWrite).
+  if (value.latest !== undefined && value.latest !== null) {
+    if (typeof value.latest !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(value.latest)) {
+      return { ok: false, status: 400, error: "modelSelection.latest must be a model class such as \"sonnet\"" };
+    }
+    selection.latest = value.latest;
+  }
   
-  if ("fallbacks" in value && Array.isArray(value.fallbacks)) {
+  if (nested && "fallbacks" in value && Array.isArray(value.fallbacks) && value.fallbacks.length > 0) {
+    // One flat chain (shared/model-limits.ts, withoutNestedFallbacks): a
+    // fallback's own fallbacks would never run, so they are refused rather
+    // than saved as configuration nobody can see take effect.
+    return {
+      ok: false,
+      status: 400,
+      error: "a fallback model cannot have fallbacks of its own — list every fallback on the primary",
+    };
+  }
+  if (!nested && "fallbacks" in value && Array.isArray(value.fallbacks)) {
     // Refuse a chain that GROWS past the cap, never one that merely keeps the
     // length it already has: a bot written before the cap existed re-sends its
     // whole chain whenever only its primary changes, and that must still save.
-    if (!fallbackCountAllowed(value.fallbacks.length, current?.selection.fallbacks?.length ?? 0)) {
+    if (!fallbackCountAllowed(value.fallbacks.length, current?.storedFallbacks ?? current?.selection.fallbacks?.length ?? 0)) {
       return {
         ok: false,
         status: 400,
@@ -1116,13 +1303,37 @@ function checkedModelSelection(
     }
     const parsedFallbacks: ModelSelection[] = [];
     for (const f of value.fallbacks) {
-       const res = checkedModelSelection(f, undefined, requireAvailableModel);
+       const res = checkedModelSelection(f, undefined, requireAvailableModel, true);
        if (!res.ok) return res;
        parsedFallbacks.push(res.selection);
     }
     if (parsedFallbacks.length > 0) {
       selection.fallbacks = parsedFallbacks;
     }
+  }
+  // Heal retired MiniMax/DSH picker ids before lineage and availability
+  // checks so a PATCH cannot re-introduce them.  model-lineage deliberately
+  // omits those engines; Claude/Grok retired ids still move via lineage below.
+  {
+    const rewritten = rewriteModelSelection(selection);
+    if (rewritten.changed) {
+      selection.model = rewritten.selection.model;
+      if (rewritten.selection.fallbacks) selection.fallbacks = rewritten.selection.fallbacks;
+      else delete selection.fallbacks;
+    }
+  }
+  // A fallback entry is only parsed here.  Availability and effort are checked
+  // once, on the reconciled chain below: a retired fallback has to reach the
+  // lineage migration before it is judged against the live catalog.
+  if (nested) return { ok: true, selection };
+  {
+    // Retired and superseded ids move forward, Latest entries resolve to
+    // the slug they will run, and the saved chain is reconciled the same way
+    // so the busy check below compares like with like.
+    const lineage = checkLineageWrite(selection, raw, current?.selection, lineageContextForInstance);
+    if (!lineage.ok) return { ok: false, status: 400, error: lineage.error };
+    selection = lineage.selection;
+    if (current && lineage.current) current = { ...current, selection: lineage.current };
   }
   const changed = current && (
     selection.instanceId !== current.selection.instanceId ||
@@ -1133,36 +1344,9 @@ function checkedModelSelection(
   if (current?.busy && changed) {
     return { ok: false, status: 409, error: "the bot is working — stop it before changing models" };
   }
-  const target = registry.get(selection.instanceId);
-  // Model IDs remain free-form at the app's general API boundary. Custom
-  // engines can accept IDs that are not in their discovery catalog, and
-  // several drivers only learn the final catalog when a turn starts. The
-  // MCP tool applies a stricter discovered-model policy for its own calls.
-  if (requireAvailableModel) {
-    if (!target) {
-      return { ok: false, status: 400, error: `model instance "${selection.instanceId}" is unavailable` };
-    }
-    const offered =
-      selection.model === target.models.default ||
-      target.models.options.some((option) => option.id === selection.model);
-    if (!offered) {
-      return {
-        ok: false,
-        status: 400,
-        error: `model "${selection.model}" is not offered by instance "${selection.instanceId}"`,
-      };
-    }
-  }
-  const targetOption = target?.models.options.find((option) => option.id === selection.model);
-  const allowed: readonly string[] = target
-    ? modelEffortLevels(
-        { driverKind: target.driverKind, capabilities: target.adapter.capabilities },
-        targetOption,
-        selection.model,
-      )
-    : [];
-  if (target && selection.effort !== undefined && !allowed.includes(selection.effort)) {
-    return { ok: false, status: 400, error: `effort "${selection.effort}" is not offered by model "${selection.model}"` };
+  for (const entry of [selection, ...(selection.fallbacks ?? [])]) {
+    const problem = checkSelectionEntry(entry, requireAvailableModel);
+    if (problem) return problem;
   }
   return { ok: true, selection };
 }
@@ -1734,6 +1918,15 @@ function redactStreamDelta(threadId: string, delta: string): string {
   return joined.startsWith(redactedTail) ? joined.slice(redactedTail.length) : "";
 }
 
+/** A thread this harness knows: a task of some bot, or a room's thread.  The
+ * inspector and the per-step input/output routes answer for nothing else. */
+function threadIsKnown(threadId: string): boolean {
+  return (
+    store.bots.some((b) => store.tasks(b.id).some((t) => t.threadId === threadId)) ||
+    Boolean(store.groupByThread(threadId))
+  );
+}
+
 function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
   switch (event.type) {
     case "content.delta": {
@@ -1776,6 +1969,11 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
       const message = redactSecretsInText(event.message);
       return message === event.message ? event : { ...event, message };
     }
+    case "context.injected": {
+      // built redacted already; the wire never has to trust that
+      const preview = redactSecretsInText(event.preview);
+      return preview === event.preview ? event : { ...event, preview };
+    }
     default:
       return event;
   }
@@ -1807,7 +2005,7 @@ function broadcast(payload: Record<string, unknown>) {
 // engine's probe that landed after its sweep) reaches open windows without
 // another GET: the picker that showed "Checking" updates on its own.
 registry.onDescribed((instances, describedAt) => {
-  broadcast({ kind: "instances", instances, describedAt });
+  broadcast({ kind: "instances", instances: presentInstances(instances), describedAt });
 });
 
 // ── server-side event folding (upstream's ingestion worker, miniature) ──
@@ -2276,6 +2474,23 @@ const watchdog = new TurnWatchdog({
 });
 watchdog.start();
 
+// One-time owner-directed move (every Sonnet and Luna becomes Latest) plus
+// the regular lineage pass, now that the registry has every engine's catalog
+// and the SSE broadcaster exists.  Later catalog refreshes and every
+// dispatch run the regular pass.
+reconcileModelLineage({ ownerDirective: true });
+// That pass cannot move anything on a Claude engine yet: no Claude CLI has
+// reported its version (server/model-lineage.ts, gateLineageByCliVersion).
+// The first describe, shared with the warm-up probe above, records them and
+// the regular pass runs again against it.
+void registry
+  .describe({ maxAgeMs: 15_000, staleWhileRevalidate: true })
+  .then((described) => {
+    recordCliVersions(described);
+    reconcileModelLineage({ skipBusy: true });
+  })
+  .catch(() => {});
+
 async function reviewPermissionCard(args: {
   instance: ProviderInstance;
   asker: {
@@ -2637,7 +2852,7 @@ async function launchFallbackTurn(input: {
     store.appendMessage(threadId, { role: "bot", kind: "activity", tool: { name, ok: true, kind: "notice" } });
 
   const launch = async (pick: TurnFallbackPick): Promise<void> => {
-    const selection: ModelSelection = { instanceId: pick.instanceId, model: pick.model, effort: pick.effort };
+    const selection = selectionForFallbackPick(pick);
     // Both failure shapes arrive here once.  Whichever reports first wins, so a
     // dispatch error that also throws cannot advance the walk twice.
     let advanced = false;
@@ -2827,17 +3042,7 @@ bus.subscribe((event: RuntimeEvent) => {
           toolName = existing?.name ?? "tool";
           const startedAt = toolStartedAt.get(itemKey);
           store.patchMessage(event.threadId, messageId, {
-            tool: {
-              name: toolName,
-              ok: event.ok,
-              spoken: existing?.spoken,
-              target: existing?.target,
-              kind: existing?.kind,
-              // a step's own words about what came back; only worth the row
-              // when it failed, or when nothing named the target
-              detail: event.detail ?? existing?.detail,
-              durationMs: startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt),
-            },
+            tool: completedToolRow(existing, event, startedAt === undefined ? undefined : Math.max(0, Date.now() - startedAt)),
           });
           toolMessageByItem.delete(itemKey);
           toolStartedAt.delete(itemKey);
@@ -2871,12 +3076,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const message = pushMessage({
           role: "bot",
           kind: "activity",
-          tool: {
-            name,
-            spoken: narrateTool(name) ?? undefined,
-            target: event.target,
-            kind: event.toolKind,
-          },
+          tool: startedToolRow(event, narrateTool(name) ?? undefined),
         });
         if (event.itemId) {
           const key = `${event.threadId}:${event.itemId}`;
@@ -3387,10 +3587,11 @@ bus.subscribe((event: RuntimeEvent) => {
           fallingOver: Boolean(next && fallbackUserMessage && typeof fallbackUserMessage.text === "string"),
         }) ?? null;
         if (next && fallbackUserMessage && typeof fallbackUserMessage.text === "string") {
-          const { nextUsed, instanceId, model, effort } = next;
           fallbackPick = next;
-          fallbackAttemptByTurn.set(fallbackKey, nextUsed);
-          fallbackSelection = { instanceId, model, effort };
+          fallbackAttemptByTurn.set(fallbackKey, next.nextUsed);
+          // A room member's fallback is replayed from this selection, so it
+          // keeps a floating pick's class (selectionForFallbackPick).
+          fallbackSelection = selectionForFallbackPick(next);
           store.patchBot(fallbackBot.id, { activeModelSelection: fallbackSelection });
           store.patchTask(fallbackBot.id, event.threadId, { activeModelSelection: fallbackSelection });
           broadcast({ kind: "bot", bot: wireBot(store.bot(fallbackBot.id)!) });
@@ -3963,6 +4164,10 @@ async function startTurn(
   }
   // a person typing into this bot ends the unattended window immediately
   else if (opts?.automationSource === undefined && !opts?.commsDepth && !opts?.cardContinuation) clearUnattended(bot.id);
+  // Point "Latest <Class>" entries at the newest member the engine offers
+  // right now and move retired ids forward before anything reads the chain,
+  // so the model dispatched and recorded below is the real slug.
+  reconcileModelLineage({ botIds: [bot.id] });
   const task = store.taskByThread(bot.id, threadId);
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
   const commsDepth = opts?.commsDepth ?? 0;
@@ -3975,6 +4180,13 @@ async function startTurn(
   let fallbackPolicy = task.modelSelection ?? bot.modelSelection;
   let selection = opts?.modelSelection
     ?? quotaCooldowns.resolveModel(bot.id, fallbackPolicy).selection;
+  if (opts?.modelSelection) {
+    const override = reconcileTurnOverride(selection, lineageContextForInstance(selection.instanceId));
+    // A Codex thread keeps the model it started with, so an override the
+    // reconcile moved must not resume this task's old thread there.
+    if (override.freshSession) store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
+    selection = override.selection;
+  }
 
   const downgradeInstance = registry.get(selection.instanceId);
   selection = unattendedModelDowngrade(selection, {
@@ -4142,8 +4354,10 @@ async function startTurn(
   const fresh =
     !rewound &&
     engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+  // the message with a reply's framing and quoted excerpt, as the model gets it
+  const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
   const { turnText, resume } = buildTurnContext({
-    text: promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User"),
+    text: replyBase,
     transcript,
     rewound,
     fresh,
@@ -4165,7 +4379,7 @@ async function startTurn(
   // classifyResumeFailure / mayReplay before using it — never error-text regexes.
   const recoveryText = resume
     ? buildTurnContext({
-        text: promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User"),
+        text: replyBase,
         transcript,
         rewound: false,
         fresh: true,
@@ -4581,6 +4795,38 @@ async function startTurn(
         },
       ]);
       turnPromptBytes.set(threadId, prompt.bytes);
+      // Where a turn's context-injection records go: a `context.injected` event
+      // for the Trajectory, and a short list on the message the chat hangs the
+      // rows under.  Drafts a message already recorded are dropped first — a
+      // model fallback dispatches the same message again.  A card continuation
+      // has no stored message, so its rows go under the last one on the active
+      // path (server/context-injection.ts `injectionTarget`).
+      const recordInjections = (drafts: readonly InjectionDraft[]) => {
+        const target = () =>
+          injectionTarget({
+            stored: store.messagesFor(threadId),
+            userMessageId: userMessage.id,
+            unstored: opts?.cardContinuation === true,
+            // only a card continuation reads it; skip the walk for every other turn
+            activePath: opts?.cardContinuation === true ? store.activePath(threadId) : [],
+          });
+        recordContextInjections(
+          {
+            publish: (event) => bus.publish(event),
+            attach: (refs) => {
+              const held = target();
+              if (!held) return;
+              store.patchMessage(threadId, held.id, { contextInjections: mergeInjectionRefs(held.contextInjections, refs) });
+            },
+          },
+          {
+            threadId,
+            provider: instance.driverKind,
+            providerInstanceId: instance.instanceId,
+            drafts: dropRecorded(drafts, target()?.contextInjections),
+          },
+        );
+      };
       const turnInput = {
         threadId,
         text: turnText,
@@ -4592,6 +4838,13 @@ async function startTurn(
         resumeCursor: resume ? task.resumeCursors[instanceId] : undefined,
         recoveryText,
         ...(recoveryText !== undefined && recoveryText !== turnText ? { recoveryIsReplay: true } : {}),
+        // A driver whose provider lost its session sends `recoveryText` in place
+        // of the turn: the replay it adds in front of the message is a handoff
+        // the person never typed, and only the driver knows it happened.
+        onReplayRecovered: () => {
+          const replay = recoveryText === undefined ? null : draftFromReplay(recoveryText, replyBase, "handoff");
+          if (replay) recordInjections([replay]);
+        },
         transcript: driverTranscript,
         // `buildTurnTools` only returns tool surfaces the harness can
         // actually execute in-process: agents, host computer, fleet
@@ -4688,6 +4941,38 @@ async function startTurn(
         autoApprove: bot.autoApprove === true,
         unattended: isUnattended(bot.id),
       };
+      // What the harness put in front of the model that the person did not
+      // type: the bot's memory, the skills and playbooks this message
+      // selected, the automation note, a teammate nudge, a quoted reply, and
+      // a replayed conversation when the engine joined mid-thread, and the
+      // note a card continuation sends as its whole prompt.  Recorded BEFORE
+      // the turn starts so the transcript row lands under the message that
+      // caused it, ahead of anything the bot does.  A replay only the DRIVER
+      // knows it sent — Codex rebuilding a session the provider lost — is
+      // recorded later, through `onReplayRecovered` above.
+      //
+      // Deliberately not recorded: the standing sections (identity, computer,
+      // connected apps, recall, tool budget, team, credentials, routines,
+      // section context, owner notes, skills index) are the bot's definition
+      // and identical every turn, so a row per turn would bury the ones that
+      // explain a change.  Recall is a TOOL the model calls — its results are
+      // tool output, already a step with its own input and output.  Attached
+      // files are tags in the message the person typed.  Webhook and resource
+      // payloads are the stored `system` message.  Steering lines are typed by
+      // the person.  Compaction is the provider CLI's own and never passes
+      // through the harness.
+      {
+        const drafts: InjectionDraft[] = draftsFromPromptSections(prompt.sections).filter(
+          (draft) => draft.source !== "memory" || memoryChangeGate.changed(threadId, draft.text),
+        );
+        const replay = draftFromReplay(turnText, replyBase, rewound ? "rewind" : "handoff");
+        if (replay) drafts.push(replay);
+        const quoted = draftFromReply(replyBase, text);
+        if (quoted) drafts.push(quoted);
+        // the card continuation's whole prompt is the harness's own note
+        if (opts?.cardContinuation && text.trim()) drafts.push({ source: "continuation", text });
+        recordInjections(drafts);
+      }
       // Bind before sendTurn so assistant_text emitted during the launch
       // still has a chat id.  The pending key is migrated onto the
       // provider turnId once sendTurn returns.
@@ -4830,6 +5115,21 @@ routines = new RoutineManager({
   taskForKey: (botId, automationKey) => store.taskByAutomationKey(botId, automationKey)?.threadId,
   stampKey: (botId, threadId, automationKey) => {
     store.stampAutomationKey(botId, threadId, automationKey);
+  },
+  automationThreadSize: (botId, threadId) => {
+    const task = store.taskByThread(botId, threadId);
+    return {
+      turns: task?.usage?.turns ?? 0,
+      messages: store.messageCountFor(threadId),
+    };
+  },
+  shouldRolloverAutomation: (_botId, _threadId, size) =>
+    shouldRolloverAutomationThread(size, automationRolloverCaps()),
+  rolloverAutomationTask: (botId, automationKey, title, activate) => {
+    const task = store.rolloverAutomationTask(botId, automationKey, { title, activate });
+    const bot = store.bot(botId);
+    if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+    return task;
   },
   startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
     startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),
@@ -6036,7 +6336,17 @@ async function runGroupMemberTurn(
     queueRoomRound({ groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection }, Date.now());
     return true;
   }
-  const selection = turnSelection ?? bot.modelSelection;
+  // A busy bot is queued below and reconciled when its turn replays; its saved
+  // chain is not rewritten from here.
+  if (!turnSelection) reconcileModelLineage({ botIds: [bot.id], skipBusy: true });
+  // A per-turn override (a fallback or retry pick, possibly queued earlier)
+  // goes through the same lineage reconciliation startTurn gives the 1:1 lane,
+  // so a retired or superseded id is never dispatched or recorded.
+  // Room turns pass no resume cursor, so only the reconciled selection is
+  // used here.
+  const selection = turnSelection
+    ? reconcileTurnOverride(turnSelection, lineageContextForInstance(turnSelection.instanceId)).selection
+    : bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
       { groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection },
@@ -9951,7 +10261,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // The thread is gone from the store, so its logs have nothing left to
       // name them (server/transcript-retention.ts).  A task that MOVED keeps
       // its thread id and never reaches this branch.
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
       const fresh = groupWithThread(updated);
       broadcast({ kind: "group", group: fresh });
       return json(res, 200, { group: fresh });
@@ -10131,7 +10441,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Both generations and any temp file, for every task this room had: a
       // `.ndjson.1` or a killed trim's `.tmp` left behind would outlive the
       // room it belonged to (server/transcript-retention.ts).
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, threadIds);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, threadIds);
       return json(res, 200, { ok: true });
     }
     m = path.match(/^\/api\/groups\/([\w-]+)\/messages$/);
@@ -10730,7 +11040,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // every other task's transcript on disk forever, which was already true
       // on `main` for the single generation it knew about.  Same set
       // `store.deleteBot` uses to drop the message records.
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, botThreadIds);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, botThreadIds);
       return json(res, 200, { ok: true });
     }
 
@@ -11383,7 +11693,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // their thread id — the source thread id names nothing afterwards and
         // its logs would sit on disk forever.  The target keeps its own
         // (server/transcript-retention.ts).
-        for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+        for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
         broadcast({ kind: "bot", bot: botWithThread(merged) });
         return json(res, 200, { bot: botWithThread(merged) });
       }
@@ -11424,7 +11734,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           broadcast({ kind: "bot", bot: fresh });
           return json(res, 200, { task: wireTask(cleared) });
         }
-        const checked = checkedModelSelection(body.modelSelection);
+        // The task's saved chain (or the bot's, which a task without an
+        // override runs on) lets the lineage check tell a retired id this
+        // edit introduces from one the chain already held, and carry a float
+        // an older client re-sends without `latest`.  The fallback cap looks
+        // only at the task's OWN override, so a new override is never
+        // grandfathered onto the bot's over-cap chain (taskWriteBaseline).
+        // No busy gate: a task override applies from that thread's next turn.
+        const checked = checkedModelSelection(
+          body.modelSelection,
+          taskWriteBaseline(store.taskByThread(m[1], m[2])?.modelSelection, store.bot(m[1])?.modelSelection),
+        );
         if (!checked.ok) return json(res, checked.status, { error: checked.error });
         const updated = store.patchTask(m[1], m[2], { modelSelection: checked.selection });
         if (!updated) return json(res, 404, { error: "no such task" });
@@ -11463,7 +11783,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 400, { error: "a bot keeps at least one task" });
-      for (const dir of [EVENTS_DIR, NATIVE_DIR]) removeTranscriptLogs(dir, [m[2]!]);
+      for (const dir of TRANSCRIPT_LOG_DIRS) removeTranscriptLogs(dir, [m[2]!]);
       const fresh = botWithThread(updated);
       broadcast({ kind: "bot", bot: fresh });
       return json(res, 200, { bot: fresh });
@@ -11937,10 +12257,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     m = path.match(/^\/api\/threads\/([\w-]+)\/events$/);
     if (m && method === "GET") {
       const threadId = m[1];
-      const known =
-        store.bots.some((b) => store.tasks(b.id).some((t) => t.threadId === threadId)) ||
-        Boolean(store.groupByThread(threadId));
-      if (!known) return json(res, 404, { error: "no such thread" });
+      if (!threadIsKnown(threadId)) return json(res, 404, { error: "no such thread" });
       const rawLimit = url.searchParams.get("limit");
       const parsedLimit = rawLimit === null ? undefined : Number(rawLimit);
       if (parsedLimit !== undefined && (!Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
@@ -11957,6 +12274,31 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         200,
         readThreadEvents({ eventsDir: EVENTS_DIR, nativeDir: NATIVE_DIR, threadId, limit, runtimeOnly: view === "trajectory" }),
       );
+    }
+
+    // ── one step's full input and output, fetched when its row is opened ──
+    // The transcript keeps a headline per step; the whole payload lives in a
+    // bounded per-thread side store (server/item-io-store.ts).  Same gate as
+    // the events route above: the thread must be one this harness knows.  The
+    // answer is already redacted with the wire's pass, cut to 32 KB a field,
+    // and says when it was cut.  A step recorded before the store existed, or
+    // one that rotated out, is a 404 — the row says so rather than guessing.
+    m = path.match(/^\/api\/threads\/([\w-]+)\/items\/([^/]+)\/io$/);
+    if (m && method === "GET") {
+      const threadId = m[1]!;
+      if (!threadIsKnown(threadId)) return json(res, 404, { error: "no such thread" });
+      let itemId: string;
+      try {
+        itemId = decodeURIComponent(m[2]!);
+      } catch {
+        return json(res, 400, { error: "item id is not valid" });
+      }
+      if (!itemId || itemId.length > ITEM_ID_MAX_LENGTH) return json(res, 400, { error: "item id is not valid" });
+      const turnId = url.searchParams.get("turnId");
+      if (turnId !== null && !/^[\w.:-]{1,200}$/.test(turnId)) return json(res, 400, { error: "turnId is not valid" });
+      const io = await itemIoStore.read(threadId, itemId, turnId ?? undefined);
+      if (!io) return json(res, 404, { error: "no input or output was recorded for this step" });
+      return json(res, 200, io);
     }
 
     // ── the fleet-wide authorization decision log ──
@@ -11999,12 +12341,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // ?fresh=1 — sent by the client's explicit "Check again"/"Refresh"
       // actions and right after a CLI/fullAuto override is saved — bypasses
       // it so the user's own action is never served a stale answer.
-      const instances = await registry.describe(
+      const described = await registry.describe(
         fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
-      // When this answer was produced, so a client holding a newer one (from
-      // the `instances` push or another request) can drop it.
-      return json(res, 200, { instances, describedAt: registry.describedAtOf(instances) });
+      // presentInstances moves saved selections forward against what the
+      // engines offer now.  describedAt is the stamp of the raw list: a client
+      // holding a newer answer (from the `instances` push or another request)
+      // can drop this one.
+      const instances = presentInstances(described);
+      return json(res, 200, { instances, describedAt: registry.describedAtOf(described) });
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -12151,7 +12496,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, { instances, describedAt: registry.describedAtOf(instances) });
+        return json(res, 200, {
+          instances: presentInstances(instances),
+          describedAt: registry.describedAtOf(instances),
+        });
       } finally {
         providerConfigBusy = false;
       }
@@ -12327,7 +12675,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances,
+          instances: presentInstances(instances),
           describedAt: registry.describedAtOf(instances),
         });
       } finally {
@@ -12451,7 +12799,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const instances = await registry.describe();
         return json(res, 200, {
           ok: true,
-          instances,
+          instances: presentInstances(instances),
           describedAt: registry.describedAtOf(instances),
         });
       } finally {
@@ -12804,7 +13152,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (typeof candidate.instanceId !== "string" || typeof candidate.model !== "string") {
           throw Object.assign(new Error("model slot must include instanceId and model"), { status: 400 });
         }
-        return { instanceId: candidate.instanceId, model: candidate.model };
+        // A "Latest <Class>" default stays floating on every bot it lands on.
+        // Absent or null is a pinned slot; anything else must be a class name,
+        // judged by the same rule as a per-bot write, never silently dropped.
+        let latest: string | undefined;
+        if (candidate.latest !== undefined && candidate.latest !== null) {
+          if (typeof candidate.latest !== "string" || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(candidate.latest)) {
+            throw Object.assign(new Error("model slot latest must be a model class such as \"sonnet\""), { status: 400 });
+          }
+          latest = candidate.latest;
+        }
+        return {
+          instanceId: candidate.instanceId,
+          model: candidate.model,
+          ...(latest ? { latest } : {}),
+        };
       };
       const readFallbackSlot = (value: unknown): FallbackSlot => {
         if (
@@ -12881,7 +13243,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       for (const bot of store.bots) {
         const next: ModelSelection = { ...bot.modelSelection };
         const existingFallbacks = next.fallbacks ?? [];
-        if (primary) next.instanceId = primary.instanceId, next.model = primary.model;
+        if (primary) {
+          next.instanceId = primary.instanceId;
+          next.model = primary.model;
+          // A "Latest <Class>" default floats on every bot it lands on; a
+          // pinned default pins.
+          if (primary.latest) next.latest = primary.latest;
+          else delete next.latest;
+        }
         if (touchesFallbacks(fallbackSlots)) {
           // Only the places the request named are written, each at its own
           // position, so an empty picker leaves that place exactly as it was.
@@ -12900,6 +13269,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         if (bot.modelSelection.instanceId === next.instanceId &&
             bot.modelSelection.model === next.model &&
+            (bot.modelSelection.latest ?? null) === (next.latest ?? null) &&
             JSON.stringify(bot.modelSelection.fallbacks ?? []) === JSON.stringify(next.fallbacks ?? [])) {
           continue;
         }
@@ -12925,8 +13295,14 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // must not fail the whole request the way the per-bot route's 409
         // does — the operator asked for the fleet — so that bot keeps exactly
         // what it had and is named, with its real reason, in the response.
+        // `next` is built from the bot's own saved chain plus the request, so
+        // every entry already says whether it floats.  An explicit `latest:
+        // null` on the pinned ones keeps the gate from carrying an older
+        // "Latest" forward onto a pinned default, which it does only for
+        // clients that predate the field.
+        const explicitLatest = (entry: ModelSelection) => ({ ...entry, latest: entry.latest ?? null });
         const gate = checkedModelSelection(
-          next,
+          { ...explicitLatest(next), ...(next.fallbacks ? { fallbacks: next.fallbacks.map(explicitLatest) } : {}) },
           { selection: bot.modelSelection, busy: Boolean(bot.busy) },
           false,
         );
@@ -12934,7 +13310,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           skipped.push({ id: bot.id, name: bot.name, reason: gate.error });
           continue;
         }
-        const patched = store.patchBot(bot.id, { modelSelection: next, activeModelSelection: next });
+        // The gate's copy: lineage-reconciled (retired and superseded ids
+        // moved forward, Latest entries resolved), exactly like a per-bot PATCH.
+        const patched = store.patchBot(bot.id, { modelSelection: gate.selection, activeModelSelection: gate.selection });
         if (patched) updated.push({ id: patched.id, bot: wireBot(patched) });
       }
       for (const { bot } of updated) broadcast({ kind: "bot", bot });
@@ -14118,7 +14496,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // The native protocol tee (server/drivers/native.ts) is queued the same
     // way, so it is drained here too.
     const graceExpired = new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref?.());
-    const drainedAndSettled = Promise.all([cancelled, telemetry.dispose(), bus.flush(), flushNativeTee()])
+    const drainedAndSettled = Promise.all([cancelled, telemetry.dispose(), bus.flush(), itemIoStore.flush(), flushNativeTee()])
       // The interrupts can queue their closing records after the first drain
       // began; drain once more so the reading below sees the whole turn.
       .then(() => bus.flush())

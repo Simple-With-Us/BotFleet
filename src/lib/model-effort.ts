@@ -41,7 +41,10 @@ export function modelEffortLevels(
   const driverKind = (engine?.driverKind ?? "").toLowerCase();
 
   // Known engine + model rules:
-  // 1. DSH / Harness: MiniMax models do not support reasoning effort.
+  // 1. DSH / Harness: MiniMax rows without their own list do not support
+  //    reasoning effort.  A row that does declare one (MiniMax M3.1 once the
+  //    install's settings.yaml declares its reasoningEfforts) already returned
+  //    above, so only list-less rows such as M2.7 Highspeed reach this.
   if ((driverKind.includes("dsh") || driverKind.includes("deepseek")) && lowerId.includes("minimax")) {
     return [];
   }

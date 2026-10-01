@@ -230,6 +230,19 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       { id: "grok-4.6", display: "Grok 4.6" },
       // The Grok Build (ACP) catalog id — see server/drivers/acp/grok.ts.
       { id: "grok-4.7-build-fast", display: "Grok 4.7 Build Fast" },
+      // Composer 2.5 is Cursor's model, served through the Grok Build CLI on
+      // accounts that have it.  It is listed under Cursor too, on purpose:
+      // uniqueModelToEngineId() leaves an id shared across engines unmapped,
+      // so a metadata-free Composer bucket still resolves through its own
+      // instance (Cursor) instead of being credited to Grok.  Do not remove
+      // it from the Cursor list without removing it from this one.
+      { id: "composer-2.5", display: "Composer 2.5" },
+      // xAI's coding model (also an API id).  Unique to this engine.  Priced
+      // at its published beta rates ($1 input / $2 output per million tokens,
+      // https://x.ai/news/grok-build-0-1), which differ from the Grok 4.7 card
+      // above.  The what-if projection prices a whole engine from one card and
+      // keeps no per-model rate table, so those rates are not recorded here.
+      { id: "grok-build-0.1", display: "Grok Build 0.1" },
       { id: "grok-3-mini", display: "Grok 3 mini", ctxTokens: 131_072 },
       // Retired id kept so legacy tasks banked as model "grok-4" (no engine
       // metadata) still attribute to Grok via uniqueModelToEngineId.
@@ -282,6 +295,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
     defaultModels: [
       { id: "cursor-default", display: "Cursor Default", ctxTokens: 200_000 },
       { id: "claude-sonnet-4.5", display: "Claude Sonnet 4.5 (via Cursor)", ctxTokens: 200_000 },
+      // Also listed under Grok (Grok Build serves Composer 2.5 too).  Shared
+      // on purpose — see the Grok list.  server/drivers/acp/cursor.ts carries
+      // this id in STATIC_CURSOR_MODELS.
+      { id: "composer-2.5", display: "Composer 2.5" },
     ],
   },
 

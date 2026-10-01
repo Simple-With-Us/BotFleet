@@ -9,7 +9,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
@@ -143,6 +143,81 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(turnStart.params.input[0].text).toBe("You are Testy.\n\nlist files");
     const threadStart = seen.calls.find((c: { method: string }) => c.method === "thread/start");
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
+  });
+
+  it("keeps a helper thread's notifications out of the turn, including its turn/completed (jobs P0)", async () => {
+    // A multi_agent helper runs as a thread of its own on the same app-server
+    // connection.  Its turn/completed arrives first and FAILED: without the
+    // thread filter it would settle this turn as failed before the main
+    // thread had said anything, and its text would become the bot's reply.
+    await create({ mode: "multi-agent" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-multi-agent", text: "list files" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+    expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
+    const text = JSON.stringify(recorder.events);
+    for (const marker of ["HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+      expect(text).not.toContain(marker);
+    }
+    // the main thread's own turn is intact, in order, with the helper's one
+    // host step nested under the spawn_agent row
+    expect(recorder.events.map((e) => e.type)).toEqual([
+      "turn.started",
+      "session.started",
+      "item.started",
+      "item.started",
+      "item.started",
+      "item.completed",
+      "item.started",
+      "item.completed",
+      "item.completed",
+      "item.completed",
+      "content.delta",
+      "item.completed",
+      "thread.token-usage.updated",
+      "turn.completed",
+    ]);
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toMatchObject({
+      text: "done from fake codex",
+    });
+  });
+
+  it("shows a helper's host commands as steps nested under the spawn_agent row (jobs P0)", async () => {
+    // A full-auto bot approves a helper's commands without a card; the row
+    // is the only record that they ran on the host.
+    await create({ mode: "multi-agent" });
+    await instance.adapter.sendTurn({ threadId: "t-multi-agent-rows", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    const spawn = recorder.events.find((e) => e.type === "item.started" && e.itemId === "spawn-1");
+    expect(spawn).toMatchObject({ title: "spawn_agent", toolKind: "task" });
+    expect((spawn as { parentItemId?: string }).parentItemId).toBeUndefined();
+    const helperStep = recorder.events.find((e) => e.type === "item.started" && e.itemId === "h1");
+    expect(helperStep).toMatchObject({ title: "HELPER COMMAND", parentItemId: "spawn-1" });
+    expect(recorder.events.some((e) => e.type === "item.completed" && e.itemId === "h1")).toBe(true);
+    // the main thread's own steps stay at the margin
+    const own = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1");
+    expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
+  });
+
+  it("reports no background jobs and no helpers until the jobs program reaches it", async () => {
+    await create();
+    expect(instance.adapter.capabilities.backgroundJobs).toBe("none");
+    expect(instance.adapter.capabilities.helpers).toBe("none");
+  });
+
+  it("files a step's own input (not its outcome fields) for the side store", async () => {
+    await create();
+    await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "list files" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const started = recorder.events.find((e) => e.type === "item.started" && e.itemId === "i1")!;
+    const input = JSON.parse(started.io!.input!.text) as Record<string, unknown>;
+    expect(input).toEqual({ type: "commandExecution", command: "ls -la" });
+    // the headline is unchanged
+    expect(started).toMatchObject({ title: "ls -la", target: "ls -la" });
+    // this fake reports no output, so the completion captures none
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemId === "i1")?.io).toBeUndefined();
   });
 
   it("keeps the full command when a Windows interpreter prefix is long", async () => {
@@ -390,6 +465,61 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(methods).toContain("turn/start");
     const turnStart = JSON.parse(readFileSync(dump, "utf8")).calls.find((c: { method: string }) => c.method === "turn/start");
     expect(JSON.stringify(turnStart.params)).toContain("my dog is Biscuit");
+  });
+
+  it("tells the harness once when it sends the replay in place of the turn", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback.json");
+    let called = 0;
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-callback",
+      text: "what now?",
+      resumeCursor: "gone-thread",
+      recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+    expect(called).toBe(1);
+  });
+
+  it("does not report a replay when there was nothing to rebuild from", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-none.json");
+    let called = 0;
+    // no recoveryText: the resume failure is terminal and nothing is replayed
+    await instance.adapter.sendTurn({
+      threadId: "t-replay-none",
+      text: "go",
+      resumeCursor: "gone-thread",
+      onReplayRecovered: () => {
+        called += 1;
+      },
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(called).toBe(0);
+  });
+
+  it("recovers the turn even when the callback throws", async () => {
+    await create();
+    process.env.FAKE_CODEX_DUMP = join(scratch, "replay-callback-throws.json");
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-replay-throws",
+        text: "what now?",
+        resumeCursor: "gone-thread",
+        recoveryText: "[rebuild]\n\nUser: my dog is Biscuit\n\nwhat now?",
+        onReplayRecovered: () => {
+          throw new Error("recorder down");
+        },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("keeps the rebuilt prompt across a transient failure after missing-session recovery", async () => {

@@ -102,3 +102,19 @@ describe("ChatView Trajectory switch", () => {
     expect(SRC).toContain("showToolCallsEnabled(state.config) && !trajectoryOpen && <TaskTimeline");
   });
 });
+
+describe("ChatView step payloads and injected context", () => {
+  it("hands each tool row its thread, so opening it can read the step's full input and output", () => {
+    expect(SRC).toContain("<ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />");
+  });
+
+  it("puts a message's injected-context rows directly under it, behind the tool-calls setting", () => {
+    const row = SRC.indexOf("{row}\n");
+    const rows = SRC.indexOf("<ContextInjectionRows entries={m.contextInjections} threadId={bot.threadId} />");
+    expect(row).toBeGreaterThan(-1);
+    expect(rows).toBeGreaterThan(row);
+    // nothing else opens between the message and its rows
+    expect(SRC.slice(row, rows)).not.toMatch(/<(?:Bubble|ActivityChip|ToolLine)\b/);
+    expect(SRC).toContain("{showToolCalls && m.contextInjections?.length ? (");
+  });
+});

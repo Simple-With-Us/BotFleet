@@ -6,7 +6,11 @@
 //
 //   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
 //                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized |
-//                     resume-unauthorized | resume-transient
+//                     resume-unauthorized | resume-transient |
+//                     multi-agent (the main thread's spawn_agent call, then a
+//                     helper thread's notifications, turn/completed included,
+//                     interleaved with the main thread's on the same
+//                     connection, every one naming its threadId as 0.159 does)
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //   FAKE_CODEX_DOWN_FILE  optional path; while the file exists, `app-server`
 //                     exits at once, the way a probe fails under host load,
@@ -39,7 +43,14 @@ const calls: Array<{ method: string; params: unknown }> = [];
 let decision: unknown = null;
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
-const notify = (method: string, params: unknown) => out({ jsonrpc: "2.0", method, params });
+const MAIN_THREAD = "codex-thread-1";
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+type NotificationParams = { [field: string]: JsonValue };
+const notify = (method: string, params: NotificationParams) =>
+  out({ jsonrpc: "2.0", method, params: mode === "multi-agent" ? { threadId: MAIN_THREAD, turnId: "turn-main", ...params } : params });
+// A helper thread's traffic, on the same connection as the main thread's.
+const notifyHelper = (method: string, params: NotificationParams) =>
+  out({ jsonrpc: "2.0", method, params: { threadId: "codex-thread-helper-1", turnId: "turn-helper", ...params } });
 
 const dump = () => {
   if (process.env.FAKE_CODEX_DUMP) {
@@ -164,7 +175,7 @@ process.stdin.on("data", (chunk) => {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
           break;
         }
-        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
+        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: MAIN_THREAD }, model: "fake-codex-model" } });
         break;
       case "turn/start": {
         if (mode === "unauthorized") {
@@ -222,6 +233,22 @@ process.stdin.on("data", (chunk) => {
           : "ls -la";
         notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
         notify("item/started", { item: { id: "w1", type: "webSearch", query: "BotFleet" } });
+        if (mode === "multi-agent") {
+          // the main thread spawns the helper (0.159's collabAgentToolCall
+          // item; the helper's thread is named once the call completes)...
+          const spawn = { id: "spawn-1", type: "collabAgentToolCall", tool: "spawnAgent", senderThreadId: MAIN_THREAD, agentsStates: {}, prompt: "look around" };
+          notify("item/started", { item: { ...spawn, receiverThreadIds: [], status: "inProgress" } });
+          notify("item/completed", { item: { ...spawn, receiverThreadIds: ["codex-thread-helper-1"], status: "completed" } });
+          // ...and the helper runs its own turn to completion before the main thread finishes
+          notifyHelper("turn/started", { turn: { id: "turn-helper", status: "inProgress" } });
+          notifyHelper("item/started", { item: { id: "h1", type: "commandExecution", command: "HELPER COMMAND" } });
+          notifyHelper("item/agentMessage/delta", { itemId: "hm1", delta: "HELPER DELTA" });
+          notifyHelper("item/completed", { item: { id: "h1", type: "commandExecution", status: "completed" } });
+          notifyHelper("item/completed", { item: { id: "hm1", type: "agentMessage", text: "HELPER TEXT" } });
+          notifyHelper("thread/tokenUsage/updated", { tokenUsage: { total: { inputTokens: 9999, cachedInputTokens: 0, outputTokens: 999 } } });
+          notifyHelper("error", { error: { message: "HELPER ERROR" }, willRetry: false });
+          notifyHelper("turn/completed", { turn: { id: "turn-helper", status: "failed", error: { message: "HELPER FAILED" } } });
+        }
         if (mode === "mcp-elicitation" || mode === "remote-computer-elicitation") {
           out({
             jsonrpc: "2.0",

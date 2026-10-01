@@ -992,6 +992,10 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           // The engine gate; each catalog row names the levels its model
           // honours (M3.1 only).
           effortLevels: M31_EFFORT_LEVELS,
+          // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+          // stay `delegate_bot`.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),

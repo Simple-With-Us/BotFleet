@@ -16,10 +16,24 @@ import { pickBotName } from "./names.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { botAvatarProfile, type BotAvatarCrop } from "../shared/bot-avatar.ts";
 import { isSnoozeExpired, SNOOZE_UNTIL_ACTIVITY } from "../shared/thread-snooze.ts";
+import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { ContextInjectionRef } from "../shared/context-injection.ts";
+import {
+  applyOwnerDirective,
+  classifyModel,
+  lineageNotice,
+  OWNER_DIRECTED_LATEST,
+  reconcileChain,
+  resumeKeepsStartedModel,
+  type LineageChange,
+  type LineageContext,
+} from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { automationRolloverSeedText } from "./automation-rollover.ts";
 
 export type BotColor =
   | "green"
@@ -147,7 +161,23 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
+    /** The helper (native subagent) step this one ran inside: the parent
+     * row's `itemId`.  The chat nests the row under that parent instead of
+     * interleaving parallel helpers' steps with the bot's own. */
+    parentItemId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent INTO a running turn (capabilities.queueing): the
    * model saw it mid-turn, so the transcript marks it — a reader should
    * know the reply above it may already account for this line */
@@ -658,6 +688,8 @@ export interface InstalledPackageMetadata {
 }
 
 const BOTS_FILE = join(DATA_DIR, "bots.json");
+/** Which one-time model-lineage migrations this data dir has had. */
+const MODEL_LINEAGE_MARKER = "model-lineage.json";
 const GROUPS_FILE = join(DATA_DIR, "groups.json");
 /** How long a burst of saveBots() calls coalesces into one atomic write. */
 const BOTS_SAVE_DEBOUNCE_MS = 250;
@@ -910,12 +942,67 @@ export class Store {
         delete b.avatarCrop;
         botsMigrated = true;
       }
+      // Fallbacks are one flat list on the primary.  A fallback's own
+      // fallbacks (only ever written through the API by hand) never ran, so
+      // they are dropped once here, with a line naming what went, and the
+      // write path refuses new ones (shared/model-limits.ts).
+      const flatten = (selection: ModelSelection | undefined, where: string): ModelSelection | undefined => {
+        if (!selection) return selection;
+        const flat = withoutNestedFallbacks(selection);
+        if (flat.dropped === 0) return selection;
+        botsMigrated = true;
+        console.log(
+          `store: ${b.name} (${b.id}) ${where} dropped ${flat.dropped} nested fallback ${flat.dropped === 1 ? "entry" : "entries"} that never ran`,
+        );
+        return flat.selection;
+      };
+      b.modelSelection = flatten(b.modelSelection, "modelSelection")!;
+      if (b.activeModelSelection) b.activeModelSelection = flatten(b.activeModelSelection, "activeModelSelection");
+      for (const task of b.tasks ?? []) {
+        if (task.modelSelection) task.modelSelection = flatten(task.modelSelection, `task ${task.threadId} modelSelection`);
+        if (task.activeModelSelection) {
+          task.activeModelSelection = flatten(task.activeModelSelection, `task ${task.threadId} activeModelSelection`);
+        }
+      }
       // A snooze IS durable — unlike busy, it is a decision the person made,
       // and a relaunch must not wake every thread they put to sleep.  Only
       // the until-activity index is rebuilt here; expired deadlines heal on
       // read and are swept by `wakeExpiredThreadSnoozes`.
       for (const task of b.tasks ?? []) {
         if (task.snoozedUntil === SNOOZE_UNTIL_ACTIVITY) this.threadsAwaitingActivity.add(task.threadId);
+      }
+      // Retired picker ids (MiniMax-M3, plain M2.7, deepseek-v4-flash) stay in
+      // bots.json after the catalog drops them; rewrite onto the live replacement
+      // so the next turn does not burn a spawn on "unknown model option".
+      if (b.modelSelection) {
+        const rewritten = rewriteModelSelection(b.modelSelection);
+        if (rewritten.changed) {
+          b.modelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      if (b.activeModelSelection) {
+        const rewritten = rewriteModelSelection(b.activeModelSelection);
+        if (rewritten.changed) {
+          b.activeModelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      for (const task of b.tasks ?? []) {
+        if (task.modelSelection) {
+          const rewritten = rewriteModelSelection(task.modelSelection);
+          if (rewritten.changed) {
+            task.modelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
+        if (task.activeModelSelection) {
+          const rewritten = rewriteModelSelection(task.activeModelSelection);
+          if (rewritten.changed) {
+            task.activeModelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
       }
     }
     for (const b of this.bots) {
@@ -2107,6 +2194,78 @@ export class Store {
     return task;
   }
 
+
+  /** Durable message count for a thread without forcing a full transcript
+   * load when the thread is not already cached. */
+  messageCountFor(threadId: string): number {
+    const cached = this.threads.get(threadId);
+    if (cached) return cached.messages.length;
+    return mdb.countMessages(threadId);
+  }
+
+  /** Drop `automationKey` (and matching aliases) from every task on this
+   * bot so a rollover can stamp the key onto a fresh task without
+   * `taskByAutomationKey` still resolving the bloated predecessor. */
+  clearAutomationKey(botId: string, automationKey: string): void {
+    if (!automationKey) return;
+    const bot = this.bot(botId);
+    if (!bot?.tasks) return;
+    let changed = false;
+    for (const task of bot.tasks) {
+      if (task.automationKey === automationKey) {
+        delete task.automationKey;
+        changed = true;
+      }
+      if (task.automationKeyAliases?.includes(automationKey)) {
+        const next = task.automationKeyAliases.filter((key) => key !== automationKey);
+        task.automationKeyAliases = next.length > 0 ? next : undefined;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+  }
+
+  /** Mint a fresh task that takes `automationKey` from any prior owner on
+   * this bot.  The old task keeps its transcript; the new one starts with
+   * a thin system pointer.  Used when a forever automation thread has
+   * grown past the rollover threshold (see `server/automation-rollover.ts`).
+   * Does not delete history. */
+  rolloverAutomationTask(
+    botId: string,
+    automationKey: string,
+    opts?: { title?: string; activate?: boolean; previousThreadId?: string },
+  ): TaskRecord | null {
+    const bot = this.bot(botId);
+    if (!bot || !automationKey) return null;
+    const previous =
+      (opts?.previousThreadId ? this.taskByThread(botId, opts.previousThreadId) : undefined) ??
+      this.taskByAutomationKey(botId, automationKey);
+    const previousThreadId = previous?.threadId ?? opts?.previousThreadId;
+    const turns = previous?.usage?.turns ?? 0;
+    const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
+    this.clearAutomationKey(botId, automationKey);
+    const title = opts?.title?.trim() || previous?.title || "Automation";
+    const activate = opts?.activate ?? true;
+    // createTask reunites on a matching key — we already cleared it.
+    const neu = this.createTask(botId, title, activate, automationKey);
+    if (!neu) return null;
+    if (previousThreadId) {
+      this.appendMessage(neu.threadId, {
+        role: "system",
+        kind: "text",
+        text: automationRolloverSeedText({
+          previousThreadId,
+          previousTitle: previous?.title,
+          turns,
+          messages,
+        }),
+      });
+    }
+    return neu;
+  }
+
   /** A fresh context on the same bot: new thread, new session, same
    * persona/tools/computer. Becomes the active task.  A matching
    * `automationKey` returns the existing task instead of minting another. */
@@ -2190,6 +2349,209 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+  /** Move saved model selections forward (shared/model-lineage.ts).
+   *
+   * Rewrites each bot's primary and fallbacks, its activeModelSelection, and
+   * every task's modelSelection and activeModelSelection: retired ids onto
+   * the newest member of their successor class, "Latest <Class>" entries
+   * onto the newest member the instance offers, and pinned older members
+   * forward when the price band allows.  Only saved SELECTIONS move.
+   * Message rows, usage buckets, and per-model stats keep the slug that
+   * actually ran — the owner's no-aliasing rule.
+   *
+   * `ownerDirective` also applies the one-time owner-directed flags (every
+   * Sonnet and every Luna becomes Latest), gated on a marker file so a
+   * later explicit pin is never re-floated.  An entry whose engine is not
+   * loaded (no context, or a shadow with no catalog) cannot be told from a
+   * custom id, so it is left as it is and listed in the marker as pending;
+   * later boot passes apply the directive to those entries alone, once
+   * their engine is back.  Idempotent: a second pass with the same catalogs
+   * changes nothing.  Each bot whose chain moved gets one notice in its
+   * active thread, and every move is logged. */
+  reconcileModelLineage(opts: {
+    contextFor: (instanceId: string) => LineageContext | undefined;
+    nameFor: (instanceId: string, model: string) => string;
+    botIds?: readonly string[];
+    ownerDirective?: boolean;
+    /** Leave working bots alone; their next turn reconciles them. */
+    skipBusy?: boolean;
+  }): Array<{ botId: string; notice: string | null }> {
+    const driverKindFor = (instanceId: string) => opts.contextFor(instanceId)?.driverKind;
+    const markerFile = join(DATA_DIR, MODEL_LINEAGE_MARKER);
+    const directiveId = OWNER_DIRECTED_LATEST.id;
+    let applied: string[] = [];
+    let pendingById: Record<string, string[]> = {};
+    // Only the boot pass asks for the one-time move, so the per-dispatch and
+    // per-refresh passes never touch the marker file.  A roster that failed
+    // to parse is not a roster to migrate.
+    const wantDirective = Boolean(opts.ownerDirective) && !this.botsLoadFailed;
+    if (wantDirective) {
+      try {
+        const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { applied?: unknown; pending?: unknown };
+        if (Array.isArray(parsed.applied)) applied = parsed.applied.filter((id): id is string => typeof id === "string");
+        if (parsed.pending && typeof parsed.pending === "object" && !Array.isArray(parsed.pending)) {
+          for (const [id, keys] of Object.entries(parsed.pending)) {
+            if (Array.isArray(keys)) pendingById[id] = keys.filter((key): key is string => typeof key === "string");
+          }
+        }
+      } catch {
+        applied = [];
+        pendingById = {};
+      }
+    }
+    // The first pass applies the directive to every entry; later passes only
+    // to the entries an earlier pass had to leave for later.
+    const firstDirectivePass = wantDirective && !applied.includes(directiveId);
+    const pendingBefore = new Set(wantDirective && !firstDirectivePass ? pendingById[directiveId] ?? [] : []);
+    const runDirective = firstDirectivePass || pendingBefore.size > 0;
+    const pendingAfter = new Set<string>();
+    // Keyed by where the entry sits, never by its model: a regular pass can
+    // move a pinned id forward (superseded, retired) before the next boot
+    // gets to apply the directive, and the entry must still be found.
+    const pendingKey = (botId: string, scope: string, slot: string, entry: ModelSelection) =>
+      JSON.stringify([botId, scope, slot, entry.instanceId]);
+    const visited = new Set<string>();
+    const wanted = opts.botIds ? new Set(opts.botIds) : null;
+    const results: Array<{ botId: string; notice: string | null }> = [];
+    let dirty = false;
+    const log = (bot: BotRecord, where: string, changes: readonly LineageChange[]) => {
+      for (const change of changes) {
+        const target = change.to ? `${change.to}${change.latest ? ` [latest ${change.latest}]` : ""}` : "(dropped)";
+        console.log(
+          `model-lineage: ${bot.name} (${bot.id}) ${where} ${change.slot} ${change.from} -> ${target} (${change.reason})`,
+        );
+      }
+    };
+    // A native Codex session resumes by thread id alone and takes its model
+    // only at thread/start, so a rewritten model must not resume the old one.
+    const dropStaleCursors = (
+      cursors: Record<string, unknown> | undefined,
+      changes: readonly LineageChange[],
+      primaryInstanceId: string,
+    ) => {
+      if (!cursors) return;
+      for (const change of changes) {
+        if (change.from === change.to || !resumeKeepsStartedModel(driverKindFor(change.instanceId))) continue;
+        // A cursor is kept per engine instance.  A fallback on the primary's
+        // own instance shares the primary's cursor, which resumes the thread
+        // the primary started whatever the fallback asks for, so only the
+        // primary's move makes it stale.
+        if (change.slot !== "primary" && change.instanceId === primaryInstanceId) continue;
+        delete cursors[change.instanceId];
+      }
+    };
+    /** `directive` names the saved selection (bot and scope) when the
+     *  owner-directed flags may apply to it. */
+    const pass = (selection: ModelSelection, directive?: { botId: string; scope: string }) => {
+      let flagged: { selection: ModelSelection; flagged: LineageChange[] } = { selection, flagged: [] };
+      if (directive && runDirective) {
+        flagged = applyOwnerDirective(selection, driverKindFor, opts.contextFor, (entry, slot) => {
+          const key = pendingKey(directive.botId, directive.scope, slot, entry as ModelSelection);
+          if (!firstDirectivePass && !pendingBefore.has(key)) return false;
+          const context = opts.contextFor(entry.instanceId);
+          if (context && !context.catalogPending) return true;
+          // A shadow still names its driver: an id outside every directed
+          // class would not be flagged whatever the catalog says.
+          if (context) {
+            const hit = classifyModel(context.driverKind, entry.model);
+            if (!hit || !OWNER_DIRECTED_LATEST.classKeys.includes(hit.classKey)) return true;
+          }
+          pendingAfter.add(key);
+          return false;
+        });
+      }
+      const reconciled = reconcileChain(flagged.selection, opts.contextFor);
+      return { selection: reconciled.selection, flagged: flagged.flagged, changes: reconciled.changes };
+    };
+    for (const bot of this.bots) {
+      if (wanted && !wanted.has(bot.id)) continue;
+      if (opts.skipBusy && bot.busy) continue;
+      visited.add(bot.id);
+      const before = JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]);
+      const notices: string[] = [];
+      if (bot.modelSelection?.instanceId) {
+        const saved = bot.modelSelection;
+        const next = pass(saved, { botId: bot.id, scope: "bot" });
+        log(bot, "bot", [...next.flagged, ...next.changes]);
+        const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
+        if (notice) notices.push(notice);
+        bot.modelSelection = next.selection;
+        dropStaleCursors(bot.resumeCursors, next.changes, saved.instanceId);
+        // Tasks without a selection of their own run on the bot's.
+        for (const task of bot.tasks ?? []) {
+          if (!task.modelSelection?.instanceId) dropStaleCursors(task.resumeCursors, next.changes, saved.instanceId);
+        }
+      }
+      if (bot.activeModelSelection?.instanceId) {
+        bot.activeModelSelection = pass(bot.activeModelSelection).selection;
+      }
+      for (const task of bot.tasks ?? []) {
+        if (task.modelSelection?.instanceId) {
+          const saved = task.modelSelection;
+          const next = pass(saved, { botId: bot.id, scope: `task ${task.threadId}` });
+          log(bot, `task ${task.threadId}`, [...next.flagged, ...next.changes]);
+          const notice = lineageNotice(saved, next.selection, next.changes, driverKindFor, opts.nameFor);
+          if (notice) notices.push(`${notice} (task “${task.title}”)`);
+          task.modelSelection = next.selection;
+          dropStaleCursors(task.resumeCursors, next.changes, saved.instanceId);
+          if (task.threadId === bot.threadId) dropStaleCursors(bot.resumeCursors, next.changes, saved.instanceId);
+        }
+        if (task.activeModelSelection?.instanceId) {
+          task.activeModelSelection = pass(task.activeModelSelection).selection;
+        }
+      }
+      if (JSON.stringify([bot.modelSelection, bot.activeModelSelection, bot.tasks]) === before) continue;
+      dirty = true;
+      const notice = notices.length ? notices.join(" · ") : null;
+      if (notice) {
+        this.appendMessage(bot.threadId, {
+          role: "bot",
+          kind: "activity",
+          // A notice, not a step: `ok` settles it so the row never spins.
+          tool: { name: notice, ok: true, kind: "notice" },
+        });
+      }
+      this.emit({ type: "bot", botId: bot.id });
+      results.push({ botId: bot.id, notice });
+    }
+    if (dirty) {
+      this.saveBots();
+      this.flushBotsNow();
+    }
+    if (runDirective) {
+      // A bot this pass skipped keeps whatever it still had pending; a bot
+      // that no longer exists has nothing left to migrate.
+      for (const key of pendingBefore) {
+        let botId: unknown;
+        try {
+          [botId] = JSON.parse(key) as unknown[];
+        } catch {
+          continue;
+        }
+        if (typeof botId === "string" && !visited.has(botId) && this.bots.some((bot) => bot.id === botId)) {
+          pendingAfter.add(key);
+        }
+      }
+      const pendingChanged =
+        pendingAfter.size !== pendingBefore.size || [...pendingAfter].some((key) => !pendingBefore.has(key));
+      if (firstDirectivePass || pendingChanged) {
+        const pending = { ...pendingById };
+        if (pendingAfter.size) pending[directiveId] = [...pendingAfter];
+        else delete pending[directiveId];
+        const marker = {
+          applied: firstDirectivePass ? [...applied, directiveId] : applied,
+          ...(Object.keys(pending).length ? { pending } : {}),
+        };
+        try {
+          writeFileAtomic(markerFile, `${JSON.stringify(marker, null, 2)}\n`);
+        } catch (error) {
+          console.error("model-lineage: could not record the owner-directed migration", error);
+        }
+      }
+    }
+    return results;
   }
 
   /** End an until-activity snooze because the thread just did something.

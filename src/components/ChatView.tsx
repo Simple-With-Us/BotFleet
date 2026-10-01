@@ -76,9 +76,10 @@ import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
 import { BUBBLE_EDITOR_WIDTH, BUBBLE_WIDTH, bubbleRow } from "@/lib/bubble-metrics";
 import { useFocusMessage } from "@/lib/focus-message";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { ToolLine } from "./ToolLine";
+import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
@@ -811,7 +812,7 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   }
   // everything that is not a bot⇄bot chip is a step in the work, and a step
   // is a log line — see ToolLine for why it stopped being a card
-  return <ToolLine message={message} actor={message.from?.name ?? bot.name} />;
+  return <ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />;
 }
 
 /** A frame of the bot's computer.
@@ -885,10 +886,11 @@ const MessagesList = memo(function MessagesList({
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
   // Fold finished tool chips into runs when summarizeToolCalls is enabled, so a stretch of them cannot bury
   // what the bot actually said. If summarizeToolCalls is false, show each step individually.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;
@@ -1106,6 +1108,12 @@ const MessagesList = memo(function MessagesList({
           <div key={m.id} className="contents" data-mid={m.id}>
             {newDay && <DaySeparator at={m.at} />}
             {row}
+            {/* what the harness put in front of the model for the turn this
+                message started, as quiet rows right under it; gated with the
+                tool calls, the other "under the hood" detail */}
+            {showToolCalls && m.contextInjections?.length ? (
+              <ContextInjectionRows entries={m.contextInjections} threadId={bot.threadId} />
+            ) : null}
           </div>
         );
       })}

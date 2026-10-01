@@ -1,0 +1,180 @@
+# Background Jobs and Subagents — Decision
+
+Panel: four scouts, three proposals (Product, Runtime, Integration), a critic and a judge.  Checked against BotFleet `origin/main` `5b9b51d95`, Harness `4ea91a3`, and live probes of Claude CLI 2.1.284 and Codex 0.154.0.
+
+## Decision
+
+- **Background jobs: yes.  BotFleet owns them, for every engine it can reach.**  One registry in the harness server runs the process, keeps the log, shows it in a header dropdown, and wakes the bot with the exit code.  It is modeled on DSH's job system.  HTTP-lane engines get four tools directly.  CLI engines get the same tools through the MCP proxy.  Engine-native background shells cannot be the foundation, because every CLI lane except warm Claude kills its process when the turn ends.
+- **Subagents ("Helpers"): show each engine's own, and build no BotFleet runtime.**  Claude and Codex already spawn helpers, and BotFleet renders them wrongly.  BotFleet-level helpers stay `delegate_bot` plus rooms, with live progress on the delegation card.  Background helpers stay off.
+- **Containment ships first.**  A live probe proved Claude bots can already start background jobs.  When one finishes, the CLI starts a turn on its own.  That turn lands as a ghost message with no turn record, no watchdog and no spend accounting, and its approvals are auto-denied.
+- **Platforms:** full on web, Mac and Linux.  Windows shows the UI but refuses to start jobs.  iOS views jobs, stops them and receives pushes, but never runs them.  Cloud and VM computers wait.
+
+## Engine Matrix
+
+Native means the engine's own feature, passed through.  Emulated means BotFleet's harness-owned job tools.
+
+| Engine | Background jobs | Helpers |
+|---|---|---|
+| grok (xAI API), minimax, openai-compat | Emulated, first (P1).  BotFleet owns their tool loop, and today their commands stop at 60 s. | Unsupported.  Use `delegate_bot`. |
+| Claude | Emulated over MCP (P2).  Native background is off from P0 and adopted later (P5). | Native, typed (P3).  Capped at 3 at once, depth 1. |
+| Codex | Emulated over MCP (P2), inside `codex sandbox` unless the bot is full-auto. | Native, typed (P3).  Thread-id fix in P0. |
+| DSH | Emulated over MCP (P2).  Its own jobs die at settle, and ACP hides them. | Native, named (by tool name), foreground only. |
+| Grok CLI, Kimi, mcode, cursor, droid, opencode, qwen, hermes, deepseekAgent | Emulated over MCP (P2).  Native jobs die at settle. | Named where tool names match (confirmed for Grok and Kimi).  Otherwise unsupported. |
+| Antigravity | Emulated, gated until fixtures pass (P2b).  Its MCP mount writes the global `~/.gemini` config under an exclusive lease, and print mode has no approval hook. | Native, named (`invoke_subagent`). |
+| pi | Emulated via `pi-mcp-extension` (P2), once it is shown to proxy the tools. | Unsupported until verified. |
+| boxagent | Unsupported: remote, opaque, no MCP. | Unsupported. |
+
+## Client Surfaces
+
+- **Web:** one React build served by the harness, so it also covers Mac, Windows and Linux.
+  - P1: pill, dropdown, View Output, Stop, Stop All, notice rows.
+  - P3: Helper cards.
+  - P4: swimlanes and a fleet-wide All Jobs panel.
+  - Verified with Playwright screenshot assertions.
+- **Mac:** the live UI usually runs a harness forked by Electron, so quitting the app ends jobs.  The dropdown footer says so.  P4 adds desktop notifications.
+- **Linux:** same as Mac, behind a flag.
+- **Windows:** the UI renders, but `job_start` is refused until a Job Object helper exists, because `taskkill /T` misses re-parented children.
+- **iOS (P4, TestFlight):** pill, sheet, notices, Stop, and a push only when the phone's stream is down.
+  - Old builds map the new frame to `.unknown`.
+  - Each new `/api/jobs*` route must be added deliberately to the companion's default-deny allowlist.
+
+## Design
+
+### Data Model
+
+- **`JobSnapshot`** (in `shared/jobs.ts`):
+  - Identity: id `job_<ulid>`, bot, thread, turn, origin (`botfleet` or `native`), kind.
+  - What it runs: a redacted label and the working directory.
+  - Status: `running`, `stopping`, `completed`, `failed`, `killed` or `lost`.
+  - Result and timing: exit code, signal, timestamps, timeout.
+  - Delivery: `onComplete` (`wake`, `notice` or `none`), notice state, and `killedBy`.
+- **Server-only fields:** pids, file paths, and separate read cursors for the model and the owner.
+- **`SubagentSnapshot`:** parent item, depth, fidelity (`typed` or `named`), last activity, tool count, tokens and duration.
+- **`automationSource`** gains `"job"`.
+
+### RuntimeEvent Additions
+
+- **P1 adds none.**  The registry broadcasts its own full-set `{kind:"jobs", threadId, jobs}` frame, debounced to 250 ms, which survives reconnects.  The frame carries labels and status, never output.  Output comes over REST.
+- **P3:** an optional `subagentId` on `item.*` and `content.delta`, plus `subagent.updated` at most once per second.
+- **P5:** `job.updated` for native jobs mirrored from the engine.  A new `onUnsolicitedTurn` driver hook gives every engine-started turn a fresh `turnId`, which keeps the bus's one-completion-per-turn rule intact.
+
+### Lifecycle and Safety Rules
+
+- **Tools:** `job_start`, `job_output`, `job_list` and `job_kill`.
+  - The `job_start` row settles immediately, because unsettled rows spin forever.
+  - `job_output` returns at most 16 KB of new output and ends with `[status: completed, exit code: 1, 4m 12s]`.
+  - The tools mount regardless of `MAX_COMMS_DEPTH`.
+- **Runner:**
+  - A detached process group, run under `nice -n 10 taskpolicy -c utility` with a `ulimit -t` CPU limit.
+  - The environment is `modelShellEnv()` plus `BOTFLEET_JOB_ID`.
+  - Output goes to a 0600 file in the data folder through a file descriptor, never a pipe and never `/tmp`.
+  - The exit code is written atomically to an `exit` file.
+- **Caps:**
+  - 3 running jobs per thread, 4 per bot and 8 per host.  Past a cap, `job_start` is refused.
+  - Default limit 60 minutes, model maximum 240, owner config up to 6 hours.
+  - Logs are capped at 8 MiB.  `jobs.json` holds at most 500 metadata records.
+- **Admission:**
+  - Refuse on high swap, low free disk, or a tripped spend ceiling.  There is no load-average gate.
+  - Thresholds come from a week of resource-watch samples, since swap already sits near 90%.
+  - Deadlines count awake time, so a Mac sleep does not expire every job.
+- **Stop:**
+  - SIGTERM to the group, then SIGKILL after 5 s.
+  - A kill by the model suppresses the notice.  A Stop by the owner tells the bot without waking it.
+  - The chat Stop button ends the turn, not the jobs.
+  - Deleting the thread or bot, or revoking its computer grant, kills its jobs.
+- **Restart (v1):**
+  - Shutdown and updater quiesce stop every job and mark it `lost`.
+  - At boot, a job settles from its `exit` file if one exists.  Otherwise a pid whose start time matches is killed and the job is marked `lost`.
+  - No wake turns at boot.  A 5-minute sweep kills stray `BOTFLEET_JOB_ID` processes.
+  - `jobs.surviveRestart` waits for a launchd bootout fixture.
+- **Approvals:**
+  - `job_start` asks, enforced on the server behind the per-turn grant.
+  - It gets its own `job:<program>` namespace in `server/auto-approve.ts` and never inherits bash approvals.
+  - An abandoned ask counts as a deny.
+- **Redaction and trust:**
+  - One `redactSecretsInText` boundary covers labels, output, notices and pushes.  Pushes never carry output.
+  - Output read in a wake turn sits inside the same untrusted-data boundary that webhooks use.
+- **Wake:**
+  - An idle bot gets `startTurn` with `automationSource:"job"`, subject to the one-turn-per-bot rule and the spend ceiling.
+  - A busy bot gets the notice through `steer-queue.ts`.  Claude steers mid-turn, and the HTTP loop drains notices between rounds.
+  - Each thread gets 3 wakes in a row, refilled by any owner message.
+  - Completions within 5 s are merged into one wake.
+  - Rooms get notices only.
+  - Kill switch: `jobs.wake:false`.
+- **Reminder and watchdog:**
+  - Every turn with running jobs opens with "Running: job_x `pnpm test` 4m 12s", so an interruption cannot make the bot forget the job or run it again.
+  - Job events never touch the 20-minute watchdog.
+  - `job_output` waits are clamped to 75 s on the HTTP lane and 120 s over MCP.  The prompt tells the bot not to poll.
+
+### UI
+
+- **Header pill:** sits left of Stop and is hidden when there are no jobs.  It reads "● 2 Jobs · 1 Helper".  The dot pulses blue while anything runs and turns red after a recent failure.
+- **Dropdown:** running jobs first, then finished jobs newest first.  Each row shows:
+  - a status dot and the command label in monospace;
+  - an exit chip such as "Exited 1", "Killed by you" or "Lost after restart";
+  - a ticking duration;
+  - View Output and Stop.
+- **In the thread:** a finished job appears as a "Job Finished" row.
+- **Helper card:** replaces the `Agent` or `Task` row and shows live activity, tool count, tokens and duration.
+- **Copy:** uses `SENTENCE_GAP` and says "bot".
+
+## Rollout
+
+1. **P0 Containment (S, about 1 day, ships alone).**
+   - Claude: set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and the helper caps via env.  Drop frames that arrive with no active turn, and nest rows by `parent_tool_use_id`.  Probe whether `ScheduleWakeup`, `CronCreate` and `Monitor` also start turns on their own.
+   - Codex: a `threadId` filter proven by a fixture, or `features.multi_agent=false` until P3.
+   - HTTP bash spawned detached, with a group kill.
+   - A lost-job detector, and the `backgroundJobs` and `helpers` capability keys.
+2. **P1 Registry, HTTP Lane, Web Pill, Wakes (M/L, 3–5 days).**
+   - Acceptance: a MiniMax bot runs `job_start "sleep 3; exit 2"`, the pill shows exit 2, the bot is woken, and Stop shows `killed`.
+   - Same PR: the `MAC-LOCAL-PROCESSES.md` row (on-demand), the Apple Note refresh, and a janitor skip for `BOTFLEET_JOB_ID`.
+3. **P2 MCP Lane (S/M, about 2 days)** for Claude, Codex, ACP and pi.
+   - **P2b Antigravity** comes after two fixtures pass: the server-side approval blocks the call, and the global config entry is removed after each turn.
+4. **P3 Helpers (M, about 2 days):** typed Claude and Codex cards, named ACP rows, live `DelegationCard`.
+5. **P4 iOS and Notifications (M, about 2 days plus TestFlight).**
+6. **Later, each conditional:** Claude native adoption, warm DSH sessions (Harness repo only), an HTTP-lane `spawn_worker`, the Windows helper, and cloud and VM jobs.
+
+## Risks and Open Questions
+
+Risks:
+- Wake loops, and the cost of wake turns that start with a cold cache.  Tokens per wake are tracked from P1.
+- Swap pressure.
+- Commands that escape the process group (`nohup`, docker).
+- CLI upgrades that change native behavior.
+- Secrets in command labels.
+
+Questions for you:
+1. **Should wake turns count as unattended?**  That adds spend-ceiling accounting and the untrusted-output boundary, but it can also trigger the switch to a cheaper model.  Recommendation: unattended, with the cheaper-model switch off for job wakes.
+2. **How should compound commands be approved?**  Auto-approve refuses anything containing `&&`, `|` or `;`, or over 160 characters.  So `pnpm test && pnpm build` needs an approval card every time, and a wake turn with nobody watching cannot start the next job.  Recommendation: a per-bot list of exact job commands you approve once.
+3. **May the phone stop jobs and read output?**  Recommendation: stop yes, output no.
+4. **Should jobs be on by default?**  Recommendation: on for HTTP-lane bots at P1, and for CLI bots at P2 once wake cost is measured.
+
+## Dissent
+
+- **Base design:** Integration scored 43, Product 37 and Runtime 36.  Integration's rule is that jobs belong to BotFleet and helpers belong to the engine.  It reaches 17 of 18 drivers with little per-driver code.
+- **Claude native background:** Product would adopt it in P2.  Runtime's probe proved ghost turns are live today, so it goes off first.
+- **Load gate:** Product and Runtime refused new jobs above 3× the core count.  Load ran 76–173 in every sample, so that gate would disable the feature permanently.
+- **Restart:** Product kept jobs running across a restart; Runtime killed them.  Runtime won for v1, because the live harness is usually forked by Electron and ops treats ppid=1 processes as leaks.  The exit file keeps later adoption possible.  Runtime's pipe-to-harness wrapper was rejected because it would rule adoption out.
+- **Wake path:** Product and Runtime woke bots through the delegation queue.  That queue rejects self-targets, runs at depth+1 without the job tools, and holds at most 4 items.
+- **Antigravity:** Runtime excluded it on a false premise, since it does mount MCP.  It is gated instead.
+- **Codex caps:** `agents.max_threads` is reportedly ignored by MultiAgentV2 (issue #33447), so containment uses the feature switch.
+
+## Evidence
+
+- **Probe `scratchpad/bgprobe/out.jsonl`:** after the first `result` come a `task_notification`, a second `init`, text, and a second `result` with `origin.kind:"task-notification"`.
+- **Claude driver (`claude.ts`):**
+  - `:987-996` drops `task_*` events.
+  - `:1013-1068` has no parent check.
+  - `:928`, `:933` and `:960` swallow the second result, pause the broker and reuse a stale turn id.
+- **Message folding:** `index.ts:2614-2630` appends text without checking for an active turn.
+- **Turn-end kills:** `codex.ts:558` ignores `threadId`, and `acp/core.ts:929` kills the engine at settle.
+- **Bash limit:** `tools/computer.ts:125` stops bash at 60 s.
+- **Turn plumbing:** `harness/bus.ts:66-90` (one completion per turn), `index.ts:2319-2324` (watchdog touch), `delegations.ts:123` (self-target rejection).
+- **Antigravity:** `antigravity.ts:1552` declares `agentsMcp:true`.  At `:902`, full-auto passes `--dangerously-skip-permissions`.
+- **Ops doc:** `MAC-LOCAL-PROCESSES.md:162` (live harness forked by Electron), `:365` (ppid=1 processes are leaks).
+
+## Board
+
+- Thread telemetry `78129d55` (completed): PRs #730 and #773.
+- P0 containment `670389e9` (P1, open).
+- Jobs program `01d09729` (P2, open).

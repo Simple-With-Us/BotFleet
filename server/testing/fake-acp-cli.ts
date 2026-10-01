@@ -7,6 +7,10 @@
 //
 //   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | resume-fails | no-auth | auth-required | permission
 //                   | interleave (message → tool → message → tool → message)
+//                   | late-input-tool-call (a tool_call announced with an empty
+//                     rawInput whose real arguments arrive on a later
+//                     tool_call_update; on the completion itself when
+//                     FAKE_ACP_LATE_INPUT_AT=completion)
 //                   | drip (stream one agent_message_chunk every
 //                     FAKE_ACP_DRIP_MS — default 20 — for the prompt idle
 //                     guard's "still alive" side: with FAKE_ACP_DRIP_COUNT
@@ -607,6 +611,41 @@ function handle(msg: any) {
           });
           complete();
         }, quietMs);
+        return;
+      }
+      if (mode === "late-input-tool-call") {
+        // A streaming agent: the call is announced with an EMPTY rawInput and
+        // the real arguments arrive on a later tool_call_update — mid-run by
+        // default, or on the completion itself when FAKE_ACP_LATE_INPUT_AT is
+        // "completion".
+        const callId = "late-input-1";
+        const onCompletion = process.env.FAKE_ACP_LATE_INPUT_AT === "completion";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "tool_call", toolCallId: callId, title: "ls", kind: "execute", rawInput: {} } },
+        });
+        if (!onCompletion) {
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { update: { sessionUpdate: "tool_call_update", toolCallId: callId, status: "in_progress", rawInput: { command: "ls -la" } } },
+          });
+        }
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: callId,
+              status: "completed",
+              ...(onCompletion ? { rawInput: { command: "ls -la" } } : {}),
+              content: [{ type: "content", content: { type: "text", text: "total 0" } }],
+            },
+          },
+        });
+        complete();
         return;
       }
       if (mode === "drip") {
