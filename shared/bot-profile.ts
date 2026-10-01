@@ -39,6 +39,39 @@ export function toolRoundsCaption(): string {
  *  Returns the effective number rather than `undefined` so callers stop
  *  re-deriving "12 because nothing said otherwise" in three separate places
  *  and disagreeing about it. */
+/** Why the scheduler may not start a bot's work right now.
+ *
+ *  `blocked` is the fourth value, and it exists because a breaker that refuses
+ *  work silently is indistinguishable from a scheduler that is stuck: a
+ *  recurring run sits `queued` with no explanation, and the bot reads `ready`
+ *  in the roster, so the only visible symptom is automation that stopped and
+ *  nothing saying why.
+ *
+ *  It was deliberately NOT added before.  The scheduler's loop is
+ *  `if (busy) continue; if (missing) failRun(...)` and then it dispatches —
+ *  so any value that is not `busy` or `missing` reaches the dispatch attempt
+ *  and is refused further down by the very gate that produced it.  A fourth
+ *  value would have looked like a fix while changing nothing.  The loop now
+ *  handles `blocked` explicitly, which is what makes the value honest.
+ *
+ *  Declared once here rather than spelled out in `routines.ts`, `webhooks.ts`
+ *  and `resource-triggers.ts`, where three independent copies of the union had
+ *  already drifted apart once. */
+export type BotDispatchState = "ready" | "busy" | "missing" | "blocked";
+
+/** One reason a dispatch is being held, in words fit for a receipt.
+ *
+ *  `canStart` used to return a bare boolean, so a run that stayed queued for
+ *  fifteen minutes gave nobody anything to read.  A reason is only useful if it
+ *  names the ENGINE rather than the symptom, because the symptom ("waiting")
+ *  is identical whether the CLI is missing, the account is capped, or the fleet
+ *  is over its spend ceiling. */
+export interface DispatchHold {
+  reason: string;
+  /** What the operator can do about it, when there is something. */
+  hint?: string;
+}
+
 export function effectiveToolRounds(
   configured: number | undefined,
 ): { rounds: number; explicit: boolean } {

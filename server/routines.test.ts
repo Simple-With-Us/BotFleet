@@ -1,3 +1,4 @@
+import { BotDispatchState } from "../shared/bot-profile.ts";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2091,5 +2092,125 @@ describe("acknowledge one trigger without touching another", () => {
     h.emitted.length = 0;
     expect(h.manager.markAllSeen({ triggerId: "hook-a" }).acknowledged).toBe(0);
     expect(h.emitted).toHaveLength(0);
+  });
+});
+import { describe, expect, it } from "vitest";
+import { BotDispatchState } from "./bot-profile";
+
+describe("a held run explains itself", () => {
+  it("records WHY a run is queued instead of sitting there looking stuck", async () => {
+    // The failure this fixes, end to end. A dead engine made `canStart` return
+    // false, the scheduler did `continue`, and the run sat QUEUED with no
+    // explanation anywhere: the receipt said "queued", the roster said
+    // "ready", and the only symptom was automation that had stopped. Fifteen
+    // minutes of a run refusing to start with nothing to read.
+    const h = harness();
+    let hold = "DeepSeek Harness could not start 3 times in a row";
+    h.options.botState = () => "blocked" as BotDispatchState;
+    h.options.dispatchHoldReason = () => hold;
+
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("queued");
+    expect(run.holdReason).toBe(hold);
+    expect(h.started).toHaveLength(0);
+  });
+
+  it("keeps the reason current as the cause changes", async () => {
+    // A stale reason is worse than none: it names an engine that is fine now
+    // and sends the reader to reinstall a working CLI.
+    const h = harness();
+    const reasons: string[] = ["dsh-agent could not start 3 times in a row", "Grok is waiting on a credential"];
+    let call = 0;
+    h.options.botState = () => "blocked" as BotDispatchState;
+    h.options.dispatchHoldReason = () => reasons[Math.min(call++, reasons.length - 1)];
+
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[0]);
+    h.setNow(routine.nextRunAt! + 1_000);
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons.at(-1));
+  });
+
+  it("falls back to a plain statement when no reason is available", async () => {
+    // A reason is better than silence, but a wrong-looking one is not required
+    // to be present: the option is optional, so the run must still read
+    // sensibly without it.
+    const h = harness();
+    h.options.botState = () => "blocked" as BotDispatchState;
+    h.options.dispatchHoldReason = undefined;
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("queued");
+    expect(run.holdReason).toMatch(/engine is not available/i);
+  });
+
+  it("clears the reason once the run finally dispatches", async () => {
+    // Otherwise the first successful run carries the previous failure's
+    // explanation forever.
+    const h = harness();
+    h.options.botState = () => "blocked" as BotDispatchState;
+    h.options.dispatchHoldReason = () => "dsh-agent could not start";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0].holdReason).toBeTruthy();
+
+    h.options.botState = () => "ready" as BotDispatchState;
+    h.setNow(routine.nextRunAt! + 1_000);
+    await h.manager.tick();
+    const [run] = h.manager.listRuns();
+    expect(run.status).toBe("running");
+    expect(run.holdReason).toBeUndefined();
+  });
+
+  it("does NOT treat blocked as busy or missing", async () => {
+    // The specific reason the fourth value was worth adding. The loop reads
+    // `if (busy) continue; if (missing) failRun(...)` and then dispatches, so
+    // a `blocked` value that fell through reached the dispatch attempt and was
+    // refused further down by the very gate that produced it — looking like a
+    // fix while changing nothing, and failing the run would have thrown away
+    // work one good tick from landing.
+    const h = harness();
+    h.options.botState = () => "blocked" as BotDispatchState;
+    h.options.dispatchHoldReason = () => "held";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    expect(h.manager.listRuns()).toMatchObject([{ status: "queued" }]);
+    expect(h.failed).toHaveLength(0);
+    expect(h.started).toHaveLength(0);
   });
 });

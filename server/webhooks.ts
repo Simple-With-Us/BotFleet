@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -128,7 +129,7 @@ export interface WebhookManagerOptions {
   file?: string;
   now?: () => number;
   emit?: (event: WebhookManagerEvent) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Resolve a live bot by display name. Used to reroute fleet-infra Sentry
    * onto Plumber without baking that bot's id into the webhook record. */
   findBotIdByName?: (name: string) => string | undefined;
@@ -930,7 +931,7 @@ export function resolveWebhookBotId(
   trigger: { botId: string; name: string },
   payload: JsonValue,
   findBotIdByName?: (name: string) => string | undefined,
-  botState?: (botId: string) => "ready" | "busy" | "missing",
+  botState?: (botId: string) => BotDispatchState,
 ): { botId: string; skipConfiguredPrompt: boolean } {
   // Name is owner-configured, not attacker-controlled.  Do not reroute an
   // unrelated webhook just because its untrusted JSON mentioned fleet-infra.
