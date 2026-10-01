@@ -603,8 +603,12 @@ public struct ProviderSnapshot: Codable, Hashable, Sendable {
     public var reason: String?
     public var authenticated: Bool?
     public var version: String?
+    /// An optional integration nobody has set up (the ASCII.dev Box engine with
+    /// no Box token): the harness keeps it registered but out of every engine list.
+    public var hidden: Bool?
 
     public var isAvailable: Bool { state == "available" }
+    public var isHidden: Bool { hidden == true }
 
     /// Phone Settings strip labels.  Mac owns setup, so these never deep-link
     /// into key entry or a CLI path — they only say what is true right now.
@@ -723,6 +727,9 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
 
 public struct InstanceList: Codable, Sendable {
     public var instances: [Instance]
+    /// When the harness's describe finished; a later push or fetch with a smaller
+    /// value is older than what the phone already holds.
+    public var describedAt: Double?
 }
 
 /// Which engine actually speaks — `VoiceProvider` in `server/tts/index.ts`.

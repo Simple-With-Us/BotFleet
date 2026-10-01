@@ -66,7 +66,7 @@ public enum Frame: Sendable {
     case config
     /// A describe finished behind a stale-while-revalidate answer; the harness
     /// pushes the fresh roster (`{ kind: "instances", instances, describedAt }`).
-    case instances([Instance])
+    case instances([Instance], describedAt: Double?)
     case runtime(RuntimeEvent)
     /// The paired Mac's update status changed — a check completed, an
     /// install started, its progress moved, or it finished.  Carries the same
@@ -79,7 +79,7 @@ public enum Frame: Sendable {
 extension Frame: Decodable {
     private enum CodingKeys: String, CodingKey {
         case kind, cursor, resumed, threadId, message, activeLeafId
-        case bot, botId, group, groupId, notification, png, mime, state, event, status, instances
+        case bot, botId, group, groupId, notification, png, mime, state, event, status, instances, describedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -131,7 +131,10 @@ extension Frame: Decodable {
         case "config":
             self = .config
         case "instances":
-            self = .instances(try container.decode([Instance].self, forKey: .instances))
+            self = .instances(
+                try container.decode([Instance].self, forKey: .instances),
+                describedAt: try container.decodeIfPresent(Double.self, forKey: .describedAt)
+            )
         case "runtime":
             self = .runtime(try container.decode(RuntimeEvent.self, forKey: .event))
         case "update.status":

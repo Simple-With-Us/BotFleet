@@ -470,7 +470,8 @@ struct SettingsView: View {
             if inst.driverKind == "deepseek" || inst.driverKind == "deepseekAgent" || inst.id == "deepseek" {
                 return false
             }
-            return inst.isEnabled
+            // An optional integration nobody has set up stays out of the list, as on the Mac.
+            return inst.isEnabled && !inst.snapshot.isHidden
         }
         loadingEngines = false
     }
