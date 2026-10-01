@@ -1,9 +1,16 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ensureDirs } from "../../config.ts";
+import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
+import { removeTempDir } from "../../testing/cleanup.ts";
+import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
+  MCODE_EFFORT_CONFIG_ID,
+  MCODE_M31_EFFORT_LEVELS,
   McodeAgentDriver,
   mcodeAuthenticated,
   mcodeDataDir,
@@ -12,7 +19,10 @@ import {
   parseMcodeModelValue,
   readMcodeModelCatalog,
   STATIC_MCODE_MODELS,
+  withMcodeEffortLevels,
 } from "./mcode.ts";
+
+const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
 
 const scratchDirs: string[] = [];
 
@@ -41,6 +51,26 @@ describe("STATIC_MCODE_MODELS", () => {
       "MiniMax-M3.1-Flash-Preview-thinking",
       "MiniMax-M2.7-highspeed-thinking",
     ]);
+  });
+
+  it("declares M3.1's effort levels and gives M2.7 Highspeed an explicit empty list", () => {
+    // mcode advertises `thinkingEffort` only for M3.1 (default, low, medium,
+    // high, xhigh, max), and BotFleet spells `default` as "no effort picked".
+    // M2.7 must say `[]` out loud: src/lib/model-effort.ts hands a row that
+    // declares no list the engine-wide one, which is M3.1's.
+    const byId = new Map(STATIC_MCODE_MODELS.options.map((option) => [option.id, option]));
+    expect(byId.get("MiniMax-M3.1-Flash-Preview-thinking")?.effortLevels).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(byId.get("MiniMax-M2.7-highspeed-thinking")?.effortLevels).toEqual([]);
+    expect(MCODE_M31_EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // No row offers M3, which stays retired: it would have no effort list at
+    // all, because mcode advertises no effort options for it.
+    expect(STATIC_MCODE_MODELS.options.some((option) => option.id.startsWith("MiniMax-M3-"))).toBe(false);
   });
 
   it("resolves every shipped id against that same advertised set", () => {
@@ -119,6 +149,53 @@ describe("readMcodeModelCatalog", () => {
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
     expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
+  });
+});
+
+describe("withMcodeEffortLevels", () => {
+  it("gives a bare row an explicit empty list and leaves declared lists alone", () => {
+    const catalog: ModelCatalog = {
+      default: "MiniMax-M3.1-Flash-Preview",
+      options: [
+        // the bare rows another branch adds to STATIC_MCODE_MODELS
+        { id: "MiniMax-M3.1-Flash-Preview", label: "M3.1 Flash Preview" },
+        { id: "MiniMax-M2.7-highspeed", label: "M2.7 Highspeed" },
+        { id: "MiniMax-M3.1-Flash-Preview-thinking", label: "thinking", effortLevels: ["low", "max"] },
+      ],
+    };
+    const fitted = withMcodeEffortLevels(catalog);
+    expect(fitted.default).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(fitted.options.map((option) => option.effortLevels)).toEqual([[], [], ["low", "max"]]);
+    // the input is not mutated
+    expect(catalog.options[0].effortLevels).toBeUndefined();
+  });
+});
+
+describe("readMcodeModelCatalog effort levels", () => {
+  it("returns every row with effortLevels defined, whichever default the owner's config names", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-mcode-effort-catalog-"));
+    scratchDirs.push(dataDir);
+    writeFileSync(
+      join(dataDir, "config.yaml"),
+      ["defaultModel: minimax/MiniMax-M2.7-highspeed", "defaultModelVariant: thinking"].join("\n"),
+      "utf8",
+    );
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
+    expect(catalog.default).toBe("MiniMax-M2.7-highspeed-thinking");
+    expect(catalog.options.length).toBeGreaterThan(0);
+    for (const option of catalog.options) {
+      expect(option.effortLevels, `${option.id} must declare its effort levels`).toBeDefined();
+    }
+    const byId = new Map(catalog.options.map((option) => [option.id, option]));
+    expect(byId.get("MiniMax-M3.1-Flash-Preview-thinking")?.effortLevels).toEqual([...MCODE_M31_EFFORT_LEVELS]);
+    expect(byId.get("MiniMax-M2.7-highspeed-thinking")?.effortLevels).toEqual([]);
+  });
+
+  it("does the same when there is no config at all", () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-mcode-effort-missing-"));
+    scratchDirs.push(dataDir);
+    const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dataDir, "missing") });
+    for (const option of catalog.options) expect(option.effortLevels).toBeDefined();
   });
 });
 
@@ -211,6 +288,10 @@ describe("McodeAgentDriver", () => {
     expect(McodeAgentDriver.models).toEqual(STATIC_MCODE_MODELS);
   });
 
+  it("carries an explicit effort list on every row it exposes", () => {
+    for (const option of McodeAgentDriver.models.options) expect(option.effortLevels).toBeDefined();
+  });
+
   it("advertises install and sign-in commands", () => {
     expect(McodeAgentDriver.install?.docsUrl).toBe("https://github.com/minimax-ai/minimax-code");
     expect(McodeAgentDriver.install?.signInCommand).toBe("mcode login --region global");
@@ -267,5 +348,306 @@ describe("parseMcodeModelValue / mcodePickerId", () => {
     expect(parseMcodeModelValue("m-two")).toBeNull();
     expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x")).toBeNull();
     expect(parseMcodeModelValue(42)).toBeNull();
+  });
+});
+
+describe("MiniMax Code reasoning effort over ACP", () => {
+  const M27 = "m:minimax:MiniMax-M2.7-highspeed:v:thinking";
+  const M31 = "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking";
+  // The order a live mcode 0.5.5 session advertises for M3.1.
+  const EFFORTS = "default,low,medium,high,xhigh,max";
+  const ENV_KEYS = [
+    "FAKE_ACP_DUMP",
+    "FAKE_ACP_RPC_DUMP",
+    "FAKE_ACP_MODELS_JSON",
+    "FAKE_ACP_REASONING_CONFIG_ID",
+    "FAKE_ACP_REASONING_EFFORTS",
+    "FAKE_ACP_REASONING_MODELS",
+    "FAKE_ACP_REASONING_STICKS",
+    "FAKE_ACP_REASONING_ERROR_CODE",
+    "FAKE_ACP_CONFIG_REPLY_BARE",
+  ];
+  let instance: ProviderInstance | undefined;
+  let recorder: EventRecorder | undefined;
+  let scratch: string;
+
+  beforeEach(() => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    scratch = mkdtempSync(join(tmpdir(), "botfleet-mcode-effort-"));
+    // M2.7 comes first, so an M3.1 turn has to switch the model before it can
+    // set an effort that the switch would otherwise reset.
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([M27, M31]);
+    process.env.FAKE_ACP_REASONING_CONFIG_ID = MCODE_EFFORT_CONFIG_ID;
+    process.env.FAKE_ACP_REASONING_EFFORTS = EFFORTS;
+    process.env.FAKE_ACP_REASONING_MODELS = M31;
+  });
+
+  afterEach(async () => {
+    for (const key of ENV_KEYS) delete process.env[key];
+    vi.restoreAllMocks();
+    recorder?.stop();
+    await instance?.dispose();
+    await removeTempDir(scratch);
+  });
+
+  const create = async () => {
+    instance = await McodeAgentDriver.create({
+      instanceId: "mcode-effort-test",
+      displayName: "MiniMax Code",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+  };
+
+  const dumpTo = (name: string): string => {
+    const dump = join(scratch, name);
+    process.env.FAKE_ACP_DUMP = dump;
+    return dump;
+  };
+
+  interface ConfigCall {
+    method: string;
+    params: { sessionId: string; configId: string; value: string };
+  }
+  const configCalls = (dump: string): ConfigCall[] => {
+    const file = `${dump}.config.json`;
+    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : [];
+  };
+
+  const setConfig = (configId: string, value: string) => ({
+    method: "session/set_config_option",
+    params: { sessionId: "fake-acp-session", configId, value },
+  });
+
+  const runTurn = async (input: { threadId: string; model: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" | "none" }) => {
+    await instance!.adapter.sendTurn({ text: "reason about this", ...input });
+    // Match on the thread: `until` also returns events already seen, so a test
+    // that runs two turns would otherwise read the first turn's completion.
+    return recorder!.until((event) => event.type === "turn.completed" && event.threadId === input.threadId);
+  };
+
+  const errorMessage = () => recorder!.events.find((event) => event.type === "runtime.error")?.message;
+
+  it("sets the picked level after the model switch, because the switch resets it", async () => {
+    const dump = dumpTo("xhigh.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-xhigh", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "xhigh" });
+
+    expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "xhigh")]);
+  });
+
+  it("sends mcode's own `default` when no effort is picked, so a level from an earlier turn never sticks", async () => {
+    const dump = dumpTo("default.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "default")]);
+  });
+
+  it("sends no effort call for M2.7 Highspeed, which mcode advertises no effort for", async () => {
+    const dump = dumpTo("m27.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-m27", model: "MiniMax-M2.7-highspeed-thinking", effort: "high" });
+
+    expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump).some((call) => call.params.configId === "thinkingEffort")).toBe(false);
+  });
+
+  it("fails the turn before prompting when mcode acknowledges a level but keeps another", async () => {
+    const rpcDump = join(scratch, "rpc-stuck.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_STICKS = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-stuck", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(
+      /MiniMax Code did not accept thinking effort high for MiniMax-M3\.1-Flash-Preview-thinking/,
+    );
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fails a no-effort turn when the session reports it kept an earlier level, instead of billing it there", async () => {
+    // A resumed session still sitting at `high`: the reset to `default` is
+    // acknowledged but not applied, and the reply says so.  M3.1 is first here,
+    // so no model switch runs and the session keeps its starting level.
+    const rpcDump = join(scratch, "rpc-sticky-default.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([M31, M27]);
+    process.env.FAKE_ACP_REASONING_EFFORTS = "high,default,low,medium,xhigh,max";
+    process.env.FAKE_ACP_REASONING_STICKS = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-sticky-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: still high/,
+    );
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("completes a no-effort turn when the session already sits at default, even if it ignores the set", async () => {
+    process.env.FAKE_ACP_REASONING_STICKS = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-stuck-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: true });
+  });
+
+  it("fails an explicit level the CLI does not advertise, naming the level", async () => {
+    // A session whose effort list lacks xhigh answers -32602 to it.
+    process.env.FAKE_ACP_REASONING_EFFORTS = "default,low,medium,high,max";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-unadvertised", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "xhigh" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort xhigh/);
+  });
+
+  it("treats `none` as Default with a warning instead of failing, since M3.1 has no off switch", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const dump = dumpTo("none.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-none", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "none" });
+
+    expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([setConfig("model", M31), setConfig("thinkingEffort", "default")]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('no effort "none"'));
+  });
+
+  it("runs at the CLI's own level when the session advertises no thinkingEffort, for Default and for a pick", async () => {
+    // An older mcode, or a login whose catalog has no effort options: after the
+    // model switch the reply lists the session's options and `thinkingEffort` is
+    // not among them.  There is nothing to set and nothing to be stuck at, and
+    // the server stamps Low on unattended runs, so the turn must still run.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_REASONING_MODELS = M27;
+    const dump = dumpTo("no-effort-option.json");
+    const rpcDump = join(scratch, "rpc-no-effort-option.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create();
+
+    const picked = await runTurn({ threadId: "mcode-effort-absent-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    const plain = await runTurn({ threadId: "mcode-effort-absent-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(picked).toMatchObject({ ok: true });
+    expect(plain).toMatchObject({ ok: true });
+    expect(configCalls(dump).some((call) => call.params.configId === "thinkingEffort")).toBe(false);
+    expect(JSON.parse(readFileSync(rpcDump, "utf8"))).toContain("session/prompt");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option (asked for high)"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option; running"));
+  });
+
+  it("reads the session/new option list when no model switch ran", async () => {
+    // M3.1 is first, so core runs no switch and the list is session/new's.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([M31, M27]);
+    process.env.FAKE_ACP_REASONING_MODELS = M27;
+    const dump = dumpTo("no-effort-option-no-switch.json");
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-absent-noswitch", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" });
+
+    expect(done).toMatchObject({ ok: true });
+    expect(configCalls(dump)).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("offers no thinking effort option"));
+  });
+
+  it("still tolerates a refused `default` when the session's option list is unknown, but not a refused pick", async () => {
+    // A bare ACK after the model switch means no current option list, so the
+    // session's capability cannot be read.  A -32602 for `default` then means
+    // "no such option" and there is no level to be stuck at; a refused explicit
+    // pick is still a failed turn.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    process.env.FAKE_ACP_REASONING_MODELS = M27;
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create();
+
+    const plain = await runTurn({ threadId: "mcode-effort-unknown-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+    expect(plain).toMatchObject({ ok: true });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("did not accept thinking effort default"));
+
+    const picked = await runTurn({ threadId: "mcode-effort-unknown-pick", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "high" });
+    expect(picked).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort high/);
+  });
+
+  it("fails a no-effort turn on a reset failure that is not a refusal, instead of billing a stale level", async () => {
+    // Anything but -32602 (a timeout carries no code at all) leaves the session
+    // at whatever level it was resumed at, so the Default turn must not run.
+    const rpcDump = join(scratch, "rpc-reset-error.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_ERROR_CODE = "-32603";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-reset-error", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: effort set failed: default/,
+    );
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fails a no-effort turn on a non-refusal reset failure even when the option list is unknown", async () => {
+    const rpcDump = join(scratch, "rpc-reset-error-unknown.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_ERROR_CODE = "-32603";
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-reset-error-unknown", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("fails a no-effort turn on a refused `default` when the session did advertise thinkingEffort", async () => {
+    // The option exists but its list lacks `default`: the -32602 is a real
+    // refusal of the value, and a resumed session could still sit at a pick.
+    const rpcDump = join(scratch, "rpc-default-missing.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_REASONING_EFFORTS = "low,medium,high,xhigh,max";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-default-missing", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(/MiniMax Code did not accept thinking effort default/);
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("accepts a bare acknowledgement that reports no option state", async () => {
+    process.env.FAKE_ACP_CONFIG_REPLY_BARE = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-bare", model: "MiniMax-M3.1-Flash-Preview-thinking", effort: "max" });
+
+    expect(done).toMatchObject({ ok: true });
+  });
+
+  it("exposes the M3.1 level list as the engine-wide effort capability", async () => {
+    await create();
+
+    expect(instance!.adapter.capabilities?.effortLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 });

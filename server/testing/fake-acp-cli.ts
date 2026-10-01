@@ -42,6 +42,30 @@
 //   FAKE_ACP_MODEL_STICKS  session/set_config_option succeeds but leaves the
 //                        model where it was, so the confirmation guard in
 //                        core.ts has something to catch
+//   FAKE_ACP_REASONING_EFFORTS  comma-separated effort values.  Advertises a
+//                        reasoning-effort config option (category thought_level)
+//                        whose first value is the starting one, and lets
+//                        session/set_config_option set it.
+//   FAKE_ACP_REASONING_CONFIG_ID  the id that effort option carries in
+//                        configOptions and in set_config_option.  Default
+//                        `reasoning_effort` (stock dsh); `thinkingEffort` is
+//                        what `mcode acp` uses.
+//   FAKE_ACP_REASONING_MODELS  comma-separated model option values (the same
+//                        strings as FAKE_ACP_MODELS).  When set, the effort
+//                        option is advertised, and a set is accepted, only
+//                        while the current model is in the list; any other set
+//                        answers -32602 "Thinking effort is not advertised for
+//                        the selected model: <v>", as mcode does for M3 and
+//                        M2.7.  A model switch then also resets the effort to
+//                        `default` when that is one of the efforts, as mcode
+//                        does.  Unset, the effort option is always on and a
+//                        model switch leaves it alone.
+//   FAKE_ACP_REASONING_STICKS  a set of the effort option succeeds but leaves
+//                        the effort where it was, like FAKE_ACP_MODEL_STICKS
+//   FAKE_ACP_REASONING_ERROR_CODE  a set of the effort option answers a JSON-RPC
+//                        error with this numeric code (for example -32603)
+//                        instead of applying it, so a test can tell a refused
+//                        value (-32602) from any other failure
 //   FAKE_ACP_CONFIG_REPLY_BARE  session/set_config_option applies the value but
 //                        answers with a bare `{}`, the shape stock dsh used:
 //                        no configOptions, so nothing to confirm against
@@ -84,6 +108,13 @@ const models: string[] = process.env.FAKE_ACP_MODELS_JSON
 let currentModel: string | null = models[0] ?? null;
 const reasoningEfforts = (process.env.FAKE_ACP_REASONING_EFFORTS ?? "").split(",").filter(Boolean);
 let currentReasoningEffort: string | null = reasoningEfforts[0] ?? null;
+const reasoningConfigId = process.env.FAKE_ACP_REASONING_CONFIG_ID || "reasoning_effort";
+const reasoningModels = (process.env.FAKE_ACP_REASONING_MODELS ?? "").split(",").filter(Boolean);
+// Whether the effort option is on offer right now: always when no model list is
+// declared, otherwise only while the current model is one of the listed ones.
+const reasoningAdvertised = () =>
+  reasoningEfforts.length > 0 &&
+  (reasoningModels.length === 0 || (currentModel !== null && reasoningModels.includes(currentModel)));
 const configOptions = () => {
   const options = [
     ...(models.length
@@ -98,10 +129,10 @@ const configOptions = () => {
         },
       ]
       : []),
-    ...(reasoningEfforts.length
+    ...(reasoningAdvertised()
       ? [
         {
-          id: "reasoning_effort",
+          id: reasoningConfigId,
           name: "Reasoning effort",
           category: "thought_level",
           type: "select",
@@ -456,9 +487,25 @@ function handle(msg: any) {
     }
     case "session/set_config_option": {
       const { configId, value } = msg.params ?? {};
+      if (configId === reasoningConfigId && process.env.FAKE_ACP_REASONING_ERROR_CODE) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: Number(process.env.FAKE_ACP_REASONING_ERROR_CODE), message: `effort set failed: ${value}` },
+        });
+        break;
+      }
+      if (configId === reasoningConfigId && reasoningModels.length > 0 && !reasoningAdvertised()) {
+        out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: `Thinking effort is not advertised for the selected model: ${value}` },
+        });
+        break;
+      }
       const accepted = configId === "model"
         ? models.includes(value)
-        : configId === "reasoning_effort"
+        : configId === reasoningConfigId
           ? reasoningEfforts.includes(value)
           : false;
       if (!accepted) {
@@ -472,8 +519,14 @@ function handle(msg: any) {
       // FAKE_ACP_MODEL_STICKS: answer OK and keep the old model anyway. Nothing
       // in the protocol forbids it, and it is the shape core.ts's confirmation
       // guard exists for — an error is loud, this is silent.
-      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS) currentModel = value;
-      if (configId === "reasoning_effort" && !process.env.FAKE_ACP_REASONING_STICKS) {
+      if (configId === "model" && !process.env.FAKE_ACP_MODEL_STICKS) {
+        currentModel = value;
+        // mcode resets the session's effort to `default` on every model switch.
+        if (reasoningModels.length > 0 && reasoningEfforts.includes("default")) {
+          currentReasoningEffort = "default";
+        }
+      }
+      if (configId === reasoningConfigId && !process.env.FAKE_ACP_REASONING_STICKS) {
         currentReasoningEffort = value;
       }
       configCalls.push({ method: msg.method, params: msg.params });
