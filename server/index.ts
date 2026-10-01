@@ -77,10 +77,10 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
-import { doomedDispatches, enableDoomedDispatchPersist } from "./doomed-dispatch.ts";
+import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
-import { effectiveToolRounds, toolBudgetPrompt } from "../shared/bot-profile.ts";
+import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
@@ -951,17 +951,70 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
   }
 }
 
-/** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
- *  consulted for work nobody is watching, so a cap can stop background
- *  automation without silently refusing a message the owner is waiting on. */
-function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
-  if (runOn !== "bot") return false;
-  const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
-    ceilingUsd: cfg.usage?.spendCeilingUsd,
-    minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
-  });
-  if (decision.blocked) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
-  return decision.blocked;
+/** Why this bot's work must not go out right now, or undefined if it can.
+ *
+ *  One function, three callers: the dispatch gate answers yes/no, the scheduler
+ *  records the reason on a run it leaves QUEUED, and the roster marks the bot
+ *  `blocked`.  As three separate predicates they could disagree — which is
+ *  exactly what happened, because only the queue knew the engine was dead and
+ *  the roster kept offering work the queue then refused.
+ *
+ *  Every branch names the ENGINE, not the symptom.  "Waiting" reads the same
+ *  whether the CLI is missing, the account is capped, or the fleet is over its
+ *  ceiling, and an operator cannot act on that. */
+function dispatchHoldFor(
+  botId: string,
+  threadId: string | undefined,
+  runOn: RoutineRunOn,
+): DispatchHold | undefined {
+  const bot = store.bot(botId);
+  if (!bot) return undefined;
+  const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
+  const policy = task?.modelSelection ?? bot.modelSelection;
+  const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+  // The registry's own display name where it has one, so the reason says
+  // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
+  // start" is no easier to act on than the boolean it replaced.
+  const engine = registry.get(instanceId as never)?.displayName ?? instanceId;
+
+  // A (bot, engine) pair that has failed to START repeatedly is not going to
+  // start on the next tick either — the CLI is missing, not executable, or
+  // waiting on an interactive login, and none of those change on a timer.  The
+  // run stays QUEUED rather than failing, so it lands once the breaker
+  // half-opens.
+  if (doomedDispatches.isOpen(bot.id, instanceId)) {
+    noteDoomedSkip(bot.id, instanceId);
+    const entry = doomedDispatches.peek(bot.id, instanceId);
+    return {
+      reason: `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row`,
+      hint: entry?.lastError
+        ? `Last error: ${entry.lastError}`
+        : `Check that the ${engine} CLI is installed and logged in`,
+    };
+  }
+
+  // Off unless a ceiling is configured, and consulted only for unattended work
+  // so a cap can stop background automation without refusing a message the
+  // owner is waiting on.  It also refuses to fire when too little of the
+  // window is priced to trust the total.
+  if (runOn === "bot") {
+    const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
+      ceilingUsd: cfg.usage?.spendCeilingUsd,
+      minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
+    });
+    if (decision.blocked) {
+      console.warn(`[spend] refusing unattended work: ${decision.reason}`);
+      return { reason: decision.reason };
+    }
+  }
+
+  if (turnExternalCredentialPending(bot, instanceId, runOn)) {
+    return {
+      reason: `${engine} is waiting on a credential`,
+      hint: `Add the ${engine} credential in Settings; the run resumes on its own once it lands`,
+    };
+  }
+  return undefined;
 }
 
 /** Comms grants minted per turn, bound to the bot they were issued for.
@@ -5599,33 +5652,22 @@ routines = new RoutineManager({
       load: readHostLoad(),
     });
   },
-  canStart: (botId, threadId, runOn) => {
-    const bot = store.bot(botId);
-    const task = bot && threadId ? store.taskByThread(bot.id, threadId) : undefined;
-    if (!bot) return true;
-    const policy = task?.modelSelection ?? bot.modelSelection;
-    const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
-    // A (bot, engine) pair that has failed to START repeatedly is not going to
-    // start on the next tick either — the CLI is missing, not executable, or
-    // waiting on an interactive login, and none of those change on a timer.
-    // Declining here leaves the run QUEUED rather than failed, so it still
-    // lands once the breaker half-opens after the TTL.  Same shape as the
-    // credential gate below it: both answer "should this go out right now".
-    if (doomedDispatches.isOpen(bot.id, instanceId)) {
-      noteDoomedSkip(bot.id, instanceId);
-      return false;
-    }
-    // Last, and off unless a ceiling is configured: an unattended fleet that
-    // silently stops working is a worse outcome than one that overspends, so
-    // this also refuses to fire when too little of the window is priced to
-    // trust the total.  The reason is logged rather than swallowed, because
-    // "the cap did not hold" needs to be explainable.
-    if (spendBlockedForUnattendedWork(runOn)) return false;
-    return !turnExternalCredentialPending(bot, instanceId, runOn);
-  },
+  canStart: (botId, threadId, runOn) => !dispatchHoldFor(botId, threadId, runOn),
+  // The reason behind a `false` from canStart, read by the scheduler when it
+  // leaves a run QUEUED.  The same verdict and the same words, because two
+  // functions answering one question differently is how a queued run ends up
+  // explaining itself with a reason that does not match the gate that held it.
+  dispatchHoldReason: (botId) => dispatchHoldFor(botId, undefined, "bot")?.reason,
   botState: (botId) => {
     const bot = store.bot(botId);
-    return !bot ? "missing" : bot.busy ? "busy" : "ready";
+    if (!bot) return "missing";
+    if (bot.busy) return "busy";
+    // Held engines read as `blocked`, not `ready`, which is the whole point of
+    // the value: the roster used to offer work to a bot whose engine could not
+    // start it, and the run then sat queued looking like a stuck scheduler.
+    // Judged on the bot's own selection, so this is the common case; canStart
+    // stays the authority for a specific thread.
+    return dispatchHoldFor(botId, undefined, "bot") ? "blocked" : "ready";
   },
   conversationMode: () => parseConversationMode(cfg.conversationMode),
   // The gap is a property of the trigger definition, so it is read live —
