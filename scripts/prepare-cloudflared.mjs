@@ -14,13 +14,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /** One slow download beats three fast failures.  Mirrors the timeout,
  * attempt count, and delay `prepare-android-tools.mjs` picked up in PR #446
@@ -378,7 +379,18 @@ export function currentOnlyFromEnv(env = process.env) {
   return env.OMB_CLOUDFLARED_CURRENT === "1";
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   const args = parsePrepareCloudflaredArgs(process.argv.slice(2));
   await prepareCloudflared({ current: args.current || currentOnlyFromEnv() });
 }

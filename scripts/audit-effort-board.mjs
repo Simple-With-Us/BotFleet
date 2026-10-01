@@ -1,6 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { readFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const OPEN = new Set(["open", "in_progress"]);
 const REPO = "jaywedgeworth22/BotFleet";
@@ -72,7 +71,18 @@ export function auditEffortBoard({ board, issues, mergedPullRequests, deployment
   };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   const [boardPath, issuePath, prPath, deploymentsPath] = process.argv.slice(2);
   if (!boardPath || !issuePath || !prPath) throw new Error("Usage: node scripts/audit-effort-board.mjs BOARD.json ISSUES.json MERGED_PRS.json [DEPLOYMENTS.json]");
   const read = (path) => JSON.parse(readFileSync(path, "utf8"));

@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -18,7 +18,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
 import {
   createUpdateProgress,
@@ -133,7 +133,13 @@ prepare builds and validates without touching the live checkout, installed app, 
 An existing exact-source build can be imported with --bundle and --dependencies.
 apply performs a fresh active-work check, installs one prepared stage, verifies exact runtime identity,
 and rolls the prior bundle and checkout back if any install or startup step fails.
-unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.`;
+unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.
+
+--force (-f, or BOTFLEET_FORCE=1) does more than reinstall when the checkout is already current.
+It drops the requirement that the harness be idle and asks it to quiesce with force=true, which
+interrupts busy bots and running or queued routines.  Their work is saved to
+pending-update-resume.json and resumed after the update.  A live room turn still refuses the
+forced update.  Use it only when interrupting that work is acceptable.`;
 }
 
 async function exists(path) {
@@ -2203,7 +2209,25 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+// Node's ESM loader realpaths the entry module, so import.meta.url names the
+// physical file while process.argv[1] keeps whatever spelling the caller used.
+// On macOS os.tmpdir() is /var/folders/..., and /var is a symlink to
+// /private/var, so the wrapper's bootstrap copy under mktemp -d compared
+// unequal, main() never ran, and the updater exited 0 without a word.  Compare
+// physical paths.  This file must stay self-contained: the installed wrapper
+// archives a fixed list of updater files, so a new import here would break the
+// bootstrap on every Mac that already has that wrapper.
+function isEntryModule() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   main().catch((error) => {
     console.error(`BotFleet update failed: ${error?.message || error}`);
     process.exitCode = 1;

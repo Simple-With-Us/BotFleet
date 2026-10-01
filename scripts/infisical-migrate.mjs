@@ -28,7 +28,8 @@
 //     status words and counts ever reach `console.log`.
 //   - Empty local values are always skipped -- there is nothing to seed.
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig, infisicalSettings, infisicalConfigured } from "../server/config.ts";
 import { SECRET_FIELDS } from "../server/secret-map.ts";
@@ -169,7 +170,18 @@ export async function run({
   }
 }
 
-const isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+const isMain = isEntryModule();
 if (isMain) {
   run().catch((caught) => {
     console.error(caught instanceof Error ? caught.message : String(caught));

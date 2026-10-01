@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1453,4 +1453,70 @@ test("a relaunch of a finished run does nothing and exits successfully", async (
   assert.equal(process.exitCode, undefined);
 });
 
+// The wrapper bootstraps the updater into `mktemp -d "${TMPDIR}/..."`.  On
+// macOS TMPDIR is under /var/folders and /var is a symlink to /private/var.
+// Node's ESM loader realpaths the entry module, so import.meta.url named
+// /private/var/... while process.argv[1] kept /var/..., the entry guard was
+// false, main() never ran, and every ubf run exited 0 without a word.  This
+// test reproduces that with an explicit symlinked directory so it fails on any
+// platform that can create one, not only on a Mac.
+async function symlinkedCopy(t, files) {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-entry-guard-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const physical = join(root, "physical");
+  const linked = join(root, "linked");
+  for (const file of files) {
+    const target = join(physical, file);
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(join(scripts, "..", file), target);
+  }
+  // "junction" is ignored on POSIX and lets Windows create the link without
+  // elevated privileges.
+  await symlink(physical, linked, "junction");
+  // Guard the premise: the two spellings must really differ.
+  assert.notEqual(await realpath(linked), linked);
+  return { linked, root };
+}
 
+test("the updater runs its entry point when invoked through a symlinked directory", async (t) => {
+  // Exactly the files the wrapper archives into its bootstrap directory, laid
+  // out the same way.  Keeping the list here also proves the entry module
+  // stays self-contained: a new import would fail to resolve in this copy.
+  const { linked, root } = await symlinkedCopy(t, [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]);
+  // --help returns before any configuration, lock, network or data directory
+  // is touched.  HOME and the BotFleet paths still point at scratch so a
+  // regression elsewhere cannot reach this machine's real checkout or app.
+  const result = await run(process.execPath, [join(linked, "scripts", "update-botfleet-mac.mjs"), "--help"], {
+    env: {
+      HOME: join(root, "home"),
+      BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+      BOTFLEET_CHECKOUT: join(root, "checkout"),
+      BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+      BOTFLEET_DATA_DIR: join(root, "data"),
+      BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+      BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  // A silent exit 0 is the bug, so the exit code alone proves nothing.
+  assert.match(result.stdout, /^Usage:/m, "main() must run and print the usage text");
+  assert.match(result.stdout, /pending-update-resume\.json/, "usage must say what --force interrupts");
+});
+
+test("another script with the same entry guard runs through a symlinked directory", async (t) => {
+  const { linked } = await symlinkedCopy(t, ["scripts/verify-release-tag.mjs"]);
+  const result = await run(process.execPath, [join(linked, "scripts", "verify-release-tag.mjs")], {
+    env: { GH_TOKEN: "" },
+    allowFailure: true,
+  });
+  // Reaching the token check proves the guard fired.  It never gets as far as
+  // a network request without a token.
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
+});
