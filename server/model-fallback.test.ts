@@ -19,6 +19,7 @@ import {
   quotaCooldowns,
   quotaOrCapFromErrorCode,
   selectTurnFallback,
+  selectionForFallbackPick,
   shouldReplayPersistedStarter,
   sliceIsShortProviderError,
   turnHitQuotaOrCap,
@@ -367,6 +368,25 @@ describe("quota and session-limit failover", () => {
 });
 
 describe("selectTurnFallback", () => {
+  it("keeps a floating fallback's latest class on the pick", () => {
+    const pick = selectTurnFallback({
+      ok: false,
+      stopReason: null,
+      produced: false,
+      quotaOrCap: true,
+      fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }],
+      used: 0,
+    });
+    expect(pick).toMatchObject({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" });
+    // What the 1:1 relaunch and a room member's replayed fallback dispatch.
+    expect(selectionForFallbackPick(pick!)).toEqual({ instanceId: "codex", model: "gpt-5.6-luna", effort: undefined, latest: "luna" });
+    expect(selectionForFallbackPick({ instanceId: "claude", model: "claude-opus-5-5", effort: "high" })).toEqual({
+      instanceId: "claude",
+      model: "claude-opus-5-5",
+      effort: "high",
+    });
+  });
+
   it("cancelled or interrupted does not fail over", () => {
     const afterUser: FallbackScanMessage[] = [{ role: "bot", kind: "activity", tool: { name: "Bash" } }];
     expect(decide(afterUser, { ok: false, stopReason: "cancelled" })).toBeUndefined();
