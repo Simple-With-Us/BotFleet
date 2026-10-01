@@ -7,8 +7,9 @@
 //   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
 //                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized |
 //                     resume-unauthorized | resume-transient |
-//                     multi-agent (a helper thread's notifications, turn/completed
-//                     included, interleave with the main thread's on the same
+//                     multi-agent (the main thread's spawn_agent call, then a
+//                     helper thread's notifications, turn/completed included,
+//                     interleaved with the main thread's on the same
 //                     connection, every one naming its threadId as 0.159 does)
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //   FAKE_CODEX_DOWN_FILE  optional path; while the file exists, `app-server`
@@ -233,7 +234,12 @@ process.stdin.on("data", (chunk) => {
         notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
         notify("item/started", { item: { id: "w1", type: "webSearch", query: "BotFleet" } });
         if (mode === "multi-agent") {
-          // the helper runs its own turn to completion before the main thread finishes
+          // the main thread spawns the helper (0.159's collabAgentToolCall
+          // item; the helper's thread is named once the call completes)...
+          const spawn = { id: "spawn-1", type: "collabAgentToolCall", tool: "spawnAgent", senderThreadId: MAIN_THREAD, agentsStates: {}, prompt: "look around" };
+          notify("item/started", { item: { ...spawn, receiverThreadIds: [], status: "inProgress" } });
+          notify("item/completed", { item: { ...spawn, receiverThreadIds: ["codex-thread-helper-1"], status: "completed" } });
+          // ...and the helper runs its own turn to completion before the main thread finishes
           notifyHelper("turn/started", { turn: { id: "turn-helper", status: "inProgress" } });
           notifyHelper("item/started", { item: { id: "h1", type: "commandExecution", command: "HELPER COMMAND" } });
           notifyHelper("item/agentMessage/delta", { itemId: "hm1", delta: "HELPER DELTA" });

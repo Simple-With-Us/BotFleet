@@ -31,12 +31,33 @@
 //                        starts a turn of its own: a background task's
 //                        notification, text, a tool step, a second result)
 //                      | ghost-running (the same, still running: no result)
-//                      | ghost-queued (a result for the CLI's own turn
-//                        arrives first, with this turn's message still queued)
+//                      | ghost-ahead (the second message arrives while the
+//                        CLI runs a turn of its own: that turn's frames and
+//                        result come first, then the message is read and
+//                        answered)
+//                      | ghost-ahead-hang (the same, but the CLI's own turn
+//                        stops at its tool call, waiting on a permission)
 //                      | helpers (a native subagent's frames, each carrying
 //                        parent_tool_use_id)
-//                      | queued-steer (a result with a steer still queued
-//                        behind it, then the CLI's turn for that steer)
+//                      | queued-steer (slow, like `slow`, but a message that
+//                        arrives mid-turn is QUEUED rather than folded: the
+//                        result reports it in queued_turn_count, and it then
+//                        runs as a turn of its own; FAKE_CLAUDE_GATE, when
+//                        set, holds each turn until that file exists)
+//   FAKE_CLAUDE_LIFECYCLE  1 (default) | 0 — whether to report
+//                      `command_lifecycle` frames for messages that carry a
+//                      uuid (queued on read, started when a turn takes one,
+//                      completed after), and the consumed uuids on each
+//                      result, the way 2.1.284 does.  0 plays an older CLI.
+//   FAKE_CLAUDE_COST_DIR  where the running `total_cost_usd` of each session
+//                      is kept (default: a folder under the OS temp dir).  As
+//                      in the real CLI the total is CUMULATIVE for the
+//                      process, and a --resume continues from the total the
+//                      session saved; each mode's own figure is that turn's
+//                      share.
+//   FAKE_CLAUDE_RESULT_MARK  optional path; a line is appended once each
+//                      result has been handed to the OS, so a test can stall
+//                      the harness while results sit unread in the pipe
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -55,7 +76,10 @@
 //                        above records only the launch)
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // The dump is read by a separate process that only knows the file exists.
 // A plain writeFileSync creates the file and then fills it, so a reader that
@@ -78,7 +102,20 @@ const argAfter = (flag: string): string | null => {
   return i === -1 ? null : (argv[i + 1] ?? null);
 };
 
-const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
+const write = (obj: unknown, done?: () => void) => process.stdout.write(JSON.stringify(obj) + "\n", done);
+// Results are rewritten on the way out (running cost, consumed uuids); the
+// hook is installed once the session state below exists.
+let shapeResult: ((result: Record<string, unknown>) => () => void) | null = null;
+const out = (obj: unknown) => {
+  if (shapeResult && obj && typeof obj === "object" && (obj as { type?: unknown }).type === "result") {
+    const after = shapeResult(obj as Record<string, unknown>);
+    const mark = process.env.FAKE_CLAUDE_RESULT_MARK;
+    write(obj, mark ? () => appendFileSync(mark, "result\n") : undefined);
+    after();
+    return;
+  }
+  write(obj);
+};
 
 // Snapshot probes: both answer on argv alone and exit without reading stdin.
 if (argv[0] === "--version") {
@@ -153,6 +190,61 @@ let turnRunning = false;
 let steered: string[] = [];
 let stdinEnded = false;
 
+// ── command lifecycle and running cost (2.1.284's shape) ─────────────────
+const lifecycleOn = process.env.FAKE_CLAUDE_LIFECYCLE !== "0";
+/** The stamped messages the running turn has taken, for its result. */
+let consumed: string[] = [];
+/** Folded steers' uuids, reported started when the fold lands. */
+let steeredIds: string[] = [];
+/** Messages read mid-turn and queued rather than folded (queued-steer). */
+const backlog: JsonValue[] = [];
+const uuidOf = (prompt: JsonValue): string | undefined => {
+  const id = prompt && typeof prompt === "object" && !Array.isArray(prompt) ? prompt.uuid : undefined;
+  return typeof id === "string" && id ? id : undefined;
+};
+const lifecycle = (commandUuid: string | undefined, state: string) => {
+  if (!lifecycleOn || !commandUuid) return;
+  write({ type: "command_lifecycle", command_uuid: commandUuid, state, uuid: randomUUID(), session_id: sessionId });
+};
+const take = (commandUuid: string | undefined) => {
+  if (!commandUuid) return;
+  consumed.push(commandUuid);
+  lifecycle(commandUuid, "started");
+};
+const costDir = process.env.FAKE_CLAUDE_COST_DIR ?? join(tmpdir(), "botfleet-fake-claude-cost");
+const costFile = join(costDir, sessionId.replace(/[^\w-]/g, "_"));
+let costTotal = 0;
+if (argAfter("--resume")) {
+  try {
+    costTotal = Number(readFileSync(costFile, "utf8")) || 0;
+  } catch {
+    /* a session with no saved total starts from zero */
+  }
+}
+shapeResult = (result) => {
+  // each mode states its own turn's cost; the CLI reports the running total
+  if (typeof result.total_cost_usd === "number") {
+    costTotal = Math.round((costTotal + result.total_cost_usd) * 1e6) / 1e6;
+    result.total_cost_usd = costTotal;
+    try {
+      mkdirSync(costDir, { recursive: true });
+      writeFileSync(costFile, String(costTotal));
+    } catch {
+      /* the next process starts from zero */
+    }
+  }
+  const taken = consumed;
+  consumed = [];
+  if (lifecycleOn && taken.length && result.user_message_uuids === undefined) {
+    result.user_message_uuids = taken;
+    result.user_message_uuid = taken[taken.length - 1];
+  }
+  // a command that started a fresh turn reports completed after its result
+  return () => {
+    for (const id of taken) lifecycle(id, "completed");
+  };
+};
+
 // The harness delivers out-of-band context (the volatile half of the system
 // prompt — drivers/prompt-split.ts) as a leading <system-reminder> block
 // inside the user turn.  The real CLI reads that block as context, not as
@@ -177,6 +269,8 @@ const finishIfDone = () => {
 // CLI is still busy with its own turn when the next message would arrive.
 let ghostPlayed = false;
 const playGhostTurn = () => {
+  // an internally enqueued command: a fresh uuid, started with no `queued`
+  lifecycle(`internal-${randomUUID()}`, "started");
   out({
     type: "system",
     subtype: "task_notification",
@@ -198,8 +292,14 @@ const playGhostTurn = () => {
       usage: { input_tokens: 40, cache_read_input_tokens: 0, output_tokens: 6 },
     },
   });
+  if (mode === "ghost-ahead-hang") {
+    // the CLI's own tool call waits on a permission nobody will grant
+    turnRunning = true;
+    setInterval(() => {}, 1_000);
+    return;
+  }
   out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "ghost-tu-1", is_error: false, content: "bgdone" }] } });
-  if (mode === "ghost-turn") {
+  if (mode === "ghost-turn" || mode === "ghost-ahead") {
     out({
       type: "result",
       is_error: false,
@@ -217,6 +317,8 @@ const playGhostTurn = () => {
 const playTurn = (prompt: JsonValue) => {
   turnRunning = true;
   steered = [];
+  steeredIds = [];
+  take(uuidOf(prompt));
   if (!dumped && process.env.FAKE_CLAUDE_DUMP) {
     dumped = true;
     const configPath = argAfter("--mcp-config");
@@ -414,42 +516,37 @@ const playTurn = (prompt: JsonValue) => {
   }
 
   if (mode === "queued-steer") {
-    // A steer that landed after the turn's last model call: the CLI settles
-    // the turn with the steer still queued (queued_turn_count 1), then runs
-    // a turn of its own for it.  Both are the harness's one turn.
-    out({ type: "assistant", message: { content: [{ type: "text", text: "first reply" }], usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 } } });
-    out({
-      type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01,
-      origin: { kind: "human" }, queued_turn_count: 1, result_index: 0,
-      usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 },
+    // A steer that lands after the turn's last model call: the CLI reads it
+    // but does not fold it, settles the turn with it still queued
+    // (queued_turn_count), then runs a turn of its own for it.  The turn
+    // ends 800 ms in, or once FAKE_CLAUDE_GATE exists when that is set (a
+    // test can make sure its steer was read first).
+    const gate = process.env.FAKE_CLAUDE_GATE;
+    const whenOpen = (run: () => void) => {
+      if (!gate) return void setTimeout(run, 800);
+      const timer = setInterval(() => {
+        if (!existsSync(gate)) return;
+        clearInterval(timer);
+        run();
+      }, 20);
+    };
+    whenOpen(() => {
+      out({
+        type: "assistant",
+        message: { content: [{ type: "text", text: `reply to: ${promptText(prompt)}` }], usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 } },
+      });
+      out({
+        type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01,
+        ...(lifecycleOn ? { origin: { kind: "human" } } : {}),
+        queued_turn_count: backlog.length,
+        usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 },
+      });
+      turnRunning = false;
+      const next = backlog.shift();
+      if (next !== undefined) playTurn(next);
+      else finishIfDone();
     });
-    out({ type: "system", subtype: "init", session_id: sessionId, model, tools: ["Bash"] });
-    out({ type: "assistant", message: { content: [{ type: "text", text: "reply to the late steer" }], usage: { input_tokens: 20, cache_read_input_tokens: 6, output_tokens: 5 } } });
-    out({
-      type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.02,
-      origin: { kind: "human" }, queued_turn_count: 0, result_index: 1,
-      usage: { input_tokens: 20, cache_read_input_tokens: 6, output_tokens: 5 },
-    });
-    turnRunning = false;
-    finishIfDone();
     return;
-  }
-
-  if (mode === "ghost-queued") {
-    // The race the driver must survive: the CLI had started a turn of its
-    // own (a background task's notification) when this message arrived, so
-    // the message waits in its queue and the CLI's own result comes first.
-    out({
-      type: "result",
-      is_error: false,
-      stop_reason: "end_turn",
-      result: "ghost reply",
-      total_cost_usd: 0.03,
-      origin: { kind: "task-notification" },
-      queued_turn_count: 1,
-      result_index: 0,
-      usage: { input_tokens: 50, cache_read_input_tokens: 0, output_tokens: 9 },
-    });
   }
 
   if (mode === "stream") {
@@ -502,9 +599,8 @@ const playTurn = (prompt: JsonValue) => {
       total_cost_usd: 0.01,
       usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
     };
-    // 2.1.284 names where each turn came from; the ghost modes need the
-    // newer shape, every other mode keeps the older one with no origin.
-    out(mode.startsWith("ghost-") ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);
+    // 2.1.284 names where each turn came from; an older CLI does not
+    out(lifecycleOn ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);
     turnRunning = false;
     if (!ghostPlayed && (mode === "ghost-turn" || mode === "ghost-running")) {
       ghostPlayed = true;
@@ -517,6 +613,7 @@ const playTurn = (prompt: JsonValue) => {
     // was folded in, the way the real CLI includes a mid-turn message in
     // the same turn's next model call
     setTimeout(() => {
+      for (const id of steeredIds) take(id);
       const tail = steered.length ? ` + steered: ${steered.join(" | ")}` : "";
       out({ type: "assistant", message: { content: [{ type: "text", text: `reply to: ${promptText(prompt)}${tail}` }] } });
       finish();
@@ -527,6 +624,7 @@ const playTurn = (prompt: JsonValue) => {
 };
 
 let buf = "";
+let messagesRead = 0;
 process.stdin.on("data", (c) => {
   buf += c;
   let nl;
@@ -541,8 +639,23 @@ process.stdin.on("data", (c) => {
       continue;
     }
     if (process.env.FAKE_CLAUDE_PROMPTS) appendFileSync(process.env.FAKE_CLAUDE_PROMPTS, JSON.stringify({ pid: process.pid, prompt }) + "\n");
-    if (turnRunning) steered.push(promptText(prompt));
-    else playTurn(prompt);
+    messagesRead++;
+    if ((mode === "ghost-ahead" || mode === "ghost-ahead-hang") && messagesRead === 2) {
+      // The CLI had started a turn of its own just before this message came
+      // in: that turn plays out first, and the message is read after it.
+      playGhostTurn();
+      if (mode === "ghost-ahead-hang") continue;
+      lifecycle(uuidOf(prompt), "queued");
+      playTurn(prompt);
+      continue;
+    }
+    lifecycle(uuidOf(prompt), "queued");
+    if (turnRunning && mode === "queued-steer") backlog.push(prompt);
+    else if (turnRunning) {
+      steered.push(promptText(prompt));
+      const id = uuidOf(prompt);
+      if (id) steeredIds.push(id);
+    } else playTurn(prompt);
   }
 });
 process.stdin.on("end", () => {

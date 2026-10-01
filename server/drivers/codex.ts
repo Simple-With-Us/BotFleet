@@ -367,6 +367,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
         // helper-thread notifications kept out of this turn (see handleNotification)
         foreignThreadNotifications: 0,
+        // helper thread id -> the spawn_agent item that started it
+        helperParents: new Map<string, string>(),
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
@@ -529,6 +531,58 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         });
       };
 
+      /** A tool step's title, or null for an item that is not a step. */
+      const toolTitle = (item: any): string | null =>
+        item.type === "commandExecution"
+          ? String(item.command ?? "shell")
+          : item.type === "fileChange"
+            ? "edit"
+            : item.type === "mcpToolCall"
+              ? (item.tool ?? item.name ?? "mcp")
+              : item.type === "webSearch"
+                ? "web_search"
+                : item.type === "collabAgentToolCall" && item.tool === "spawnAgent"
+                  ? "spawn_agent"
+                  : null;
+      const emitToolStarted = (item: any, parentItemId?: string) => {
+        const title = toolTitle(item);
+        if (!title) return;
+        // the app-server names the file it changed and the query it
+        // searched; a row that says only "edit" makes the reader open
+        // the diff to learn which file
+        emit({
+          ...base(threadId, turnId),
+          type: "item.started",
+          itemType: "tool",
+          itemId: item.id,
+          title,
+          ...(parentItemId === undefined ? {} : { parentItemId }),
+          ...toolFields(title, item, { cwd: turn.cwd }),
+          ...captureInput(codexItemInput(item)),
+        });
+      };
+      const emitToolCompleted = (item: any) => {
+        if (!toolTitle(item)) return;
+        emit({
+          ...base(threadId, turnId),
+          type: "item.completed",
+          itemType: "tool",
+          itemId: item.id,
+          ok: item.status !== "failed" && item.status !== "declined",
+          detail: describeResult(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
+          ...captureOutput(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
+        });
+      };
+      /** The main thread's spawn_agent call: which helper thread it started,
+       *  so that helper's steps nest under its row. */
+      const noteHelperSpawn = (item: any) => {
+        if (item?.type !== "collabAgentToolCall" || item.tool !== "spawnAgent" || !Array.isArray(item.receiverThreadIds)) return;
+        for (const receiver of item.receiverThreadIds) {
+          const helperThread = codexNonemptyString.safeParse(receiver);
+          if (helperThread.success && typeof item.id === "string") state.helperParents.set(helperThread.data, item.id);
+        }
+      };
+
       const handleNotification = (msg: any) => {
         const p = msg.params ?? {};
         // Codex runs its helpers (multi_agent) as threads of their own on
@@ -541,6 +595,21 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // helpers and passes, as does anything before thread/start answers.
         const notifiedThread = codexNonemptyString.safeParse(p.threadId);
         if (notifiedThread.success && state.codexThreadId !== null && notifiedThread.data !== state.codexThreadId) {
+          // A helper's own steps still reach the transcript: in a full-auto
+          // bot its host commands are approved without a card, and a row is
+          // the only record that they ran.  Each nests under the spawn_agent
+          // row that started the helper (or, before that row names the
+          // helper's thread, under the thread itself, which the chat marks
+          // as a helper's step either way).
+          const item = p.item ?? {};
+          if ((msg.method === "item/started" || msg.method === "item/completed") && toolTitle(item)) {
+            if (msg.method === "item/started") {
+              emitToolStarted(item, state.helperParents.get(notifiedThread.data) ?? notifiedThread.data);
+            } else {
+              emitToolCompleted(item);
+            }
+            return;
+          }
           state.foreignThreadNotifications++;
           return;
         }
@@ -563,30 +632,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           case "item/started": {
             const item = p.item ?? {};
-            const title =
-              item.type === "commandExecution"
-                ? String(item.command ?? "shell")
-                : item.type === "fileChange"
-                  ? "edit"
-                  : item.type === "mcpToolCall"
-                    ? (item.tool ?? item.name ?? "mcp")
-                    : item.type === "webSearch"
-                      ? "web_search"
-                      : null;
-            if (title) {
-              // the app-server names the file it changed and the query it
-              // searched; a row that says only "edit" makes the reader open
-              // the diff to learn which file
-              emit({
-                ...base(threadId, turnId),
-                type: "item.started",
-                itemType: "tool",
-                itemId: item.id,
-                title,
-                ...toolFields(title, item, { cwd: turn.cwd }),
-                ...captureInput(codexItemInput(item)),
-              });
-            }
+            noteHelperSpawn(item);
+            emitToolStarted(item);
             break;
           }
           case "item/completed": {
@@ -600,16 +647,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
                 state.sawStreamDelta = false;
                 emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text: item.text });
               }
-            } else if (["commandExecution", "fileChange", "mcpToolCall", "webSearch"].includes(item.type)) {
-              emit({
-                ...base(threadId, turnId),
-                type: "item.completed",
-                itemType: "tool",
-                itemId: item.id,
-                ok: item.status !== "failed" && item.status !== "declined",
-                detail: describeResult(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
-                ...captureOutput(item.aggregatedOutput ?? item.output ?? item.result ?? item.error),
-              });
+            } else if (toolTitle(item)) {
+              // a spawn_agent call names the helper's thread by the time it completes
+              noteHelperSpawn(item);
+              emitToolCompleted(item);
             } else if (item.type === "reasoning") {
               emit({ ...base(threadId, turnId), type: "item.updated", itemType: "reasoning", tokens: null });
             }
@@ -983,9 +1024,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
         // Jobs matrix (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md):
-        // BotFleet jobs arrive over MCP in P2.  Native helpers run, but their
-        // threads are kept out of the turn (handleNotification) until P3
-        // shows them as typed Helper cards.
+        // BotFleet jobs arrive over MCP in P2.  Native helpers run; their
+        // steps nest under the spawn_agent row and the rest of their threads
+        // is kept out of the turn (handleNotification).  Typed Helper cards
+        // are P3, so this still reports none.
         backgroundJobs: "none",
         helpers: "none",
       },
