@@ -474,7 +474,28 @@ describe("MiniMax Code reasoning effort over ACP", () => {
     expect(methods).not.toContain("session/prompt");
   });
 
-  it("still completes a no-effort turn when the session keeps its level, since `default` is where it already sits", async () => {
+  it("fails a no-effort turn when the session reports it kept an earlier level, instead of billing it there", async () => {
+    // A resumed session still sitting at `high`: the reset to `default` is
+    // acknowledged but not applied, and the reply says so.  M3.1 is first here,
+    // so no model switch runs and the session keeps its starting level.
+    const rpcDump = join(scratch, "rpc-sticky-default.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([M31, M27]);
+    process.env.FAKE_ACP_REASONING_EFFORTS = "high,default,low,medium,xhigh,max";
+    process.env.FAKE_ACP_REASONING_STICKS = "1";
+    await create();
+
+    const done = await runTurn({ threadId: "mcode-effort-sticky-default", model: "MiniMax-M3.1-Flash-Preview-thinking" });
+
+    expect(done).toMatchObject({ ok: false });
+    expect(errorMessage()).toMatch(
+      /MiniMax Code did not accept thinking effort default for MiniMax-M3\.1-Flash-Preview-thinking: still high/,
+    );
+    const methods: string[] = JSON.parse(readFileSync(rpcDump, "utf8"));
+    expect(methods).not.toContain("session/prompt");
+  });
+
+  it("completes a no-effort turn when the session already sits at default, even if it ignores the set", async () => {
     process.env.FAKE_ACP_REASONING_STICKS = "1";
     await create();
 

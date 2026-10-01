@@ -273,21 +273,22 @@ const support: AcpSupport = {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // An explicit pick the CLI refuses must not quietly run at another level:
-      // that is a paid turn the person did not ask for.  A refused `default`
-      // is harmless, since it is also where a fresh session already sits.
+      // that is a paid turn the person did not ask for.  A refused `default` is
+      // different: -32602 means this session advertises no effort option for
+      // the model, so there is no level for it to be stuck at.
       if (explicit) throw new Error(refused(message));
       console.warn(`[mcode] ${model}: ${refused(message)}`);
       return;
     }
 
     // Only a *reported* mismatch means it did not take: a bare `{}` ACK reports
-    // no option state to compare against.
+    // no option state to compare against.  The mismatch fails the turn for
+    // Default too.  A reply that still reports an earlier level (a resumed
+    // session that kept `high`) proves the reset to `default` failed, and
+    // running anyway would bill the turn at that level, which is the sticky
+    // behaviour sending `default` every turn exists to prevent.
     const confirmed = reportedConfigValue(result, MCODE_EFFORT_CONFIG_ID);
-    if (confirmed !== undefined && confirmed !== value) {
-      const detail = `still ${confirmed}`;
-      if (explicit) throw new Error(refused(detail));
-      console.warn(`[mcode] ${model}: ${refused(detail)}`);
-    }
+    if (confirmed !== undefined && confirmed !== value) throw new Error(refused(`still ${confirmed}`));
   },
 };
 

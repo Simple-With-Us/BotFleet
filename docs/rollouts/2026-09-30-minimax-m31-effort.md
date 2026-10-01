@@ -23,7 +23,7 @@ What does not ship, and why, is in the sections below: no context-window control
 - A model switch resets the effort to `default`.  ACP core already runs the model switch before `configureSession`, so the driver sends the effort after it.
 - The change is session-scoped and never writes `config.yaml`.
 - The driver sends the picked level, or mcode's own literal `default` when none is picked.  `default` goes out **every turn**, so a level picked earlier in a reused or resumed session never sticks, and the owner's MiniMax Code TUI default never leaks into a bot that chose Default.
-- A rejected explicit level (mcode answers -32602), or a reply that reports a different current value, fails the turn with "MiniMax Code did not accept thinking effort `<x>` for `<model>`".  A rejected or mismatched `default` logs a warning and continues, because a fresh session already sits there.
+- A rejected explicit level (mcode answers -32602), or a reply that reports a different current value, fails the turn with "MiniMax Code did not accept thinking effort `<x>` for `<model>`".  That includes Default: a reply that still reports an earlier level (a resumed session that kept `high`) proves the reset failed, and running anyway would bill the turn at that level.  Only a refused `default` (-32602, meaning the session advertises no effort option for the model) logs a warning and continues, since there is no level for it to be stuck at.
 - `none` (and any level the model lacks) is treated as Default with a warning.  M3.1 has no off switch.
 
 ### Direct HTTP Wire
@@ -91,7 +91,7 @@ PR #742 (`ag/minimax-engine-updates`) also edits `STATIC_MCODE_MODELS`.  It adds
 
 All tests use the fake ACP CLI and a stubbed `fetch`.  No live MiniMax request was made, no mcode turn was run with a prompt, and nothing read `~/.minimax/config.yaml` values or `~/.botfleet`.
 
-- `server/drivers/acp/mcode.test.ts`: M3.1 sends the picked level after the model switch, Default sends `default` every turn, M2.7 sends no call, a session that keeps another level fails the turn, an unadvertised level fails with the level named, `none` degrades to Default, a refused `default` only logs.
+- `server/drivers/acp/mcode.test.ts`: M3.1 sends the picked level after the model switch, Default sends `default` every turn, M2.7 sends no call, a session that keeps another level fails the turn, an unadvertised level fails with the level named, `none` degrades to Default, a session that reports it kept an earlier level fails a Default turn too, and a refused `default` only logs.
 - `server/drivers/minimax.test.ts`: `reasoning_effort` on every round including a tool round, absent for Default, `none`, M2.7 and the utility call, `refreshModels` keeps M3.1's levels and gives an unknown id none.
 - `src/lib/model-effort.test.ts` and `server/model-fallback.test.ts`: picker levels for both engines, DSH MiniMax rule unchanged, unattended runs stamp Low.
 - The fake ACP CLI gained `FAKE_ACP_REASONING_CONFIG_ID` and `FAKE_ACP_REASONING_MODELS`, backward compatible (documented in its header).
