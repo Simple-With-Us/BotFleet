@@ -24,6 +24,7 @@
 // with a string the MODEL reads, so a broken tool is one more thing the
 // agent can reason about rather than a dead turn.
 
+import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 import { looksSensitive } from "../auto-approve.ts";
@@ -42,6 +43,7 @@ import {
   type AgentToolExecutor,
 } from "./agents.ts";
 import { createComputerTools } from "./computer.ts";
+import { createJobTools, type JobToolsOptions } from "./jobs.ts";
 import { TurnProcessGroups } from "./process-group.ts";
 import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
@@ -98,6 +100,13 @@ export interface TurnToolHostContext {
   /** Optional dependency injection for the voice-message executor, used by
    *  tests; absent falls back to the first-party hosted TTS driver. */
   linqDeps?: Partial<LinqToolDeps>;
+  /** The background job tools for this turn (jobs P1).  Present exactly when
+   *  the dispatch offered them in the catalog — the same one boolean feeds
+   *  both, so a job tool the model was not offered finds no executor here. */
+  jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "maxWaitSeconds" | "turnId">;
+  /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
+   *  tool loop drains them between model rounds. */
+  drainNotices?: () => string[];
   /** Ceiling on model-to-tool rounds; absent = the driver's default. */
   maxRounds?: number;
   /** The harness's permission broker, already bound to this turn's bot and
@@ -187,6 +196,17 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     // run them must stay driven by the one `localComputer` boolean —
     // a separate flag here could only drift from the registry's gate.
     ...(ctx.localComputer ? Object.entries(createGithubTools(ctx.botId)) : []),
+    // Jobs run where bash runs: the turn's working folder on this host.
+    ...(ctx.jobs
+      ? Object.entries(
+          createJobTools({
+            ...ctx.jobs,
+            botId: ctx.botId,
+            threadId: ctx.threadId,
+            cwd: ctx.cwd && existsSync(ctx.cwd) ? ctx.cwd : process.cwd(),
+          }),
+        )
+      : []),
     ...(ctx.linq
       ? Object.entries(
           createLinqTools(
@@ -233,6 +253,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
     // same boolean the executor merge above already keys off.
     github: Boolean(ctx.localComputer),
     linq: Boolean(ctx.linq),
+    jobs: Boolean(ctx.jobs),
   };
   // The same gate the catalog handed the model.  A hallucinated name, or a
   // real name the model was not offered this turn, finds no executor.
@@ -246,6 +267,7 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
   return {
     maxRounds: ctx.maxRounds,
     requestApproval: ctx.requestApproval,
+    drainNotices: ctx.drainNotices,
     settle() {
       // The lost-job detector: a command that returned, or was stopped,
       // while something it started kept running.  Nothing will report on
@@ -296,7 +318,9 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
           };
           // This executor invokes bash on the host, never in a VM. Scope
           // host-computer approvals independently of the model's arguments.
-          if (call.name === "bash" && ctx.localComputer) request.approvalScope = "local-computer";
+          // A background job is a host shell too, under its own `job:`
+          // approval namespace (server/auto-approve.ts).
+          if ((call.name === "bash" || call.name === "job_start") && ctx.localComputer) request.approvalScope = "local-computer";
           const verdict: RequestOutcome = await runtime.requestApproval(request);
           if (verdict !== "allowed-once") {
             // A refusal the MODEL reads, so the turn continues and the

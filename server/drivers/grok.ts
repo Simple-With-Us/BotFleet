@@ -377,9 +377,9 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,
-          // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
-          // stay `delegate_bot`.
-          backgroundJobs: "none",
+          // Jobs matrix: BotFleet's own job tools run in this loop (P1,
+          // server/tools/jobs.ts); helpers stay `delegate_bot`.
+          backgroundJobs: "emulated",
           helpers: "none",
         },
         sendTurn,

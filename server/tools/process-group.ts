@@ -184,8 +184,10 @@ if (POSIX) {
   });
 }
 
-/** Whether the process `pid` started within LEADER_START_SLACK_MS of `at`. */
-function startedNear(pid: number, at: number): Promise<boolean> {
+/** Whether the process `pid` started within LEADER_START_SLACK_MS of `at`.
+ * Exported for the jobs registry (server/jobs/registry.ts), which checks a
+ * recorded job leader the same way at boot. */
+export function startedNear(pid: number, at: number): Promise<boolean> {
   return new Promise((resolve) => {
     // the start time only: never a command line, which can carry credentials
     execFile("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C" }, timeout: 5_000 }, (error, stdout) => {

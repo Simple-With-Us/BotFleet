@@ -882,6 +882,21 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         stopReasonOverride = suspended.stopReason;
         break;
       }
+
+      // Between rounds, before the next model call: anything the harness is
+      // holding for this turn — a background job that just ended — goes in
+      // as one more user message, so the model reads it before it decides
+      // what to do next (and does not start the same work again).  Appended,
+      // never spliced, so the prefix the provider already saw is unchanged.
+      let notices: string[] = [];
+      try {
+        notices = deps.toolHost?.drainNotices?.() ?? [];
+      } catch (error) {
+        console.error("tool host notice drain failed", error);
+      }
+      if (notices.length > 0) {
+        messages.push({ role: "user", content: `[BotFleet notice]\n${notices.join("\n")}` });
+      }
     }
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e));

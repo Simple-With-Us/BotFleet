@@ -108,6 +108,11 @@ export function unattendedModelDowngrade(
   },
 ): ModelSelection {
   if (opts.hasExplicitSelection) return selection;
+  // A background job's wake turn is unattended — spend-ceiling accounting and
+  // the untrusted-data boundary — but keeps the bot's own model (owner
+  // ruling b, 2026-10-01): the bot is finishing work it chose, on the model
+  // it chose it with.
+  if (opts.automationSource === "job") return selection;
   const automated =
     Boolean(opts.unattended) ||
     opts.automationSource === "webhook" ||
@@ -394,7 +399,7 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
 
 export interface BootRecoveryResumeUser {
   role?: string;

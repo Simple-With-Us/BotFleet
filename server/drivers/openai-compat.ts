@@ -571,7 +571,8 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,
-          backgroundJobs: "none",
+          // BotFleet's own job tools run in this loop (jobs P1).
+          backgroundJobs: "emulated",
           helpers: "none",
         },
         sendTurn,
