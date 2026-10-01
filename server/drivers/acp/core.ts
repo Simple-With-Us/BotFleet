@@ -588,12 +588,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
        * version — so a timeout can be told apart from a missing binary. */
       const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
         new Promise<{ version: string | null; error: Error | null; elapsedMs: number }>((resolve) => {
+          // Its place among overlapping probes: taken before the process starts,
+          // so a slow older probe cannot replace what a newer one remembered.
+          const order = lastKnownVersion.begin();
           const startedAt = Date.now();
           execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
             const trimmed = err ? null : stdout.trim();
             const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
-              lastKnownVersion.record(trimmed);
+              lastKnownVersion.record(trimmed, order);
               resolve({ version: trimmed, error: null, elapsedMs });
             } else {
               logProbeFailure(input.instanceId, `${effective.cli} --version`, err, elapsedMs);
@@ -607,7 +610,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                 elapsedMs,
                 20000,
               );
-              if (failure.kind !== "transient") lastKnownVersion.forget();
+              if (failure.kind !== "transient") lastKnownVersion.forget(order);
               resolve({ version: failure.kind === "transient" ? lastKnownVersion.get() : null, error: err, elapsedMs });
             }
           });

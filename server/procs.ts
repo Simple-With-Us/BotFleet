@@ -22,6 +22,35 @@ import {
  * fresh. */
 export const KNOWN_VERSION_MAX_AGE_MS = 30 * 60_000;
 
+/** One instant read off both clocks.  `wall` is the system clock: it counts
+ * the time a sleeping Mac was out, but it jumps when the clock is corrected.
+ * `mono` is monotonic: a correction cannot move it, but it can stop while
+ * the Mac sleeps.  Neither alone is a safe way to ask how old an answer is. */
+export interface ClockReading {
+  wall: number;
+  mono: number;
+}
+
+export function readClock(): ClockReading {
+  return { wall: Date.now(), mono: performance.now() };
+}
+
+/** A reading as of an earlier wall-clock time — one read back from disk — with
+ * its monotonic half placed the same distance behind `now`, so it ages the way
+ * the wall clock says it should.  A time in the future ages from now. */
+export function clockReadingAt(wall: number, now: ClockReading = readClock()): ClockReading {
+  return { wall, mono: now.mono - Math.max(0, now.wall - wall) };
+}
+
+/** How long ago `then` was: the larger of what the two clocks say.  The wall
+ * clock catches a Mac that slept; the monotonic one catches a wall clock
+ * corrected backwards, which would otherwise call an old answer young (or
+ * give it a negative age) and keep it standing past its limit.  Over-counting
+ * is the safe direction: a remembered answer expires early, never late. */
+export function elapsedSince(then: ClockReading, now: ClockReading = readClock()): number {
+  return Math.max(now.wall - then.wall, now.mono - then.mono);
+}
+
 /** How long past a probe's soft `timeout` execCli waits for stdio to close before forcing the callback. */
 const HARD_EXEC_GRACE_MS = 2_000;
 /** A deadline timer this late means the event loop was stalled. */
@@ -220,34 +249,65 @@ export function isProbeTimeout(err: unknown): boolean {
  * for a later probe that gets no answer (a busy Mac, not a verdict).  It is
  * only good for KNOWN_VERSION_MAX_AGE_MS after the CLI last actually
  * answered: past that, the probe's own "did not answer" stands, so a CLI that
- * has wedged for good stops living on its last answer for ever. */
+ * has wedged for good stops living on its last answer for ever.
+ *
+ * Probes of one CLI overlap, and one that started earlier can settle later.
+ * A probe takes its place in line with `begin()` BEFORE it spawns and hands
+ * that number back with its answer; an answer (or a definitive failure) from
+ * a probe that started before one already heard from is dropped, so a slow
+ * old probe cannot put back what a newer one replaced. */
 export class LastKnownAnswer<T> {
   private held: { value: T } | null = null;
-  private confirmedAt = 0;
+  private confirmedAt: ClockReading = { wall: 0, mono: 0 };
+  /** Start order of the newest probe that has reported (an answer or a
+   * definitive failure). */
+  private newest = 0;
+  private started = 0;
   // Plain fields, not parameter properties: the harness runs this file under
   // Node's type stripping, which rejects those.
   private readonly maxAgeMs: number;
   private readonly now: () => number;
+  private readonly mono: () => number;
 
-  constructor(maxAgeMs: number = KNOWN_VERSION_MAX_AGE_MS, now: () => number = () => Date.now()) {
+  constructor(
+    maxAgeMs: number = KNOWN_VERSION_MAX_AGE_MS,
+    now: () => number = () => Date.now(),
+    mono: () => number = () => performance.now(),
+  ) {
     this.maxAgeMs = maxAgeMs;
     this.now = now;
+    this.mono = mono;
   }
 
-  /** The CLI answered this. */
-  record(value: T): void {
+  private reading(): ClockReading {
+    return { wall: this.now(), mono: this.mono() };
+  }
+
+  /** A probe is about to start: its place in line. */
+  begin(): number {
+    return ++this.started;
+  }
+
+  /** The CLI answered this.  `order` is the probe's `begin()`; left out, the
+   * answer counts as from a probe that has only just started. */
+  record(value: T, order: number = this.begin()): void {
+    if (order < this.newest) return;
+    this.newest = order;
     this.held = { value };
-    this.confirmedAt = this.now();
+    this.confirmedAt = this.reading();
   }
 
-  /** The CLI gave a definitive failure: nothing to stand on any more. */
-  forget(): void {
+  /** The CLI gave a definitive failure: nothing to stand on any more.  A
+   * failure from a probe older than one already heard from is stale news. */
+  forget(order: number = this.begin()): void {
+    if (order < this.newest) return;
+    this.newest = order;
     this.held = null;
   }
 
   /** The remembered answer while it may still stand in, else null. */
   get(): T | null {
-    if (this.held && this.now() - this.confirmedAt > this.maxAgeMs) this.held = null;
+    if (this.held && elapsedSince(this.confirmedAt, this.reading()) > this.maxAgeMs) this.held = null;
     return this.held ? this.held.value : null;
   }
 }

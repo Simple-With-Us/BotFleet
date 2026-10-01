@@ -933,6 +933,9 @@ export const PiDriver: ProviderDriver<PiConfig> = {
     // Mac does not flip a working pi to "not installed".
     const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
         let child: ReturnType<typeof spawnCli>;
@@ -978,7 +981,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       });
       let version = probed.version;
       if (version) {
-        lastKnownVersion.record(version);
+        lastKnownVersion.record(version, versionOrder);
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
@@ -989,7 +992,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // version.  A missing or broken binary is a verdict.
           version = remembered;
         } else {
-          if (failure.kind !== "transient") lastKnownVersion.forget();
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
           return failure.kind === "transient"
             ? { state: "unavailable", transient: true, reason: failure.reason }
             : { state: "unavailable", reason: failure.reason };

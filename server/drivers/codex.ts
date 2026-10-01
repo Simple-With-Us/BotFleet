@@ -862,6 +862,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
   const engineLabel = input.displayName || "Codex";
   const snapshot = async (): Promise<ProviderSnapshot> => {
     const env = childEnv();
+    // Its place among overlapping probes: taken before the process starts,
+    // so a slow older probe cannot replace what a newer one remembered.
+    const versionOrder = lastKnownVersion.begin();
     const startedAt = Date.now();
     const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
       execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
@@ -870,7 +873,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
     let version = probed.version;
     if (version) {
-      lastKnownVersion.record(version);
+      lastKnownVersion.record(version, versionOrder);
     } else {
       const elapsed = Date.now() - startedAt;
       logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
@@ -881,7 +884,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // version.  A missing or crashing binary is a verdict.
         version = remembered;
       } else {
-        if (failure.kind !== "transient") lastKnownVersion.forget();
+        if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
         return failure.kind === "transient"
           ? { state: "unavailable", transient: true, reason: failure.reason }
           : { state: "unavailable", reason: failure.reason };
@@ -891,6 +894,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     if (match && (parseInt(match[1]) === 0 && parseInt(match[2]) < 151)) {
       return { state: "unavailable", reason: `Codex CLI is out of date (needs 0.151.0+). Run \`npm install -g @openai/codex\`` };
     }
+    const authOrder = lastKnownAuth.begin();
     const authStartedAt = Date.now();
     const probedAuth = await new Promise<boolean | undefined>((resolve) => {
       execCli(config.cli, ["login", "status"], { timeout: 20000, env }, (err, stdout, stderr) => {
@@ -899,7 +903,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         resolve(answer);
       });
     });
-    if (probedAuth !== undefined) lastKnownAuth.record(probedAuth);
+    if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
     // childEnv drops OPENAI_API_KEY on purpose — turns run on the ChatGPT login
     return { state: "available", version, authenticated: probedAuth ?? lastKnownAuth.get() ?? undefined, billing: "subscription" };
   };

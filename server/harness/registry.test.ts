@@ -1856,4 +1856,183 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     expect(fake.snapshotCalls).toBe(2);
     await registry.disposeAll();
   });
+
+  it("never makes a request wait on, or take its answer from, a sweep older than the reload it came after", async () => {
+    const gateA = deferred<void>();
+    const gateB = deferred<void>();
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => {
+        if (call === 2) await gateA.promise;
+        if (call === 3) await gateB.promise;
+        return { state: "available", version: `v${call}` };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+    await registry.load({ a: { driver: "fake" } });
+    await registry.describe();
+    await tick();
+
+    // A background sweep (#2) is stuck, and the user's "Check again" queues a
+    // trailing sweep behind it.
+    void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+    await tick();
+    const beforeReload = registry.describe();
+    // A Settings change reloads the engine; the next "Check again" starts the
+    // new fleet's own sweep (#3), which is also stuck.
+    await registry.reloadInstance("a", { driver: "fake" });
+    const duringReload = registry.describe();
+    await tick();
+    // A third "Check again" arrives AFTER sweep #3 began.  Sweep #2 belongs to
+    // the fleet that was reloaded, so it is not the one to wait for, and #3
+    // began before this request, so it is not the answer.
+    const afterSweepBegan = registry.describe();
+    gateB.resolve();
+    const answer = await Promise.race([afterSweepBegan, tick(500).then(() => "timeout" as const)]);
+    expect(answer).not.toBe("timeout");
+    expect((answer as Awaited<typeof afterSweepBegan>)[0].snapshot.version).toBe("v4");
+    expect((await duringReload)[0].snapshot.version).toBe("v3");
+    // The request queued before the reload is answered too, once sweep #2 lets go.
+    gateA.resolve();
+    await beforeReload;
+    await registry.disposeAll();
+  });
+
+  it("starts a shared trailing sweep no earlier than the latest request it answers", async () => {
+    const gateA = deferred<void>();
+    const gateB = deferred<void>();
+    const calls: Record<string, number> = { a: 0, b: 0 };
+    const fake = makeFakeDriver({
+      snapshotImpl: async (input) => {
+        const id = input.instanceId;
+        const n = ++calls[id];
+        if (id === "a" && n === 2) await gateA.promise;
+        if (id === "b" && n === 2) await gateB.promise;
+        return { state: "available", version: `${id}${n}` };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], {
+      probeConcurrency: 1,
+      entryDeadlineMs: 400,
+      transientRecheckMs: 0,
+    });
+    await registry.load({ a: { driver: "fake" }, b: { driver: "fake" } });
+    await registry.describe();
+    await tick();
+
+    // A background sweep is stuck on a; the first "Check again" queues behind it.
+    void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+    await tick();
+    const first = registry.describe();
+    // The sweep moves on to b, whose probe then hangs...
+    gateA.resolve();
+    await tick();
+    // ...and a second "Check again" arrives after that probe began.  It shares
+    // the queued sweep, which must therefore not adopt that older probe.
+    const second = registry.describe();
+    await tick(600);
+    const [one, two] = await Promise.all([first, second]);
+    expect(two).toBe(one);
+    expect(two.find((row) => row.instanceId === "b")?.snapshot.version).toBe("b3");
+    gateB.resolve();
+    await registry.disposeAll();
+  });
+
+  it("queues a sweep that starts after the caller instead of joining one older than maxAgeMs", async () => {
+    const gate = deferred<void>();
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => {
+        if (call === 2) await gate.promise;
+        return { state: "available", version: `v${call}` };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+    await registry.load({ a: { driver: "fake" } });
+    await registry.describe();
+    await tick();
+    // A long sweep is running, and the last completed answer is stale too.
+    void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+    await tick(80);
+    // The automatic fallback accepts an answer at most 50 ms old.  The running
+    // sweep began before that, so it may have probed an engine before a
+    // recent install or sign-in.
+    const decided = registry.describe({ maxAgeMs: 50 });
+    gate.resolve();
+    expect((await decided)[0].snapshot.version).toBe("v3");
+    expect(fake.snapshotCalls).toBe(3);
+    await registry.disposeAll();
+  });
+
+  it("keeps the last definitive snapshot when snapshot() throws for an engine whose own cli override is present", async () => {
+    const tmpDir = join(tmpdir(), `bf-cli-override-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tmpDir, { recursive: true });
+    const fakeBin = join(tmpDir, "fake-cli");
+    writeFileSync(fakeBin, "#!/usr/bin/env node\nprocess.exit(0)\n", { mode: 0o755 });
+    try {
+      const fake = makeFakeDriver({
+        // The default command is nowhere on PATH, so no engine has default candidates.
+        defaultConfig: { cli: "botfleet-no-such-cli-for-tests" },
+        snapshotImpl: (_input, call) => {
+          if (call > 3) throw new Error("describe blew up");
+          return { state: "available", version: "1.0.0" };
+        },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({
+        // An absolute override that exists, a bare name found on PATH, and an
+        // override that is not there.
+        path: { driver: "fake", config: { cli: fakeBin } },
+        bare: { driver: "fake", config: { cli: "node" } },
+        missing: { driver: "fake", config: { cli: join(tmpDir, "gone") } },
+      });
+      const first = await registry.describe();
+      expect(first.map((row) => row.snapshot.state)).toEqual(["available", "available", "available"]);
+      expect(first.every((row) => row.cliCandidates.length === 0)).toBe(true);
+      const second = await registry.describe();
+      const byId = Object.fromEntries(second.map((row) => [row.instanceId, row.snapshot]));
+      // The CLI is still there: an error is not a verdict.
+      expect(byId.path).toMatchObject({ state: "available", version: "1.0.0" });
+      expect(byId.bare).toMatchObject({ state: "available", version: "1.0.0" });
+      // Nothing to stand on: the failure shows.
+      expect(byId.missing).toMatchObject({ state: "unavailable", reason: "describe blew up" });
+      await registry.disposeAll();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stops standing a baseline in for a probe 30 minutes on, even if the wall clock was corrected backwards", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let mono = 1_000;
+    const monoSpy = vi.spyOn(performance, "now").mockImplementation(() => mono);
+    try {
+      const start = Date.now();
+      const fake = makeFakeDriver({
+        snapshotImpl: (_input, call) =>
+          call === 1
+            ? { state: "available", version: "1.0.0" }
+            : { state: "unavailable", transient: true, reason: "Fake did not answer in time" },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      expect((await registry.describeFresh())[0].snapshot.state).toBe("available");
+
+      // An hour back, then ten real minutes: the baseline is that old and
+      // still stands in for a probe that gave no answer.
+      vi.setSystemTime(start - 60 * 60_000 + 10 * 60_000);
+      mono += 10 * 60_000;
+      const young = (await registry.describeFresh())[0].snapshot;
+      expect(young.state).toBe("available");
+      expect(young.transient).toBeUndefined();
+
+      // Thirty-one real minutes since it answered, though the wall clock still
+      // reads as before it answered: a negative age must not keep it alive.
+      vi.setSystemTime(start - 60 * 60_000 + 31 * 60_000);
+      mono += 21 * 60_000;
+      const old = (await registry.describeFresh())[0].snapshot;
+      expect(old).toMatchObject({ state: "unavailable", transient: true });
+    } finally {
+      monoSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

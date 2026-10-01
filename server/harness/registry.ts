@@ -12,7 +12,7 @@ import { windowHeadlines, windowsLabelFromHeadlines } from "../../src/lib/quota-
 import { lastAntigravityQuotaSnapshot, quotaModelsFromSnapshot } from "../antigravity-quota.ts";
 import { decodeMinimaxConfig, resolveMinimaxCredentials, type MinimaxConfig } from "../drivers/minimax.ts";
 import { findCliCandidates } from "../env-path.ts";
-import { KNOWN_VERSION_MAX_AGE_MS } from "../procs.ts";
+import { clockReadingAt, elapsedSince, KNOWN_VERSION_MAX_AGE_MS, readClock, type ClockReading } from "../procs.ts";
 import { applyMiniMaxBalanceToRegistry, getCachedLocalMiniMaxConfig, getMiniMaxBalance } from "../minimax-balance.ts";
 import { quotaCooldowns } from "../model-fallback.ts";
 import { computerReach, type ComputerReach } from "../computer-capability.ts";
@@ -165,6 +165,19 @@ function cliDefaultOf(driver: AnyProviderDriver | undefined): string | undefined
     return typeof cfg?.cli === "string" ? cfg.cli : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** Whether an instance's own `cli` override names something that is there: an
+ * absolute path that exists, or a bare name found on the augmented PATH.  The
+ * default binary's candidates (`cliCandidates`) say nothing about it: a custom
+ * engine pointed at a working binary off PATH has none. */
+function cliOverridePresent(cli: string | undefined): boolean {
+  if (!cli) return false;
+  try {
+    return /[/\\]/.test(cli) || /^[a-zA-Z]:/.test(cli) ? existsSync(cli) : findCliCandidates(cli).length > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -419,7 +432,11 @@ export class ProviderRegistry {
    *    started earlier: it queues one trailing sweep instead. */
   private lastDone: { at: number; result: DescribedInstance[] } | null = null;
   private inFlight: { startedAt: number; generation: string; promise: Promise<DescribedInstance[]> } | null = null;
-  private trailing: { createdAt: number; promise: Promise<DescribedInstance[]> } | null = null;
+  /** The sweep queued behind the running one for callers who must not be
+   *  answered from before they asked.  `floor` is the latest request among
+   *  everyone sharing it (the sweep it becomes starts no earlier), and `key`
+   *  is the fleet it was queued for: after a reload it is no one's to join. */
+  private trailing: { floor: number; key: string; promise: Promise<DescribedInstance[]> } | null = null;
   /** Bumped when the fleet itself changes (load, removeInstance). */
   private generation = 0;
   /** Bumped when ONE instance is reloaded.  A sweep that started before it
@@ -436,7 +453,17 @@ export class ProviderRegistry {
   private entryProbes = new Map<InstanceId, { startedAt: number; seq: number; gen: string; promise: Promise<DescribedInstance> }>();
   /** The last definitive answer per engine — never a timeout — which an
    * inconclusive probe falls back to, field by field. */
-  private lastDefinitive = new Map<InstanceId, { at: number; seq: number; info: DescribedInstance; authAt: number }>();
+  private lastDefinitive = new Map<
+    InstanceId,
+    {
+      seq: number;
+      info: DescribedInstance;
+      /** When the baseline was taken, and when its sign-in was last really
+       *  answered, on both clocks (see procs.ts elapsedSince). */
+      born: ClockReading;
+      authBorn: ClockReading;
+    }
+  >();
   /** The newest settled describe per instance, so a sweep that finishes after
    * a single-engine refresh (or a late probe) never puts an older answer back. */
   private latestSettled = new Map<InstanceId, { at: number; seq: number; gen: string; info: DescribedInstance }>();
@@ -524,7 +551,8 @@ export class ProviderRegistry {
         // must not look fresh to the DEFINITIVE_MAX_AGE_MS check.
         for (const info of instances as DescribedInstance[]) {
           if (info?.snapshot?.state === "available" && !info.snapshot.transient && !this.lastDefinitive.has(info.instanceId)) {
-            this.lastDefinitive.set(info.instanceId, { at, seq: 0, info, authAt: at });
+            const born = clockReadingAt(at);
+            this.lastDefinitive.set(info.instanceId, { seq: 0, info, born, authBorn: born });
           }
         }
       }
@@ -580,9 +608,11 @@ export class ProviderRegistry {
       return done.result;
     }
 
-    // Accepts an answer up to maxAge old: a sweep already running is at
-    // least that fresh.
-    if (maxAge > 0) return this.ensureSweep();
+    // Accepts an answer up to maxAge old.  A sweep that began within that is
+    // joined; an older one (a long sweep on a busy Mac) may have probed an
+    // engine before a recent install or sign-in, so a sweep that starts after
+    // this call is queued behind it instead.
+    if (maxAge > 0) return this.freshSweep(now - maxAge);
 
     // No memo at all: the user's own action ("Check again", a just-created
     // or just-deleted engine) must never be served a sweep that started
@@ -604,21 +634,38 @@ export class ProviderRegistry {
     // reloaded: start now.
     if (!running || running.generation !== this.sweepKey()) return this.startSweep(requestedAt);
     if (running.startedAt >= requestedAt) return running.promise;
-    if (!this.trailing) {
-      const createdAt = this.stamp();
-      const promise: Promise<DescribedInstance[]> = running.promise
+    // A trailing sweep is shared only while it still belongs to this fleet:
+    // one queued before a reload waits on the previous fleet's sweep, and the
+    // sweep that has since started for the new fleet began before this caller
+    // asked.  A sharer raises the floor, so the sweep that finally runs starts
+    // no earlier than the latest request it answers: its probes cannot join
+    // one that began before that caller asked.
+    const key = this.sweepKey();
+    const queued = this.trailing;
+    if (queued && queued.key === key) {
+      queued.floor = Math.max(queued.floor, requestedAt);
+      return queued.promise;
+    }
+    const slot: { floor: number; key: string; promise: Promise<DescribedInstance[]> } = {
+      floor: requestedAt,
+      key,
+      promise: running.promise
         .then(() => undefined, () => undefined)
         .then(() => {
-          if (this.trailing?.promise === promise) this.trailing = null;
+          if (this.trailing === slot) this.trailing = null;
+          // A trailing sweep queued since for the current fleet starts after
+          // everyone this one answers asked: it answers them too.
+          const newer = this.trailing;
+          if (newer && newer.key === this.sweepKey()) return newer.promise;
           // Something else started a sweep after every caller sharing this
           // trailing one asked: that sweep already answers them.
           const now = this.inFlight;
-          if (now && now.startedAt >= createdAt && now.generation === this.sweepKey()) return now.promise;
-          return this.startSweep(createdAt);
-        });
-      this.trailing = { createdAt, promise };
-    }
-    return this.trailing.promise;
+          if (now && now.startedAt >= slot.floor && now.generation === this.sweepKey()) return now.promise;
+          return this.startSweep(slot.floor);
+        }),
+    };
+    this.trailing = slot;
+    return slot.promise;
   }
 
   private startSweep(notBefore: number): Promise<DescribedInstance[]> {
@@ -894,7 +941,13 @@ export class ProviderRegistry {
         // gave no answer) keeps the age of the answer that set it, so
         // repeated auth timeouts cannot renew an old verdict for ever.
         const borrowedAuth = raw.snapshot.authenticated === undefined && typeof info.snapshot.authenticated === "boolean";
-        this.lastDefinitive.set(raw.instanceId, { at, seq, info, authAt: borrowedAuth && baseline ? baseline.authAt : at });
+        const born = readClock();
+        this.lastDefinitive.set(raw.instanceId, {
+          seq,
+          info,
+          born,
+          authBorn: borrowedAuth && baseline ? baseline.authBorn : born,
+        });
       }
     }
     const latest = this.latestSettled.get(raw.instanceId);
@@ -917,18 +970,22 @@ export class ProviderRegistry {
     opts: { keepPreviousQuota?: boolean } = {},
   ): DescribedInstance {
     const record = this.lastDefinitive.get(curr.instanceId);
-    const now = Date.now();
-    if (!record || now - record.at > DEFINITIVE_MAX_AGE_MS) return curr;
+    // Aged on both clocks, so a wall clock corrected backwards cannot keep a
+    // baseline standing past its limit.
+    const now = readClock();
+    if (!record || elapsedSince(record.born, now) > DEFINITIVE_MAX_AGE_MS) return curr;
     const prev = record.info;
     if (prev.driverKind !== curr.driverKind || (prev.enabled !== false) !== (curr.enabled !== false)) return curr;
     // Whether the baseline's sign-in is still young enough to stand in: it
     // ages from the probe that actually answered it, not from later probes
     // that only borrowed it.
-    const authFresh = now - record.authAt <= DEFINITIVE_MAX_AGE_MS;
+    const authFresh = elapsedSince(record.authBorn, now) <= DEFINITIVE_MAX_AGE_MS;
+    // A snapshot() that threw is an error, not a verdict, while the CLI is
+    // still there: the default binary on PATH, or the instance's own override.
     const thrown =
       this.thrownSnapshots.has(curr.snapshot) &&
       prev.snapshot.state === "available" &&
-      curr.cliCandidates.length > 0;
+      (curr.cliCandidates.length > 0 || cliOverridePresent(curr.cli));
     if (curr.snapshot.transient || thrown) {
       // Quota (cooldowns, windows) was computed for THIS describe; only a
       // deadline fallback, which computed none, borrows the old one.

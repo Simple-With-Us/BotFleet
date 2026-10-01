@@ -1472,6 +1472,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
       const startedAt = Date.now();
       const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
         execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
@@ -1480,7 +1483,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       });
       let version = probed.version;
       if (version) {
-        lastKnownVersion.record(version);
+        lastKnownVersion.record(version, versionOrder);
       } else {
         const elapsed = Date.now() - startedAt;
         logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
@@ -1491,7 +1494,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // version.  A missing or crashing binary is a verdict.
           version = remembered;
         } else {
-          if (failure.kind !== "transient") lastKnownVersion.forget();
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
           return failure.kind === "transient"
             ? { state: "unavailable", transient: true, reason: failure.reason }
             : { state: "unavailable", reason: failure.reason };
@@ -1507,8 +1510,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           reason: CLAUDE_ISOLATION_REASON,
         };
       }
+      const authOrder = lastKnownAuth.begin();
       const probedAuth = await claudeSignedIn(config.cli, env);
-      if (probedAuth !== undefined) lastKnownAuth.record(probedAuth);
+      if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
       // Only as old as KNOWN_VERSION_MAX_AGE_MS: past that, unknown.
       const authenticated = probedAuth ?? lastKnownAuth.get() ?? undefined;
       // claudeEnvironment strips ANTHROPIC_API_KEY, so turns run on the

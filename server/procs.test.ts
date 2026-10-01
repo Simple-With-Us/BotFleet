@@ -5,7 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { classifyVersionProbeFailure, execCli, isProbeTimeout, KNOWN_VERSION_MAX_AGE_MS, LastKnownAnswer } from "./procs.ts";
+import {
+  classifyVersionProbeFailure,
+  clockReadingAt,
+  elapsedSince,
+  execCli,
+  isProbeTimeout,
+  KNOWN_VERSION_MAX_AGE_MS,
+  LastKnownAnswer,
+} from "./procs.ts";
 
 type Result = { err: (Error & { timedOut?: boolean; killed?: boolean }) | null; stdout: string };
 
@@ -231,5 +239,100 @@ describe("LastKnownAnswer", () => {
     remembered.record("1.0.0");
     remembered.forget();
     expect(remembered.get()).toBeNull();
+  });
+
+  it("drops an older probe's answer that settles after a newer probe's", () => {
+    const remembered = new LastKnownAnswer<string>(60_000, () => 0);
+    // Two overlapping probes: the first starts earlier and is slow.
+    const older = remembered.begin();
+    const newer = remembered.begin();
+    remembered.record("2.0.0", newer);
+    remembered.record("1.0.0", older);
+    // A later timeout borrows the newer answer, never the old one put back.
+    expect(remembered.get()).toBe("2.0.0");
+  });
+
+  it("keeps an older probe's answer when no newer probe has reported yet", () => {
+    const remembered = new LastKnownAnswer<string>(60_000, () => 0);
+    const older = remembered.begin();
+    remembered.begin();
+    remembered.record("1.0.0", older);
+    expect(remembered.get()).toBe("1.0.0");
+  });
+
+  it("ignores an older probe's definitive failure after a newer probe answered", () => {
+    const remembered = new LastKnownAnswer<string>(60_000, () => 0);
+    const older = remembered.begin();
+    const newer = remembered.begin();
+    remembered.record("2.0.0", newer);
+    remembered.forget(older);
+    expect(remembered.get()).toBe("2.0.0");
+  });
+
+  it("does not let an older probe's answer undo a newer probe's definitive failure", () => {
+    const remembered = new LastKnownAnswer<string>(60_000, () => 0);
+    const older = remembered.begin();
+    const newer = remembered.begin();
+    remembered.forget(newer);
+    remembered.record("1.0.0", older);
+    expect(remembered.get()).toBeNull();
+    // A probe that starts after the failure is newer than it and counts.
+    remembered.record("3.0.0", remembered.begin());
+    expect(remembered.get()).toBe("3.0.0");
+  });
+
+  it("still expires an answer 30 minutes after it was given when the wall clock is corrected backwards", () => {
+    let wall = 1_000_000;
+    let mono = 5_000;
+    const remembered = new LastKnownAnswer<string>(KNOWN_VERSION_MAX_AGE_MS, () => wall, () => mono);
+    remembered.record("2.1.284");
+    // The system clock is corrected an hour back, then 31 real minutes pass:
+    // the wall clock calls the answer a negative age, the monotonic one does not.
+    wall -= 60 * 60_000;
+    wall += 31 * 60_000;
+    mono += 31 * 60_000;
+    expect(remembered.get()).toBeNull();
+  });
+
+  it("still expires an answer after a Mac slept past its limit, when the monotonic clock stopped", () => {
+    let wall = 0;
+    let mono = 0;
+    const remembered = new LastKnownAnswer<string>(KNOWN_VERSION_MAX_AGE_MS, () => wall, () => mono);
+    remembered.record("2.1.284");
+    wall += 45 * 60_000;
+    expect(remembered.get()).toBeNull();
+  });
+
+  it("keeps an answer inside its limit when the wall clock is corrected backwards", () => {
+    let wall = 1_000_000;
+    let mono = 0;
+    const remembered = new LastKnownAnswer<string>(KNOWN_VERSION_MAX_AGE_MS, () => wall, () => mono);
+    remembered.record("2.1.284");
+    wall -= 10 * 60_000;
+    mono += 5 * 60_000;
+    expect(remembered.get()).toBe("2.1.284");
+  });
+});
+
+describe("elapsedSince", () => {
+  it("is the larger of the wall and monotonic elapsed times", () => {
+    const then = { wall: 1_000, mono: 100 };
+    expect(elapsedSince(then, { wall: 2_000, mono: 150 })).toBe(1_000);
+    expect(elapsedSince(then, { wall: 500, mono: 400 })).toBe(300);
+  });
+
+  it("ages a reading taken from a past wall time by how long ago that was", () => {
+    const now = { wall: 10_000, mono: 7_000 };
+    const reading = clockReadingAt(4_000, now);
+    expect(elapsedSince(reading, now)).toBe(6_000);
+    // The wall clock is then corrected backwards by an hour: it still reads as 6 s plus what passed.
+    expect(elapsedSince(reading, { wall: now.wall - 3_600_000 + 1_000, mono: now.mono + 1_000 })).toBe(7_000);
+  });
+
+  it("ages a timestamp from the future from now, never from a negative age", () => {
+    const now = { wall: 10_000, mono: 7_000 };
+    const reading = clockReadingAt(50_000, now);
+    expect(elapsedSince(reading, now)).toBe(0);
+    expect(elapsedSince(reading, { wall: 10_500, mono: 7_500 })).toBe(500);
   });
 });
