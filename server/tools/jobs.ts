@@ -15,6 +15,8 @@
 // Output a job printed is data, never instructions.  `job_output` says so in
 // the result itself, the same boundary a webhook's payload sits inside.
 
+import { z } from "zod";
+
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import {
   JOB_ID_PATTERN,
@@ -52,22 +54,20 @@ export interface JobToolsOptions {
 
 const fail = (content: string, detail: string): TurnToolOutcome => ({ kind: "error", content, detail });
 
-/** A model-authored argument as text; anything else is "absent". */
-// A tool argument is `unknown` by contract (the model wrote it), and this is
-// where that contract meets the executor.
-// oxlint-disable-next-line anti-slop/no-unknown-parameters
-function text(argument: unknown): string {
-  return typeof argument === "string" ? argument : "";
-}
+/** A model-authored argument as text; anything else is "absent".  A tool
+ *  argument is `unknown` by contract (the model wrote it), and these two
+ *  schemas are where that contract meets the executor. */
+const TextArgument = z.string().catch("");
 
-/** A model-authored number, or undefined when it is not a usable one. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters
-function count(argument: unknown): number | undefined {
-  const value = typeof argument === "string" && argument.trim() ? Number(argument) : argument;
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
+/** A model-authored number (or numeric string), or undefined when it is not
+ *  a usable one. */
+const CountArgument = z.coerce.number().finite().optional().catch(undefined);
 
-export function createJobTools(options: JobToolsOptions): Record<string, JobToolExecutor> {
+const text = (argument: TurnToolCall["arguments"][string]): string => TextArgument.parse(argument);
+const count = (argument: TurnToolCall["arguments"][string]): number | undefined =>
+  argument === undefined || argument === null || argument === "" ? undefined : CountArgument.parse(argument);
+
+export function createJobTools(options: JobToolsOptions) {
   const now = options.now ?? Date.now;
 
   /** The job, when it is this bot's own; otherwise the refusal to return. */
@@ -162,5 +162,5 @@ export function createJobTools(options: JobToolsOptions): Record<string, JobTool
     return { kind: "result", content: `Stopped ${job.id} \`${job.label}\` and every process it started.\n${jobStatusLine(job, now())}` };
   };
 
-  return { job_start: jobStart, job_output: jobOutput, job_list: jobList, job_kill: jobKill };
+  return { job_start: jobStart, job_output: jobOutput, job_list: jobList, job_kill: jobKill } satisfies Record<string, JobToolExecutor>;
 }

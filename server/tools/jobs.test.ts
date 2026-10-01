@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { RequestOutcome } from "../contracts.ts";
+import type { RequestOutcome, TurnToolCall } from "../contracts.ts";
 import { DEFAULT_JOBS_SETTINGS, JobRegistry } from "../jobs/registry.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { createTurnToolHost, type TurnToolHostDeps } from "./host.ts";
@@ -73,7 +73,7 @@ function hostFor(registry: JobRegistry, cwd: string, botId = "bot-self", drainNo
   });
 }
 
-const call = (name: string, args: Record<string, unknown>) => ({ id: `call_${name}`, name, arguments: args });
+const call = (name: string, args: TurnToolCall["arguments"]): TurnToolCall => ({ id: `call_${name}`, name, arguments: args });
 
 /** How many of the job's own `x` bytes a result carries (its words aside). */
 const xs = (content: string) => content.split("\n").filter((line) => /^x+$/.test(line)).join("").length;

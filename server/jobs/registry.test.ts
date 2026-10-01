@@ -27,6 +27,22 @@ interface Harness {
 }
 
 const made: Harness[] = [];
+
+/** One record of the registry's own `jobs.json`, as the tests read it back. */
+interface StoredRecord {
+  id: string;
+  pid: number | null;
+  status: string;
+  notice: string;
+  logPath?: string;
+  [field: string]: string | number | boolean | null | undefined;
+}
+
+function stored(dir: string): StoredRecord[] {
+  // SAFETY: the registry under test wrote this file itself, in this test's
+  // own temp folder, as a JSON array of job records.
+  return JSON.parse(readFileSync(join(dir, "jobs", "jobs.json"), "utf8")) as StoredRecord[];
+}
 const strays: ChildProcess[] = [];
 
 function harness(overrides: Partial<JobRegistryDeps> = {}, dir?: string): Harness {
@@ -34,7 +50,7 @@ function harness(overrides: Partial<JobRegistryDeps> = {}, dir?: string): Harnes
   const frames: JobsFrame[] = [];
   const finished: Harness["finished"] = [];
   const clock = { now: 1_700_000_000_000 };
-  const host = { swap: 50 as number | null, disk: 100 * 1024 ** 3 as number | null, spend: false };
+  const host: Harness["host"] = { swap: 50, disk: 100 * 1024 ** 3, spend: false };
   const settings = { value: { ...DEFAULT_JOBS_SETTINGS } };
   const registry = new JobRegistry({
     dir: join(root, "jobs"),
@@ -228,10 +244,7 @@ posix("running real processes", () => {
     const h = harness();
     const started = start(h, "sleep 30 & sleep 30; wait");
     if (!started.ok) throw new Error(started.error);
-    const pid = await until(() => {
-      const raw = readFileSync(join(h.dir, "jobs", "jobs.json"), "utf8");
-      return (JSON.parse(raw) as Array<{ id: string; pid: number | null }>).find((r) => r.id === started.job.id)?.pid ?? null;
-    });
+    const pid = await until(() => stored(h.dir).find((r) => r.id === started.job.id)?.pid ?? null);
     expect(alive(pid)).toBe(true);
     const killed = await h.registry.kill(started.job.id, "model");
     expect(killed.job?.status).toBe("killed");
@@ -293,12 +306,10 @@ posix("running real processes", () => {
     if (!started.ok) throw new Error(started.error);
     const ended = await until(() => h.finished.find((entry) => entry.job.id === started.job.id));
     expect(ended.job.status).toBe("completed");
-    const record = (JSON.parse(readFileSync(join(h.dir, "jobs", "jobs.json"), "utf8")) as Array<{ id: string; pid: number }>).find(
-      (r) => r.id === started.job.id,
-    )!;
+    const leader = stored(h.dir).find((r) => r.id === started.job.id)!.pid!;
     await until(() => {
       try {
-        process.kill(-record.pid, 0);
+        process.kill(-leader, 0);
         return false;
       } catch {
         return true;
@@ -327,10 +338,10 @@ describe("records", () => {
     expect(kept).toContain(running.job.id);
     expect(kept).not.toContain(ids[0]);
     expect(existsSync(join(h.dir, "jobs", `${ids[0]}.log`))).toBe(false);
-    const stored = JSON.parse(readFileSync(join(h.dir, "jobs", "jobs.json"), "utf8")) as Array<{ id: string; logPath?: string }>;
-    expect(stored).toHaveLength(3);
+    const onDisk = stored(h.dir);
+    expect(onDisk).toHaveLength(3);
     // paths are derived from the id, never persisted; nor is the command
-    expect(JSON.stringify(stored)).not.toContain("logPath");
+    expect(JSON.stringify(onDisk)).not.toContain("logPath");
   });
 
   it("broadcasts one debounced full-set frame per thread, never with output", async () => {
@@ -392,7 +403,7 @@ posix("restart", () => {
     const first = harness({ now: Date.now });
     const live = start(first, "sleep 30");
     if (!live.ok) throw new Error(live.error);
-    const records = JSON.parse(readFileSync(join(first.dir, "jobs", "jobs.json"), "utf8")) as Array<Record<string, unknown>>;
+    const records = stored(first.dir);
     const liveRecord = records.find((r) => r.id === live.job.id)!;
     const leader = Number(liveRecord.pid);
     // Forge two more jobs the "earlier run" left: one whose exit file says 3,
@@ -434,15 +445,10 @@ posix("restart", () => {
     const h = harness();
     const started = start(h, "sleep 30");
     if (!started.ok) throw new Error(started.error);
-    const pid = (JSON.parse(readFileSync(join(h.dir, "jobs", "jobs.json"), "utf8")) as Array<{ id: string; pid: number }>).find(
-      (r) => r.id === started.job.id,
-    )!.pid;
+    const pid = stored(h.dir).find((r) => r.id === started.job.id)!.pid!;
     h.registry.shutdownSync();
     await until(() => !alive(pid));
-    const stored = (JSON.parse(readFileSync(join(h.dir, "jobs", "jobs.json"), "utf8")) as Array<{ id: string; status: string; notice: string }>).find(
-      (r) => r.id === started.job.id,
-    )!;
-    expect(stored).toMatchObject({ status: "lost", notice: "pending" });
+    expect(stored(h.dir).find((r) => r.id === started.job.id)).toMatchObject({ status: "lost", notice: "pending" });
   });
 });
 

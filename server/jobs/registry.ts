@@ -661,7 +661,7 @@ export class JobRegistry {
     const now = this.now();
     const credit = Math.max(0, Math.min(now - this.lastTick, this.tickMs * 2));
     this.lastTick = now;
-    for (const record of [...this.records.values()]) {
+    for (const record of this.records.values()) {
       if (record.status !== "running") continue;
       record.awakeMs += credit;
       this.capLog(record);

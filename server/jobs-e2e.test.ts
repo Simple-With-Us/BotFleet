@@ -23,6 +23,9 @@ import { harnessReady } from "./testing/harness-ready.ts";
 import { freePortBlock } from "./testing/ports.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
+
+/** A JSON request body, as the routes under test accept it. */
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 /** One round that calls `job_start` with this command. */
@@ -52,7 +55,7 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
   const frames: JobsFrame[] = [];
   const stream = new AbortController();
 
-  const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+  const api = async (method: string, path: string, body?: Json): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${base}${path}`, {
       method,
       headers: body ? { "content-type": "application/json" } : undefined,
@@ -86,7 +89,7 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
   const jobsOf = async (threadId: string): Promise<JobSnapshot[]> =>
     (await api("GET", `/api/jobs?threadId=${threadId}`)).body.jobs ?? [];
 
-  const makeBot = async (name: string, patch: Record<string, unknown>) => {
+  const makeBot = async (name: string, patch: Record<string, Json>) => {
     const created = await api("POST", "/api/bots");
     expect(created.status).toBe(201);
     const patched = await api("PATCH", `/api/bots/${created.body.bot.id}`, {
@@ -131,15 +134,16 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
     );
     port = await freePortBlock([0, 1]);
     base = `http://127.0.0.1:${port}`;
+    const childEnv: NodeJS.ProcessEnv = {
+      HOME: home,
+      USERPROFILE: home,
+      OMB_PORT: String(port),
+      OMB_WEBHOOK_PORT: String(port + 1),
+    };
+    if (process.env.PATH) childEnv.PATH = process.env.PATH;
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        HOME: home,
-        USERPROFILE: home,
-        OMB_PORT: String(port),
-        OMB_WEBHOOK_PORT: String(port + 1),
-      },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr?.on("data", (chunk) => {
@@ -219,6 +223,8 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
       // the bot is woken: a third request, carrying the notice, after the merge window
       const wake = await until(() => chatRequests().length >= before + 3 && chatRequests()[before + 2], 40_000);
       expect(wake, `the bot was never woken. stderr:\n${stderr}`).toBeTruthy();
+      // SAFETY: the fake engine records the JSON chat-completions body the
+      // harness POSTed, and every such body carries a messages array.
       const wakeBody = wake!.body as { messages: Array<{ role: string; content: string }> };
       const lastUser = wakeBody.messages.filter((m) => m.role === "user").at(-1)!;
       expect(lastUser.content).toContain(`Background job ${failed.id} \`sleep 3; exit 2\` failed: exit code 2`);
@@ -229,6 +235,7 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
       expect(await waitForIdle(bot.id)).toBeTruthy();
 
       // the thread shows the "Job Finished" row and the wake's own notice
+      // SAFETY: GET /api/threads/:id/messages answers { messages: Message[] }.
       const thread = (await api("GET", `/api/threads/${bot.threadId}/messages`)).body.messages as Array<{
         role: string;
         kind: string;

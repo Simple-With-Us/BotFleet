@@ -52,11 +52,11 @@ function setup(overrides: Partial<JobWakeDeps> = {}) {
     setTimer: (fn, ms) => {
       const timer = { fn, ms, cleared: false };
       timers.push(timer);
-      return timer;
-    },
-    // SAFETY: the setTimer above is the only producer of these handles.
-    clearTimer: (handle) => {
-      (handle as { cleared: boolean }).cleared = true;
+      return {
+        cancel: () => {
+          timer.cleared = true;
+        },
+      };
     },
     ...overrides,
   });

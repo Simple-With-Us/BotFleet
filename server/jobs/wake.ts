@@ -44,9 +44,14 @@ export interface JobWakeDeps {
   startWake(botId: string, threadId: string, prompt: string, jobIds: string[]): Promise<void>;
   mergeWindowMs?: number;
   maxConsecutive?: number;
-  setTimer?: (fn: () => void, ms: number) => unknown;
-  clearTimer?: (handle: unknown) => void;
+  /** Schedules the merge window's end; tests capture it rather than wait. */
+  setTimer?: (fn: () => void, ms: number) => WakeTimer;
   log?: (line: string) => void;
+}
+
+/** A scheduled merge-window end that can be called off. */
+export interface WakeTimer {
+  cancel(): void;
 }
 
 /** The prompt a wake turn runs with: the notices, then what to do with them. */
@@ -62,12 +67,11 @@ export class JobWakeCoordinator {
   private readonly deps: JobWakeDeps;
   private readonly mergeWindowMs: number;
   private readonly maxConsecutive: number;
-  private readonly setTimer: (fn: () => void, ms: number) => unknown;
-  private readonly clearTimer: (handle: unknown) => void;
+  private readonly setTimer: (fn: () => void, ms: number) => WakeTimer;
   /** threadId → wakes used since the owner last typed there. */
   private readonly used = new Map<string, number>();
   /** threadId → the merge timer for a pending wake. */
-  private readonly scheduled = new Map<string, { botId: string; handle: unknown }>();
+  private readonly scheduled = new Map<string, { botId: string; timer: WakeTimer }>();
   /** threadId → botId: a wake that is due, held until the bot settles. */
   private readonly waiting = new Map<string, string>();
 
@@ -80,11 +84,8 @@ export class JobWakeCoordinator {
       ((fn, ms) => {
         const timer = setTimeout(fn, ms);
         timer.unref?.();
-        return timer;
+        return { cancel: () => clearTimeout(timer) };
       });
-    // SAFETY: the default setTimer above is the only producer of handles the
-    // default clearTimer receives, and it returns a Node timeout.
-    this.clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
   }
 
   /** A job ended.  Only a `wake` job on a 1:1 thread schedules anything; the
@@ -93,11 +94,11 @@ export class JobWakeCoordinator {
     if (job.onComplete !== "wake") return;
     if (this.deps.isRoom(job.threadId)) return;
     if (this.scheduled.has(job.threadId)) return; // merged into the wake already due
-    const handle = this.setTimer(() => {
+    const timer = this.setTimer(() => {
       this.scheduled.delete(job.threadId);
       void this.fire(job.threadId, job.botId);
     }, this.mergeWindowMs);
-    this.scheduled.set(job.threadId, { botId: job.botId, handle });
+    this.scheduled.set(job.threadId, { botId: job.botId, timer });
   }
 
   /** The owner typed into this thread: its wakes are refilled. */
@@ -107,6 +108,9 @@ export class JobWakeCoordinator {
 
   /** A bot's turn settled: deliver any wake that waited for it. */
   botSettled(botId: string): void {
+    // A copy, not the live map: a wake that finds the bot busy again puts
+    // its thread straight back, and a live iteration would visit it again.
+    // oxlint-disable-next-line unicorn/no-useless-spread
     for (const [threadId, waitingBot] of [...this.waiting]) {
       if (waitingBot !== botId) continue;
       this.waiting.delete(threadId);
@@ -116,8 +120,7 @@ export class JobWakeCoordinator {
 
   /** Forget a deleted thread. */
   forgetThread(threadId: string): void {
-    const scheduled = this.scheduled.get(threadId);
-    if (scheduled) this.clearTimer(scheduled.handle);
+    this.scheduled.get(threadId)?.timer.cancel();
     this.scheduled.delete(threadId);
     this.waiting.delete(threadId);
     this.used.delete(threadId);
