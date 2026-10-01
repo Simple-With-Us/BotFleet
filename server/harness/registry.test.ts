@@ -1887,9 +1887,12 @@ describe("ProviderRegistry probe ordering and baselines", () => {
     // began before this request, so it is not the answer.
     const afterSweepBegan = registry.describe();
     gateB.resolve();
-    const answer = await Promise.race([afterSweepBegan, tick(500).then(() => "timeout" as const)]);
-    expect(answer).not.toBe("timeout");
-    expect((answer as Awaited<typeof afterSweepBegan>)[0].snapshot.version).toBe("v4");
+    const answer = await Promise.race([
+      afterSweepBegan.then((rows) => ({ rows })),
+      tick(500).then(() => ({ rows: null })),
+    ]);
+    expect(answer.rows).not.toBeNull();
+    expect(answer.rows?.[0].snapshot.version).toBe("v4");
     expect((await duringReload)[0].snapshot.version).toBe("v3");
     // The request queued before the reload is answered too, once sweep #2 lets go.
     gateA.resolve();
@@ -1900,10 +1903,10 @@ describe("ProviderRegistry probe ordering and baselines", () => {
   it("starts a shared trailing sweep no earlier than the latest request it answers", async () => {
     const gateA = deferred<void>();
     const gateB = deferred<void>();
-    const calls: Record<string, number> = { a: 0, b: 0 };
+    const calls = { a: 0, b: 0 };
     const fake = makeFakeDriver({
       snapshotImpl: async (input) => {
-        const id = input.instanceId;
+        const id = input.instanceId === "a" ? "a" : "b";
         const n = ++calls[id];
         if (id === "a" && n === 2) await gateA.promise;
         if (id === "b" && n === 2) await gateB.promise;

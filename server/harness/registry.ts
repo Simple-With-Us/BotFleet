@@ -87,6 +87,16 @@ export interface ProviderRegistryOptions {
   transientRecheckMs?: number;
 }
 
+/** The sweep queued behind the running one for callers who must not be
+ * answered from before they asked.  `floor` is the latest request among
+ * everyone sharing it (the sweep it becomes starts no earlier), and `key` is
+ * the fleet it was queued for: after a reload it is no one's to join. */
+interface TrailingSweep {
+  floor: number;
+  key: string;
+  promise: Promise<DescribedInstance[]>;
+}
+
 /** Called when a completed describe changes what clients were last told. */
 export type DescribeListener = (instances: DescribedInstance[], describedAt: number) => void;
 
@@ -432,11 +442,7 @@ export class ProviderRegistry {
    *    started earlier: it queues one trailing sweep instead. */
   private lastDone: { at: number; result: DescribedInstance[] } | null = null;
   private inFlight: { startedAt: number; generation: string; promise: Promise<DescribedInstance[]> } | null = null;
-  /** The sweep queued behind the running one for callers who must not be
-   *  answered from before they asked.  `floor` is the latest request among
-   *  everyone sharing it (the sweep it becomes starts no earlier), and `key`
-   *  is the fleet it was queued for: after a reload it is no one's to join. */
-  private trailing: { floor: number; key: string; promise: Promise<DescribedInstance[]> } | null = null;
+  private trailing: TrailingSweep | null = null;
   /** Bumped when the fleet itself changes (load, removeInstance). */
   private generation = 0;
   /** Bumped when ONE instance is reloaded.  A sweep that started before it
@@ -646,7 +652,7 @@ export class ProviderRegistry {
       queued.floor = Math.max(queued.floor, requestedAt);
       return queued.promise;
     }
-    const slot: { floor: number; key: string; promise: Promise<DescribedInstance[]> } = {
+    const slot: TrailingSweep = {
       floor: requestedAt,
       key,
       promise: running.promise
