@@ -145,6 +145,45 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(threadStart.params).toMatchObject({ model: "gpt-5.6-sol", modelProvider: "openai" });
   });
 
+  it("keeps a helper thread's notifications out of the turn, including its turn/completed (jobs P0)", async () => {
+    // A multi_agent helper runs as a thread of its own on the same app-server
+    // connection.  Its turn/completed arrives first and FAILED: without the
+    // thread filter it would settle this turn as failed before the main
+    // thread had said anything, and its text would become the bot's reply.
+    await create({ mode: "multi-agent" });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-multi-agent", text: "list files" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+    expect(done).toMatchObject({ turnId, ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
+    const text = JSON.stringify(recorder.events);
+    for (const marker of ["HELPER COMMAND", "HELPER DELTA", "HELPER TEXT", "HELPER ERROR", "HELPER FAILED", "9999"]) {
+      expect(text).not.toContain(marker);
+    }
+    // the main thread's own turn is intact, in order
+    expect(recorder.events.map((e) => e.type)).toEqual([
+      "turn.started",
+      "session.started",
+      "item.started",
+      "item.started",
+      "item.completed",
+      "item.completed",
+      "content.delta",
+      "item.completed",
+      "thread.token-usage.updated",
+      "turn.completed",
+    ]);
+    expect(recorder.events.find((e) => e.type === "item.completed" && e.itemType === "assistant_text")).toMatchObject({
+      text: "done from fake codex",
+    });
+  });
+
+  it("reports no background jobs and no helpers until the jobs program reaches it", async () => {
+    await create();
+    expect(instance.adapter.capabilities.backgroundJobs).toBe("none");
+    expect(instance.adapter.capabilities.helpers).toBe("none");
+  });
+
   it("files a step's own input (not its outcome fields) for the side store", async () => {
     await create();
     await instance.adapter.sendTurn({ threadId: "t-tool-io", text: "list files" });

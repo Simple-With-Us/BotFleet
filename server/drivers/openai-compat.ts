@@ -563,7 +563,17 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         // no MCP server is mounted in this file and respondToRequest answers
         // The driver owns both transcript replay and model-to-tool rounds.
         // localComputerMcp runs host computer tools through the toolLoop host.
-        capabilities: { sessionModelSwitch: "in-session", agentsMcp: true, toolLoop: true, localComputerMcp: true, replaysTranscript: true },
+        // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+        // stay `delegate_bot`.
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          toolLoop: true,
+          localComputerMcp: true,
+          replaysTranscript: true,
+          backgroundJobs: "none",
+          helpers: "none",
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
         sweepStuckTurns: async (olderThanMs: number) => {

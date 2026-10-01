@@ -1732,6 +1732,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             images: support.images !== false,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
+            // Jobs matrix: native jobs die when the turn settles, and BotFleet
+            // jobs arrive over MCP in P2.  Named helper rows come in P3.
+            backgroundJobs: "none",
+            helpers: "none",
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

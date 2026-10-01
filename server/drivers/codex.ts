@@ -365,6 +365,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // codex reports token usage as a running THREAD total; the harness
         // wants this turn's figure, so the last report is banked on settle
         usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
+        // helper-thread notifications kept out of this turn (see handleNotification)
+        foreignThreadNotifications: 0,
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
@@ -407,6 +409,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const settle = (ok: boolean, stopReason: string | null) => {
         if (state.settled) return;
         state.settled = true;
+        if (state.foreignThreadNotifications > 0) {
+          console.warn(`[codex] kept ${state.foreignThreadNotifications} helper-thread notification(s) out of this turn`);
+        }
         for (const finish of [...asks.values()]) finish("deny", "BotFleet: the turn ended", "system");
         for (const p of rpcPending.values()) p.reject(new Error("turn settled"));
         rpcPending.clear();
@@ -526,6 +531,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
       const handleNotification = (msg: any) => {
         const p = msg.params ?? {};
+        // Codex runs its helpers (multi_agent) as threads of their own on
+        // this same app-server connection, and every v2 notification names
+        // its thread (required by the 0.159 schema).  Only this turn's
+        // thread may speak for it: a helper's text is not the bot's reply,
+        // its usage is not the bot's context, and its turn/completed would
+        // otherwise settle this turn the moment the helper finished.  A
+        // notification with no threadId (an older app-server) predates
+        // helpers and passes, as does anything before thread/start answers.
+        if (typeof p.threadId === "string" && state.codexThreadId !== null && p.threadId !== state.codexThreadId) {
+          state.foreignThreadNotifications++;
+          return;
+        }
         switch (msg.method) {
           // token-level chat text; the item/completed frame follows with the
           // whole message, so its delta is only a fallback when none streamed
@@ -964,6 +981,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         qdrantMcp: true,
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        // Jobs matrix (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md):
+        // BotFleet jobs arrive over MCP in P2.  Native helpers run, but their
+        // threads are kept out of the turn (handleNotification) until P3
+        // shows them as typed Helper cards.
+        backgroundJobs: "none",
+        helpers: "none",
       },
       sendTurn,
       interruptTurn: async (threadId) => active.get(threadId)?.stop(),
