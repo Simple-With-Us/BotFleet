@@ -12001,20 +12001,35 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // the way the runtime event path redacts before broadcasting: a setup
         // failure can carry provider text, and this route is a different
         // boundary from the one that already sanitises it.
-        doomed: doomedDispatches.list().map((entry) => ({
-          ...entry,
-          open: doomedDispatches.isOpen(entry.botId, entry.instanceId),
-          lastError: entry.lastError
-            ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
-            : undefined,
-        })),
-        // Bots whose fallback chain is longer on the picker than it is at
-        // runtime. `selectTurnFallback` skips a candidate that is the primary
-        // again, or one it already walked, so a chain that reads as three tiers
-        // in Settings can be two — silently, because the picker counts what was
-        // typed. Two live bots were configured that way. Reported per bot here
-        // rather than corrected in the record: repeating the primary at the end
-        // of a chain is a defensible thing for an owner to mean.
+        doomed: doomedDispatches.list().map((entry) => {
+          const bot = store.bot(entry.botId);
+          const open = doomedDispatches.isOpen(entry.botId, entry.instanceId);
+          // `open` alone is not "held": a fallback engine's breaker can stay
+          // open long after the primary recovered and the bot is dispatching
+          // normally. Whether a pair HOLDS the bot depends on the engine that
+          // bot would actually use, which is the same question dispatchHoldFor
+          // asks — so it is answered here, once, instead of guessed at in the
+          // panel from a list that knows nothing about the bot's selection.
+          const holds = Boolean(
+            bot
+            && open
+            && executionInstanceFor(bot, bot.modelSelection, "bot") === entry.instanceId,
+          );
+          return {
+            ...entry,
+            open,
+            holds,
+            lastError: entry.lastError
+              ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
+              : undefined,
+          };
+        }),
+        // Bots with an ADJACENT repeat in a fallback chain — the only kind the
+        // runtime cannot reach. `selectTurnFallback` compares a candidate with
+        // the engine that JUST failed, so a trailing repeat of the PRIMARY is
+        // perfectly reachable and is NOT reported here; only a repeat of the
+        // entry immediately before it is. Reported rather than corrected:
+        // removing the entry is a product decision, not a helper's.
         // Bot-level AND per-task, because in Projects mode a task carries its
         // own modelSelection and fallback chain and the runtime prefers it. A
         // bot-only view reported chains that never run and missed the ones

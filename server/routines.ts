@@ -1018,9 +1018,22 @@ export class RoutineManager {
 
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
-        if (this.isBotSnoozed(run.botId)) continue;
+        // `holdReason` is a cached verdict from the last time canStart ran, and
+        // the gates below can `continue` without ever re-deriving it. A manual
+        // snooze can outlast the engine coming back, leaving a receipt that
+        // claims it is waiting on a dead engine when it is not. Clearing on
+        // every skip keeps the field meaning "verified on the most recent
+        // attempt" rather than "true at some point in the past"; the next tick
+        // that reaches canStart sets it again if it still holds.
+        if (this.isBotSnoozed(run.botId)) {
+          run.holdReason = undefined;
+          continue;
+        }
         const state = this.options.botState(run.botId);
-        if (state === "busy") continue;
+        if (state === "busy") {
+          run.holdReason = undefined;
+          continue;
+        }
         if (state === "missing") {
           this.failRun(run, "The assigned Bot no longer exists");
           continue;
