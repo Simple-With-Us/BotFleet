@@ -2194,3 +2194,85 @@ describe("a held run explains itself", () => {
     expect(run.holdReason).toBeUndefined();
   });
 });
+
+describe("a sustained hold does not churn the state file", () => {
+  it("saves and emits once, then stays quiet while the reason is unchanged", async () => {
+    // The scheduler ticks every ten seconds. Persisting and emitting on every
+    // tick wrote the whole state file and pushed duplicate SSE and replay
+    // frames indefinitely — 8,640 no-op writes a day for one sustained hold,
+    // scaling with queue depth.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const afterFirst = h.emitted.length;
+    expect(h.manager.listRuns()[0].holdReason).toContain("DeepSeek Harness");
+
+    for (let i = 1; i <= 5; i++) {
+      h.setNow(routine.nextRunAt! + i * 10_000);
+      await h.manager.tick();
+    }
+    expect(h.emitted.length).toBe(afterFirst);
+    // The reason is still there — quiet, not forgotten.
+    expect(h.manager.listRuns()[0].holdReason).toContain("DeepSeek Harness");
+  });
+
+  it("emits again when the cause changes, because a stale reason misleads", async () => {
+    const h = harness();
+    const reasons = ["dsh-agent could not start", "Grok is waiting on a credential"];
+    let call = 0;
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => reasons[Math.min(call++, reasons.length - 1)];
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const afterFirst = h.emitted.length;
+    h.setNow(routine.nextRunAt! + 10_000);
+    await h.manager.tick();
+    expect(h.emitted.length).toBeGreaterThan(afterFirst);
+    expect(h.manager.listRuns()[0].holdReason).toBe(reasons[1]);
+  });
+
+  it("clears the hold from a coalesced child so its receipt cannot claim to be held", async () => {
+    // The child runs on the owner's turn, and copyCombinedOutcome does not
+    // overwrite holdReason — so without this it ended up "completed" while
+    // still carrying a hold reason.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "held for now";
+    for (let i = 0; i < 2; i++) {
+      h.manager.enqueueWebhook({
+        webhookId: "combined-fixture",
+        webhookName: "Combined fixture",
+        prompt: `Delivery ${i}`,
+        botId: "maus-1",
+        runOn: "bot",
+        deliveryId: `delivery-${i}`,
+        receivedAt: 1000 + i,
+      });
+    }
+    h.setNow(Date.now());
+    await h.manager.tick();
+    expect(h.manager.listRuns().every((run) => run.holdReason === "held for now")).toBe(true);
+
+    h.setCanStart(true);
+    h.setNow(Date.now() + 10_000);
+    await h.manager.tick();
+    const runs = h.manager.listRuns();
+    const owner = runs.find((run) => !run.coalescedInto)!;
+    expect(runs.filter((run) => run.coalescedInto === owner.id)).toHaveLength(1);
+    expect(runs.every((run) => run.holdReason === undefined)).toBe(true);
+  });
+});
