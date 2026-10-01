@@ -7,8 +7,10 @@ import type { ModelSelection } from "./contracts.ts";
 import { STATIC_CODEX_MODELS } from "./drivers/codex-catalog.ts";
 import {
   anyLineageLabel,
+  classifyModel,
   compareRank,
   hasLineage,
+  lineageClasses,
   presentCatalog,
   reconcileChain,
   reconcileEntry,
@@ -195,6 +197,28 @@ function sameTarget(a: ModelSelection, b: ModelSelection): boolean {
   return a.instanceId === b.instanceId && a.model === b.model;
 }
 
+/** Whether `entry` is an older member of the class `saved` floats on, on the
+ *  same engine: the model a floating slot held before a reconcile resolved it
+ *  forward.  Custom ids are the operator's own and never count. */
+function staleResolutionOf(
+  saved: ModelSelection,
+  entry: ModelSelection,
+  contextFor: (instanceId: string) => LineageContext | undefined,
+): boolean {
+  if (!saved.latest || saved.instanceId !== entry.instanceId || saved.model === entry.model) return false;
+  const context = contextFor(entry.instanceId);
+  if (!context || context.customIds?.includes(entry.model) || context.customIds?.includes(saved.model)) return false;
+  const older = classifyModel(context.driverKind, entry.model);
+  const resolved = classifyModel(context.driverKind, saved.model);
+  return Boolean(
+    older &&
+      resolved &&
+      older.classKey === saved.latest &&
+      resolved.classKey === saved.latest &&
+      compareRank(resolved.rank, older.rank) > 0,
+  );
+}
+
 /** A client that predates `latest` (the shipped iOS app decodes only
  *  instanceId / model / effort / fallbacks) re-sends a floating entry
  *  without the field.  When the entry still names the engine and model of a
@@ -206,8 +230,20 @@ function sameTarget(a: ModelSelection, b: ModelSelection): boolean {
  *  or reordered a fallback, so the rest of the chain shifted) is then paired
  *  with the first unpaired saved entry that names the same engine and model.
  *  Each saved entry is paired at most once, so a pinned entry is never
- *  handed a float that belongs to a different place in the chain. */
-function carryLatestChain(incoming: ModelSelection[], raws: unknown[], saved: ModelSelection[]): ModelSelection[] {
+ *  handed a float that belongs to a different place in the chain.
+ *
+ *  Last, an entry still unpaired is a STALE copy when a saved floating entry
+ *  on the same engine has since resolved to a newer member of its class: the
+ *  client read the older slug, the server moved the float forward, and the
+ *  client wrote its old copy back.  Pairing it keeps the float instead of
+ *  pinning the slot to a model the person never picked.  The same place wins
+ *  when several saved entries qualify. */
+function carryLatestChain(
+  incoming: ModelSelection[],
+  raws: unknown[],
+  saved: ModelSelection[],
+  contextFor: (instanceId: string) => LineageContext | undefined,
+): ModelSelection[] {
   const out = [...incoming];
   const used = new Set<number>();
   const open: number[] = [];
@@ -224,15 +260,59 @@ function carryLatestChain(incoming: ModelSelection[], raws: unknown[], saved: Mo
     }
     open.push(index);
   });
+  const stale: number[] = [];
   for (const index of open) {
     const entry = incoming[index]!;
     const match = saved.findIndex((candidate, at) => !used.has(at) && sameTarget(candidate, entry));
-    if (match < 0) continue;
+    if (match < 0) {
+      stale.push(index);
+      continue;
+    }
     used.add(match);
     const from = saved[match]!;
     if (carries(index) && from.latest) out[index] = { ...entry, latest: from.latest };
   }
+  for (const index of stale) {
+    if (!carries(index)) continue;
+    const entry = incoming[index]!;
+    const candidates = saved.flatMap((candidate, at) =>
+      !used.has(at) && staleResolutionOf(candidate, entry, contextFor) ? [at] : [],
+    );
+    const at = candidates.includes(index) ? index : candidates[0];
+    if (at === undefined) continue;
+    used.add(at);
+    out[index] = { ...entry, latest: saved[at]!.latest };
+  }
   return out;
+}
+
+/** Why an explicit `latest` on one entry cannot be honoured, or null.  The
+ *  field must name a class this engine has and the model must belong to it
+ *  (a retired id counts for its successor class); anything else would be
+ *  dropped by the reconcile and saved as a pinned slot, turning a typo into
+ *  a successful write with different meaning.  Left alone: an engine the
+ *  harness does not know (nothing to check against), the operator's own
+ *  custom ids, and an entry the saved chain already holds exactly (a
+ *  leftover must not block editing another slot). */
+function latestProblem(
+  entry: ModelSelection,
+  context: LineageContext | undefined,
+  saved: readonly ModelSelection[],
+): string | null {
+  if (!entry.latest || !context || context.customIds?.includes(entry.model)) return null;
+  if (saved.some((candidate) => sameTarget(candidate, entry) && candidate.latest === entry.latest)) return null;
+  const classes = lineageClasses(context.driverKind).map((cls) => cls.key);
+  if (!classes.includes(entry.latest)) {
+    return `is not a model class on instance "${entry.instanceId}"${
+      classes.length ? ` (use one of: ${classes.join(", ")})` : " (this engine has no Latest classes)"
+    }`;
+  }
+  const hit = classifyModel(context.driverKind, entry.model);
+  const retired = retiredModel(context.driverKind, entry.model);
+  if (hit?.classKey !== entry.latest && retired?.successorClass !== entry.latest) {
+    return `does not match model "${entry.model}"`;
+  }
+  return null;
 }
 
 export type LineageWriteResult =
@@ -241,7 +321,10 @@ export type LineageWriteResult =
 
 /** The lineage half of a modelSelection write.
  *
- *  - Carries `latest` forward for clients that do not send it.
+ *  - Refuses an explicit `latest` that names no class on the engine or does
+ *    not match the model.
+ *  - Carries `latest` forward for clients that do not send it, including a
+ *    stale copy of a model the float has since moved past.
  *  - Refuses a retired id with no successor, but only when this write
  *    introduces it: the UI re-sends the whole chain on every edit, and a
  *    saved leftover in one slot must not block editing another.
@@ -257,8 +340,16 @@ export function checkLineageWrite(
   contextFor: (instanceId: string) => LineageContext | undefined,
 ): LineageWriteResult {
   const saved = chainEntries(current);
+  const asked = chainEntries(selection);
+  for (let index = 0; index < asked.length; index++) {
+    const entry = asked[index]!;
+    const problem = latestProblem(entry, contextFor(entry.instanceId), saved);
+    if (problem) {
+      return { ok: false, error: `modelSelection.latest "${entry.latest}" in ${slotFor(index)} ${problem}` };
+    }
+  }
   const raws = [raw, ...(selection.fallbacks ?? []).map((_, index) => rawFallback(raw, index))];
-  const carried = carryLatestChain(chainEntries(selection), raws, saved);
+  const carried = carryLatestChain(asked, raws, saved, contextFor);
   const incoming: ModelSelection = { ...carried[0]! };
   delete incoming.fallbacks;
   if (selection.fallbacks) incoming.fallbacks = carried.slice(1);

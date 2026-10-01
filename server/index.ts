@@ -219,6 +219,7 @@ import {
   modelNameFor,
   presentDescribedInstances,
   reconcileTurnOverride,
+  withoutModelsTooNewForCli,
 } from "./model-lineage.ts";
 import {
   isEffortLevel,
@@ -1166,9 +1167,17 @@ function checkSelectionEntry(
     if (!target) {
       return { ok: false, status: 400, error: `model instance "${entry.instanceId}" is unavailable` };
     }
+    // The catalog the pickers show, not the registry's full one: a Claude CLI
+    // too old for a model does not list it (and the lineage context above
+    // already leaves it out), so a strict write must not persist it either.
+    const runnable = withoutModelsTooNewForCli(
+      target.driverKind,
+      target.models,
+      cliVersionByInstance.get(entry.instanceId),
+    );
     const offered =
-      entry.model === target.models.default ||
-      target.models.options.some((option) => option.id === entry.model);
+      entry.model === runnable.default ||
+      runnable.options.some((option) => option.id === entry.model);
     if (!offered) {
       return {
         ok: false,

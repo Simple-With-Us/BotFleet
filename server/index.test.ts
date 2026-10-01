@@ -2111,7 +2111,7 @@ describe("harness HTTP API", () => {
       const strict = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-opus-5-5",
+          model: "claude-opus-5",
           fallbacks: [{ instanceId: "claude", model: "claude-3-7-sonnet" }],
         },
         requireAvailableModel: true,
@@ -2126,13 +2126,51 @@ describe("harness HTTP API", () => {
       const unknown = await api("PATCH", `/api/bots/${bot.id}`, {
         modelSelection: {
           instanceId: "claude",
-          model: "claude-opus-5-5",
+          model: "claude-opus-5",
           fallbacks: [{ instanceId: "claude", model: "not-a-real-model" }],
         },
         requireAvailableModel: true,
       });
       expect(unknown.status).toBe(400);
       expect(unknown.body.error).toMatch(/not offered/i);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("judges a strict write against the catalog the detected CLI can run, not the registry's full one", async () => {
+    // The fixture Claude CLI reports 2.1.232, older than the 2.1.280 that
+    // Opus 5.5 needs: the picker does not list it, so an MCP-style strict
+    // write must not persist it either, on the primary or on a fallback.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
+    expect(claude.models.options.map((option: { id: string }) => option.id)).not.toContain("claude-opus-5-5");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const primary = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(primary.status).toBe(400);
+      expect(primary.body.error).toMatch(/"claude-opus-5-5" is not offered by instance "claude"/);
+
+      const fallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-opus-5-5" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(fallback.status).toBe(400);
+      expect(fallback.body.error).toMatch(/not offered/);
+
+      // General writes stay free-form, and the model the CLI does list saves.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+        requireAvailableModel: true,
+      })).status).toBe(200);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
@@ -7708,6 +7746,65 @@ describe("model lineage over HTTP: saved selections move forward, never aliased"
       });
       expect(bad.status).toBe(400);
       expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a Latest class that does not exist or does not fit the model, instead of saving it pinned", async () => {
+    await withBot("Lineage Bad Class", async (bot) => {
+      const before = await selectionOf(bot.id);
+      const typo = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(typo.status).toBe(400);
+      expect(typo.body.error).toMatch(/latest "sonnett" in primary is not a model class/);
+
+      const mismatch = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5", latest: "sonnet" },
+      });
+      expect(mismatch.status).toBe(400);
+      expect(mismatch.body.error).toMatch(/does not match model "claude-opus-5"/);
+
+      // Fallbacks and tasks go through the same check.
+      const inFallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnett" }],
+        },
+      });
+      expect(inFallback.status).toBe(400);
+      expect(inFallback.body.error).toMatch(/in fallback 1/);
+      const onTask = await api("PATCH", `/api/bots/${bot.id}/tasks/${bot.threadId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(onTask.status).toBe(400);
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" } },
+      });
+      expect(apply.status).toBe(400);
+
+      expect(await selectionOf(bot.id)).toEqual(before);
+    });
+  });
+
+  it("keeps a float when an older client writes back the slug it read before the float moved on", async () => {
+    await withBot("Lineage Stale Write", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+      })).status).toBe(200);
+      // The shipped iOS app read `claude-sonnet-5` while the float pointed
+      // there, the harness has since moved it to 5.5, and the app writes its
+      // copy back with no `latest`.
+      const stale = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", effort: "high" },
+      });
+      expect(stale.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        latest: "sonnet",
+        effort: "high",
+      });
     });
   });
 

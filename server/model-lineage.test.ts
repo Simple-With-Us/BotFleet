@@ -28,9 +28,17 @@ interface FixtureInstance {
   models: { default: string; options: Array<{ id: string; label: string; custom?: boolean }> };
 }
 
+// A Codex account whose live catalog already lists GPT-6 Luna beside the
+// GPT-5.6 Luna a client may still be holding.
+const CODEX_LIVE_NEWER = {
+  default: "gpt-6-luna",
+  options: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.6-luna"].map((id) => ({ id, label: id })),
+};
+
 const instances: Record<string, FixtureInstance> = {
   claude: { driverKind: "claudeAgent", models: STATIC_CLAUDE_MODELS },
   codex: { driverKind: "codex", models: CODEX_LIVE },
+  codexNewer: { driverKind: "codex", models: CODEX_LIVE_NEWER },
   grok: { driverKind: "grokAgent", models: STATIC_GROK_MODELS },
   grokApi: { driverKind: "grok", models: { default: "grok-4.7", options: [{ id: "grok-4.7", label: "Grok 4.7" }] } },
   // A Grok CLI whose config.toml adds its own row under a retired id.
@@ -358,6 +366,141 @@ describe("checkLineageWrite", () => {
     const ios: ModelSelection = { instanceId: "claude", model: "claude-opus-5-5", fallbacks: [{ instanceId: "claude", model: "claude-haiku-4-5" }] };
     const result = write(ios, saved, JSON.parse(JSON.stringify(ios)));
     expect(result.ok && result.selection.fallbacks?.[0]).toEqual({ instanceId: "claude", model: "claude-haiku-4-5" });
+  });
+
+  it("refuses a Latest class the engine does not have, naming the slot and the classes it does", () => {
+    const typo = write({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" });
+    expect(typo.ok).toBe(false);
+    expect(!typo.ok && typo.error).toMatch(/^modelSelection\.latest "sonnett" in primary is not a model class on instance "claude"/);
+    expect(!typo.ok && typo.error).toMatch(/sonnet/);
+
+    const inFallback = write({
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [{ instanceId: "codex", model: "gpt-5.6-luna", latest: "sonnet" }],
+    });
+    expect(inFallback.ok).toBe(false);
+    expect(!inFallback.ok && inFallback.error).toMatch(/in fallback 1 is not a model class on instance "codex"/);
+
+    // An engine with no Latest classes at all never floats anything.
+    const none = write({ instanceId: "minimax", model: "MiniMax-M3", latest: "sonnet" });
+    expect(none).toMatchObject({ ok: false });
+    expect(!none.ok && none.error).toMatch(/no Latest classes/);
+  });
+
+  it("refuses a Latest class the model does not belong to", () => {
+    const result = write({ instanceId: "claude", model: "claude-opus-5-5", latest: "sonnet" });
+    expect(result).toEqual({
+      ok: false,
+      error: 'modelSelection.latest "sonnet" in primary does not match model "claude-opus-5-5"',
+    });
+    // The class of the model on a different engine does not carry over.
+    expect(write({ instanceId: "codex", model: "gpt-5.6-luna", latest: "sonnet" }).ok).toBe(false);
+  });
+
+  it("accepts a Latest that fits: a member of the class, a retired id on its successor, a custom id, a saved leftover", () => {
+    expect(write({ instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" }).ok).toBe(true);
+    expect(write({ instanceId: "claude", model: "claude-3-7-sonnet", latest: "sonnet" }).ok).toBe(true);
+    expect(write({ instanceId: "codex", model: "gpt-5.6-luna", latest: "luna" }).ok).toBe(true);
+    expect(write({ instanceId: "grokCustom", model: "grok-3-mini", latest: "grok" }).ok).toBe(true);
+    // A saved entry the write merely re-sends is not judged again, so a
+    // leftover cannot block editing another slot.
+    const leftover: ModelSelection = { instanceId: "claude", model: "claude-opus-5-5", latest: "sonnet" };
+    expect(write({ ...leftover, effort: "high" }, leftover).ok).toBe(true);
+    // An engine the harness does not know has nothing to check against.
+    expect(write({ instanceId: "ghost", model: "whatever", latest: "sonnett" }).ok).toBe(true);
+  });
+
+  describe("a stale write of a model the float has since moved past", () => {
+    const resolved: ModelSelection = {
+      instanceId: "codexNewer",
+      model: "gpt-6-luna",
+      latest: "luna",
+      fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
+    };
+    const staleWrite = (ios: ModelSelection, saved: ModelSelection = resolved) =>
+      write(ios, saved, JSON.parse(JSON.stringify(ios)));
+
+    it("keeps Latest Luna when the shipped iOS app writes back the GPT-5.6 Luna it read", () => {
+      const result = staleWrite({
+        instanceId: "codexNewer",
+        model: "gpt-5.6-luna",
+        effort: "high",
+        fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5" }],
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        selection: {
+          instanceId: "codexNewer",
+          model: "gpt-6-luna",
+          latest: "luna",
+          fallbacks: [{ model: "claude-sonnet-5-5", latest: "sonnet" }],
+        },
+      });
+      // Nothing moved relative to what is saved, so the busy gate sees no edit.
+      expect(result.ok && result.selection.model).toBe(result.ok && result.current?.model);
+    });
+
+    it("works the same in a fallback slot and for a Claude float", () => {
+      const saved: ModelSelection = {
+        instanceId: "claude",
+        model: "claude-opus-5-5",
+        fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" }],
+      };
+      const result = staleWrite(
+        { instanceId: "claude", model: "claude-opus-5-5", fallbacks: [{ instanceId: "claude", model: "claude-sonnet-5" }] },
+        saved,
+      );
+      expect(result.ok && result.selection.fallbacks?.[0]).toEqual({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        latest: "sonnet",
+      });
+      expect(result.ok && result.selection.latest).toBeUndefined();
+    });
+
+    it("pins when the write says so, or when the entry is not an older member of the saved class", () => {
+      // the picker's explicit pin
+      const pin: ModelSelection = { instanceId: "codexNewer", model: "gpt-5.6-luna" };
+      const explicit = write(pin, resolved, { instanceId: "codexNewer", model: "gpt-5.6-luna", latest: null });
+      expect(explicit.ok && explicit.selection.latest).toBeUndefined();
+      // another class on the same engine
+      const sol = staleWrite({ instanceId: "codexNewer", model: "gpt-5.6-sol" });
+      expect(sol.ok && sol.selection.latest).toBeUndefined();
+      // another engine
+      const otherEngine = staleWrite({ instanceId: "codex", model: "gpt-5.6-luna" });
+      expect(otherEngine.ok && otherEngine.selection.latest).toBeUndefined();
+      // the saved entry is pinned, so there is no float to carry
+      const pinned = staleWrite({ instanceId: "codexNewer", model: "gpt-5.6-luna" }, { instanceId: "codexNewer", model: "gpt-6-luna" });
+      expect(pinned.ok && pinned.selection.latest).toBeUndefined();
+      // an older saved float is not "newer" than what the client sent
+      const older = staleWrite(
+        { instanceId: "codexNewer", model: "gpt-6-luna" },
+        { instanceId: "codexNewer", model: "gpt-5.6-luna", latest: "luna" },
+      );
+      expect(older.ok && older.selection.model).toBe("gpt-6-luna");
+    });
+
+    it("never takes a float from an exact match, and each saved float is used once", () => {
+      // Fallback 1 floats and has resolved forward to GPT-6 Luna.  The write
+      // lists a stale GPT-5.6 Luna first and the exact GPT-6 Luna after it:
+      // the exact copy claims the float, the stale one is left pinned.
+      const saved: ModelSelection = {
+        instanceId: "codexNewer",
+        model: "gpt-5.6-sol",
+        fallbacks: [{ instanceId: "codexNewer", model: "gpt-6-luna", latest: "luna" }],
+      };
+      const result = staleWrite(
+        {
+          instanceId: "codexNewer",
+          model: "gpt-5.6-sol",
+          fallbacks: [{ instanceId: "codexNewer", model: "gpt-5.6-luna" }, { instanceId: "codexNewer", model: "gpt-6-luna" }],
+        },
+        saved,
+      );
+      expect(result.ok && result.selection.fallbacks?.[0]?.latest).toBeUndefined();
+      expect(result.ok && result.selection.fallbacks?.[1]).toMatchObject({ model: "gpt-6-luna", latest: "luna" });
+    });
   });
 
   it("pins when the picker sends latest: null", () => {
