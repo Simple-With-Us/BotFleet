@@ -440,8 +440,11 @@ export class ProviderRegistry {
    *  - A caller that must not be answered from before its own request (the
    *    "Check again" button, a just-created engine) never joins a sweep that
    *    started earlier: it queues one trailing sweep instead. */
-  private lastDone: { at: number; result: DescribedInstance[] } | null = null;
-  private inFlight: { startedAt: number; generation: string; promise: Promise<DescribedInstance[]> } | null = null;
+  private lastDone: { at: number; born: ClockReading; result: DescribedInstance[] } | null = null;
+  /** `born` is the sweep's start on both clocks: a stamp can run ahead of the
+   *  wall clock after it is corrected backwards, so how long a sweep has been
+   *  running (and so whether `maxAgeMs` still covers it) is read off `born`. */
+  private inFlight: { startedAt: number; born: ClockReading; generation: string; promise: Promise<DescribedInstance[]> } | null = null;
   private trailing: TrailingSweep | null = null;
   /** Bumped when the fleet itself changes (load, removeInstance). */
   private generation = 0;
@@ -547,7 +550,7 @@ export class ProviderRegistry {
       const instances = legacy ? parsed : parsed?.instances;
       if (Array.isArray(instances) && instances.length > 0) {
         const seeded = (instances as DescribedInstance[]).map(seedFromDisk);
-        this.lastDone = { at, result: seeded };
+        this.lastDone = { at, born: clockReadingAt(at), result: seeded };
         this.describedAtByResult.set(seeded, at);
         // An engine that was working when this cache was written is the
         // baseline for this process's first, possibly slow, probes.
@@ -582,7 +585,11 @@ export class ProviderRegistry {
 
   async describe(opts?: { maxAgeMs?: number; staleWhileRevalidate?: boolean }): Promise<DescribedInstance[]> {
     const maxAge = opts?.maxAgeMs ?? 0;
-    const now = Date.now();
+    // Ages are read on both clocks (see procs.ts elapsedSince): a stamp can
+    // run ahead of the wall clock after it is corrected backwards, and plain
+    // subtraction would keep a stale answer inside maxAge for the size of the
+    // correction on top of maxAge itself.
+    const clock = readClock();
     const done = this.lastDone;
     // A sweep already running that started after the last completed one is
     // the newest answer there is, and a caller that decides something from
@@ -595,13 +602,13 @@ export class ProviderRegistry {
       if (
         running &&
         running.generation === this.sweepKey() &&
-        now - running.startedAt <= maxAge &&
+        elapsedSince(running.born, clock) <= maxAge &&
         (!done || running.startedAt > done.at)
       ) {
         return running.promise;
       }
     }
-    if (maxAge > 0 && done && now - done.at <= maxAge) return done.result;
+    if (maxAge > 0 && done && elapsedSince(done.born, clock) <= maxAge) return done.result;
 
     // A caller that can live with a slightly old answer gets the last
     // completed one immediately while a new probe runs behind it.  Probing
@@ -618,7 +625,17 @@ export class ProviderRegistry {
     // joined; an older one (a long sweep on a busy Mac) may have probed an
     // engine before a recent install or sign-in, so a sweep that starts after
     // this call is queued behind it instead.
-    if (maxAge > 0) return this.freshSweep(now - maxAge);
+    if (maxAge > 0) {
+      let floor = clock.wall - maxAge;
+      const running = this.inFlight;
+      // A sweep older than maxAge on the larger clock may still carry a stamp
+      // that reads young (the wall clock ran back since it started): the floor
+      // goes above its start so it is queued behind, never joined.
+      if (running && running.generation === this.sweepKey() && elapsedSince(running.born, clock) > maxAge) {
+        floor = Math.max(floor, running.startedAt + 1);
+      }
+      return this.freshSweep(floor);
+    }
 
     // No memo at all: the user's own action ("Check again", a just-created
     // or just-deleted engine) must never be served a sweep that started
@@ -692,7 +709,7 @@ export class ProviderRegistry {
       // fleet, not the obsolete one.
       return this.freshSweep(startedAt);
     });
-    const slot = { startedAt, generation, promise };
+    const slot = { startedAt, born: readClock(), generation, promise };
     this.inFlight = slot;
     const clear = () => {
       if (this.inFlight === slot) this.inFlight = null;
@@ -710,7 +727,7 @@ export class ProviderRegistry {
     // wherever its REST response and SSE push arrive in between.
     const at = this.stamp(answeredAt);
     const previous = this.lastDone;
-    this.lastDone = { at, result };
+    this.lastDone = { at, born: clockReadingAt(at), result };
     this.describedAtByResult.set(result, at);
     if (persist) this.saveDiskCache(result, at);
     this.scheduleRecheck(result);

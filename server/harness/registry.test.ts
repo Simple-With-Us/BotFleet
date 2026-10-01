@@ -2038,4 +2038,77 @@ describe("ProviderRegistry probe ordering and baselines", () => {
       vi.useRealTimers();
     }
   });
+  it("re-probes once maxAgeMs of real time has passed, even if the wall clock was corrected backwards", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let mono = 1_000;
+    const monoSpy = vi.spyOn(performance, "now").mockImplementation(() => mono);
+    try {
+      const start = Date.now();
+      const fake = makeFakeDriver({
+        snapshotImpl: (_input, call) => ({ state: "available", version: `v${call}` }),
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      await registry.describe();
+      expect(fake.snapshotCalls).toBe(1);
+
+      // The wall clock goes back an hour.  Five real seconds on, the memo is
+      // inside the 15 s window and is served.
+      vi.setSystemTime(start - 60 * 60_000);
+      mono += 5_000;
+      expect((await registry.describe({ maxAgeMs: 15_000 }))[0].snapshot.version).toBe("v1");
+      expect(fake.snapshotCalls).toBe(1);
+
+      // Twenty real seconds on, it is out of the window, though the wall clock
+      // still reads as before the answer was taken: a negative age must not
+      // keep a stale engine verdict routable.
+      mono += 15_000;
+      expect((await registry.describe({ maxAgeMs: 15_000 }))[0].snapshot.version).toBe("v2");
+      expect(fake.snapshotCalls).toBe(2);
+      await registry.disposeAll();
+    } finally {
+      monoSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("queues behind a sweep older than maxAgeMs on the real clock, even if the wall clock was corrected backwards", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let mono = 1_000;
+    const monoSpy = vi.spyOn(performance, "now").mockImplementation(() => mono);
+    try {
+      const start = Date.now();
+      const gate = deferred<void>();
+      const fake = makeFakeDriver({
+        snapshotImpl: async (_input, call) => {
+          if (call === 2) await gate.promise;
+          return { state: "available", version: `v${call}` };
+        },
+      });
+      const registry = new ProviderRegistry([fake.driver], { transientRecheckMs: 0 });
+      await registry.load({ a: { driver: "fake" } });
+      await registry.describe();
+      await tick();
+      // A long sweep is running and the last completed answer is stale too.
+      // (The faked wall clock does not tick by itself.)
+      vi.setSystemTime(start + 10);
+      mono += 10;
+      void registry.describe({ maxAgeMs: 1, staleWhileRevalidate: true });
+      await tick(20);
+      // The wall clock goes back an hour while the sweep runs: its start stamp
+      // now reads as less than a second old, but twenty real seconds have
+      // passed.  The sweep may have probed an engine before a recent install
+      // or sign-in, so it is not joined.
+      vi.setSystemTime(start - 60 * 60_000);
+      mono += 20_000;
+      const decided = registry.describe({ maxAgeMs: 15_000 });
+      gate.resolve();
+      expect((await decided)[0].snapshot.version).toBe("v3");
+      expect(fake.snapshotCalls).toBe(3);
+      await registry.disposeAll();
+    } finally {
+      monoSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 });

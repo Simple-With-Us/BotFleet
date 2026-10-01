@@ -1027,4 +1027,18 @@ describe("instances ordering guard", () => {
     expect(unstamped.instances[0].snapshot.version).toBe("d");
     expect(unstamped.instancesDescribedAt).toBe(3_000);
   });
+  it("forgets the ordering mark but keeps the engine list when the stream could not resume", () => {
+    // A restarted harness stamps from its own clock, which can sit below the
+    // last process's final stamp.  Its first answer must not be dropped as old.
+    const held = reducer(initialState, { type: "instances", instances: [engine("held")], describedAt: 9_000 });
+    const reset = reducer(held, { type: "instancesOrderReset" });
+    expect(reset.instances[0].snapshot.version).toBe("held");
+    expect(reset.instancesDescribedAt).toBe(0);
+    const restarted = reducer(reset, { type: "instances", instances: [engine("restarted")], describedAt: 4_000 });
+    expect(restarted.instances[0].snapshot.version).toBe("restarted");
+    expect(restarted.instancesDescribedAt).toBe(4_000);
+    // Ordering holds again from that stamp on.
+    const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
+    expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
 });

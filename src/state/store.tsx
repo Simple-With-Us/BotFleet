@@ -952,6 +952,10 @@ export type Action =
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
   | { type: "instances"; instances: InstanceInfo[]; describedAt?: number }
+  /** The stream could not resume, so the harness may be a new process whose
+   *  `describedAt` clock owes nothing to the last one's: forget the mark (not
+   *  the list) so the next answer is not judged against it. */
+  | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
   | { type: "send"; botId: string; text: string; replyToId?: string }
@@ -1323,6 +1327,8 @@ export function reducer(state: AppState, action: Action): AppState {
       if (at !== undefined && at < state.instancesDescribedAt) return state;
       return { ...state, instances: action.instances, instancesDescribedAt: at ?? state.instancesDescribedAt };
     }
+    case "instancesOrderReset":
+      return state.instancesDescribedAt === 0 ? state : { ...state, instancesDescribedAt: 0 };
     case "configStatus":
       return {
         ...state,
@@ -2985,6 +2991,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           setStream(EMPTY_STREAM);
           pendingFrames.length = 0;
+          // A harness that restarted stamps from its own clock, which a
+          // backwards correction can leave below the last process's final
+          // stamp.  Keep the engine list, drop the mark, so the hydrate's
+          // fetch (and later pushes) are not discarded as "older".
+          rawDispatch({ type: "instancesOrderReset" });
         }
         if (shouldHydrateAfterHello(frame.resumed === true, hydrationFailed)) hydrate();
         return;
