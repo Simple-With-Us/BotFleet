@@ -50,8 +50,6 @@ export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from
 const DRIVER_KIND = "codex";
 const codexNonemptyString = z.string().min(1);
 
-// A resumed thread keeps the model it was started with, so changing the bot's
-// model cannot fix a retired one there — only a fresh thread or a rewind can.
 /** The part of a Codex item that is the step's INPUT: the command, the files
  * it changes, the tool and its arguments, the search.  The item also carries
  * its own outcome (status, output, exit code), which belongs to OUT, and its
@@ -75,6 +73,8 @@ function codexItemInput(item: Record<string, unknown>): Record<string, unknown> 
   return input;
 }
 
+// A resumed thread keeps the model it was started with, so changing the bot's
+// model cannot fix a retired one there — only a fresh thread or a rewind can.
 function unknownModelMessage(resumed: boolean): string {
   return resumed
     ? "This conversation's Codex model isn't available.  Start a new thread or rewind."

@@ -21,10 +21,20 @@
 //   in flight    a bounded append queue that drops its oldest entries before it
 //                grows, exactly as the event-log tee does
 //
-// Redaction runs twice and both times with the pass the wire uses
+// Redaction runs twice here and both times with the pass the wire uses
 // (`redactSecretsInText`): when a record is written, so the file on disk never
 // holds a credential the wire would hide, and again when one is read, so a
-// pattern added after a record was written still covers it.
+// pattern added after a record was written still covers it.  That is a TEXT
+// pass.  A structured input gets the tree pass first, when it is captured
+// (`shared/item-io.ts` `prepareInput`), because the tree rules (a masked
+// `{name, value}` env entry, a secret-shaped key) cannot be recovered from
+// text once the object has been flattened.  Together they cover what the
+// event log's tee covers.
+//
+// Deleting a thread removes its file here too, but not through this class:
+// server/index.ts sweeps ITEM_IO_DIR with the event and native logs
+// (`removeTranscriptLogs` over TRANSCRIPT_LOG_DIRS), which is why the store
+// has no delete of its own.
 //
 // Nothing here throws at a caller.  The store is a convenience over the bus; a
 // disk that will not take a write costs a row its expanded view, never a turn.
@@ -33,13 +43,7 @@ import { join } from "node:path";
 
 import { BoundedAppendQueue, type AppendQueueStats } from "./harness/append-queue.ts";
 import { redactSecretsInText } from "./redact.ts";
-import {
-  appendBoundedAsync,
-  ITEM_IO_LOG_MAX_BYTES,
-  removeTranscriptLogs,
-  rotatedPath,
-  type AppendWriter,
-} from "./transcript-retention.ts";
+import { appendBoundedAsync, ITEM_IO_LOG_MAX_BYTES, rotatedPath, type AppendWriter } from "./transcript-retention.ts";
 import {
   cutText,
   ITEM_IO_FIELD_LIMIT,
@@ -281,11 +285,5 @@ export class ItemIoStore {
   /** Queue depth and cumulative drops, for tests. */
   stats(): AppendQueueStats {
     return this.writes.stats();
-  }
-
-  /** Delete every generation a thread owns here.  Called wherever a bot, a task
-   * or a room is deleted, beside the same call for the event and native logs. */
-  remove(threadIds: Iterable<string>): number {
-    return removeTranscriptLogs(this.dir, threadIds);
   }
 }

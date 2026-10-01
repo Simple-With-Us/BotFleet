@@ -8,7 +8,7 @@ import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { EVENTS_DIR } from "../config.ts";
-import { captureInput, type ItemIoCapture } from "../../shared/item-io.ts";
+import { captureInput, textSignature, type ItemIoCapture } from "../../shared/item-io.ts";
 import { redactSecretsForLog } from "../redact.ts";
 import { appendBoundedAsync, EVENTS_LOG_MAX_BYTES, type AppendWriter } from "../transcript-retention.ts";
 import { newId, type ProviderInstance, type RuntimeEvent, type RuntimeEventListener } from "../contracts.ts";
@@ -21,6 +21,13 @@ const INCOMPLETE_LOG_MESSAGE =
  * bound, not a lifetime: the check exists to catch a driver bug within the
  * same conversation, not to keep a ledger. */
 const SETTLED_TURN_MEMORY = 512;
+
+/** How many tool calls the bus remembers the announced arguments of, so the
+ * settled `item.completed` of a call whose arguments did not change is not
+ * filed a second time.  A bound, not a lifetime: an entry normally lives from a
+ * call's `item.started` to its `item.completed`, and a call that never
+ * completes (an interrupted turn) is evicted by newer ones. */
+const ANNOUNCED_ARGUMENTS_MEMORY = 512;
 
 /** Where a step's full input and output go.  The bus only ever calls this; the
  * store behind it is `server/item-io-store.ts`.  Structural so a test can hand
@@ -49,6 +56,9 @@ export class EventBus {
   /** `threadId:turnId` of every turn that has already produced a terminal
    * event.  Insertion-ordered, so the oldest entry is the one evicted. */
   private settledTurns = new Set<string>();
+  /** `threadId:itemId` -> fingerprint of the `arguments` string a tool step's
+   * `item.started` already filed in the side store.  Insertion-ordered. */
+  private announcedArguments = new Map<string, string>();
   private readonly appendLog: AppendWriter;
   private readonly writes: BoundedAppendQueue<TeeEntry>;
 
@@ -158,8 +168,27 @@ export class EventBus {
       (clean.type === "item.started" || (clean.type === "item.completed" && clean.itemType === "tool")) &&
       typeof clean.arguments === "string"
     ) {
-      const derived = captureInput(clean.arguments).io;
-      if (derived) io = { ...io, ...derived };
+      // The chat-completions loop puts the same settled string on a step's
+      // `item.started` and its `item.completed`; filing it twice would write two
+      // copies of up to 32 KB and run the redaction twice.  Only a CHANGED
+      // string (a streamed first fragment, settled when the step completes) is
+      // worth a second record.
+      const key = `${event.threadId}:${event.itemId}`;
+      const signature = textSignature(clean.arguments);
+      const unchanged = this.announcedArguments.get(key) === signature;
+      if (clean.type === "item.completed") {
+        this.announcedArguments.delete(key);
+      } else {
+        this.announcedArguments.delete(key);
+        this.announcedArguments.set(key, signature);
+        while (this.announcedArguments.size > ANNOUNCED_ARGUMENTS_MEMORY) {
+          this.announcedArguments.delete(this.announcedArguments.keys().next().value!);
+        }
+      }
+      if (!unchanged) {
+        const derived = captureInput(clean.arguments).io;
+        if (derived) io = { ...io, ...derived };
+      }
     }
     if (io !== undefined && (io.input || io.output || io.text)) {
       try {

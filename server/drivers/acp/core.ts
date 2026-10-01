@@ -22,7 +22,7 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
-import { captureBoth, captureInput, inputText } from "../../../shared/item-io.ts";
+import { capturePreparedBoth, capturePreparedInput, prepareInput, textSignature } from "../../../shared/item-io.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
@@ -747,10 +747,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // A long quiet build is work, not a wedge — the idle guard consults
         // this the same way it consults `asks`.
         const openToolCalls = new Set<string>();
-        // The input each open call last had recorded, as text.  A streaming
-        // agent announces a call with an empty or partial `rawInput` and sends
-        // the whole of it on a later `tool_call_update`, so the update has to
-        // be compared with what is already filed.  Dropped as the call ends.
+        // A fingerprint of the input each open call last had recorded.  A
+        // streaming agent announces a call with an empty or partial `rawInput`
+        // and sends the whole of it on a later `tool_call_update`, so the
+        // update has to be compared with what is already filed.  Only the
+        // fingerprint is held (never the text, which can be a whole file), and
+        // it is dropped as the call ends.
         const toolInputs = new Map<string, string>();
         let nextId = 1;
         let sessionId: string | null = null;
@@ -1139,10 +1141,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
+              // prepared once: the same text is filed with the event and
+              // fingerprinted for the update that may follow
+              const announced = u.rawInput === undefined ? undefined : prepareInput(u.rawInput);
               if (typeof u.toolCallId === "string") {
                 openToolCalls.add(u.toolCallId);
-                const announced = u.rawInput === undefined ? undefined : inputText(u.rawInput);
-                if (announced !== undefined) toolInputs.set(u.toolCallId, announced);
+                if (announced !== undefined) toolInputs.set(u.toolCallId, textSignature(announced.text));
               }
               flushAssistantText();
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
@@ -1160,16 +1164,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   locations: u.locations,
                   cwd: turn.cwd,
                 }),
-                ...captureInput(u.rawInput),
+                ...capturePreparedInput(announced),
               });
               break;
             }
             case "tool_call_update": {
               // The schema lets a call's input arrive or settle on an update,
               // at any status: take it when it is new text for this call.
-              const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? inputText(u.rawInput) : undefined;
-              const newInput = settled !== undefined && toolInputs.get(u.toolCallId) !== settled ? settled : undefined;
-              if (newInput !== undefined) toolInputs.set(u.toolCallId, newInput);
+              const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? prepareInput(u.rawInput) : undefined;
+              const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
+              const newInput = settled !== undefined && toolInputs.get(u.toolCallId) !== settledSignature ? settled : undefined;
+              if (newInput !== undefined && settledSignature !== undefined) toolInputs.set(u.toolCallId, settledSignature);
               if (u.status === "completed" || u.status === "failed") {
                 openToolCalls.delete(u.toolCallId);
                 if (typeof u.toolCallId === "string") toolInputs.delete(u.toolCallId);
@@ -1180,7 +1185,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   itemId: u.toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
-                  ...captureBoth(newInput, u.content ?? u.rawOutput),
+                  ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
                 });
               } else if (newInput !== undefined) {
                 emit({
@@ -1188,7 +1193,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   type: "item.updated",
                   itemType: "tool",
                   itemId: u.toolCallId,
-                  ...captureInput(newInput),
+                  ...capturePreparedInput(newInput),
                 });
               }
               break;

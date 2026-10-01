@@ -90,7 +90,10 @@ export interface RuntimeEventBase {
    * (`server/item-io-store.ts`).  Capture-only: `EventBus.publish` moves it
    * into the store and strips it, so no subscriber, no wire frame and no
    * event-log line ever carries it.  Already bounded by the driver
-   * (`shared/item-io.ts`); never redacted here — the store redacts. */
+   * (`shared/item-io.ts`); the bus does not redact it — the store does, with
+   * the wire's pass.  A structured input was already redacted as a tree when
+   * the driver captured it, so a `{name, value}` env entry is masked by its
+   * name before it is flattened to text. */
   io?: ItemIoCapture;
 }
 

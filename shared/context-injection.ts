@@ -15,6 +15,8 @@
 // The full text is never persisted on the message; it goes to the same bounded
 // side store a tool's input and output use, and is fetched when a row opens.
 
+import { formatByteSize } from "./text-format.ts";
+
 /** Every kind of injection the harness records.  Closed on purpose: the label
  * table below is a `Record<ContextSource, …>`, so a new source is a type error
  * until someone decides what it is called. */
@@ -95,10 +97,8 @@ export function contextInjectionLabel(source: ContextSource): string {
   return `Context injection · ${CONTEXT_SOURCE_LABEL[source]}`;
 }
 
-/** A byte count as a person reads it: `412 B`, `3.2 KB`, `1.4 MB`. */
+/** A byte count as a person reads it, or "" for one that is not a size. */
 export function formatContextBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "";
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return formatByteSize(Math.round(bytes));
 }

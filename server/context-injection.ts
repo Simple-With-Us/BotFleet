@@ -29,7 +29,7 @@
 // its pattern anchors on).  The full text is not persisted on the message; it
 // rides the event's `io` capture into the bounded side store, which redacts it
 // again.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { newEventId, type RuntimeEvent } from "./contracts.ts";
 import {
@@ -159,8 +159,10 @@ export function injectionTarget<M extends { id: string }>(input: {
 
 /** Remembers the last memory text recorded per thread, so MEMORY.md — which
  * rides every turn — is recorded when it first appears and when it changes,
- * not on every message.  Bounded: a long-lived harness sees many threads, and
- * a forgotten entry costs one extra record, never a wrong one. */
+ * not on every message.  What is held is a digest, never the text: MEMORY.md
+ * can be tens of kilobytes and a long-lived harness sees many threads, so
+ * holding the text would pin megabytes for threads long since deleted.
+ * Bounded: a forgotten entry costs one extra record, never a wrong one. */
 export class MemoryChangeGate {
   private readonly seen = new Map<string, string>();
   private readonly limit: number;
@@ -174,15 +176,12 @@ export class MemoryChangeGate {
   /** True when `text` differs from what this thread last recorded (or nothing
    * was recorded yet).  Remembers it either way. */
   changed(threadId: string, text: string): boolean {
+    const digest = createHash("sha256").update(text).digest("hex");
     const previous = this.seen.get(threadId);
     this.seen.delete(threadId);
-    this.seen.set(threadId, text);
+    this.seen.set(threadId, digest);
     while (this.seen.size > this.limit) this.seen.delete(this.seen.keys().next().value!);
-    return previous !== text;
-  }
-
-  forget(threadId: string): void {
-    this.seen.delete(threadId);
+    return previous !== digest;
   }
 }
 

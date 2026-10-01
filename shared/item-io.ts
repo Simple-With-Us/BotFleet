@@ -13,10 +13,20 @@
 // halves share: the bounded-text shape, the per-field cap, and the pure
 // functions that turn whatever an engine handed us into text.
 //
-// Nothing here redacts.  Redaction is the store's job (it runs the same pass
-// the wire and the event log use, at write AND at read), because it has to
-// happen exactly once per destination and never depend on which driver built
-// the capture.
+// One thing here does redact, and only one: a STRUCTURED input is redacted as a
+// tree before it is flattened to text.  The tree knows things the text cannot
+// recover — that `{"name": "OMB_COMMS_TOKEN", "value": "…"}` is a credential
+// by its name — so it has to run while the object is still an object, exactly
+// as the event log's tee does.  Everything else is the store's job (it runs
+// the same text pass the wire uses, at write AND at read), because that has to
+// happen once per destination and never depend on which driver built the
+// capture.  The tree pass also cuts each long string leaf BEFORE the regexes
+// see it, so one capture does bounded work however large the tool's argument
+// was (a write_file with a multi-megabyte body, say).
+import { redactSecretsInText, redactSecretsWith } from "./redact.ts";
+import { cutText } from "./text-format.ts";
+
+export { cutText };
 
 /** Longest field the side store keeps, in UTF-16 units.  Generous enough for a
  * whole source file or a long command's output, small enough that a thread of
@@ -61,20 +71,13 @@ export interface ItemIoPayload {
   text?: BoundedText;
 }
 
-/** Cut `value` to `limit` UTF-16 units without ending on the first half of a
- * surrogate pair — a lone half renders as a replacement glyph. */
-export function cutText(value: string, limit: number): string {
-  if (value.length <= limit) return value;
-  let end = Math.max(0, limit);
-  const last = value.charCodeAt(end - 1);
-  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return value.slice(0, end);
-}
-
-/** `text` bounded to `limit`, with the facts a reader needs to say it was. */
-export function boundText(text: string, limit: number = ITEM_IO_CAPTURE_LIMIT): BoundedText {
-  if (text.length <= limit) return { text, truncated: false, length: text.length };
-  return { text: cutText(text, limit), truncated: true, length: text.length };
+/** `text` bounded to `limit`, with the facts a reader needs to say it was.
+ * `elided` is how many units were dropped BEFORE `text` was built (a long
+ * string leaf cut ahead of redaction), so `length` still reports the original
+ * size and `truncated` still says something was lost. */
+export function boundText(text: string, limit: number = ITEM_IO_CAPTURE_LIMIT, elided = 0): BoundedText {
+  if (text.length <= limit && elided <= 0) return { text, truncated: false, length: text.length };
+  return { text: cutText(text, limit), truncated: true, length: text.length + Math.max(0, elided) };
 }
 
 function pretty(value: unknown): string | undefined {
@@ -92,12 +95,37 @@ function pretty(value: unknown): string | undefined {
   }
 }
 
+/** A step's arguments, as text ready for the store. */
+export interface PreparedInput {
+  text: string;
+  /** units dropped from long string leaves before the text was built */
+  elided: number;
+}
+
+/** A structured input with every string leaf cut to the capture limit and then
+ * redacted, and `{name, value}` env entries and secret-shaped keys masked by
+ * the tree rules.  A leaf is cut BEFORE the content pass but redacted while the
+ * cut is still the last thing in it, which is the order
+ * `redactSecretsInLogText` explains: a credential straddling the cut is seen
+ * as an unterminated value and masked, not shipped as a prefix. */
+function redactedAndClipped(value: unknown): { value: unknown; elided: number } {
+  let elided = 0;
+  const tree = redactSecretsWith(value, (leaf) => {
+    if (leaf.length <= ITEM_IO_CAPTURE_LIMIT) return redactSecretsInText(leaf);
+    const head = cutText(leaf, ITEM_IO_CAPTURE_LIMIT);
+    elided += leaf.length - head.length;
+    return redactSecretsInText(head);
+  });
+  return { value: tree, elided };
+}
+
 /** The arguments of a step as text.  A string that is JSON — OpenAI-shaped
  * arguments arrive as one — is re-indented so it reads as the object it is;
  * any other string is kept verbatim; an object is pretty-printed.  Empty and
  * absent inputs answer undefined: a tool that took no arguments has no IN
- * block worth showing. */
-export function inputText(value: unknown): string | undefined {
+ * block worth showing.  The work is bounded: a structured input is walked
+ * once, with each long string cut before it is redacted or serialized. */
+export function prepareInput(value: unknown): PreparedInput | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -110,19 +138,39 @@ export function inputText(value: unknown): string | undefined {
     const wholeValue =
       (trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"));
     if (wholeValue && trimmed.length <= ITEM_IO_CAPTURE_LIMIT * 4) {
+      let parsed: unknown;
       try {
-        const indented = JSON.stringify(JSON.parse(trimmed), null, 2);
-        // a tool called with `{}` took no arguments: no IN block worth showing
-        return indented === "{}" || indented === "[]" ? undefined : indented;
+        parsed = JSON.parse(trimmed);
       } catch {
         // a fragment of arguments still streaming in: show it as it is
-        return value;
+        return { text: value, elided: 0 };
       }
+      const clipped = redactedAndClipped(parsed);
+      const indented = pretty(clipped.value);
+      // a tool called with `{}` took no arguments: no IN block worth showing
+      if (indented === undefined || indented === "{}" || indented === "[]") return undefined;
+      return { text: indented, elided: clipped.elided };
     }
-    return value;
+    return { text: value, elided: 0 };
   }
-  const text = pretty(value);
-  return text === "{}" || text === "[]" ? undefined : text;
+  const clipped = redactedAndClipped(value);
+  const text = pretty(clipped.value);
+  if (text === undefined || text === "{}" || text === "[]") return undefined;
+  return { text, elided: clipped.elided };
+}
+
+/** `prepareInput`, text only. */
+export function inputText(value: unknown): string | undefined {
+  return prepareInput(value)?.text;
+}
+
+/** A short fingerprint of a text, for "is this the same input I already
+ * filed" without holding the input itself: its length and both ends.  Streamed
+ * arguments only ever grow, so a different input differs in length, and two of
+ * the same length that agree at both ends are the same input for every purpose
+ * this serves. */
+export function textSignature(text: string): string {
+  return `${text.length}:${text.slice(0, 48)}:${text.slice(-48)}`;
 }
 
 /** Fields an engine puts a result's text under, in the order a reader would
@@ -169,11 +217,17 @@ export function outputText(content: unknown): string | undefined {
   return fallback === "{}" || fallback === "[]" ? undefined : fallback;
 }
 
+/** `{ io: { input } }` for an input already run through `prepareInput`, or
+ * `{}` when there was none.  Lets a caller that also needs the text (to
+ * compare it with what it filed before) prepare it once. */
+export function capturePreparedInput(prepared: PreparedInput | undefined): { io?: ItemIoCapture } {
+  return prepared === undefined ? {} : { io: { input: boundText(prepared.text, ITEM_IO_CAPTURE_LIMIT, prepared.elided) } };
+}
+
 /** `{ io: { input } }` for a step's arguments, or `{}` when there were none.
  * Spread into an `item.started` event. */
 export function captureInput(value: unknown): { io?: ItemIoCapture } {
-  const text = inputText(value);
-  return text === undefined ? {} : { io: { input: boundText(text) } };
+  return capturePreparedInput(prepareInput(value));
 }
 
 /** `{ io: { output } }` for a step's result, or `{}` when it returned nothing.
@@ -184,15 +238,20 @@ export function captureOutput(content: unknown): { io?: ItemIoCapture } {
 }
 
 /** Both halves, for an `item.completed` that carries the settled arguments
- * beside the result. */
-export function captureBoth(input: unknown, content: unknown): { io?: ItemIoCapture } {
-  const inText = inputText(input);
+ * (already prepared) beside the result. */
+export function capturePreparedBoth(input: PreparedInput | undefined, content: unknown): { io?: ItemIoCapture } {
   const outText = outputText(content);
-  if (inText === undefined && outText === undefined) return {};
+  if (input === undefined && outText === undefined) return {};
   return {
     io: {
-      ...(inText !== undefined ? { input: boundText(inText) } : {}),
+      ...(input !== undefined ? { input: boundText(input.text, ITEM_IO_CAPTURE_LIMIT, input.elided) } : {}),
       ...(outText !== undefined ? { output: boundText(outText) } : {}),
     },
   };
+}
+
+/** Both halves, for an `item.completed` that carries the settled arguments
+ * beside the result. */
+export function captureBoth(input: unknown, content: unknown): { io?: ItemIoCapture } {
+  return capturePreparedBoth(prepareInput(input), content);
 }

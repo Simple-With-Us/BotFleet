@@ -10,7 +10,10 @@ import {
   cutText,
   inputText,
   outputText,
+  prepareInput,
+  textSignature,
 } from "./item-io.ts";
+import { redactSecretsForLog } from "./redact.ts";
 
 describe("bounding text", () => {
   it("leaves text within the limit alone and reports its length", () => {
@@ -64,6 +67,59 @@ describe("inputText", () => {
     const huge = `{"content":"${"x".repeat(ITEM_IO_CAPTURE_LIMIT * 5)}"}`;
     // verbatim: a re-indent would have added newlines
     expect(inputText(huge)).toBe(huge);
+  });
+});
+
+describe("input redaction and bounds", () => {
+  const ENV_VALUE = "abcd1234efgh5678";
+
+  it("masks a {name, value} env entry by its name before flattening the input to text", () => {
+    const input = { env: [{ name: "OMB_COMMS_TOKEN", value: ENV_VALUE }] };
+    // the text pass alone cannot see this: after flattening it is two ordinary strings
+    expect(inputText(input)).not.toContain(ENV_VALUE);
+    expect(inputText(input)).toContain("redacted 16 chars");
+    // and it agrees with what the event log's tee does with the same object
+    expect(JSON.stringify(redactSecretsForLog(input))).not.toContain(ENV_VALUE);
+  });
+
+  it("masks the same entry inside OpenAI-shaped JSON arguments", () => {
+    const text = inputText(JSON.stringify({ env: [{ name: "OMB_COMMS_TOKEN", value: ENV_VALUE }], cmd: "ls" }));
+    expect(text).not.toContain(ENV_VALUE);
+    expect(text).toContain('"cmd": "ls"');
+  });
+
+  it("masks a secret-shaped key and a credential inside an ordinary string", () => {
+    const token = `sk-proj-${"c".repeat(24)}`;
+    const text = inputText({ api_key: "plain-looking-value", command: `curl -H "Authorization: Bearer ${token}"` });
+    expect(text).not.toContain("plain-looking-value");
+    expect(text).not.toContain("c".repeat(24));
+  });
+
+  it("cuts a long string leaf before redacting or serializing it, and still reports the original size", () => {
+    const body = "w".repeat(ITEM_IO_CAPTURE_LIMIT * 40);
+    const prepared = prepareInput({ path: "big.txt", content: body });
+    expect(prepared).toBeDefined();
+    // the work was bounded: the text is a little over the limit, not 40 times it
+    expect(prepared!.text.length).toBeLessThan(ITEM_IO_CAPTURE_LIMIT + 200);
+    expect(prepared!.elided).toBe(body.length - ITEM_IO_CAPTURE_LIMIT);
+    const capture = captureInput({ path: "big.txt", content: body });
+    expect(capture.io?.input?.truncated).toBe(true);
+    expect(capture.io?.input?.length).toBeGreaterThanOrEqual(body.length);
+    expect(capture.io?.input?.text).toContain("big.txt");
+  });
+
+  it("says a capture was truncated when only a leaf was cut and the text still fits", () => {
+    const capture = captureInput({ content: "q".repeat(ITEM_IO_CAPTURE_LIMIT + 1) });
+    expect(capture.io?.input?.truncated).toBe(true);
+  });
+
+  it("fingerprints a text by length and both ends", () => {
+    const text = `${"a".repeat(100)}${"b".repeat(100)}`;
+    expect(textSignature(text)).toBe(textSignature(`${text}`));
+    expect(textSignature(text)).not.toBe(textSignature(`${text}c`));
+    expect(textSignature("")).toBe("0::");
+    // short enough to hold per open call
+    expect(textSignature("z".repeat(1_000_000)).length).toBeLessThan(120);
   });
 });
 

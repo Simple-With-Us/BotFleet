@@ -143,11 +143,13 @@ describe("MemoryChangeGate", () => {
     expect(gate.changed("c", "x")).toBe(false);
   });
 
-  it("forgets a thread on request", () => {
+  it("holds a digest, not the memory text", () => {
     const gate = new MemoryChangeGate();
-    gate.changed("t", "x");
-    gate.forget("t");
-    expect(gate.changed("t", "x")).toBe(true);
+    const memory = "a long memory ".repeat(2000);
+    gate.changed("t", memory);
+    const held = JSON.stringify([...(gate as unknown as { seen: Map<string, string> }).seen.values()]);
+    expect(held).not.toContain("a long memory");
+    expect(held.length).toBeLessThan(200);
   });
 });
 

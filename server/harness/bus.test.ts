@@ -435,6 +435,57 @@ describe("EventBus tool input and output capture", () => {
     expect(sink.writes[0].write.io.output?.text).toBe("done");
   });
 
+  const completedTool = (over: Partial<RuntimeEvent> = {}) =>
+    testEvent({
+      type: "item.completed",
+      itemType: "tool",
+      itemId: "toolu_1",
+      turnId: "turn-1",
+      ok: true,
+      io: { output: { text: "done", truncated: false, length: 4 } },
+      ...over,
+    } as Partial<RuntimeEvent>);
+
+  it("files the same arguments once when a step starts and completes with the same string", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    bus.publish(started({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    bus.publish(completedTool({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    // the input is written with the start; the completion adds only the result
+    expect(sink.writes.map((entry) => [entry.write.io.input?.text, entry.write.io.output?.text])).toEqual([
+      ['{\n  "path": "a.ts"\n}', undefined],
+      [undefined, "done"],
+    ]);
+  });
+
+  it("files the settled arguments again when they changed since the step started", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    // a streamed engine announces the call off its first fragment
+    bus.publish(started({ arguments: '{"pa' } as Partial<RuntimeEvent>));
+    bus.publish(completedTool({ arguments: '{"path":"a.ts"}' } as Partial<RuntimeEvent>));
+    expect(sink.writes).toHaveLength(2);
+    expect(sink.writes[0].write.io.input?.text).toBe('{"pa');
+    expect(sink.writes[1].write.io.input?.text).toBe('{\n  "path": "a.ts"\n}');
+    expect(sink.writes[1].write.io.output?.text).toBe("done");
+  });
+
+  it("keeps steps of different threads and ids apart, and forgets a step once it completes", () => {
+    const sink = recorder();
+    const bus = makeBus(undefined, { itemIo: sink });
+    const args = { arguments: '{"n":1}' } as Partial<RuntimeEvent>;
+    bus.publish(started({ ...args, threadId: "thread-a" }));
+    // the same item id on another thread was never announced there
+    bus.publish(completedTool({ ...args, threadId: "thread-b" }));
+    expect(sink.writes.map((entry) => entry.threadId)).toEqual(["thread-a", "thread-b"]);
+    expect(sink.writes[1].write.io.input?.text).toBe('{\n  "n": 1\n}');
+    // a finished step is dropped from the memory: an id the engine reuses is filed afresh
+    bus.publish(completedTool({ ...args, threadId: "thread-a" }));
+    bus.publish(started({ ...args, threadId: "thread-a" }));
+    const inputs = sink.writes.filter((entry) => entry.threadId === "thread-a" && entry.write.io.input);
+    expect(inputs).toHaveLength(2);
+  });
+
   it("does not record an event with nothing to record, or no item id to key it by", () => {
     const sink = recorder();
     const bus = makeBus(undefined, { itemIo: sink });

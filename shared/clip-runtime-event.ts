@@ -14,18 +14,16 @@
 // provider's native payload, which the Inspector's Raw lens already serves) is
 // dropped: nothing in a trajectory reads it.
 import type { RuntimeEvent } from "../server/contracts.ts";
+import { cutText } from "./text-format.ts";
 
 /** Longest free-text field a trajectory keeps, in UTF-16 units. */
 export const TRAJECTORY_FIELD_LIMIT = 2000;
 
 function cut(value: string, limit: number): string {
   if (value.length <= limit) return value;
-  // never end on the first half of a surrogate pair: a lone half renders as a
-  // replacement glyph
-  let end = Math.max(0, limit - 1);
-  const last = value.charCodeAt(end - 1);
-  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return `${value.slice(0, end)}…`;
+  // one unit is left for the ellipsis; `cutText` never ends on half a
+  // surrogate pair
+  return `${cutText(value, limit - 1)}…`;
 }
 
 /** The same event with each long text field clipped to `limit`.  Returns the

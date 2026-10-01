@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ITEM_ID_MAX_LENGTH, ItemIoStore } from "./item-io-store.ts";
-import { ITEM_IO_FIELD_LIMIT, boundText } from "../shared/item-io.ts";
+import { removeTranscriptLogs } from "./transcript-retention.ts";
+import { ITEM_IO_CAPTURE_LIMIT, ITEM_IO_FIELD_LIMIT, boundText, captureInput } from "../shared/item-io.ts";
 
 const dirs: string[] = [];
 const stores: ItemIoStore[] = [];
@@ -169,6 +170,36 @@ describe("redaction", () => {
     expect(onDisk).toContain("redacted");
   });
 
+  it("masks an env entry by its name, as the event log does, from a captured structured input", async () => {
+    const dir = tmp();
+    const store = makeStore({ dir });
+    // an ACP / MCP-style tool call: the value alone is an ordinary-looking
+    // string, only the NAME says it is a credential
+    const value = "abcd1234efgh5678";
+    store.record("t", {
+      itemId: "a",
+      io: captureInput({ command: "deploy", env: [{ name: "OMB_COMMS_TOKEN", value }] }).io ?? {},
+    });
+    await store.flush();
+    expect(readFileSync(join(dir, "t.ndjson"), "utf8")).not.toContain(value);
+    const served = await store.read("t", "a");
+    expect(served?.input?.text).not.toContain(value);
+    expect(served?.input?.text).toContain("redacted 16 chars");
+    // the part that is not a secret is still there
+    expect(served?.input?.text).toContain("deploy");
+  });
+
+  it("never stores the first half of a credential cut off the end of an oversized argument", async () => {
+    const store = makeStore({ dir: tmp() });
+    // the leaf is cut at the capture limit with the secret straddling it; what
+    // the store keeps stops short of that point, so no prefix of it survives
+    const content = `${"x".repeat(ITEM_IO_CAPTURE_LIMIT - 11)} ${SECRET}`;
+    store.record("t", { itemId: "a", io: captureInput({ content }).io ?? {} });
+    const served = await store.read("t", "a");
+    expect(served?.input?.text).not.toContain("sk-p");
+    expect(served?.input?.truncated).toBe(true);
+  });
+
   it("redacts what it serves even when an older record on disk was not", async () => {
     const dir = tmp();
     const store = makeStore({ dir });
@@ -278,7 +309,11 @@ describe("keys and failures", () => {
 });
 
 describe("cleanup", () => {
-  it("removes both generations of a deleted thread and leaves its neighbours", async () => {
+  // server/index.ts deletes a thread's logs with `removeTranscriptLogs` over
+  // its TRANSCRIPT_LOG_DIRS, ITEM_IO_DIR among them; the store itself has no
+  // delete.  This pins that the layout the store writes is the one that sweep
+  // removes.
+  it("leaves a deleted thread's two generations to the shared sweep, and its neighbours alone", async () => {
     const dir = tmp();
     const store = makeStore({ dir, maxBytes: 300 });
     for (let i = 0; i < 6; i += 1) {
@@ -287,7 +322,7 @@ describe("cleanup", () => {
     store.record("kept", { itemId: "a", io: { output: boundText("keep me") } });
     await store.flush();
     expect(existsSync(join(dir, "gone.ndjson.1"))).toBe(true);
-    expect(store.remove(["gone"])).toBeGreaterThanOrEqual(2);
+    expect(removeTranscriptLogs(dir, ["gone"])).toBeGreaterThanOrEqual(2);
     expect(existsSync(join(dir, "gone.ndjson"))).toBe(false);
     expect(existsSync(join(dir, "gone.ndjson.1"))).toBe(false);
     expect(await store.read("gone", "item-5")).toBeNull();
