@@ -265,6 +265,24 @@ function startsUnsolicitedTurn(frame: { type?: unknown; subtype?: unknown }): bo
   return frame.type === "system" && (frame.subtype === "init" || frame.subtype === "task_notification");
 }
 
+type TurnUsage = { input: number; output: number; cachedInput?: number };
+
+/** Two reported costs as one; unknown only when neither is known. */
+function sumCost(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return a + b;
+}
+
+/** Two reported usages as one, keeping the cache share when either has it. */
+function sumUsage(a: TurnUsage | undefined, b: TurnUsage | undefined): TurnUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const usage: TurnUsage = { input: a.input + b.input, output: a.output + b.output };
+  if (a.cachedInput !== undefined || b.cachedInput !== undefined) usage.cachedInput = (a.cachedInput ?? 0) + (b.cachedInput ?? 0);
+  return usage;
+}
+
 /** A short tag for a log line: enough to tell threads apart, never the id. */
 function threadTag(threadId: string): string {
   return createHash("sha256").update(threadId).digest("hex").slice(0, 8);
@@ -723,6 +741,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
          *  message already surfaced as an error, and the result frame that
          *  follows settles the turn `unknown_model`. */
         modelRejection?: string;
+        /** Cost and usage of this turn's earlier CLI results, when a steer
+         *  queued behind one made the CLI run another turn for it. */
+        carried?: { cost: number | null; usage?: TurnUsage };
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -1335,18 +1356,36 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             break;
           case "result": {
-            // A result for a turn the CLI started itself, while this turn's
-            // message still waits in the CLI's queue behind it.  Settling on
-            // it would end this turn early and orphan its real reply, which
-            // follows with its own result.  (A message folded INTO the
-            // CLI's turn leaves nothing queued, and that turn's result is
-            // the only one this turn will get, so it settles below.)
+            const resultUsage: TurnUsage | undefined = o.usage
+              ? {
+                  input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
+                  output: o.usage.output_tokens || 0,
+                  ...(typeof o.usage.cache_read_input_tokens === "number"
+                    ? { cachedInput: o.usage.cache_read_input_tokens }
+                    : {}),
+                }
+              : undefined;
+            // More user sends wait behind this result, and every one is this
+            // turn's: BotFleet writes a new turn only after the last one
+            // settled.  What is queued is this turn's own message (a turn the
+            // CLI started itself ran first) or a steer that landed after the
+            // turn's last model call.  Each runs as a CLI turn with a result
+            // of its own, so this turn stays open until the last of them —
+            // settling here would orphan the reply still to come.
             const origin = meta.origin?.kind;
-            if (origin !== undefined && origin !== "human" && (meta.queued_turn_count ?? 0) > 0) {
-              unsolicitedFrames.foreignResults++;
-              console.warn(
-                `[claude] thread ${threadTag(threadId)}: a ${origin} turn ended ahead of this turn's queued message; waiting for its own result`,
-              );
+            if ((meta.queued_turn_count ?? 0) > 0) {
+              if (origin === undefined || origin === "human") {
+                // this turn's own work: its bill is carried to the settle
+                session.turn.carried = {
+                  cost: sumCost(session.turn.carried?.cost ?? null, o.total_cost_usd ?? null),
+                  usage: sumUsage(session.turn.carried?.usage, resultUsage),
+                };
+              } else {
+                unsolicitedFrames.foreignResults++;
+                console.warn(
+                  `[claude] thread ${threadTag(threadId)}: a ${origin} turn ended ahead of this turn's queued message; waiting for its own result`,
+                );
+              }
               break;
             }
             // result.usage is this invocation's total — one process per turn,
@@ -1390,19 +1429,12 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               : isError
                 ? (o.terminal_reason ?? o.stop_reason ?? null)
                 : (o.stop_reason ?? o.terminal_reason ?? null);
+            const carried = liveTurn?.carried;
             settle(
               !isError && !modelRejected,
               stopReason,
-              o.total_cost_usd ?? null,
-              o.usage
-                ? {
-                    input: (o.usage.input_tokens || 0) + (o.usage.cache_read_input_tokens || 0) + (o.usage.cache_creation_input_tokens || 0),
-                    output: o.usage.output_tokens || 0,
-                    ...(typeof o.usage.cache_read_input_tokens === "number"
-                      ? { cachedInput: o.usage.cache_read_input_tokens }
-                      : {}),
-                  }
-                : undefined,
+              sumCost(carried?.cost ?? null, o.total_cost_usd ?? null),
+              sumUsage(carried?.usage, resultUsage),
             );
             break;
           }

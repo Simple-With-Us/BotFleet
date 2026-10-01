@@ -1799,6 +1799,20 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       expect(claudeUnsolicitedFrameStats().foreignResults).toBe(before.foreignResults + 1);
     });
 
+    it("keeps a turn open across a steer the CLI queued behind its result, and bills both", async () => {
+      await create("queued-steer");
+      const { turnId } = await instance.adapter.sendTurn({ threadId: "t-queued-steer", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed");
+
+      expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
+      const replies = recorder.events.filter((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(replies.map((e) => (e as { text: string }).text)).toEqual(["first reply", "reply to the late steer"]);
+      expect(replies.every((e) => e.turnId === turnId)).toBe(true);
+      expect(recorder.events.indexOf(replies[1])).toBeLessThan(recorder.events.indexOf(done));
+      expect(done).toMatchObject({ turnId, ok: true, usage: { input: 40, output: 8, cachedInput: 10 } });
+      expect((done as { cost: number }).cost).toBeCloseTo(0.03, 10);
+    });
+
     it("nests a helper's steps under the call that started it and keeps its prose out of the reply", async () => {
       await create("helpers");
       await instance.adapter.sendTurn({ threadId: "t-helpers", text: "survey" });

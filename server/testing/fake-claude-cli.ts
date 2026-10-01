@@ -35,6 +35,8 @@
 //                        arrives first, with this turn's message still queued)
 //                      | helpers (a native subagent's frames, each carrying
 //                        parent_tool_use_id)
+//                      | queued-steer (a result with a steer still queued
+//                        behind it, then the CLI's turn for that steer)
 //   FAKE_CLAUDE_DUMP   path to write {argv, env, prompt, mcpConfig} as JSON,
 //                      so the test can assert on argv shape and env hygiene.
 //                      mcpConfig is read back from the --mcp-config file the
@@ -406,6 +408,28 @@ const playTurn = (prompt: JsonValue) => {
     out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "task-1", is_error: false, content: "helper report" }] } });
     out({ type: "assistant", message: { content: [{ type: "text", text: "all done" }], usage: { input_tokens: 12, cache_read_input_tokens: 0, output_tokens: 3 } } });
     out({ type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.02, usage: { input_tokens: 22, cache_read_input_tokens: 0, output_tokens: 7 } });
+    turnRunning = false;
+    finishIfDone();
+    return;
+  }
+
+  if (mode === "queued-steer") {
+    // A steer that landed after the turn's last model call: the CLI settles
+    // the turn with the steer still queued (queued_turn_count 1), then runs
+    // a turn of its own for it.  Both are the harness's one turn.
+    out({ type: "assistant", message: { content: [{ type: "text", text: "first reply" }], usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 } } });
+    out({
+      type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.01,
+      origin: { kind: "human" }, queued_turn_count: 1, result_index: 0,
+      usage: { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 3 },
+    });
+    out({ type: "system", subtype: "init", session_id: sessionId, model, tools: ["Bash"] });
+    out({ type: "assistant", message: { content: [{ type: "text", text: "reply to the late steer" }], usage: { input_tokens: 20, cache_read_input_tokens: 6, output_tokens: 5 } } });
+    out({
+      type: "result", is_error: false, stop_reason: "end_turn", total_cost_usd: 0.02,
+      origin: { kind: "human" }, queued_turn_count: 0, result_index: 1,
+      usage: { input_tokens: 20, cache_read_input_tokens: 6, output_tokens: 5 },
+    });
     turnRunning = false;
     finishIfDone();
     return;
