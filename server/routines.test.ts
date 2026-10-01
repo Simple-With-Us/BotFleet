@@ -2276,3 +2276,56 @@ describe("a sustained hold does not churn the state file", () => {
     expect(runs.every((run) => run.holdReason === undefined)).toBe(true);
   });
 });
+
+describe("a terminal run stops claiming to be held", () => {
+  it("clears the reason when a held run is cancelled", async () => {
+    // A receipt reading "cancelled" AND "waiting because its engine is dead" at
+    // the same time is worse than no reason at all: nothing in it tells the
+    // reader which half is stale.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const queued = h.manager.listRuns()[0];
+    expect(queued.status).toBe("queued");
+    expect(queued.holdReason).toContain("DeepSeek Harness");
+
+    await h.manager.cancelRun(queued.id);
+    const [cancelled] = h.manager.listRuns();
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.holdReason).toBeUndefined();
+  });
+
+  it("clears the reason when the run is failed rather than dispatched", async () => {
+    // `failRun` is the other terminal exit a held run can take — a deleted bot,
+    // a vanished thread, a dispatch throw — and it has to clear the reason too.
+    const h = harness();
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "held for now";
+    const routine = h.manager.create({
+      name: "Compile gates",
+      prompt: "Run the gate",
+      botId: "maus-1",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 5).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    const queued = h.manager.listRuns()[0];
+    expect(queued.holdReason).toBe("held for now");
+
+    // A bot that vanishes takes the run to "missing" on the next tick.
+    h.setBot("missing");
+    h.setNow(routine.nextRunAt! + 10_000);
+    await h.manager.tick();
+    const [failed] = h.manager.listRuns();
+    expect(failed.status).toBe("failed");
+    expect(failed.holdReason).toBeUndefined();
+  });
+});
