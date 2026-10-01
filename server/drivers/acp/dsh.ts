@@ -12,6 +12,7 @@ import {
   DSH_MINIMAX_PROVIDER_ID,
   classifyDshError,
   dshCredentialCandidates,
+  dshInstalledEffortLevels,
   dshModelIdFromOptionValue,
   DshModelNotOfferedError,
   dshModelOptionValue,
@@ -30,7 +31,7 @@ import { parse as parseYaml } from "yaml";
 import { createAcpDriver, type AcpConfig, type AcpSupport } from "./core.ts";
 import { dshWrapSpawn } from "./dsh-mcp.ts";
 
-export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
+export { dshWrapSpawn, isDshEngineCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Harness package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
  * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
@@ -240,9 +241,11 @@ export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
   const options = STATIC_DSH_MODELS.options.map((option) => ({ ...option }));
+  let settings: DshSettings | undefined;
   let discovered: ModelCatalog["options"] = [];
   try {
-    discovered = modelRowsFromSettings(parseDshSettings(readFileSync(readDshSettingsPath(environment), "utf8")));
+    settings = parseDshSettings(readFileSync(readDshSettingsPath(environment), "utf8"));
+    discovered = modelRowsFromSettings(settings);
   } catch {
     // No settings file, unreadable, or unparseable YAML: the static catalog
     // stands.  A discovery miss is never fatal.
@@ -265,6 +268,18 @@ export function readDshModelCatalog(
     const merged = options[index];
     if (row.contextWindow) merged.contextWindow = row.contextWindow;
     options[index] = merged;
+  }
+  // Per-model effort levels (MiniMax M3.1) exist only when this install's
+  // settings entry declares them: stock dsh does not catalog M3.1, so without
+  // `reasoningEfforts` on its entry dsh refuses every level.  Harness answers
+  // for every per-model row, and an explicit `[]` here wins over the static
+  // `perModelEffortLevels` core folds on afterwards, so the picker never
+  // offers a level this dsh would refuse.  A missing or unreadable file
+  // answers `[]` for those rows too.
+  const installedLevels = dshInstalledEffortLevels(settings);
+  for (const option of options) {
+    const levels = installedLevels[option.id];
+    if (levels) option.effortLevels = [...levels];
   }
   // The static default is always in the union, so a refresh cannot move a
   // selection out from under the user.
@@ -299,16 +314,6 @@ function dshClassifyError(error: unknown): ProviderErrorCode | undefined {
   return code === "unknown" ? undefined : code;
 }
 
-function currentConfigValue(result: unknown, configId: string): unknown {
-  if (!result || typeof result !== "object") return undefined;
-  const options = (result as { configOptions?: unknown }).configOptions;
-  if (!Array.isArray(options)) return undefined;
-  const option = options.find(
-    (candidate) => candidate && typeof candidate === "object" && (candidate as { id?: unknown }).id === configId,
-  );
-  return option && typeof option === "object" ? (option as { currentValue?: unknown }).currentValue : undefined;
-}
-
 /** DSH's `initialize` base deadline.  `dsh --profile acp` answers only after
  * its Cordis host has loaded ~200 plugin packages: about 3.5 s of CPU, which
  * the shared 60 s default was cutting off once host load stretched it (p99
@@ -331,23 +336,12 @@ export const dshSupport = {
     harnessDshSupport.isAuthenticated?.(env) ?? false,
   authFailure: "continue" as const,
   buildPromptText: (turn: SendTurnInput) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
+  // Effort semantics are engine shape and live in Harness: an explicit level
+  // is sent and must take, and Default on a row with per-model levels (MiniMax
+  // M3.1) sends dsh's provider-default value so a level a resumed session kept
+  // from an earlier turn clears.  DeepSeek rows still send nothing for Default.
   async configureSession({ request, sessionId, turn }) {
-    if (!turn.effort) return;
-    const requested = turn.effort === "none" ? "off" : turn.effort;
-    const result = await request("session/set_config_option", {
-      sessionId,
-      configId: "reasoning_effort",
-      value: requested,
-    });
-    const confirmed = currentConfigValue(result, "reasoning_effort");
-    // Only a *reported* mismatch means the setting did not take.  A reply that
-    // carries no option state (stock `dsh` answered `{}`) reports nothing to
-    // compare, and failing on that refused every effort-pinned turn.
-    if (confirmed !== undefined && confirmed !== requested) {
-      throw new Error(
-        `Harness did not switch reasoning effort to ${requested} (still ${String(confirmed ?? "unknown")})`,
-      );
-    }
+    await harnessDshSupport.configureSession?.({ request, sessionId, turn });
   },
 } satisfies AcpSupport;
 

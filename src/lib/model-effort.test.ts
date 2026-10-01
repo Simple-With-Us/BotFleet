@@ -77,4 +77,23 @@ describe("modelEffortLevels", () => {
       "xhigh",
     ]);
   });
+
+  it("shows the DSH MiniMax M3.1 picker only when its catalog row carries levels", () => {
+    // The server folds Harness's per-model levels onto the DSH catalog, gated on
+    // the install's settings.yaml, so the row's own list is the whole answer.
+    const dsh = {
+      driverKind: "dshAgent",
+      capabilities: { effortLevels: ["none", "high", "max"] as const },
+    };
+    const m31Levels = ["low", "medium", "high", "xhigh", "max"] as const;
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: m31Levels })).toEqual(m31Levels);
+    expect(modelSupportsEffort(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: m31Levels })).toBe(true);
+    // An install whose entry declares no levels answers [] and hides it.
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M3.1-Flash-Preview", effortLevels: [] })).toEqual([]);
+    // Other DSH MiniMax rows carry no list and stay hidden by the DSH rule.
+    expect(modelEffortLevels(dsh, { id: "MiniMax-M2.7-highspeed" })).toEqual([]);
+    // DeepSeek rows keep the engine-wide list.
+    expect(modelEffortLevels(dsh, { id: "DeepSeek-V4.1-Flash" })).toEqual(["none", "high", "max"]);
+  });
 });
+

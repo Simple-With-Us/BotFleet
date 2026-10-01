@@ -4,7 +4,7 @@
 // needs SPAWNED_PROXIES.dshAcpBridge (packaged Electron stdio bridge).
 import {
   writeDshMcpPatch,
-  isStockDshCli,
+  isDshEngineCli,
 } from "harness/dsh/mcp-patch";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 import type { SendTurnInput } from "../../contracts.ts";
@@ -14,7 +14,7 @@ export {
   DSH_MCP_PATCH_PREFIX,
   dshMcpPatchYaml,
   dshMcpServerName,
-  isStockDshCli,
+  isDshEngineCli,
   writeDshMcpPatch,
 } from "harness/dsh/mcp-patch";
 
@@ -23,7 +23,7 @@ export function dshWrapSpawn(
   args: string[],
   turn: Pick<SendTurnInput, "integrations">,
 ): AcpSpawnRewrite {
-  if (!isStockDshCli(cli)) return { cli, args };
+  if (!isDshEngineCli(cli)) return { cli, args };
   const servers = acpMcpServers(turn);
   if (servers.length === 0) return { cli, args };
   const patch = writeDshMcpPatch(servers);
