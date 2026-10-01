@@ -5,18 +5,23 @@ import { join } from "node:path";
 import {
   CLOUDFLARED_ASSETS,
   CLOUDFLARED_VERSION,
+  VERSION_PROBE_ATTEMPTS,
+  VERSION_PROBE_TIMEOUT_MS,
+  classifyVersionProbe,
   cloudflaredArchiveCacheDirectory,
   currentOnlyFromEnv,
   describeDownloadFailure,
   downloadRelease,
   executableTarget,
   parsePrepareCloudflaredArgs,
+  probePinnedVersion,
   sha256,
   targetForCurrentHost,
   targetsForHost,
   targetsForPreparation,
   verifyPinnedBinary,
   verifySha256,
+  versionProbeFailureMessage,
 } from "./prepare-cloudflared.mjs";
 
 const PINNED_ASSETS = {
@@ -202,5 +207,137 @@ describe("the Mac updater's single-architecture staging", () => {
     expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "1" })).toBe(true);
     expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "true" })).toBe(false);
     expect(currentOnlyFromEnv({ OMB_CLOUDFLARED_CURRENT: "" })).toBe(false);
+  });
+});
+
+/** The shape `spawnSync` really returns, so the classifier is exercised
+ * against Node's contract rather than a convenient shape of our own.  A
+ * timeout is `error.code === "ETIMEDOUT"` with the child killed: `status` is
+ * null and `signal` is set. */
+function probeResult(overrides = {}) {
+  return { status: 0, signal: null, stdout: "", stderr: "", ...overrides };
+}
+
+function timedOutResult(binary = "/staged/cloudflared") {
+  return probeResult({
+    status: null,
+    signal: "SIGTERM",
+    error: Object.assign(new Error(`spawnSync ${binary} ETIMEDOUT`), { code: "ETIMEDOUT" }),
+  });
+}
+
+function fakeSpawn(responses) {
+  const calls = [];
+  const spawn = (binary, args, options) => {
+    calls.push({ binary, args, options });
+    return responses[Math.min(calls.length - 1, responses.length - 1)];
+  };
+  return { spawn, calls };
+}
+
+const quiet = { log: () => {} };
+
+describe("identifying the staged cloudflared executable", () => {
+  it("waits 60s and allows one retry by default, not the old 10s ceiling", () => {
+    expect(VERSION_PROBE_TIMEOUT_MS).toBe(60_000);
+    expect(VERSION_PROBE_ATTEMPTS).toBe(2);
+    const { spawn, calls } = fakeSpawn([probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` })]);
+    probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual(["version"]);
+    expect(calls[0].options.timeout).toBe(60_000);
+  });
+
+  it("retries once past a timeout and accepts the answer the retry gets", () => {
+    // The Oct 1, 2026 incident: the binary was correct, the host was not.
+    const { spawn, calls } = fakeSpawn([
+      timedOutResult(),
+      probeResult({ stdout: `cloudflared version ${CLOUDFLARED_VERSION}\n` }),
+    ]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(probe.ok).toBe(true);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("reports a timeout as a timeout, not as a version mismatch", () => {
+    const { spawn, calls } = fakeSpawn([timedOutResult()]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(probe.ok).toBe(false);
+    expect(probe.reason).toBe("timeout");
+    expect(calls).toHaveLength(2);
+
+    const message = versionProbeFailureMessage("darwin-arm64", probe);
+    expect(message).toContain(`darwin-arm64 executable did not identify as cloudflared ${CLOUDFLARED_VERSION}`);
+    expect(message).toMatch(/timed out on attempt 2 of 2 at 60s each/);
+    expect(message).toContain("status=null");
+    expect(message).toContain("signal=SIGTERM");
+    expect(message).toContain("ETIMEDOUT");
+    // The cause a person can act on, not the "corrupt download" dead end.
+    expect(message).not.toMatch(/did not report the pinned version/);
+  });
+
+  it("still reports a genuine version mismatch, without retrying", () => {
+    const { spawn, calls } = fakeSpawn([
+      probeResult({ stdout: "cloudflared version 2026.7.1\n" }),
+    ]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn, ...quiet });
+    expect(probe.reason).toBe("version");
+    expect(calls).toHaveLength(1);
+
+    const message = versionProbeFailureMessage("linux-x64", probe);
+    expect(message).toMatch(/it ran but did not report the pinned version/);
+    expect(message).toContain("output=cloudflared version 2026.7.1");
+    expect(message).not.toMatch(/timed out/);
+  });
+
+  it("names a non-zero exit and a killed child distinctly, and never retries either", () => {
+    const failed = probePinnedVersion("/staged/cloudflared", {
+      spawn: fakeSpawn([probeResult({ status: 3, stderr: "cannot find the right architecture\n" })]).spawn,
+      ...quiet,
+    });
+    expect(failed.reason).toBe("status");
+    const failedMessage = versionProbeFailureMessage("linux-x64", failed);
+    expect(failedMessage).toMatch(/exited with status 3/);
+    expect(failedMessage).toContain("status=3");
+
+    const killedSpawn = fakeSpawn([probeResult({ status: null, signal: "SIGKILL" })]);
+    const killed = probePinnedVersion("/staged/cloudflared", { spawn: killedSpawn.spawn, ...quiet });
+    expect(killed.reason).toBe("signal");
+    expect(killedSpawn.calls).toHaveLength(1);
+    expect(versionProbeFailureMessage("linux-x64", killed)).toMatch(/killed by SIGKILL/);
+  });
+
+  it("does not spend a second attempt on a binary that cannot be run at all", () => {
+    const missing = fakeSpawn([
+      probeResult({
+        status: null,
+        error: Object.assign(new Error("spawnSync /staged/cloudflared ENOENT"), { code: "ENOENT" }),
+      }),
+    ]);
+    const probe = probePinnedVersion("/staged/cloudflared", { spawn: missing.spawn, ...quiet });
+    expect(probe.reason).toBe("spawn");
+    expect(missing.calls).toHaveLength(1);
+    expect(versionProbeFailureMessage("linux-x64", probe)).toMatch(/could not be run/);
+  });
+
+  it("accepts the version from either stream and ignores an unversioned failure", () => {
+    expect(classifyVersionProbe(probeResult({ stderr: `cloudflared ${CLOUDFLARED_VERSION}\n` }))).toEqual({
+      ok: true,
+      reason: "version",
+    });
+    expect(classifyVersionProbe(probeResult({ status: 0, stdout: "some other tunnel client\n" }))).toEqual({
+      ok: false,
+      reason: "version",
+    });
+  });
+
+  it("announces the retry so a stalled build says why it paused", () => {
+    const lines = [];
+    probePinnedVersion("/staged/cloudflared", {
+      spawn: fakeSpawn([timedOutResult()]).spawn,
+      log: (line) => lines.push(line),
+    });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/timed out after 60s .* retrying \(attempt 2 of 2\)/);
   });
 });

@@ -33,6 +33,15 @@ upstream digest before that necessary packaging change, then verifies the
 nested signature, signing team, and architecture before notarization. Linux
 and Windows packages retain the exact reviewed upstream executable bytes.
 
+The executable is also asked to report its own version, and that step waits
+60 seconds with one retry. `cloudflared version` prints in well under two
+seconds on an idle host, so a longer wait costs nothing when the machine is
+healthy, while a build running on a heavily loaded fleet host no longer
+reports a saturated CPU as a version mismatch. Only a timeout is retried: a
+missing, non-executable, or wrong-version binary fails the same way twice, so
+the error names what actually happened -- exit status, terminating signal, or
+spawn error -- instead of a bare "did not identify as cloudflared".
+
 cloudflared is licensed under Apache License 2.0. The distribution includes a
 separately named copy of the complete Apache 2.0 text at
 `resources/licenses/cloudflared-LICENSE.txt`.

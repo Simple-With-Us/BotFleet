@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { classifyError } from "../retry.ts";
-import { GrokAgentDriver, grokRejectedModelMessage, readGrokModelCatalog, STATIC_GROK_MODELS } from "./grok.ts";
+import {
+  GrokAgentDriver,
+  grokRejectedModelMessage,
+  grokRpcReason,
+  readGrokModelCatalog,
+  STATIC_GROK_MODELS,
+} from "./grok.ts";
 
 const scratchDirs: string[] = [];
 
@@ -253,5 +259,32 @@ describe("grokRejectedModelMessage", () => {
     expect(ids).toHaveLength(12);
     expect(message).not.toContain("bad slug");
     expect(message).not.toContain("xxxx");
+  });
+});
+
+describe("grokRpcReason", () => {
+  const rpcError = (message: string, data?: unknown) => Object.assign(new Error(message), { code: -32602, data });
+
+  it("folds the RPC error's data string into the reason, as grok 1.0.46 sends it", () => {
+    expect(grokRpcReason(rpcError("Invalid params", "unknown model id"))).toBe("Invalid params: unknown model id");
+  });
+
+  it("leaves the message alone when there is no usable data or it is already there", () => {
+    expect(grokRpcReason(rpcError("Invalid params"))).toBe("Invalid params");
+    expect(grokRpcReason(rpcError("Invalid params", { nested: true }))).toBe("Invalid params");
+    expect(grokRpcReason(rpcError("Invalid params", "   "))).toBe("Invalid params");
+    expect(grokRpcReason(rpcError("Invalid params: unknown model id", "unknown model id"))).toBe(
+      "Invalid params: unknown model id",
+    );
+    expect(grokRpcReason("plain failure")).toBe("plain failure");
+  });
+
+  it("makes the real CLI rejection classify as unknown_model rather than unknown", () => {
+    const bare = new Error(grokRejectedModelMessage("composer-2.5", "Invalid params"));
+    expect(classifyError(bare).reason).toBe("unknown");
+    const folded = new Error(
+      grokRejectedModelMessage("composer-2.5", grokRpcReason(rpcError("Invalid params", "unknown model id"))),
+    );
+    expect(classifyError(folded)).toEqual({ transient: false, reason: "unknown_model" });
   });
 });
