@@ -4,7 +4,8 @@
 // summed here; nothing is fetched.
 import * as React from "react";
 import { Check, CheckCircle, ChevronDown, Loader2, RefreshCw, Sparkles, XCircle } from "lucide-react";
-import { api, useSecretSources, useStore, type ConfigStatus, type TaskUsage } from "@/state/store";
+import { api, useSecretSources, useStore, type ConfigStatus, type InstanceInfo, type TaskUsage } from "@/state/store";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { cn } from "@/lib/cn";
 import { BotMascot } from "./Avatar";
 import { Card } from "./SettingsPrimitives";
@@ -127,6 +128,16 @@ export function hasEngineSpendActivity(spend: EngineSpend | undefined): boolean 
     || spend.spend7dUsd > 0
     || (spend.unpricedTurns5h ?? 0) > 0
     || (spend.unpricedTurns7d ?? 0) > 0;
+}
+
+/** Whether an unavailable engine with no quota data of its own stays out of
+ *  Engine Quotas.  Only engines never set up (no CLI, no key/token), turned
+ *  off, or optional and unconfigured are hidden.  One whose last probe just
+ *  did not answer in time keeps its row: it is being re-checked, not missing. */
+export function hidesIdleUnavailableEngineRow(instance: Pick<InstanceInfo, "snapshot">): boolean {
+  if (isHiddenEngine(instance)) return true;
+  if (isCheckingEngine(instance)) return false;
+  return isEngineUnconfigured(instance.snapshot);
 }
 
 /** Total turns in the window the panel could not put a price on. */
@@ -682,7 +693,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
         )}
         <div className="flex flex-col divide-y divide-hairline/20">
           {state.instances.filter((instance) => {
-            if (instance.enabled === false || isHiddenQuotaEngine(instance.driverKind)) return false;
+            if (instance.enabled === false || isHiddenQuotaEngine(instance.driverKind) || isHiddenEngine(instance)) return false;
             const isDeepSeek =
               instance.driverKind === "deepseekAgent" ||
               instance.driverKind === "dshAgent" ||
@@ -724,7 +735,7 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
             // or explicitly disabled are worth hiding when they have no
             // quota data of their own.
             if (instance.snapshot.state !== "available" && !hasQuotaData) {
-              return !isEngineUnconfigured(instance.snapshot.reason);
+              return !hidesIdleUnavailableEngineRow(instance);
             }
             return true;
           }).map((instance) => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { engineSetupCopy, isApiKeyOnly, needsCli, needsSignIn } from "./EngineSetup";
+import { engineCheckingCopy, engineSetupCopy, isApiKeyOnly, needsCli, needsSignIn } from "./EngineSetup";
 import type { InstanceInfo } from "@/state/store";
 
 function instance(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
@@ -32,6 +32,22 @@ function apiKeyInstance(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
 }
 
 describe("needsCli / needsSignIn", () => {
+  it("never calls an engine whose probe did not answer in time 'not installed' or 'signed out'", () => {
+    const checking = instance({ state: "unavailable", transient: true, reason: "Kimi did not answer in time" });
+    expect(needsCli(checking)).toBe(false);
+    expect(needsSignIn(checking)).toBe(false);
+    const copy = engineCheckingCopy(checking);
+    expect(copy.title).toBe("Checking Kimi");
+    // Two-space sentence gap as U+00A0 + space, never the literal entity.
+    expect(copy.description).toBe("Kimi did not answer in time.\u00a0 BotFleet is checking again and will update this on its own.");
+    expect(copy.description).not.toContain("&nbsp;");
+  });
+
+  it("does not read an unknown sign-in (auth probe timed out) as signed out", () => {
+    const unknown = instance({ state: "available", version: "0.36.1" });
+    expect(needsSignIn(unknown)).toBe(false);
+  });
+
   it("treats a missing binary as a CLI install, not a sign-in", () => {
     const missing = instance({ state: "unavailable", reason: "`kimi` CLI not found" });
     expect(needsCli(missing)).toBe(true);

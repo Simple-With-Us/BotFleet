@@ -93,6 +93,10 @@ final class Session: ObservableObject {
     /// transient sheet dismissals and cancelled tasks so the profile model picker
     /// never empties spuriously.
     @Published private(set) var cachedInstances: [Instance] = []
+    /// The roster behind `cachedInstances` and the `describedAt` high-water mark
+    /// every fetch and push is ordered by (`InstanceRoster`).  Reset with them
+    /// on pair / sign-out: another computer's stamps share nothing with this one's.
+    private var instanceRoster = InstanceRoster()
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
@@ -370,6 +374,7 @@ final class Session: ObservableObject {
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         cachedInstances = []
+        instanceRoster.reset()
         status = .connecting
     }
 
@@ -449,6 +454,7 @@ final class Session: ObservableObject {
         self.state = CompanionState()
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
         restorePending = false
@@ -521,6 +527,7 @@ final class Session: ObservableObject {
         pushSenderHealthNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         resetAvatarCache()
@@ -697,6 +704,11 @@ final class Session: ObservableObject {
                         // the request dies halfway through replay/hydration,
                         // reconnecting must still ask for the missing gap.
                         if !resumed {
+                            // A stream that cannot resume is usually a restarted
+                            // harness, whose describedAt clock owes nothing to
+                            // the last process's.  Keep the roster, drop the
+                            // mark, so the next fetch is not judged against it.
+                            instanceRoster.forgetOrder()
                             coldHydration: while true {
                                 switch try await hydrateSnapshot(using: client) {
                                 case .applied:
@@ -748,6 +760,10 @@ final class Session: ObservableObject {
                     state.advance(to: frame.seq)
                     if case .updateStatus = frame.frame {
                         pollMacUpdateWhileRunning()
+                    }
+                    if case let .instances(fetched, describedAt) = frame.frame {
+                        // A pushed roster replaces the cached one, the same as a fetch.
+                        applyInstances(fetched, describedAt: describedAt)
                     }
                 }
                 // the stream ended without an error — the harness went away
@@ -2456,18 +2472,27 @@ final class Session: ObservableObject {
         return outcome
     }
 
+    /// Replaces the cached roster unless the harness already described a newer
+    /// one: a slow fetch must not overwrite a fresher push, or the reverse.
+    /// Every path that installs a roster goes through here, so one high-water
+    /// mark orders them all.  An answer without a stamp (an older harness) is
+    /// applied as before.
+    @discardableResult
+    private func applyInstances(_ fetched: [Instance], describedAt: Double?) -> Bool {
+        guard instanceRoster.apply(fetched, describedAt: describedAt) else { return false }
+        cachedInstances = instanceRoster.instances
+        instanceDriverKinds = instanceRoster.driverKinds
+        return true
+    }
+
     func instances() async -> [Instance] {
         guard let client else { return [] }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
-            guard pairingGeneration == generation else { return fetched }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
-            return fetched
+            let list = try await client.instanceList()
+            guard pairingGeneration == generation else { return list.instances }
+            // A fetch older than the roster already held answers with the newer one.
+            return applyInstances(list.instances, describedAt: list.describedAt) ? list.instances : cachedInstances
         } catch {
             recordActionError(error)
             if pairingGeneration == generation && !cachedInstances.isEmpty {
@@ -2486,13 +2511,9 @@ final class Session: ObservableObject {
         guard let client else { return }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
+            let list = try await client.instanceList()
             guard pairingGeneration == generation else { return }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
+            applyInstances(list.instances, describedAt: list.describedAt)
         } catch {
             // Quiet: connectivity / cancel while the roster is open.
         }

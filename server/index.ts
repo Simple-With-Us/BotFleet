@@ -1933,6 +1933,13 @@ function broadcast(payload: Record<string, unknown>) {
   }
 }
 
+// A describe that finished behind a stale-while-revalidate answer (or a slow
+// engine's probe that landed after its sweep) reaches open windows without
+// another GET: the picker that showed "Checking" updates on its own.
+registry.onDescribed((instances, describedAt) => {
+  broadcast({ kind: "instances", instances: presentInstances(instances), describedAt });
+});
+
 // ── server-side event folding (upstream's ingestion worker, miniature) ──
 // The canonical stream is the source of truth; the persisted transcript
 // and every client view are projections of it.
@@ -12174,9 +12181,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
       // presentInstances moves saved selections forward against what the
-      // engines offer now.
+      // engines offer now.  describedAt is the stamp of the raw list: a client
+      // holding a newer answer (from the `instances` push or another request)
+      // can drop this one.
       const instances = presentInstances(described);
-      return json(res, 200, { instances });
+      return json(res, 200, { instances, describedAt: registry.describedAtOf(described) });
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -12323,7 +12332,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, { instances: presentInstances(instances) });
+        return json(res, 200, {
+          instances: presentInstances(instances),
+          describedAt: registry.describedAtOf(instances),
+        });
       } finally {
         providerConfigBusy = false;
       }
@@ -12495,10 +12507,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           if (newLive) bus.attach([newLive]);
         }
         resetPathCache();
+        const instances = await registry.describe();
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances: presentInstances(await registry.describe()),
+          instances: presentInstances(instances),
+          describedAt: registry.describedAtOf(instances),
         });
       } finally {
         providerConfigBusy = false;
@@ -12618,9 +12632,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         quotaCooldowns.clearWhere((cooldown) => cooldown.instanceId === instanceId);
         modelRejections.clearInstance(instanceId);
         resetPathCache();
+        const instances = await registry.describe();
         return json(res, 200, {
           ok: true,
-          instances: presentInstances(await registry.describe()),
+          instances: presentInstances(instances),
+          describedAt: registry.describedAtOf(instances),
         });
       } finally {
         providerConfigBusy = false;

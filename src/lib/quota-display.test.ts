@@ -207,6 +207,15 @@ describe("isEngineUnconfigured", () => {
     expect(isEngineUnconfigured(undefined)).toBe(false);
     expect(isEngineUnconfigured(null)).toBe(false);
   });
+
+  it("never calls an engine unconfigured when its probe just did not answer in time", () => {
+    // A slow probe is not a missing CLI: the row stays while it is re-checked.
+    expect(isEngineUnconfigured({ reason: "Claude did not answer in time", transient: true })).toBe(false);
+    // Even a stale "not found" wording carried on a transient snapshot.
+    expect(isEngineUnconfigured({ reason: "`cursor-agent` CLI not found", transient: true })).toBe(false);
+    // A definitive snapshot still reads by its reason.
+    expect(isEngineUnconfigured({ reason: "`cursor-agent` CLI not found" })).toBe(true);
+  });
 });
 
 describe("antigravity group summary", () => {
