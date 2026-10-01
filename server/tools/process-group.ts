@@ -202,15 +202,16 @@ export function runInProcessGroup(file: string, args: string[], options: Grouped
       // A finished group is forgotten; a stopped one stays tracked until its
       // kill lands, and one with a process left running is the turn's to stop.
       if (pgid !== undefined && !stopped && !leftRunning) options.groups?.release(pgid);
-      resolve({
+      const result: GroupedRunResult = {
         code,
         signal: exitSignal,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
-        ...(stopped ? { stopped } : {}),
-        ...(spawnError !== undefined ? { spawnError } : {}),
         leftRunning,
-      });
+      };
+      if (stopped) result.stopped = stopped;
+      if (spawnError !== undefined) result.spawnError = spawnError;
+      resolve(result);
     };
     const stop = (why: NonNullable<GroupedRunResult["stopped"]>) => {
       if (settled) return;

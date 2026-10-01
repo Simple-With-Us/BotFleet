@@ -1806,7 +1806,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
 
       const started = recorder.events.filter((e) => e.type === "item.started" && e.itemType === "tool");
       expect(started.map((e) => (e as { itemId?: string }).itemId)).toEqual(["task-1", "helper-read-1"]);
-      expect(started[0]).not.toHaveProperty("parentItemId");
+      expect((started[0] as { parentItemId?: string }).parentItemId).toBeUndefined();
       expect(started[1]).toMatchObject({ title: "Read", parentItemId: "task-1" });
       // the helper's step still completes like any other
       expect(recorder.events.some((e) => e.type === "item.completed" && e.itemType === "tool" && e.itemId === "helper-read-1")).toBe(true);

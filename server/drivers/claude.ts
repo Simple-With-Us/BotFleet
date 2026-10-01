@@ -14,6 +14,8 @@ import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
+import { z } from "zod";
+
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
@@ -184,12 +186,12 @@ export function claudeSignedIn(
  *   to 3 at once, one level deep.
  *
  * Forced over any inherited value: these are a safety floor, not defaults. */
-export const CLAUDE_CONTAINMENT_ENV: Readonly<Record<string, string>> = {
+export const CLAUDE_CONTAINMENT_ENV = {
   CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
   CLAUDE_CODE_DISABLE_CRON: "1",
   CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: "3",
   CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: "1",
-};
+} as const satisfies Record<string, string>;
 
 /** Built-ins whose whole job is to start a turn later, with nobody's message
  * behind it.  The environment above does not remove any of them from the
@@ -268,15 +270,25 @@ function threadTag(threadId: string): string {
   return createHash("sha256").update(threadId).digest("hex").slice(0, 8);
 }
 
-/** Where a result came from, when the CLI says: `human` for the message
- * BotFleet wrote, anything else for a turn the CLI started itself
- * (`task-notification`, `peer`, `channel`, ...).  Absent on CLIs before
- * the `origin` field, which only ever ran turns BotFleet asked for. */
-function resultOrigin(frame: { origin?: unknown }): string | undefined {
-  const origin = frame.origin;
-  if (typeof origin !== "object" || origin === null || !("kind" in origin)) return undefined;
-  return typeof origin.kind === "string" ? origin.kind : undefined;
-}
+/** The few fields containment reads off a raw stream-json frame, each
+ * dropped to undefined when the CLI sent something else.
+ *
+ * - `origin.kind` says where a result came from: `human` for the message
+ *   BotFleet wrote, anything else for a turn the CLI started itself
+ *   (`task-notification`, `peer`, `channel`, ...).  Absent on CLIs before
+ *   the field, which only ever ran turns BotFleet asked for.
+ * - `queued_turn_count` counts user sends still waiting behind a result.
+ * - `parent_tool_use_id` names the Task/Agent call a helper frame belongs to. */
+const FrameMeta = z
+  .object({
+    subtype: z.string().optional().catch(undefined),
+    origin: z.object({ kind: z.string() }).optional().catch(undefined),
+    queued_turn_count: z.number().optional().catch(undefined),
+    total_cost_usd: z.number().optional().catch(undefined),
+    parent_tool_use_id: z.string().min(1).optional().catch(undefined),
+  })
+  // a frame that is not an object at all carries none of them
+  .catch({});
 
 const DRIVER_KIND = "claudeAgent";
 const CLAUDE_ISOLATION_REASON = "Update Claude Code to a version supporting --strict-mcp-config and refresh engines; CLI isolation support could not be verified.";
@@ -1160,13 +1172,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
        *  never transcript text, never stamped with a settled turn's id, and
        *  never settles or pauses anything: the turn that owned the broker and
        *  the thread is gone, and the next one has not been written yet. */
-      const dropUnsolicited = (frame: any) => {
+      const dropUnsolicited = (frame: { type?: unknown; subtype?: unknown }) => {
+        const meta = FrameMeta.parse(frame);
         if (frame.type === "result") {
           unsolicitedFrames.dropped++;
-          const cost = typeof frame.total_cost_usd === "number" ? `, cost ${frame.total_cost_usd.toFixed(4)}` : "";
+          const cost = meta.total_cost_usd === undefined ? "" : `, cost ${meta.total_cost_usd.toFixed(4)}`;
           console.warn(
             `[claude] thread ${threadTag(threadId)}: dropped a turn the CLI started on its own ` +
-              `(${session.unsolicitedFrames + 1} frames, origin ${resultOrigin(frame) ?? "unknown"}${cost})`,
+              `(${session.unsolicitedFrames + 1} frames, origin ${meta.origin?.kind ?? "unknown"}${cost})`,
           );
           session.unsolicited = false;
           session.unsolicitedFrames = 0;
@@ -1180,7 +1193,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (session.unsolicited) return;
         session.unsolicited = true;
         unsolicitedFrames.turns++;
-        const subtype = typeof frame.subtype === "string" ? `/${frame.subtype}` : "";
+        const subtype = meta.subtype === undefined ? "" : `/${meta.subtype}`;
         console.warn(
           `[claude] thread ${threadTag(threadId)}: the CLI started a turn of its own (${String(frame.type)}${subtype}); dropping its frames`,
         );
@@ -1217,7 +1230,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // A helper (native subagent) frame names the Task/Agent call that
         // started it.  Its steps nest under that row; its own prose is the
         // helper talking to its parent, not the bot answering anyone.
-        const helperOf = typeof o.parent_tool_use_id === "string" && o.parent_tool_use_id ? o.parent_tool_use_id : null;
+        const meta = FrameMeta.parse(o);
+        const helperOf = meta.parent_tool_use_id;
         switch (o.type) {
           case "system":
             if (o.subtype === "init") {
@@ -1282,7 +1296,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
                   itemType: "tool",
                   itemId: b.id,
                   title: b.name,
-                  ...(helperOf ? { parentItemId: helperOf } : {}),
+                  parentItemId: helperOf,
                   ...toolFields(b.name, b.input, { cwd: turn.cwd }),
                   ...captureInput(b.input),
                 });
@@ -1327,8 +1341,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // follows with its own result.  (A message folded INTO the
             // CLI's turn leaves nothing queued, and that turn's result is
             // the only one this turn will get, so it settles below.)
-            const origin = resultOrigin(o);
-            if (origin !== undefined && origin !== "human" && Number(o.queued_turn_count) > 0) {
+            const origin = meta.origin?.kind;
+            if (origin !== undefined && origin !== "human" && (meta.queued_turn_count ?? 0) > 0) {
               unsolicitedFrames.foreignResults++;
               console.warn(
                 `[claude] thread ${threadTag(threadId)}: a ${origin} turn ended ahead of this turn's queued message; waiting for its own result`,

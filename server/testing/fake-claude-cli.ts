@@ -471,16 +471,16 @@ const playTurn = (prompt: JsonValue) => {
   });
 
   const finish = () => {
-    out({
+    const result = {
       type: "result",
       is_error: false,
       stop_reason: "end_turn",
       total_cost_usd: 0.01,
       usage: { input_tokens: 10, cache_read_input_tokens: 2, output_tokens: 5 },
-      // 2.1.284 names where each turn came from; the ghost modes need the
-      // newer shape, every other mode keeps the older one with no origin.
-      ...(mode.startsWith("ghost-") ? { origin: { kind: "human" }, queued_turn_count: 0 } : {}),
-    });
+    };
+    // 2.1.284 names where each turn came from; the ghost modes need the
+    // newer shape, every other mode keeps the older one with no origin.
+    out(mode.startsWith("ghost-") ? { ...result, origin: { kind: "human" }, queued_turn_count: 0 } : result);
     turnRunning = false;
     if (!ghostPlayed && (mode === "ghost-turn" || mode === "ghost-running")) {
       ghostPlayed = true;

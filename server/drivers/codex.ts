@@ -539,7 +539,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // otherwise settle this turn the moment the helper finished.  A
         // notification with no threadId (an older app-server) predates
         // helpers and passes, as does anything before thread/start answers.
-        if (typeof p.threadId === "string" && state.codexThreadId !== null && p.threadId !== state.codexThreadId) {
+        const notifiedThread = codexNonemptyString.safeParse(p.threadId);
+        if (notifiedThread.success && state.codexThreadId !== null && notifiedThread.data !== state.codexThreadId) {
           state.foreignThreadNotifications++;
           return;
         }

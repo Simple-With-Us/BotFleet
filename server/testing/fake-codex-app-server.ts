@@ -43,10 +43,12 @@ let decision: unknown = null;
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
 const MAIN_THREAD = "codex-thread-1";
-const notify = (method: string, params: Record<string, unknown>) =>
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+type NotificationParams = { [field: string]: JsonValue };
+const notify = (method: string, params: NotificationParams) =>
   out({ jsonrpc: "2.0", method, params: mode === "multi-agent" ? { threadId: MAIN_THREAD, turnId: "turn-main", ...params } : params });
 // A helper thread's traffic, on the same connection as the main thread's.
-const notifyHelper = (method: string, params: Record<string, unknown>) =>
+const notifyHelper = (method: string, params: NotificationParams) =>
   out({ jsonrpc: "2.0", method, params: { threadId: "codex-thread-helper-1", turnId: "turn-helper", ...params } });
 
 const dump = () => {
