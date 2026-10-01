@@ -5,10 +5,9 @@ Board row `873f0bbe`, branch `claude/dsh-m31-effort`.  Owner approval 2026-10-01
 ## What Ships
 
 - **Harness (Clutch) #65**, merged as `2d57ec5`: `EffortLevel` gains `xhigh`, `dshSupport.perModelEffortLevels` publishes `MiniMax-M3.1-Flash-Preview: [low, medium, high, xhigh, max]`, `dshInstalledEffortLevels(settings)` narrows that to what an install's `settings.yaml` declares, and Default on a row with per-model levels sends dsh's provider-default value `""`.  Harness doc: `docs/dsh-reasoning-effort.md` in that repo.
-- **BotFleet** pins `harness` to `github:jaywedgeworth22/Clutch#2d57ec5…` and:
+- **BotFleet** moves the `clutch` pin from `6edb253` (#764) to `github:jaywedgeworth22/Clutch#2d57ec5…`, which brings Clutch #63 and #65, and:
   - `readDshModelCatalog` sets the M3.1 row's `effortLevels` from the installed settings, so the picker offers Default, Low, Medium, High, X-High and Max only when dsh will take them, and an explicit `[]` otherwise.
-  - The DSH `configureSession` delegates to Harness instead of keeping its own copy.  The old copy returned early whenever a turn had no effort, which left a level an earlier turn pinned on a resumed session in force.
-  - `isStockDshCli` becomes Clutch's `isDshEngineCli` (the same engine check, now also matching the `clutch` wrapper).
+  - The DSH `configureSession` delegates to Clutch instead of keeping its own copy.  The old copy returned early whenever a turn had no effort, which left a level an earlier turn pinned on a resumed session in force.
 
 No UI code changes.  The web picker (`src/lib/model-effort.ts`) and iOS (`Instance.effortLevels(for:)` in `Models.swift`) already prefer a row's own list over the DSH MiniMax rule, so M3.1 shows the picker once its row carries levels and M2.7 Highspeed stays hidden.  Only the web rule's comment changed.
 
@@ -40,7 +39,7 @@ A turn with no effort on M3.1 sends `reasoning_effort: ""`, dsh's "Provider defa
 ## Behaviour Changes
 
 - **Unattended runs start at Low.**  `unattendedModelDowngrade` stamps Low on unattended, webhook and resource-triggered runs whenever the selected model offers Low.  DSH M3.1 now offers it, so those runs start at Low instead of MiniMax's default, the same as M3.1 on MiniMax Code and the direct engine (see the 2026-09-30 doc).
-- **The Clutch rename rides along.**  The pin moves past Clutch #60 through #64, so `dshSupport.displayName` (the default label for a DSH instance with no name of its own) is now "Clutch", and a DeepSeek picker id with no advertised catalog encodes to dsh's stock wire id (`DeepSeek-V4.1-Flash` → `deepseek-flash`, Clutch #63).  A turn that names no model therefore reports the stock wire id (`deepseek-flash`) as its session model.  Those test updates match PR #762.
+- **Clutch #63 rides along.**  A DeepSeek picker id with no advertised catalog now encodes to dsh's stock wire id (`DeepSeek-V4.1-Flash` → `deepseek-flash`), so a turn that names no model reports `deepseek-flash` as its session model.  Those test updates are the same text as PR #762's.
 
 ## Verification
 
@@ -57,4 +56,4 @@ One paid MiniMax call (owner-approved) to confirm MiniMax accepts pi-ai's `think
 
 ## Merge Order
 
-PR #762 and PR #764 also move the Clutch pin, and PR #742 edits `package.json`.  Whichever lands second regenerates `pnpm-lock.yaml` with `pnpm install` rather than merge-resolving it.  The DSH test updates here are the same text as #762's, and the `isDshEngineCli` rename is the same as #764's, so those hunks merge cleanly.  PR #764 renames the dependency key to `clutch`; after it lands, `harness/dsh/acp` imports here become `clutch/dsh/acp`.
+PR #764 (the `clutch` key) has landed and is merged into this branch.  PR #762 also moves the Clutch pin and PR #742 edits `package.json`.  Whichever lands second regenerates `pnpm-lock.yaml` with `pnpm install` rather than merge-resolving it.  The DSH wire-id test updates here are the same text as #762's, so those hunks merge cleanly.
