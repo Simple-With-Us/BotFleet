@@ -137,7 +137,18 @@ describe("settings", () => {
   });
 });
 
-describe("caps", () => {
+// Windows refuses every job (no process groups to stop), so every block that
+// starts one runs on POSIX hosts only; the refusal has its own block below.
+describe("on Windows", () => {
+  it("refuses with a clear message", () => {
+    const h = harness({ platform: "win32", spawn: fakeSpawn().spawnFn });
+    const refused = start(h, "echo hi");
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error).toContain("not available on Windows");
+  });
+});
+
+posix("caps", () => {
   it("refuses past 3 per thread, 4 per bot and 8 per host", () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn });
@@ -153,13 +164,6 @@ describe("caps", () => {
     const ninth = start(h, "sleep 9", "thread-z", "bot-z");
     expect(ninth.ok).toBe(false);
     if (!ninth.ok) expect(ninth.error).toContain("8 background jobs");
-  });
-
-  it("refuses on Windows with a clear message", () => {
-    const h = harness({ platform: "win32", spawn: fakeSpawn().spawnFn });
-    const refused = start(h, "echo hi");
-    expect(refused.ok).toBe(false);
-    if (!refused.ok) expect(refused.error).toContain("not available on Windows");
   });
 
   it("refuses when jobs are switched off", () => {
@@ -179,7 +183,7 @@ describe("caps", () => {
   });
 });
 
-describe("admission", () => {
+posix("admission", () => {
   it("refuses on high swap, low disk, or a tripped spend ceiling — and never on load", () => {
     const h = harness({ spawn: fakeSpawn().spawnFn });
     h.host.swap = 99;
@@ -318,7 +322,7 @@ posix("running real processes", () => {
   });
 });
 
-describe("records", () => {
+posix("records", () => {
   it("keeps at most the record cap, dropping the oldest finished with their files, never a running job", async () => {
     const { spawnFn, children } = fakeSpawn();
     const h = harness({ spawn: spawnFn, recordMax: 3 });
@@ -359,7 +363,7 @@ describe("records", () => {
   });
 });
 
-describe("awake-time deadlines", () => {
+posix("awake-time deadlines", () => {
   it("credits at most two ticks across a sleep, then times the job out on awake time", async () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn, tickMs: 5_000 });

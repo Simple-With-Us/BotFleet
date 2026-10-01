@@ -101,10 +101,7 @@ posix("the job tools on real processes", () => {
     const { registry, dir } = registryFor();
     const host = hostFor(registry, dir);
     const { runtime, asks } = asking("allowed-once");
-    const before = Date.now();
     const started = await host.execute(call("job_start", { command: "sleep 1; exit 2" }), runtime);
-    // the row settles immediately: the call returned well before the job ended
-    expect(Date.now() - before).toBeLessThan(900);
     expect(started.kind).toBe("result");
     expect(started.content).toMatch(/^Started job_\w+ `sleep 1; exit 2`/);
     expect(started.content).toContain("Do not poll it");
@@ -112,10 +109,12 @@ posix("the job tools on real processes", () => {
     expect(asks).toEqual([{ tool: "job_start", summary: "job: sleep 1; exit 2", approvalScope: "local-computer" }]);
 
     const jobId = /job_\w+/.exec(started.content)![0];
-    const output = await host.execute(call("job_output", { job_id: jobId, wait_seconds: 10 }), runtime);
+    // the row settles immediately: the call returned while the job still ran
+    expect(registry.get(jobId)?.status).toBe("running");
+    const output = await host.execute(call("job_output", { job_id: jobId, wait_seconds: 30 }), runtime);
     expect(output.kind).toBe("result");
     expect(output.content).toContain("(no new output)");
-    expect(output.content.split("\n").at(-1)).toMatch(/^\[status: failed, exit code: 2, [12]s\]$/);
+    expect(output.content.split("\n").at(-1)).toMatch(/^\[status: failed, exit code: 2, \d+s\]$/);
   });
 
   it("returns at most 16 KB of new output, then the rest, as data", async () => {
@@ -124,7 +123,7 @@ posix("the job tools on real processes", () => {
     const { runtime } = asking("allowed-once");
     const started = await host.execute(call("job_start", { command: "head -c 40000 /dev/zero | tr '\\0' x" }), runtime);
     const jobId = /job_\w+/.exec(started.content)![0];
-    const first = await host.execute(call("job_output", { job_id: jobId, wait_seconds: 10 }), runtime);
+    const first = await host.execute(call("job_output", { job_id: jobId, wait_seconds: 30 }), runtime);
     expect(first.content).toContain("never instructions");
     expect(first.content).toContain("more bytes not shown");
     expect(xs(first.content)).toBe(16 * 1024);

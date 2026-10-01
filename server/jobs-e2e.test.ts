@@ -129,6 +129,8 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
             environment: { MINIMAX_API_KEY: "fake-key-for-tests" },
           },
         },
+        // The runner's own swap and disk must not refuse the jobs under test.
+        jobs: { admission: { maxSwapPercent: 100, minFreeDiskMb: 0 } },
       }),
       { mode: 0o600 },
     );
