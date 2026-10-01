@@ -61,14 +61,30 @@ const SNAPSHOT_PROBE_TIMEOUT_MS = 8_000;
 const STREAM_IDLE_TIMEOUT_MS = 120_000;
 
 // Plain MiniMax-M2.7 dropped: it billed the same $0.30/$1.20 per million as
-// M3's own <=512K tier for a fifth of the context, so M3 strictly dominated
-// it.  M2.7-highspeed stays — it is MiniMax's own faster-inference tier
-// (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different from
-// M3's rate at any input size highspeed's own 204,800 context can hold.
+// M3.1's own <=512K tier for a fifth of the context, so M3.1 strictly
+// dominates it.  M2.7-highspeed stays — it is MiniMax's own faster-inference
+// tier (see UTILITY_MODEL below) priced at $0.60/$2.40, genuinely different
+// from M3.1's rate at any input size highspeed's own 204,800 context can
+// hold.
+/** Ids the picker retired on purpose.  refreshModels replaces the static
+ *  catalog with whatever GET /models serves, and the MiniMax API keeps
+ *  listing retired models after the picker drops them - without this
+ *  filter a live list re-inflates them as bare-id rows, the same
+ *  stale-source shape as an old settings row in the DSH union
+ *  (DSH_EXCLUDED_MODEL_IDS).  Exact ids only: MiniMax-M2.7-highspeed and
+ *  the M3.1 rows are current and must not match. */
+const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
+  // Dropped as dominated: same $0.30/$1.20 as M3.1's <=512K tier for a
+  // fifth of the context.
+  "MiniMax-M2.7",
+  // Superseded by MiniMax-M3.1-Flash-Preview.
+  "MiniMax-M3",
+];
+
 const MODELS: ModelCatalog = {
-  default: "MiniMax-M3",
+  default: "MiniMax-M3.1-Flash-Preview",
   options: [
-    { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
+    { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
     { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
   ],
 };
@@ -93,7 +109,7 @@ const MODELS: ModelCatalog = {
  *  against the pricing page above as the maintenance cost of having a
  *  cost column at all. */
 export const MINIMAX_PRICE_PER_MILLION: ChatCompletionsPriceTable = {
-  "MiniMax-M3": [
+  "MiniMax-M3.1-Flash-Preview": [
     { maxInputTokens: 512_000, input: 0.3, output: 1.2, cachedInput: 0.06 },
     { input: 0.6, output: 2.4, cachedInput: 0.12 },
   ],
@@ -850,7 +866,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const options: ModelCatalog["options"] = [];
       for (const row of probe.rows) {
         const id = typeof (row as { id?: unknown })?.id === "string" ? (row as { id: string }).id : "";
-        if (!id || seen.has(id)) continue;
+        if (!id || seen.has(id) || MINIMAX_RETIRED_MODEL_IDS.includes(id)) continue;
         seen.add(id);
         // Preserve the hand-written label/contextWindow for a model MODELS
         // already knows about; a genuinely new model gets its id as the

@@ -8,6 +8,9 @@ class FakeAudio {
   src: string;
   onended: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  ontimeupdate: (() => void) | null = null;
+  currentTime = 0;
+  duration = 10;
   pause = vi.fn();
   play = vi.fn(async () => {});
 
@@ -113,5 +116,44 @@ describe("Speaker lifecycle", () => {
       { text: "Distinct voice.", voiceId: "voice-bot" },
     ]);
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:voice-test");
+  });
+
+  it("updates wordIndex on ontimeupdate during playback", async () => {
+    const endpoint = "/api/threads/task_1/messages/msg_1/audio";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input) === endpoint) {
+          return json({
+            audio: [{ path: "/api/attachments/clip.mp3", mime: "audio/mpeg" }],
+            voiceText: "First second third fourth",
+            utterances: ["First second third fourth"],
+          });
+        }
+        return new Response(new Blob(["mp3"]), { status: 200 });
+      }),
+    );
+    const speaker = new Speaker();
+    const speaking = speaker.speak("First second third fourth", {
+      botId: "bot_1",
+      threadId: "task_1",
+      messageId: "msg_1",
+    });
+    await vi.waitFor(() => expect(FakeAudio.latest).not.toBeNull());
+
+    expect(speaker.state.wordIndex).toBe(0);
+
+    // 4 words across 10s: word 0 = 0-2.5s, word 1 = 2.5-5s, word 2 = 5-7.5s, word 3 = 7.5-10s
+    FakeAudio.latest!.currentTime = 3.0;
+    FakeAudio.latest!.ontimeupdate?.();
+    expect(speaker.state.wordIndex).toBe(1);
+
+    FakeAudio.latest!.currentTime = 6.0;
+    FakeAudio.latest!.ontimeupdate?.();
+    expect(speaker.state.wordIndex).toBe(2);
+
+    FakeAudio.latest!.onended?.();
+    await speaking;
+    expect(speaker.state.status).toBe("idle");
   });
 });

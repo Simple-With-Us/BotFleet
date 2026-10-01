@@ -3,6 +3,7 @@ import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
+import { BotFallbackModels } from "./BotFallbackModels";
 import { ModelPicker } from "./ModelPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
@@ -372,6 +373,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "speakReplies"
         | "speechDevices"
         | "voice"
+        | "voiceSummaryMode"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
@@ -596,45 +598,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               }
             />
             
-            {bot.modelSelection.fallbacks?.map((fallback, i) => (
-              <div key={i} className="flex flex-col gap-2 pt-4 border-t border-hairline/40">
-                <div className="flex items-center justify-between">
-                  <div className="text-[13px] font-medium text-ink">Fallback #{i + 1}</div>
-                  <button 
-                    onClick={() => {
-                       const next = [...(bot.modelSelection.fallbacks || [])];
-                       next.splice(i, 1);
-                       patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                    }}
-                    className="text-[12px] text-red-500 hover:underline"
-                  >
-                    Remove
-                  </button>
-                </div>
-                <ModelPicker
-                  bot={bot}
-                  contained
-                  selection={fallback}
-                  onChange={(sel) => {
-                     const next = [...(bot.modelSelection.fallbacks || [])];
-                     next[i] = sel;
-                     patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                  }}
-                />
-              </div>
-            ))}
-            
-            {(bot.modelSelection.fallbacks?.length || 0) < 2 && (
-              <button
-                onClick={() => {
-                   const next = [...(bot.modelSelection.fallbacks || []), { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model }];
-                   patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                }}
-                className="mt-2 text-left text-[13px] text-blue-500 hover:underline"
-              >
-                Add Fallback Model
-              </button>
-            )}
+            <BotFallbackModels bot={bot} onChange={(modelSelection) => patch({ modelSelection })} />
           </div>
 
           {(() => {

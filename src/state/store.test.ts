@@ -998,3 +998,47 @@ describe("paginated scrollback", () => {
     expect(fresh.loadingEarlier).toEqual({});
   });
 });
+
+describe("instances ordering guard", () => {
+  const engine = (version: string) => ({
+    instanceId: "claude",
+    driverKind: "claudeAgent",
+    displayName: "Claude",
+    snapshot: { state: "available" as const, version },
+    models: { default: "", options: [] },
+  });
+
+  it("drops an instances answer older than the one already shown", () => {
+    // A slow GET that started before the `instances` push must not put the
+    // older sweep back on screen.
+    const pushed = reducer(initialState, { type: "instances", instances: [engine("new")], describedAt: 2_000 });
+    const late = reducer(pushed, { type: "instances", instances: [engine("old")], describedAt: 1_000 });
+    expect(late.instances[0].snapshot.version).toBe("new");
+    expect(late.instancesDescribedAt).toBe(2_000);
+  });
+
+  it("applies a newer or equal answer, and one from a server that sends no stamp", () => {
+    const first = reducer(initialState, { type: "instances", instances: [engine("a")], describedAt: 1_000 });
+    const same = reducer(first, { type: "instances", instances: [engine("b")], describedAt: 1_000 });
+    expect(same.instances[0].snapshot.version).toBe("b");
+    const newer = reducer(same, { type: "instances", instances: [engine("c")], describedAt: 3_000 });
+    expect(newer.instances[0].snapshot.version).toBe("c");
+    const unstamped = reducer(newer, { type: "instances", instances: [engine("d")] });
+    expect(unstamped.instances[0].snapshot.version).toBe("d");
+    expect(unstamped.instancesDescribedAt).toBe(3_000);
+  });
+  it("forgets the ordering mark but keeps the engine list when the stream could not resume", () => {
+    // A restarted harness stamps from its own clock, which can sit below the
+    // last process's final stamp.  Its first answer must not be dropped as old.
+    const held = reducer(initialState, { type: "instances", instances: [engine("held")], describedAt: 9_000 });
+    const reset = reducer(held, { type: "instancesOrderReset" });
+    expect(reset.instances[0].snapshot.version).toBe("held");
+    expect(reset.instancesDescribedAt).toBe(0);
+    const restarted = reducer(reset, { type: "instances", instances: [engine("restarted")], describedAt: 4_000 });
+    expect(restarted.instances[0].snapshot.version).toBe("restarted");
+    expect(restarted.instancesDescribedAt).toBe(4_000);
+    // Ordering holds again from that stamp on.
+    const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
+    expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
+});

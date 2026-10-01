@@ -8,9 +8,12 @@
 //                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized |
 //                     resume-unauthorized | resume-transient
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
+//   FAKE_CODEX_DOWN_FILE  optional path; while the file exists, `app-server`
+//                     exits at once, the way a probe fails under host load,
+//                     so a test can take the live catalog away mid-run
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_CODEX_MODE ?? "happy";
 
@@ -19,6 +22,8 @@ if (process.argv[2] === "--version") {
   process.exit(0);
 }
 if (process.argv[2] === "login" && process.argv[3] === "status") {
+  // A probe that gets no answer it can read (what a timed-out one sees).
+  if (mode === "login-silent") process.exit(0);
   if (mode === "logged-out") {
     process.stderr.write("Not logged in\n");
     process.exit(1);
@@ -29,6 +34,7 @@ if (process.argv[2] === "login" && process.argv[3] === "status") {
   statusStream.write("Logged in using ChatGPT\n");
   process.exit(0);
 }
+if (process.env.FAKE_CODEX_DOWN_FILE && existsSync(process.env.FAKE_CODEX_DOWN_FILE)) process.exit(1);
 const calls: Array<{ method: string; params: unknown }> = [];
 let decision: unknown = null;
 

@@ -103,6 +103,19 @@ describe("Settings Search Engine", () => {
     expect(result.matchingItemIds.has("engines:matrix")).toBe(true);
   });
 
+  it("finds the ASCII.dev Box engine by its name, not by Computer", () => {
+    const result = searchSettings("ascii.dev box");
+    expect(result.matchingSectionIds.has("engines")).toBe(true);
+    expect(result.matchingItemIds.has("engines:clis")).toBe(true);
+  });
+
+  it("finds where local models are set up, under Add Engine", () => {
+    for (const query of ["local models", "ollama", "lm studio"]) {
+      const result = searchSettings(query);
+      expect(result.matchingItemIds.has("engines:addCustom"), query).toBe(true);
+    }
+  });
+
   it("finds host cli credentials sync across computers", () => {
     const result = searchSettings("credentials sync");
     expect(result.matchingSectionIds.has("computers")).toBe(true);

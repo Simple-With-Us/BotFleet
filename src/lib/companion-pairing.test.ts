@@ -344,4 +344,71 @@ describe("companionPairingLink", () => {
       ],
     }, "local")).toBeNull();
   });
+
+  it("validates pinned Tailscale route using tailnetName fallback when advertised endpoints are empty", () => {
+    const source = {
+      port: 8810,
+      tailnetName: "mac.tail1234.ts.net",
+      endpoints: [],
+    };
+    const pin = companionPairingRoutePin(source, "tailscale");
+    expect(pin).not.toBeNull();
+    expect(pin?.protectedEndpoint).toEqual({
+      url: "http://mac.tail1234.ts.net:8810",
+      kind: "tailnet",
+      priority: 0,
+    });
+    expect(companionPairingRoutePinAvailable(source, pin!)).toBe(true);
+
+    // Still available when port and tailnetName match
+    expect(companionPairingRoutePinAvailable({
+      endpoints: [],
+      tailnetName: "mac.tail1234.ts.net",
+      port: 8810,
+    }, pin!)).toBe(true);
+  });
+
+  it("invalidates pinned Tailscale route when tailnetName changes or is cleared", () => {
+    const source = {
+      port: 8810,
+      tailnetName: "mac.tail1234.ts.net",
+      endpoints: [],
+    };
+    const pin = companionPairingRoutePin(source, "tailscale");
+    expect(pin).not.toBeNull();
+
+    // Cleared tailnetName
+    expect(companionPairingRoutePinAvailable({
+      endpoints: [],
+      tailnetName: "",
+      port: 8810,
+    }, pin!)).toBe(false);
+
+    // Changed tailnetName
+    expect(companionPairingRoutePinAvailable({
+      endpoints: [],
+      tailnetName: "other.tail1234.ts.net",
+      port: 8810,
+    }, pin!)).toBe(false);
+
+    // Changed port
+    expect(companionPairingRoutePinAvailable({
+      endpoints: [],
+      tailnetName: "mac.tail1234.ts.net",
+      port: 8812,
+    }, pin!)).toBe(false);
+  });
+
+  it("validates pinned Tailscale route when advertised endpoints include the matching tailnet route", () => {
+    const source = {
+      port: 8810,
+      tailnetName: "mac.tail1234.ts.net",
+      endpoints: [
+        { url: "http://mac.tail1234.ts.net:8810", kind: "tailnet" as const, priority: 0 },
+      ],
+    };
+    const pin = companionPairingRoutePin(source, "tailscale");
+    expect(pin).not.toBeNull();
+    expect(companionPairingRoutePinAvailable(source, pin!)).toBe(true);
+  });
 });

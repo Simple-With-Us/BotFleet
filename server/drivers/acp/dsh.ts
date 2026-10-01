@@ -13,8 +13,10 @@ import {
   classifyDshError,
   dshCredentialCandidates,
   dshModelIdFromOptionValue,
+  DshModelNotOfferedError,
   dshModelOptionValue,
   dshProviderForModel,
+  dshSameModel,
   dshSpawnArgs as harnessDshSpawnArgs,
   dshSupport as harnessDshSupport,
   dshVersionCompatibilityReason,
@@ -30,21 +32,26 @@ import { dshWrapSpawn } from "./dsh-mcp.ts";
 
 export { dshWrapSpawn, isStockDshCli } from "./dsh-mcp.ts";
 /** BotFleet DSH model catalog.  The Harness package still publishes
- * MiniMax-M2.7, but it is dropped here per the product decision (M3 dominates
- * on context and is the canonical DSH-hosted MiniMax row). */
+ * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
+ * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
 /** BotFleet DSH model catalog.
  *
  *  Owner-facing list (2026-09-27): DeepSeek V4 Pro, DeepSeek V4 Flash, then
- *  MiniMax M3.1 Flash Preview, M3, and M2.7 Highspeed.  DeepSeek's catalog is
+ *  MiniMax M3.1 Flash Preview and M2.7 Highspeed.  DeepSeek's catalog is
  *  only two models — `deepseek-flash` IS the image+video model, billed at the
  *  same rate as text (its image tokens bill "together with your text tokens"),
  *  so there is deliberately no third DeepSeek row for the multimodal variant.
- *  The V4.1 rename retired the `deepseek-v4-flash` / `deepseek-v4-pro` ids;
- *  both sit in `DSH_EXCLUDED_MODEL_IDS` so a profile written against the old
- *  catalog cannot re-add them to the picker.
+ *  The V4.1 rename retired the `deepseek-v4-flash` id, which sits in
+ *  `DSH_EXCLUDED_MODEL_IDS` so a profile written against the old catalog
+ *  cannot re-add it.  `deepseek-v4-pro` is NOT retired: it is still the
+ *  declared Pro id on stock dsh 0.1.5-rc.2 and in an owner override (only its
+ *  display name gained ".1"), so it folds onto the `DeepSeek-V4.1-Pro` row via
+ *  `dshSameModel` rather than being excluded.
  *
- *  `MiniMax-M2.7` is dropped per the product decision (M3 dominates on context
- *  and is the canonical DSH-hosted MiniMax row).
+ *  `MiniMax-M2.7` and `MiniMax-M3` are dropped per the product decision (M3.1
+ *  Flash Preview dominates on context and is the canonical DSH-hosted MiniMax
+ *  row); both sit in `DSH_EXCLUDED_MODEL_IDS` so the live-catalog union with
+ *  an older settings file cannot re-add them.
  *
  *  Badges are price/speed facts the picker renders as chips, so the cost
  *  tradeoff is visible before a model is picked. */
@@ -79,12 +86,6 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
         "Frontier multimodal coding model with a 1M context window. MiniMax offers it through Token Plan and MiniMax Code, so it needs a Token Plan key.",
     },
     {
-      id: "MiniMax-M3",
-      label: "MiniMax-M3",
-      images: true,
-      contextWindow: 1_000_000,
-    },
-    {
       id: "MiniMax-M2.7-highspeed",
       label: "MiniMax-M2.7-highspeed",
       images: true,
@@ -101,11 +102,16 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
-  // Retired by the V4.1 rename.  A settings file written against the old
-  // catalog still declares these, and the union below would otherwise
-  // re-add them as stale duplicates of the V4.1 rows.
+  // Superseded by MiniMax-M3.1-Flash-Preview.  Dropping it from the static
+  // options is not enough: a settings file written while M3 shipped still
+  // declares it, and the live-catalog union below would re-add it.
+  "MiniMax-M3",
+  // Retired by the V4.1 rename: no current catalog declares it.  A settings
+  // file written against the old catalog still does, and the union below
+  // would otherwise re-add it as a stale duplicate of the V4.1 Flash row.
+  // `deepseek-v4-pro` is deliberately absent: it is still declared, and
+  // `dshSameModel` folds it onto `DeepSeek-V4.1-Pro` without a duplicate.
   "deepseek-v4-flash",
-  "deepseek-v4-pro",
 ];
 
 /** The Harness install declares the models it can actually serve in its own
@@ -229,7 +235,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
  *  `DeepSeek-V4.1-Flash` is the static default.  A partial source can add
  *  models; it cannot retire them.  Removals need an explicit exclusion in
  *  `DSH_EXCLUDED_MODEL_IDS`, which is how `MiniMax-M2.7` and the retired
- *  pre-rename DeepSeek ids are handled. */
+ *  pre-rename `deepseek-v4-flash` id are handled. */
 export function readDshModelCatalog(
   environment: Record<string, string | undefined> = process.env,
 ): ModelCatalog {
@@ -243,7 +249,13 @@ export function readDshModelCatalog(
   }
   for (const row of discovered) {
     if (isExcludedModelId(row.id)) continue;
-    const index = options.findIndex((option) => option.id === row.id);
+    // Fold, don't duplicate: a settings row that spells a static model
+    // differently (`deepseek-flash`, an owner's `deepseek-v4.1-flash`) is the
+    // same model as the static `DeepSeek-V4.1-Flash` row, so it merges there.
+    // dshSameModel covers the DeepSeek alias spellings plus case; any other
+    // id still needs an exact match, so an unrelated model lands as its own
+    // row exactly as before.
+    const index = options.findIndex((option) => dshSameModel(option.id, row.id));
     if (index === -1) {
       options.push(row);
       continue;
@@ -263,11 +275,13 @@ export {
   DSH_MINIMUM_ACP_VERSION,
   DSH_PROVIDER_ID,
   DSH_MINIMAX_PROVIDER_ID,
+  DshModelNotOfferedError,
   classifyDshError,
   dshCredentialCandidates,
   dshModelIdFromOptionValue,
   dshModelOptionValue,
   dshProviderForModel,
+  dshSameModel,
   dshVersionCompatibilityReason,
 };
 

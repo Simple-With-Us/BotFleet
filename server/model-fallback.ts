@@ -10,6 +10,7 @@ import { STATIC_ANTIGRAVITY_MODELS } from "./antigravity-models.ts";
 import { STATIC_CLAUDE_MODELS } from "./claude-models.ts";
 import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
+import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
@@ -289,6 +290,61 @@ export function turnHitQuotaOrCap(messagesAfterUser: FallbackScanMessage[]): boo
   return Boolean(turnQuotaOrCapEvidence(messagesAfterUser, false));
 }
 
+// ── a rejected model id is a failure, not a reply ───────────────────────
+// The Claude CLI answers an unknown model with an assistant-shaped message
+// ("There's an issue with the selected model (...)"), not a process failure.
+// The driver now reports that structurally: an error row plus the
+// `unknown_model` stop reason.  The text pattern below is only the backstop
+// for a transcript row written before that, or by an engine that still
+// forwards the prose.  It is anchored and length-capped on purpose: a real
+// answer that mentions a missing model ("the staging model id was not found in
+// the catalog, so I added it") must never read as a provider failure, and it
+// is only consulted when the turn already failed.
+
+/** Stop reason a driver settles with when the provider rejected the model id.
+ *  `retry.ts` classifies the same word as terminal, so the two agree. */
+export const MODEL_REJECTED_STOP_REASON = "unknown_model";
+
+const MODEL_REJECTION_TEXT = /^There's an issue with the selected model\b/i;
+const MODEL_REJECTION_TEXT_MAX = 400;
+
+export function isModelRejectionText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && trimmed.length < MODEL_REJECTION_TEXT_MAX && MODEL_REJECTION_TEXT.test(trimmed);
+}
+
+export interface ModelRejectionEvidence {
+  text: string;
+  source: "stop-reason" | "terminal-text";
+}
+
+/** Did this FAILED turn end because the provider rejected the model id?
+ *
+ *  The stop reason decides when a driver reports one.  Otherwise only the LAST
+ *  bot text counts, never the slice as a whole: the slice accumulates across
+ *  fail-over attempts (the fallback re-uses the same user message), so a second
+ *  dead entry would otherwise be hidden behind the first one's text. */
+export function turnModelRejectionEvidence(
+  messagesAfterUser: FallbackScanMessage[],
+  turnOk: boolean,
+  stopReason?: string | null,
+): ModelRejectionEvidence | undefined {
+  if (turnOk) return undefined;
+  if (stopReason === MODEL_REJECTED_STOP_REASON) {
+    for (let i = messagesAfterUser.length - 1; i >= 0; i--) {
+      const message = messagesAfterUser[i];
+      if (message.role !== "bot" || message.kind !== "activity") continue;
+      const name = message.tool?.name ?? "";
+      if (/^error:/i.test(name)) return { text: name.replace(/^error:\s*/i, "").trim(), source: "stop-reason" };
+    }
+    return { text: "The provider rejected the model.", source: "stop-reason" };
+  }
+  const botTexts = messagesAfterUser.filter((message) => message.role === "bot" && message.kind === "text");
+  const text = botTexts.at(-1)?.text?.trim();
+  if (text && isModelRejectionText(text)) return { text, source: "terminal-text" };
+  return undefined;
+}
+
 /**
  * Whether this user turn already produced real assistant output.
  * Counts only non-error text and terminal tool results (`tool.ok === true`).
@@ -488,6 +544,12 @@ function doomedGate(gate: DoomedEngineGate | undefined): DoomedEngineGate {
   return gate ?? defaultDoomedGate;
 }
 
+/** The rejection gate to consult for one call: the caller's own, or the
+ *  process-wide registry the fold writes to. */
+function rejectionGate(gate: ModelRejectionGate | undefined): ModelRejectionGate {
+  return gate ?? ((botId, instanceId, model, now) => modelRejections.isRejected(botId, instanceId, model, now));
+}
+
 // ── #90 auto-failover priority (server/index.ts's autoFallbackChain) ────
 // Most-preferred first, handed straight to turn-safety.ts's
 // eligibleAutoFallbackChain.  It lives here rather than inline in index.ts
@@ -526,6 +588,9 @@ export function selectTurnFallback(input: {
    *  excluded on its account. */
   botId?: string;
   isDoomed?: DoomedEngineGate;
+  /** Skips an entry the provider already rejected for this bot.  Like the
+   *  doomed gate it needs `botId`; defaults to the process-wide registry. */
+  isModelRejected?: ModelRejectionGate;
   now?: number;
 }): TurnFallbackPick | undefined {
   if (input.ok) return undefined;
@@ -543,6 +608,7 @@ export function selectTurnFallback(input: {
   const now = input.now ?? Date.now();
   const { botId } = input;
   const isDoomed = botId ? doomedGate(input.isDoomed) : undefined;
+  const isRejected = botId ? rejectionGate(input.isModelRejected) : undefined;
   for (let i = start; i < chain.length; i++) {
     const next = chain[i];
     if (!next?.instanceId) continue;
@@ -551,6 +617,9 @@ export function selectTurnFallback(input: {
     // owner's saved preference order, and nextUsed still points past the
     // entry that was chosen so a later failure walks the same chain.
     if (botId && isDoomed?.(botId, next.instanceId, now)) continue;
+    // A model the provider already said it does not have would only spend
+    // another spawn to hear it again, and end the walk there.
+    if (botId && isRejected?.(botId, next.instanceId, next.model, now)) continue;
     return { instanceId: next.instanceId, model: next.model, effort: next.effort, nextUsed: i + 1 };
   }
   return undefined;
@@ -839,22 +908,34 @@ export class QuotaCooldownRegistry {
     botId: string,
     primary: ModelSelection,
     now = Date.now(),
-    opts: { isDoomed?: DoomedEngineGate } = {},
+    opts: { isDoomed?: DoomedEngineGate; isModelRejected?: ModelRejectionGate } = {},
   ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
     const cd = this.get(botId, primary.instanceId, primary.model, now);
-    if (!cd) {
+    const isRejected = rejectionGate(opts.isModelRejected);
+    // A primary the provider rejected is routed around exactly like a cooling
+    // one: it would fail again before doing any work.  Unlike a cooldown it
+    // leaves no row for the Usage settings to show as a quota hit.
+    const primaryRejected = isRejected(botId, primary.instanceId, primary.model, now);
+    if (!cd && !primaryRejected) {
       return { selection: primary, isFallback: false };
     }
+    // A rejected primary has no cooldown row, so the result carries none.
+    const resolved = (selection: ModelSelection, isFallback: boolean) => {
+      const result: { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } = { selection, isFallback };
+      if (cd) result.cooldown = cd;
+      return result;
+    };
     const fallbacks = primary.fallbacks;
     if (fallbacks && fallbacks.length > 0) {
       const isDoomed = doomedGate(opts.isDoomed);
       for (const fb of fallbacks) {
         if (this.get(botId, fb.instanceId, fb.model, now)) continue;
         if (isDoomed(botId, fb.instanceId, now)) continue;
-        return { selection: fb, isFallback: true, cooldown: cd };
+        if (isRejected(botId, fb.instanceId, fb.model, now)) continue;
+        return resolved(fb, true);
       }
     }
-    return { selection: primary, isFallback: false, cooldown: cd };
+    return resolved(primary, false);
   }
 }
 

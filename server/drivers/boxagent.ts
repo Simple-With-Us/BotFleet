@@ -48,7 +48,7 @@ function decodeConfig(raw: unknown): BoxAgentConfig {
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Computer", supportsMultipleInstances: false },
+  metadata: { displayName: "ASCII.dev Box", supportsMultipleInstances: false },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -278,7 +278,13 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       if (!token) {
-        return { state: "unavailable", reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' };
+        // Never set up: stay registered (a token added later just works) but
+        // out of every engine list until then.
+        return {
+          state: "unavailable",
+          hidden: true,
+          reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json',
+        };
       }
       try {
         await api("/me");

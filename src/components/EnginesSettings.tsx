@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Loader2, Plus, TriangleAlert, Upload, X } from "lucide-react";
 
 import { api, useStore, type InstanceInfo } from "@/state/store";
+import { listedInEnginesSettings } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { EngineCapabilitiesMatrix } from "./EngineCapabilitiesMatrix";
@@ -450,7 +451,7 @@ function EngineRow({
       {instance.driverKind === "boxAgent" && (
         <div className="mt-2 rounded bg-accent/10 px-2 py-1.5 text-[11px] leading-relaxed text-ink-secondary border border-accent/20">
           <strong className="text-ink">Runs on Its Own Computer.</strong>
-          {"  "}A bot on the Computer engine runs its turn on box.ascii.dev, not on this computer, so it has no team tools, no peers to ask, no approval cards, no memory, and no skills.
+          {"  "}A bot on the ASCII.dev Box engine runs its turn on box.ascii.dev, not on this computer, so it has no team tools, no peers to ask, no approval cards, no memory, and no skills.
           {"  "}Pick another engine for a bot that has to work with the rest of your team.
         </div>
       )}
@@ -773,7 +774,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
           body: JSON.stringify(patch),
         });
         if (res?.instances) {
-          dispatch({ type: "instances", instances: res.instances });
+          dispatch({ type: "instances", instances: res.instances, describedAt: res.describedAt });
         }
         return { ok: true };
       } catch (e: any) {
@@ -787,14 +788,7 @@ export function EnginesSettings({ highlightClass }: { highlightClass?: (domId: s
     [dispatch],
   );
 
-  // Include CLI engines, MiniMax, OpenAI-compat, and custom engines
-  const rows = state.instances.filter((i) =>
-    i.cli !== undefined ||
-    i.cliDefault !== undefined ||
-    i.driverKind === "minimax" ||
-    i.driverKind === "openai-compat" ||
-    Boolean(i.isCustom),
-  );
+  const rows = state.instances.filter(listedInEnginesSettings);
   // Engines the user has turned off used to sit behind a "Show (N)" link
   // that defaulted to hidden, so a newly added engine whose CLI is not
   // installed yet was simply absent from Settings — the reader saw a count

@@ -36,13 +36,10 @@ describe("STATIC_MCODE_MODELS", () => {
     // model config option, folded through mcodePickerId.  A row the session
     // does not advertise fails the turn with an opaque "does not offer", so
     // the shipped list is the advertised set and not a hand-written guess.
-    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3");
+    expect(STATIC_MCODE_MODELS.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(STATIC_MCODE_MODELS.options.map((o) => o.id)).toEqual([
-      "MiniMax-M3",
-      "MiniMax-M3-thinking",
       "MiniMax-M3.1-Flash-Preview-thinking",
       "MiniMax-M2.7-highspeed-thinking",
-      "MiniMax-M2.7-thinking",
     ]);
   });
 
@@ -54,13 +51,10 @@ describe("STATIC_MCODE_MODELS", () => {
       {
         id: "model",
         options: [
-          { value: "m:minimax:MiniMax-M3:v:", name: "M3" },
-          { value: "m:minimax:MiniMax-M3:v:thinking", name: "M3 · thinking" },
           { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:", name: "M3.1-Flash-Preview" },
           { value: "m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking", name: "flash · thinking" },
           { value: "m:minimax:MiniMax-M2.7-highspeed:v:thinking", name: "M2.7 highspeed" },
-          { value: "m:minimax:MiniMax-M2.7:v:thinking", name: "M2.7" },
-        ],
+          ],
       },
     ];
     for (const option of STATIC_MCODE_MODELS.options) {
@@ -100,7 +94,7 @@ describe("readMcodeModelCatalog", () => {
   it("never adopts a default that is not on offer", () => {
     // Adopting it would send every turn to a row the picker never showed.
     writeConfig(dataDir, ["defaultModel: minimax/MiniMax-M9-Imaginary", "defaultModelVariant: thinking"].join("\n"));
-    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3");
+    expect(readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir }).default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
   });
 
   it("keeps the shipped rows rather than appending unverified ids", () => {
@@ -116,7 +110,7 @@ describe("readMcodeModelCatalog", () => {
 
   it("keeps the shipped catalog when there is no config at all", () => {
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: join(dataDir, "missing") });
-    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
   });
 
@@ -124,7 +118,7 @@ describe("readMcodeModelCatalog", () => {
     writeConfig(dataDir, "defaultModel: [not, a, string]\n\tdefaultModelVariant: : :\n");
     const catalog = readMcodeModelCatalog({ MINIMAX_DATA_DIR: dataDir });
     expect(catalog.options).toEqual(STATIC_MCODE_MODELS.options);
-    expect(catalog.default).toBe("MiniMax-M3");
+    expect(catalog.default).toBe("MiniMax-M3.1-Flash-Preview-thinking");
   });
 });
 
@@ -134,33 +128,33 @@ describe("parseMcodeModelValue — the advertised no-variant form", () => {
     // `m:minimax:MiniMax-M3:v:` — a bare `v:` with an EMPTY variant, not the
     // `u` suffix its own type suggests.  Rejecting that spelling made every
     // no-variant model unselectable, including plain MiniMax-M3.
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:v:")).toEqual({
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:")).toEqual({
       providerId: "minimax",
-      modelId: "MiniMax-M3",
+      modelId: "MiniMax-M3.1-Flash-Preview",
     });
   });
 
   it("folds an empty variant to the same picker id the `u` spelling gives", () => {
-    const emptyVariant = parseMcodeModelValue("m:minimax:MiniMax-M3:v:");
-    const uSuffix = parseMcodeModelValue("m:minimax:MiniMax-M3:u");
-    expect(mcodePickerId(emptyVariant!)).toBe("MiniMax-M3");
-    expect(mcodePickerId(uSuffix!)).toBe("MiniMax-M3");
+    const emptyVariant = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:");
+    const uSuffix = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:u");
+    expect(mcodePickerId(emptyVariant!)).toBe("MiniMax-M3.1-Flash-Preview");
+    expect(mcodePickerId(uSuffix!)).toBe("MiniMax-M3.1-Flash-Preview");
   });
 
   it("still reads a real variant", () => {
-    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M3:v:thinking");
+    const parsed = parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:v:thinking");
     expect(parsed?.variant).toBe("thinking");
-    expect(mcodePickerId(parsed!)).toBe("MiniMax-M3-thinking");
+    expect(mcodePickerId(parsed!)).toBe("MiniMax-M3.1-Flash-Preview-thinking");
   });
 
   it("decodes percent-encoded segments", () => {
-    const parsed = parseMcodeModelValue("m:mini%20max:MiniMax%2DM3:v:high%20speed");
-    expect(parsed).toEqual({ providerId: "mini max", modelId: "MiniMax-M3", variant: "high speed" });
+    const parsed = parseMcodeModelValue("m:mini%20max:MiniMax%2DM3.1%2DFlash%2DPreview:v:high%20speed");
+    expect(parsed).toEqual({ providerId: "mini max", modelId: "MiniMax-M3.1-Flash-Preview", variant: "high speed" });
   });
 
   it("still rejects a value that is not a model selection", () => {
     expect(parseMcodeModelValue("not-a-value")).toBeNull();
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:x:y:z")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x:y:z")).toBeNull();
     expect(parseMcodeModelValue(undefined)).toBeNull();
   });
 });
@@ -229,14 +223,14 @@ describe("mcodeModelOptionValue", () => {
     {
       id: "model",
       options: [
-        { value: "m:minimax:MiniMax-M3:u", name: "MiniMax-M3" },
+        { value: "m:minimax:MiniMax-M3.1-Flash-Preview:u", name: "MiniMax-M3.1-Flash-Preview" },
         { value: "m:minimax:MiniMax-M2.7:v:highspeed", name: "MiniMax-M2.7 (highspeed)" },
       ],
     },
   ];
 
   it("matches a plain model id and returns the advertised value verbatim", () => {
-    expect(mcodeModelOptionValue("MiniMax-M3", advertised)).toBe("m:minimax:MiniMax-M3:u");
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", advertised)).toBe("m:minimax:MiniMax-M3.1-Flash-Preview:u");
   });
 
   it("matches the variant folded into the picker id", () => {
@@ -244,14 +238,14 @@ describe("mcodeModelOptionValue", () => {
   });
 
   it("keeps the user's own BYOK provider id instead of constructing one", () => {
-    const byok = [{ id: "model", options: [{ value: "m:my-openai:MiniMax-M3:u", name: "MiniMax-M3" }] }];
-    expect(mcodeModelOptionValue("MiniMax-M3", byok)).toBe("m:my-openai:MiniMax-M3:u");
+    const byok = [{ id: "model", options: [{ value: "m:my-openai:MiniMax-M3.1-Flash-Preview:u", name: "MiniMax-M3.1-Flash-Preview" }] }];
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", byok)).toBe("m:my-openai:MiniMax-M3.1-Flash-Preview:u");
   });
 
   it("skips the switch when the session advertises no model option (older mcode)", () => {
-    expect(mcodeModelOptionValue("MiniMax-M3", [])).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3", undefined)).toBeNull();
-    expect(mcodeModelOptionValue("MiniMax-M3", [{ id: "mode", options: [] }])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", [])).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", undefined)).toBeNull();
+    expect(mcodeModelOptionValue("MiniMax-M3.1-Flash-Preview", [{ id: "mode", options: [] }])).toBeNull();
   });
 
   it("fails clearly when the model is not in the advertised options", () => {
@@ -265,13 +259,13 @@ describe("parseMcodeModelValue / mcodePickerId", () => {
     const parsed = parseMcodeModelValue("m:minimax:MiniMax-M2.7:v:highspeed");
     expect(parsed).toEqual({ providerId: "minimax", modelId: "MiniMax-M2.7", variant: "highspeed" });
     expect(mcodePickerId(parsed!)).toBe("MiniMax-M2.7-highspeed");
-    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3:u")!)).toBe("MiniMax-M3");
+    expect(mcodePickerId(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:u")!)).toBe("MiniMax-M3.1-Flash-Preview");
     expect(parseMcodeModelValue("m:p:Some%20Model:u")).toEqual({ providerId: "p", modelId: "Some Model" });
   });
 
   it("rejects values that are not mcode-shaped", () => {
     expect(parseMcodeModelValue("m-two")).toBeNull();
-    expect(parseMcodeModelValue("m:minimax:MiniMax-M3:x")).toBeNull();
+    expect(parseMcodeModelValue("m:minimax:MiniMax-M3.1-Flash-Preview:x")).toBeNull();
     expect(parseMcodeModelValue(42)).toBeNull();
   });
 });

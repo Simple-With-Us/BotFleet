@@ -11,7 +11,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { hasEngineSpendActivity, unpricedTurnCount } from "./UsageSection.tsx";
+import {
+  hasEngineSpendActivity,
+  hidesIdleUnavailableEngineRow,
+  unpricedTurnCount,
+} from "./UsageSection.tsx";
 import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
@@ -132,7 +136,7 @@ describe("modelDisplayName", () => {
 });
 
 describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
-  it("matches first-paint registry defaults for Cursor and DeepSeek Harness", () => {
+  it("matches first-paint registry defaults for Cursor and Harness", () => {
     const cursorPreset = findMatchingPreset("cursor", "Cursor Ultra", null);
     expect(cursorPreset).toBeDefined();
     expect(cursorPreset?.label).toBe("Cursor Ultra");
@@ -154,7 +158,7 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(legacyMatch).toBeDefined();
   });
 
-  it("does not include a confusing $0 custom row for DeepSeek Harness", () => {
+  it("does not include a confusing $0 custom row for Harness", () => {
     const options = ENGINE_PLAN_OPTIONS["deepseek-harness"];
     expect(options.length).toBe(1);
     expect(options[0].costPerMonth).toBeNull();
@@ -318,5 +322,32 @@ describe("held-engine and redundant-chain payloads", () => {
     expect(doomed[0].consecutiveFailures).toBe(3);
     expect(chains[0].redundant[0].reason).toBe("same-as-primary");
     expect(chains[0].effective).toBeLessThan(chains[0].total);
+
+describe("hidesIdleUnavailableEngineRow", () => {
+  it("keeps a row whose probe just did not answer in time", () => {
+    // The owner's "only 2-3 engines" report: a slow `--version` read as
+    // "CLI not found" and Engine Quotas hid the row.
+    expect(
+      hidesIdleUnavailableEngineRow({
+        snapshot: { state: "unavailable", transient: true, reason: "Cursor did not answer in time" },
+      }),
+    ).toBe(false);
+  });
+
+  it("still hides engines that were never set up", () => {
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "`codex` CLI not found" } })).toBe(true);
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "Disabled in settings" } })).toBe(true);
+  });
+
+  it("hides the ASCII.dev Box engine until a Box token is configured", () => {
+    expect(
+      hidesIdleUnavailableEngineRow({
+        snapshot: { state: "unavailable", hidden: true, reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' },
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps a configured engine that is failing right now", () => {
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "box API unreachable: fetch failed" } })).toBe(false);
   });
 });

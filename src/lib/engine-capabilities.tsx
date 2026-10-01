@@ -574,7 +574,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3", display: "MiniMax M3", ctxTokens: 1_000_000 },
+      { id: "MiniMax-M3.1-Flash-Preview", display: "MiniMax M3.1 Flash Preview", ctxTokens: 1_000_000 },
       { id: "MiniMax-H3", display: "MiniMax H3", ctxTokens: 256_000 },
     ],
   },
@@ -640,13 +640,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       ],
     },
     defaultModels: [
-      { id: "MiniMax-M3", display: "MiniMax M3", ctxTokens: 1_000_000 },
-      { id: "MiniMax-M3-thinking", display: "MiniMax M3 · thinking", ctxTokens: 1_000_000 },
       { id: "MiniMax-M3.1-Flash-Preview-thinking", display: "MiniMax M3.1 Flash Preview · thinking", ctxTokens: 1_000_000 },
       // Context length for the M2.7 tiers is not published in the CLI's own
       // catalog, so no figure is claimed here.
       { id: "MiniMax-M2.7-highspeed-thinking", display: "MiniMax M2.7 Highspeed · thinking" },
-      { id: "MiniMax-M2.7-thinking", display: "MiniMax M2.7 · thinking" },
     ],
   },
 };

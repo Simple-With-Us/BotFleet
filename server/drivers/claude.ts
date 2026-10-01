@@ -19,7 +19,17 @@ import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import {
+  brokerSocketPath,
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  isProbeTimeout,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -84,28 +94,71 @@ function sweepReceiptsOnce(): void {
   }
 }
 
-/** Whether `claude` has been signed in.
+/** How long `claude auth status --json` may take: the same budget as
+ * `--version`.  On a busy Mac it measured 5-12 s, past the old 8 s budget, and
+ * every probe that ran out of time used to read as a sign-out. */
+export const CLAUDE_AUTH_TIMEOUT_MS = 20_000;
+
+function claudeAuthTimeoutMs(): number {
+  // Test fixtures shorten the budget so a hanging fake CLI costs a second,
+  // not twenty.
+  const override = Number(process.env.FAKE_CLAUDE_AUTH_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_AUTH_TIMEOUT_MS;
+}
+
+/** How long `claude --help` may take when checking for --strict-mcp-config. */
+const CLAUDE_HELP_TIMEOUT_MS = 10_000;
+
+function claudeHelpTimeoutMs(): number {
+  // Test fixtures shorten this too, for the same reason.
+  const override = Number(process.env.FAKE_CLAUDE_HELP_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CLAUDE_HELP_TIMEOUT_MS;
+}
+
+/** `loggedIn` from `claude auth status --json`, or undefined when stdout is
+ * not that document. */
+function parseClaudeLoggedIn(stdout: string | undefined): boolean | undefined {
+  try {
+    const status: unknown = JSON.parse(stdout ?? "");
+    if (typeof status !== "object" || status === null) return undefined;
+    return "loggedIn" in status && status.loggedIn === true;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `claude` has been signed in: true, false, or undefined when the
+ * probe could not tell.
  *
  * Credential storage is deliberately not inspected here. Claude Code uses the
  * macOS Keychain for OAuth, a JSON file on some platforms, and may gain other
  * backends over time. Presence checks also accept stale credentials. The CLI's
  * own machine-readable auth command is the source of truth for every backend.
+ *
+ * The answer is three-valued because a probe that ran out of time is not a
+ * sign-out.  Parsed JSON is definitive whatever the exit code: a genuinely
+ * signed-out CLI exits 1 AND prints `{"loggedIn":false}`.  A fast failure with
+ * no JSON (an older CLI without the `auth` subcommand) still fails closed.
+ * Only a timeout or kill — no answer at all — is undefined, and the caller
+ * keeps whatever it last knew.
  */
 export function claudeSignedIn(
   cli: string,
   env: NodeJS.ProcessEnv,
   run: typeof execCli = execCli,
-): Promise<boolean> {
+  timeoutMs: number = claudeAuthTimeoutMs(),
+): Promise<boolean | undefined> {
   return new Promise((resolve) => {
-    run(cli, ["auth", "status", "--json"], { timeout: 8000, env }, (_error, stdout) => {
-      try {
-        const status: unknown = JSON.parse(stdout);
-        resolve(
-          typeof status === "object" && status !== null && "loggedIn" in status && status.loggedIn === true,
-        );
-      } catch {
-        resolve(false);
+    const startedAt = Date.now();
+    run(cli, ["auth", "status", "--json"], { timeout: timeoutMs, env }, (error, stdout) => {
+      const answer = parseClaudeLoggedIn(stdout);
+      if (answer !== undefined) return resolve(answer);
+      const elapsed = Date.now() - startedAt;
+      if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= timeoutMs)) {
+        logProbeFailure("claude", `${cli} auth status --json`, error, elapsed);
+        return resolve(undefined);
       }
+      resolve(false);
     });
   });
 }
@@ -458,6 +511,39 @@ function firstText(content: unknown): string {
   return "";
 }
 
+// ── model rejection ─────────────────────────────────────────────────────
+// When the CLI cannot use the requested model id it does not fail the process.
+// It answers with a synthetic assistant frame (`model: "<synthetic>"`, zero
+// usage) whose top-level `error` is "model_not_found" and whose text reads
+// "There's an issue with the selected model (...)", then a result frame with
+// `is_error: true`, `terminal_reason: "api_error"` and `api_error_status: 404`.
+// Forwarded as an ordinary assistant reply, that text counted as real output:
+// the fallback walk stopped on the dead entry and the transcript filled with
+// the CLI's own apology (see selectTurnFallback in model-fallback.ts).
+//
+// The structural markers decide.  The text only backs them up for a CLI that
+// drops the `error` field, and only for a short, synthetic, zero-output frame,
+// so a real answer that happens to open with these words is not swallowed.
+const MODEL_REJECTION_ERROR = "model_not_found";
+const MODEL_REJECTION_TEXT = /^There's an issue with the selected model\b/;
+const MODEL_REJECTION_TEXT_MAX = 400;
+
+export function isModelRejectionFrame(frame: any, text: string): boolean {
+  if (frame?.error === MODEL_REJECTION_ERROR || frame?.message?.error === MODEL_REJECTION_ERROR) return true;
+  const message = frame?.message;
+  const synthetic = message?.model === "<synthetic>" || !(Number(message?.usage?.output_tokens) > 0);
+  const trimmed = text.trim();
+  return synthetic && trimmed.length > 0 && trimmed.length < MODEL_REJECTION_TEXT_MAX && MODEL_REJECTION_TEXT.test(trimmed);
+}
+
+function modelRejectionMessage(cliText: string, requested: string | null | undefined): string {
+  // The CLI names the id it rejected in parentheses; the request is the
+  // fallback for a frame that carried no text.
+  const named = /\(([^()\s]{1,120})\)/.exec(cliText)?.[1] ?? requested ?? null;
+  const subject = named ? `the model ${named}` : "the selected model";
+  return `Claude can't use ${subject}.  It may not exist, or this account may not have access to it.  Pick another model in Settings.`;
+}
+
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
   metadata: { displayName: "Claude", supportsMultipleInstances: true },
@@ -528,6 +614,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
          *  tools the turn already ran (E2).  Unlike sawStreamDelta, which is
          *  a per-frame dedup hint and resets after each assistant frame. */
         producedOutput: boolean;
+        /** Set when the CLI answered with a model-rejection frame: the
+         *  message already surfaced as an error, and the result frame that
+         *  follows settles the turn `unknown_model`. */
+        modelRejection?: string;
         input: SendTurnInput;
         retry: { attempt: number; cancelled: boolean };
         retryAbort: AbortController;
@@ -1013,6 +1103,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           case "assistant": {
             const msg = o.message ?? {};
             const text = firstText(msg.content);
+            if (session.turn && isModelRejectionFrame(o, text)) {
+              // Not an assistant reply: an error the turn failed on.  It must
+              // reach the transcript as an error row, never as bot text, so
+              // the failover reads "nothing produced" and walks on, and the
+              // next engine does not inherit the apology as history.
+              const message = modelRejectionMessage(text, session.turn.input.model);
+              session.turn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+              break;
+            }
             if (text.trim()) {
               if (session.turn) session.turn.producedOutput = true;
               // fallback delta for CLIs/paths that never streamed the block
@@ -1087,11 +1187,30 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             // (the Messages API's own field: end_turn, tool_use, ...) is the
             // right label for a normal completion and stays primary there.
             const isError = o.is_error === true;
-            const stopReason = isError
-              ? (o.terminal_reason ?? o.stop_reason ?? null)
-              : (o.stop_reason ?? o.terminal_reason ?? null);
+            // A rejected model id: the frame above named it, or the result
+            // alone reports a 404 before any output.  `unknown_model` is what
+            // retry.ts already classifies as terminal, and what the failover
+            // reads to mark this (bot, model) pair as rejected.
+            const liveTurn = session.turn;
+            const modelRejected =
+              Boolean(liveTurn?.modelRejection) ||
+              (isError && o.api_error_status === 404 && !liveTurn?.producedOutput);
+            if (modelRejected && liveTurn && !liveTurn.modelRejection) {
+              const reported = String(o.result ?? "");
+              const message = modelRejectionMessage(
+                reported.length < MODEL_REJECTION_TEXT_MAX ? reported : "",
+                liveTurn.input.model,
+              );
+              liveTurn.modelRejection = message;
+              emit({ ...base(threadId, currentTurnId()), type: "runtime.error", message });
+            }
+            const stopReason = modelRejected
+              ? "unknown_model"
+              : isError
+                ? (o.terminal_reason ?? o.stop_reason ?? null)
+                : (o.stop_reason ?? o.terminal_reason ?? null);
             settle(
-              !isError,
+              !isError && !modelRejected,
               stopReason,
               o.total_cost_usd ?? null,
               o.usage
@@ -1278,32 +1397,51 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       return writeUser(s, threadId, text);
     };
 
-    // Probe capabilities once per detected version.  Failed probes expire so
-    // a transient timeout does not require a harness restart to recover.
-    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<boolean> } | undefined;
-    const supportsStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<boolean> => {
+    // Probe capabilities once per detected version.  A "no" expires after
+    // 30 s so an upgrade is noticed without a restart; a probe that gave no
+    // answer (timeout) is kept only 5 s, and never reads as "too old".
+    type StrictMcpAnswer = "yes" | "no" | "unknown";
+    let strictMcpProbe: { version: string; expiresAt: number; result: Promise<StrictMcpAnswer> } | undefined;
+    const probeStrictMcp = (version: string, env: NodeJS.ProcessEnv): Promise<StrictMcpAnswer> => {
       if (strictMcpProbe?.version === version && strictMcpProbe.expiresAt > Date.now()) {
         return strictMcpProbe.result;
       }
+      const startedAt = Date.now();
+      const helpTimeout = claudeHelpTimeoutMs();
       const probe = {
         version,
         expiresAt: Date.now() + 30_000,
-        result: new Promise<boolean>((resolve) => {
-          execCli(config.cli, ["--help"], { timeout: 10000, env }, (error, stdout) => {
-            resolve(!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout));
+        result: new Promise<StrictMcpAnswer>((resolve) => {
+          execCli(config.cli, ["--help"], { timeout: helpTimeout, env }, (error, stdout) => {
+            if (!error && /(?:^|\s)--strict-mcp-config(?:\s|$)/m.test(stdout)) return resolve("yes");
+            const elapsed = Date.now() - startedAt;
+            if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= helpTimeout)) {
+              logProbeFailure(instanceId, `${config.cli} --help`, error, elapsed);
+              return resolve("unknown");
+            }
+            resolve("no");
           });
         }),
       };
       strictMcpProbe = probe;
-      void probe.result.then((supported) => {
-        if (supported) probe.expiresAt = Infinity;
+      void probe.result.then((answer) => {
+        if (answer === "yes") probe.expiresAt = Infinity;
+        // Not an answer: look again soon, but not on every call — each look
+        // is another process on an already busy Mac.
+        else if (answer === "unknown") probe.expiresAt = Date.now() + 5_000;
       });
       return probe.result;
     };
-
     const requireStrictMcp = async (): Promise<void> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      if (await supportsStrictMcp(strictMcpProbe?.version ?? "unprobed", env)) return;
+      const strict = await probeStrictMcp(strictMcpProbe?.version ?? "unprobed", env);
+      if (strict === "yes") return;
+      // `--help` gave no answer in time: nothing says this CLI is too old, so
+      // the turn must not tell the user to update it.  It still cannot run
+      // unverified, so it fails as a slow check the next turn retries.
+      if (strict === "unknown") {
+        throw new Error(`${input.displayName || "Claude"} did not answer in time; try again in a moment`);
+      }
       // A failed probe conflates two very different causes: the CLI is too
       // old for --strict-mcp-config (upgrade it), or the CLI cannot run at
       // all (missing or not executable — a setup problem). Both surfaced as
@@ -1326,36 +1464,57 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       throw reason;
     };
 
-    let lastKnownVersion: string | null = null;
+    // Last definitive answers, so one probe that runs out of time on a busy
+    // Mac does not flip a working, signed-in Claude to "not installed" or
+    // "sign-in required".
+    const lastKnownVersion = new LastKnownAnswer<string>();
+    const lastKnownAuth = new LastKnownAnswer<boolean>();
+    const engineLabel = input.displayName || "Claude";
     const snapshot = async (): Promise<ProviderSnapshot> => {
       const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
-      let version = await new Promise<string | null>((resolve) => {
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
         execCli(config.cli, ["--version"], { timeout: 20000, env }, (err, stdout) => {
-          const trimmed = err ? null : stdout.trim();
-          if (trimmed) {
-            lastKnownVersion = trimmed;
-            resolve(trimmed);
-          } else if (lastKnownVersion) {
-            resolve(lastKnownVersion);
-          } else {
-            resolve(null);
-          }
+          resolve({ version: err ? null : stdout.trim() || null, error: err });
         });
       });
-      if (!version) {
-        if (lastKnownVersion) {
-          version = lastKnownVersion;
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, engineLabel, elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or crashing binary is a verdict.
+          version = remembered;
         } else {
-          return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
       }
-      if (!(await supportsStrictMcp(version, env))) {
+      const strict = await probeStrictMcp(version, env);
+      if (strict === "unknown") {
+        return { state: "unavailable", transient: true, reason: `${engineLabel} did not answer in time`, version };
+      }
+      if (strict === "no") {
         return {
           state: "unavailable",
           reason: CLAUDE_ISOLATION_REASON,
         };
       }
-      const authenticated = await claudeSignedIn(config.cli, env);
+      const authOrder = lastKnownAuth.begin();
+      const probedAuth = await claudeSignedIn(config.cli, env);
+      if (probedAuth !== undefined) lastKnownAuth.record(probedAuth, authOrder);
+      // Only as old as KNOWN_VERSION_MAX_AGE_MS: past that, unknown.
+      const authenticated = probedAuth ?? lastKnownAuth.get() ?? undefined;
       // claudeEnvironment strips ANTHROPIC_API_KEY, so turns run on the
       // CLI's own login (Pro/Max): the cost it reports is what the call
       // WOULD bill, not a charge

@@ -30,6 +30,13 @@ export interface FakeDriverOptions {
   quota?: ProviderSnapshot["quota"];
   /** Default config returned by driver.defaultConfig(). */
   defaultConfig?: Record<string, unknown> | (() => Record<string, unknown>);
+  /** Scripted snapshot() — receives the instance's create input and a
+   *  1-based call counter shared by every instance of this driver, so a test
+   *  can make one probe slow, inconclusive or definitive. */
+  snapshotImpl?: (
+    input: DriverCreateInput<Record<string, unknown>>,
+    call: number,
+  ) => ProviderSnapshot | Promise<ProviderSnapshot>;
 }
 
 export interface FakeDriverHandle {
@@ -38,6 +45,8 @@ export interface FakeDriverHandle {
   created: Map<string, { instance: ProviderInstance; emit: (e: RuntimeEvent) => void }>;
   decodedConfigs: unknown[];
   disposed: string[];
+  /** How many times snapshot() has been called across every instance. */
+  snapshotCalls: number;
 }
 
 export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
@@ -46,6 +55,7 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
     created: new Map(),
     decodedConfigs: [],
     disposed: [],
+    snapshotCalls: 0,
     driver: {
       driverKind: kind,
       metadata: { displayName: `Fake ${kind}` },
@@ -79,6 +89,8 @@ export function makeFakeDriver(opts: FakeDriverOptions = {}): FakeDriverHandle {
           enabled: input.enabled,
           models: handle.driver.models,
           snapshot: async (): Promise<ProviderSnapshot> => {
+            const call = ++handle.snapshotCalls;
+            if (opts.snapshotImpl) return { ...(await opts.snapshotImpl(input, call)) };
             if (opts.failSnapshot) throw new Error(opts.failSnapshot);
             // A fresh object per call: the registry mutates `snapshot.quota`
             // in place, and a shared literal would leak one describe()'s
