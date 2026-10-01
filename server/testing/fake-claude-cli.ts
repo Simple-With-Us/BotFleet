@@ -34,7 +34,8 @@
 //                      private temp file and deletes it when the turn settles,
 //                      so a test cannot open it after the fact.
 //   FAKE_CLAUDE_AUTH   in (default) | out | unsupported | malformed |
-//                      inherited-api-key — what `auth status` reports
+//                      inherited-api-key | hang — what `auth status` reports
+//                      (hang: never answers, so the probe runs out of time)
 //   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
 //                           so integration tests can queue work before settle
 //   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
@@ -77,12 +78,22 @@ if (argv[0] === "--version") {
 
 if (argv[0] === "--help") {
   if (process.env.FAKE_CLAUDE_HELP_PROBES) appendFileSync(process.env.FAKE_CLAUDE_HELP_PROBES, "probe\n");
+  if (process.env.FAKE_CLAUDE_HELP === "hang") {
+    // A busy Mac: no answer before the driver's deadline kills this.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+    process.exit(0);
+  }
   process.stdout.write(process.env.FAKE_CLAUDE_HELP === "unsupported" ? "Usage: claude\n" : "  --strict-mcp-config  Only load explicit MCP servers\n");
   process.exit(0);
 }
 
 if (argv[0] === "auth" && argv[1] === "status") {
   const auth = process.env.FAKE_CLAUDE_AUTH ?? "in";
+  if (auth === "hang") {
+    // A busy Mac: no answer before the driver's deadline kills this.
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+    process.exit(0);
+  }
   if (auth === "unsupported") {
     process.stderr.write("error: unknown command 'auth'\n");
     process.exit(1);

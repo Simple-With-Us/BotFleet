@@ -22,7 +22,15 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
   decodeInitTimeoutMs,
@@ -182,11 +190,11 @@ export interface AcpSupport {
   /** Per-model reasoning-effort budgets, keyed by model id.  A model listed
    * here gets its entry as the catalog option's `effortLevels`, which the
    * client prefers over the driver-wide list; models absent from the map
-   * fall back to `effortLevels`.  Mirrors the Harness
-   * `AcpSupport.perModelEffortLevels` shape so a Harness-published map can
+   * fall back to `effortLevels`.  Mirrors the Clutch
+   * `AcpSupport.perModelEffortLevels` shape so a Clutch-published map can
    * be passed straight through. */
   perModelEffortLevels?: Readonly<Record<string, readonly EffortLevel[]>>;
-  /** Harness's model-specific image truth; explicit catalog values take priority. */
+  /** Clutch's model-specific image truth; explicit catalog values take priority. */
   perModelImages?: Readonly<Record<string, boolean>>;
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
@@ -271,7 +279,10 @@ export interface AcpSupport {
   authFailure: "fail" | "continue";
   /** snapshot(): can this harness actually run a turn? (env already carries the
    *  merged config). May be async for harnesses that have to ask the CLI. */
-  isAuthenticated(env: Record<string, string | undefined>, config: AcpConfig): boolean | Promise<boolean>;
+  isAuthenticated(
+    env: Record<string, string | undefined>,
+    config: AcpConfig,
+  ): boolean | undefined | Promise<boolean | undefined>;
   /** Refuse a first-party cloud turn before spawning when snapshot auth is
    * false. Local injected models deliberately bypass this subscription gate. */
   requireAuthenticationBeforeSpawn?: boolean;
@@ -570,21 +581,42 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
       };
-      let lastKnownVersion: string | null = null;
-      const cliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
-        new Promise<string | null>((resolve) => {
+      // Expires KNOWN_VERSION_MAX_AGE_MS after the CLI last answered, so a
+      // CLI that wedges for good settles as "did not answer in time".
+      const lastKnownVersion = new LastKnownAnswer<string>();
+      /** One `--version` probe, with what went wrong when it produced no
+       * version — so a timeout can be told apart from a missing binary. */
+      const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
+        new Promise<{ version: string | null; error: Error | null; elapsedMs: number }>((resolve) => {
+          // Its place among overlapping probes: taken before the process starts,
+          // so a slow older probe cannot replace what a newer one remembered.
+          const order = lastKnownVersion.begin();
+          const startedAt = Date.now();
           execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
             const trimmed = err ? null : stdout.trim();
+            const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
-              lastKnownVersion = trimmed;
-              resolve(trimmed);
-            } else if (lastKnownVersion) {
-              resolve(lastKnownVersion);
+              lastKnownVersion.record(trimmed, order);
+              resolve({ version: trimmed, error: null, elapsedMs });
             } else {
-              resolve(null);
+              logProbeFailure(input.instanceId, `${effective.cli} --version`, err, elapsedMs);
+              // The last good version stands in only for a probe that gave no
+              // answer.  A missing or crashing binary is a verdict and also
+              // retires the remembered version.
+              const failure = classifyVersionProbeFailure(
+                err,
+                effective.cli,
+                input.displayName || input.instanceId,
+                elapsedMs,
+                20000,
+              );
+              if (failure.kind !== "transient") lastKnownVersion.forget(order);
+              resolve({ version: failure.kind === "transient" ? lastKnownVersion.get() : null, error: err, elapsedMs });
             }
           });
         });
+      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) =>
+        (await probeCliVersion(effective, env)).version;
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
         provider: DRIVER_KIND,
@@ -673,7 +705,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         }
         if (support.requireAuthenticationBeforeSpawn && !skipSubscriptionAuthForLocalInject(turn.model)) {
-          let authenticated: boolean;
+          let authenticated: boolean | undefined;
           try {
             authenticated = await support.isAuthenticated(env, turnConfig);
           } catch (error) {
@@ -682,7 +714,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           const cancelled = cancelledBeforeDispatch();
           if (cancelled) return cancelled;
-          if (!authenticated) {
+          // Undefined is "the probe could not tell" — let the CLI itself
+          // answer rather than refusing a signed-in user on a slow probe.
+          if (authenticated === false) {
             return finishBeforeDispatch(false, "auth_required", { message: support.loginNote, setup: true });
           }
         }
@@ -1354,11 +1388,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   // Signed-in subscription CLIs (grok.com OIDC on disk) still
                   // run off ambient login when authenticate rejects.  BOTFLEET-C
                   // paged high for "not signed in" while auth.json was valid.
-                  if (support.authFailure === "fail" && !(await support.isAuthenticated(env, turnConfig))) {
+                  if (support.authFailure === "fail" && (await support.isAuthenticated(env, turnConfig)) === false) {
                     throw new Error(support.loginNote);
                   }
                 }
-              } else if (support.authFailure === "fail" && !(await support.isAuthenticated(env, turnConfig))) {
+              } else if (support.authFailure === "fail" && (await support.isAuthenticated(env, turnConfig)) === false) {
                 throw new Error(support.loginNote);
               }
             }
@@ -1616,13 +1650,25 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
       const snapshot = async (): Promise<ProviderSnapshot> => {
         const env = childEnv();
-        let version = await cliVersion(config, env);
+        const probed = await probeCliVersion(config, env);
+        let version = probed.version;
         if (!version) {
-          if (lastKnownVersion) {
-            version = lastKnownVersion;
-          } else {
-            return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-          }
+          // probeCliVersion already reused the last good version for a
+          // transient failure; what reaches here is classified, not reused.
+          // Only a binary that is missing or cannot run is "not found".  A
+          // probe that ran out of time on a busy Mac is transient: the
+          // registry answers from the last good snapshot and the UI says
+          // "Checking".
+          const failure = classifyVersionProbeFailure(
+            probed.error,
+            config.cli,
+            input.displayName || input.instanceId,
+            probed.elapsedMs,
+            20000,
+          );
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
         const incompatible = support.versionCompatibilityReason?.(version, config);
         if (incompatible) return { state: "unavailable", reason: incompatible, version };

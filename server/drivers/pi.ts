@@ -30,7 +30,14 @@ import { hostToolPrefix, turnComputerMounts } from "../computer-grants.ts";
 import { augmentedPath } from "../env-path.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+} from "../procs.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { STDERR_EXCERPT_HEAD, STDERR_EXCERPT_TAIL, stderrExcerpt } from "../stderr-excerpt.ts";
 import { readHostLoad, resolveInitDeadline } from "./acp/init-deadline.ts";
@@ -922,13 +929,33 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       return { turnId };
     };
 
+    // Last good `--version`, so one probe that runs out of time on a busy
+    // Mac does not flip a working pi to "not installed".
+    const lastKnownVersion = new LastKnownAnswer<string>();
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const version = await new Promise<string | null>((resolve) => {
-        const child = spawnCli(config.cli, ["--version"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: piEnvironment({ ...process.env, ...input.environment }),
-        });
+      // Its place among overlapping probes: taken before the process starts,
+      // so a slow older probe cannot replace what a newer one remembered.
+      const versionOrder = lastKnownVersion.begin();
+      const startedAt = Date.now();
+      const probed = await new Promise<{ version: string | null; error: Error | null }>((resolve) => {
+        let child: ReturnType<typeof spawnCli>;
+        try {
+          child = spawnCli(config.cli, ["--version"], {
+            stdio: ["ignore", "pipe", "pipe"],
+            env: piEnvironment({ ...process.env, ...input.environment }),
+          });
+        } catch (error) {
+          resolve({ version: null, error: error as Error });
+          return;
+        }
         let out = "";
+        let settled = false;
+        const settle = (value: { version: string | null; error: Error | null }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
         child.stdout?.setEncoding("utf8");
         child.stdout?.on("data", (c: string) => (out += c));
         child.stderr?.resume();
@@ -938,19 +965,39 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           } catch {
             /* ignore */
           }
-          resolve(null);
-        }, 8000);
+          settle({
+            version: null,
+            error: Object.assign(new Error(`\`${config.cli}\` did not exit within 20000ms`), { timedOut: true }),
+          });
+        }, 20000);
         timer.unref?.();
-        child.on("error", () => {
-          clearTimeout(timer);
-          resolve(null);
-        });
-        child.on("close", () => {
-          clearTimeout(timer);
-          resolve(out.trim() || null);
-        });
+        child.on("error", (error) => settle({ version: null, error }));
+        child.on("close", (code) =>
+          settle({
+            version: out.trim() || null,
+            error: out.trim() ? null : Object.assign(new Error(`exit ${code}`), { code }),
+          }),
+        );
       });
-      if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+      let version = probed.version;
+      if (version) {
+        lastKnownVersion.record(version, versionOrder);
+      } else {
+        const elapsed = Date.now() - startedAt;
+        logProbeFailure(instanceId, `${config.cli} --version`, probed.error, elapsed);
+        const failure = classifyVersionProbeFailure(probed.error, config.cli, input.displayName || "pi", elapsed, 20000);
+        const remembered = failure.kind === "transient" ? lastKnownVersion.get() : null;
+        if (remembered) {
+          // Only a probe that gave no answer may stand on the last good
+          // version.  A missing or broken binary is a verdict.
+          version = remembered;
+        } else {
+          if (failure.kind !== "transient") lastKnownVersion.forget(versionOrder);
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
+        }
+      }
       // pi keeps its credentials in its own data root; there is no sign-in
       // subcommand to probe, so read the file it writes.  Reporting a
       // hardcoded `true` meant an installed-but-unauthenticated pi looked

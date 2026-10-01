@@ -57,3 +57,7 @@ debug-cap.mjs
 # Editor / shell backup files (PR #218 inadvertently committed docs/EFFORT-LOG.md.bak)
 *.bak
 *.bak-*
+
+# Python bytecode
+__pycache__/
+*.pyc

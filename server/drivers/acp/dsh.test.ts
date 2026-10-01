@@ -210,7 +210,7 @@ describe("native DSH ACP turns", () => {
   const create = async () => {
     instance = await DshAgentDriver.create({
       instanceId: "dsh-native-test",
-      displayName: "Harness",
+      displayName: "Clutch",
       environment: {},
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
@@ -253,7 +253,7 @@ describe("native DSH ACP turns", () => {
   });
 
   it("sends the advertised wire value for a picker id the install declares differently", async () => {
-    // Harness #54 through BotFleet's ACP core: stock dsh declares
+    // Clutch #54 through BotFleet's ACP core: stock dsh declares
     // `deepseek-flash` (display name DeepSeek-V4.1-Flash), so the constructed
     // value `["deepseek-official","DeepSeek-V4.1-Flash"]` would be refused.
     // The resolver must send the advertised tuple, and the session must still
@@ -503,7 +503,7 @@ describe("dsh capability honesty", () => {
   it("advertises only the controls implemented by the native ACP profile", async () => {
     const instance = await DshAgentDriver.create({
       instanceId: "dsh-capabilities",
-      displayName: "Harness",
+      displayName: "Clutch",
       environment: {},
       enabled: true,
       config: DshAgentDriver.defaultConfig(),
@@ -582,7 +582,7 @@ describe("dsh authentication and credentials", () => {
   });
 });
 
-// The DSH engine's catalog comes from the Harness install's own settings file
+// The DSH engine's catalog comes from the installed engine's own settings file
 // so a new profile model shows up without a BotFleet release.  The static
 // catalog is the floor, and because a DSH profile is *partial* (it often
 // configures only the minimax provider) the live read unions rather than
@@ -792,7 +792,7 @@ describe("readDshModelCatalog", () => {
   });
 });
 
-describe("dsh model option resolution (Harness #54 consumer)", () => {
+describe("dsh model option resolution (Clutch #54 consumer)", () => {
   // What stock dsh 0.1.5-rc.x advertises at session/new: opaque route tuples
   // whose ids are NOT the picker ids.
   const STOCK_ADVERTISED = [
@@ -867,7 +867,7 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
   });
 
   it("names the provider route of a refused model, so a wrong-route pick does not read as a contradiction", () => {
-    // Harness #56: a model declared only under another provider stays refused
+    // Clutch #56: a model declared only under another provider stays refused
     // (a different route has its own credentials and billing), and the error
     // now lists offers as provider/id and says where the model is declared.
     let thrown: unknown;
@@ -893,10 +893,10 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
   });
 });
 
-// Harness publishes per-model effort levels for MiniMax M3.1 on DSH, which
+// Clutch publishes per-model effort levels for MiniMax M3.1 on DSH, which
 // exist only when the install's settings.yaml entry declares
 // `reasoningEfforts` (stock dsh does not catalog M3.1).  The live catalog
-// gates the picker on that entry, and configureSession is Harness's.
+// gates the picker on that entry, and configureSession is Clutch's.
 describe("DSH MiniMax M3.1 reasoning effort", () => {
   const M31 = "MiniMax-M3.1-Flash-Preview";
   const M31_LEVELS = ["low", "medium", "high", "xhigh", "max"];
@@ -955,7 +955,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
     });
   });
 
-  it("passes the Harness per-model map through as a fallback for the static catalog", () => {
+  it("passes the Clutch per-model map through as a fallback for the static catalog", () => {
     expect(dshSupport.perModelEffortLevels?.[M31]).toEqual(M31_LEVELS);
     expect(dshSupport.effortLevels).toEqual(["none", "high", "max"]);
   });

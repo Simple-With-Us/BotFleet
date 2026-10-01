@@ -1,11 +1,11 @@
 // Stock `@deepseek-ai/dsh-acp` rejects non-empty session/new mcpServers.
 // BotFleet still builds the same stdio mounts every other ACP engine gets.
-// YAML overlay helpers live in Harness; this file is the spawn glue that
+// YAML overlay helpers live in Clutch; this file is the spawn glue that
 // needs SPAWNED_PROXIES.dshAcpBridge (packaged Electron stdio bridge).
 import {
   writeDshMcpPatch,
   isDshEngineCli,
-} from "harness/dsh/mcp-patch";
+} from "clutch/dsh/mcp-patch";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 import type { SendTurnInput } from "../../contracts.ts";
 import { acpMcpServers, type AcpSpawnRewrite } from "./core.ts";
@@ -16,7 +16,7 @@ export {
   dshMcpServerName,
   isDshEngineCli,
   writeDshMcpPatch,
-} from "harness/dsh/mcp-patch";
+} from "clutch/dsh/mcp-patch";
 
 export function dshWrapSpawn(
   cli: string,

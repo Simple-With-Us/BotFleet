@@ -1,10 +1,10 @@
 /**
- * DSH ACP driver — BotFleet runtime composed with the Harness engine shape.
+ * DSH ACP driver — BotFleet runtime composed with the Clutch engine shape.
  *
  * Engine catalog, version gate, error classifier, and model-id round-trip
- * live in `jaywedgeworth22/Harness` (`harness/dsh/acp`).  This file keeps
+ * live in `jaywedgeworth22/Clutch` (`clutch/dsh/acp`).  This file keeps
  * `wrapSpawn` and `createAcpDriver` here because they need BotFleet's ACP
- * core and the Node stdio bridge.  Edit engine shape in Harness, not here.
+ * core and the Node stdio bridge.  Edit engine shape in Clutch, not here.
  */
 import {
   DSH_MINIMUM_ACP_VERSION,
@@ -18,10 +18,10 @@ import {
   dshModelOptionValue,
   dshProviderForModel,
   dshSameModel,
-  dshSpawnArgs as harnessDshSpawnArgs,
-  dshSupport as harnessDshSupport,
+  dshSpawnArgs as clutchDshSpawnArgs,
+  dshSupport as clutchDshSupport,
   dshVersionCompatibilityReason,
-} from "harness/dsh/acp";
+} from "clutch/dsh/acp";
 
 import type { ModelCatalog, ProviderErrorCode, SendTurnInput } from "../../contracts.ts";
 import { readFileSync } from "node:fs";
@@ -32,7 +32,7 @@ import { createAcpDriver, type AcpConfig, type AcpSupport } from "./core.ts";
 import { dshWrapSpawn } from "./dsh-mcp.ts";
 
 export { dshWrapSpawn, isDshEngineCli } from "./dsh-mcp.ts";
-/** BotFleet DSH model catalog.  The Harness package still publishes
+/** BotFleet DSH model catalog.  The Clutch package still publishes
  * MiniMax-M2.7, but it is dropped here per the product decision (M3.1 Flash
  * Preview dominates on context and is the canonical DSH-hosted MiniMax row). */
 /** BotFleet DSH model catalog.
@@ -99,7 +99,7 @@ export const STATIC_DSH_MODELS: ModelCatalog = {
 };
 
 /** Models the product keeps out of the picker even when the installed
- *  Harness offers them.  Same expression that builds STATIC_DSH_MODELS, so
+ *  engine offers them.  Same expression that builds STATIC_DSH_MODELS, so
  *  the live read below and the static fallback agree on what is excluded. */
 const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "MiniMax-M2.7",
@@ -115,10 +115,10 @@ const DSH_EXCLUDED_MODEL_IDS: readonly string[] = [
   "deepseek-v4-flash",
 ];
 
-/** The Harness install declares the models it can actually serve in its own
+/** The installed engine declares the models it can actually serve in its own
  *  settings file, under a provider map at `llm-pi-ai.providers.<id>.models[]`
  *  with `id` / `name` / `contextWindow`.  That file is the real source of truth
- *  for "what can this DSH run right now" — the catalog compiled into the Harness
+ *  for "what can this DSH run right now" — the catalog compiled into the Clutch
  *  package goes stale the moment the owner edits a profile or the package is
  *  pinned to an older release.  Reading it is the same move claude.ts makes
  *  against `~/.claude/settings.json`.
@@ -226,7 +226,7 @@ function modelRowsFromSettings(settings: DshSettings): ModelCatalog["options"] {
 }
 
 /** Live catalog for the DSH engine: the static rows plus whatever the
- *  installed Harness adds, with live metadata winning on the ids both know.
+ *  installed engine adds, with live metadata winning on the ids both know.
  *
  *  This **unions rather than replaces**, which is the same call
  *  `readClaudeModelCatalog` makes.  The reason is concrete: a DSH profile that
@@ -271,7 +271,7 @@ export function readDshModelCatalog(
   }
   // Per-model effort levels (MiniMax M3.1) exist only when this install's
   // settings entry declares them: stock dsh does not catalog M3.1, so without
-  // `reasoningEfforts` on its entry dsh refuses every level.  Harness answers
+  // `reasoningEfforts` on its entry dsh refuses every level.  Clutch answers
   // for every per-model row, and an explicit `[]` here wins over the static
   // `perModelEffortLevels` core folds on afterwards, so the picker never
   // offers a level this dsh would refuse.  A missing or unreadable file
@@ -301,12 +301,12 @@ export {
 };
 
 export function dshSpawnArgs(config: AcpConfig, turn: Pick<SendTurnInput, "integrations">): string[] {
-  return harnessDshSpawnArgs(config, turn);
+  return clutchDshSpawnArgs(config, turn);
 }
 
 /**
- * The Harness package's error codes include "unknown"; BotFleet's
- * ProviderErrorCode does not — an unrecognized harness code is the same as
+ * The Clutch package's error codes include "unknown"; BotFleet's
+ * ProviderErrorCode does not — an unrecognized Clutch code is the same as
  * no classification here.
  */
 function dshClassifyError(error: unknown): ProviderErrorCode | undefined {
@@ -322,26 +322,26 @@ function dshClassifyError(error: unknown): ProviderErrorCode | undefined {
 export const DSH_INIT_TIMEOUT_MS = 120_000;
 
 export const dshSupport = {
-  ...harnessDshSupport,
+  ...clutchDshSupport,
   initTimeoutMs: DSH_INIT_TIMEOUT_MS,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
-  loginNote: harnessDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
+  loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",
   resumeMethod: "session/resume" as const,
   spawnArgs: dshSpawnArgs,
   wrapSpawn: dshWrapSpawn,
   pickAuthMethod: () => null,
   classifyError: dshClassifyError,
   isAuthenticated: (env: Record<string, string | undefined>, _config: AcpConfig) =>
-    harnessDshSupport.isAuthenticated?.(env) ?? false,
+    clutchDshSupport.isAuthenticated?.(env) ?? false,
   authFailure: "continue" as const,
   buildPromptText: (turn: SendTurnInput) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
-  // Effort semantics are engine shape and live in Harness: an explicit level
+  // Effort semantics are engine shape and live in Clutch: an explicit level
   // is sent and must take, and Default on a row with per-model levels (MiniMax
   // M3.1) sends dsh's provider-default value so a level a resumed session kept
   // from an earlier turn clears.  DeepSeek rows still send nothing for Default.
   async configureSession({ request, sessionId, turn }) {
-    await harnessDshSupport.configureSession?.({ request, sessionId, turn });
+    await clutchDshSupport.configureSession?.({ request, sessionId, turn });
   },
 } satisfies AcpSupport;
 
