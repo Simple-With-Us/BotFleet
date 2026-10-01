@@ -967,6 +967,7 @@ function dispatchHoldFor(
   botId: string,
   threadId: string | undefined,
   runOn: RoutineRunOn,
+  opts: { count?: boolean } = {},
 ): DispatchHold | undefined {
   const bot = store.bot(botId);
   if (!bot) return undefined;
@@ -984,7 +985,11 @@ function dispatchHoldFor(
   // run stays QUEUED rather than failing, so it lands once the breaker
   // half-opens.
   if (doomedDispatches.isOpen(bot.id, instanceId)) {
-    noteDoomedSkip(bot.id, instanceId);
+    // Counted once, at the gate that actually prevented a dispatch. The reason
+    // lookup runs the same predicate for the same run on the same tick, and
+    // counting from both reported twice as many prevented dispatches as
+    // occurred.
+    if (opts.count) noteDoomedSkip(bot.id, instanceId);
     const entry = doomedDispatches.peek(bot.id, instanceId);
     return {
       reason: `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row`,
@@ -5226,7 +5231,12 @@ async function startTurn(
       // dispatch for a CLI/ACP-lane bot, which is never eligible anyway.
       const recallSettingsForTurn =
         usesDriverToolLoop && cfg.qdrant?.enabled !== false ? recallSettings() : undefined;
-      const hasRecall = recallAvailableForTurn(recallSettingsForTurn, usesDriverToolLoop, Boolean(findRecallCli()));
+      // Short-circuited, not passed as a value: JS evaluates arguments eagerly,
+      // so passing findRecallCli() would run its synchronous existsSync probes
+      // on every dispatch even when recall is off or this engine cannot carry
+      // the tools. The old expression avoided exactly that.
+      const hasRecall = recallSettingsForTurn !== undefined
+        && recallAvailableForTurn(recallSettingsForTurn, usesDriverToolLoop, findRecallCli)
       // Same reasoning as `phoneEligible` above: the skill selection already
       // decided whether this message is phone-related, using the SAME
       // toolLoop eligibility.  Re-deriving that here would just risk the
@@ -5651,22 +5661,21 @@ routines = new RoutineManager({
       load: readHostLoad(),
     });
   },
-  canStart: (botId, threadId, runOn) => !dispatchHoldFor(botId, threadId, runOn),
+  canStart: (botId, threadId, runOn) => !dispatchHoldFor(botId, threadId, runOn, { count: true }),
   // The reason behind a `false` from canStart, read by the scheduler when it
-  // leaves a run QUEUED.  The same verdict and the same words, because two
-  // functions answering one question differently is how a queued run ends up
-  // explaining itself with a reason that does not match the gate that held it.
-  dispatchHoldReason: (botId) => dispatchHoldFor(botId, undefined, "bot")?.reason,
+  // leaves a run QUEUED.  Takes the run's own destination and thread for the
+  // same reason canStart does, and passes `count: false` so asking why does not
+  // also count a second prevented dispatch.
+  dispatchHoldReason: (botId, threadId, runOn) =>
+    dispatchHoldFor(botId, threadId, runOn, { count: false })?.reason,
+  // Liveness only.  It has no thread and no runOn, so it CANNOT judge a hold:
+  // doing so hardcoded a destination and put the local spend ceiling and the
+  // local credential gate in front of CLOUD runs, which both deliberately
+  // exempt.  The hold belongs at the canStart site, which has the run's real
+  // context — and that is now where it is.
   botState: (botId) => {
     const bot = store.bot(botId);
-    if (!bot) return "missing";
-    if (bot.busy) return "busy";
-    // Held engines read as `blocked`, not `ready`, which is the whole point of
-    // the value: the roster used to offer work to a bot whose engine could not
-    // start it, and the run then sat queued looking like a stuck scheduler.
-    // Judged on the bot's own selection, so this is the common case; canStart
-    // stays the authority for a specific thread.
-    return dispatchHoldFor(botId, undefined, "bot") ? "blocked" : "ready";
+    return !bot ? "missing" : bot.busy ? "busy" : "ready";
   },
   conversationMode: () => parseConversationMode(cfg.conversationMode),
   // The gap is a property of the trigger definition, so it is read live —
@@ -13073,7 +13082,20 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // stopped draining cannot be told apart without both lists.  `list()`
         // is the live registry including half-open entries, so the half-open
         // "we let one probe through" state is visible here too.
-        doomed: doomedDispatches.list(),
+        // `open` is carried because `list()` also returns sub-threshold
+        // counters and expired half-open entries, and both dispatch normally —
+        // rendering every row of that list as "held" reports a healthy engine
+        // as held after a single transient failure.  `lastError` is redacted on
+        // the way the runtime event path redacts before broadcasting: a setup
+        // failure can carry provider text, and this route is a different
+        // boundary from the one that already sanitises it.
+        doomed: doomedDispatches.list().map((entry) => ({
+          ...entry,
+          open: doomedDispatches.isOpen(entry.botId, entry.instanceId),
+          lastError: entry.lastError
+            ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
+            : undefined,
+        })),
         // Bots whose fallback chain is longer on the picker than it is at
         // runtime. `selectTurnFallback` skips a candidate that is the primary
         // again, or one it already walked, so a chain that reads as three tiers

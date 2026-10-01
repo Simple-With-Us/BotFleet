@@ -40,11 +40,16 @@ export function findRecallCli(): string | null {
 export function recallAvailableForTurn(
   settings: { url?: string; collection?: string } | null | undefined,
   usesDriverToolLoop: boolean,
-  cliAvailable: boolean,
+  cliAvailable: boolean | (() => string | null),
 ): boolean {
   if (!usesDriverToolLoop) return false;
   if (!settings) return false;
-  return Boolean(settings.url || cliAvailable);
+  // `url` short-circuits the CLI probe, so a configured service never touches
+  // the filesystem. The probe is LAZY for the other order: passing
+  // `findRecallCli` by value would evaluate its synchronous existsSync calls
+  // on every dispatch, including the many where recall is off entirely.
+  if (settings.url) return true;
+  return typeof cliAvailable === "function" ? Boolean(cliAvailable()) : Boolean(cliAvailable);
 }
 
 /** An explicitly selected service is never bypassed by another local corpus. */
