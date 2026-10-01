@@ -2247,7 +2247,14 @@ export class Store {
         );
       }
     };
+    // An entry whose instance has no context yet (engine not loaded, catalog
+    // not described) cannot be classified, so the directive did not really
+    // apply to it: the marker stays unset and the next boot pass retries.
+    let directiveIncomplete = false;
+    const lacksContext = (entry: ModelSelection): boolean =>
+      opts.contextFor(entry.instanceId) === undefined || Boolean(entry.fallbacks?.some(lacksContext));
     const pass = (selection: ModelSelection, directive: boolean) => {
+      if (directive && lacksContext(selection)) directiveIncomplete = true;
       const flagged = directive ? applyOwnerDirective(selection, driverKindFor, opts.contextFor) : { selection, flagged: [] };
       const reconciled = reconcileChain(flagged.selection, opts.contextFor);
       return { selection: reconciled.selection, flagged: flagged.flagged, changes: reconciled.changes };
@@ -2299,7 +2306,7 @@ export class Store {
       this.saveBots();
       this.flushBotsNow();
     }
-    if (runDirective) {
+    if (runDirective && !directiveIncomplete) {
       try {
         writeFileAtomic(markerFile, `${JSON.stringify({ applied: [...applied, OWNER_DIRECTED_LATEST.id] }, null, 2)}\n`);
       } catch (error) {

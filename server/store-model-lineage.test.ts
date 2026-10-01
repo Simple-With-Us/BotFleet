@@ -19,6 +19,7 @@ const CODEX_LIVE = {
   options: ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"].map((id) => ({ id, label: id })),
 };
 
+let claudeLoaded = true;
 let codexModels: { default: string; options: Array<{ id: string; label: string }> } = CODEX_LIVE;
 const instance = (id: string) =>
   ({
@@ -26,7 +27,7 @@ const instance = (id: string) =>
     codex: { driverKind: "codex", models: codexModels },
     grok: { driverKind: "grokAgent", models: STATIC_GROK_MODELS },
     dsh: { driverKind: "dshAgent", models: { default: "DeepSeek-V4.1-Flash", options: [{ id: "DeepSeek-V4.1-Flash", label: "DeepSeek-V4.1-Flash" }] } },
-  })[id];
+  })[id === "claude" && !claudeLoaded ? "" : id];
 
 const reconcile = (store: Store, ownerDirective = false) =>
   store.reconcileModelLineage({
@@ -64,6 +65,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   rmSync(DATA_DIR, { recursive: true, force: true });
   codexModels = CODEX_LIVE;
+  claudeLoaded = true;
   vi.spyOn(console, "log").mockImplementation(() => {});
 });
 
@@ -139,6 +141,20 @@ describe("Store.reconcileModelLineage", () => {
     store.patchBot("plumber", { modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5" } });
     expect(reconcile(store, true)).toEqual([]);
     expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5" });
+  });
+
+  it("leaves the owner-directed marker unset while a selection's engine has no context, and applies once it does", () => {
+    seedBots([{ id: "plumber", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } }]);
+    const store = new Store(() => ({ instanceId: "claude", model: "claude-sonnet-5-5" }));
+    const markerPath = join(DATA_DIR, "model-lineage.json");
+    claudeLoaded = false;
+    reconcile(store, true);
+    expect(existsSync(markerPath)).toBe(false);
+    expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5" });
+    claudeLoaded = true;
+    reconcile(store, true);
+    expect(store.bot("plumber")!.modelSelection).toEqual({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+    expect(JSON.parse(readFileSync(markerPath, "utf8")).applied).toEqual([OWNER_DIRECTED_LATEST.id]);
   });
 
   it("resolves Latest Luna only once the live catalog offers a newer Luna", () => {

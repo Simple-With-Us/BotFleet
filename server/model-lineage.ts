@@ -164,9 +164,6 @@ export function modelNameFor(models: CatalogLike | undefined, id: string): strin
   return models?.options.find((option) => option.id === id)?.label ?? anyLineageLabel(id) ?? id;
 }
 
-function slotFor(index: number): string {
-  return index < 0 ? "primary" : `fallback ${index + 1}`;
-}
 
 function rawLatest(raw: unknown): { present: boolean; value: unknown } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { present: false, value: undefined };
@@ -184,6 +181,22 @@ function rawFallback(raw: unknown, index: number): unknown {
 function chainEntries(selection: ModelSelection | undefined): ModelSelection[] {
   if (!selection) return [];
   return [selection, ...(selection.fallbacks ?? [])];
+}
+
+/** Every entry of the chain, nested descendants included, depth first, each
+ *  with its slot name ("primary", "fallback 1", "fallback 1.2"). */
+function walkChain(selection: ModelSelection | undefined): Array<{ entry: ModelSelection; slot: string }> {
+  if (!selection) return [];
+  const out: Array<{ entry: ModelSelection; slot: string }> = [{ entry: selection, slot: "primary" }];
+  const visit = (node: ModelSelection, path: string) => {
+    (node.fallbacks ?? []).forEach((fallback, index) => {
+      const name = path ? `${path}.${index + 1}` : String(index + 1);
+      out.push({ entry: fallback, slot: `fallback ${name}` });
+      visit(fallback, name);
+    });
+  };
+  visit(selection, "");
+  return out;
 }
 
 function sameTarget(a: ModelSelection, b: ModelSelection): boolean {
@@ -257,10 +270,8 @@ export function checkLineageWrite(
   const incoming: ModelSelection = { ...carried[0]! };
   delete incoming.fallbacks;
   if (selection.fallbacks) incoming.fallbacks = carried.slice(1);
-  const entries = chainEntries(incoming);
-  const unclaimed = [...saved];
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i]!;
+  const unclaimed = walkChain(current).map((item) => item.entry);
+  for (const { entry, slot } of walkChain(incoming)) {
     const driverKind = contextFor(entry.instanceId)?.driverKind;
     const retired = retiredModel(driverKind, entry.model);
     if (!retired || retired.successorClass !== null) continue;
@@ -271,7 +282,7 @@ export function checkLineageWrite(
     else {
       return {
         ok: false,
-        error: `retired model "${entry.model}" in ${slotFor(i - 1)} — choose another model`,
+        error: `retired model "${entry.model}" in ${slot} — choose another model`,
       };
     }
   }

@@ -6149,7 +6149,12 @@ async function runGroupMemberTurn(
     return true;
   }
   if (!turnSelection) reconcileModelLineage({ botIds: [bot.id] });
-  const selection = turnSelection ?? bot.modelSelection;
+  // A per-turn override (a fallback or retry pick, possibly queued earlier)
+  // goes through the same lineage reconciliation startTurn gives the 1:1 lane,
+  // so a retired or superseded id is never dispatched or recorded.
+  const selection = turnSelection
+    ? reconcileEntry(turnSelection, lineageContextForInstance(turnSelection.instanceId)).entry
+    : bot.modelSelection;
   if (turnExternalCredentialPending(bot, selection.instanceId)) {
     const queued = queueRoomRound(
       { groupId: group.id, threadId, botId: bot.id, hop, cardContinuation, turnSelection },

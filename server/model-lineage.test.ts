@@ -188,6 +188,16 @@ describe("checkLineageWrite", () => {
     expect(result).toEqual({ ok: false, error: 'retired model "grok-3-mini" in fallback 2 — choose another model' });
   });
 
+  it("refuses a newly introduced retired id nested below a fallback, and grandfathers a saved one", () => {
+    const nested: ModelSelection = {
+      instanceId: "claude",
+      model: "claude-sonnet-5-5",
+      fallbacks: [{ instanceId: "codex", model: "gpt-5.5", fallbacks: [{ instanceId: "grokApi", model: "grok-3-mini" }] }],
+    };
+    expect(write(nested)).toEqual({ ok: false, error: 'retired model "grok-3-mini" in fallback 1.1 — choose another model' });
+    expect(write({ ...nested, model: "claude-opus-5-5" }, nested).ok).toBe(true);
+  });
+
   it("lets a saved retired leftover through so another slot can still be edited", () => {
     const saved: ModelSelection = {
       instanceId: "claude",
