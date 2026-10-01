@@ -1040,7 +1040,12 @@ function dispatchHoldFor(
       minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
     });
     if (decision.blocked) {
-      console.warn(`[spend] refusing unattended work: ${decision.reason}`);
+      // Logged only when `count` is set, i.e. at the gate that actually
+      // refuses a dispatch.  The scheduler asks the same question twice per run
+      // per tick — once through canStart, once for the reason — so logging in
+      // both places wrote two warnings per run every ten seconds and flooded
+      // the log under a sustained ceiling.
+      if (opts.count) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
       return { reason: decision.reason };
     }
   }
