@@ -430,7 +430,13 @@ function handle(msg: any) {
       if (mode === "set-model-invalid-params" && msg.method === "session/set_model") {
         // an agent whose ACP model namespace does not contain the id it was
         // sent — Cursor's answer when handed an argv slug like `auto`.
-        return out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Invalid params" } });
+        // The reason rides in `data`, as grok 1.0.46 sends it for a model its
+        // account is not served ("unknown model id").
+        return out({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32602, message: "Invalid params", data: "unknown model id" },
+        });
       }
       const settingId = msg.method === "session/set_mode" ? "modeId" : "modelId";
       if (typeof msg.params?.sessionId !== "string" || typeof msg.params?.[settingId] !== "string") {

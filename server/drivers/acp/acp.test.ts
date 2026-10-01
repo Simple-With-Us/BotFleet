@@ -15,6 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
+import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
@@ -784,15 +786,37 @@ describe("ACP turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-grok-composer", text: "go", model: "composer-2.5" });
     const done = await recorder.until((e) => e.type === "turn.completed");
 
-    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    // The turn settles with the structural rejection stop reason, which is
+    // what lets the fallback walk mark this model rejected (model-rejections.ts)
+    // instead of spawning the CLI again on every turn.
+    expect(done).toMatchObject({ ok: false, stopReason: MODEL_REJECTED_STOP_REASON });
     const err = recorder.events.filter((e) => e.type === "runtime.error");
     expect(err).toHaveLength(1);
     const message = err[0]!.message as string;
     expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
-    expect(message).toContain("Invalid params");
+    // The reason rides in the RPC error's `data`; core.ts keeps it off the
+    // Error message, so the driver has to fold it back in.
+    expect(message).toContain("via session/set_model: Invalid params: unknown model id.");
+    expect(classifyError(new Error(message))).toEqual({ transient: false, reason: "unknown_model" });
     expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
     expect(message).toContain("`grok models`");
     expect(message).not.toContain("1.0.6");
+  });
+
+  it("grok does not mark a model rejected when set_model fails for another reason", async () => {
+    // An agent that predates session/set_model answers -32601 "method not
+    // found".  That is no verdict on the model id, so the turn keeps the
+    // generic rpc_error stop reason and the model is not hidden for hours.
+    process.env.FAKE_ACP_MODE = "no-session-config";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-old-cli", text: "go", model: "grok-4.7" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    const message = recorder.events.find((e) => e.type === "runtime.error")!.message as string;
+    expect(message).toContain('Grok rejected model "grok-4.7" via session/set_model');
+    expect(message).toContain("method not found");
   });
 
   it("droid takes model and autonomy over the wire, never through argv", async () => {

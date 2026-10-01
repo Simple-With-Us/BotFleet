@@ -377,6 +377,20 @@ class AcpPromptIdleError extends Error {
   }
 }
 
+/** The agent refused a session setting because it does not serve the model
+ *  id: the turn settles `unknown_model`, the structural stop reason that
+ *  model-fallback.ts reads (MODEL_REJECTED_STOP_REASON) to mark the
+ *  (bot, engine, model) rejected, so later turns and fail-overs skip it
+ *  instead of spawning the CLI to hear the same answer.  A harness opts in by
+ *  throwing this from `configureSession`, and only for a real refusal: a
+ *  timeout or a crash is not a verdict on the model. */
+export class AcpModelRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AcpModelRejectedError";
+  }
+}
+
 class AcpResumeError extends Error {
   constructor(options?: { cause?: unknown }) {
     super(
@@ -1666,11 +1680,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   ? "auth_required"
                   : e instanceof AcpResumeError
                     ? "resume_failed"
-                    : promptTimedOut
-                      ? "prompt_timeout"
-                      : promptWentIdle
-                        ? "prompt_stall"
-                        : "rpc_error",
+                    : e instanceof AcpModelRejectedError
+                      ? "unknown_model"
+                      : promptTimedOut
+                        ? "prompt_timeout"
+                        : promptWentIdle
+                          ? "prompt_stall"
+                          : "rpc_error",
               );
             }
           }
