@@ -72,8 +72,8 @@ describe("VoiceSettings", () => {
       })
     );
 
-    expect(html).toContain("Voice Summary (DeepSeek V4.1 Flash)");
-    expect(html).toContain("View Benchmark Findings");
+    expect(html).toContain("Voice Summary");
+    expect(html).toContain("Benchmark Findings");
     expect(html).toContain("On-Demand");
     expect(html).toContain("All Messages");
     expect(html).toContain("Off");

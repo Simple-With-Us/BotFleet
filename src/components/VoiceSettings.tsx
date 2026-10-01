@@ -9,7 +9,7 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
 import { cn } from "@/lib/cn";
-import { TtsBenchmarkModal } from "./TtsBenchmarkModal";
+import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
 const MINIMAX_KEY_URL = "https://platform.minimax.io/user/basic-information/interface-key";
@@ -29,7 +29,6 @@ export function VoiceSettings({
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
-  const [benchmarkModalOpen, setBenchmarkModalOpen] = useState(false);
 
   // ── custom voice identifier state ───────────────────────────────────
   const [customOpen, setCustomOpen] = useState(false);
@@ -469,7 +468,7 @@ export function VoiceSettings({
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Speech to Text</div>
         <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.  Recordings sent from iPhone keep the original audio and transcript on their message.</p>
-        <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured.  Siri and iOS 27 speech features still need device testing.</p>
+        <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured.</p>
       </div>
 
       {/* ── Play Replies On ── */}
@@ -489,26 +488,32 @@ export function VoiceSettings({
         </div>
       </div>
 
-      {/* ── Per-Bot Voice Summary Mode (DeepSeek V4.1 Flash) ── */}
+      {/* ── Per-Bot Voice Summary Mode ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2">
-              <span className="text-[13px] font-medium text-ink">Voice Summary (DeepSeek V4.1 Flash)</span>
-              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">Default</span>
-            </div>
+            <div className="text-[13px] font-medium text-ink">Voice Summary</div>
             <p className="mt-1 text-[11.5px] text-ink-secondary">
-              Condenses code, links, and markdown into a conversational 1–2 sentence verbal update before synthesis with MiniMax.
+              Condenses code, links, and markdown into a conversational verbal update before synthesis with MiniMax.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => setBenchmarkModalOpen(true)}
+          <a
+            href="https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => {
+              if (window.ogb?.openExternal) {
+                e.preventDefault();
+                void window.ogb.openExternal(
+                  "https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
+                );
+              }
+            }}
             className="flex shrink-0 items-center gap-1 rounded-md border border-hairline px-2.5 py-1 text-[11.5px] font-medium text-ink-secondary transition-colors hover:bg-raised hover:text-ink"
           >
-            <span>View Benchmark Findings</span>
+            <span>Benchmark Findings</span>
             <ExternalLink size={12} />
-          </button>
+          </a>
         </div>
 
         {/* 3-way Mode Selector */}
@@ -518,12 +523,12 @@ export function VoiceSettings({
               {
                 id: "on_demand",
                 title: "On-Demand",
-                desc: "Summarize only when playing/speaking (saves tokens)",
+                desc: "Distill only when you play or speak",
               },
               {
                 id: "always",
                 title: "All Messages",
-                desc: "Auto-summarize every response from this bot",
+                desc: "Pre-summarize every response from this bot",
               },
               {
                 id: "off",
@@ -532,8 +537,7 @@ export function VoiceSettings({
               },
             ] as const
           ).map((mode) => {
-            // An unset mode follows the workspace flag the server consults, so the UI never shows On-Demand while the server stays off.
-            const currentMode = bot.voiceSummaryMode ?? (tts.optimizedSummary ? "on_demand" : "off");
+            const currentMode = resolveVoiceSummaryMode(bot);
             const isSelected = currentMode === mode.id;
             return (
               <button
@@ -565,11 +569,6 @@ export function VoiceSettings({
         </div>
       </div>
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
-
-      <TtsBenchmarkModal
-        open={benchmarkModalOpen}
-        onClose={() => setBenchmarkModalOpen(false)}
-      />
     </div>
   );
 }
