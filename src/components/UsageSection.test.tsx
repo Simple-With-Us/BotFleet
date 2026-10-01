@@ -322,6 +322,8 @@ describe("held-engine and redundant-chain payloads", () => {
     expect(doomed[0].consecutiveFailures).toBe(3);
     expect(chains[0].redundant[0].reason).toBe("same-as-primary");
     expect(chains[0].effective).toBeLessThan(chains[0].total);
+  });
+});
 
 describe("hidesIdleUnavailableEngineRow", () => {
   it("keeps a row whose probe just did not answer in time", () => {
