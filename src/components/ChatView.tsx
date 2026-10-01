@@ -48,7 +48,8 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { splitVoiceSummary } from "../../shared/voice-summary";
+import { splitVoiceSummary, stripVoiceSummaryTags } from "../../shared/voice-summary";
+import { useSpeech } from "@/lib/tts/useSpeech";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -253,6 +254,73 @@ function BubbleEditor({
   );
 }
 
+function SpokenSummaryCard({
+  messageId,
+  voiceText,
+  legacyVoice,
+}: {
+  messageId: string;
+  voiceText?: string;
+  legacyVoice?: string;
+}) {
+  const speech = useSpeech();
+  const isMine = speech.messageId === messageId && speech.status === "speaking";
+  const isPreparing = speech.messageId === messageId && speech.status === "preparing";
+  const spokenText = (isMine && speech.caption) || voiceText || legacyVoice || "";
+
+  if (!spokenText && !isMine && !isPreparing) return null;
+
+  const words = spokenText.trim().split(/\s+/).filter(Boolean);
+  const activeWordIdx = isMine ? speech.wordIndex ?? -1 : -1;
+
+  return (
+    <details
+      open={isMine || isPreparing ? true : undefined}
+      className="mt-2 border-t border-hairline/40 pt-2"
+      onClick={(event) => event.stopPropagation()}
+    >
+      <summary className="cursor-pointer text-[12px] font-medium text-ink-secondary hover:text-ink flex items-center gap-1.5 select-none">
+        <span>Spoken Summary</span>
+        {isMine && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-accent font-normal animate-pulse">
+            • Reading aloud
+          </span>
+        )}
+        {isPreparing && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-ink-secondary/70 font-normal">
+            • Preparing audio…
+          </span>
+        )}
+      </summary>
+      <div className="mt-2 text-[13px] leading-relaxed text-ink-secondary">
+        {isMine && words.length > 0 ? (
+          <p className="select-text">
+            {words.map((word, idx) => {
+              const isCurrent = idx === activeWordIdx;
+              const isPast = activeWordIdx >= 0 && idx < activeWordIdx;
+              return (
+                <span
+                  key={idx}
+                  className={cn(
+                    "transition-colors duration-75",
+                    isCurrent && "font-bold text-accent px-0.5 rounded bg-accent/15",
+                    isPast && "text-ink font-medium",
+                    !isCurrent && !isPast && "text-ink-secondary/70",
+                  )}
+                >
+                  {word}{" "}
+                </span>
+              );
+            })}
+          </p>
+        ) : (
+          <ChatMarkdown text={spokenText} />
+        )}
+      </div>
+    </details>
+  );
+}
+
 function Bubble({
   bot,
   message,
@@ -320,10 +388,11 @@ function Bubble({
   };
   const text = message.text ?? "";
   const voiceSections = message.role === "bot" && message.kind === "text" ? splitVoiceSummary(text) : null;
-  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(text) : null;
+  const cleanWritten = message.role === "bot" && message.kind === "text" ? stripVoiceSummaryTags(text) : text;
+  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(cleanWritten) : null;
   const attachedImages = humanTyped ? splitAttachedImages(text) : null;
-  const visibleText = attachedImages?.display ?? text;
-  const copyContent = humanTyped ? visibleText : (toImessageBody ?? text);
+  const visibleText = attachedImages?.display ?? cleanWritten;
+  const copyContent = humanTyped ? visibleText : (toImessageBody ?? cleanWritten);
   const requestId = message.card?.requestId;
   const collapsible =
     humanTyped && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
@@ -617,12 +686,13 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? text} />
-              {voiceSections && (
-                <details className="mt-2 border-t border-hairline/40 pt-2" onClick={(event) => event.stopPropagation()}>
-                  <summary className="cursor-pointer text-[12px] text-ink-secondary">Spoken Summary</summary>
-                  <div className="mt-2 text-[13px] text-ink-secondary"><ChatMarkdown text={voiceSections.voice} /></div>
-                </details>
+              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
+              {message.role === "bot" && (
+                <SpokenSummaryCard
+                  messageId={message.id}
+                  voiceText={message.voiceText}
+                  legacyVoice={voiceSections?.voice}
+                />
               )}
             </MessageBoundary>
           )}

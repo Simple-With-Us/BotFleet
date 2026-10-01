@@ -102,6 +102,7 @@ export interface Message {
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
+  voiceText?: string;
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
@@ -344,6 +345,9 @@ export interface Bot {
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
+   * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
+  voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */

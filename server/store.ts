@@ -124,6 +124,8 @@ export interface Message {
   modelSelection?: { instanceId: string; model: string };
   /** Persisted audio clips for this exact reply, in playback order. */
   audio?: Array<{ path: string; mime: string }>;
+  /** Distilled speech-friendly text generated for TTS synthesis. */
+  voiceText?: string;
   /** Original incoming microphone recording and recognizer output never change. */
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   /** Corrections are annotations, not edits to the audio or original transcript. */
@@ -593,6 +595,9 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
+   * "on_demand" (default/opt-in) runs only on manual speak; "always" runs on every turn. */
+  voiceSummaryMode?: "off" | "on_demand" | "always";
   /** true after an edit/branch-switch rewound the visible conversation:
    * provider sessions still hold the abandoned branch, so the next turn
    * must start fresh (drop cursors) and replay the surviving path. */

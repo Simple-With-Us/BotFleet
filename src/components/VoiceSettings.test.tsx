@@ -63,4 +63,20 @@ describe("VoiceSettings", () => {
     expect(html).toContain("custom-voice-id (Current)");
     expect(html).not.toContain("Apple Personal Voice");
   });
+
+  it("renders voice summary mode options and benchmark findings button", () => {
+    const html = renderToStaticMarkup(
+      createElement(VoiceSettings, {
+        bot: sampleBot("voice-1"),
+        onPatch: () => {},
+      })
+    );
+
+    expect(html).toContain("Voice Summary");
+    expect(html).toContain("Benchmark Findings");
+    expect(html).toContain("On-Demand");
+    expect(html).toContain("All Messages");
+    expect(html).toContain("Off");
+  });
 });
+
