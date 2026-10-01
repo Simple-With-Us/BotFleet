@@ -373,6 +373,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "speakReplies"
         | "speechDevices"
         | "voice"
+        | "voiceSummaryMode"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
