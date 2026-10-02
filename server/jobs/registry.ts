@@ -284,6 +284,9 @@ const FRAME_FINISHED_LIMIT = 20;
  *  or restarting, which a SIGTERM cannot tell apart. */
 export const JOB_STOPPED_REASON = "BotFleet's server stopped";
 
+/** How often finished records are checked for a deleted thread or bot. */
+const FORGET_CHECK_MS = 60_000;
+
 /** Output faster than this is a runaway (`yes`, an error loop), not a log. */
 export const JOB_FLOOD_BYTES_PER_SECOND = 64 * 1024 * 1024;
 
@@ -427,6 +430,8 @@ export class JobRegistry {
   private readonly forgotten = new Set<string>();
   private lastTick: number;
   private lastLogCheck: number;
+  /** When finished records were last checked for a deleted thread or bot. */
+  private lastForgetCheck = Number.NEGATIVE_INFINITY;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private logTimer: ReturnType<typeof setInterval> | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -880,12 +885,15 @@ export class JobRegistry {
     const awake = this.awakeNow();
     const credit = Math.max(0, Math.min(awake - this.lastTick, this.maxTickCreditMs));
     this.lastTick = awake;
+    // Finished records (up to 500) are checked once a minute, not every tick.
+    const checkFinished = awake - this.lastForgetCheck >= FORGET_CHECK_MS;
+    if (checkFinished) this.lastForgetCheck = awake;
     for (const record of this.records.values()) {
       if (this.adoptable.has(record.id)) continue; // adopt() settles these
       if (record.status !== "running") {
         // A finished job whose conversation or bot is gone, deleted by a
         // route that did not stop its jobs itself: drop its output too.
-        if (!isJobActive(record) && this.deps.stopReason?.(this.snapshot(record))?.forget) this.forget([record.id]);
+        if (checkFinished && !isJobActive(record) && this.deps.stopReason?.(this.snapshot(record))?.forget) this.forget([record.id]);
         continue;
       }
       record.awakeMs += credit;

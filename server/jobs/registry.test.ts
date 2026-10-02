@@ -759,7 +759,7 @@ describe("a deleted conversation's jobs", () => {
     await until(() => !alive(stray.pid!));
   });
 
-  it("finished ones are forgotten on the next tick when a route deleted the thread without stopping them", () => {
+  it("finished ones are forgotten within a minute when a route deleted the thread without stopping them", () => {
     const { spawnFn, children } = fakeSpawn();
     let gone = false;
     const h = harness({ spawn: spawnFn, stopReason: () => (gone ? { reason: "its conversation was deleted", forget: true } : null) });
@@ -769,6 +769,10 @@ describe("a deleted conversation's jobs", () => {
     h.registry.tick();
     expect(h.registry.get(done.job.id)).not.toBeNull();
     gone = true;
+    // finished records are checked once a minute, not every tick
+    h.registry.tick();
+    expect(h.registry.get(done.job.id)).not.toBeNull();
+    h.awake.now += 60_000;
     h.registry.tick();
     expect(h.registry.get(done.job.id)).toBeNull();
   });

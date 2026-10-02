@@ -62,9 +62,10 @@ function add(totals: WakeUsageTotals, usage: WakeTurnUsage): void {
   totals.inputTokens += count(usage.inputTokens);
   totals.outputTokens += count(usage.outputTokens);
   totals.cachedInputTokens += count(usage.cachedInputTokens);
-  if (typeof usage.costUsd === "number" && Number.isFinite(usage.costUsd) && usage.costUsd >= 0) {
+  const cost = usage.costUsd ?? null;
+  if (cost !== null && Number.isFinite(cost) && cost >= 0) {
     totals.pricedWakes += 1;
-    totals.costUsd += usage.costUsd;
+    totals.costUsd += cost;
   }
 }
 
