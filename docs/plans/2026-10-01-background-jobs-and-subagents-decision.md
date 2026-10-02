@@ -188,3 +188,12 @@ The owner answered the open questions on Oct 1, 2026.  These rulings override th
 - **(c) Job approval:** a bot set to full-auto (its Auto mode) starts jobs without asking.  Every other bot gets an approval card for every `job_start`, and an abandoned ask counts as a deny.  `job_start` has its own `job:<program>` approval namespace and never inherits bash approvals.
 - **(d) iPhone (P4):** the phone may stop jobs and read job output.
 - **(e) On by default:** jobs are on by default for HTTP-lane bots at P1.
+
+## P1 Implementation Notes
+
+Where P1 settled a detail the design above leaves open, after review on PR #784.
+
+- **Wake turns and Auto mode:** a wake turn is unattended (ruling b), and an unattended turn does not inherit Auto mode.  Ruling (c) is the exception: a full-auto bot's `job_start` is still auto-approved in its own job wake, so it can start the next job.  Every other tool in that turn, and a `job_start` in a turn a webhook, resource alert or text started, still asks.  The destructive, sensitive and cut-summary guards apply throughout.
+- **Updates:** the updater's quiesce no longer stops jobs, because a quiesce can be rolled back.  The restart that follows an update stops them and marks them lost, the same as any shutdown.
+- **Tokens per wake:** each settled wake turn's tokens and cost are totalled apart from other turns, overall and per bot, at `GET /api/jobs/wake-usage`.  That is the measurement the P2 decision on CLI bots waits for.
+- **Boot:** a group whose leader is gone is never signalled by its number.  The sweep stops exactly the processes carrying the lost job's `BOTFLEET_JOB_ID`.
