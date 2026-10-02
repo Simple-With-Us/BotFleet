@@ -36,6 +36,17 @@ const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "testing", 
  * unique 8-char tag so no two tests share a broker socket/pipe name. */
 const COLLISION_THREAD_IDS = ["t-dup-1", "t-dup-2", "t-dup-3", "t-dup-4"];
 
+/** The inputs the permission-path test sends: the keys of Claude's Write,
+ * Edit, NotebookEdit, Bash and Read tools that matter to it. */
+interface FileToolInput {
+  file_path?: string;
+  notebook_path?: string;
+  content?: string;
+  old_string?: string;
+  new_string?: string;
+  command?: string;
+}
+
 /** Connect to a broker socket and resolve once the connection is live. */
 function connectSocket(path: string): Promise<Socket> {
   return new Promise((resolve, reject) => {
@@ -1307,6 +1318,45 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     conn.end();
     await instance.adapter.interruptTurn("t-perm-abc");
     await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("carries the raw path and the turn folder of a file-writing ask, and nothing for any other tool", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "omb-claude-paths-"));
+    try {
+      await create("hang");
+      await instance.adapter.sendTurn({ threadId: "t-perm-paths", text: "go", cwd: folder });
+      await recorder.until((e) => e.type === "session.started");
+      const conn = await connectSocket(permissionSocketPath("t-perm-paths"));
+      const ask = (id: string, tool: string, input: FileToolInput) =>
+        conn.write(JSON.stringify({ t: "ask", id, tool, input }) + "\n");
+
+      // the model's own spelling, `~` and `..` untouched: resolving it is the
+      // server's job, against the filesystem
+      ask("w1", "Write", { file_path: "~/.zshrc", content: "export X=1" });
+      ask("w2", "Edit", { file_path: `${folder}/src/../../outside.txt`, old_string: "a", new_string: "b" });
+      ask("w3", "NotebookEdit", { notebook_path: `${folder}/n.ipynb` });
+      // a file tool with no usable path still says so, instead of saying nothing
+      ask("w4", "Write", { content: "no path at all" });
+      ask("b1", "Bash", { command: "git status" });
+      ask("r1", "Read", { file_path: `${folder}/a.ts` });
+      const opened = async (id: string) => recorder.until((e) => e.type === "request.opened" && e.requestId === id);
+
+      expect(await opened("w1")).toMatchObject({ tool: "Write", paths: ["~/.zshrc"], cwd: folder });
+      expect(await opened("w2")).toMatchObject({ tool: "Edit", paths: [`${folder}/src/../../outside.txt`], cwd: folder });
+      expect(await opened("w3")).toMatchObject({ tool: "NotebookEdit", paths: [`${folder}/n.ipynb`], cwd: folder });
+      expect(await opened("w4")).toMatchObject({ tool: "Write", paths: [], cwd: folder });
+      for (const id of ["b1", "r1"]) {
+        const event = await opened(id);
+        expect(event).toHaveProperty("paths", undefined);
+        expect(event).toHaveProperty("cwd", undefined);
+      }
+
+      conn.end();
+      await instance.adapter.interruptTurn("t-perm-paths");
+      await recorder.until((e) => e.type === "turn.completed");
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
   });
 
   it("answers to unknown or already-resolved asks resolve `unavailable` — typed, never a throw", async () => {

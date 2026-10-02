@@ -202,6 +202,16 @@ export type RuntimeEvent = RuntimeEventBase &
         summary: string;
         choices?: string[];
         approvalScope?: "local-computer" | "disposable-computer";
+        /** The raw path(s) a file-writing tool (Claude's Write and Edit) asked
+         * to touch, exactly as the model spelled them.  The summary is a
+         * clipped JSON of the input, which a path can fall out of; auto mode
+         * resolves these against the filesystem before it approves a write.
+         * Present only for a driver that carries them: an empty list means
+         * the tool named no usable path. */
+        paths?: string[];
+        /** The working folder the engine process runs in, when the turn set
+         * one: the root a carried path is allowed to live under. */
+        cwd?: string;
       }
     | {
         type: "request.resolved";

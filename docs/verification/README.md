@@ -19,6 +19,7 @@ Verification uses these isolated fixtures:
 - [Chat UI](chat-ui.md) — driven headlessly through the real renderer
 - [Routines and webhooks](routines.md) — scheduled task execution and webhook delivery
 - [Approvals and the permission broker](approvals.md) — access control and approval workflows
+- [Auto mode guards](auto-mode-guards.md) — the commands and file writes that stop for a person even in auto mode
 - [iOS companion pairing and stream resume](ios-companion.md) — device pairing and message stream recovery
 - [Packaged server smoke test](packaged-server.md) — server start-up and module resolution
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted

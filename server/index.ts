@@ -12,7 +12,7 @@ import {
 } from "../shared/local-auto-consent.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { extname, join } from "node:path";
@@ -54,6 +54,7 @@ import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJob
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
+import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
 import { resolveStaticFile } from "./static-files.ts";
 import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
@@ -362,6 +363,7 @@ import {
   memorySystemPrompt,
   describeWorkspaceSweep,
   sweepOrphanedWorkspaces,
+  workspaceDir,
 } from "./workspace.ts";
 import {
   readMemoryFile,
@@ -3334,11 +3336,23 @@ bus.subscribe((event: RuntimeEvent) => {
       // broker, while a Codex bot reports a mounted MCP server's tool by its
       // bare name, `job_start` included.  Read now, before anything awaits.
       const ownJobStart = permission && isOwnJobStartRequest(permissionBroker, event);
+      // A file-writing ask carries the model's raw path; where it would really
+      // land is judged here against the turn's folder, the bot's own
+      // workspace and the temp folders, so auto mode never approves a write to
+      // a shell startup file or a launch agent.  /tmp is named beside tmpdir()
+      // because on macOS they are different folders.
+      const fileWrite = permission && asker && event.paths
+        ? checkWriteTargets(event.paths, {
+          roots: [event.cwd, workspaceDir(asker.id), tmpdir(), process.platform === "win32" ? undefined : "/tmp"],
+          dataDir: DATA_DIR,
+        })
+        : undefined;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
           ownJobStart,
           scope: event.approvalScope,
+          fileWrite,
         })
         : null;
       if (verdict?.approve && asker && event.requestId) {
@@ -3442,7 +3456,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // offered as "Always allow" grants.
           allowKey:
             permission
-              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope)
+              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope, { fileWrite })
               : undefined,
           // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
@@ -3451,7 +3465,9 @@ bus.subscribe((event: RuntimeEvent) => {
                 ? "This looked destructive, so auto mode stopped to ask."
                 : verdict?.source === "sensitive-guard"
                   ? "This touched sensitive files or credentials, so auto mode stopped to ask."
-                  : "Approval needed, so auto mode stopped to ask."
+                  : verdict?.source === "system-guard"
+                    ? "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
+                    : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
         },
