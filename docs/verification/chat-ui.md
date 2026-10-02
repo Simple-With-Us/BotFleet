@@ -63,7 +63,7 @@ The composer clears the moment Enter is pressed, so a second Enter cannot send t
 
 ### Setup
 
-`vite preview` proxies `/api` to the local bot server on port 8799.  The spec answers every route with `page.route` and aborts the event stream, so no request leaves the page and a running install is never contacted.  Do not add a spec to this file that lets a route fall through.
+`vite preview` proxies `/api` to the local bot server on port 8799.  The spec answers every route with `page.route`, including the event stream, which it answers with a hello frame and ends, so no request leaves the page and a running install is never contacted.  Do not add a test to `tests/e2e/composer-draft.spec.ts` that lets a route fall through.
 
 ### Steps
 
@@ -88,5 +88,9 @@ A machine with no Playwright browser can run the same spec against the installed
 - A refusal that arrives late keeps what was typed meanwhile, with the failed message first.
 - A refusal that arrives after switching to another bot leaves that bot's box alone, and the text is waiting on coming back.
 - A refusal brings back a pasted-text chip and the quoted reply, and while the server is still thinking both are gone from the composer.
+- Steer Now in a busy room gives the message back when the server refuses it.
+- A room message held for a busy member goes out when the room settles, and is given back if the server refuses it then.
+- A second room message held for a busy member joins the first instead of replacing it, and when the room settles they go out once, as one message.
+- Two held room messages that the server refuses come back together in the box.
 
-Before the fix, five of these seven failed with an empty box.  The two that passed are the controls for an accepted send.
+Before the fix, nine of these eleven failed: the restore cases with an empty box, and the held-message cases with the first message lost.  The two that passed are the controls for an accepted send.
