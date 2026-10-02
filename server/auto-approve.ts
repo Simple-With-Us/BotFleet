@@ -105,12 +105,41 @@ const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "compu
 
 /** Background job tools (jobs P1).  Their grants live in a namespace of their
  *  own, `job:<program>`, so a remembered `Bash:git` never starts a job, and
- *  the owner ruled (2026-10-01, ruling c) that every job start asks unless
- *  the bot is in Auto mode — so a `job:` key is never remembered at all. */
+ *  the owner ruled (2026-10-01, and again 2026-10-02) that every job start
+ *  asks unless the bot is in Auto mode — so a `job:` key is never remembered
+ *  at all. */
 const JOB_TOOLS = new Set(["job_start"]);
 
 export function isJobTool(tool: string): boolean {
   return JOB_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase());
+}
+
+/** The unprefixed name of the harness's own job tool, as its HTTP tool lane
+ *  offers it to a bot (server/tools/registry.ts).  A name alone never makes a
+ *  request the harness's own: a Codex bot reports a third-party MCP tool by
+ *  its bare name too (server/drivers/codex.ts), so `job_start` from a mounted
+ *  server arrives spelled exactly the same.  Whose call it is comes from where
+ *  the request was raised, see `isOwnJobStartRequest`. */
+export function isOwnJobStart(tool: string): boolean {
+  return tool === "job_start";
+}
+
+/** The harness's own `job_start`, decided by ORIGIN: the request is one the
+ *  in-process tool host opened on the permission broker
+ *  (server/tools/approvals.ts, server/tools/host.ts).  That is the only way
+ *  the harness raises a job start in P1, and no engine and no third-party MCP
+ *  server can open a request there.  This, and only this, is the call the
+ *  owner's ruling covers; a tool a mounted server happens to call `job_start`
+ *  keeps every guard that any other MCP tool has.  The MCP lane (jobs P2) has
+ *  its own endpoint and must raise its asks the same way, on the broker, to be
+ *  counted here.  Read it synchronously from the `request.opened` handler: the
+ *  broker registers an ask before it publishes the event, and settles it only
+ *  after the event has been handled. */
+export function isOwnJobStartRequest(
+  broker: { isOpen(threadId: string, requestId: string): boolean },
+  event: { tool: string; threadId: string; requestId?: string },
+): boolean {
+  return isOwnJobStart(event.tool) && Boolean(event.requestId) && broker.isOpen(event.threadId, event.requestId!);
 }
 
 /** The program a job summary (`job: pnpm test`) starts, by the same rule a
@@ -270,13 +299,33 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
-    /** The unattended turn is a background job's wake (or continues one):
-     *  nothing outside BotFleet started it.  Only `job_start` reads it. */
-    jobWake?: boolean;
+    /** The request is the harness's own `job_start`, by origin: the in-process
+     *  tool host opened it on the permission broker (`isOwnJobStartRequest`).
+     *  The tool name alone is not enough, since an engine reports a mounted
+     *  MCP server's tool by its bare name too.  Only the job-start ruling
+     *  reads it. */
+    ownJobStart?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
   },
 ): AutoVerdict {
+  // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
+  // auto never gets an approval card for the harness's own `job_start`.  It
+  // stands ahead of everything below on purpose, so no guard and no kind of
+  // turn can turn it back into a card: not the destructive and sensitive
+  // patterns, not the cut-summary check, and not the unattended block, so a
+  // turn a webhook, a resource alert, a text or a job's own wake started
+  // starts its job too.  The ruling is about this one tool, and "own" is
+  // decided by where the request came from (`context.ownJobStart`), with the
+  // name as a second lock, never by the name alone: a mounted MCP server's
+  // `job_start` reaches here spelled the same on Codex, and it keeps every
+  // guard.  Bash and every other tool keep all of theirs, and a bot that is
+  // not in full auto falls through to the checks below, where a job start is
+  // never granted and a card is the only way in.
+  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+    const key = approvalKey(tool, summary, context.scope);
+    return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
+  }
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
@@ -287,8 +336,11 @@ export function autoVerdict(
   // "nobody granted this" card without knowing both halves.
   const key = approvalKey(tool, summary, context?.scope);
   const jobTool = isJobTool(tool);
-  // A job's whole command is on the card, compound or not (ruling c: Auto
-  // mode starts jobs without asking).  One cut to fit is the exception.
+  // A job's whole command is on the card, compound or not.  One cut to fit
+  // is unseen, so no person is asked to approve it.  (The harness's own
+  // `job_start` never gets here from a full-auto bot, and refuses a command
+  // too long for the card before any card is shown, so this is what keeps a
+  // lookalike tool's cut summary from riding an Auto grant.)
   const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
   const grant =
     destructive || sensitive || unsafeCommand
@@ -302,17 +354,6 @@ export function autoVerdict(
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
-    // Owner ruling (c), 2026-10-01: a bot in Auto mode starts background
-    // jobs without asking.  The ruling answered the decision doc's open
-    // question about exactly this turn — a job's wake, with nobody watching,
-    // that has to start the next job — so the wake turn keeps Auto mode for
-    // `job_start` and nothing else.  The destructive, sensitive and
-    // cut-summary checks above already took `grant` away when they apply,
-    // and a turn some outside event started (a webhook, a resource alert, a
-    // text) is not a job wake and keeps the block below.
-    if (jobTool && context.jobWake && grant?.source === "auto-mode") {
-      return { approve: grant.approve, source: grant.source, rule: grant.rule };
-    }
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
     // else wrote, so it does not inherit that decision — the guard above is a

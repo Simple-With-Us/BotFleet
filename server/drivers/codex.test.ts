@@ -748,6 +748,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ action: "accept", content: {} });
   });
 
+  it("reports a mounted MCP server's job_start by its bare name, so the name alone proves nothing", async () => {
+    // The harness's approval rule for its own job_start therefore comes from
+    // where a request was raised (isOwnJobStartRequest in
+    // server/auto-approve.ts): a request arrives here spelled exactly like
+    // the harness's own.
+    await create({ mode: "mcp-elicitation-job-start" });
+    const dump = join(scratch, "mcp-elicitation-job-start.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-job-start", text: "run the ci job" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "job_start",
+      summary: 'Allow the ci MCP server to run tool "job_start"?',
+    });
+
+    await instance.adapter.respondToRequest("t-mcp-job-start", opened.requestId!, { behavior: "deny" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("leaves an explicitly remote MCP ask unscoped in a mixed-computer turn", async () => {
     await create({ mode: "remote-computer-elicitation" });
     await instance.adapter.sendTurn({
