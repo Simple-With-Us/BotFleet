@@ -1152,9 +1152,9 @@ const jobsEnabled = (ctx: ToolGateContext) => Boolean(ctx.jobs);
 
 /** Longest command text an approval card carries whole.  `job_start` refuses
  *  a longer command before any card is shown (server/tools/jobs.ts), so a
- *  person never clicks Allow on a hidden tail.  Should a summary be cut
- *  anyway, auto-approve refuses to answer for the bot
- *  (server/auto-approve.ts), so the tail cannot ride an Auto grant either. */
+ *  person never clicks Allow on a hidden tail.  That refusal is the whole
+ *  guard: a bot in full auto starts its jobs without a card
+ *  (server/auto-approve.ts), so the length limit holds for it as well. */
 export const JOB_SUMMARY_MAX_CHARS = 2000;
 
 /** A job's command as an approval card shows it: every run of whitespace

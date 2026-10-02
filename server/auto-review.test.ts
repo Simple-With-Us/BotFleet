@@ -26,6 +26,7 @@ describe("shouldReview", () => {
     "local-computer-block",
     "destructive-guard",
     "sensitive-guard",
+    "system-guard",
     "no-grant",
   ];
 

@@ -5,7 +5,8 @@
 // real app-server, it never exits on its own — the driver kills it.
 //
 //   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
-//                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized |
+//                     mcp-elicitation | mcp-elicitation-job-start (a mounted
+//                     server's own `job_start`) | logged-in-stdout | logged-out | unauthorized |
 //                     resume-unauthorized | resume-transient |
 //                     multi-agent (the main thread's spawn_agent call, then a
 //                     helper thread's notifications, turn/completed included,
@@ -249,18 +250,20 @@ process.stdin.on("data", (chunk) => {
           notifyHelper("error", { error: { message: "HELPER ERROR" }, willRetry: false });
           notifyHelper("turn/completed", { turn: { id: "turn-helper", status: "failed", error: { message: "HELPER FAILED" } } });
         }
-        if (mode === "mcp-elicitation" || mode === "remote-computer-elicitation") {
+        if (mode === "mcp-elicitation" || mode === "mcp-elicitation-job-start" || mode === "remote-computer-elicitation") {
           out({
             jsonrpc: "2.0",
             id: 101,
             method: "mcpServer/elicitation/request",
             params: {
-              serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : "agents",
+              serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : mode === "mcp-elicitation-job-start" ? "ci" : "agents",
               mode: "form",
               _meta: { codex_approval_kind: "mcp_tool_call", tool_params: mode === "remote-computer-elicitation" ? { command: "bash -c echo hi" } : {} },
               message: mode === "remote-computer-elicitation"
                 ? 'Allow the computer_shared_vm MCP server to run tool "bash"?'
-                : 'Allow the agents MCP server to run tool "list_bots"?',
+                : mode === "mcp-elicitation-job-start"
+                  ? 'Allow the ci MCP server to run tool "job_start"?'
+                  : 'Allow the agents MCP server to run tool "list_bots"?',
               requestedSchema: { type: "object", properties: {} },
             },
           });

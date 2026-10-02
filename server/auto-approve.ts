@@ -9,6 +9,19 @@
 // it is a "you probably didn't mean to hand THIS one over unattended"
 // backstop for the obvious catastrophes. Real containment is the
 // sandbox and the bot's own computer, not a regex.
+//
+// Three guards stop a request even in auto mode, and outrank any grant:
+//   destructive-guard  the pattern list below, plus the command rows in
+//                      command-guard.ts (git clean, find -delete, pkill ...)
+//   sensitive-guard    keys, credentials and the files that run code later
+//                      (shell startup files, launch agents)
+//   system-guard       a command that changes the computer outside the
+//                      project (launchctl, crontab, global installs), and a
+//                      Write or Edit whose real path leaves the bot's folders
+
+import { z } from "zod";
+
+import { commandRisk, type CommandRisk } from "./command-guard.ts";
 
 const DESTRUCTIVE = [
   /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, // rm -rf, rm -fr, rm -r -f
@@ -40,12 +53,24 @@ const SENSITIVE = [
   /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
   /security\s+find-(generic|internet)-password|\bkeychain\b/i,
   /\bcredentials?\.json\b|\bserviceaccount\b/i,
+  // Files that run code the next time a terminal opens or a user logs in.  A
+  // write here outlives the turn and runs with nobody asking, which is why they
+  // sit beside the keys; a read is carded too, because people export tokens
+  // from these files.  The leading delimiter keeps `webpack.profile.js` and
+  // `.profile-picture.png` out.
+  /(^|[\s/"'=:~])\.(zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|cshrc|tcshrc|kshrc)(?![\w-])/i,
+  /\.config\/fish\/(config\.fish|conf\.d|functions)|(^|[\s/"'])config\.fish(?![\w-])/i,
+  /\.config\/(systemd\/user|autostart)\b/i,
+  /\bLibrary\/Launch(Agents|Daemons)\b/i,
+  /(^|[\s"'=:])\/etc\/(zshrc|zprofile|zshenv|zlogin|bashrc|bash\.bashrc|profile|profile\.d|paths|paths\.d|environment|sudoers|sudoers\.d|crontab|cron\.[a-z]+)\b/i,
+  /\/var\/(at\/tabs|spool\/cron)\b/i,
+  /Start Menu\/Programs\/Startup/i,
   // BotFleet's own state is a credential store too, and it was the one
   // place the list above missed: config.json holds every provider key, and
   // a bot that can `cat` it has the whole fleet.  The data directory is
   // `~/.botfleet` by default, or OMB_DATA_DIR on a test or soak rig — both
   // named here rather than imported, because this file stays free of
-  // imports.  The app-owned workspaces live under that same directory
+  // config imports.  The app-owned workspaces live under that same directory
   // (server/workspace.ts), so they are covered by it.
   /(^|[\s/"'])\.botfleet([/\\]|$|["'\s])/i,
   // The desktop's OS-encrypted credential document (safeStorage), which is
@@ -92,6 +117,76 @@ export function looksDestructive(text: string): boolean {
   return matchFirst(DESTRUCTIVE, text) !== null;
 }
 
+/** The rule that makes `text` sensitive, or null.  A match that only
+ * `looksSensitive` sees (the Windows spelling) still gets a name. */
+function sensitiveRule(text: string): string | null {
+  return looksSensitive(text) ? (matchFirst(SENSITIVE, text) ?? "sensitive-file") : null;
+}
+
+/** The command rows (command-guard.ts) apply to what runs a command: the
+ * shell tools and a background job.  Any other tool's summary is data (a
+ * Write's is the JSON of its input, file content included), and a README
+ * that says "brew install jq" is not a global install. */
+function commandRiskFor(tool: string, summary: string): CommandRisk | null {
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
+  if (JOB_TOOLS.has(bare)) return commandRisk(summary.replace(/^job:\s*/, ""));
+  // the HTTP lane's bash card reads `bash: <command>`
+  if (bare === "bash") return commandRisk(summary.replace(/^bash:\s+/, ""));
+  return COMMAND_TOOLS.has(bare) ? commandRisk(summary) : null;
+}
+
+/** Where a file-writing ask would really land, as decided by
+ * server/path-containment.ts from the raw path the driver carried. */
+export interface FileWriteCheck {
+  /** every path stays inside the turn folder, the bot's workspace or temp */
+  contained: boolean;
+  /** why it is not contained, for the decision log */
+  why?: string;
+  /** the physical locations the write would land on, symlinks resolved */
+  real: readonly string[];
+}
+
+const FILE_PATH_KEYS = new Set(["file_path", "notebook_path"]);
+const FILE_WRITE_TOOLS = new Set(["write", "edit", "multiedit", "notebookedit"]);
+const filePath = z.string().min(1);
+
+/** The raw path(s) a Claude file-writing tool asked to touch, or undefined
+ * for any other tool.  A path key that holds anything but a non-empty string
+ * is carried as "" (and a tool with no path key at all as an empty list), which
+ * the path check refuses: nothing that cannot be located is approved. */
+export function fileWritePaths<Input extends object>(tool: string, input: Input | undefined): string[] | undefined {
+  // Strip the MCP namespace first, the way `commandRiskFor` and
+  // `isCoarseApprovalKey` do.  Testing the raw name meant an MCP filesystem
+  // tool (`mcp__fs__write`) matched nothing, returned no path, and so had its
+  // write auto-approved with no containment check at all — the one direction
+  // where skipping the check is not the safe default.
+  const bare = tool.replace(/^mcp__.+?__/, "");
+  if (!FILE_WRITE_TOOLS.has(bare.toLowerCase())) return undefined;
+  const paths: string[] = [];
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (!FILE_PATH_KEYS.has(key)) continue;
+    const parsed = filePath.safeParse(value);
+    paths.push(parsed.success ? parsed.data : "");
+  }
+  return paths;
+}
+
+interface FileGuard {
+  source: "sensitive-guard" | "system-guard";
+  rule: string;
+}
+
+/** What the real location of a file write says: a startup or credential file
+ * even inside a root, or a path that left every root. */
+function fileWriteGuard(check: FileWriteCheck | undefined): FileGuard | null {
+  if (!check) return null;
+  for (const real of check.real) {
+    const rule = sensitiveRule(real);
+    if (rule) return { source: "sensitive-guard", rule };
+  }
+  return check.contained ? null : { source: "system-guard", rule: `file-write:${check.why ?? "outside-roots"}` };
+}
+
 /** The key an "Always allow" remembers.
  *
  * A bare tool name is far too coarse for a command runner: remembering
@@ -105,12 +200,41 @@ const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "compu
 
 /** Background job tools (jobs P1).  Their grants live in a namespace of their
  *  own, `job:<program>`, so a remembered `Bash:git` never starts a job, and
- *  the owner ruled (2026-10-01, ruling c) that every job start asks unless
- *  the bot is in Auto mode — so a `job:` key is never remembered at all. */
+ *  the owner ruled (2026-10-01, and again 2026-10-02) that every job start
+ *  asks unless the bot is in Auto mode — so a `job:` key is never remembered
+ *  at all. */
 const JOB_TOOLS = new Set(["job_start"]);
 
 export function isJobTool(tool: string): boolean {
   return JOB_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase());
+}
+
+/** The unprefixed name of the harness's own job tool, as its HTTP tool lane
+ *  offers it to a bot (server/tools/registry.ts).  A name alone never makes a
+ *  request the harness's own: a Codex bot reports a third-party MCP tool by
+ *  its bare name too (server/drivers/codex.ts), so `job_start` from a mounted
+ *  server arrives spelled exactly the same.  Whose call it is comes from where
+ *  the request was raised, see `isOwnJobStartRequest`. */
+export function isOwnJobStart(tool: string): boolean {
+  return tool === "job_start";
+}
+
+/** The harness's own `job_start`, decided by ORIGIN: the request is one the
+ *  in-process tool host opened on the permission broker
+ *  (server/tools/approvals.ts, server/tools/host.ts).  That is the only way
+ *  the harness raises a job start in P1, and no engine and no third-party MCP
+ *  server can open a request there.  This, and only this, is the call the
+ *  owner's ruling covers; a tool a mounted server happens to call `job_start`
+ *  keeps every guard that any other MCP tool has.  The MCP lane (jobs P2) has
+ *  its own endpoint and must raise its asks the same way, on the broker, to be
+ *  counted here.  Read it synchronously from the `request.opened` handler: the
+ *  broker registers an ask before it publishes the event, and settles it only
+ *  after the event has been handled. */
+export function isOwnJobStartRequest(
+  broker: { isOpen(threadId: string, requestId: string): boolean },
+  event: { tool: string; threadId: string; requestId?: string },
+): boolean {
+  return isOwnJobStart(event.tool) && Boolean(event.requestId) && broker.isOpen(event.threadId, event.requestId!);
 }
 
 /** The program a job summary (`job: pnpm test`) starts, by the same rule a
@@ -151,7 +275,10 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
  * be truncated, or when a shell has more than one operation. This is a
  * temporary fail-closed guard until drivers carry full permission input. */
 function unsafeCommandSummary(tool: string, summary: string): boolean {
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  // The same namespace strip as `commandRiskFor`; `[^_]+` could not span the
+  // underscores in a tool like `mcp__computer_local_vm__bash`, so the name
+  // never matched and this guard quietly did not apply to it.
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
   if (!COMMAND_TOOLS.has(bare)) return false;
   if (summary.length >= 160) return true;
   // Conservative on purpose: shell metacharacters inside quoted strings
@@ -219,12 +346,17 @@ export function offerableApprovalKey(
   tool: string,
   summary: string,
   scope?: "local-computer" | "disposable-computer",
+  context?: { fileWrite?: FileWriteCheck },
 ): string | undefined {
   if (scope === "local-computer") return undefined;
   // every job start asks (ruling c): there is no grant to offer
   if (isJobTool(tool)) return undefined;
   if (looksDestructive(summary) || looksDestructive(tool)) return undefined;
   if (looksSensitive(summary)) return undefined;
+  // a command row or a write outside the bot's folders is never remembered:
+  // the grant would be for the program or the tool, and the next use of it
+  // may be the ordinary one
+  if (commandRiskFor(tool, summary) || fileWriteGuard(context?.fileWrite)) return undefined;
   const key = approvalKey(tool, summary, scope);
   if (coarseAlwaysAllowRefused(key, { scope })) return undefined;
   return key;
@@ -245,6 +377,7 @@ export type AutoVerdictSource =
   | "local-computer-block"
   | "destructive-guard"
   | "sensitive-guard"
+  | "system-guard"
   | "no-grant";
 
 export interface AutoVerdict {
@@ -270,28 +403,65 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
-    /** The unattended turn is a background job's wake (or continues one):
-     *  nothing outside BotFleet started it.  Only `job_start` reads it. */
-    jobWake?: boolean;
+    /** The request is the harness's own `job_start`, by origin: the in-process
+     *  tool host opened it on the permission broker (`isOwnJobStartRequest`).
+     *  The tool name alone is not enough, since an engine reports a mounted
+     *  MCP server's tool by its bare name too.  Only the job-start ruling
+     *  reads it. */
+    ownJobStart?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
+    /** Where a Claude Write or Edit would really land, decided from the raw
+     *  path its driver carried (server/path-containment.ts).  Absent for
+     *  every tool whose driver carries no path; nothing is guessed then. */
+    fileWrite?: FileWriteCheck;
   },
 ): AutoVerdict {
+  // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
+  // auto never gets an approval card for the harness's own `job_start`.  It
+  // stands ahead of everything below on purpose, so no guard and no kind of
+  // turn can turn it back into a card: not the destructive and sensitive
+  // patterns, not the cut-summary check, and not the unattended block, so a
+  // turn a webhook, a resource alert, a text or a job's own wake started
+  // starts its job too.  The ruling is about this one tool, and "own" is
+  // decided by where the request came from (`context.ownJobStart`), with the
+  // name as a second lock, never by the name alone: a mounted MCP server's
+  // `job_start` reaches here spelled the same on Codex, and it keeps every
+  // guard.  Bash and every other tool keep all of theirs, and a bot that is
+  // not in full auto falls through to the checks below, where a job start is
+  // never granted and a card is the only way in.
+  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+    const key = approvalKey(tool, summary, context.scope);
+    return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
+  }
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
-  const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
-  const sensitive = destructive ? null : looksSensitive(summary) ? (matchFirst(SENSITIVE, summary) ?? "sensitive-file") : null;
+  const risk = commandRiskFor(tool, summary);
+  const fileGuard = fileWriteGuard(context?.fileWrite);
+  const destructive =
+    matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool) ?? (risk?.kind === "destructive" ? risk.rule : null);
+  const sensitive = destructive
+    ? null
+    : (sensitiveRule(summary) ?? (fileGuard?.source === "sensitive-guard" ? fileGuard.rule : null));
+  // not destructive and not a credential, but it changes the computer outside
+  // the project, or writes outside the folders the bot works in
+  const systemChange = destructive || sensitive
+    ? null
+    : (risk?.kind === "system" ? risk.rule : null) ?? (fileGuard?.source === "system-guard" ? fileGuard.rule : null);
   // The grant is computed even when a hard block will refuse it: the row
   // worth auditing is "this WOULD have auto-approved, and only the block
   // stood in the way", which cannot be told apart from an ordinary
   // "nobody granted this" card without knowing both halves.
   const key = approvalKey(tool, summary, context?.scope);
   const jobTool = isJobTool(tool);
-  // A job's whole command is on the card, compound or not (ruling c: Auto
-  // mode starts jobs without asking).  One cut to fit is the exception.
+  // A job's whole command is on the card, compound or not.  One cut to fit
+  // is unseen, so no person is asked to approve it.  (The harness's own
+  // `job_start` never gets here from a full-auto bot, and refuses a command
+  // too long for the card before any card is shown, so this is what keeps a
+  // lookalike tool's cut summary from riding an Auto grant.)
   const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
   const grant =
-    destructive || sensitive || unsafeCommand
+    destructive || sensitive || systemChange || unsafeCommand
       ? null
       : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
@@ -300,19 +470,9 @@ export function autoVerdict(
           : null;
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
+  if (systemChange) return { approve: null, source: "system-guard", rule: systemChange };
   if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
-    // Owner ruling (c), 2026-10-01: a bot in Auto mode starts background
-    // jobs without asking.  The ruling answered the decision doc's open
-    // question about exactly this turn — a job's wake, with nobody watching,
-    // that has to start the next job — so the wake turn keeps Auto mode for
-    // `job_start` and nothing else.  The destructive, sensitive and
-    // cut-summary checks above already took `grant` away when they apply,
-    // and a turn some outside event started (a webhook, a resource alert, a
-    // text) is not a job wake and keeps the block below.
-    if (jobTool && context.jobWake && grant?.source === "auto-mode") {
-      return { approve: grant.approve, source: grant.source, rule: grant.rule };
-    }
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
     // else wrote, so it does not inherit that decision — the guard above is a
