@@ -1675,6 +1675,19 @@ const jobWakes = new JobWakeCoordinator({
     await startTurn(botId, prompt, { threadId, automationSource: "job" });
     jobRegistry.markNoticesDelivered(jobIds);
   },
+  // A busy COMMAND-LINE turn is told on the turn it is already in (jobs P2),
+  // never woken: Claude steers mid-turn, and an engine that cannot steer
+  // returns false so the notice rides its next turn's opening reminder
+  // instead.  The HTTP lane has no such hook and keeps parking a busy bot.
+  steerBusyNotice: (botId, threadId, prompt) => {
+    const bot = store.bot(botId);
+    const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
+    const adapter = instance?.adapter;
+    if (instance?.driverKind === "boxAgent") return false;
+    if (!adapter?.steer || adapter.capabilities.queueing !== true) return false;
+    if (providerReloadInProgress) return false;
+    return adapter.steer(threadId, prompt);
+  },
   log: (line) => console.warn(line),
 });
 

@@ -1771,8 +1771,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
             // Jobs matrix: native jobs die when the turn settles, and BotFleet
-            // jobs arrive over MCP in P2.  Named helper rows come in P3.
-            backgroundJobs: "none",
+            // jobs arrive over MCP (jobs P2) through the `agents` mount this
+            // engine already builds in `acpMcpServers`.  Truthful per engine:
+            // an engine that declares no MCP support mounts no job tools, and
+            // says so.  Named helper rows come in P3.
+            backgroundJobs: mountsMcpServers ? "emulated" : "none",
             helpers: "none",
           },
           sendTurn,

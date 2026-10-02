@@ -517,10 +517,22 @@ describe("the background job records", () => {
     for (const name of ["job_output", "job_list", "job_kill"]) expect(harnessTool(name)!.approval).toBeUndefined();
   });
 
-  it("are offered on the HTTP lane only, and only when jobs are mounted", () => {
+  it("are offered on both lanes, and only when jobs are mounted", () => {
     const names = ["job_start", "job_output", "job_list", "job_kill"];
     expect(httpToolDefinitions(gate({ jobs: true })).map((t) => t.name)).toEqual(expect.arrayContaining(names));
     expect(httpToolDefinitions(gate({ jobs: false })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
-    expect(mcpToolDefinitions(gate({ jobs: true })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
+    // jobs P2: the MCP lane mounts them too, on the same single gate.
+    expect(mcpToolDefinitions(gate({ jobs: true })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual(names);
+    expect(mcpToolDefinitions(gate({ jobs: false })).map((t) => t.name).filter((n) => n.startsWith("job_"))).toEqual([]);
+  });
+
+  it("advertises the MCP lane's longer job_output wait, and only there", () => {
+    // jobs P2: 120 s over MCP, 75 s on the HTTP lane, and the deviation says
+    // why in the record rather than only in a comment.
+    const mcp = mcpToolDefinitions(gate({ jobs: true })).find((t) => t.name === "job_output")!;
+    const http = httpToolDefinitions(gate({ jobs: true })).find((t) => t.name === "job_output")!;
+    expect(mcp.description).toContain("at most 120");
+    expect(http.description).toContain("at most 75");
+    expect(harnessTool("job_output")!.wire!.mcp!.reason).toContain("120");
   });
 });
