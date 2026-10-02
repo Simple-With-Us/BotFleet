@@ -27,8 +27,8 @@ describe("wake usage", () => {
     expect(totals.costUsd).toBeCloseTo(0.012);
     expect(totals.byBot["bot-a"]).toMatchObject({ wakes: 2, inputTokens: 2100, pricedWakes: 1 });
     expect(totals.byBot["bot-b"]).toMatchObject({ wakes: 1, outputTokens: 10 });
-    // 0600, and read back by the next run
-    expect(statSync(join(dir, "wake-usage.json")).mode & 0o777).toBe(0o600);
+    // 0600 (Windows has no such mode bits), and read back by the next run
+    if (process.platform !== "win32") expect(statSync(join(dir, "wake-usage.json")).mode & 0o777).toBe(0o600);
     expect(new JobWakeUsage(dir).snapshot()).toEqual(totals);
     // totals only: nothing a turn said is ever kept
     expect(Object.keys(JSON.parse(readFileSync(join(dir, "wake-usage.json"), "utf8"))).sort()).toEqual(

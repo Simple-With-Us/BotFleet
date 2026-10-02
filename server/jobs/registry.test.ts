@@ -4,7 +4,7 @@
 // clock for awake-time deadlines.  Every test works in its own temp folder.
 import { EventEmitter } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -68,6 +68,11 @@ function harness(overrides: Partial<JobRegistryDeps> = {}, dir?: string): Harnes
     graceMs: 300,
     frameDebounceMs: 5,
     listProcesses: async () => [],
+    // The suites that use a fake spawn are about bookkeeping, not about the
+    // host they run on: a registry on Windows refuses every start, so they
+    // would all fail there.  The Windows refusal has its own rows, which
+    // pass `platform: "win32"` themselves.
+    platform: "darwin",
     ...overrides,
   });
   const h = { registry, dir: root, frames, finished, clock, awake, host, settings };
@@ -622,6 +627,80 @@ describe("reads never split a secret", () => {
     expect(second.text).toContain("done\n");
   });
 
+  // A private key a job prints in more than one write, with the bot reading
+  // in between: no read may carry a line of its body, whatever the window.
+  describe("a private key printed in more than one write", () => {
+    const bodyLine = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+    const keyHead = "-----BEGIN PRIVATE KEY-----\n";
+    const keyBody = (lines: number) => `${bodyLine}\n`.repeat(lines);
+    const keyTail = "-----END PRIVATE KEY-----\n";
+
+    it("holds a key that opens the log until its END marker is printed", () => {
+      const { spawnFn } = fakeSpawn();
+      const h = harness({ spawn: spawnFn });
+      const started = start(h, "printer");
+      if (!started.ok) throw new Error(started.error);
+      const log = logOf(h, started.job.id);
+      writeFileSync(log, `${keyHead}${keyBody(5)}`);
+      const first = h.registry.readForModel(started.job.id, 16_384)!;
+      expect(first.text).toBe("");
+      expect(first.held).toBeGreaterThan(0);
+      appendFileSync(log, `${keyBody(5)}${keyTail}done\n`);
+      const second = h.registry.readForModel(started.job.id, 16_384)!;
+      expect(second.text).not.toContain(bodyLine);
+      expect(second.text).toContain("-----END PRIVATE KEY-----");
+      expect(second.text).toContain("done\n");
+    });
+
+    it("never shows the body of a key that follows other output", () => {
+      const { spawnFn } = fakeSpawn();
+      const h = harness({ spawn: spawnFn });
+      const started = start(h, "printer");
+      if (!started.ok) throw new Error(started.error);
+      const log = logOf(h, started.job.id);
+      writeFileSync(log, `building\n${keyHead}${keyBody(5)}`);
+      const reads = [h.registry.readForModel(started.job.id, 16_384)!];
+      expect(reads[0]!.text).toBe("building\n");
+      reads.push(h.registry.readForModel(started.job.id, 16_384)!);
+      appendFileSync(log, `${keyBody(5)}${keyTail}done\n`);
+      reads.push(h.registry.readForModel(started.job.id, 16_384)!);
+      expect(reads.map((read) => read.text).join("")).not.toContain(bodyLine);
+      expect(reads[2]!.text).toContain("done\n");
+    });
+
+    it("masks the rest of a key longer than a read window, read by read", () => {
+      const { spawnFn } = fakeSpawn();
+      const h = harness({ spawn: spawnFn });
+      const started = start(h, "printer");
+      if (!started.ok) throw new Error(started.error);
+      writeFileSync(logOf(h, started.job.id), `${keyHead}${keyBody(20)}${keyTail}done\n`);
+      const texts: string[] = [];
+      for (let i = 0; i < 80; i += 1) {
+        const read = h.registry.readForModel(started.job.id, 200)!;
+        texts.push(read.text);
+        if (read.remaining === 0 && read.held === 0) break;
+      }
+      const all = texts.join("");
+      expect(all).not.toContain(bodyLine.slice(0, 24));
+      expect(all).toContain("done\n");
+    });
+
+    it("masks a view that starts inside a key, which the owner's offset can do", () => {
+      const { spawnFn, children } = fakeSpawn();
+      const h = harness({ spawn: spawnFn });
+      const started = start(h, "printer");
+      if (!started.ok) throw new Error(started.error);
+      writeFileSync(logOf(h, started.job.id), `${keyHead}${keyBody(20)}${keyTail}done\n`);
+      children[0]!.child.emit("exit", 0, null);
+      const inside = Buffer.byteLength(keyHead) + 3 * (bodyLine.length + 1);
+      const view = h.registry.readForOwner(started.job.id, { since: inside, limit: 1_000 })!;
+      expect(view.text).not.toContain(bodyLine.slice(0, 24));
+      const rest = h.registry.readForOwner(started.job.id, { since: inside, limit: 16_384 })!;
+      expect(rest.text).toContain("-----END PRIVATE KEY-----");
+      expect(rest.text).toContain("done\n");
+    });
+  });
+
   it("holds the line a running job is still printing, and says nothing is waiting", () => {
     const { spawnFn, children } = fakeSpawn();
     const h = harness({ spawn: spawnFn });
@@ -648,7 +727,7 @@ describe("reads never split a secret", () => {
   });
 });
 
-describe("the log watch", () => {
+posix("the log watch", () => {
   it("stops a job that prints faster than the flood limit, and holds its log to the cap", async () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn, logMaxBytes: 1000, floodBytesPerSecond: 100_000 });
@@ -678,7 +757,7 @@ describe("the log watch", () => {
   });
 });
 
-describe("before boot finishes", () => {
+posix("before boot finishes", () => {
   it("loads the earlier run's records at once, so a job started before adopt() is saved beside them and never settled by it", async () => {
     const first = harness();
     const forged = {
@@ -735,7 +814,7 @@ describe("refusing before the ask", () => {
   });
 });
 
-describe("a deleted conversation's jobs", () => {
+posix("a deleted conversation's jobs", () => {
   it("are stopped, then forgotten with their logs; a stray of theirs is still swept", async () => {
     const { spawnFn, children } = fakeSpawn();
     const stray = spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });

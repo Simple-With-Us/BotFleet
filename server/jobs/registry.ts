@@ -341,16 +341,51 @@ export function safeReadEnd(buffer: Buffer, length: number, final: boolean, full
   }
   if (end === 0) return 0;
   // A private key cut before its END marker would leave its body bare in the
-  // next read (the PEM pattern anchors on BEGIN).  Hold the block back.
+  // next read (the PEM pattern anchors on BEGIN).  Hold the block back, from
+  // the start of the BEGIN line — also when that is the start of this very
+  // read, which is where the hold-back of an earlier read leaves it.
   const text = buffer.subarray(0, end).toString("latin1");
   let lastBegin = -1;
   for (const match of text.matchAll(PEM_BEGIN)) lastBegin = match.index;
-  if (lastBegin > 0 && !PEM_END.test(text.slice(lastBegin))) {
-    // back to the start of the BEGIN line
-    const lineStart = text.lastIndexOf("\n", lastBegin);
-    return lineStart >= 0 ? lineStart + 1 : lastBegin;
+  if (lastBegin >= 0 && !PEM_END.test(text.slice(lastBegin))) {
+    const lineStart = text.lastIndexOf("\n", lastBegin) + 1;
+    if (lineStart > 0) return lineStart;
+    // The key opens the window.  More is waiting only when the window is
+    // full, and then the key is longer than any real one: the read has to
+    // move on (the next read finds itself inside a key, see `startsInsideKey`).
+    // Otherwise the rest has not been printed yet: wait for it.
+    if (!full) return 0;
   }
   return end;
+}
+
+/** How far back from a read's start to look for the BEGIN marker of a private
+ *  key the read opens inside.  Real keys are a few KB; one that is longer
+ *  than this is not a key worth the extra read. */
+const PEM_LOOKBACK_BYTES = 32 * 1024;
+
+/** Whether the log's bytes just before logical offset `at` leave a private
+ *  key open: a BEGIN marker with no END after it.  A read that starts there
+ *  has the key's body with no marker to anchor the redactor on.  `fd` reads
+ *  the log file, whose first byte is logical offset `dropped`. */
+function startsInsideKey(fd: number, dropped: number, at: number): boolean {
+  const base = Math.max(dropped, at - PEM_LOOKBACK_BYTES);
+  const span = at - base;
+  if (span <= 0) return false;
+  const buffer = Buffer.alloc(span);
+  const read = readSync(fd, buffer, 0, span, base - dropped);
+  const text = buffer.subarray(0, read).toString("latin1");
+  let lastBegin = -1;
+  for (const match of text.matchAll(PEM_BEGIN)) lastBegin = match.index;
+  return lastBegin >= 0 && !PEM_END.test(text.slice(lastBegin));
+}
+
+/** A read that opens inside a private key: what comes before the key's END
+ *  marker is key body, and goes; the rest is redacted as any text is. */
+function redactInsideKey(raw: string): string {
+  if (raw === "") return raw;
+  const end = PEM_END.exec(raw);
+  return `[private key redacted]\n${end ? redactSecretsInText(raw.slice(end.index)) : ""}`;
 }
 
 /** Where a read that starts somewhere arbitrary (the owner's "newest 64 KB",
@@ -716,7 +751,11 @@ export class JobRegistry {
       // then never split a character, a line, or a token
       const cut = safeReadEnd(body, body.length, final, full);
       const usable = final ? cut : utf8Boundary(body, cut);
-      const text = redactSecretsInText(body.subarray(0, usable).toString("utf8"));
+      const raw = body.subarray(0, usable).toString("utf8");
+      // A private key printed in more than one write, or longer than a
+      // window, leaves the next read opening inside it.  Redaction anchors
+      // on the BEGIN marker, so that read has to be told.
+      const text = startsInsideKey(fd, record.droppedBytes, from + start) ? redactInsideKey(raw) : redactSecretsInText(raw);
       return { text, from, to: from + start + usable, end, dropped, full };
     } catch {
       return { text: "", from, to: from, end, dropped, full: false };
