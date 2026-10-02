@@ -394,6 +394,10 @@ import { readSkillFolder } from "./skill-folder.ts";
 import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
+import {
+  ensureContainerComputerSession,
+  localVmSharedBotSession,
+} from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
@@ -2884,6 +2888,14 @@ const localVmLifecycleBusy = new Set<string>();
 // Keyed by thread AND bot: see `releaseLocalVmThread` and `TurnOwnerClaims`.
 const localVmThreadTargets = new TurnOwnerClaims<LocalVmTarget>();
 const localVmActiveThreads = new Map<string, { threadId: string; botId: string }>();
+/** Active lanes per CONTAINER key.
+ *
+ * In shared mode several bots hold distinct lanes on the one shared container,
+ * so the single `localVmActiveThreads` entry per container is gone.  The idle
+ * teardown asks "is anyone still driving THIS container", which is a count
+ * across lanes, not a lookup of one entry — without this, bot A's lane going
+ * idle would let the teardown remove the container bot B is still clicking in. */
+const localVmContainerActiveLanes = new Map<string, number>();
 let localVmImageBusy = false;
 let localVmProvisionBusy = false;
 let localVmModeChangeBusy = false;
@@ -2899,11 +2911,47 @@ function localVmTargetForBot(botId?: string): LocalVmTarget {
   if (cfg.localVm?.mode === "per-bot" && botId) {
     return perBotLocalVmTarget(botId);
   }
+  // Shared mode: one container, one desktop per bot.  `key` stays the shared
+  // container so lifecycle, idle teardown and the viewer keep seeing a single
+  // desktop; the per-bot session is what gives the bot its own display, socket
+  // and screenshot, and the lease lane below is what makes its turn its own.
+  if (botId) {
+    const session = localVmSharedBotSession(botId);
+    return { ...SHARED_LOCAL_VM_TARGET, laneKey: `localvm-bot:${session.short}`, session };
+  }
   return SHARED_LOCAL_VM_TARGET;
 }
 
+/** Lease lane for a target: per-bot in shared mode, the container otherwise. */
+function localVmLaneKey(target: LocalVmTarget): string {
+  return target.laneKey ?? target.key;
+}
+
 function localVmLeaseFor(target: LocalVmTarget): LocalVmLease {
-  return localVmLeases.forTarget(target.key);
+  return localVmLeases.forTarget(localVmLaneKey(target));
+}
+
+/** Mark a lane active or inactive, keeping the per-container count exact so the
+ * idle backstop cannot tear down a container another bot is still using. */
+function setLocalVmLaneActive(
+  target: LocalVmTarget,
+  threadId: string,
+  botId: string,
+  active: boolean,
+): void {
+  const lane = localVmLaneKey(target);
+  const current = localVmActiveThreads.get(lane);
+  if (active) {
+    localVmActiveThreads.set(lane, { threadId, botId });
+  } else if (current && current.threadId === threadId && current.botId === botId) {
+    localVmActiveThreads.delete(lane);
+  } else {
+    return;
+  }
+  const delta = active ? 1 : -1;
+  const next = (localVmContainerActiveLanes.get(target.key) ?? 0) + delta;
+  if (next > 0) localVmContainerActiveLanes.set(target.key, next);
+  else localVmContainerActiveLanes.delete(target.key);
 }
 
 function localVmIdleFor(target: LocalVmTarget): LocalVmIdleTimer {
@@ -2911,7 +2959,10 @@ function localVmIdleFor(target: LocalVmTarget): LocalVmIdleTimer {
   if (idle) return idle;
   idle = new LocalVmIdleTimer(
     LOCAL_VM_IDLE_MS,
-    () => localVmImageBusy || localVmLifecycleBusy.has(target.key) || localVmActiveThreads.has(target.key),
+    () =>
+      localVmImageBusy ||
+      localVmLifecycleBusy.has(target.key) ||
+      (localVmContainerActiveLanes.get(target.key) ?? 0) > 0,
     async () => {
       localVmLifecycleBusy.add(target.key);
       try {
@@ -2968,8 +3019,7 @@ function releaseLocalVmThread(threadId: string, botId?: string): void {
   const target = localVmThreadTargets.release(threadId, owner);
   if (!target) return;
   localVmLeaseFor(target).release(threadId, owner);
-  const active = localVmActiveThreads.get(target.key);
-  if (active && active.threadId === threadId && active.botId === owner) localVmActiveThreads.delete(target.key);
+  setLocalVmLaneActive(target, threadId, owner, false);
 }
 
 /** Claim the Local VM for one turn, or throw the reason it cannot be had.
@@ -2989,7 +3039,7 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
     throw new Error("this Local VM is already being used by another turn — wait for that turn to finish");
   }
   localVmThreadTargets.set(threadId, botId, target);
-  localVmActiveThreads.set(target.key, { threadId, botId });
+  setLocalVmLaneActive(target, threadId, botId, true);
   localVmIdleFor(target).touch();
   let localVm = await containerComputerStatus(undefined, undefined, target);
   try {
@@ -2999,6 +3049,21 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
+  }
+  // The container is up but this bot's desktop may not be: in shared mode each
+  // bot owns its own display + socket, and the first turn for a bot is the one
+  // that has to start it.  Idempotent, so every later turn is a no-op.  The
+  // shared `:1` supervisor desktop is never touched.
+  if (target.session) {
+    try {
+      await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+    } catch (error) {
+      throw new Error(
+        `could not start this bot's shared VM desktop on ${target.session.display}: ${
+          error instanceof Error ? error.message : String(error)
+        } (App Settings → Local VM)`,
+      );
+    }
   }
   return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
 }
