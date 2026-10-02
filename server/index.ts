@@ -12,7 +12,7 @@ import {
 } from "../shared/local-auto-consent.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { extname, join } from "node:path";
@@ -54,6 +54,7 @@ import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJob
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
+import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
 import { resolveStaticFile } from "./static-files.ts";
 import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
@@ -64,7 +65,8 @@ import { initializeHarnessOwnership, harnessOwnerProof } from "../electron/harne
 import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
-import { runtimeBuildIdentity, runtimeReadiness } from "./runtime-identity.ts";
+import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
+import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
 import {
   avatarGenerationRequestSchema,
@@ -362,6 +364,7 @@ import {
   memorySystemPrompt,
   describeWorkspaceSweep,
   sweepOrphanedWorkspaces,
+  workspaceDir,
 } from "./workspace.ts";
 import {
   readMemoryFile,
@@ -563,6 +566,18 @@ void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
+// BOTFLEET-2M / Sentry 7768010831: createUpdateControl wires readiness into a
+// 2s status timer. Mid-update harness restart can fire that timer across the
+// top-level awaits below (infisical.preload, registry.load, …) before later
+// module bindings exist. Keep this Map — and the boot gate readiness reads —
+// initialized synchronously before construction so emitIfChanged never walks
+// an uninitialized binding.
+let bootComplete = false;
+/** Room rounds held only so credential restore can drain; counted out of
+ * queuedRooms when allowCredentialQueues is set. Must exist before
+ * createUpdateControl: currentRuntimeReadiness for-of's it on the status path. */
+const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
+
 // "Is there a newer BotFleet, and install it" — asked from this Mac or from
 // a paired phone.  The updater it starts stops this harness partway through,
 // so it can never be our child: it is launched detached and reports through
@@ -610,10 +625,9 @@ const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
 let activeUpdateAdmissions = 0;
 const cfg = loadConfig();
-// Flipped once, at the end of this file, when everything a secret change
-// might rebuild or re-point exists.  A snapshot that lands before then is
-// applied to `cfg` and nothing more.
-let bootComplete = false;
+// bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
+// once at the end of this file when everything a secret change might rebuild
+// exists; a snapshot that lands before then is applied to `cfg` only.
 // The secret store resolves before anything reads `cfg`.  `loadConfig()` above
 // ran while the snapshot was still empty, so the whole config is read again
 // once the preload lands — that second read is what puts a stored value in
@@ -2452,7 +2466,6 @@ const pendingMemberFallback = new Map<
   // fallback another engine's failure armed.
   { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
 >();
-const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
   threadId: string;
@@ -3334,11 +3347,23 @@ bus.subscribe((event: RuntimeEvent) => {
       // broker, while a Codex bot reports a mounted MCP server's tool by its
       // bare name, `job_start` included.  Read now, before anything awaits.
       const ownJobStart = permission && isOwnJobStartRequest(permissionBroker, event);
+      // A file-writing ask carries the model's raw path; where it would really
+      // land is judged here against the turn's folder, the bot's own
+      // workspace and the temp folders, so auto mode never approves a write to
+      // a shell startup file or a launch agent.  /tmp is named beside tmpdir()
+      // because on macOS they are different folders.
+      const fileWrite = permission && asker && event.paths
+        ? checkWriteTargets(event.paths, {
+          roots: [event.cwd, workspaceDir(asker.id), tmpdir(), process.platform === "win32" ? undefined : "/tmp"],
+          dataDir: DATA_DIR,
+        })
+        : undefined;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
           ownJobStart,
           scope: event.approvalScope,
+          fileWrite,
         })
         : null;
       if (verdict?.approve && asker && event.requestId) {
@@ -3442,7 +3467,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // offered as "Always allow" grants.
           allowKey:
             permission
-              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope)
+              ? offerableApprovalKey(event.tool, event.summary, event.approvalScope, { fileWrite })
               : undefined,
           // in auto mode a card can only mean the guard stopped it — say so accurately
           held:
@@ -3451,7 +3476,9 @@ bus.subscribe((event: RuntimeEvent) => {
                 ? "This looked destructive, so auto mode stopped to ask."
                 : verdict?.source === "sensitive-guard"
                   ? "This touched sensitive files or credentials, so auto mode stopped to ask."
-                  : "Approval needed, so auto mode stopped to ask."
+                  : verdict?.source === "system-guard"
+                    ? "This reaches outside the bot's folders or changes the computer, so auto mode stopped to ask."
+                    : "Approval needed, so auto mode stopped to ask."
               : undefined,
           approvalScope: event.approvalScope,
         },
@@ -4316,6 +4343,10 @@ function drainQueuedSends() {
       excludeMessageIds: excludeIds,
       linqChatId,
       unattended: relayed || undefined,
+      // person-initiated: the person's OWN messages, held only because the
+      // bot was busy.  Draining them is that person asking, so it wakes a
+      // stopped bot — the same as typing them into an idle bot.
+      personInitiated: true,
     }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
@@ -4373,6 +4404,14 @@ async function startTurn(
     modelSelection?: ModelSelection;
     from?: Message["from"];
     comm?: Message["comm"];
+    /**
+     * True only when a PERSON asked for this specific turn.  Every
+     * system-initiated dispatch — update resume, boot recovery, a card
+     * continuation, a job, a routine, a webhook — leaves this false, so a bot
+     * they stopped cannot be re-dispatched behind their back.  See
+     * `server/bot-stop-policy.ts`.
+     */
+    personInitiated?: boolean;
   },
 ) {
   if (runtimeQuiescing) {
@@ -4380,7 +4419,18 @@ async function startTurn(
   }
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
-  if (!opts?.automationSource) {
+  // A stop is a decision about the BOT, not about the turn in flight, so it
+  // is enforced here — the one place every dispatch passes through — rather
+  // than in each caller.  A resume used to clear the stop on its way past
+  // (no `automationSource` on a replayed human prompt) and start the bot.
+  const stopDecision = decideBotStop({
+    stopped: routines?.isBotSnoozed(botId) === true,
+    personInitiated: opts?.personInitiated === true,
+  });
+  if (stopDecision.action === "refuse") {
+    throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
+  }
+  if (stopDecision.clearsStop) {
     routines?.clearBotSnooze(botId);
   }
   if (providerReloadInProgress) {
@@ -6512,6 +6562,15 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
       return;
     }
     if (channelId) finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume");
+    // A deliberate stop is not a resume failure.  Record it as the person
+    // stopping the bot, drop the marker, and do NOT remember a failure — a
+    // remembered one is permanent noise on a thread nobody is trying to run.
+    if (isBotStoppedError(error)) {
+      console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped`);
+      releaseBootResume(bot.id, threadId);
+      store.patchBot(bot.id, { inflightThreadId: undefined });
+      return;
+    }
     console.error(`boot recovery failed for ${bot.name} (${threadId}):`, error);
     // Terminal, and remembered: without this the next boot finds the same
     // marker, dispatches the same doomed turn, and fails the same way — 29
@@ -7555,6 +7614,12 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
     cardContinuation: true,
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
+    // A stopped bot is a decision, not a fault: settle the card quietly rather
+    // than parking it in a retry loop that can never succeed.
+    if (isBotStoppedError(error)) {
+      markConnectorResumeFailed(entry.threadId, entry.resumeKey, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) pendingConnectorResumes.set(`${entry.threadId}:${entry.resumeKey}`, entry);
     else markConnectorResumeFailed(entry.threadId, entry.resumeKey, message);
@@ -7660,6 +7725,12 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
     cardContinuation: true,
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
+    // See the connector resume above: a stopped bot settles the card instead
+    // of retrying forever.
+    if (isBotStoppedError(error)) {
+      markSecretResumeFailed(entry.threadId, entry.messageId, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) {
       pendingSecretResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
@@ -8561,6 +8632,10 @@ function drainCredentialFallbacks(): void {
       modelSelection: entry.selection,
       automationSource: entry.userMessage.automationSource,
       unattended: isUnattended(entry.botId),
+      // person-initiated: the person answered the card, so they are asking
+      // for the turn to continue — the same as retyping it.  A stop set
+      // while the card was open is lifted by that answer, not overridden.
+      personInitiated: true,
     }).catch((error) => {
       if (isExternalCredentialPendingError(error)) pendingCredentialFallback.set(key, entry);
       else console.error(`credential fallback resume failed for ${entry.botId}:`, error);
@@ -8835,9 +8910,16 @@ function isLoopbackAddress(address: string | undefined): boolean {
 }
 
 function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueues = false) {
-  for (const [key, round] of credentialPendingRoomRounds) {
-    if (!hasQueuedRoomRound(round.threadId, round.botId)) credentialPendingRoomRounds.delete(key);
-  }
+  // Status timer / capabilities can run before module init finishes. Other
+  // readiness counters still live below the top-level awaits; refuse Install
+  // until bootComplete rather than throwing on a half-built harness.
+  if (!bootComplete) return runtimeReadiness({ boot: 1 });
+  // Belt: never for-of a non-Map even if this binding is somehow replaced.
+  const pendingRoundCount = sweepMapIfPresent(
+    credentialPendingRoomRounds,
+    (_key: string, round: { threadId: string; botId: string }) =>
+      !hasQueuedRoomRound(round.threadId, round.botId),
+  );
   return runtimeReadiness({
     // Restore routes may exclude only their own still-held HTTP admission.
     // Other requests, including ones still reading a body, remain blockers.
@@ -8846,7 +8928,7 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
     completions: completionFolds.size,
     groupOperations: groupTurnOperations.size,
     queuedSends: queuedMessageCount(),
-    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? credentialPendingRoomRounds.size : 0)),
+    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? pendingRoundCount : 0)),
     delegations: pendingDelegationSnapshot().length,
     connectors: pendingConnectorResumes.size,
     secrets: pendingSecretResumes.size,
@@ -8922,6 +9004,10 @@ async function resumeInterruptedChatTurns(
           threadId: resumeThreadId,
           userMessage: resumePrompt,
           automationSource: resumePrompt.automationSource,
+          // NOT person-initiated, even though the replayed prompt is a
+          // person's message.  The person who wrote it is not asking now; the
+          // system is.  This is the call that used to clear their own stop and
+          // restart the bot they had parked.
           ...(resumePrompt.automationSource === "delegation" ? {
             commsDepth: 1,
             unattended: isUnattended(resumeBot.id),
@@ -8930,6 +9016,12 @@ async function resumeInterruptedChatTurns(
           } : {}),
         });
       } catch (error) {
+        if (isBotStoppedError(error)) {
+          // Their stop outranks our replay.  Say so in the log rather than
+          // retrying: the thread stays put until the person starts the bot.
+          console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped`);
+          continue;
+        }
         // The provider rejected the redispatch before it could emit a
         // terminal event. Consume only this re-armed watch and record it.
         finalizeDelegationWatch(resumeThreadId, false, "", "Delegated turn could not resume");
@@ -8968,6 +9060,39 @@ function rollbackForcedQuiesce(
   resourceTriggers.start();
   infisical.start();
   void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback");
+}
+
+/** How long a forced quiesce waits for interrupted work to actually settle.
+ *
+ * The old fixed `200ms` sleep was the single reason "update failed while bots
+ * were running" was such a common report.  Interrupting a bot asks its
+ * provider subprocess to stop; that subprocess then has to exit, its
+ * `turn.completed` fold has to run, and `busy` has to clear.  A CLI that
+ * takes two seconds to die is normal, and at 200 ms the readiness re-check
+ * still saw `turns: N`, concluded the machine was busy, and ROLLED THE WHOLE
+ * UPDATE BACK — after having already interrupted the bots.  So the update
+ * failed, and the work it had already stopped still had to be resumed by
+ * hand.  Bounded so a genuinely wedged subprocess still refuses promptly
+ * rather than hanging the updater; the refusal path is unchanged, it just
+ * no longer fires on a bot that was on its way out. */
+const QUIESCE_DRAIN_TIMEOUT_MS = 15_000;
+/** Poll interval while draining.  Short enough to feel immediate, long enough
+ * that a large fleet does not spin the readiness scan. */
+const QUIESCE_DRAIN_POLL_MS = 250;
+
+/** Wait for interrupted work to settle, up to the drain timeout.
+ *
+ * Returns as soon as the runtime reports idle.  Deliberately does NOT throw:
+ * the caller re-reads readiness itself and decides, so this only decides how
+ * long to wait, never whether the update may proceed. */
+async function drainAfterInterrupt(): Promise<void> {
+  const deadline = Date.now() + QUIESCE_DRAIN_TIMEOUT_MS;
+  // The first check is immediate: a bot whose fold already ran needs no wait.
+  if (currentRuntimeReadiness().safeToRestart) return;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, QUIESCE_DRAIN_POLL_MS));
+    if (currentRuntimeReadiness().safeToRestart) return;
+  }
 }
 
 async function beginRuntimeQuiesce(force = false) {
@@ -9076,7 +9201,7 @@ async function beginRuntimeQuiesce(force = false) {
       }
     }
 
-    await new Promise((r) => setTimeout(r, 200));
+    await drainAfterInterrupt();
 
     // Report the actual final safety state.  Forcing interrupts the routines
     // and busy bots above, but anything else still counted — a queued send, a
@@ -11733,6 +11858,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           ...(fromImessage ? { automationSource: "imessage" as const } : {}),
           unattended: relaySourced || undefined,
+          // person-initiated: a person sent this.  Relayed or not, someone
+          // typed it on purpose, which is how a stopped bot is meant to be
+          // woken — `interrupt` stops automation, not the owner.
+          personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
       };
@@ -11794,6 +11923,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         replyTo,
         automationSource: message.automationSource,
         unattended: message.role === "system" ? isUnattended(bot.id) : undefined,
+        // person-initiated: a person hitting retry/rewind on a message.
+        personInitiated: true,
       });
       return json(res, 202, { ok: true });
     }

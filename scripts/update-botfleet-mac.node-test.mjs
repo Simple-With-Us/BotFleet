@@ -32,6 +32,7 @@ import {
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
   run,
+  runtimePreflight,
   settledRunOutcome,
   signalProcess,
   stableApplicationProcessError,
@@ -1528,6 +1529,53 @@ test("post-start identity accepts new work while the pre-install readiness gate 
   assert.match(
     authenticatedRuntimeError({ ...runtime, uiHash: "d".repeat(64) }, owner, prepared, { requireIdle: false }),
     /does not match the prepared application build/,
+  );
+});
+
+// A crashed or booted-out harness leaves harness-owner.json behind naming a pid
+// that is gone.  That is a stopped app, not a machine that has never adopted
+// this build, and the refusal has to say so: the old text sent an operator
+// looking for a first-adoption procedure that does not exist for a crash.
+// Skipped on Windows like the other owner-record tests here: assertPrivateRegularFile
+// compares st_uid against process.getuid(), which is undefined there, so it throws
+// before the classification under test is ever reached.
+test("preflight names a stale owner record as a stopped harness, not a first adoption", { skip: process.platform === "win32" ? "Mac updater requires POSIX ownership and modes" : false }, async (t) => {
+  const dead = spawn(process.execPath, ["-e", ""]);
+  const deadPid = dead.pid;
+  await once(dead, "exit");
+
+  const dataDirectory = await mkdtemp(join(tmpdir(), "ubf-stale-owner-"));
+  await chmod(dataDirectory, 0o700);
+  t.after(() => rm(dataDirectory, { recursive: true, force: true }));
+  const record = join(dataDirectory, "harness-owner.json");
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64) }));
+  await chmod(record, 0o600);
+
+  const stale = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(stale.safe, false);
+  assert.match(stale.reason, new RegExp(`harness \\(pid ${deadPid}\\) is not running`));
+  assert.doesNotMatch(stale.reason, /first adoption/);
+  // Descriptive only.  applyPreparedUpdate starts the harness and then polls
+  // it, so this text reaches an operator at a moment when the updater has
+  // already started the app; an imperative would contradict that.
+  assert.doesNotMatch(stale.reason, /start the app/i);
+
+  // With no record at all the genuine first-adoption text still applies, so the
+  // fix narrows the message instead of replacing it.
+  await rm(record);
+  const absent = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(absent.safe, false);
+  assert.match(absent.reason, /first adoption/);
+
+  // A record carrying a field the owner contract does not define is refused
+  // rather than partially believed.  Extra keys used to pass validation and
+  // were then ignored downstream, so nothing was exploitable; refusing them
+  // means a malformed or tampered record cannot be half-honoured.
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64), extra: 1 }));
+  await chmod(record, 0o600);
+  await assert.rejects(
+    () => runtimePreflight({ dataDirectory }, null),
+    /Harness owner record is invalid/,
   );
 });
 
