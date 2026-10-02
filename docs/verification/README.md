@@ -25,6 +25,7 @@ Verification uses these isolated fixtures:
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
+- [Saved data faults](saved-data.md) — unreadable bots, rooms, routines and settings files are set aside, never deleted
 
 ### Test Fixtures
 
@@ -38,6 +39,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Quota fallback:** `server/turn-tools.test.ts` exercises provider failover.
 - **Mac updater:** `scripts/mac-update-transaction.node-test.mjs` simulates signed update delivery.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
+- **Saved data faults:** `server/store-quarantine.test.ts`, `server/routines-quarantine.test.ts`, `server/config-salvage.test.ts` and `server/data-faults-boot.test.ts` cover each store and the real server; `tests/e2e/data-fault-banner.spec.ts` covers the bar.
 
 ## Evidence
 

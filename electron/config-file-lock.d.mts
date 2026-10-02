@@ -12,9 +12,23 @@ export interface ConfigLockOptions {
   timeoutMs?: number;
 }
 
+export interface ConfigFileSetAside {
+  /** The config file that could not be used. */
+  path: string;
+  /** Where it went, or null when another process had already moved it. */
+  setAsidePath: string | null;
+  /** Why it could not be used, safe to log: never a fragment of the file. */
+  reason: string;
+}
+
 export interface UpdateConfigFileOptions extends ConfigLockOptions {
   /** Mode for the written file (default 0o600). */
   mode?: number;
+  /** Epoch milliseconds used to name a set-aside file (default Date.now()). */
+  now?: number;
+  /** Told when an unusable file was renamed aside just before being replaced.
+   * Default: one console.warn line. */
+  onSetAside?: (info: ConfigFileSetAside) => void;
 }
 
 export type ConfigFileObject = Record<string, unknown>;

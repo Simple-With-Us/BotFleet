@@ -650,15 +650,23 @@ export function describeOrphanSweep(result: OrphanSweepResult): string | null {
  * `server.listen`) and then on the same daily cadence as the cap sweep.
  * `getLiveThreadIds` is called fresh on every run, not just once at
  * registration, so a thread created or deleted after boot is still read
- * correctly a day later.  Both timers are unref'd.  Returns the stopper. */
+ * correctly a day later.  Both timers are unref'd.  `opts.hold` returns a reason to skip a run (or
+ * null to go ahead).  Returns the stopper. */
 export function startOrphanTranscriptSweeps(
   dirs: TranscriptDirs,
   getLiveThreadIds: () => Iterable<string>,
   log: (line: string) => void = console.log,
-  opts: { dryRun?: boolean; initialDelayMs?: number } = {},
+  opts: { dryRun?: boolean; initialDelayMs?: number; hold?: () => string | null } = {},
 ): () => void {
   const dryRun = opts.dryRun ?? false;
   const run = () => {
+    // `hold` is asked on every run.  A reason means the roster cannot be trusted to say which threads
+    // still exist (a set-aside bots.json is waiting), so nothing is treated as an orphan.
+    const held = opts.hold?.();
+    if (held) {
+      log(`[retention] orphan transcript sweep skipped: ${held}.`);
+      return;
+    }
     const result = sweepOrphanedTranscripts(dirs, new Set(getLiveThreadIds()), { dryRun });
     const line = describeOrphanSweep(result);
     if (line) log(line);
