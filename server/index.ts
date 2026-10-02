@@ -304,6 +304,7 @@ import {
   unmountCliJobTurn,
   type McpLaneJobDeps,
 } from "./jobs/mcp-lane.ts";
+import { jobLane as jobLaneFor } from "./jobs/engine-lanes.ts";
 import {
   JOB_ID_PATTERN,
   JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP,
@@ -4890,30 +4891,19 @@ async function startTurn(
       // spellings of the same gate would be two chances to disagree.
       const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
       const hasHostComputer = turnComputers.hasHostComputer;
-      // Background jobs (P1): an engine that runs BotFleet's emulated jobs, a
-      // bot that holds This Computer, and jobs not switched off.  One boolean,
-      // handed to the catalog and to the host alike, so a job tool the model
-      // was not offered finds no executor.
-      const jobsForTurn =
-        usesDriverToolLoop &&
-        hasHostComputer &&
-        instance.adapter.capabilities.backgroundJobs === "emulated" &&
-        jobSettings().enabled;
-      // The same gate for the command-line lane (jobs P2), minus the tool-loop
-      // requirement and plus the owner's `jobs.cliLanes` switch.  Kept beside
-      // the one above on purpose: the two lanes differ by where the tools are
-      // mounted, not by what a job may do.
-      const jobsForCliTurn =
-        !usesDriverToolLoop &&
-        hasHostComputer &&
-        instance.adapter.capabilities.backgroundJobs === "emulated" &&
-        jobSettings().enabled &&
-        jobSettings().cliLanes &&
-        instance.adapter.capabilities.agentsMcp === true;
-      // The lane's jobs, whichever lane this is.  The prompt and the mounted
-      // tools must agree: telling a bot about jobs it cannot call is the one
-      // thing the prompt rule forbids.
-      const jobsMounted = jobsForTurn || jobsForCliTurn;
+      // Background jobs.  One derivation for both lanes (server/jobs/
+      // engine-lanes.ts), read once here: the prompt, the mounted tools and
+      // the mounted turn must all be the same answer, and a second copy of
+      // this expression is a second chance for them to disagree.
+      const jobLane = jobLaneFor(instance.adapter.capabilities, jobSettings(), hasHostComputer);
+      const jobsForTurn = jobLane.lane === "http";
+      const jobsForCliTurn = jobLane.lane === "mcp";
+      const jobsMounted = jobLane.lane !== "none";
+      if (!jobsMounted && instance.adapter.capabilities.backgroundJobs === "emulated") {
+        // Only worth a line when an engine that COULD have jobs was refused
+        // one, which is the case a maintainer is looking for.
+        console.warn(`[jobs] no job tools for ${instance.driverKind}: ${jobLane.reason}`);
+      }
 
       // Agent control tools include peer comms and the secure credential
       // request card. A comms-invoked turn (depth ≥ cap) gets none — hard recursion
@@ -4939,7 +4929,7 @@ async function startTurn(
       // settles: a comms token outlives its turn, and without this a token
       // replayed after the turn would find job tools with a stale folder.
       // `cwd` is the same working folder the turn's own tools are confined to.
-      if (jobsMounted && !usesDriverToolLoop) {
+      if (jobsForCliTurn) {
         mountCliJobTurn({
           botId: bot.id,
           threadId,
@@ -5365,7 +5355,7 @@ async function startTurn(
       // re-stamped with it (requirement 6): a CLI-lane job records the turn
       // that made it, the way an HTTP-lane job records its tool runtime's.
       // A remount keeps every other field the harness set at dispatch.
-      if (started.turnId && jobsMounted && !usesDriverToolLoop) {
+      if (started.turnId && jobsForCliTurn) {
         const mounted = readCliJobTurn(bot.id, threadId);
         if (mounted) mountCliJobTurn({ ...mounted, turnId: started.turnId });
       }

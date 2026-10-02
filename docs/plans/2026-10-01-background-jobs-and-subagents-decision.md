@@ -209,3 +209,89 @@ The owner settled two points that P1 had left for confirmation.
 
 - **Full-auto bots never get a job approval card.**  The owner applied ruling (c) literally and rejected the narrowing P1 shipped.  A bot in full auto starts jobs without a card whether or not the command reads as destructive or sensitive, and in a turn a webhook, resource alert or text started as well as in an attended turn or a job's own wake.  Every other bot gets a card for every `job_start`, and an abandoned ask counts as a deny.  Nothing else changes: bash and every other tool keep their guards and the unattended block, a third-party MCP tool that borrows the name `job_start` is not covered, and a `job:` grant is still never remembered.
 - **Jobs run through the updater quiesce fence.**  The owner accepted the deviation from Restart v1 in the P1 notes.  A job keeps running while the fence is up, and the restart that follows an update still stops it and marks it lost.
+
+## P2 Implementation Notes
+
+Where P2 settled a detail the design above leaves open, after review.  P2 mounts
+the job tools for command-line engines over the MCP proxy the fleet already had;
+it did not build a second proxy, and it did not re-decide any of the rulings.
+
+- **The mount is the existing one.**  A command-line engine already receives
+  BotFleet's tools as a stdio MCP server named `agents`, spawned per turn
+  (`agentsIntegration` in `server/index.ts`, spoken by
+  `server/drivers/agents-proxy.ts`).  P2 adds the four job tools to that
+  server's `tools/list` and one hop per tool.  The ACP family builds the same
+  server through `acpMcpServers`, DSH through Clutch's spawn wrapper, and pi
+  through `pi-mcp-extension`, so all of them inherit the mount.
+- **Execution stays in the harness, and there is one implementation of it.**
+  Every job tool call is a request to `/api/internal/jobs`, answered by
+  `server/jobs/mcp-lane.ts` against the P1 registry.  The words a bot reads, the
+  fences, the refusals and the untrusted-output fence are `createJobTools`'s —
+  the same code the HTTP lane runs — not a second copy that can drift.  What
+  differs is where the approval comes from, how long a wait may be, and which
+  turn id a job records.
+- **Ruling (c) reaches this lane by origin, not by name.**  The lane opens its
+  `job_start` ask on the harness's own permission broker, which is what
+  `isOwnJobStartRequest` recognises.  That is the whole mechanism: a full-auto
+  bot's job start is answered inside `request.opened` with no card, in every
+  kind of turn, exactly as on the HTTP lane.  A third-party tool that borrows
+  the name cannot reach the broker and so keeps every guard.  The broker is
+  also the lane's only answerer, which is why the lane's `respondToRequest`
+  story never applies here — the ask is the harness's, not the engine's.
+- **`job_output` waits 120 s over MCP, 75 s on HTTP.**  The clamp is a declared
+  per-surface deviation on the tool record (`wire.mcp`, with its `reason`), not a
+  second number in a driver: an MCP call has no in-process round loop to pay for
+  between rounds, so the wait is all the bot spends, while the HTTP lane's 75 s
+  sits under a 90-second round budget that cannot move.  The advertised schema
+  says which lane it is on, and both numbers are asserted.
+- **Identity is the token, never the model.**  The comms grant names the bot and
+  thread; the bodies run against that binding and against nothing in the model's
+  arguments.  A bot may therefore only read or stop its own jobs.  The mount is
+  taken down on `turn.completed`, because a token outlives the turn that minted
+  it and a replayed one would otherwise find a finished turn's working folder.
+- **Turn ids.**  A CLI-lane job records the engine's turn id, stamped in as soon
+  as `sendTurn` returns it, the way an HTTP-lane job records its tool runtime's.
+- **Busy bots are steered, not woken.**  An idle bot is woken with
+  `automationSource: "job"`, as P1 does.  A busy one is not woken at all: the
+  notice is steered onto the turn already running (Claude, via `steer`), and an
+  engine with no `steer` leaves it queued for its next turn's opening reminder.
+  Either way no wake is scheduled, which is what keeps a busy bot from being
+  woken by a job repeatedly.  The steered text says the job ended while the bot
+  was *working*, not idle, because that is what happened.  The HTTP lane has no
+  such hook and keeps parking a busy bot.
+- **One lane derivation.**  `server/jobs/engine-lanes.ts` decides an engine's
+  lane from flags the drivers already declare plus the owner's settings, and
+  both call sites read it.  `server/jobs/engine-fixtures.ts` is a table of all
+  nineteen shipped engines, and its test asserts the table covers
+  `BUILT_IN_DRIVERS` — so a new engine cannot land without stating its job
+  reach, which is the discipline `computer-capability.fixtures.ts` already keeps
+  for computers after that one drifted.
+- **The owner's switch.**  `jobs.cliLanes` (default on) returns the command-line
+  lane to the HTTP lane alone.  Jobs stay on by default for command-line bots
+  too (ruling e).  Per-wake token accounting is P1's, unchanged, and already
+  covers these wakes.
+- **Unchanged from P1, deliberately.**  The Windows refusal, the per-thread cap,
+  admission, the updater-quiesce fence (ruling c), and kill-on-thread-or-bot-
+  delete are all registry-level and are reached unchanged by this lane.  A
+  command-line job is a process on the same Mac, fenced by the same code.
+- **Codex and the sandbox.**  A Codex job is spawned by the harness, not by
+  Codex, so it is *not* inside the codex sandbox.  The approval card is what
+  stands between a Codex bot and a job, and a full-auto Codex bot is under
+  ruling (c) instead.  The decision doc's "inside the codex sandbox" note is
+  therefore not what ships, and the driver says so where it is read.
+- **Antigravity stays gated (P2b not started).**  Fixture (i) passes: the ask is
+  opened in-process, so a job start blocks until a person answers it, and the
+  engine has no asks of its own to answer it with.  Fixture (ii) does not.  The
+  mount is removed on settle and on abort, but a crash cannot run a returned
+  function, and the only sweep (`cleanStaleAntigravityMcp`) runs inside the
+  driver's own init — so a crashed turn's entry can sit in the user's global
+  `~/.gemini` config pointing at a proxy process that is gone.  Passing it needs
+  an unconditional boot-time sweep and a lease TTL, which is a change to a
+  shared user-wide file rather than a jobs change.  `backgroundJobs` stays
+  `none`, and a test asserts it so the gate cannot be opened by a comment.
+- **pi is supported, on evidence.**  `pi-mcp-extension` is a real MCP client, and
+  the fixture runs the whole chain with no stand-in in the middle: the real
+  extension, driven by a fake pi (the one thing this Mac cannot run), pointed at
+  the real `agents-proxy` with `OMB_JOBS=1`, reaching a stub harness — the
+  model's `agents_job_start` arrives and the harness's words come back.  The
+  driver half is pinned too, so `buildMcpServers` cannot drop the `agents` entry.

@@ -236,3 +236,80 @@ describe("job wakes", () => {
     expect(prompt).toMatch(/idle\.  Read/);
   });
 });
+
+describe("a busy command-line bot is steered, not woken (jobs P2)", () => {
+  function steerSetup(options: { steer?: boolean } = {}) {
+    const steers: Array<{ botId: string; threadId: string; prompt: string }> = [];
+    const t = setup({
+      steerBusyNotice: (botId, threadId, prompt) => {
+        if (options.steer === false) return false;
+        steers.push({ botId, threadId, prompt });
+        return true;
+      },
+    });
+    t.state.busy.add("bot-a");
+    return { ...t, steers };
+  }
+
+  it("steers the notice onto the running turn and spends no wake", async () => {
+    const t = steerSetup();
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    expect(t.steers).toHaveLength(1);
+    expect(t.steers[0]).toMatchObject({ botId: "bot-a", threadId: "thread-a" });
+    // The whole point: no new turn, so nothing for the bot to be woken into.
+    expect(t.wakes).toHaveLength(0);
+    // And the notice left the queue, because the running turn took it.
+    expect(t.queue.get("thread-a") ?? []).toHaveLength(0);
+  });
+
+  it("says the job ended while the bot was working, not while it was idle", async () => {
+    const t = steerSetup();
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    expect(t.steers[0]!.prompt).toMatch(/ended while you were working/);
+    expect(t.steers[0]!.prompt).not.toMatch(/while you were idle/);
+  });
+
+  it("does not schedule a retry, so a busy bot cannot be woken in a loop", async () => {
+    const t = steerSetup();
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    expect(t.wakes).toHaveLength(0);
+    // The parking timer is the loop: none was armed, so there is nothing to
+    // re-fire and no wake to spend on the next settle either.
+    expect(t.timers.filter((timer) => !timer.cleared)).toHaveLength(0);
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(t.wakes).toHaveLength(0);
+    expect(t.steers).toHaveLength(1);
+  });
+
+  it("puts the notice back and parks when the engine cannot steer", async () => {
+    // An engine with no steer (every ACP engine but Claude) leaves the notice
+    // queued for its next turn's opening reminder — which is the same channel
+    // it already used, so nothing is lost.
+    const t = steerSetup({ steer: false });
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    expect(t.steers).toHaveLength(0);
+    expect(t.wakes).toHaveLength(0);
+    expect(t.queue.get("thread-a") ?? []).toHaveLength(1);
+    // Parked, so the settle that ends the turn still finds it waiting.
+    expect(t.timers.some((timer) => timer.ms === 30_000 && !timer.cleared)).toBe(true);
+    t.state.busy.delete("bot-a");
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(t.wakes).toHaveLength(1);
+  });
+
+  it("wakes an IDLE command-line bot as before, rather than steering into nothing", async () => {
+    const t = steerSetup();
+    t.state.busy.delete("bot-a");
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    expect(t.steers).toHaveLength(0);
+    expect(t.wakes).toHaveLength(1);
+    expect(t.wakes[0]!.prompt).toMatch(/while you were idle/);
+  });
+});
