@@ -3335,7 +3335,10 @@ bus.subscribe((event: RuntimeEvent) => {
       // a shell startup file or a launch agent.  /tmp is named beside tmpdir()
       // because on macOS they are different folders.
       const fileWrite = permission && asker && event.paths
-        ? checkWriteTargets(event.paths, { roots: [event.cwd, workspaceDir(asker.id), tmpdir(), "/tmp"], dataDir: DATA_DIR })
+        ? checkWriteTargets(event.paths, {
+          roots: [event.cwd, workspaceDir(asker.id), tmpdir(), process.platform === "win32" ? undefined : "/tmp"],
+          dataDir: DATA_DIR,
+        })
         : undefined;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
