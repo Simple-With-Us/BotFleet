@@ -103,11 +103,19 @@ describe("a server booted over damaged saved data", () => {
     );
 
     portBase = await freePortBlock([0, 1]);
+    // An empty directory rather than a hardcoded "/usr/bin:/bin", which does
+    // not exist on Windows.  The server resolves `git` at startup through
+    // readSourceBuildIdentity, so a PATH naming no such directory there made
+    // the child exit 1 before it ever read the damaged data.  An empty folder
+    // hides engine CLIs the same way on every platform, and the server is
+    // started by absolute path so it does not need one to be found.
+    const emptyBin = join(home, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: ROOT,
       env: {
         // No engine CLI is on this PATH either.
-        PATH: "/usr/bin:/bin",
+        PATH: emptyBin,
         HOME: home,
         USERPROFILE: home,
         OMB_PORT: String(portBase),

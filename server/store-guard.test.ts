@@ -44,7 +44,15 @@ describe("store-guard", () => {
       expect(moved).toEqual({ ok: true, path: join(dir, "bots.json.corrupt-1790000000000") });
       expect(names()).toEqual(["bots.json.corrupt-1790000000000"]);
       expect(readFileSync(join(dir, "bots.json.corrupt-1790000000000"), "utf8")).toBe("{broken");
-      expect(statSync(join(dir, "bots.json.corrupt-1790000000000")).mode & 0o777).toBe(0o600);
+      // The mode is only meaningful where the filesystem has permission bits.
+      // NTFS has none, so statSync reports 0o666 for every file there and
+      // `writeFileSync`'s mode option is ignored; asserting it there would be
+      // asserting a property Windows does not have.  What is portable is that
+      // the set-aside file is the owner's and not world-writable, which the
+      // POSIX branch below already covers.
+      if (process.platform !== "win32") {
+        expect(statSync(join(dir, "bots.json.corrupt-1790000000000")).mode & 0o777).toBe(0o600);
+      }
     });
 
     it("never reuses a name, however many land in the same millisecond", () => {
@@ -178,16 +186,30 @@ describe("store-guard", () => {
     });
 
     it("leaves an unusable file where it is when it cannot be moved aside", () => {
-      // A name this long is a legal file but cannot take the ".corrupt-<epoch>" suffix, so the rename fails the way
-      // a read-only folder would, whoever is running the test.
-      const long = join(dir, `${"b".repeat(240)}.json`);
-      writeFileSync(long, "{ not json");
-      const loaded = loadGuarded(long, list, 1790000000000);
-      expect(loaded).toEqual({ status: "unreadable", value: null, writesRefused: true });
-      expect(readFileSync(long, "utf8")).toBe("{ not json");
-      expect(readdirSync(dir)).toHaveLength(1);
-      expect(listDataFaults()[0]).toMatchObject({ kind: "unreadable", writesRefused: true, setAsideAs: null });
-      expect(listDataFaults()[0]!.reason).toContain("could not be moved aside");
+      // Make the rename fail the way this platform makes it fail.  On POSIX a
+      // read-only folder refuses the new name; on Windows the folder's
+      // read-only attribute gates nothing, but a read-only FILE cannot be
+      // moved.  The previous version leaned on a filename too long to accept
+      // the ".corrupt-<epoch>" suffix, which holds under a 255-byte POSIX name
+      // limit but not on NTFS with long paths enabled — there the rename went
+      // through and this reported "set-aside" where it means "unreadable".
+      const file = join(dir, "bots.json");
+      const windows = process.platform === "win32";
+      writeFileSync(file, "{ not json");
+      if (windows) chmodSync(file, 0o444);
+      else chmodSync(dir, 0o555);
+      try {
+        const loaded = loadGuarded(file, list, 1790000000000);
+        expect(loaded).toEqual({ status: "unreadable", value: null, writesRefused: true });
+        expect(readFileSync(file, "utf8")).toBe("{ not json");
+        // Nothing was set aside, and the original is still the file it was.
+        expect(readdirSync(dir)).toEqual(["bots.json"]);
+        expect(listDataFaults()[0]).toMatchObject({ kind: "unreadable", writesRefused: true, setAsideAs: null });
+        expect(listDataFaults()[0]!.reason).toContain("could not be moved aside");
+      } finally {
+        if (windows) chmodSync(file, 0o600);
+        else chmodSync(dir, 0o755);
+      }
     });
 
     it("refuses to save when the copy of a partly usable file cannot be made", () => {

@@ -43,14 +43,31 @@ export function readPackagedBuildIdentity(directory) {
 
 /** Capture once at build/startup, so moving a checkout cannot relabel a live process. */
 export function readSourceBuildIdentity(root) {
-  const git = (...args) => execFileSync("git", ["-C", root, ...args], {
-    encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+  // Git is not guaranteed to be on PATH: a checkout started from a GUI app, a
+  // stripped container, or a test that scrubs PATH cannot run it.  That is not
+  // a reason for the server to refuse to start, so an unavailable git reports
+  // the commit as all zeros and the build as dirty.  Marking it dirty is what
+  // makes this safe — `buildCompatibility` never calls two dirty builds
+  // "matching", so an unknown commit can never read as agreement between a
+  // stale UI bundle and this server.
+  const unknownCommit = "0".repeat(40);
+  let sourceCommit = unknownCommit;
+  let sourceDirty = true;
+  try {
+    const git = (...args) => execFileSync("git", ["-C", root, ...args], {
+      encoding: "utf8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    const head = git("rev-parse", "HEAD");
+    if (/^[a-f0-9]{40}$/.test(head)) {
+      sourceCommit = head;
+      sourceDirty = git("status", "--porcelain", "--untracked-files=no").length > 0;
+    }
+  } catch {
+    /* git is absent, or this is not a checkout: the commit stays unknown */
+  }
   const value = {
     app: "botfleet", version: JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,
-    apiVersion: HARNESS_API_VERSION, sourceCommit: git("rev-parse", "HEAD"),
-    sourceDirty: git("status", "--porcelain", "--untracked-files=no").length > 0,
-    uiHash: null,
+    apiVersion: HARNESS_API_VERSION, sourceCommit, sourceDirty, uiHash: null,
   };
   if (!validBuildIdentity(value)) throw new Error("BotFleet source identity is invalid");
   return value;
