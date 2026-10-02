@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Attachment } from "./composer-attachments";
 import {
+  foldSentDrafts,
   getDraft,
   getDraftAttachments,
   mergeRestoredDraft,
@@ -98,6 +99,45 @@ describe("mergeRestoredDraft", () => {
       { text: "", attachments: [paste("a"), file("b")] },
     );
     expect(merged.attachments.map((attachment) => attachment.id)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("foldSentDrafts", () => {
+  const sent = (text: string, attachments: Attachment[] = [], reply?: string) => ({
+    draftId: "group:room:thread",
+    threadId: "thread",
+    text,
+    attachments,
+    reply,
+  });
+
+  it("puts the earlier held message first and keeps both texts", () => {
+    const folded = foldSentDrafts(sent("first, held"), sent("second, also held"));
+    expect(folded.text).toBe("first, held\n\nsecond, also held");
+  });
+
+  it("joins the chips of both without repeating one", () => {
+    const folded = foldSentDrafts(sent("a", [paste("p1"), file("f1")]), sent("b", [file("f1"), paste("p2")]));
+    expect(folded.attachments.map((attachment) => attachment.id)).toEqual(["p1", "f1", "p2"]);
+  });
+
+  it("keeps the later reply target, and the earlier one when the later has none", () => {
+    expect(foldSentDrafts(sent("a", [], "old"), sent("b", [], "new")).reply).toBe("new");
+    expect(foldSentDrafts(sent("a", [], "old"), sent("b")).reply).toBe("old");
+    expect(foldSentDrafts(sent("a"), sent("b")).reply).toBeUndefined();
+  });
+
+  it("carries the conversation it was sent from", () => {
+    const folded = foldSentDrafts(sent("a"), sent("b"));
+    expect(folded).toMatchObject({ draftId: "group:room:thread", threadId: "thread" });
+  });
+
+  it("restores as one draft when the held message is refused", () => {
+    const folded = foldSentDrafts(sent("first", [paste("p1")]), sent("second"));
+    expect(mergeRestoredDraft({ text: "", attachments: [] }, folded)).toEqual({
+      text: "first\n\nsecond",
+      attachments: [paste("p1")],
+    });
   });
 });
 

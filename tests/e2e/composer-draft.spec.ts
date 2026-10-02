@@ -284,3 +284,49 @@ test('a room message held for a busy member is given back if the server refuses 
   await expect.poll(() => sends.length).toBe(1);
   await expect(box).toHaveValue('queued behind the member who is talking');
 });
+
+test('a second room message held for a busy member joins the first and goes out once', async ({ page }) => {
+  const sends = await mockServer(page, accept);
+  roomState.busy = true;
+  await openApp(page);
+  const box = await openRoom(page);
+
+  await box.fill('first thought');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  await box.fill('second thought');
+  await box.press('Enter');
+
+  // both are held and nothing has gone out: the second did not replace the first
+  await expect(box).toHaveValue('');
+  const chip = page.getByText('Queued — sends when', { exact: false }).first();
+  await expect(chip).toContainText('first thought');
+  await expect(chip).toContainText('second thought');
+  expect(sends).toHaveLength(0);
+
+  roomState.busy = false;
+  await expect.poll(() => sends.length).toBe(1);
+  expect(sends[0].text).toBe('first thought\n\nsecond thought');
+  // a late look: it was not sent twice, and the box stayed empty
+  await page.waitForTimeout(300);
+  expect(sends).toHaveLength(1);
+  await expect(box).toHaveValue('');
+});
+
+test('two room messages held for a busy member come back together when the server refuses them', async ({ page }) => {
+  const sends = await mockServer(page, refuse);
+  roomState.busy = true;
+  await openApp(page);
+  const box = await openRoom(page);
+
+  await box.fill('first thought');
+  await box.press('Enter');
+  await box.fill('second thought');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  expect(sends).toHaveLength(0);
+
+  roomState.busy = false;
+  await expect.poll(() => sends.length).toBe(1);
+  await expect(box).toHaveValue('first thought\n\nsecond thought');
+});
