@@ -2,7 +2,7 @@
 // id, so switching threads unmounts it and its local text state dies with
 // it. Drafts live in localStorage, so coming back to a bot — in this
 // session or after a restart — finds what you were typing still there.
-import { useCallback, useEffect, useState, type SetStateAction } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type SetStateAction } from "react";
 import { isAttachment, type Attachment } from "./composer-attachments.js";
 
 const KEY = "omb-drafts";
@@ -99,6 +99,60 @@ export function appendDraftAttachments(id: string, newAttachments: Attachment[])
   }
 }
 
+/** What a send took out of the composer: the text and the attachment chips. */
+export interface DraftSnapshot {
+  text: string;
+  attachments: Attachment[];
+}
+
+/** A failed send folded back into the composer as it is now.  The failed text
+ * goes first (it was written first) and anything typed since is kept after
+ * it; chips are joined by id, so a restore never doubles one. */
+export function mergeRestoredDraft(current: DraftSnapshot, sent: DraftSnapshot): DraftSnapshot {
+  const text = !current.text.trim()
+    ? sent.text
+    : !sent.text.trim()
+      ? current.text
+      : `${sent.text.trimEnd()}\n\n${current.text}`;
+  const restored = new Set(sent.attachments.map((attachment) => attachment.id));
+  return {
+    text,
+    attachments: [...sent.attachments, ...current.attachments.filter((attachment) => !restored.has(attachment.id))],
+  };
+}
+
+type LiveRestore = (sent: DraftSnapshot) => void;
+
+// The composers that are on screen right now, by conversation.  An open
+// composer owns the text its person is looking at (storage can be full or
+// blocked and still hold nothing), so a restore goes to it first.
+const liveDrafts = new Map<string, LiveRestore>();
+
+export function registerLiveDraft(id: string, restore: LiveRestore): () => void {
+  liveDrafts.set(id, restore);
+  // a composer that unmounts late must not unregister the one that replaced it
+  return () => {
+    if (liveDrafts.get(id) === restore) liveDrafts.delete(id);
+  };
+}
+
+/** Puts a send the server refused back into conversation `id`'s draft.  The
+ * person may have switched conversations while the send was in flight, so
+ * with no open composer it lands in storage, where coming back finds it. */
+export function restoreDraft(id: string, sent: DraftSnapshot, store: Store = getStore()): void {
+  const live = liveDrafts.get(id);
+  if (live) {
+    live(sent);
+    return;
+  }
+  const merged = mergeRestoredDraft(
+    { text: getDraft(store, id), attachments: getDraftAttachments(store, id) },
+    sent,
+  );
+  setDraft(store, id, merged.text);
+  setDraftAttachments(store, id, merged.attachments);
+}
+
 // Reaching for localStorage is itself a failure point: on an origin with
 // storage blocked the getter throws, and `typeof` doesn't shield it.
 function getStore(): Store {
@@ -155,6 +209,54 @@ export function useComposerDraft(
     return subscribeDraftAttachmentUpdates(id, setAttachmentState);
   }, [id]);
 
+  // A send the server refuses folds back into what is on screen right now.
+  // Registered in a layout effect: a refusal that lands between this render
+  // and a passive effect would write storage behind a draft already read.
+  const onScreen = useRef<DraftSnapshot>({ text, attachments });
+  onScreen.current = { text, attachments };
+  useLayoutEffect(
+    () =>
+      registerLiveDraft(id, (sent) => {
+        const merged = mergeRestoredDraft(onScreen.current, sent);
+        onScreen.current = merged;
+        setText(merged.text);
+        setAttachments(merged.attachments);
+      }),
+    [id, setText, setAttachments],
+  );
+
   return [text, setText, attachments, setAttachments];
+}
+
+/** A send as the composer handed it over: the draft it took, which
+ * conversation it came from, and the message it was a reply to. */
+export interface SentDraft<Reply> extends DraftSnapshot {
+  draftId: string;
+  threadId: string;
+  reply?: Reply;
+}
+
+/** Returns what a composer calls when the server refuses or cannot be reached
+ * for a send: the draft goes back where it was, and the reply target goes back
+ * too unless the person has moved on (another thread, another reply, or the
+ * composer is gone). */
+export function useFailedSendRestore<Reply>(
+  threadId: string,
+  onRestoreReply?: (reply: Reply) => void,
+): (sent: SentDraft<Reply>) => void {
+  const latest = useRef({ threadId, onRestoreReply, mounted: true });
+  latest.current.threadId = threadId;
+  latest.current.onRestoreReply = onRestoreReply;
+  useEffect(() => {
+    latest.current.mounted = true;
+    return () => {
+      latest.current.mounted = false;
+    };
+  }, []);
+  return useCallback((sent) => {
+    restoreDraft(sent.draftId, sent);
+    const now = latest.current;
+    if (sent.reply && now.mounted && now.threadId === sent.threadId) now.onRestoreReply?.(sent.reply);
+  }, []);
 }
 

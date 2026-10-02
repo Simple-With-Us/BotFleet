@@ -1861,6 +1861,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         bot={bot}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />
