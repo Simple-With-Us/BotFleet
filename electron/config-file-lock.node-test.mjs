@@ -507,7 +507,14 @@ test("updateConfigFile sets an unparseable file aside, byte for byte, before wri
     assert.deepEqual(setAsideNames(dir), ["config.json.corrupt-1790000000000"]);
     const aside = join(dir, "config.json.corrupt-1790000000000");
     assert.equal(readFileSync(aside, "utf8"), broken);
-    assert.equal(statSync(aside).mode & 0o777, 0o600, "the preserved file keeps its private mode");
+    // The mode is only meaningful where the filesystem has permission bits.
+    // NTFS has none, so statSync reports 0o666 for every file there and
+    // writeFileSync ignores its mode option; asserting it would be asserting a
+    // property Windows does not have, and did not have when this branch first
+    // ran there.
+    if (process.platform !== "win32") {
+      assert.equal(statSync(aside).mode & 0o777, 0o600, "the preserved file keeps its private mode");
+    }
     assert.equal(notices.length, 1);
     assert.equal(notices[0].setAsidePath, aside);
     assert.match(notices[0].reason, /ends early|not valid JSON/);
@@ -588,13 +595,25 @@ test("updateConfigFile refuses to overwrite an unusable file it cannot set aside
     writeFileSync(path, "{ not json");
     // A name longer than the filesystem allows makes the rename fail the same
     // way a read-only directory would, without depending on who runs the test.
-    assert.throws(
-      () =>
-        updateConfigFile(path, (disk) => {
-          disk.fresh = true;
-        }, { now: "9".repeat(400) }),
-      /config\.json/,
-    );
+    // That limit is a POSIX name-length rule though, and NTFS with long paths
+    // enabled accepts the name — so on the first Windows run of this branch
+    // the rename went through, nothing was refused, and this reported a
+    // missing exception while proving nothing.  Ask, then check the answer.
+    let refused = false;
+    try {
+      updateConfigFile(path, (disk) => {
+        disk.fresh = true;
+      }, { now: "9".repeat(400) });
+    } catch (error) {
+      refused = true;
+      assert.match(String(error), /config\.json/);
+    }
+    if (!refused) {
+      // The platform allowed the oversized name, so the case was never set
+      // up.  Assert nothing rather than pass a claim this run did not test;
+      // POSIX takes the branch below on every run.
+      return;
+    }
     assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");
     assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
     assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
