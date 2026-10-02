@@ -18,39 +18,9 @@
 // and routines.ts all import it, so it must import none of them.
 import { readdirSync } from "node:fs";
 
-export type DataFaultKind =
-  /** The file could not be used.  It was moved aside and the store started without it. */
-  | "set-aside"
-  /** Some entries were unusable.  The whole original was copied aside and the rest kept. */
-  | "partial"
-  /** The file exists but could not be read, or could not be moved aside.  Saves to it are refused. */
-  | "unreadable"
-  /** config.json could not be used at all, so this run is on defaults. */
-  | "config-ignored"
-  /** Some sections of config.json were unusable and left out; the rest were kept. */
-  | "config-partial"
-  /** A set-aside copy from an earlier run is still in the data folder. */
-  | "left-over";
+import type { DataFault, DataFaultKind } from "../shared/data-fault.ts";
 
-export interface DataFault {
-  /** The data file the notice is about, as a base name ("bots.json"). */
-  file: string;
-  kind: DataFaultKind;
-  /** A short phrase that completes "<file> could not be used because ...".  Never file content. */
-  reason: string;
-  /** Base name of the preserved file, when there is one. */
-  setAsideAs: string | null;
-  /** How many entries were left out (kind "partial"). */
-  omitted: number;
-  /** Which config.json sections were left out (kind "config-partial"). */
-  sections: string[];
-  /** True when BotFleet is deliberately not saving to this file. */
-  writesRefused: boolean;
-  /** True when old-data cleanup is paused because of this notice. */
-  holdsCleanup: boolean;
-  /** Epoch milliseconds. */
-  at: number;
-}
+export type { DataFault, DataFaultKind } from "../shared/data-fault.ts";
 
 const faults = new Map<string, DataFault>();
 

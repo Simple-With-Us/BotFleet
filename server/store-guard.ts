@@ -40,10 +40,12 @@ export function fsFailureCode(error: Error): string {
 
 /** Why JSON.parse failed, in words that are safe to log.  The parser's own message quotes the text
  * around the failure, and config.json holds API keys, so only its position is ever used. */
-export function jsonFailureReason(error: Error): string {
+export function jsonFailureReason(error: Error, length?: number): string {
   const message = error.message;
   if (/end of JSON input|unterminated/i.test(message)) return "it ends early (it looks cut short)";
   const at = /position (\d+)/.exec(message)?.[1];
+  // A parser that stops at the very end of the text is looking at a file that was cut off.
+  if (at && length !== undefined && Number(at) >= length) return "it ends early (it looks cut short)";
   return at ? `it is not valid JSON (near character ${at})` : "it is not valid JSON";
 }
 
@@ -82,6 +84,26 @@ export interface GuardedLoad<T> {
   value: T | null;
   /** True when saving to this file would destroy the only copy of something. */
   writesRefused: boolean;
+}
+
+/**
+ * The common reading of a store that is a list of records: it must be a list, and an entry is kept
+ * if `isRecord` accepts it.  An entry that fails is left out and counted; if the list is not empty and
+ * NOTHING in it is usable, the file as a whole is unusable.  The test is deliberately the least the
+ * store needs before its own migrations run (an object with an id, and for rooms a member list), because
+ * a strict schema here would set aside a perfectly good file written by an older build.
+ */
+export function interpretRecordList<T>(
+  parsed: JsonValue,
+  isRecord: (candidate: JsonValue) => candidate is JsonValue & T,
+  noun: { one: string; many: string },
+): Interpreted<T[]> {
+  if (!Array.isArray(parsed)) return { ok: false, reason: `it does not hold a list of ${noun.many}` };
+  const kept = parsed.filter(isRecord);
+  if (parsed.length > 0 && kept.length === 0) {
+    return { ok: false, reason: `none of its ${parsed.length} entries is a usable ${noun.one}` };
+  }
+  return { ok: true, value: kept, omitted: parsed.length - kept.length };
 }
 
 function holdsCleanup(file: string): boolean {
@@ -141,7 +163,7 @@ export function loadGuarded<T>(
   try {
     parsed = parseJson(body);
   } catch (error) {
-    return setAside(jsonFailureReason(error instanceof Error ? error : new Error(String(error))));
+    return setAside(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
   }
 
   const result = interpret(parsed);
