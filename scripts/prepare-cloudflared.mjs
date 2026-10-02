@@ -23,6 +23,14 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  NATIVE_PROBE_ATTEMPTS,
+  NATIVE_PROBE_TIMEOUT_MS,
+  classifyNativeProbe,
+  nativeProbeFailureMessage,
+  probeNativeVersion,
+} from "./native-version-probe.mjs";
+
 /** One slow download beats three fast failures.  Mirrors the timeout,
  * attempt count, and delay `prepare-android-tools.mjs` picked up in PR #446
  * for the same class of incident (the Sep 17 update outage traced to this
@@ -180,84 +188,45 @@ function targetRunsOnHost(target, platform = process.platform, arch = process.ar
  * reported as a version mismatch -- sending the reader after a corrupt
  * download instead of a saturated machine.  Sixty seconds with a single retry
  * keeps the warm path instant and spends patience only where a timeout is
- * actually the answer. */
-export const VERSION_PROBE_TIMEOUT_MS = 60_000;
-export const VERSION_PROBE_ATTEMPTS = 2;
-
-const PROBE_DETAIL_LIMIT = 200;
-
-function oneLine(value, limit = PROBE_DETAIL_LIMIT) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
-}
+ * actually the answer.  The probe itself now lives in `native-version-probe.mjs`
+ * so the CUA driver packaging step cannot reintroduce a smaller copy of the
+ * same bug; these two names stay as the cloudflared-facing spelling. */
+export const VERSION_PROBE_TIMEOUT_MS = NATIVE_PROBE_TIMEOUT_MS;
+export const VERSION_PROBE_ATTEMPTS = NATIVE_PROBE_ATTEMPTS;
 
 /** `spawnSync` reports a timeout as `error.code === "ETIMEDOUT"` with the
  * child killed, so `status` is null and `signal` is set -- none of which the
  * single boolean this replaced could distinguish from a real version
  * mismatch.  Classify the four ways the probe can fail so the thrown message
- * names the cause a person can act on. */
+ * names the cause a person can act on.  The matched version is dropped on
+ * purpose: it is a constant for cloudflared, so returning it would only give
+ * callers a second way to spell the answer already carried by `ok`. */
 export function classifyVersionProbe(result = {}) {
-  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
-  if (result.error) {
-    const message = String(result.error.message ?? result.error);
-    const timedOut = result.error.code === "ETIMEDOUT" || /ETIMEDOUT/i.test(message);
-    return { ok: false, reason: timedOut ? "timeout" : "spawn" };
-  }
-  if (result.status === 0) {
-    return output.includes(CLOUDFLARED_VERSION)
-      ? { ok: true, reason: "version" }
-      : { ok: false, reason: "version" };
-  }
-  if (result.signal) return { ok: false, reason: "signal" };
-  return { ok: false, reason: "status" };
+  const { version, ...classification } = classifyNativeProbe(result, (output) =>
+    output.includes(CLOUDFLARED_VERSION) ? CLOUDFLARED_VERSION : null,
+  );
+  return classification;
 }
 
 /** Ask the staged executable for its version, retrying only a timeout.  A
  * missing or non-executable binary and a non-zero exit are deterministic and
  * would just make the second attempt fail the same way one second later. */
 export function probePinnedVersion(binary, options = {}) {
-  const {
-    spawn = spawnSync,
-    timeoutMs = VERSION_PROBE_TIMEOUT_MS,
-    attempts = VERSION_PROBE_ATTEMPTS,
-    log = console.error,
-  } = options;
-  let last;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const result = spawn(binary, ["version"], {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: timeoutMs,
-    });
-    last = { ...classifyVersionProbe(result), result, attempt, attempts, timeoutMs };
-    if (last.ok) return last;
-    if (last.reason !== "timeout" || attempt === attempts) break;
-    log(
-      `cloudflared version probe timed out after ${Math.round(timeoutMs / 1000)}s — retrying ` +
-        `(attempt ${attempt + 1} of ${attempts})`,
-    );
-  }
-  return last;
+  return probeNativeVersion(binary, {
+    ...options,
+    args: ["version"],
+    matchVersion: (output) => (output.includes(CLOUDFLARED_VERSION) ? CLOUDFLARED_VERSION : null),
+  });
 }
 
 /** The original sentence is kept verbatim so existing logs and board history
  * still match, with the probe's own evidence appended. */
 export function versionProbeFailureMessage(target, probe = {}) {
-  const { result = {}, attempt, attempts, timeoutMs } = probe;
-  const cause = {
-    timeout: () =>
-      `the version probe timed out on attempt ${attempt} of ${attempts} at ${Math.round(timeoutMs / 1000)}s each`,
-    spawn: () => "the executable could not be run",
-    signal: () => `the version probe was killed by ${result.signal}`,
-    status: () => `the version probe exited with status ${result.status}`,
-    version: () => "it ran but did not report the pinned version",
-  }[probe.reason]?.() ?? "the version probe did not complete";
-  const details = [`status=${result.status ?? "null"}`, `signal=${result.signal ?? "none"}`];
-  if (result.error) details.push(`error=${oneLine(result.error.message, 160)}`);
-  const output = oneLine([result.stdout, result.stderr].filter(Boolean).join(" "));
-  if (output) details.push(`output=${output}`);
-  return `${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION} (${cause}; ${details.join("; ")})`;
+  return nativeProbeFailureMessage(
+    `${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION}`,
+    probe,
+    { causes: { version: () => "it ran but did not report the pinned version" } },
+  );
 }
 
 export function verifyCloudflaredExecutable(binary, target, options = {}) {

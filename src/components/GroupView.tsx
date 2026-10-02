@@ -1633,6 +1633,7 @@ export function GroupView({ group }: { group: Group }) {
         locked={setupPending}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
       />
       </div>
       </div>

@@ -178,8 +178,14 @@ describe("summarizeForVoice", () => {
   it("prompt contains expected negative constraints and XML tags", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<core_directive>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<rules_for_spoken_prose>");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<pacing_and_punctuation>");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("NO DASHES");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("NO ELLIPSES");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<#0.3#>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<text_normalization>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("<negative_constraints>");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT read out raw git commit hashes");
+    expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
   });
 });
+

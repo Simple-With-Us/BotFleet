@@ -967,7 +967,16 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string }
+  | {
+      type: "sendGroup";
+      groupId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | {
       type: "patchGroup";
       groupId: string;
@@ -992,7 +1001,16 @@ export type Action =
   | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyToId?: string }
+  | {
+      type: "send";
+      botId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
@@ -2371,7 +2389,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 });
               }
             })
-            .catch(showError);
+            .catch((error) => {
+              showError(error);
+              action.onError?.(error instanceof Error ? error.message : String(error));
+            });
           break;
         }
         case "editMessage":
@@ -2525,7 +2546,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
             body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          }).catch(showError);
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         case "patchGroup": {
           const previous = groupBeforePatch;
