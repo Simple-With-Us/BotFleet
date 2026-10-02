@@ -56,3 +56,37 @@ pnpm test -- src/App.test.ts
 ```
 
 The test uses the repository's test fixtures and does not contact the harness on port 8799.
+
+## Composer Draft Restore
+
+The composer clears the moment Enter is pressed, so a second Enter cannot send the same text twice.  If the server refuses the send, or cannot be reached, the text, the attachment chips and the reply target come back.  Anything typed in the meantime is kept after the restored text.  This recipe proves it in a real browser, with the test answering every `/api` route itself.
+
+### Setup
+
+`vite preview` proxies `/api` to the local bot server on port 8799.  The spec answers every route with `page.route` and aborts the event stream, so no request leaves the page and a running install is never contacted.  Do not add a spec to this file that lets a route fall through.
+
+### Steps
+
+```sh
+# Unit seams: the merge, the restore into a conversation nobody has open,
+# and the store reporting a refused or unreachable send.
+pnpm exec vitest run src/lib/drafts.test.ts src/state/store.send-failure.test.tsx
+
+# Browser behavior, the way CI runs it.
+pnpm exec vite build
+pnpm exec playwright test tests/e2e/composer-draft.spec.ts
+```
+
+A machine with no Playwright browser can run the same spec against the installed Chrome from an untracked config that sets `use: { channel: 'chrome' }` and a `baseURL` for a throwaway `vite` dev server.  Do not commit that config.
+
+### Expected Evidence
+
+- A 400 answer puts the text back in the box.
+- A refused connection puts the text back in the box.
+- A 202 answer leaves the box empty, and a second Enter sends nothing more.
+- A 202 that arrives late does not bring the text back.
+- A refusal that arrives late keeps what was typed meanwhile, with the failed message first.
+- A refusal that arrives after switching to another bot leaves that bot's box alone, and the text is waiting on coming back.
+- A refusal brings back a pasted-text chip and the quoted reply, and while the server is still thinking both are gone from the composer.
+
+Before the fix, five of these seven failed with an empty box.  The two that passed are the controls for an accepted send.
