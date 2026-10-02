@@ -1555,6 +1555,10 @@ test("preflight names a stale owner record as a stopped harness, not a first ado
   assert.equal(stale.safe, false);
   assert.match(stale.reason, new RegExp(`harness \\(pid ${deadPid}\\) is not running`));
   assert.doesNotMatch(stale.reason, /first adoption/);
+  // Descriptive only.  applyPreparedUpdate starts the harness and then polls
+  // it, so this text reaches an operator at a moment when the updater has
+  // already started the app; an imperative would contradict that.
+  assert.doesNotMatch(stale.reason, /start the app/i);
 
   // With no record at all the genuine first-adoption text still applies, so the
   // fix narrows the message instead of replacing it.

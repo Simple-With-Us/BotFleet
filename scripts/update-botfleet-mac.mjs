@@ -750,8 +750,16 @@ async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
   // A record naming a dead pid is a stopped or crashed harness, not an
   // unadopted one.  Say which it is, so the operator restarts the app instead
   // of looking for a first-adoption procedure that does not exist.
+  //
+  // Descriptive only, deliberately.  This reason is shared with
+  // runtimeIdentityPreflight, and applyPreparedUpdate starts the harness and
+  // then polls it, so a dead pid is the expected state on the first poll
+  // before the new one has written its own record.  An imperative here would
+  // tell the operator to start the app at the exact moment the updater had
+  // already started it, and would contradict the caller's own failure text
+  // ("Updated harness did not prove its expected build").
   if (state === "stale") {
-    return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running; start the app and retry` };
+    return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running` };
   }
   if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
