@@ -424,10 +424,11 @@ function stripBom(text) {
  * around it, because config.json holds API keys and the parser's own
  * message quotes the source.  Mirrors jsonFailureReason in
  * server/store-guard.ts, which the packaged app cannot import. */
-function jsonFailureReason(error) {
+function jsonFailureReason(error, length) {
   const message = String(error?.message ?? "");
   if (/end of JSON input|unterminated/i.test(message)) return "it ends early (it looks cut short)";
   const at = /position (\d+)/.exec(message)?.[1];
+  if (at && length !== undefined && Number(at) >= length) return "it ends early (it looks cut short)";
   return at ? `it is not valid JSON (near character ${at})` : "it is not valid JSON";
 }
 
@@ -451,7 +452,7 @@ function inspectConfigFile(configPath) {
   try {
     parsed = JSON.parse(body);
   } catch (error) {
-    return { disk: {}, unusable: jsonFailureReason(error) };
+    return { disk: {}, unusable: jsonFailureReason(error, body.length) };
   }
   if (!isPlainObject(parsed)) return { disk: {}, unusable: "it does not hold a JSON object" };
   return { disk: parsed, unusable: null };

@@ -1180,7 +1180,7 @@ function readStoredConfig(path: string): StoredConfigRead {
   try {
     parsed = parseJson(body);
   } catch (error) {
-    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error))));
+    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error)), body.length));
   }
   try {
     return { config: parseStoredConfig(parsed), problem: null };
