@@ -33,6 +33,11 @@
 //                     file exists — a deterministic busy window for the
 //                     steer-queue e2e, with the echo pinning exactly what a
 //                     drained turn was sent)
+//   FAKE_ACP_COMMANDS  comma-separated command names.  The agent announces
+//                     them in an `available_commands_update` right after
+//                     session/new and session/load, before any prompt, and
+//                     marks the one after session/load as replayed history
+//                     when FAKE_ACP_COMMANDS_REPLAY is set.
 //   FAKE_ACP_DUMP   path to write {argv, env} as JSON, so a test can assert
 //                   argv shape (agent/stdio flags) and env hygiene
 //   FAKE_ACP_MODELS      comma-separated model ids. Enables the opencode-shaped
@@ -88,6 +93,21 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
+
+/** The agent's catalog of slash commands, announced the way ACP agents do:
+ *  a session/update notification, before any prompt. */
+const announceCommands = (replayed: boolean): void => {
+  const names = (process.env.FAKE_ACP_COMMANDS ?? "").split(",").filter(Boolean);
+  if (names.length === 0) return;
+  const sessionId = "fake-acp-session";
+  const update = {
+    sessionUpdate: "available_commands_update",
+    availableCommands: names.map((name) => ({ name, description: `fake ${name}` })),
+  };
+  const params = replayed ? { sessionId, _meta: { isReplay: true }, update } : { sessionId, update };
+  out({ jsonrpc: "2.0", method: "session/update", params });
+};
+
 if (mode === "cancel-exits-with-child") {
   const descendant = spawn(
     process.execPath,
@@ -431,6 +451,7 @@ function handle(msg: any) {
         ...(opts ? { configOptions: opts } : {}),
         ...(mdls ? { models: mdls } : {}),
       });
+      announceCommands(false);
       break;
     }
     case "session/load":
@@ -446,6 +467,7 @@ function handle(msg: any) {
       const opts = configOptions();
       const mdls = sessionModels();
       result(msg.id, { ...(opts ? { configOptions: opts } : {}), ...(mdls ? { models: mdls } : {}) });
+      announceCommands(process.env.FAKE_ACP_COMMANDS_REPLAY === "1");
       break;
     }
     // per-session settings (droid sets model/autonomy here, not via argv).

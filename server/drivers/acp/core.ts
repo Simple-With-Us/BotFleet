@@ -73,6 +73,7 @@ import { augmentedPath } from "../../env-path.ts";
 // packaged server dir entirely. See server/proxy-paths.ts.
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "../engine-commands.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
 import { getBool } from "../../feature-flags.ts";
 
@@ -649,6 +650,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         turnId,
         createdAt: new Date().toISOString(),
       });
+      /** The agent's slash-command catalog (`available_commands_update`), kept
+       *  per instance so the same list is announced once, not once a turn. */
+      let announcedCommands = "";
+      const announceCommands = (threadId: string, turnId: string, raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, turnId), type: "engine.commands", names, origin: "acp-available-commands" });
+      };
 
       const sendTurn = async (turn: SendTurnInput) => {
         const { threadId } = turn;
@@ -1012,6 +1023,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (state.settled || state.retrying || state.deadlineTerminating) return false;
           if (retry.cancelled || preflightCancelled || disposed) return false;
           if (state.sawOutput) return false;
+          // a command turn is never replayed: a relaunch could run it twice
+          if (turn.command) return false;
           if (retry.attempt >= RETRY_MAX_ATTEMPTS - 1) return false;
           const verdict = classifyError(failure);
           if (!verdict.transient) return false;
@@ -1175,8 +1188,17 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           // native log but never normalized: the prompt result is the settle.
           if (msg.method !== "session/update") return;
           const p = msg.params ?? {};
-          if (!state.promptSent || p._meta?.isReplay === true) return;
           const u = p.update ?? {};
+          // Agents announce their commands right after session/new or
+          // session/load, before the prompt goes out and while a resumed
+          // session is still replaying, so this reads ahead of the gate below.
+          // It never becomes a transcript item.
+          if (u.sessionUpdate === "available_commands_update") {
+            const names = z.array(z.object({ name: z.string() })).safeParse(u.availableCommands);
+            if (names.success) announceCommands(threadId, turnId, names.data.map((command) => command.name));
+            return;
+          }
+          if (!state.promptSent || p._meta?.isReplay === true) return;
           switch (u.sessionUpdate) {
             case "agent_message_chunk": {
               const delta = u.content?.text;
@@ -1571,11 +1593,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             emitSessionStarted();
             state.promptSent = true;
-            const text = support.buildPromptText
+            // A command turn is written as the agent parses it: the bare
+            // "/name args" with no persona in front.  Every other turn is
+            // shielded so a leading slash in the composed text cannot run as a
+            // command (the persona normally leads, so this is a second lock).
+            const composed = support.buildPromptText
               ? support.buildPromptText(turn)
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
+            const text = turn.command ? engineCommandText(turn.command) : neutralizeLeadingSlash(composed);
             const result = await request(
               "session/prompt",
               {
@@ -1774,6 +1801,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             // jobs arrive over MCP in P2.  Named helper rows come in P3.
             backgroundJobs: "none",
             helpers: "none",
+            // Agents announce their commands over `available_commands_update`;
+            // an allowlisted one runs as a turn of its own.
+            engineCommands: true,
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

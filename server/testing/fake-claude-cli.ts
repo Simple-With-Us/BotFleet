@@ -70,6 +70,9 @@
 //   FAKE_CLAUDE_QUOTA_GATE  optional file whose creation releases quota mode,
 //                           so integration tests can queue work before settle
 //   FAKE_CLAUDE_REPLY  optional successful assistant text for prose-boundary tests
+//   FAKE_CLAUDE_SLASH_COMMANDS  optional comma-separated list the init frame
+//                        reports as `slash_commands`, the way the real CLI
+//                        lists its built-in, skill and plugin commands
 //   FAKE_CLAUDE_PROMPTS  optional path; every user message this process reads
 //                        from stdin is appended as one JSON line, so a test
 //                        can see what a REUSED process was sent (the dump
@@ -367,8 +370,11 @@ const playTurn = (prompt: JsonValue) => {
     }
   }
 
-  // the real CLI re-announces init on every turn of a live process
-  out({ type: "system", subtype: "init", session_id: sessionId, model });
+  // the real CLI re-announces init on every turn of a live process, with its
+  // catalog of slash commands (FAKE_CLAUDE_SLASH_COMMANDS, comma separated)
+  const init = { type: "system", subtype: "init", session_id: sessionId, model };
+  const slashCommands = process.env.FAKE_CLAUDE_SLASH_COMMANDS;
+  out(slashCommands ? { ...init, slash_commands: slashCommands.split(",") } : init);
 
   if (mode === "hang") {
     // stay alive until killed — lets tests exercise interrupt + the

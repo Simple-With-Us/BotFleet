@@ -58,6 +58,7 @@ import {
   resolveInjectId,
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
+import { engineCommandText, neutralizeLeadingSlash, normalizeAnnouncedCommands } from "./engine-commands.ts";
 import {
   clearPromptSplitReceipt,
   EMPTY_FINGERPRINT,
@@ -340,6 +341,8 @@ const FrameMeta = z
     user_message_uuid: z.string().min(1).optional().catch(undefined),
     user_message_uuids: z.array(z.string()).optional().catch(undefined),
     parent_tool_use_id: z.string().min(1).optional().catch(undefined),
+    // the `system` `init` frame's catalog of the CLI's own slash commands
+    slash_commands: z.array(z.string()).optional().catch(undefined),
   })
   // a frame that is not an object at all carries none of them
   .catch({});
@@ -920,10 +923,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     /** Write a user message for the running turn.  It is stamped with a uuid
      *  the CLI reports back (`command_lifecycle`, `user_message_uuids`), and
      *  recorded as this turn's and as not yet taken BEFORE the write: the
-     *  CLI's answer can only be read after it. */
-    const writeUser = (s: Session, threadId: string, text: string): Promise<boolean> => {
+     *  CLI's answer can only be read after it.
+     *
+     *  This is the only place text reaches the CLI's stdin, so it is also the
+     *  one place a leading slash is shielded (`neutralizeLeadingSlash`): a
+     *  message that starts with "/advisor" or "/model" would otherwise run as
+     *  the CLI's own command and rewrite the owner's global settings.  Only a
+     *  command turn (`bare`) is written as typed. */
+    const writeUser = (s: Session, threadId: string, text: string, bare = false): Promise<boolean> => {
       const uuid = randomUUID();
-      const promptMsg = { type: "user", uuid, message: { role: "user", content: text } };
+      const promptMsg = { type: "user", uuid, message: { role: "user", content: bare ? text : neutralizeLeadingSlash(text) } };
       if (!s.child.stdin.writable || s.child.stdin.destroyed) return Promise.resolve(false);
       const turn = s.turn;
       turn?.sends.add(uuid);
@@ -1158,8 +1167,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // receipt this harness never wrote — and on a mention turn, whose note
       // describes this very message.  A legacy unsplit turn goes bare.  The
       // receipt is only pending here; the CLI's first frame commits it.
-      const planTurnText = (sessionKey: string): { text: string; pending: { key: string; receipt: PromptSplitReceipt } | null } => {
-        if (halves.stable === null) return { text: turn.text, pending: null };
+      //
+      // A command turn (`/compact`) is the exception: the CLI parses a slash
+      // command only at the very start of the message, so it is written alone,
+      // with no note and no receipt.  The note rides the next ordinary turn,
+      // which still finds the receipt missing.
+      const planTurnText = (sessionKey: string) => {
+        if (turn.command) return { text: engineCommandText(turn.command), pending: null, bare: true };
+        if (halves.stable === null) return { text: turn.text, pending: null, bare: false };
         const receipt = promptSplitFingerprints(halves.stable, halves.volatile);
         const previous = readPromptSplitReceipt(DRIVER_KIND, sessionKey);
         const carried = previous !== null && previous.volatile === receipt.volatile && !turn.mentionTurn;
@@ -1168,6 +1183,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             ? turn.text
             : withVolatileNote(turn.text, halves.volatile, previous !== null && previous.volatile !== EMPTY_FINGERPRINT),
           pending: { key: sessionKey, receipt },
+          bare: false,
         };
       };
 
@@ -1197,7 +1213,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const plan = planTurnText(live.sessionId ?? sessionId ?? newSessionId!);
         live.pendingReceipt = plan.pending;
-        const written = await writeUser(live, threadId, plan.text);
+        const written = await writeUser(live, threadId, plan.text, plan.bare);
         if (!written) {
           live.pendingReceipt = null;
           active.delete(threadId);
@@ -1491,6 +1507,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (!t) dropUnsolicited(frame, meta);
       };
 
+      /** The CLI's slash-command catalog, from its init frame: once per
+       *  process, and again if it ever changes.  Names only; what to show of
+       *  them is decided by the allowlist, not by this text. */
+      let announcedCommands = "";
+      const announceCommands = (raw: readonly string[]) => {
+        const names = normalizeAnnouncedCommands(raw);
+        const key = names.join(",");
+        if (key === announcedCommands) return;
+        announcedCommands = key;
+        emit({ ...base(threadId, currentTurnId()), type: "engine.commands", names, origin: "claude-init" });
+      };
+
       const handleLine = (line: string) => {
         let o: any;
         try {
@@ -1502,6 +1530,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         // every stream-json frame is an object; anything else says nothing
         if (o === null || typeof o !== "object") return;
         const meta = FrameMeta.parse(o);
+        // Read before the turn-ownership gates below: a lifecycle-aware CLI's
+        // init frame can arrive while no BotFleet turn owns the process, and
+        // the gates would drop it before it reached the switch.
+        if (o.type === "system" && meta.subtype === "init" && meta.slash_commands) announceCommands(meta.slash_commands);
         if (o.type === "command_lifecycle") {
           onLifecycle(o, meta);
           return;
@@ -1761,6 +1793,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           const verdict = classifyError({ exitCode: code, stderr: message });
           if (
             !liveTurn.retry.cancelled &&
+            // a command turn is not replayed: relaunching would run `/compact`
+            // a second time on the resumed session
+            !liveTurn.input.command &&
             code !== 0 &&
             verdict.transient &&
             !liveTurn.producedOutput &&
@@ -1877,7 +1912,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // mid-turn steer or the next turn; closeSession() ends it.
       const plan = planTurnText(sessionId ?? newSessionId!);
       session.pendingReceipt = plan.pending;
-      if (!(await writeUser(session, threadId, plan.text))) {
+      if (!(await writeUser(session, threadId, plan.text, plan.bare))) {
         session.pendingReceipt = null;
         settle(false, "stdin_write_failed");
         closeSession(threadId, "stdin write failed");
@@ -2115,6 +2150,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // under the Task/Agent row that started it.  One level deep; the
           // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).
           helpers: "typed",
+          // The init frame lists the CLI's slash commands; an allowlisted one
+          // runs as a turn of its own (server/drivers/engine-commands.ts).
+          engineCommands: true,
         },
         sendTurn,
         steer,
