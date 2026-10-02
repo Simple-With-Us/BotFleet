@@ -1536,7 +1536,10 @@ test("post-start identity accepts new work while the pre-install readiness gate 
 // that is gone.  That is a stopped app, not a machine that has never adopted
 // this build, and the refusal has to say so: the old text sent an operator
 // looking for a first-adoption procedure that does not exist for a crash.
-test("preflight names a stale owner record as a stopped harness, not a first adoption", async (t) => {
+// Skipped on Windows like the other owner-record tests here: assertPrivateRegularFile
+// compares st_uid against process.getuid(), which is undefined there, so it throws
+// before the classification under test is ever reached.
+test("preflight names a stale owner record as a stopped harness, not a first adoption", { skip: process.platform === "win32" ? "Mac updater requires POSIX ownership and modes" : false }, async (t) => {
   const dead = spawn(process.execPath, ["-e", ""]);
   const deadPid = dead.pid;
   await once(dead, "exit");
