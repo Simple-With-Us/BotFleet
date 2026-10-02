@@ -41,6 +41,26 @@ describe("loadConfig with a config.json it cannot fully use", () => {
     expect(listDataFaults()).toEqual([]);
   });
 
+  // A missing config.json is a first run only when nothing of it is left over.
+  // The config lock renames the old file aside and then renames the staged one
+  // over it, so a process that dies between those two syscalls leaves no
+  // config.json with its contents in the set-aside.  Reading that as a first
+  // run would put BotFleet on defaults silently — and config.json is the one
+  // file registerLeftOverSetAsideFiles does not raise a notice for.
+  it("does not read a missing config.json as a first run when one was set aside", () => {
+    const setAside = join(DATA_DIR, "config.json.corrupt-1790000000000");
+    writeFileSync(setAside, JSON.stringify({ profile: { name: "Ada" } }));
+    try {
+      expect(loadConfig().profile).toBeUndefined();
+      const lines = warned();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("config.json.corrupt-1790000000000");
+      expect(listDataFaults().map((fault) => fault.file)).toContain("config.json");
+    } finally {
+      rmSync(setAside, { force: true });
+    }
+  });
+
   it("stays quiet on a healthy file, including keys this build does not know", () => {
     writeFileSync(path, JSON.stringify({ profile: { name: "Ada" }, aSectionFromANewerBuild: { on: true } }));
     expect(loadConfig().profile?.name).toBe("Ada");

@@ -16,13 +16,14 @@
 //     case in which saving stops, and the notice says so.
 //   * A byte-order mark is not damage: it is stripped and the file is used.
 //   * When a list holds some usable entries and some not, the usable ones are
-//     kept and the whole original is COPIED aside first, so what is left out
-//     is still on disk.
+//     kept and the whole original is COPIED aside first — and flushed to disk
+//     before the copy is called a success, so what is left out is still on
+//     disk even across a power loss.
 //
 // Every fault is logged once at the moment it is found and recorded in
 // data-faults.ts for the app's banner.  Nothing logged or recorded here ever
 // contains a fragment of the file.
-import { constants, copyFileSync, existsSync, readFileSync, renameSync } from "node:fs";
+import { closeSync, constants, copyFileSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { ROSTER_FILES, recordDataFault, type DataFault } from "./data-faults.ts";
@@ -51,6 +52,48 @@ export function jsonFailureReason(error: Error, length?: number): string {
 
 export type SetAside = { ok: true; path: string | null } | { ok: false; reason: string };
 
+/**
+ * Flush a freshly written file to stable storage.  Returns false when that
+ * could not be done, which is the caller's cue to leave the original in place:
+ * the next save would otherwise replace it and leave this as the only copy of
+ * what the load left out.
+ *
+ * "r+" rather than "r" because a read-only handle cannot be flushed on Windows.
+ * The directory entry is flushed too, and that part is best-effort: on Windows
+ * a directory cannot be opened as a file at all, and the file's own contents
+ * are the part that must not be lost.
+ */
+function makeDurable(path: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r+");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  }
+  try {
+    const dir = openSync(dirname(path), "r");
+    try {
+      fsyncSync(dir);
+    } finally {
+      closeSync(dir);
+    }
+  } catch {
+    /* the name may or may not be journalled; the bytes above are what matter */
+  }
+  return true;
+}
+
 /** Move (or copy) `path` to a name beside it that does not exist yet.  Never overwrites and never
  * deletes: the source is renamed, so its mode and contents survive intact.  `path: null` means the
  * file was already gone, which happens when another BotFleet process set it aside first. */
@@ -60,8 +103,30 @@ export function setFileAside(path: string, how: "move" | "copy", now: number = D
   let target = join(dir, `${name}.corrupt-${now}`);
   for (let n = 1; existsSync(target); n += 1) target = join(dir, `${name}.corrupt-${now}-${n}`);
   try {
-    if (how === "move") renameSync(path, target);
-    else copyFileSync(path, target, constants.COPYFILE_EXCL);
+    if (how === "move") {
+      // A rename moves bytes that are already durable — they were written
+      // through writeFileAtomic — and the rename itself is atomic, so there is
+      // nothing to flush here.
+      renameSync(path, target);
+      return { ok: true, path: target };
+    }
+    copyFileSync(path, target, constants.COPYFILE_EXCL);
+    // copyFileSync returns once the bytes are in the page cache, not once they
+    // are on the disk.  The load below treats this copy as the record of what
+    // it could not parse, then lets the store write the pruned file over the
+    // original through writeFileAtomic, which IS durable.  So without this
+    // flush the only durable file is the one missing those entries, and a
+    // power loss takes them for good.  If the flush fails, the copy is removed
+    // and the call fails, which leaves the original in place and stops the
+    // save that would have replaced it.
+    if (!makeDurable(target)) {
+      try {
+        unlinkSync(target);
+      } catch {
+        /* best-effort cleanup */
+      }
+      return { ok: false, reason: "it could not be copied aside (the copy could not be made durable)" };
+    }
     return { ok: true, path: target };
   } catch (error) {
     const failure = error instanceof Error ? error : new Error(String(error));

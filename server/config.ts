@@ -3,12 +3,12 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
-import { clearDataFault, recordDataFault } from "./data-faults.ts";
+import { clearDataFault, findSetAsideFiles, recordDataFault } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { describeDsn } from "./sentry.ts";
@@ -1164,15 +1164,28 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
   };
 }
 
-/** Read config.json.  Silent only when the file does not exist (a first run); every other way of
- * not getting a full config out of it is a problem the caller reports. */
+/** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
+ * is a first run; every other way of not getting a full config out of it is a problem the caller
+ * reports. */
 function readStoredConfig(path: string): StoredConfigRead {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch (error) {
     const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
-    return code === "ENOENT" ? { config: {}, problem: null } : ignoredConfig(`it could not be read (${code})`);
+    if (code !== "ENOENT") return ignoredConfig(`it could not be read (${code})`);
+    // A missing config.json is a first run only when nothing of it is left
+    // over.  The config lock renames the old file aside and then renames the
+    // staged one over it, and a process that dies between those two adjacent
+    // syscalls leaves the file absent with its contents sitting in the
+    // set-aside.  Reading that as a first run would put BotFleet on defaults
+    // with no fault, no log and no banner — the exact silent loss this branch
+    // exists to prevent — and registerLeftOverSetAsideFiles deliberately does
+    // not raise config.json, so nothing else would surface it either.
+    const leftOver = findSetAsideFiles(dirname(path)).find((entry) => entry.file === basename(path));
+    return leftOver
+      ? ignoredConfig(`it is missing, but an earlier copy of it was set aside as ${leftOver.name}, so these are not first-run settings`)
+      : { config: {}, problem: null };
   }
   const body = stripBom(text);
   if (body.trim() === "") return ignoredConfig("it is empty");
