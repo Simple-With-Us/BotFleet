@@ -46,6 +46,7 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -413,16 +414,72 @@ export function withConfigFileLock(configPath, fn, options = {}) {
   }
 }
 
+/** Drop a leading byte-order mark, which some editors add when a person
+ * fixes a file by hand.  Mirrors stripBom in server/store-guard.ts. */
+function stripBom(text) {
+  return text.startsWith("\uFEFF") ? text.slice(1) : text;
+}
+
+/** Why JSON.parse failed, safe to log: only a position, never the text
+ * around it, because config.json holds API keys and the parser's own
+ * message quotes the source.  Mirrors jsonFailureReason in
+ * server/store-guard.ts, which the packaged app cannot import. */
+function jsonFailureReason(error) {
+  const message = String(error?.message ?? "");
+  if (/end of JSON input|unterminated/i.test(message)) return "it ends early (it looks cut short)";
+  const at = /position (\d+)/.exec(message)?.[1];
+  return at ? `it is not valid JSON (near character ${at})` : "it is not valid JSON";
+}
+
+/** Read `configPath` and say whether what is there can be used.
+ * `disk` is the parsed object, or `{}` when there is nothing usable.
+ * `unusable` is null for a file that is missing, empty or healthy, and
+ * otherwise the reason a file that DOES hold something could not be used
+ * (not JSON, not an object, unreadable) -- that file is somebody's settings
+ * and must not be written over without being kept. */
+function inspectConfigFile(configPath) {
+  let text;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { disk: {}, unusable: null };
+    return { disk: {}, unusable: `it could not be read (${error?.code ?? "unknown error"})` };
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return { disk: {}, unusable: null };
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch (error) {
+    return { disk: {}, unusable: jsonFailureReason(error) };
+  }
+  if (!isPlainObject(parsed)) return { disk: {}, unusable: "it does not hold a JSON object" };
+  return { disk: parsed, unusable: null };
+}
+
 /** The parsed config object on disk, or `{}` when the file is missing or
  * not a JSON object -- the state of a fresh install, not an error.  Every
- * writer treats that the same way, so it lives here once. */
+ * writer treats that the same way, so it lives here once.  A file that holds
+ * something unusable also reads as `{}`, but `updateConfigFile` sets it aside
+ * before it would be replaced. */
 export function readConfigFile(configPath) {
+  return inspectConfigFile(configPath).disk;
+}
+
+/** Rename an unusable `configPath` to `<name>.corrupt-<epoch ms>` beside it.
+ * Never overwrites an existing name and never deletes; the rename keeps the
+ * file's private mode.  Returns where it went, or null if another process
+ * had already moved it.  Throws if it cannot be moved. */
+function setConfigFileAside(configPath, now) {
+  let target = `${configPath}.corrupt-${now}`;
+  for (let n = 1; existsSync(target); n += 1) target = `${configPath}.corrupt-${now}-${n}`;
   try {
-    const parsed = JSON.parse(readFileSync(configPath, "utf8"));
-    return isPlainObject(parsed) ? parsed : {};
-  } catch {
-    return {};
+    renameSync(configPath, target);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
+  return target;
 }
 
 /** Durable, atomic file replace: write a sibling temp file, fsync it, rename
@@ -477,7 +534,7 @@ export function updateConfigFile(configPath, mutate, options = {}) {
   return withConfigFileLock(
     configPath,
     (lock) => {
-      const disk = readConfigFile(configPath);
+      const { disk, unusable } = inspectConfigFile(configPath);
       const next = mutate(disk);
       if (next && typeof next.then === "function") {
         throw new TypeError("updateConfigFile: mutate must be synchronous");
@@ -488,12 +545,35 @@ export function updateConfigFile(configPath, mutate, options = {}) {
       // this lease ran out or a peer took the lock over while `mutate`, the
       // temp-file write or the fsync ran.  The staged temp file is dropped,
       // the peer's file stays intact, and the caller sees an error instead.
+      //
+      // A file that held something unusable is set aside in the same
+      // breath, after the fence and just before the rename that replaces
+      // it, so the write that follows can never destroy it.  If it cannot be
+      // moved, the throw drops the staged file and the original stays put.
       writeFileAtomic(configPath, JSON.stringify(toWrite, null, 2), {
         mode: options.mode ?? 0o600,
-        beforeRename: () => lock.assertHeld(),
+        beforeRename: () => {
+          lock.assertHeld();
+          if (unusable === null) return;
+          let setAsidePath;
+          try {
+            setAsidePath = setConfigFileAside(configPath, options.now ?? Date.now());
+          } catch (error) {
+            throw new Error(
+              `${configPath} could not be used because ${unusable}, and it could not be moved aside (${error?.code ?? "unknown error"}), so it was not overwritten`,
+            );
+          }
+          (options.onSetAside ?? reportSetAside)({ path: configPath, setAsidePath, reason: unusable });
+        },
       });
       return toWrite;
     },
     options,
+  );
+}
+
+function reportSetAside({ path, setAsidePath, reason }) {
+  console.warn(
+    `config: ${path} could not be used because ${reason}.  ${setAsidePath ? `Moved it to ${setAsidePath}` : "It was already moved aside"} and wrote a new file.  Nothing was deleted.`,
   );
 }

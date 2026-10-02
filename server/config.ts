@@ -3,11 +3,12 @@
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
 import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { z } from "zod";
 
-import { updateConfigFile } from "../electron/config-file-lock.mjs";
+import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
+import { clearDataFault, recordDataFault } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { describeDsn } from "./sentry.ts";
@@ -22,6 +23,7 @@ import {
   type RoomTerminology,
 } from "../shared/terminology.ts";
 import { DEFAULT_VPS_MODE, migrateAllowedComputersToProviders } from "../shared/local-auto-consent.ts";
+import { fsFailureCode, jsonFailureReason, stripBom } from "./store-guard.ts";
 
 const optionalText = z.string().optional();
 const externalCredentialStorage = z.literal("external").optional();
@@ -1095,13 +1097,131 @@ export function migrateComputerProvidersConfig(cfg: AppConfig): boolean {
   return true;
 }
 
-export function loadConfig(): AppConfig {
-  let cfg: AppConfig = {};
-  try {
-    cfg = parseStoredConfig(parseJson(readFileSync(join(DATA_DIR, "config.json"), "utf8")));
-  } catch {
-    /* first run — env fallbacks below */
+/** What reading config.json turned up besides the settings themselves. */
+interface StoredConfigProblem {
+  /** "config-ignored": nothing in the file was usable.  "config-partial": some sections were left out. */
+  kind: "config-ignored" | "config-partial";
+  /** For the log and the notice.  Built from paths and error codes only, never from values. */
+  reason: string;
+  sections: string[];
+}
+
+interface StoredConfigRead {
+  config: AppConfig;
+  problem: StoredConfigProblem | null;
+}
+
+/** The sections of config.json this build understands.  Salvage keeps only these, so a key it has
+ * never heard of (a newer build's, or a hostile one such as `__proto__`) never reaches the config. */
+const STORED_CONFIG_SECTIONS: ReadonlySet<string> = new Set<string>(appConfigSchema.keyof().options);
+
+/** The last problem reported, so a file that stays broken is reported once rather than on every
+ * loadConfig() call, which routes make per request.  A clean read resets it, so a file that is
+ * repaired and then breaks again is reported again. */
+let lastStoredConfigWarning: string | null = null;
+
+function ignoredConfig(reason: string): StoredConfigRead {
+  return { config: {}, problem: { kind: "config-ignored", reason, sections: [] } };
+}
+
+/** Keep every section of an invalid config.json that validates on its own, and report the rest.
+ * Inside `instances` the unit is one engine entry, because dropping the whole map reroutes every
+ * engine to its default for the sake of one bad field.  Each piece is validated with the same
+ * parseStoredConfig the whole file goes through, so the legacy-value rewrites apply here too. */
+function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
+  const usable: JsonObject = {};
+  const issues: string[] = [];
+  const left: string[] = [];
+  for (const [section, value] of Object.entries(stored)) {
+    if (!STORED_CONFIG_SECTIONS.has(section)) continue;
+    try {
+      parseStoredConfig({ [section]: value });
+      usable[section] = value;
+      continue;
+    } catch (error) {
+      const entries = section === "instances" ? jsonObjectSchema.safeParse(value) : null;
+      if (!entries?.success) {
+        issues.push(error instanceof Error ? error.message : `${section} is invalid`);
+        left.push(section);
+        continue;
+      }
+      const kept: Array<[string, JsonValue]> = [];
+      for (const [id, entry] of Object.entries(entries.data)) {
+        try {
+          parseStoredConfig({ [section]: { [id]: entry } });
+          kept.push([id, entry]);
+        } catch (entryError) {
+          issues.push(entryError instanceof Error ? entryError.message : `${section}.${id} is invalid`);
+          left.push(`${section}.${id}`);
+        }
+      }
+      if (kept.length > 0) usable[section] = Object.fromEntries(kept);
+    }
   }
+  return {
+    config: parseStoredConfig(usable),
+    problem: { kind: "config-partial", reason: issues.join("; "), sections: left },
+  };
+}
+
+/** Read config.json.  Silent only when the file does not exist (a first run); every other way of
+ * not getting a full config out of it is a problem the caller reports. */
+function readStoredConfig(path: string): StoredConfigRead {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
+    return code === "ENOENT" ? { config: {}, problem: null } : ignoredConfig(`it could not be read (${code})`);
+  }
+  const body = stripBom(text);
+  if (body.trim() === "") return ignoredConfig("it is empty");
+  let parsed: JsonValue;
+  try {
+    parsed = parseJson(body);
+  } catch (error) {
+    return ignoredConfig(jsonFailureReason(error instanceof Error ? error : new Error(String(error))));
+  }
+  try {
+    return { config: parseStoredConfig(parsed), problem: null };
+  } catch {
+    const asObject = jsonObjectSchema.safeParse(parsed);
+    return asObject.success ? salvageStoredConfig(asObject.data) : ignoredConfig("it must hold a JSON object");
+  }
+}
+
+function reportStoredConfig(path: string, problem: StoredConfigProblem | null): void {
+  if (!problem) {
+    lastStoredConfigWarning = null;
+    clearDataFault("config.json", ["config-ignored", "config-partial"]);
+    return;
+  }
+  const message =
+    problem.kind === "config-ignored"
+      ? `config: ignoring ${path} and using defaults because ${problem.reason}.  The file itself was not changed.`
+      : `config: ${path} has settings BotFleet could not use, and they were left out: ${problem.reason}.  Every other setting in the file is in use.  The file itself was not changed.`;
+  if (message !== lastStoredConfigWarning) {
+    lastStoredConfigWarning = message;
+    console.warn(message);
+  }
+  recordDataFault({
+    file: "config.json",
+    kind: problem.kind,
+    reason: problem.reason,
+    setAsideAs: null,
+    omitted: 0,
+    sections: problem.sections,
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
+}
+
+export function loadConfig(): AppConfig {
+  const configPath = join(DATA_DIR, "config.json");
+  const stored = readStoredConfig(configPath);
+  reportStoredConfig(configPath, stored.problem);
+  const cfg: AppConfig = stored.config;
   // these secrets OS-encrypted and hands them to this process as env at
   // spawn, leaving config.json without the plaintext field — so the file
   // value is the dev-mode (no desktop shell) fallback, not the primary.
@@ -1362,7 +1482,28 @@ export function saveConfig(
       merged[section] = next;
     }
     return merged;
-  }, { mode: 0o600 });
+  }, { mode: 0o600, onSetAside: reportConfigSetAside });
+}
+
+/** updateConfigFile renamed an unusable config.json aside just before replacing it.  Say so in the
+ * log and in the app: the new file holds this save and nothing else, so the owner needs to know
+ * where the rest of their settings went. */
+function reportConfigSetAside(info: ConfigFileSetAside): void {
+  const to = info.setAsidePath;
+  console.error(
+    `config: ${info.path} could not be used because ${info.reason}.  ${to ? `Moved it to ${to}` : "It had already been moved aside"} and saved this change into a new file.  Nothing was deleted.  Settings that were only in the old file are not in effect until you copy them across.`,
+  );
+  recordDataFault({
+    file: "config.json",
+    kind: "set-aside",
+    reason: info.reason,
+    setAsideAs: to ? basename(to) : null,
+    omitted: 0,
+    sections: [],
+    writesRefused: false,
+    holdsCleanup: false,
+    at: Date.now(),
+  });
 }
 
 /** Merge a validated patch into the parsed on-disk object.  Runs under the

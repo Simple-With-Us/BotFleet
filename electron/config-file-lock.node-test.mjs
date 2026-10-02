@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -474,6 +474,130 @@ test("two processes doing locked read-modify-writes on one file never lose an up
     const final = readConfigFile(path);
     assert.deepEqual(final, { server: { count: N }, electron: { count: N } });
     assert.equal(existsSync(lockPathFor(path)), false, "no lock left behind");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// An unusable config.json used to read as `{}`, so the next writer (a Settings
+// save, the updater's throttle record, a boot credential migration) replaced
+// the file with its patch alone and every key the owner had was gone.  Now the
+// unusable file is renamed aside first, under the same lock, and never
+// deleted.
+
+const setAsideNames = (dir) => readdirSync(dir).filter((name) => name.startsWith("config.json.corrupt-"));
+
+test("updateConfigFile sets an unparseable file aside, byte for byte, before writing a new one", () => {
+  const { dir, path } = tempConfig();
+  try {
+    const broken = '{"xai":{"key":"fixture-key"},"profile":{"name":"Ada"';
+    writeFileSync(path, broken, { mode: 0o600 });
+    const notices = [];
+    let seen;
+    updateConfigFile(
+      path,
+      (disk) => {
+        seen = { ...disk };
+        disk.second = true;
+      },
+      { now: 1790000000000, onSetAside: (info) => notices.push(info) },
+    );
+    assert.deepEqual(seen, {});
+    assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { second: true });
+    assert.deepEqual(setAsideNames(dir), ["config.json.corrupt-1790000000000"]);
+    const aside = join(dir, "config.json.corrupt-1790000000000");
+    assert.equal(readFileSync(aside, "utf8"), broken);
+    assert.equal(statSync(aside).mode & 0o777, 0o600, "the preserved file keeps its private mode");
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0].setAsidePath, aside);
+    assert.match(notices[0].reason, /ends early|not valid JSON/);
+    assert.ok(!notices[0].reason.includes("fixture-key"), "the reason never quotes the file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile sets aside a JSON value that is not an object, and never reuses a name", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "[1,2,3]");
+    writeFileSync(join(dir, "config.json.corrupt-1790000000000"), "earlier");
+    updateConfigFile(path, (disk) => {
+      disk.fresh = true;
+    }, { now: 1790000000000, onSetAside: () => {} });
+    assert.deepEqual(setAsideNames(dir).sort(), [
+      "config.json.corrupt-1790000000000",
+      "config.json.corrupt-1790000000000-1",
+    ]);
+    assert.equal(readFileSync(join(dir, "config.json.corrupt-1790000000000"), "utf8"), "earlier");
+    assert.equal(readFileSync(join(dir, "config.json.corrupt-1790000000000-1"), "utf8"), "[1,2,3]");
+    assert.deepEqual(readConfigFile(path), { fresh: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile treats a byte-order mark as part of a healthy file", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, `\uFEFF${JSON.stringify({ keep: { me: 1 } })}`);
+    assert.deepEqual(readConfigFile(path), { keep: { me: 1 } });
+    updateConfigFile(path, (disk) => {
+      disk.added = true;
+    });
+    assert.deepEqual(setAsideNames(dir), []);
+    const text = readFileSync(path, "utf8");
+    assert.ok(!text.startsWith("\uFEFF"));
+    assert.deepEqual(JSON.parse(text), { keep: { me: 1 }, added: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile does not set aside an empty file, which holds nothing to lose", () => {
+  const { dir, path } = tempConfig();
+  try {
+    for (const body of ["", "  \n"]) {
+      writeFileSync(path, body);
+      updateConfigFile(path, (disk) => {
+        disk.ok = true;
+      });
+      assert.deepEqual(setAsideNames(dir), []);
+      assert.deepEqual(readConfigFile(path), { ok: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile leaves an unusable file exactly where it is when nothing needs writing", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    updateConfigFile(path, () => null);
+    assert.equal(readFileSync(path, "utf8"), "{ not json");
+    assert.deepEqual(setAsideNames(dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateConfigFile refuses to overwrite an unusable file it cannot set aside", () => {
+  const { dir, path } = tempConfig();
+  try {
+    writeFileSync(path, "{ not json");
+    // A name longer than the filesystem allows makes the rename fail the same
+    // way a read-only directory would, without depending on who runs the test.
+    assert.throws(
+      () =>
+        updateConfigFile(path, (disk) => {
+          disk.fresh = true;
+        }, { now: "9".repeat(400) }),
+      /config\.json/,
+    );
+    assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");
+    assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+    assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
