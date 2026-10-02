@@ -53,6 +53,13 @@ export const NATIVE_LOG_MAX_BYTES = 64 * 1024 * 1024;
  * native cap still keeps far more history than the panel shows. */
 export const EVENTS_LOG_MAX_BYTES = 16 * 1024 * 1024;
 
+/** Cap for `item-io/<threadId>.ndjson`, the side store of tool inputs, tool
+ * outputs and injected context (server/item-io-store.ts).  Each field is
+ * already cut to 32 KB, so 6 MB is a few hundred steps of full-size payloads
+ * or several thousand ordinary ones, and a thread costs at most two of them on
+ * disk.  Older steps simply answer "not recorded" once they rotate out. */
+export const ITEM_IO_LOG_MAX_BYTES = 6 * 1024 * 1024;
+
 /** The one rotated generation kept beside a live log. */
 export const ROTATED_SUFFIX = ".1";
 
@@ -429,18 +436,29 @@ function reapStaleTemp(file: string, pid: number, now: number): ReapedTemp {
 export interface TranscriptDirs {
   eventsDir: string;
   nativeDir: string;
+  /** The tool input/output side store.  Optional so a caller that predates it
+   * (and every test that builds the pair by hand) keeps working. */
+  ioDir?: string;
 }
 
-/** Both directories at their own caps, summed. */
+/** Every directory a thread's transcript logs live in. */
+function transcriptDirList(dirs: TranscriptDirs): string[] {
+  return dirs.ioDir ? [dirs.eventsDir, dirs.nativeDir, dirs.ioDir] : [dirs.eventsDir, dirs.nativeDir];
+}
+
+/** Every directory at its own cap, summed. */
 export function sweepTranscriptRetention(dirs: TranscriptDirs): SweepResult {
-  const events = sweepTranscriptLogs(dirs.eventsDir, EVENTS_LOG_MAX_BYTES);
-  const native = sweepTranscriptLogs(dirs.nativeDir, NATIVE_LOG_MAX_BYTES);
+  const parts = [
+    sweepTranscriptLogs(dirs.eventsDir, EVENTS_LOG_MAX_BYTES),
+    sweepTranscriptLogs(dirs.nativeDir, NATIVE_LOG_MAX_BYTES),
+    ...(dirs.ioDir ? [sweepTranscriptLogs(dirs.ioDir, ITEM_IO_LOG_MAX_BYTES)] : []),
+  ];
   return {
-    scanned: events.scanned + native.scanned,
-    trimmed: events.trimmed + native.trimmed,
-    bytesReclaimed: events.bytesReclaimed + native.bytesReclaimed,
-    tempRemoved: events.tempRemoved + native.tempRemoved,
-    failed: events.failed + native.failed,
+    scanned: parts.reduce((sum, part) => sum + part.scanned, 0),
+    trimmed: parts.reduce((sum, part) => sum + part.trimmed, 0),
+    bytesReclaimed: parts.reduce((sum, part) => sum + part.bytesReclaimed, 0),
+    tempRemoved: parts.reduce((sum, part) => sum + part.tempRemoved, 0),
+    failed: parts.reduce((sum, part) => sum + part.failed, 0),
   };
 }
 
@@ -568,7 +586,7 @@ export function sweepOrphanedTranscripts(
   // thread id -> what it holds across BOTH directories, so a write to either
   // one is enough to keep the thread out of the "untouched" bucket.
   const candidates = new Map<string, { files: number; bytes: number; newestMtime: number }>();
-  for (const dir of [dirs.eventsDir, dirs.nativeDir]) {
+  for (const dir of transcriptDirList(dirs)) {
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -613,7 +631,7 @@ export function sweepOrphanedTranscripts(
   if (!dryRun && orphaned.length) {
     // One listing per directory for every orphan together, the same
     // batching `removeTranscriptLogs` already does for a room's tasks.
-    for (const dir of [dirs.eventsDir, dirs.nativeDir]) removeTranscriptLogs(dir, orphaned);
+    for (const dir of transcriptDirList(dirs)) removeTranscriptLogs(dir, orphaned);
   }
   return { ids: orphaned.length, files, bytesReclaimed, dryRun };
 }

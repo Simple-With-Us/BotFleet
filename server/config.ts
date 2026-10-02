@@ -964,6 +964,10 @@ export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet")
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
+/** Full tool inputs and outputs, and injected context text, per thread —
+ * bounded, rotated, and fetched only when a row is opened
+ * (server/item-io-store.ts). */
+export const ITEM_IO_DIR = join(DATA_DIR, "item-io");
 
 function migrateLegacyHomeDir(current: string, legacyNames: readonly string[]): void {
   if (existsSync(current)) return;
@@ -983,7 +987,7 @@ export function ensureDirs() {
   // one-time migration from the pre-rename data dirs — bots, transcripts,
   // config and keys all carry over. Skip when tests isolate via OMB_DATA_DIR.
   if (!process.env.OMB_DATA_DIR) migrateLegacyHomeDir(DATA_DIR, LEGACY_HOME_DATA_DIRS);
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR]) mkdirSync(dir, { recursive: true });
 }
 
 /** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider

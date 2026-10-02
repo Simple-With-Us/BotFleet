@@ -75,6 +75,10 @@ export interface TrajectoryPanelProps {
   onQuery: (query: string) => void;
   expanded: ReadonlySet<string>;
   onToggle: (id: string) => void;
+  /** The thread the steps belong to: an opened step reads its full input and
+   *  output from the harness with it.  Without one the list shows the clipped
+   *  headline every step already has. */
+  threadId?: string;
   /** No page has come back yet. */
   loading?: boolean;
   error?: string | null;
@@ -82,6 +86,7 @@ export interface TrajectoryPanelProps {
 }
 
 export function TrajectoryPanel({
+  threadId,
   trajectory,
   mode,
   onMode,
@@ -134,6 +139,7 @@ export function TrajectoryPanel({
   const visible = mode === "calls" ? shownCalls : shownRows;
   const hidden = (mode === "calls" ? calls.length : matching.length) - visible.length;
   const control: ListControl = {
+    threadId,
     expanded,
     onToggle,
     tabStopId: tabStop(
@@ -427,6 +433,7 @@ export const TrajectoryView = memo(function TrajectoryView({ threadId, messages,
 
   return (
     <TrajectoryPanel
+      threadId={threadId}
       trajectory={trajectory}
       mode={mode}
       onMode={setMode}

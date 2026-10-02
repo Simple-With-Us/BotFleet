@@ -33,11 +33,17 @@ const DEFAULT_URL = "https://api.x.ai/v1";
 
 // This is the xAI API catalog, which is separate from Grok Build's
 // subscription CLI catalog in acp/grok.ts. The Build-only fast variant is
-// intentionally absent here.
+// intentionally absent here, and so is Composer 2.5 (Cursor's model, served
+// through the Grok Build CLI, not the xAI API).  grok-build-0.1 is a public
+// xAI API model id (beta since 2026-05-29, https://x.ai/news/grok-build-0-1).
+// Live discovery below keeps this row's label and drops duplicates.  There is
+// no per-model rate table in the repo (the what-if projection prices a whole
+// engine from src/lib/engine-capabilities.tsx), so no rate is recorded here.
 const MODELS = {
   default: "grok-4.7",
   options: [
     { id: "grok-4.7", label: "Grok 4.7" },
+    { id: "grok-build-0.1", label: "Grok Build 0.1" },
     { id: "grok-4.6", label: "Grok 4.6" },
     { id: "grok-4.5", label: "Grok 4.5" },
   ],
@@ -371,6 +377,10 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           toolLoop: true,
           localComputerMcp: true,
           replaysTranscript: true,
+          // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+          // stay `delegate_bot`.
+          backgroundJobs: "none",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),

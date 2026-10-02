@@ -1116,6 +1116,15 @@ export function redactSecrets(input: unknown, depth = 0): unknown {
   return redactTree(input, depth, redactSecretsInText);
 }
 
+/** The same tree walk with the caller's own content pass for every string that
+ * is not under a secret-shaped key.  For a destination with its own bound on a
+ * string (a side store that cuts each field), so the cut can happen BEFORE the
+ * regexes instead of after them.  Secret-shaped keys and `{name, value}` env
+ * entries are masked outright, exactly as in `redactSecrets`. */
+export function redactSecretsWith(input: unknown, text: (value: string) => string): unknown {
+  return redactTree(input, 0, text);
+}
+
 /** Cap on how much of one string the canonical event log keeps.
  *
  * The unit is UTF-16 code units rather than bytes on purpose: `String.length`

@@ -2,6 +2,7 @@
 // so the panel stays a thin renderer and the labels can be tested.
 import type { RuntimeEvent } from "../../server/contracts.ts";
 import type { InspectorEntry, NativeRecord } from "../../server/thread-events.ts";
+import { formatContextBytes } from "../../shared/context-injection";
 export type { InspectorEntry, InspectorPage, NativeRecord } from "../../server/thread-events.ts";
 
 interface FoldPreview {
@@ -95,6 +96,8 @@ export function summarizeRuntime(e: RuntimeEvent): { summary: string; tone: Insp
       return { summary: `tokens in ${e.input} · out ${e.output}`, tone: "plain" };
     case "runtime.error":
       return { summary: `${e.setup ? "setup: " : ""}${clip(oneLine(e.message))}`, tone: "error" };
+    case "context.injected":
+      return { summary: `context injected: ${e.source} · ${formatContextBytes(e.bytes)}${e.preview ? ` · ${clip(oneLine(e.preview))}` : ""}`, tone: "plain" };
     default:
       return { summary: (e as { type: string }).type, tone: "plain" };
   }

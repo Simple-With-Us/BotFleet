@@ -28,6 +28,15 @@ describe("clipRuntimeEvent", () => {
     for (const value of [detail.detail, text.text, summary.summary, message.message]) expect(value).toHaveLength(TRAJECTORY_FIELD_LIMIT);
   });
 
+  it("clips an injection's preview and leaves its source and size alone", () => {
+    const event: RuntimeEvent = { ...base, type: "context.injected", source: "memory", preview: "p".repeat(5_000), bytes: 5_000 };
+    const clipped = clipRuntimeEvent(event) as Extract<RuntimeEvent, { type: "context.injected" }>;
+    expect(clipped.preview).toHaveLength(TRAJECTORY_FIELD_LIMIT);
+    expect(clipped).toMatchObject({ source: "memory", bytes: 5_000, itemId: "i1" });
+    const short: RuntimeEvent = { ...base, type: "context.injected", source: "skill", preview: "short", bytes: 5 };
+    expect(clipRuntimeEvent(short)).toBe(short);
+  });
+
   it("honours a smaller limit", () => {
     const event: RuntimeEvent = { ...base, type: "item.completed", itemType: "assistant_text", text: "abcdefghij" };
     expect((clipRuntimeEvent(event, 5) as { text: string }).text).toBe("abcd…");

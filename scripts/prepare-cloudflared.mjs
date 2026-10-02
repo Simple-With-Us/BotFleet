@@ -14,13 +14,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /** One slow download beats three fast failures.  Mirrors the timeout,
  * attempt count, and delay `prepare-android-tools.mjs` picked up in PR #446
@@ -171,24 +172,102 @@ function targetRunsOnHost(target, platform = process.platform, arch = process.ar
   return target === `${platform}-${arch}`;
 }
 
-function executableHasPinnedVersion(binary, target) {
+/** `cloudflared version` runs a local, already-checksum-verified executable and
+ * prints in ~0.2s warm / ~1.5s cold, so 10s looked generous.  It is not: on
+ * Oct 1, 2026 a `package:mac:local` inside `~/apps/update-botfleet.sh` died at
+ * a host load average in the 400-700s with the swap nearly full, where a child
+ * process can miss its 10s slice while waiting for a CPU, and the failure was
+ * reported as a version mismatch -- sending the reader after a corrupt
+ * download instead of a saturated machine.  Sixty seconds with a single retry
+ * keeps the warm path instant and spends patience only where a timeout is
+ * actually the answer. */
+export const VERSION_PROBE_TIMEOUT_MS = 60_000;
+export const VERSION_PROBE_ATTEMPTS = 2;
+
+const PROBE_DETAIL_LIMIT = 200;
+
+function oneLine(value, limit = PROBE_DETAIL_LIMIT) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** `spawnSync` reports a timeout as `error.code === "ETIMEDOUT"` with the
+ * child killed, so `status` is null and `signal` is set -- none of which the
+ * single boolean this replaced could distinguish from a real version
+ * mismatch.  Classify the four ways the probe can fail so the thrown message
+ * names the cause a person can act on. */
+export function classifyVersionProbe(result = {}) {
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  if (result.error) {
+    const message = String(result.error.message ?? result.error);
+    const timedOut = result.error.code === "ETIMEDOUT" || /ETIMEDOUT/i.test(message);
+    return { ok: false, reason: timedOut ? "timeout" : "spawn" };
+  }
+  if (result.status === 0) {
+    return output.includes(CLOUDFLARED_VERSION)
+      ? { ok: true, reason: "version" }
+      : { ok: false, reason: "version" };
+  }
+  if (result.signal) return { ok: false, reason: "signal" };
+  return { ok: false, reason: "status" };
+}
+
+/** Ask the staged executable for its version, retrying only a timeout.  A
+ * missing or non-executable binary and a non-zero exit are deterministic and
+ * would just make the second attempt fail the same way one second later. */
+export function probePinnedVersion(binary, options = {}) {
+  const {
+    spawn = spawnSync,
+    timeoutMs = VERSION_PROBE_TIMEOUT_MS,
+    attempts = VERSION_PROBE_ATTEMPTS,
+    log = console.error,
+  } = options;
+  let last;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const result = spawn(binary, ["version"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: timeoutMs,
+    });
+    last = { ...classifyVersionProbe(result), result, attempt, attempts, timeoutMs };
+    if (last.ok) return last;
+    if (last.reason !== "timeout" || attempt === attempts) break;
+    log(
+      `cloudflared version probe timed out after ${Math.round(timeoutMs / 1000)}s — retrying ` +
+        `(attempt ${attempt + 1} of ${attempts})`,
+    );
+  }
+  return last;
+}
+
+/** The original sentence is kept verbatim so existing logs and board history
+ * still match, with the probe's own evidence appended. */
+export function versionProbeFailureMessage(target, probe = {}) {
+  const { result = {}, attempt, attempts, timeoutMs } = probe;
+  const cause = {
+    timeout: () =>
+      `the version probe timed out on attempt ${attempt} of ${attempts} at ${Math.round(timeoutMs / 1000)}s each`,
+    spawn: () => "the executable could not be run",
+    signal: () => `the version probe was killed by ${result.signal}`,
+    status: () => `the version probe exited with status ${result.status}`,
+    version: () => "it ran but did not report the pinned version",
+  }[probe.reason]?.() ?? "the version probe did not complete";
+  const details = [`status=${result.status ?? "null"}`, `signal=${result.signal ?? "none"}`];
+  if (result.error) details.push(`error=${oneLine(result.error.message, 160)}`);
+  const output = oneLine([result.stdout, result.stderr].filter(Boolean).join(" "));
+  if (output) details.push(`output=${output}`);
+  return `${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION} (${cause}; ${details.join("; ")})`;
+}
+
+export function verifyCloudflaredExecutable(binary, target, options = {}) {
+  verifyPinnedBinary(readFileSync(binary), target);
   // A dual-architecture macOS package is prepared in one invocation. Do not
   // assume Rosetta is installed or attempt to execute the other architecture;
   // its executable bytes are still pinned and its Mach-O header is checked.
-  if (!targetRunsOnHost(target)) return true;
-  const result = spawnSync(binary, ["version"], {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 10_000,
-  });
-  return result.status === 0 && `${result.stdout}\n${result.stderr}`.includes(CLOUDFLARED_VERSION);
-}
-
-export function verifyCloudflaredExecutable(binary, target) {
-  verifyPinnedBinary(readFileSync(binary), target);
-  if (!executableHasPinnedVersion(binary, target)) {
-    throw new Error(`${target} executable did not identify as cloudflared ${CLOUDFLARED_VERSION}`);
-  }
+  if (!targetRunsOnHost(target)) return;
+  const probe = probePinnedVersion(binary, options);
+  if (!probe.ok) throw new Error(versionProbeFailureMessage(target, probe));
 }
 
 function executableIsCurrent(binary, manifestFile, target) {
@@ -378,7 +457,18 @@ export function currentOnlyFromEnv(env = process.env) {
   return env.OMB_CLOUDFLARED_CURRENT === "1";
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryModule()) {
   const args = parsePrepareCloudflaredArgs(process.argv.slice(2));
   await prepareCloudflared({ current: args.current || currentOnlyFromEnv() });
 }

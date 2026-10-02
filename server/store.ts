@@ -20,6 +20,7 @@ import { withoutNestedFallbacks } from "../shared/model-limits.ts";
 import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
+import type { ContextInjectionRef } from "../shared/context-injection.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -31,6 +32,8 @@ import {
   type LineageContext,
 } from "../shared/model-lineage.ts";
 import { mergeTaskStats, type TurnStatsSample } from "./turn-stats.ts";
+import { rewriteModelSelection } from "./retired-model-ids.ts";
+import { automationRolloverSeedText } from "./automation-rollover.ts";
 
 export type BotColor =
   | "green"
@@ -158,7 +161,23 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
+    /** The helper (native subagent) step this one ran inside: the parent
+     * row's `itemId`.  The chat nests the row under that parent instead of
+     * interleaving parallel helpers' steps with the bot's own. */
+    parentItemId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent INTO a running turn (capabilities.queueing): the
    * model saw it mid-turn, so the transcript marks it — a reader should
    * know the reply above it may already account for this line */
@@ -951,6 +970,39 @@ export class Store {
       // read and are swept by `wakeExpiredThreadSnoozes`.
       for (const task of b.tasks ?? []) {
         if (task.snoozedUntil === SNOOZE_UNTIL_ACTIVITY) this.threadsAwaitingActivity.add(task.threadId);
+      }
+      // Retired picker ids (MiniMax-M3, plain M2.7, deepseek-v4-flash) stay in
+      // bots.json after the catalog drops them; rewrite onto the live replacement
+      // so the next turn does not burn a spawn on "unknown model option".
+      if (b.modelSelection) {
+        const rewritten = rewriteModelSelection(b.modelSelection);
+        if (rewritten.changed) {
+          b.modelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      if (b.activeModelSelection) {
+        const rewritten = rewriteModelSelection(b.activeModelSelection);
+        if (rewritten.changed) {
+          b.activeModelSelection = rewritten.selection;
+          botsMigrated = true;
+        }
+      }
+      for (const task of b.tasks ?? []) {
+        if (task.modelSelection) {
+          const rewritten = rewriteModelSelection(task.modelSelection);
+          if (rewritten.changed) {
+            task.modelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
+        if (task.activeModelSelection) {
+          const rewritten = rewriteModelSelection(task.activeModelSelection);
+          if (rewritten.changed) {
+            task.activeModelSelection = rewritten.selection;
+            botsMigrated = true;
+          }
+        }
       }
     }
     for (const b of this.bots) {
@@ -2140,6 +2192,78 @@ export class Store {
     this.saveBots();
     this.emit({ type: "bot", botId });
     return task;
+  }
+
+
+  /** Durable message count for a thread without forcing a full transcript
+   * load when the thread is not already cached. */
+  messageCountFor(threadId: string): number {
+    const cached = this.threads.get(threadId);
+    if (cached) return cached.messages.length;
+    return mdb.countMessages(threadId);
+  }
+
+  /** Drop `automationKey` (and matching aliases) from every task on this
+   * bot so a rollover can stamp the key onto a fresh task without
+   * `taskByAutomationKey` still resolving the bloated predecessor. */
+  clearAutomationKey(botId: string, automationKey: string): void {
+    if (!automationKey) return;
+    const bot = this.bot(botId);
+    if (!bot?.tasks) return;
+    let changed = false;
+    for (const task of bot.tasks) {
+      if (task.automationKey === automationKey) {
+        delete task.automationKey;
+        changed = true;
+      }
+      if (task.automationKeyAliases?.includes(automationKey)) {
+        const next = task.automationKeyAliases.filter((key) => key !== automationKey);
+        task.automationKeyAliases = next.length > 0 ? next : undefined;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.saveBots();
+    this.emit({ type: "bot", botId });
+  }
+
+  /** Mint a fresh task that takes `automationKey` from any prior owner on
+   * this bot.  The old task keeps its transcript; the new one starts with
+   * a thin system pointer.  Used when a forever automation thread has
+   * grown past the rollover threshold (see `server/automation-rollover.ts`).
+   * Does not delete history. */
+  rolloverAutomationTask(
+    botId: string,
+    automationKey: string,
+    opts?: { title?: string; activate?: boolean; previousThreadId?: string },
+  ): TaskRecord | null {
+    const bot = this.bot(botId);
+    if (!bot || !automationKey) return null;
+    const previous =
+      (opts?.previousThreadId ? this.taskByThread(botId, opts.previousThreadId) : undefined) ??
+      this.taskByAutomationKey(botId, automationKey);
+    const previousThreadId = previous?.threadId ?? opts?.previousThreadId;
+    const turns = previous?.usage?.turns ?? 0;
+    const messages = previousThreadId ? this.messageCountFor(previousThreadId) : 0;
+    this.clearAutomationKey(botId, automationKey);
+    const title = opts?.title?.trim() || previous?.title || "Automation";
+    const activate = opts?.activate ?? true;
+    // createTask reunites on a matching key — we already cleared it.
+    const neu = this.createTask(botId, title, activate, automationKey);
+    if (!neu) return null;
+    if (previousThreadId) {
+      this.appendMessage(neu.threadId, {
+        role: "system",
+        kind: "text",
+        text: automationRolloverSeedText({
+          previousThreadId,
+          previousTitle: previous?.title,
+          turns,
+          messages,
+        }),
+      });
+    }
+    return neu;
   }
 
   /** A fresh context on the same bot: new thread, new session, same

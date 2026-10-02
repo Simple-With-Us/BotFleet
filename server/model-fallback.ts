@@ -12,6 +12,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
+import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
  *  gemini-3.1-pro-high/low yields ids the engine rejects.  Prefer the
@@ -567,15 +568,19 @@ export function selectTurnFallback(input: {
   for (let i = start; i < chain.length; i++) {
     const next = chain[i];
     if (!next?.instanceId) continue;
-    if (input.current && sameEngine(next, input.current)) continue;
+    // Heal retired picker ids before same-engine / rejection checks so a
+    // saved MiniMax-M3 entry cannot loop against a live Flash Preview
+    // primary or burn another unknown-model spawn.
+    const model = rewriteRetiredModelId(next.model);
+    if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
     // Skip in place, never re-order: the remaining entries are still the
     // owner's saved preference order, and nextUsed still points past the
     // entry that was chosen so a later failure walks the same chain.
     if (botId && isDoomed?.(botId, next.instanceId, now)) continue;
     // A model the provider already said it does not have would only spend
     // another spawn to hear it again, and end the walk there.
-    if (botId && isRejected?.(botId, next.instanceId, next.model, now)) continue;
-    return { ...selectionForFallbackPick(next), nextUsed: i + 1 };
+    if (botId && isRejected?.(botId, next.instanceId, model, now)) continue;
+    return { ...selectionForFallbackPick({ ...next, model }), nextUsed: i + 1 };
   }
   return undefined;
 }
@@ -865,14 +870,17 @@ export class QuotaCooldownRegistry {
     now = Date.now(),
     opts: { isDoomed?: DoomedEngineGate; isModelRejected?: ModelRejectionGate } = {},
   ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
-    const cd = this.get(botId, primary.instanceId, primary.model, now);
+    // Heal retired picker ids before cooldown / rejection lookups so a
+    // bots.json still naming MiniMax-M3 never reaches the engine.
+    const rewrittenPrimary = rewriteModelSelection(primary).selection;
+    const cd = this.get(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     const isRejected = rejectionGate(opts.isModelRejected);
     // A primary the provider rejected is routed around exactly like a cooling
     // one: it would fail again before doing any work.  Unlike a cooldown it
     // leaves no row for the Usage settings to show as a quota hit.
-    const primaryRejected = isRejected(botId, primary.instanceId, primary.model, now);
+    const primaryRejected = isRejected(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     if (!cd && !primaryRejected) {
-      return { selection: primary, isFallback: false };
+      return { selection: rewrittenPrimary, isFallback: false };
     }
     // A rejected primary has no cooldown row, so the result carries none.
     const resolved = (selection: ModelSelection, isFallback: boolean) => {
@@ -880,17 +888,18 @@ export class QuotaCooldownRegistry {
       if (cd) result.cooldown = cd;
       return result;
     };
-    const fallbacks = primary.fallbacks;
+    const fallbacks = rewrittenPrimary.fallbacks;
     if (fallbacks && fallbacks.length > 0) {
       const isDoomed = doomedGate(opts.isDoomed);
       for (const fb of fallbacks) {
-        if (this.get(botId, fb.instanceId, fb.model, now)) continue;
-        if (isDoomed(botId, fb.instanceId, now)) continue;
-        if (isRejected(botId, fb.instanceId, fb.model, now)) continue;
-        return resolved(fb, true);
+        const next = rewriteModelSelection(fb).selection;
+        if (this.get(botId, next.instanceId, next.model, now)) continue;
+        if (isDoomed(botId, next.instanceId, now)) continue;
+        if (isRejected(botId, next.instanceId, next.model, now)) continue;
+        return resolved(next, true);
       }
     }
-    return resolved(primary, false);
+    return resolved(rewrittenPrimary, false);
   }
 }
 
