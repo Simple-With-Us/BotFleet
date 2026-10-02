@@ -674,8 +674,20 @@ async function healthTopology(ports, options = {}) {
   return healthTopologyResult(await Promise.all(ports.map(probeHealth)), options);
 }
 
+const OWNER_KEYS = ["version", "pid", "port", "nonce"];
+
+/**
+ * Strict on the unknown-key case as well as the field cases, so a record
+ * carrying anything beyond the four documented fields is refused rather than
+ * partially believed.  The updater is the one module in this directory that
+ * imports nothing outside node: builtins, because it has to run while the app,
+ * the checkout and the stage's node_modules are all in flux; it therefore
+ * cannot take a schema library at this trust boundary.
+ */
 function validOwner(owner) {
-  return owner?.version === 1 && Number.isInteger(owner.pid) && owner.pid > 0 &&
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return false;
+  if (Object.keys(owner).some((key) => !OWNER_KEYS.includes(key))) return false;
+  return owner.version === 1 && Number.isInteger(owner.pid) && owner.pid > 0 &&
     Number.isInteger(owner.port) && owner.port > 0 && owner.port <= 65535 &&
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
 }

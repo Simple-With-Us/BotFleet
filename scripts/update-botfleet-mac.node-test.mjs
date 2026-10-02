@@ -1562,6 +1562,17 @@ test("preflight names a stale owner record as a stopped harness, not a first ado
   const absent = await runtimePreflight({ dataDirectory }, null);
   assert.equal(absent.safe, false);
   assert.match(absent.reason, /first adoption/);
+
+  // A record carrying a field the owner contract does not define is refused
+  // rather than partially believed.  Extra keys used to pass validation and
+  // were then ignored downstream, so nothing was exploitable; refusing them
+  // means a malformed or tampered record cannot be half-honoured.
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64), extra: 1 }));
+  await chmod(record, 0o600);
+  await assert.rejects(
+    () => runtimePreflight({ dataDirectory }, null),
+    /Harness owner record is invalid/,
+  );
 });
 
 test("packaged identity comes from the build output rather than an ambient label", async () => {
