@@ -9,6 +9,19 @@
 // it is a "you probably didn't mean to hand THIS one over unattended"
 // backstop for the obvious catastrophes. Real containment is the
 // sandbox and the bot's own computer, not a regex.
+//
+// Three guards stop a request even in auto mode, and outrank any grant:
+//   destructive-guard  the pattern list below, plus the command rows in
+//                      command-guard.ts (git clean, find -delete, pkill ...)
+//   sensitive-guard    keys, credentials and the files that run code later
+//                      (shell startup files, launch agents)
+//   system-guard       a command that changes the computer outside the
+//                      project (launchctl, crontab, global installs), and a
+//                      Write or Edit whose real path leaves the bot's folders
+
+import { z } from "zod";
+
+import { commandRisk, type CommandRisk } from "./command-guard.ts";
 
 const DESTRUCTIVE = [
   /\brm\s+(-[a-z]*\s+)*-[a-z]*[rf]/i, // rm -rf, rm -fr, rm -r -f
@@ -40,12 +53,24 @@ const SENSITIVE = [
   /\.aws\/credentials|\.netrc|\.npmrc|\.pypirc|\.docker\/config\.json/i,
   /security\s+find-(generic|internet)-password|\bkeychain\b/i,
   /\bcredentials?\.json\b|\bserviceaccount\b/i,
+  // Files that run code the next time a terminal opens or a user logs in.  A
+  // write here outlives the turn and runs with nobody asking, which is why they
+  // sit beside the keys; a read is carded too, because people export tokens
+  // from these files.  The leading delimiter keeps `webpack.profile.js` and
+  // `.profile-picture.png` out.
+  /(^|[\s/"'=:~])\.(zshrc|zshenv|zprofile|zlogin|zlogout|bashrc|bash_profile|bash_login|bash_logout|bash_aliases|profile|cshrc|tcshrc|kshrc)(?![\w-])/i,
+  /\.config\/fish\/(config\.fish|conf\.d|functions)|(^|[\s/"'])config\.fish(?![\w-])/i,
+  /\.config\/(systemd\/user|autostart)\b/i,
+  /\bLibrary\/Launch(Agents|Daemons)\b/i,
+  /(^|[\s"'=:])\/etc\/(zshrc|zprofile|zshenv|zlogin|bashrc|bash\.bashrc|profile|profile\.d|paths|paths\.d|environment|sudoers|sudoers\.d|crontab|cron\.[a-z]+)\b/i,
+  /\/var\/(at\/tabs|spool\/cron)\b/i,
+  /Start Menu\/Programs\/Startup/i,
   // BotFleet's own state is a credential store too, and it was the one
   // place the list above missed: config.json holds every provider key, and
   // a bot that can `cat` it has the whole fleet.  The data directory is
   // `~/.botfleet` by default, or OMB_DATA_DIR on a test or soak rig — both
   // named here rather than imported, because this file stays free of
-  // imports.  The app-owned workspaces live under that same directory
+  // config imports.  The app-owned workspaces live under that same directory
   // (server/workspace.ts), so they are covered by it.
   /(^|[\s/"'])\.botfleet([/\\]|$|["'\s])/i,
   // The desktop's OS-encrypted credential document (safeStorage), which is
@@ -90,6 +115,68 @@ export function looksSensitive(text: string): boolean {
 
 export function looksDestructive(text: string): boolean {
   return matchFirst(DESTRUCTIVE, text) !== null;
+}
+
+/** The rule that makes `text` sensitive, or null.  A match that only
+ * `looksSensitive` sees (the Windows spelling) still gets a name. */
+function sensitiveRule(text: string): string | null {
+  return looksSensitive(text) ? (matchFirst(SENSITIVE, text) ?? "sensitive-file") : null;
+}
+
+/** The command rows (command-guard.ts) apply to what runs a command: the
+ * shell tools and a background job.  Any other tool's summary is data (a
+ * Write's is the JSON of its input, file content included), and a README
+ * that says "brew install jq" is not a global install. */
+function commandRiskFor(tool: string, summary: string): CommandRisk | null {
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
+  if (JOB_TOOLS.has(bare)) return commandRisk(summary.replace(/^job:\s*/, ""));
+  return COMMAND_TOOLS.has(bare) ? commandRisk(summary) : null;
+}
+
+/** Where a file-writing ask would really land, as decided by
+ * server/path-containment.ts from the raw path the driver carried. */
+export interface FileWriteCheck {
+  /** every path stays inside the turn folder, the bot's workspace or temp */
+  contained: boolean;
+  /** why it is not contained, for the decision log */
+  why?: string;
+  /** the physical locations the write would land on, symlinks resolved */
+  real: readonly string[];
+}
+
+const FILE_PATH_KEYS = new Set(["file_path", "notebook_path"]);
+const FILE_WRITE_TOOLS = new Set(["write", "edit", "multiedit", "notebookedit"]);
+const filePath = z.string().min(1);
+
+/** The raw path(s) a Claude file-writing tool asked to touch, or undefined
+ * for any other tool.  A path key that holds anything but a non-empty string
+ * is carried as "" (and a tool with no path key at all as an empty list), which
+ * the path check refuses: nothing that cannot be located is approved. */
+export function fileWritePaths<Input extends object>(tool: string, input: Input | undefined): string[] | undefined {
+  if (!FILE_WRITE_TOOLS.has(tool.toLowerCase())) return undefined;
+  const paths: string[] = [];
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (!FILE_PATH_KEYS.has(key)) continue;
+    const parsed = filePath.safeParse(value);
+    paths.push(parsed.success ? parsed.data : "");
+  }
+  return paths;
+}
+
+interface FileGuard {
+  source: "sensitive-guard" | "system-guard";
+  rule: string;
+}
+
+/** What the real location of a file write says: a startup or credential file
+ * even inside a root, or a path that left every root. */
+function fileWriteGuard(check: FileWriteCheck | undefined): FileGuard | null {
+  if (!check) return null;
+  for (const real of check.real) {
+    const rule = sensitiveRule(real);
+    if (rule) return { source: "sensitive-guard", rule };
+  }
+  return check.contained ? null : { source: "system-guard", rule: `file-write:${check.why ?? "outside-roots"}` };
 }
 
 /** The key an "Always allow" remembers.
@@ -219,12 +306,17 @@ export function offerableApprovalKey(
   tool: string,
   summary: string,
   scope?: "local-computer" | "disposable-computer",
+  context?: { fileWrite?: FileWriteCheck },
 ): string | undefined {
   if (scope === "local-computer") return undefined;
   // every job start asks (ruling c): there is no grant to offer
   if (isJobTool(tool)) return undefined;
   if (looksDestructive(summary) || looksDestructive(tool)) return undefined;
   if (looksSensitive(summary)) return undefined;
+  // a command row or a write outside the bot's folders is never remembered:
+  // the grant would be for the program or the tool, and the next use of it
+  // may be the ordinary one
+  if (commandRiskFor(tool, summary) || fileWriteGuard(context?.fileWrite)) return undefined;
   const key = approvalKey(tool, summary, scope);
   if (coarseAlwaysAllowRefused(key, { scope })) return undefined;
   return key;
@@ -245,6 +337,7 @@ export type AutoVerdictSource =
   | "local-computer-block"
   | "destructive-guard"
   | "sensitive-guard"
+  | "system-guard"
   | "no-grant";
 
 export interface AutoVerdict {
@@ -275,12 +368,26 @@ export function autoVerdict(
     jobWake?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
+    /** Where a Claude Write or Edit would really land, decided from the raw
+     *  path its driver carried (server/path-containment.ts).  Absent for
+     *  every tool whose driver carries no path; nothing is guessed then. */
+    fileWrite?: FileWriteCheck;
   },
 ): AutoVerdict {
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
-  const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
-  const sensitive = destructive ? null : looksSensitive(summary) ? (matchFirst(SENSITIVE, summary) ?? "sensitive-file") : null;
+  const risk = commandRiskFor(tool, summary);
+  const fileGuard = fileWriteGuard(context?.fileWrite);
+  const destructive =
+    matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool) ?? (risk?.kind === "destructive" ? risk.rule : null);
+  const sensitive = destructive
+    ? null
+    : (sensitiveRule(summary) ?? (fileGuard?.source === "sensitive-guard" ? fileGuard.rule : null));
+  // not destructive and not a credential, but it changes the computer outside
+  // the project, or writes outside the folders the bot works in
+  const systemChange = destructive || sensitive
+    ? null
+    : (risk?.kind === "system" ? risk.rule : null) ?? (fileGuard?.source === "system-guard" ? fileGuard.rule : null);
   // The grant is computed even when a hard block will refuse it: the row
   // worth auditing is "this WOULD have auto-approved, and only the block
   // stood in the way", which cannot be told apart from an ordinary
@@ -291,7 +398,7 @@ export function autoVerdict(
   // mode starts jobs without asking).  One cut to fit is the exception.
   const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
   const grant =
-    destructive || sensitive || unsafeCommand
+    destructive || sensitive || systemChange || unsafeCommand
       ? null
       : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
@@ -300,6 +407,7 @@ export function autoVerdict(
           : null;
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
+  if (systemChange) return { approve: null, source: "system-guard", rule: systemChange };
   if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
     // Owner ruling (c), 2026-10-01: a bot in Auto mode starts background

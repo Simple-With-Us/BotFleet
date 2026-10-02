@@ -9,6 +9,7 @@ import {
   autoDecision,
   autoVerdict,
   coarseAlwaysAllowRefused,
+  fileWritePaths,
   isCoarseApprovalKey,
   looksDestructive,
   looksSensitive,
@@ -436,5 +437,316 @@ describe("job_start approvals", () => {
     const verdict = autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ...host, unattended: true });
     expect(verdict.approve).toBeNull();
     expect(verdict.source).toBe("unattended-block");
+  });
+});
+
+// The approval gaps the Cherry Studio review found: a single-stage command
+// with no shell metacharacter was approved in auto mode even when it wiped
+// the tree, reached the launch agents or installed a package globally, and a
+// Write or Edit anywhere on disk was approved without a path check.
+describe("command rows that force a card in auto mode", () => {
+  const auto = { autoApprove: true };
+  // a remembered grant for the program must not widen into the row
+  const granted = {
+    autoApprove: true,
+    alwaysAllow: ["Bash:git", "Bash:npm", "Bash:pnpm", "Bash:brew", "Bash:pip", "Bash:find", "Bash:launchctl", "Bash:crontab", "Bash:cargo"],
+  };
+
+  const destructiveRows: Array<[string, string]> = [
+    ["git-clean", "git clean -fd"],
+    ["git-clean", "git -C ../app clean -fdx"],
+    ["git-clean", "sudo git clean -fd"],
+    ["git-clean", "FOO=1 git clean -fd"],
+    ["git-clean", '"git" clean -fd'],
+    ["git-clean", "sh -c 'git clean -fd'"],
+    ["git-checkout-discard", "git checkout ."],
+    ["git-checkout-discard", "git checkout -- ."],
+    ["git-restore-discard", "git restore ."],
+    ["find-delete", "find . -name '*.tmp' -delete"],
+    ["find-exec-rm", "find . -type f -exec rm {} +"],
+    ["truncate", "truncate -s 0 app.log"],
+    ["pkill", "pkill node"],
+    ["killall", "killall Dock"],
+    // chained commands are carded anyway, but under the rule that names them
+    // and out of reach of the reviewer, which only looks at undecided cards
+    ["pkill", "ls && pkill node"],
+  ];
+  for (const [rule, command] of destructiveRows) {
+    it(`cards ${JSON.stringify(command)} as ${rule}`, () => {
+      for (const bot of [auto, granted]) {
+        expect(autoVerdict(bot, "Bash", command)).toEqual({ approve: null, source: "destructive-guard", rule });
+      }
+      expect(autoVerdict(granted, "Bash", command, { unattended: true })).toMatchObject({ approve: null, source: "destructive-guard" });
+      expect(autoDecision(auto, "Bash", command)).toBeNull();
+    });
+  }
+
+  const systemRows: Array<[string, string]> = [
+    ["launchctl", "launchctl load ~/Library/LaunchAgents/x.plist"],
+    ["launchctl", "launchctl bootout gui/501/com.example.x"],
+    ["crontab", "crontab -e"],
+    ["global-install", "npm install -g typescript"],
+    ["global-install", "pnpm add --global typescript"],
+    ["global-install", "brew install jq"],
+    ["global-install", "pip install --user requests"],
+    ["global-install", "pip install requests"],
+    ["global-install", "cargo install ripgrep"],
+  ];
+  for (const [rule, command] of systemRows) {
+    it(`cards ${JSON.stringify(command)} as ${rule}`, () => {
+      // the launch-agent paths in these commands are sensitive on their own,
+      // so judge the command row by the verdict for the bare program too
+      const verdict = autoVerdict(granted, "Bash", command);
+      expect(verdict.approve).toBeNull();
+      expect(["system-guard", "sensitive-guard"]).toContain(verdict.source);
+      if (verdict.source === "system-guard") expect(verdict.rule).toBe(rule);
+      expect(autoVerdict(granted, "Bash", command, { unattended: true }).approve).toBeNull();
+    });
+  }
+
+  it("names a system row's own source and rule when no path already stops it", () => {
+    for (const [rule, command] of [
+      ["launchctl", "launchctl bootout gui/501/com.example.x"],
+      ["crontab", "crontab -e"],
+      ["global-install", "npm install -g typescript"],
+      ["global-install", "brew install jq"],
+    ]) {
+      for (const bot of [auto, granted]) {
+        expect(autoVerdict(bot, "Bash", command)).toEqual({ approve: null, source: "system-guard", rule });
+      }
+    }
+  });
+
+  it("applies to every command tool name, and to a background job", () => {
+    for (const tool of ["bash", "shell", "execute", "run_command", "terminal", "mcp__computer_shared_vm__bash"]) {
+      expect(autoVerdict(auto, tool, "git clean -fd").source, tool).toBe("destructive-guard");
+    }
+    const host = { scope: "local-computer" as const };
+    expect(autoVerdict(auto, "job_start", "job: git clean -fd", host)).toMatchObject({ approve: null, source: "destructive-guard", rule: "git-clean" });
+    expect(autoVerdict(auto, "job_start", "job: npm i -g typescript", host)).toMatchObject({ approve: null, source: "system-guard" });
+    expect(autoVerdict(auto, "job_start", "job: pnpm test", host).approve).toBeTruthy();
+  });
+
+  it("outranks a remembered grant even for the program that was granted", () => {
+    expect(autoDecision({ alwaysAllow: ["Bash:git"] }, "Bash", "git clean -fd")).toBeNull();
+    expect(autoDecision({ alwaysAllow: ["Bash:git"] }, "Bash", "git status")).toBeTruthy();
+    expect(autoDecision({ alwaysAllow: ["Bash:npm"] }, "Bash", "npm install -g typescript")).toBeNull();
+    expect(autoDecision({ alwaysAllow: ["Bash:npm"] }, "Bash", "npm install lodash")).toBeTruthy();
+  });
+
+  it("keeps approving the ordinary commands next to each row", () => {
+    for (const command of [
+      "git status",
+      "git checkout -b feature/x",
+      "git checkout main",
+      "git restore --staged src/a.ts",
+      "git clean -n",
+      "npm install lodash",
+      "npm i -D vitest",
+      "npm run test -- -g slow",
+      "rm build/output.js",
+      "find . -name '*.ts'",
+      "grep -rn truncate src",
+      "crontab -l",
+      "launchctl list",
+      "brew list",
+      ".venv/bin/pip install requests",
+      "kill 1234",
+    ]) {
+      expect(autoVerdict(auto, "Bash", command), command).toMatchObject({ approve: "auto-approved Bash", source: "auto-mode" });
+    }
+    expect(autoVerdict({ alwaysAllow: ["Bash:git"] }, "Bash", "git checkout -b feature/x")).toMatchObject({ source: "always-allow" });
+  });
+
+  it("does not judge text that merely mentions a command when the tool is not a command runner", () => {
+    const body = '{"file_path":"/ws/README.md","content":"install it with brew install jq, then pkill node; git clean -fd"}';
+    expect(autoVerdict(auto, "Write", body)).toMatchObject({ approve: "auto-approved Write" });
+    expect(autoVerdict(auto, "Edit", body)).toMatchObject({ approve: "auto-approved Edit" });
+    expect(autoVerdict(auto, "mcp__github__create_issue", '{"body":"run git clean -fd && pkill node"}').approve).toBeTruthy();
+  });
+
+  it("names the rule so the decision log can say which row stopped it", () => {
+    const verdict = autoVerdict(auto, "Bash", "git -c core.x=y clean -fd");
+    expect(verdict.rule).toBe("git-clean");
+  });
+
+  it("never offers Always allow for a command that a row stops", () => {
+    for (const command of [
+      "git clean -fd",
+      "git checkout .",
+      "find . -delete",
+      "truncate -s 0 x",
+      "pkill node",
+      "launchctl bootout gui/501/x",
+      "crontab -e",
+      "npm install -g typescript",
+      "brew install jq",
+      "pip install --user x",
+    ]) {
+      expect(offerableApprovalKey("Bash", command), command).toBeUndefined();
+    }
+    expect(offerableApprovalKey("Bash", "git status")).toBe("Bash:git");
+    expect(offerableApprovalKey("Bash", "npm install lodash")).toBe("Bash:npm");
+    expect(offerableApprovalKey("Bash", "git checkout -b feature/x")).toBe("Bash:git");
+  });
+});
+
+describe("shell startup files and launch agents are sensitive", () => {
+  for (const text of [
+    "cat ~/.zshrc",
+    "sed -i '' 's/a/b/' ~/.zshrc",
+    "echo 'export X=1' >> $HOME/.bashrc",
+    "tee -a ~/.zprofile",
+    "vim .bash_profile",
+    "ln -s /tmp/x ~/.zshenv",
+    "cat ~/.profile",
+    "cat /Users/milind/.zshrc.local",
+    "cp evil.plist ~/Library/LaunchAgents/",
+    "cat /Library/LaunchDaemons/com.example.plist",
+    "ls /Users/milind/Library/LaunchAgents",
+    "cat ~/.config/fish/config.fish",
+    "cat /etc/zshrc",
+    "cat /etc/sudoers.d/x",
+    "cp x.service ~/.config/systemd/user/",
+    "cat C:\\Users\\runneradmin\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\a.bat",
+    '{"file_path":"/Users/milind/.zshrc","content":"x"}',
+  ]) {
+    it(`stops: ${text}`, () => {
+      expect(looksSensitive(text)).toBe(true);
+      expect(offerableApprovalKey("Bash", text)).toBeUndefined();
+    });
+  }
+  for (const text of [
+    "cat README.md",
+    "cat webpack.profile.js",
+    "node --prof app.js",
+    "npm run profile",
+    "cat src/zshrc-notes.md",
+    "cat .bashrc-template",
+    "cat .profile-picture.png",
+    "ls Library/Preferences",
+    "cat docs/launchagents.md",
+    "echo profile",
+    "cat ~/.botfleet/workspaces/bot-1/memory/profile.md",
+  ]) {
+    it(`allows: ${text}`, () => expect(looksSensitive(text)).toBe(false));
+  }
+
+  it("cards a Bash edit of an rc file in auto mode, which no metacharacter used to stop", () => {
+    const verdict = autoVerdict({ autoApprove: true }, "Bash", "sed -i '' 's/a/b/' ~/.zshrc");
+    expect(verdict).toMatchObject({ approve: null, source: "sensitive-guard" });
+    expect(autoVerdict({ autoApprove: true }, "Bash", "cp evil.plist ~/Library/LaunchAgents/")).toMatchObject({ approve: null, source: "sensitive-guard" });
+  });
+});
+
+describe("fileWritePaths", () => {
+  it("returns the raw path a Claude file tool asked about", () => {
+    expect(fileWritePaths("Write", { file_path: "/ws/a.ts", content: "x" })).toEqual(["/ws/a.ts"]);
+    expect(fileWritePaths("Edit", { file_path: "/ws/a.ts", old_string: "a", new_string: "b" })).toEqual(["/ws/a.ts"]);
+    expect(fileWritePaths("MultiEdit", { file_path: "/ws/a.ts", edits: [] })).toEqual(["/ws/a.ts"]);
+    expect(fileWritePaths("NotebookEdit", { notebook_path: "/ws/n.ipynb" })).toEqual(["/ws/n.ipynb"]);
+    expect(fileWritePaths("write", { file_path: "/ws/a.ts" })).toEqual(["/ws/a.ts"]);
+  });
+
+  it("returns the path exactly as given, quotes, tildes and dots included", () => {
+    expect(fileWritePaths("Write", { file_path: "~/.zshrc" })).toEqual(["~/.zshrc"]);
+    expect(fileWritePaths("Write", { file_path: "/ws/../etc/hosts" })).toEqual(["/ws/../etc/hosts"]);
+    expect(fileWritePaths("Write", { file_path: '"/ws/a b.ts"' })).toEqual(['"/ws/a b.ts"']);
+  });
+
+  it("returns an empty or blank list, which fails closed, when a file tool names no usable path", () => {
+    expect(fileWritePaths("Write", {})).toEqual([]);
+    expect(fileWritePaths("Write", undefined)).toEqual([]);
+    expect(fileWritePaths("Write", { file_path: 5 })).toEqual([""]);
+    expect(fileWritePaths("Write", { file_path: "" })).toEqual([""]);
+    expect(fileWritePaths("Edit", { file_path: ["/ws/a.ts"] })).toEqual([""]);
+    expect(fileWritePaths("Write", { file_path: "/ws/a.ts", notebook_path: 5 })).toEqual(["/ws/a.ts", ""]);
+  });
+
+  it("says nothing about tools that are not Claude file tools", () => {
+    expect(fileWritePaths("Bash", { command: "ls" })).toBeUndefined();
+    expect(fileWritePaths("Read", { file_path: "/ws/a.ts" })).toBeUndefined();
+    expect(fileWritePaths("mcp__fs__write", { file_path: "/ws/a.ts" })).toBeUndefined();
+    expect(fileWritePaths("mcp__x__Write", { file_path: "/ws/a.ts" })).toBeUndefined();
+  });
+});
+
+describe("file writes in auto mode", () => {
+  const auto = { autoApprove: true };
+  const summary = '{"file_path":"/ws/src/a.ts","content":"x"}';
+  const inside = { contained: true, real: ["/ws/src/a.ts"] };
+  const outside = { contained: false, why: "outside-roots", real: ["/Users/milind/Documents/notes.txt"] };
+
+  it("approves a write that the path check kept inside", () => {
+    expect(autoVerdict(auto, "Write", summary, { fileWrite: inside })).toEqual({
+      approve: "auto-approved Write",
+      source: "auto-mode",
+      rule: undefined,
+    });
+    expect(autoVerdict(auto, "Edit", summary, { fileWrite: inside }).approve).toBeTruthy();
+  });
+
+  it("cards a write that left every root, as its own source the reviewer never sees", () => {
+    expect(autoVerdict(auto, "Write", summary, { fileWrite: outside })).toEqual({
+      approve: null,
+      source: "system-guard",
+      rule: "file-write:outside-roots",
+    });
+  });
+
+  it("names the reason when the path could not be established", () => {
+    for (const why of ["relative-path", "unresolvable", "invalid-path", "no-path", "protected-dir"]) {
+      expect(autoVerdict(auto, "Write", summary, { fileWrite: { contained: false, why, real: [] } })).toMatchObject({
+        approve: null,
+        source: "system-guard",
+        rule: `file-write:${why}`,
+      });
+    }
+  });
+
+  it("outranks a remembered Write grant, in every turn kind", () => {
+    const bot = { autoApprove: true, alwaysAllow: ["Write", "Edit"] };
+    expect(autoVerdict(bot, "Write", summary, { fileWrite: outside })).toMatchObject({ approve: null, source: "system-guard" });
+    expect(autoVerdict(bot, "Write", summary, { fileWrite: outside, unattended: true })).toMatchObject({ approve: null, source: "system-guard" });
+    expect(autoVerdict(bot, "Write", summary, { fileWrite: outside, scope: "local-computer" })).toMatchObject({ approve: null, source: "system-guard" });
+    expect(autoVerdict({ alwaysAllow: ["Write"] }, "Write", summary, { fileWrite: outside })).toMatchObject({ approve: null, source: "system-guard" });
+    // and the same grant still works for a write that stayed inside
+    expect(autoVerdict({ alwaysAllow: ["Write"] }, "Write", summary, { fileWrite: inside })).toMatchObject({ source: "always-allow" });
+  });
+
+  it("cards a write that stayed inside a root but landed on a startup or credential file", () => {
+    for (const real of [
+      "/ws/.zshrc",
+      "/Users/milind/Library/LaunchAgents/com.example.plist",
+      "/ws/.ssh/authorized_keys",
+      "/ws/.config/fish/config.fish",
+    ]) {
+      const verdict = autoVerdict(auto, "Write", '{"file_path":"/ws/notes.txt"}', { fileWrite: { contained: true, real: [real] } });
+      expect(verdict, real).toMatchObject({ approve: null, source: "sensitive-guard" });
+    }
+  });
+
+  it("leaves a write alone when the driver did not carry a path", () => {
+    // other engines' edit tools reach autoVerdict with no path to check
+    expect(autoVerdict(auto, "Write", summary).approve).toBeTruthy();
+  });
+
+  it("never offers Always allow for a write that left the roots, or for a startup file", () => {
+    expect(offerableApprovalKey("Write", summary, undefined, { fileWrite: outside })).toBeUndefined();
+    expect(offerableApprovalKey("Write", summary, undefined, { fileWrite: { contained: true, real: ["/ws/.zshrc"] } })).toBeUndefined();
+    expect(offerableApprovalKey("Write", summary, undefined, { fileWrite: inside })).toBe("Write");
+    expect(offerableApprovalKey("Write", summary)).toBe("Write");
+  });
+
+  it("names a launch agent or startup file as sensitive when it is also outside the roots", () => {
+    for (const real of ["/Users/milind/Library/LaunchAgents/com.example.plist", "/Users/milind/.zshrc"]) {
+      const verdict = autoVerdict(auto, "Write", summary, { fileWrite: { contained: false, why: "outside-roots", real: [real] } });
+      expect(verdict, real).toMatchObject({ approve: null, source: "sensitive-guard" });
+    }
+  });
+
+  it("lets the sensitive guard name itself first when the summary already shows a credential path", () => {
+    const sensitiveSummary = '{"file_path":"/Users/milind/.ssh/id_rsa","content":"x"}';
+    expect(autoVerdict(auto, "Write", sensitiveSummary, { fileWrite: outside })).toMatchObject({ source: "sensitive-guard" });
   });
 });

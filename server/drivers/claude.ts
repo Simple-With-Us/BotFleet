@@ -19,6 +19,7 @@ import { z } from "zod";
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
 import { stderrExcerpt } from "../stderr-excerpt.ts";
 import { augmentedPath } from "../env-path.ts";
+import { fileWritePaths } from "../auto-approve.ts";
 import { toolFields } from "../tool-fields.ts";
 import { describeResult } from "../../shared/tool-activity.ts";
 import { captureInput, captureOutput } from "../../shared/item-io.ts";
@@ -1235,6 +1236,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
             askTools.set(ask.id, typeof ask.tool === "string" ? ask.tool : undefined);
+            const paths = fileWritePaths(ask.tool, ask.input);
             emit({
               ...base(threadId, eventTurnId),
               type: "request.opened",
@@ -1242,6 +1244,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               requestType: ask.kind,
               tool: ask.tool,
               summary: askSummary(ask),
+              paths,
+              cwd: paths ? turn.cwd : undefined,
               approvalScope:
                 typeof ask.tool === "string" && hostPrefix !== null && ask.tool.startsWith(hostPrefix)
                   ? "local-computer"
