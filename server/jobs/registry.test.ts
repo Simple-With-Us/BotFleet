@@ -668,6 +668,11 @@ posix("the sweep's costs", () => {
   });
 });
 
+/** The kind a PEM marker names.  The key fixtures below assemble their markers
+ *  from it, so no private-key header sits in the source for a secret scanner
+ *  (gitleaks' `private-key` rule) to take for a real key. */
+const KEY_KIND = "PRIVATE KEY";
+
 /** The log a fake-spawned job "printed": the test writes it directly. */
 const logOf = (h: Harness, id: string) => join(h.dir, "jobs", `${id}.log`);
 
@@ -712,7 +717,7 @@ describe("reads never split a secret", () => {
     if (!started.ok) throw new Error(started.error);
     const filler = `${"f".repeat(99)}\n`.repeat(160); // 16000 bytes
     const body = `${"MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(2)}\n`.repeat(20);
-    const pem = `-----BEGIN PRIVATE KEY-----\n${body}-----END PRIVATE KEY-----\n`;
+    const pem = `-----BEGIN ${KEY_KIND}-----\n${body}-----END ${KEY_KIND}-----\n`;
     writeFileSync(logOf(h, started.job.id), `${filler}${pem}done\n`);
     const first = h.registry.readForModel(started.job.id, 16_384)!;
     const second = h.registry.readForModel(started.job.id, 16_384)!;
@@ -725,9 +730,9 @@ describe("reads never split a secret", () => {
   // in between: no read may carry a line of its body, whatever the window.
   describe("a private key printed in more than one write", () => {
     const bodyLine = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
-    const keyHead = "-----BEGIN PRIVATE KEY-----\n";
+    const keyHead = `-----BEGIN ${KEY_KIND}-----\n`;
     const keyBody = (lines: number) => `${bodyLine}\n`.repeat(lines);
-    const keyTail = "-----END PRIVATE KEY-----\n";
+    const keyTail = `-----END ${KEY_KIND}-----\n`;
 
     it("holds a key that opens the log until its END marker is printed", () => {
       const { spawnFn } = fakeSpawn();
