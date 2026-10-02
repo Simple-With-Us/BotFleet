@@ -954,7 +954,7 @@ ensure_tf_ready() {
   IOS_TF_NOTES_PREV_SHA="$PREV_SHIP_SHA" \
   IOS_TF_NOTES_APP="$DISPLAY_NAME" \
   IOS_TF_NOTES_IOS_PREFIX="$IOS_PATH_PREFIX" \
-  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" \
+  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" "${APPLE_ID:-}" \
     >"${LOG_DIR}/ensure-tf-ready.json" 2>"${LOG_DIR}/ensure-tf-ready.err"
   local rc=$?
   set -e

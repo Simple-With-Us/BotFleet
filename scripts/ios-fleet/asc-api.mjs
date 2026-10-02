@@ -328,7 +328,7 @@ async function main() {
   const [method, path, body, arg4, arg5] = process.argv.slice(2);
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
-    console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion]");
+    console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
     console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
     process.exit(1);
   }
@@ -347,6 +347,50 @@ async function main() {
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
     return { status: res.status, ok: res.ok, parsed, text };
+  }
+
+  // filter[bundleId] is a PREFIX match on Apple's side (app.botfleet also
+  // returns app.botfleet.macos), so always exact-match attributes.bundleId.
+  // When the registry bundle is not registered yet but appleId is known, fall
+  // back to GET /v1/apps/<appleId>.
+  async function resolveAscAppId(bundleId, appleIdHint, logPrefix) {
+    const hint = String(appleIdHint || process.env.ASC_APPLE_ID || "").trim();
+    let appId = null;
+
+    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=50`);
+    if (apps.ok) {
+      const exact = (apps.parsed.data || []).find(
+        (a) => a?.attributes?.bundleId === bundleId
+      );
+      if (exact) {
+        appId = exact.id;
+      } else if ((apps.parsed.data || []).length) {
+        console.error(
+          `${logPrefix}: filter[bundleId]=${bundleId} returned ${apps.parsed.data.length} row(s) but no exact match` +
+          ` (${apps.parsed.data.map((a) => a.attributes?.bundleId).join(", ")})`
+        );
+      }
+    } else {
+      console.error(`${logPrefix}: apps query failed (HTTP ${apps.status})`);
+      return { appId: null, appsStatus: apps.status };
+    }
+
+    if (!appId && hint) {
+      const byId = await api("GET", `/v1/apps/${encodeURIComponent(hint)}`);
+      if (byId.ok && byId.parsed.data?.id) {
+        appId = byId.parsed.data.id;
+        const resolvedBundle = byId.parsed.data.attributes?.bundleId || "(unknown)";
+        console.error(
+          `${logPrefix}: bundle ${bundleId} not in ASC; using appleId ${hint} (${resolvedBundle})`
+        );
+      } else {
+        console.error(
+          `${logPrefix}: appleId fallback ${hint} failed (HTTP ${byId.status})`
+        );
+      }
+    }
+
+    return { appId, appsStatus: apps.status };
   }
 
   // Highest N already used by the "<prefix>.N" MARKETING version train
@@ -383,52 +427,10 @@ async function main() {
       process.exit(2);
     }
 
-    // Resolve the ASC app record.
-    // filter[bundleId] is a PREFIX match on Apple's side (app.botfleet also
-    // returns app.botfleet.macos), so we always exact-match attributes.bundleId.
-    // When the registry still points at a not-yet-registered bundle (e.g. the
-    // premature app.botfleet.ios rename) but appleId is known, fall back to
-    // GET /v1/apps/<appleId> so the seq gate can still verify.
     const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
-    let appId = null;
-    let resolvedBundle = null;
-
-    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=50`);
-    if (apps.ok) {
-      const exact = (apps.parsed.data || []).find(
-        (a) => a?.attributes?.bundleId === bundleId
-      );
-      if (exact) {
-        appId = exact.id;
-        resolvedBundle = exact.attributes.bundleId;
-      } else if ((apps.parsed.data || []).length) {
-        console.error(
-          `latest-build-seq: filter[bundleId]=${bundleId} returned ${apps.parsed.data.length} row(s) but no exact match` +
-          ` (${apps.parsed.data.map((a) => a.attributes?.bundleId).join(", ")})`
-        );
-      }
-    } else {
-      console.error(`latest-build-seq: apps query failed (HTTP ${apps.status})`);
-      process.exit(2);
-    }
-
-    if (!appId && appleIdHint) {
-      const byId = await api("GET", `/v1/apps/${encodeURIComponent(appleIdHint)}`);
-      if (byId.ok && byId.parsed.data?.id) {
-        appId = byId.parsed.data.id;
-        resolvedBundle = byId.parsed.data.attributes?.bundleId || "(unknown)";
-        console.error(
-          `latest-build-seq: bundle ${bundleId} not in ASC; using appleId ${appleIdHint} (${resolvedBundle})`
-        );
-      } else {
-        console.error(
-          `latest-build-seq: appleId fallback ${appleIdHint} failed (HTTP ${byId.status})`
-        );
-      }
-    }
-
+    const { appId, appsStatus } = await resolveAscAppId(bundleId, appleIdHint, "latest-build-seq");
     if (!appId) {
-      console.error(`latest-build-seq: app not found for bundle (HTTP ${apps.status})`);
+      console.error(`latest-build-seq: app not found for bundle (HTTP ${appsStatus})`);
       process.exit(2);
     }
 
@@ -523,8 +525,9 @@ async function main() {
     const bundleId = path;
     const wantBuildVersion = body;
     const wantMarketing = arg4;
+    const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
     if (!bundleId || !wantBuildVersion) {
-      console.error("Usage: node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion]");
+      console.error("Usage: node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
       console.error("  <buildVersion> is CFBundleVersion (CURRENT_PROJECT_VERSION) of the build");
       console.error("  this run uploaded. It is required: without it there is no way to tell the");
       console.error("  new build from the previous ship, and ASC has no record of the new build");
@@ -541,12 +544,11 @@ async function main() {
     const POLL_MS = 15000;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
-    if (!apps.ok || !apps.parsed.data?.[0]) {
-      console.error(`ensure-tf-ready: app not found for bundle (HTTP ${apps.status})`);
+    const { appId, appsStatus } = await resolveAscAppId(bundleId, appleIdHint, "ensure-tf-ready");
+    if (!appId) {
+      console.error(`ensure-tf-ready: app not found for bundle (HTTP ${appsStatus})`);
       process.exit(2);
     }
-    const appId = apps.parsed.data[0].id;
 
     // ---- Phase A: discovery. Poll until the uploaded build has an ASC record.
     let query = `/v1/builds?filter[app]=${appId}&filter[version]=${encodeURIComponent(wantBuildVersion)}`;
