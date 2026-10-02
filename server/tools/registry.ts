@@ -1232,6 +1232,7 @@ const JOB_OUTPUT: HarnessTool = {
   // the deviation is per-surface rather than one raised number.
   wire: {
     mcp: {
+      reason: "jobs P2: the MCP lane has no in-process round loop, so a 120 s wait costs the bot only the wait; the HTTP lane's 75 s sits under a 90 s round budget that cannot move.",
       description:
         "Read what one of your background jobs printed since you last read it: at most 16 KB, ending with the job's status line, for example [status: completed, exit code: 1, 4m 12s]. wait_seconds (at most 120) waits for the job to end first. Call it when you need the output now, not to check on a job: you are told when it ends.",
       schema: {
