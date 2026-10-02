@@ -1350,7 +1350,7 @@ export function GroupView({ group }: { group: Group }) {
             <Search size={18} />
           </button>
           {/* Members' background jobs on this room's thread: notices only, never a wake. */}
-          <JobsMenu threadId={group.threadId} />
+          <JobsMenu threadId={group.threadId} room />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}

@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { ApprovalCard } from "./ApprovalCard";
-import { spokenApprovalPrompt, type Pending } from "./PendingApproval";
+import { pendingApprovalLabel, spokenApprovalPrompt, type Pending } from "./PendingApproval";
 import type { Message } from "@/state/store";
 
 const routineRequest = {
@@ -125,5 +125,27 @@ describe("ApprovalCard routine proposals", () => {
     expect(spoken).toContain("Review the schedule and instructions on screen");
     expect(spoken).not.toContain("Review every item in the backlog");
     expect(spoken.length).toBeLessThan(200);
+  });
+});
+
+describe("a background job's approval", () => {
+  const message: Message = {
+    id: "job-card",
+    role: "bot",
+    kind: "options",
+    at: 1,
+    card: { title: "Approve?", subtitle: "job: pnpm test", options: ["Allow", "Deny"], requestId: "req-job", tool: "job_start" },
+  };
+
+  it("says a background job is starting, and that it keeps running after Allow", () => {
+    const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
+    expect(markup).toContain("Wants to start a background job");
+    expect(markup).not.toContain("job start");
+    expect(markup).toContain("keeps running in the background after you allow it.\u00a0 You can stop it");
+    expect(markup).not.toContain("&nbsp;");
+  });
+
+  it("names the job approval in the composer strip", () => {
+    expect(pendingApprovalLabel({ message, requestId: "req-job", tool: "job_start", detail: "job: pnpm test" })).toBe("Background job approval requested");
   });
 });

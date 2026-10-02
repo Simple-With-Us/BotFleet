@@ -255,3 +255,30 @@ export function jobRowData(job: JobSnapshot): JobRowData {
   if (job.killedBy) row.killedBy = job.killedBy;
   return row;
 }
+
+/** One notice line: "Background job job_x `cmd` failed: exit code 2 after
+ *  3s.  Read its output with job_output." — the label, then how it ended. */
+const NOTICE_LINE = /^Background job job_[0-9A-Za-z]+ `(.*)` ((?:finished|failed|was stopped|was lost)\b.*?)\.(?:\s{2}|$)/;
+
+/** Cut `text` to `max` characters at a word, with an ellipsis. */
+export function clipAtWord(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max - 1);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/** The subtitle a job's wake turn shows in the thread: how the job ended,
+ *  in words, without its id or the bot-directed instructions under it —
+ *  "pnpm test failed: exit code 2 after 3s", or "2 jobs ended". */
+export function jobWakeSubtitle(prompt: string, max = 80): string | undefined {
+  const ended = prompt
+    .split("\n")
+    .map((line) => NOTICE_LINE.exec(line.trim()))
+    .filter((match) => match !== null);
+  if (ended.length === 0) return undefined;
+  if (ended.length > 1) return `${ended.length} jobs ended`;
+  const [, label, how] = ended[0]!;
+  return clipAtWord(`${label} ${how}`, max);
+}
+
