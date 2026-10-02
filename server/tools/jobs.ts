@@ -35,6 +35,7 @@ import {
 } from "../../shared/jobs.ts";
 import type { JobRegistry } from "../jobs/registry.ts";
 import type { AgentToolCallContext } from "./agents.ts";
+import { JOB_SUMMARY_MAX_CHARS, jobCommandForCard } from "./registry.ts";
 
 export type JobToolExecutor = (
   call: TurnToolCall,
@@ -42,12 +43,21 @@ export type JobToolExecutor = (
   runtime: TurnToolRuntime,
 ) => Promise<TurnToolOutcome>;
 
+/** Why a command cannot become a job, or null: one an approval card could
+ *  not show whole.  A person must see everything they allow, so a longer
+ *  command is refused before any card is shown, and the bot is told to put
+ *  it in a script file.  (Auto mode refuses such a summary too, behind this.) */
+export function jobCommandRefusal(command: string): string | null {
+  const shown = jobCommandForCard(command).length;
+  if (shown <= JOB_SUMMARY_MAX_CHARS) return null;
+  return `That command is ${shown} characters, and a job's command is shown whole to whoever approves it, which fits ${JOB_SUMMARY_MAX_CHARS} at most.  Write the commands to a script file in the working folder and start that, for example job_start with "sh build.sh".`;
+}
+
 export interface JobToolsOptions {
   /** The parts of the registry the tools use. */
   registry: Pick<JobRegistry, "start" | "refusal" | "readForModel" | "waitForEnd" | "kill" | "list" | "get">;
   botId: string;
   threadId: string;
-  turnId?: string;
   /** Where commands run: the turn's working folder. */
   cwd: string;
   /** `wake` on a 1:1 thread, `notice` in a room. */
@@ -109,13 +119,15 @@ export function createJobTools(options: JobToolsOptions) {
     return { job };
   };
 
-  const jobStart: JobToolExecutor = async (call) => {
+  const jobStart: JobToolExecutor = async (call, _ctx, runtime) => {
     const command = text(call.arguments.command).trim();
     if (!command) return fail("command must be a non-empty string", "invalid_argument");
+    const tooLong = jobCommandRefusal(command);
+    if (tooLong) return fail(tooLong, "refused");
     const started = options.registry.start({
       botId: options.botId,
       threadId: options.threadId,
-      turnId: options.turnId,
+      turnId: runtime.turnId,
       command,
       cwd: options.cwd,
       timeoutMinutes: count(call.arguments.timeout_minutes),

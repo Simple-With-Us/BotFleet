@@ -552,7 +552,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         // the contract says a host never throws; this normalises the one
         // that does rather than letting it end the turn
         host
-          .execute(decoded, { signal, requestApproval })
+          .execute(decoded, { signal, requestApproval, turnId: deps.base().turnId })
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e);
             return { kind: "error", content: `Tool ${decoded.name} failed: ${message}`, detail: message } as TurnToolOutcome;

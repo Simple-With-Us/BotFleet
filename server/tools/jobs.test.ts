@@ -117,6 +117,15 @@ posix("the job tools on real processes", () => {
     expect(output.content.split("\n").at(-1)).toMatch(/^\[status: failed, exit code: 2, \d+s\]$/);
   });
 
+  it("records the turn that started the job", async () => {
+    const { registry, dir } = registryFor();
+    const host = hostFor(registry, dir);
+    const { runtime } = asking("allowed-once");
+    const started = await host.execute(call("job_start", { command: "true" }), { ...runtime, turnId: "turn-7" });
+    const jobId = /job_\w+/.exec(started.content)![0];
+    expect(registry.get(jobId)?.turnId).toBe("turn-7");
+  });
+
   it("returns at most 16 KB of new output, then the rest, as data", async () => {
     const { registry, dir } = registryFor();
     const host = hostFor(registry, dir);
@@ -245,6 +254,22 @@ posix("the wake promise", () => {
 });
 
 posix("refusing before the card", () => {
+  it("never asks to approve a command the card would cut, and says to write a script file", async () => {
+    const { registry, dir } = registryFor();
+    const host = hostFor(registry, dir);
+    const ask = asking("allowed-once");
+    const outcome = await host.execute(call("job_start", { command: `echo ${"y".repeat(2_000)}` }), ask.runtime);
+    expect(outcome).toMatchObject({ kind: "error", detail: "refused" });
+    expect(outcome.content).toContain("script file");
+    expect(ask.asks).toEqual([]);
+    expect(registry.list()).toEqual([]);
+    // whitespace folds the way the card folds it, so this one fits whole
+    const fits = await host.execute(call("job_start", { command: `echo ${"y".repeat(1_900)}\n\n   ${"z".repeat(50)}` }), ask.runtime);
+    expect(fits.kind).toBe("result");
+    expect(ask.asks).toHaveLength(1);
+    expect(ask.asks[0]!.summary.endsWith("…")).toBe(false);
+  });
+
   it("never asks to approve a job past a cap", async () => {
     const { registry, dir } = registryFor();
     const host = hostFor(registry, dir);

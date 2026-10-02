@@ -43,7 +43,7 @@ import {
   type AgentToolExecutor,
 } from "./agents.ts";
 import { createComputerTools } from "./computer.ts";
-import { createJobTools, type JobToolsOptions } from "./jobs.ts";
+import { createJobTools, jobCommandRefusal, type JobToolsOptions } from "./jobs.ts";
 import { TurnProcessGroups } from "./process-group.ts";
 import { createGithubTools } from "./github.ts";
 import { createPhoneTools } from "./phone.ts";
@@ -103,7 +103,7 @@ export interface TurnToolHostContext {
   /** The background job tools for this turn (jobs P1).  Present exactly when
    *  the dispatch offered them in the catalog — the same one boolean feeds
    *  both, so a job tool the model was not offered finds no executor here. */
-  jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds" | "turnId">;
+  jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds">;
   /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
    *  tool loop drains them between model rounds. */
   drainNotices?: () => string[];
@@ -300,7 +300,10 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
         // admission) is refused BEFORE the card: nobody is asked to approve
         // something that was never going to run.
         if (call.name === "job_start" && ctx.jobs) {
-          const refused = ctx.jobs.registry.refusal({ botId: ctx.botId, threadId: ctx.threadId });
+          // A command the card could not show whole is refused too: nobody
+          // may approve what they cannot read.
+          const command = typeof call.arguments.command === "string" ? call.arguments.command : "";
+          const refused = jobCommandRefusal(command) ?? ctx.jobs.registry.refusal({ botId: ctx.botId, threadId: ctx.threadId });
           if (refused) return failed(refused, "refused");
         }
         const approval = harnessTool(call.name)?.approval;

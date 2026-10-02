@@ -1248,12 +1248,16 @@ export class JobRegistry {
   }
 }
 
+/** The sentence of a notice that sends the bot to a tool.  An engine that has
+ *  no job tools reads the notice without it (server/jobs/prompt.ts). */
+export const JOB_READ_HINT = "  Read its output with job_output.";
+
 /** The line a bot reads when one of its jobs ended.  Never carries output:
  *  the bot reads that with `job_output`, inside the untrusted-data boundary. */
 export function noticeLine(job: JobSnapshot): string {
   const head = `Background job ${job.id} \`${job.label}\``;
   const took = formatJobDuration(jobElapsedMs(job, job.endedAt ?? job.startedAt));
-  const read = "  Read its output with job_output.";
+  const read = JOB_READ_HINT;
   switch (job.status) {
     case "completed":
       return `${head} finished: exit code 0 after ${took}.${read}`;

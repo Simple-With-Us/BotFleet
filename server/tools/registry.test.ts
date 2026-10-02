@@ -493,9 +493,15 @@ describe("the import cycle stays broken", () => {
 // descriptions state are literals; these rows pin them to the numbers
 // shared/jobs.ts actually enforces.
 describe("the background job records", () => {
-  it("state the limits the registry enforces", () => {
+  it("leave the run limits the owner can change to the system prompt, and state the fixed ones", () => {
     const start = harnessTool("job_start")!;
-    expect(start.description).toContain(`${JOB_DEFAULT_MINUTES} minutes unless you set timeout_minutes, at most ${JOB_MODEL_MAX_MINUTES}`);
+    // `jobs.defaultMinutes` and `jobs.maxMinutes` are the owner's: a literal
+    // here would tell the model a limit the harness no longer enforces
+    const stated = JSON.stringify([start.description, start.schema]);
+    expect(stated).not.toContain(String(JOB_DEFAULT_MINUTES));
+    expect(stated).not.toContain(String(JOB_MODEL_MAX_MINUTES));
+    expect(start.description).toContain("in your instructions");
+    expect(JSON.stringify(start.schema)).toContain(`at most ${JOB_SUMMARY_MAX_CHARS} characters`);
     const output = harnessTool("job_output")!;
     expect(output.description).toContain(`at most ${JOB_OUTPUT_MAX_BYTES / 1024} KB`);
     expect(output.description).toContain(`wait_seconds (at most ${JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP})`);

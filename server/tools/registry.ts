@@ -1145,30 +1145,44 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
 
 // ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
 // HTTP lane only in P1: a CLI engine reaches them over MCP in P2.  The
-// numbers below (60 and 240 minutes, 16 KB, 75 s) are literals because this
-// file imports nothing; registry.test.ts pins them to shared/jobs.ts.
+// numbers below (16 KB, 75 s) are literals because this file imports
+// nothing; registry.test.ts pins them to shared/jobs.ts.
 
 const jobsEnabled = (ctx: ToolGateContext) => Boolean(ctx.jobs);
 
-/** Longest command text an approval card carries whole.  Past it the
- *  summary is cut, and auto-approve refuses to answer for the bot
- *  (server/auto-approve.ts), so a hidden tail can never ride an Auto grant. */
+/** Longest command text an approval card carries whole.  `job_start` refuses
+ *  a longer command before any card is shown (server/tools/jobs.ts), so a
+ *  person never clicks Allow on a hidden tail.  Should a summary be cut
+ *  anyway, auto-approve refuses to answer for the bot
+ *  (server/auto-approve.ts), so the tail cannot ride an Auto grant either. */
 export const JOB_SUMMARY_MAX_CHARS = 2000;
 
+/** A job's command as an approval card shows it: every run of whitespace
+ *  folded to one space.  The card cuts it at JOB_SUMMARY_MAX_CHARS, so this
+ *  is also the length a command is held to. */
+export function jobCommandForCard(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+// The run limits (the default and the longest a bot may ask for) are the
+// owner's to change (`jobs.defaultMinutes`, `jobs.maxMinutes`), so neither
+// description states them: the system prompt's jobs section does, from the
+// live settings (server/jobs/prompt.ts), and job_start's own reply says the
+// limit the job got.
 const JOB_START: HarnessTool = {
   name: "job_start",
   description:
-    "Start a long-running shell command in the background on the host computer and return at once. Use it for builds, test suites, dev servers and anything that may take longer than a minute; use bash for quick commands. The job runs in its own process group at low priority with a run limit (60 minutes unless you set timeout_minutes, at most 240). You are told when it ends, so do not poll it, and do not start the same work again while it runs.",
+    "Start a long-running shell command in the background on the host computer and return at once. Use it for builds, test suites, dev servers and anything that may take longer than a minute; use bash for quick commands. The job runs in its own process group at low priority with a run limit (the default and the longest allowed are in your instructions; set timeout_minutes to change it). You are told when it ends, so do not poll it, and do not start the same work again while it runs.",
   schema: {
     type: "object",
     properties: {
       command: {
         type: "string",
-        description: "The shell command to run, exactly as you would type it.",
+        description: `The shell command to run, exactly as you would type it, at most ${JOB_SUMMARY_MAX_CHARS} characters: it is shown whole to whoever approves it. For anything longer, write a script file and run that.`,
       },
       timeout_minutes: {
         type: "integer",
-        description: "Run limit in minutes. Defaults to 60; at most 240. The job is stopped when it runs this long.",
+        description: "Run limit in minutes. Leave it out for the default; a number above the longest allowed is lowered to it. The job is stopped when it runs this long.",
       },
     },
     required: ["command"],
@@ -1183,7 +1197,7 @@ const JOB_START: HarnessTool = {
     policy: "ask",
     summary: (args) => {
       const raw = typeof args.command === "string" ? args.command : "";
-      const command = raw.replace(/\s+/g, " ").trim();
+      const command = jobCommandForCard(raw);
       if (!command) return "job";
       const clipped = command.length > JOB_SUMMARY_MAX_CHARS ? `${command.slice(0, JOB_SUMMARY_MAX_CHARS - 1)}…` : command;
       return `job: ${clipped}`;

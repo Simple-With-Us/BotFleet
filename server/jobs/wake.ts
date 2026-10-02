@@ -20,7 +20,8 @@
 //     it refills them.  Past that, notices wait for the owner.
 //   - Rooms get notices only; a room turn is the room's to start.
 //   - The spend ceiling and the `jobs.wake: false` kill switch stop wakes
-//     without dropping notices.
+//     without dropping notices.  So does an engine with no job tools: a bot
+//     switched to one mid-job reads its notice on its next turn instead.
 //   - A wake that cannot dispatch (busy, reloading, quiescing) puts its
 //     notices back and waits for the next settle — and, because a bot can
 //     go idle without a turn settling (a provider reload ending, a stalled
@@ -36,6 +37,10 @@ export interface JobWakeDeps {
   isRoom(threadId: string): boolean;
   /** The bot is running a turn anywhere (one turn per bot). */
   botBusy(botId: string): boolean;
+  /** The bot's engine mounts the job tools now.  One switched to an engine
+   *  without them while its jobs ran would be woken to read output it has no
+   *  tool for. */
+  botHasJobTools(botId: string): boolean;
   /** The spend ceiling refuses unattended work now. */
   spendBlocked(): boolean;
   /** The steer queue's job-notice channel. */
@@ -164,6 +169,10 @@ export class JobWakeCoordinator {
     // Something else delivered them (a round drain, an owner's turn).
     if (!this.deps.pendingNotices(threadId).some((item) => item.wake)) return;
     if (!this.deps.wakeEnabled()) return;
+    if (!this.deps.botHasJobTools(botId)) {
+      this.deps.log?.(`[jobs] not waking for ${threadId.slice(0, 8)}: its engine has no job tools; the notice waits for the next turn`);
+      return;
+    }
     if ((this.used.get(threadId) ?? 0) >= this.maxConsecutive) {
       this.deps.log?.(`[jobs] not waking for ${threadId.slice(0, 8)}: ${this.maxConsecutive} wakes in a row; the notice waits for the owner`);
       return;

@@ -32,11 +32,12 @@ function setup(overrides: Partial<JobWakeDeps> = {}) {
   const queue = new Map<string, JobNoticeItem[]>();
   const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
   const wakes: Array<{ botId: string; threadId: string; prompt: string; jobIds: string[] }> = [];
-  const state = { busy: new Set<string>(), rooms: new Set<string>(), wake: true, spend: false, fail: false };
+  const state = { busy: new Set<string>(), rooms: new Set<string>(), wake: true, spend: false, fail: false, noTools: new Set<string>() };
   const coordinator = new JobWakeCoordinator({
     wakeEnabled: () => state.wake,
     isRoom: (threadId) => state.rooms.has(threadId),
     botBusy: (botId) => state.busy.has(botId),
+    botHasJobTools: (botId) => !state.noTools.has(botId),
     spendBlocked: () => state.spend,
     drainNotices: (threadId) => {
       const items = queue.get(threadId) ?? [];
@@ -148,6 +149,21 @@ describe("job wakes", () => {
     // and none of their notices were dropped
     expect(t.queue.get("thread-c")).toHaveLength(1);
     expect(t.queue.get("thread-d")).toHaveLength(1);
+  });
+
+  it("does not wake a bot whose engine has no job tools, and keeps its notice for the next turn", async () => {
+    const t = setup();
+    // switched to a CLI engine while its job ran
+    t.state.noTools.add("bot-a");
+    t.finish(job("job_switched", "thread-e", "bot-a"));
+    await t.fireTimers();
+    expect(t.wakes).toHaveLength(0);
+    expect(t.queue.get("thread-e")).toHaveLength(1);
+    expect(t.coordinator.wakesLeft("thread-e")).toBe(3);
+    // another bot, on an engine that has them, is woken as ever
+    t.finish(job("job_other", "thread-f", "bot-b"));
+    await t.fireTimers();
+    expect(t.wakes.map((wake) => wake.threadId)).toEqual(["thread-f"]);
   });
 
   it("puts the notices back, unspent, when the wake cannot dispatch", async () => {

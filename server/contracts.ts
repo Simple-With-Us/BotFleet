@@ -435,6 +435,10 @@ export interface TurnToolRuntime {
    *  for as long as the card is open, then delegates to the harness's
    *  permission broker (`TurnToolHost.requestApproval`). */
   requestApproval(ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }): Promise<RequestOutcome>;
+  /** The turn this call belongs to, when the driver's loop knows it.  A
+   *  tool that leaves something behind the turn (a background job) records
+   *  it, so the thing can be traced back to the turn that made it. */
+  turnId?: TurnId;
 }
 
 /** The harness side of a driver-owned tool loop.  A driver that declares
