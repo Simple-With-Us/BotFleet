@@ -54,6 +54,8 @@ A passing run shows:
 - The rows read the command text.  A program run through a variable (`$TOOL clean`) or a script file is out of their sight, and so is a symlink swapped in between the check and the write.  This is a "you probably did not mean to hand this over unattended" backstop, not a sandbox.
 - The verdict cannot see whether a Python virtualenv is active, so a bare `pip install` asks.  `pip install` through a virtualenv's own `bin/pip`, or with `VIRTUAL_ENV=` in the command, does not.
 - Only Claude's Write, Edit, MultiEdit and NotebookEdit carry a path today.  Other engines' file tools are judged as before.
+- The checks only see what reaches the permission broker.  The Claude CLI in `acceptEdits` mode accepts edits inside its own working folder without asking, so a legacy task that runs with no folder set (the CLI then starts in the home folder) never raises an ask for a file under home, and a `bypassPermissions` (full auto) instance has no broker at all.  Both come from the CLI's documented behavior and were not reproduced against a real CLI here.
+- A command summary is read as the command text.  Codex's older approval shape and an ACP command sent as an array do not carry that text, so the rows have nothing to match there.
 
 ## Cleanup
 

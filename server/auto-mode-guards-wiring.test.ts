@@ -35,7 +35,37 @@ let folder: string;
 let elsewhere: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+/** The few request bodies this test sends. */
+interface BotPatch {
+  name: string;
+  autoApprove: boolean;
+  computers: string[];
+  cwd: string;
+  modelSelection: { instanceId: string; model: string };
+}
+interface TextBody {
+  text: string;
+}
+interface RespondBody {
+  requestId: string;
+  behavior: "allow" | "deny";
+}
+
+/** A card as the transcript shows it. */
+interface CardView {
+  held?: string;
+  subtitle?: string;
+  allowKey?: string;
+}
+
+/** What the broker socket sends back to the proxy. */
+interface AnswerFrame {
+  t: string;
+  id: string;
+  behavior: string;
+}
+
+const api = async (method: string, path: string, body?: BotPatch | TextBody | RespondBody): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
@@ -51,7 +81,8 @@ async function waitForDecision(requestId: string, decision: string, ms = 30_000)
   const deadline = Date.now() + ms;
   for (;;) {
     const { body } = await api("GET", "/api/decisions");
-    const row = ((body.decisions ?? []) as DecisionRow[]).find((r) => r.requestId === requestId && r.decision === decision);
+    const rows: DecisionRow[] = body.decisions ?? [];
+    const row = rows.find((r) => r.requestId === requestId && r.decision === decision);
     if (row) return row;
     if (Date.now() > deadline) return null;
     await sleep(250);
@@ -59,7 +90,7 @@ async function waitForDecision(requestId: string, decision: string, ms = 30_000)
 }
 
 /** The card for one request on a bot's transcript. */
-async function waitForCard(botId: string, requestId: string, ms = 30_000) {
+async function waitForCard(botId: string, requestId: string, ms = 30_000): Promise<CardView | null> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     const { body } = await api("GET", "/api/bots");
@@ -67,7 +98,7 @@ async function waitForCard(botId: string, requestId: string, ms = 30_000) {
     const card = bot?.messages?.find(
       (m: { kind: string; card?: { requestId?: string } }) => m.kind === "options" && m.card?.requestId === requestId,
     );
-    if (card) return card.card as { held?: string; subtitle?: string; allowKey?: string };
+    if (card) return card.card;
     await sleep(250);
   }
   return null;
@@ -111,7 +142,7 @@ async function startBot(name: string) {
     modelSelection: { instanceId: "claude", model: "sonnet" },
   });
   expect(patched.status).toBe(200);
-  const bot = patched.body.bot as { id: string; threadId: string };
+  const bot: { id: string; threadId: string } = patched.body.bot;
   const sent = await api("POST", `/api/bots/${bot.id}/messages`, { text: "go" });
   expect(sent.status, JSON.stringify(sent.body)).toBe(202);
   const conn = await connectBroker(bot.threadId);
@@ -121,7 +152,7 @@ async function startBot(name: string) {
   conn.on("data", (chunk) => {
     buffer += chunk;
     for (let nl = buffer.indexOf("\n"); nl !== -1; nl = buffer.indexOf("\n")) {
-      const message = JSON.parse(buffer.slice(0, nl)) as { t: string; id: string; behavior: string };
+      const message: AnswerFrame = JSON.parse(buffer.slice(0, nl));
       buffer = buffer.slice(nl + 1);
       if (message.t === "answer") answers.set(message.id, message);
     }
@@ -174,15 +205,11 @@ posixOnly("auto mode guards are wired from the Claude driver to the card", () =>
         },
       }),
     );
+    const env: NodeJS.ProcessEnv = { HOME: home, USERPROFILE: home, OMB_PORT: String(PORT), FAKE_CLAUDE_MODE: "hang" };
+    if (process.env.PATH) env.PATH = process.env.PATH;
     child = spawnDetached(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        HOME: home,
-        USERPROFILE: home,
-        OMB_PORT: String(PORT),
-        FAKE_CLAUDE_MODE: "hang",
-      },
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));

@@ -130,6 +130,8 @@ function sensitiveRule(text: string): string | null {
 function commandRiskFor(tool: string, summary: string): CommandRisk | null {
   const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
   if (JOB_TOOLS.has(bare)) return commandRisk(summary.replace(/^job:\s*/, ""));
+  // the HTTP lane's bash card reads `bash: <command>`
+  if (bare === "bash") return commandRisk(summary.replace(/^bash:\s+/, ""));
   return COMMAND_TOOLS.has(bare) ? commandRisk(summary) : null;
 }
 

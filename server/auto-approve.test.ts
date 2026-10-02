@@ -521,10 +521,26 @@ describe("command rows that force a card in auto mode", () => {
     for (const tool of ["bash", "shell", "execute", "run_command", "terminal", "mcp__computer_shared_vm__bash"]) {
       expect(autoVerdict(auto, tool, "git clean -fd").source, tool).toBe("destructive-guard");
     }
+    // the shapes the other engines send: Codex wraps in the login shell, ACP
+    // sends the bare command, the HTTP lane labels it
+    expect(autoVerdict(auto, "shell", "/bin/zsh -lc 'git clean -fdx'")).toMatchObject({ source: "destructive-guard", rule: "git-clean" });
+    expect(autoVerdict(auto, "execute", "sudo launchctl bootout gui/501/com.example.x")).toMatchObject({ source: "system-guard", rule: "launchctl" });
+    expect(autoVerdict(auto, "shell", "/bin/zsh -lc 'git status'").approve).toBeTruthy();
     const host = { scope: "local-computer" as const };
     expect(autoVerdict(auto, "job_start", "job: git clean -fd", host)).toMatchObject({ approve: null, source: "destructive-guard", rule: "git-clean" });
     expect(autoVerdict(auto, "job_start", "job: npm i -g typescript", host)).toMatchObject({ approve: null, source: "system-guard" });
     expect(autoVerdict(auto, "job_start", "job: pnpm test", host).approve).toBeTruthy();
+  });
+
+  it("reads the command behind the label the HTTP bash tool puts on its summary", () => {
+    // the HTTP lane's card summary is `bash: <command>`, not the bare command
+    expect(autoVerdict(auto, "bash", "bash: git clean -fd")).toEqual({ approve: null, source: "destructive-guard", rule: "git-clean" });
+    expect(autoVerdict(auto, "bash", "bash: pkill node")).toMatchObject({ source: "destructive-guard", rule: "pkill" });
+    expect(autoVerdict(auto, "bash", "bash: npm install -g typescript")).toMatchObject({ source: "system-guard", rule: "global-install" });
+    expect(autoVerdict(auto, "bash", "bash: sudo sh -c 'git clean -fd'")).toMatchObject({ source: "destructive-guard" });
+    expect(autoVerdict(auto, "bash", "bash: git status").approve).toBeTruthy();
+    expect(autoVerdict(auto, "bash", "bash: npm install lodash").approve).toBeTruthy();
+    expect(autoVerdict(auto, "bash", "bash").approve).toBeTruthy();
   });
 
   it("outranks a remembered grant even for the program that was granted", () => {
