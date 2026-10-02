@@ -680,9 +680,10 @@ const OWNER_KEYS = ["version", "pid", "port", "nonce"];
  * Strict on the unknown-key case as well as the field cases, so a record
  * carrying anything beyond the four documented fields is refused rather than
  * partially believed.  The updater is the one module in this directory that
- * imports nothing outside node: builtins, because it has to run while the app,
- * the checkout and the stage's node_modules are all in flux; it therefore
- * cannot take a schema library at this trust boundary.
+ * imports nothing from node_modules — only node: builtins and two sibling
+ * project modules — because it has to run while the app, the checkout and the
+ * stage's own dependency tree are all in flux, and it installs that tree
+ * itself.  It therefore cannot take a schema package at this trust boundary.
  */
 function validOwner(owner) {
   if (!owner || typeof owner !== "object" || Array.isArray(owner)) return false;
