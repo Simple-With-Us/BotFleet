@@ -2832,7 +2832,7 @@ bus.subscribe((event: RuntimeEvent) => {
     // The turn's job tools go with it.  A comms token is minted per turn and
     // can outlive it, so leaving the mount up would let a replayed token
     // start a job against a finished turn's working folder.
-    unmountCliJobTurn(event.threadId);
+    unmountCliJobTurn(event.threadId, event.turnId);
   }
 });
 

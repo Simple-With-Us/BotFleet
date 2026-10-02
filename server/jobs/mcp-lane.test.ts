@@ -258,4 +258,39 @@ describe("the mounted CLI job turn", () => {
     unmountCliJobTurn("thread_me");
     expect(readCliJobTurn("bot_me", "thread_me")).toBeUndefined();
   });
+
+  it("leaves a ROOM peer alone: one thread, several bots' turns at once", () => {
+    // A room is one thread shared by every member, and a `turn.completed`
+    // names no bot.  Unmounting the whole thread would pull the job tools out
+    // from under the members still working, so the turn id decides.
+    mountCliJobTurn({ ...turn, botId: "bot_a", turnId: "turn_a" });
+    mountCliJobTurn({ ...turn, botId: "bot_b", turnId: "turn_b" });
+    try {
+      unmountCliJobTurn("thread_me", "turn_a");
+      expect(readCliJobTurn("bot_a", "thread_me")).toBeUndefined();
+      // The peer is mid-turn and keeps its tools.
+      expect(readCliJobTurn("bot_b", "thread_me")?.turnId).toBe("turn_b");
+      unmountCliJobTurn("thread_me", "turn_b");
+      expect(readCliJobTurn("bot_b", "thread_me")).toBeUndefined();
+    } finally {
+      unmountCliJobTurn("thread_me", "turn_a");
+      unmountCliJobTurn("thread_me", "turn_b");
+    }
+  });
+
+  it("takes down only the unstamped mounts when no turn is named", () => {
+    // Between dispatch and `sendTurn` returning there is a mount with no turn
+    // on it.  An event that names no turn can only be about one of those, so
+    // it must not reach in and tear down a stamped, identified turn.
+    mountCliJobTurn({ ...turn, botId: "bot_a", turnId: "turn_a" });
+    mountCliJobTurn({ ...turn, botId: "bot_b" });
+    try {
+      unmountCliJobTurn("thread_me");
+      expect(readCliJobTurn("bot_b", "thread_me")).toBeUndefined();
+      expect(readCliJobTurn("bot_a", "thread_me")?.turnId).toBe("turn_a");
+    } finally {
+      unmountCliJobTurn("thread_me", "turn_a");
+      unmountCliJobTurn("thread_me");
+    }
+  });
 });

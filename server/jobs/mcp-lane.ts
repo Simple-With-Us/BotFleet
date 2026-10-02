@@ -66,12 +66,21 @@ export function mountCliJobTurn(turn: CliJobTurn): void {
   mountedTurns.set(keyOf(turn.botId, turn.threadId), turn);
 }
 
-/** Unmount when the turn settles, so a token that outlives its turn finds
- *  no job tools rather than a stale turn's folder.  Keyed by thread because
- *  that is all a `turn.completed` event names; one thread is one bot's. */
-export function unmountCliJobTurn(threadId: string): void {
+/** Unmount when the turn settles, so a token that outlives its turn finds no
+ *  job tools rather than a stale turn's folder.
+ *
+ *  Keyed by THREAD **and** turn, not by thread alone: a room is one thread
+ *  shared by every member, and `turn.completed` names no bot, so tearing down
+ *  a whole thread would pull the job tools out from under the members who are
+ *  still working.  An event that names no turn removes only the mounts that
+ *  have no turn stamped on them, which are the ones it can actually be
+ *  talking about. */
+export function unmountCliJobTurn(threadId: string, turnId?: string): void {
   for (const [key, turn] of [...mountedTurns]) {
-    if (turn.threadId === threadId) mountedTurns.delete(key);
+    if (turn.threadId !== threadId) continue;
+    if (turnId !== undefined ? turn.turnId === turnId : turn.turnId === undefined) {
+      mountedTurns.delete(key);
+    }
   }
 }
 
