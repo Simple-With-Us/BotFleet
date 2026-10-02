@@ -170,11 +170,15 @@ function useNow(jobs: readonly JobSnapshot[], live: boolean, fixed?: number): nu
   return fixed ?? now;
 }
 
+/** One empty list for every thread with no jobs, so the clock's effect does
+ *  not re-run on every store update. */
+const NO_JOBS: readonly JobSnapshot[] = [];
+
 export function JobsMenu({ threadId, room = false }: { threadId: string; room?: boolean }) {
   const { state } = useStore();
   const botNames: Record<string, string> = {};
   if (room) for (const bot of state.bots) botNames[bot.id] = bot.name;
-  return <JobsMenuView threadId={threadId} jobs={state.jobsByThread[threadId] ?? []} botNames={room ? botNames : undefined} />;
+  return <JobsMenuView threadId={threadId} jobs={state.jobsByThread[threadId] ?? NO_JOBS} botNames={room ? botNames : undefined} />;
 }
 
 interface OutputState {
