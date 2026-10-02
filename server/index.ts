@@ -1684,7 +1684,10 @@ const jobWakes = new JobWakeCoordinator({
     const bot = store.bot(botId);
     const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
     const adapter = instance?.adapter;
-    if (instance?.driverKind === "boxAgent") return false;
+    // Both guards, not one: `steer` is how a message enters a running turn
+    // and `queueing` is the capability that says this engine can hold one.
+    // Claude is the only driver that implements both today, so every other
+    // engine takes the `false` and leaves the notice for its next turn.
     if (!adapter?.steer || adapter.capabilities.queueing !== true) return false;
     if (providerReloadInProgress) return false;
     return adapter.steer(threadId, prompt);
