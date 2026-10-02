@@ -234,7 +234,8 @@ export function JobsMenuView({ threadId, jobs, botNames, now: fixedNow, defaultO
       if (!ref.current?.contains(event.target as Node)) close(false);
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close(true);
+      // back to the pill, unless focus was somewhere else entirely
+      if (event.key === "Escape") close(ref.current?.contains(document.activeElement) ?? false);
     };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
