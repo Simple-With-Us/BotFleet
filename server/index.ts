@@ -1650,8 +1650,9 @@ const jobWakes = new JobWakeCoordinator({
   // Unattended (owner ruling b): the spend ceiling gates it (spendBlocked
   // above), and the job output it reads sits behind the untrusted fence the
   // automation prompt names — but the bot's own model, never the cheaper
-  // one (unattendedModelDowngrade), and Auto mode may start its next job
-  // (ruling c; autoVerdict's `jobWake`).  The mark it sets is `job`'s.
+  // one (unattendedModelDowngrade).  A full-auto bot starts its next job
+  // without a card, as it does in any turn (autoVerdict).  The mark it sets
+  // is `job`'s.
   startWake: async (botId, threadId, prompt, jobIds) => {
     await startTurn(botId, prompt, { threadId, automationSource: "job" });
     jobRegistry.markNoticesDelivered(jobIds);
@@ -3325,13 +3326,10 @@ bus.subscribe((event: RuntimeEvent) => {
         bot ??
         (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
         (speaker ? store.bot(speaker.botId) : undefined);
-      const markedBy = permission && asker && event.requestId ? unattendedSource(asker.id) : null;
-      const unattended = markedBy !== null;
+      const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
-          // a job's wake keeps Auto mode for `job_start` (ruling c)
-          jobWake: markedBy === "job",
           scope: event.approvalScope,
         })
         : null;

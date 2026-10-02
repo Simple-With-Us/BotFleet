@@ -318,6 +318,24 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
     90_000,
   );
 
+  it(
+    "starts a full-auto bot's job with no card even when the command reads as destructive (owner ruling)",
+    async () => {
+      const bot = await makeBot("literal", { autoApprove: true, acknowledgeLocalAuto: true });
+      // `echo` only prints the words, but the destructive guard reads them as
+      // `git reset --hard`.  Every other tool in Auto mode would stop here.
+      engine.queueCompletion(startsJob("echo git reset --hard", "call_job_literal"));
+      engine.queueCompletion(says("Started it."));
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "print the words" })).status).toBe(202);
+      const ended = await until(async () => (await jobsOf(bot.threadId)).find((job) => job.label === "echo git reset --hard" && job.status === "completed"));
+      expect(ended, `the job never ran. stderr:\n${stderr}`).toBeTruthy();
+      expect(await waitForIdle(bot.id)).toBeTruthy();
+      const live = await botById(bot.id);
+      expect((live?.messages ?? []).some((m: { kind: string; card?: { tool?: string } }) => m.kind === "options" && m.card?.tool === "job_start")).toBe(false);
+    },
+    90_000,
+  );
+
   it("guards the job routes the way the thread events route is guarded", async () => {
     expect((await api("GET", "/api/jobs/not-a-job")).status).toBe(400);
     expect((await api("GET", "/api/jobs/job_01JZZZZZZZZZZZZZZZZZZZZZZZ")).status).toBe(404);

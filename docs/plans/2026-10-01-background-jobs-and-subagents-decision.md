@@ -88,7 +88,7 @@ Native means the engine's own feature, passed through.  Emulated means BotFleet'
   - No wake turns at boot.  A 5-minute sweep kills stray `BOTFLEET_JOB_ID` processes.
   - `jobs.surviveRestart` waits for a launchd bootout fixture.
 - **Approvals:**
-  - `job_start` asks, enforced on the server behind the per-turn grant.
+  - `job_start` asks, enforced on the server behind the per-turn grant.  A bot in full auto is the one exception and never gets a card, whatever the command or the turn (Owner Rulings, 2026-10-02).
   - It gets its own `job:<program>` namespace in `server/auto-approve.ts` and never inherits bash approvals.
   - An abandoned ask counts as a deny.
 - **Redaction and trust:**
@@ -185,7 +185,7 @@ The owner answered the open questions on Oct 1, 2026.  These rulings override th
 
 - **(a) Order:** build P0, then P1, now.
 - **(b) Wake turns are unattended:** a job wake turn counts as unattended.  It goes through spend-ceiling accounting and sits inside the same untrusted-data boundary webhooks use.  It keeps the bot's same model: there is no cheaper-model fallback for job wakes.
-- **(c) Job approval:** a bot set to full-auto (its Auto mode) starts jobs without asking.  Every other bot gets an approval card for every `job_start`, and an abandoned ask counts as a deny.  `job_start` has its own `job:<program>` approval namespace and never inherits bash approvals.
+- **(c) Job approval:** a bot set to full-auto (its Auto mode) starts jobs without asking.  Every other bot gets an approval card for every `job_start`, and an abandoned ask counts as a deny.  `job_start` has its own `job:<program>` approval namespace and never inherits bash approvals.  On 2026-10-02 the owner applied this literally: see "Owner Rulings (2026-10-02)" below.
 - **(d) iPhone (P4):** the phone may stop jobs and read job output.
 - **(e) On by default:** jobs are on by default for HTTP-lane bots at P1.
 
@@ -193,12 +193,19 @@ The owner answered the open questions on Oct 1, 2026.  These rulings override th
 
 Where P1 settled a detail the design above leaves open, after review on PR #784.
 
-- **Ruling (c), as read:** "starts jobs without asking" is read as Auto mode's own behavior.  The destructive and sensitive guards that stop every other Auto-mode tool still stop `job_start`, so a job is never easier to start than the same command through bash, and a `job_start` in a turn a webhook, resource alert or text started still asks.  Both are for the owner to confirm; they are the conservative reading.
+- **Ruling (c), as read (superseded 2026-10-02):** P1 first read "starts jobs without asking" as Auto mode's own behavior, so the destructive and sensitive guards still stopped `job_start`, and a `job_start` in a turn a webhook, resource alert or text started still asked.  The owner rejected that narrowing on 2026-10-02 and applied the ruling literally, with no carve-out.  A bot in full auto never gets a `job_start` approval card, whether or not the command reads as destructive or sensitive, and in every kind of turn: attended, a webhook's, a resource alert's, a text's, or a job's own wake.  A bot that is not in full auto gets a card for every `job_start`, as before.  The change is in `server/auto-approve.ts` and covers the harness's own `job_start` only, so a third-party MCP tool that borrows the name keeps its guards.  Bash and every other tool keep all of theirs.
 - **Command length:** `job_start` refuses a command longer than an approval card shows whole (2,000 characters, whitespace folded) before any card appears, and tells the bot to write a script file.  Nobody approves a hidden tail.
 - **Run limits:** the default and the longest run are the owner's to change, so they are stated in the system prompt's jobs section from the live settings, not in the tool descriptions.
 - **Finished logs:** kept a week, and no more than 256 MiB of them between all finished jobs, oldest first, on top of the 500-record cap.  A dropped job's id stays in the sweep's list.
 - **Other engines:** a bot switched to an engine without the job tools while its jobs ran is told what ended, without the sentence that sends it to `job_output`, and is not woken for it.
-- **Wake turns and Auto mode:** a wake turn is unattended (ruling b), and an unattended turn does not inherit Auto mode.  Ruling (c) is the exception: a full-auto bot's `job_start` is still auto-approved in its own job wake, so it can start the next job.  Every other tool in that turn, and a `job_start` in a turn a webhook, resource alert or text started, still asks.  The destructive, sensitive and cut-summary guards apply throughout.
-- **Updates (a deviation from Restart v1 above, for the owner to confirm):** the updater's quiesce no longer stops jobs, because a quiesce can be rolled back.  The restart that follows an update stops them and marks them lost, the same as any shutdown, so the end state is the same as the design's and a rolled-back update loses nothing.  While the fence is up a job may finish, and its bot is told on the next turn after the restart, not woken.
+- **Wake turns and Auto mode:** a wake turn is unattended (ruling b), and an unattended turn does not inherit Auto mode.  Ruling (c) is the exception, and since 2026-10-02 it is unconditional: a full-auto bot's `job_start` is auto-approved in its own job wake, so it can start the next job, and in a turn a webhook, resource alert or text started.  Every other tool in an unattended turn, bash included, still asks.  No guard applies to a full-auto bot's `job_start`.  The command-length limit still does, because `job_start` refuses a command too long for the card before any card or auto-approval, so nobody and nothing approves a hidden tail.
+- **Updates (a deviation from Restart v1 above, accepted by the owner 2026-10-02):** the updater's quiesce no longer stops jobs, because a quiesce can be rolled back.  The restart that follows an update stops them and marks them lost, the same as any shutdown, so the end state is the same as the design's and a rolled-back update loses nothing.  While the fence is up a job may finish, and its bot is told on the next turn after the restart, not woken.  The owner accepted jobs running through the quiesce fence on 2026-10-02.
 - **Tokens per wake:** each settled wake turn's tokens and cost are totalled apart from other turns, overall and per bot, at `GET /api/jobs/wake-usage`.  That is the measurement the P2 decision on CLI bots waits for.
 - **Boot:** a group whose leader is gone is never signalled by its number.  The sweep stops exactly the processes carrying the lost job's `BOTFLEET_JOB_ID`.
+
+## Owner Rulings (2026-10-02)
+
+The owner settled two points that P1 had left for confirmation.
+
+- **Full-auto bots never get a job approval card.**  The owner applied ruling (c) literally and rejected the narrowing P1 shipped.  A bot in full auto starts jobs without a card whether or not the command reads as destructive or sensitive, and in a turn a webhook, resource alert or text started as well as in an attended turn or a job's own wake.  Every other bot gets a card for every `job_start`, and an abandoned ask counts as a deny.  Nothing else changes: bash and every other tool keep their guards and the unattended block, and a `job:` grant is still never remembered.
+- **Jobs run through the updater quiesce fence.**  The owner accepted the deviation from Restart v1 in the P1 notes.  A job keeps running while the fence is up, and the restart that follows an update still stops it and marks it lost.
