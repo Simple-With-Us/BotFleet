@@ -1041,9 +1041,14 @@ export async function launchAgentPlistLabel(plist, runCommand = run) {
 }
 
 /**
- * The launchd label a bootstrap of `plist` loads.  The legacy-named plist
- * still carries the legacy label, so a harness started from the fallback runs
- * as com.jay.botfleet-server, not as the renamed label.
+ * The launchd label a bootstrap of `plist` is assumed to load when nobody
+ * reads its Label.  The legacy-named com.jay.botfleet-server.plist does not
+ * reliably carry the legacy label: a pre-transition Mac declares
+ * com.jay.botfleet-server in it, but a Mac migrated in place declares
+ * app.botfleet.server in that same file (the owner's Mac did on 2026-10-02).
+ * Mapping the legacy path to the legacy label is the covering guess, not a
+ * fact about the file: rollback boots out config.label unconditionally, so a
+ * legacy-named plist that carries the renamed label is stopped either way.
  */
 export function harnessLaunchdLabel(config, plist) {
   return plist === config.legacyPlist ? config.legacyLabel : config.label;
@@ -1115,6 +1120,35 @@ export async function waitForLaunchdBootout(domain, label, {
   return false;
 }
 
+/**
+ * Boot out every harness job before install: each label loaded now, as well
+ * as each label the capture saw.  The capture ran minutes earlier, and a job
+ * can have been bootstrapped since (a watchdog restarting the harness it
+ * found stopped).  Left loaded, its KeepAlive relaunches the harness the
+ * moment quiesce signals it.  A label found loaded here is recorded on
+ * `previous`, so rollback restores it exactly like one the capture saw.
+ * `launchctl bootout` exits nonzero when the job is already gone, so success
+ * is judged by `launchctl print`, as rollback judges it: only a job that is
+ * still loaded is a refusal.
+ */
+export async function bootOutHarnessForQuiesce(config, previous, {
+  print = (label) => run("launchctl", ["print", `${config.domain}/${label}`], { allowFailure: true }),
+  bootout = (label) => run("launchctl", ["bootout", `${config.domain}/${label}`], { allowFailure: true }),
+  confirmAbsent = (label) => waitForLaunchdBootout(config.domain, label),
+} = {}) {
+  const [loaded, legacyLoaded] = await Promise.all([print(config.label), print(config.legacyLabel)]);
+  if (loaded.code === 0) previous.launchdLoaded = true;
+  if (legacyLoaded.code === 0) previous.legacyLaunchdLoaded = true;
+  // BOTFLEET_LAUNCH_AGENT_LABEL may name the legacy label itself; the
+  // deduplicated list boots each loaded label out exactly once.
+  for (const label of quiesceBootoutLabels(config, previous)) {
+    await bootout(label);
+    if (!(await confirmAbsent(label))) {
+      throw new Error(`Could not boot out ${label} before install: ${config.domain}/${label} is still loaded`);
+    }
+  }
+}
+
 export function applicationAttachmentError(snapshot, openApplication) {
   if (!openApplication) return null;
   const health = Array.isArray(snapshot?.health) ? snapshot.health : [];
@@ -1135,29 +1169,91 @@ export function credentialPreparationReceiptPath(prepared) {
   return join(prepared.stageDirectory, "credential-migration.json");
 }
 
-async function waitForExit(pids, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let remaining = pids.filter(processIsAlive);
-  while (remaining.length && Date.now() < deadline) {
-    await sleep(250);
-    remaining = remaining.filter(processIsAlive);
+async function waitForExit(pids, timeoutMs, { isAlive = processIsAlive, wait = sleep, now = Date.now } = {}) {
+  const deadline = now() + timeoutMs;
+  let remaining = pids.filter((pid) => isAlive(pid));
+  while (remaining.length && now() < deadline) {
+    await wait(250);
+    remaining = remaining.filter((pid) => isAlive(pid));
   }
   return remaining;
 }
 
-async function terminateVerified(pids, previous, config) {
-  let remaining = await waitForExit([...new Set(pids)], config.gracefulExitMs);
-  for (const pid of remaining) {
-    const command = await processCommand(pid);
-    const cwd = await processCwd(pid);
-    const verified = (previous.processCommands?.[pid] && previous.processCommands[pid] === command &&
-        previous.processCwds?.[pid] === cwd) || isExpectedBotFleetProcess(command, cwd, config);
-    if (!verified) throw new Error(`Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`);
-    process.kill(pid, "SIGTERM");
+/**
+ * Send `signal` to `pid` and report whether it was delivered.  ESRCH means
+ * the process has already exited, which is the outcome a shutdown wants, so
+ * it comes back as false rather than as an exception: the 2026-10-02 apply
+ * rolled back on a bare "kill ESRCH" because a BotFleet process finished its
+ * own quit between being verified and being signalled.  Every other failure,
+ * EPERM above all, still throws and names the pid, because a process that
+ * refuses the signal is still running.
+ */
+export function signalProcess(pid, signal, kill = (target, name) => process.kill(target, name)) {
+  try {
+    kill(pid, signal);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not send ${signal} to BotFleet process ${pid}: ${reason}`, { cause: error });
   }
-  remaining = await waitForExit(remaining, config.termExitMs);
+}
+
+/**
+ * Stop the BotFleet processes in `pids`: wait for a graceful exit, SIGTERM
+ * whatever is left once its identity checks out, then wait again.  Never
+ * SIGKILL.
+ *
+ * `current` names the pids resolved just now from what holds BotFleet state
+ * (database holders, processes inside the bundle, the owner answering a
+ * BotFleet port).  Each of those must verify as a BotFleet executable or the
+ * step refuses.  Any other pid was recorded at capture, minutes earlier, and
+ * is only a hint: its process may have finished its own shutdown since, and
+ * the number may now name an unrelated process.  A captured-only pid whose
+ * identity no longer matches is therefore not ours any more.  It is skipped,
+ * never signalled, and never waited on.  Without `current` every pid is
+ * held to the strict rule.
+ *
+ * A process exiting on its own is success at every point.  Under load `ps`
+ * and `lsof` take seconds, so a process can pass the liveness check and be
+ * gone by the time its identity comes back (empty), or by the time the
+ * signal goes out (ESRCH).  Neither is a refusal.  What still has to hold
+ * afterwards: every process actually signalled must exit, and the
+ * transaction's assertQuiesced step re-reads the database holders, the
+ * bundle's processes, and every BotFleet port before anything is installed.
+ */
+export async function terminateVerified(pids, previous, config, {
+  current,
+  isAlive = processIsAlive,
+  commandOf = processCommand,
+  cwdOf = processCwd,
+  kill,
+  wait = sleep,
+  now = Date.now,
+} = {}) {
+  const timing = { isAlive, wait, now };
+  const resolvedNow = current ? new Set(current) : null;
+  const survivors = await waitForExit([...new Set(pids)], config.gracefulExitMs, timing);
+  const signalled = [];
+  for (const pid of survivors) {
+    const command = await commandOf(pid);
+    const cwd = await cwdOf(pid);
+    const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
+      previous.processCwds?.[pid] === cwd;
+    if (!sameAsCaptured && !isExpectedBotFleetProcess(command, cwd, config)) {
+      // Exited while ps and lsof were still describing it: there was no
+      // process left to describe, so its identity came back empty.
+      if (!isAlive(pid)) continue;
+      // A captured pid that now names something else: the process the
+      // capture saw is gone, and this one never held BotFleet state.
+      if (resolvedNow && !resolvedNow.has(pid)) continue;
+      throw new Error(`Process ${pid} still holds BotFleet state but its executable is not an expected BotFleet path`);
+    }
+    if (signalProcess(pid, "SIGTERM", kill)) signalled.push(pid);
+  }
+  const remaining = await waitForExit(signalled, config.termExitMs, timing);
   if (remaining.length) {
-    throw new Error(`BotFleet did not exit after graceful quit and SIGTERM (${remaining.length} verified processes remain); refusing SIGKILL`);
+    throw new Error(`BotFleet did not exit after graceful quit and SIGTERM (pid ${remaining.join(", ")}); refusing SIGKILL`);
   }
 }
 
@@ -1725,22 +1821,26 @@ function createOperations(config) {
     },
 
     quiesce: async (previous) => {
-      // BOTFLEET_LAUNCH_AGENT_LABEL may name the legacy label itself; the
-      // deduplicated list boots each loaded label out exactly once.
-      for (const label of quiesceBootoutLabels(config, previous)) {
-        const stopped = await run("launchctl", ["bootout", `${config.domain}/${label}`], { allowFailure: true });
-        if (stopped.code !== 0) throw new Error(`Could not boot out ${label} before install`);
-      }
+      await bootOutHarnessForQuiesce(config, previous);
       await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
-      const currentHolders = await sqliteHolders(config.dataDirectory);
-      // Re-read the bundle's processes here rather than trusting the capture:
-      // the embedded driver and the helper apps are started on demand, so one
-      // can appear between the capture and the shutdown.
-      const currentBundlePids = await bundleProcessPids(config.appPath);
+      // Re-resolve what holds BotFleet state now rather than trusting the
+      // capture.  The embedded driver and the helper apps start on demand, so
+      // one can appear between the capture and the shutdown; and the harness
+      // the capture saw can have been replaced since, so its recorded pid is
+      // gone or names someone else while the replacement owns the database
+      // and port 8799.  The captured pids still go in, as hints that
+      // terminateVerified drops once their identity no longer matches.
+      const [currentHolders, currentBundlePids, health] = await Promise.all([
+        sqliteHolders(config.dataDirectory),
+        bundleProcessPids(config.appPath),
+        Promise.all(config.ports.map(probeHealth)),
+      ]);
+      const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
       await terminateVerified(
-        [...previous.runtimePids, ...previous.appPids, ...currentBundlePids, ...currentHolders],
+        [...previous.runtimePids, ...previous.appPids, ...current],
         previous,
         config,
+        { current },
       );
     },
 
