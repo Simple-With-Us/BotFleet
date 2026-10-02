@@ -488,12 +488,14 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       files: "yes",
       terminal: "yes",
       thisComputer: "yes",
-      webAccess: "yes",      imageAttachments: "yes",
+      webAccess: "yes",
+      imageAttachments: "yes",
       // The DSH ACP adapter declares composioMcp
       // (server/drivers/acp/dsh.test.ts) — the matrix used to render
       // "-" here because the registry omitted it.
       connectedApps: "yes",
-      crossBotCoordination: "yes",      longContext: "yes",
+      crossBotCoordination: "yes",
+      longContext: "yes",
       roomCoordination: "yes",
       voiceChat: "yes",
       computerUse: "unknown",
@@ -622,7 +624,8 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       // present here even though the direct MiniMax engine does not have it.
       connectedApps: "yes",
       crossBotCoordination: "yes",
-      longContext: "yes",      roomCoordination: "yes",
+      longContext: "yes",
+      roomCoordination: "yes",
       voiceChat: "yes",
       computerUse: "no",
       liveResearch: "no",
