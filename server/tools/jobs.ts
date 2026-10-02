@@ -46,7 +46,8 @@ export type JobToolExecutor = (
 /** Why a command cannot become a job, or null: one an approval card could
  *  not show whole.  A person must see everything they allow, so a longer
  *  command is refused before any card is shown, and the bot is told to put
- *  it in a script file.  (Auto mode refuses such a summary too, behind this.) */
+ *  it in a script file.  A bot in full auto is held to the same limit, since
+ *  its jobs start without a card and this is the only place it is checked. */
 export function jobCommandRefusal(command: string): string | null {
   const shown = jobCommandForCard(command).length;
   if (shown <= JOB_SUMMARY_MAX_CHARS) return null;

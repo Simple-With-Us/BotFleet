@@ -50,7 +50,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, offerableApprovalKey } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -1652,8 +1652,9 @@ const jobWakes = new JobWakeCoordinator({
   // Unattended (owner ruling b): the spend ceiling gates it (spendBlocked
   // above), and the job output it reads sits behind the untrusted fence the
   // automation prompt names — but the bot's own model, never the cheaper
-  // one (unattendedModelDowngrade), and Auto mode may start its next job
-  // (ruling c; autoVerdict's `jobWake`).  The mark it sets is `job`'s.
+  // one (unattendedModelDowngrade).  A full-auto bot starts its next job
+  // without a card, as it does in any turn (autoVerdict).  The mark it sets
+  // is `job`'s.
   startWake: async (botId, threadId, prompt, jobIds) => {
     await startTurn(botId, prompt, { threadId, automationSource: "job" });
     jobRegistry.markNoticesDelivered(jobIds);
@@ -2815,9 +2816,11 @@ bus.subscribe((event: RuntimeEvent) => {
 //
 // Each mark remembers what set it.  `job`: a background job's wake (jobs P1)
 // — nothing outside BotFleet started it, so the turn keeps the bot's own
-// model (owner ruling b) and Auto mode may start its next job (ruling c).
-// `outside`: a webhook, a resource alert, a text, or work handed on from one.
-// A wake never weakens a mark an outside event set: the stronger one stays.
+// model (owner ruling b).  `outside`: a webhook, a resource alert, a text, or
+// work handed on from one.  A wake never weakens a mark an outside event set:
+// the stronger one stays.  The mark does not decide job approvals: a
+// full-auto bot's own `job_start` is auto-approved under either, and under no
+// mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
 const UNATTENDED_TTL_MS = 30 * 60_000;
@@ -3327,8 +3330,12 @@ bus.subscribe((event: RuntimeEvent) => {
         bot ??
         (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
         (speaker ? store.bot(speaker.botId) : undefined);
-      const markedBy = permission && asker && event.requestId ? unattendedSource(asker.id) : null;
-      const unattended = markedBy !== null;
+      const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      // Whose `job_start` this is comes from where it was raised, never from
+      // its name: only the in-process tool host opens asks on the permission
+      // broker, while a Codex bot reports a mounted MCP server's tool by its
+      // bare name, `job_start` included.  Read now, before anything awaits.
+      const ownJobStart = permission && isOwnJobStartRequest(permissionBroker, event);
       // A file-writing ask carries the model's raw path; where it would really
       // land is judged here against the turn's folder, the bot's own
       // workspace and the temp folders, so auto mode never approves a write to
@@ -3343,8 +3350,7 @@ bus.subscribe((event: RuntimeEvent) => {
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
-          // a job's wake keeps Auto mode for `job_start` (ruling c)
-          jobWake: markedBy === "job",
+          ownJobStart,
           scope: event.approvalScope,
           fileWrite,
         })
