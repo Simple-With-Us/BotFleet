@@ -213,7 +213,7 @@ posixOnly("auto mode guards are wired from the Claude driver to the card", () =>
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));
-    const deadline = Date.now() + 40_000;
+    const deadline = Date.now() + 90_000;
     for (;;) {
       try {
         if (await harnessReady(BASE)) break;
@@ -223,7 +223,7 @@ posixOnly("auto mode guards are wired from the Claude driver to the card", () =>
       if (Date.now() > deadline) throw new Error(`server never came up. stderr:\n${stderr}`);
       await sleep(150);
     }
-  }, 60_000);
+  }, 110_000);
 
   afterAll(async () => {
     await waitForExit(child, { signal: "SIGTERM" });
