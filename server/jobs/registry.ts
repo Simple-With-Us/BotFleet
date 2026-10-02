@@ -1274,8 +1274,13 @@ export class JobRegistry {
     this.adoptable.delete(record.id);
     this.lastLogEnd.delete(record.id);
     this.removeFiles(record);
-    this.forgotten.add(record.id);
-    if (this.forgotten.size > JOB_RECORD_MAX) this.forgotten.delete(this.forgotten.values().next().value!);
+    // Only a job that ended lately can have strays the sweep still looks for
+    // (mayHaveStrays); remembering a week-old one would switch the sweep's
+    // process listing back on for the rest of this run.
+    if ((record.endedAt ?? record.startedAt) >= this.now() - SWEEP_RELEVANT_MS) {
+      this.forgotten.add(record.id);
+      if (this.forgotten.size > JOB_RECORD_MAX) this.forgotten.delete(this.forgotten.values().next().value!);
+    }
   }
 
   private removeFiles(record: JobRecord): void {

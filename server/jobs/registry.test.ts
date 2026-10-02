@@ -625,6 +625,29 @@ posix("the sweep's costs", () => {
     expect(listings).toBe(1);
   });
 
+  it("goes quiet again once the jobs it remembered are a week old", async () => {
+    const { spawnFn, children } = fakeSpawn();
+    let listings = 0;
+    const h = harness({
+      spawn: spawnFn,
+      listProcesses: async () => {
+        listings += 1;
+        return [];
+      },
+    });
+    const started = start(h, "build");
+    if (!started.ok) throw new Error(started.error);
+    children[0]!.child.emit("exit", 0, null);
+    // a week and a day on, the once-a-minute check drops the record; nothing of
+    // it is worth a listing of every process's environment
+    h.clock.now += 8 * 24 * 3_600_000;
+    h.awake.now += 60_000;
+    h.registry.tick();
+    expect(h.registry.get(started.job.id)).toBeNull();
+    await h.registry.sweep();
+    expect(listings).toBe(0);
+  });
+
   it("still stops the strays of a job the record cap dropped", async () => {
     const { spawnFn, children } = fakeSpawn();
     const stray = spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
