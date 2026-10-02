@@ -10,6 +10,7 @@ import {
 import {
   ArrowLeft,
   Check,
+  Cloud,
   Loader2,
   Mail,
   QrCode,
@@ -898,6 +899,14 @@ function ValuePoints() {
   );
 }
 
+const endpointHost = (url: string): string => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+};
+
 export function PhoneSetupFlowView({
   controller,
   variant,
@@ -915,6 +924,139 @@ export function PhoneSetupFlowView({
   const manualCodeMode = phonePairingManualCodeMode(Boolean(c.state?.pairing), c.pairingLink);
 
   if (c.phase === "intro") {
+    if (variant === "settings") {
+      const hostedEndpoint = c.state?.endpoints?.find((e) => e.kind === "hosted");
+      const hostedHost = hostedEndpoint ? endpointHost(hostedEndpoint.url) : null;
+      const tailscaleHost = c.state?.tailnetName
+        ? `${c.state.tailnetName}:${c.state.port}`
+        : c.state?.tailscale
+          ? `${c.state.tailscale}:${c.state.port}`
+          : null;
+      const lanHost = c.state?.lan ? `${c.state.lan}:${c.state.port}` : null;
+
+      return (
+        <div className="flex flex-col gap-4 text-left">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-[16px] font-semibold text-ink">
+                {c.state?.devices.length ? "Pair Another Phone" : "Pair a Phone"}
+              </h2>
+              <p className="mt-1 text-[13px] leading-relaxed text-ink-secondary">
+                Select a route below to create an instant pairing QR code for your iPhone.
+              </p>
+            </div>
+            <button
+              onClick={c.start}
+              disabled={!c.state || c.busy || c.accountBusy}
+              className="rounded-lg bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
+            >
+              {c.state?.devices.length ? "Pair (Auto Select)" : "Pair a Phone"}
+            </button>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            {/* Route 1: Tailscale */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck size={16} className={c.tailscaleAvailable ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Tailscale</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      c.tailscaleAvailable ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {c.tailscaleAvailable ? "Connected" : "Offline"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={tailscaleHost ?? "Not connected"}>
+                  {tailscaleHost ?? "Tailnet not detected"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Direct private mesh.  Best when your phone is signed in to Tailscale.
+                </p>
+              </div>
+              <button
+                onClick={c.useTailscale}
+                disabled={!c.tailscaleAvailable || c.busy || c.accountBusy}
+                className="mt-3 w-full rounded-lg border border-hairline/50 bg-control/60 py-1.5 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+              >
+                Pair over Tailscale
+              </button>
+            </div>
+
+            {/* Route 2: Companion Gateway */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Cloud size={16} className={c.hostedReady ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Gateway</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      c.hostedReady ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {c.hostedReady ? "Ready" : "Port 8810"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={hostedHost ?? "Cloudflare Tunnel (port 8810)"}>
+                  {hostedHost ?? "Cloudflare Tunnel (8810)"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Works away from home on cellular or travel Wi-Fi without VPN.
+                </p>
+              </div>
+              <button
+                onClick={c.start}
+                disabled={!c.state || c.busy || c.accountBusy}
+                className="mt-3 w-full rounded-lg bg-accent/90 py-1.5 text-[12px] font-medium text-white hover:bg-accent disabled:opacity-40"
+              >
+                Pair via Gateway
+              </button>
+            </div>
+
+            {/* Route 3: Local Wi-Fi */}
+            <div className="flex flex-col justify-between rounded-xl border border-hairline/40 bg-inset p-3.5">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Wifi size={16} className={lanHost ? "text-accent" : "text-ink-secondary"} />
+                    <span className="text-[13px] font-semibold text-ink">Local Wi-Fi</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                      lanHost ? "bg-success/15 text-success" : "bg-control text-ink-secondary"
+                    }`}
+                  >
+                    {lanHost ? "Available" : "No LAN"}
+                  </span>
+                </div>
+                <div className="mt-2 truncate font-mono text-[11.5px] text-ink-secondary" title={lanHost ?? "Not connected"}>
+                  {lanHost ?? "No local IP"}
+                </div>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-secondary">
+                  Direct LAN connection when both devices are on the same local network.
+                </p>
+              </div>
+              <button
+                onClick={c.useLocal}
+                disabled={!lanHost || c.busy || c.accountBusy}
+                className="mt-3 w-full rounded-lg border border-hairline/50 bg-control/60 py-1.5 text-[12px] font-medium text-ink hover:bg-control disabled:opacity-40"
+              >
+                Pair on Wi-Fi
+              </button>
+            </div>
+          </div>
+
+          {c.error && <p role="alert" className="mt-1 text-[12.5px] text-danger">{c.error}</p>}
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-col items-center text-center">
         <div className="flex size-14 items-center justify-center rounded-2xl bg-accent/12 text-accent">
@@ -930,11 +1072,7 @@ export function PhoneSetupFlowView({
           disabled={!c.state || c.busy || c.accountBusy}
           className="mt-5 w-full max-w-[320px] rounded-lg bg-accent py-2.5 text-[14px] font-medium text-white hover:opacity-90 disabled:cursor-wait disabled:opacity-40"
         >
-          {variant === "settings"
-            ? c.state?.devices.length
-              ? "Pair Another Phone"
-              : "Pair a Phone"
-            : "Set Up My Phone"}
+          Set Up My Phone
         </button>
         {c.error && <p role="alert" className="mt-3 max-w-[390px] text-[12.5px] text-danger">{c.error}</p>}
         {variant === "onboarding" && (

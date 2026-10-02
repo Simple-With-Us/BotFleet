@@ -128,6 +128,11 @@ export function CompanionSection({ profileEmail = "" }: { profileEmail?: string 
       <CompanionGatewayCard />
 
       <Card
+        title="Desktop Browser Access"
+        subtitle="Looking to open BotFleet in a web browser from another Mac or PC?  Manage and test your public web ingress tunnel under the Remote tab in Settings."
+      />
+
+      <Card
         title="Paired Phones"
         subtitle={pairedCount ? "Manage the phones that can use this BotFleet." : "No phones are paired yet."}
       >
