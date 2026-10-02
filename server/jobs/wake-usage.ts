@@ -95,14 +95,30 @@ export class JobWakeUsage {
     this.state.since ??= this.now();
     add(this.state, usage);
     add((this.state.byBot[usage.botId] ??= empty()), usage);
+    this.persist();
+  }
+
+  /** Drop the per-bot rows of bots that no longer exist.  The overall totals
+   *  keep what their wakes cost: that money was spent. */
+  retainBots(isKnown: (botId: string) => boolean): void {
+    let changed = false;
+    for (const botId of Object.keys(this.state.byBot)) {
+      if (isKnown(botId)) continue;
+      delete this.state.byBot[botId];
+      changed = true;
+    }
+    if (changed) this.persist();
+  }
+
+  snapshot(): WakeUsageSnapshot {
+    return structuredClone(this.state);
+  }
+
+  private persist(): void {
     try {
       writeFileAtomic(this.path, JSON.stringify(this.state), { mode: 0o600 });
     } catch {
       /* the totals are a measurement; losing one write never stops a turn */
     }
-  }
-
-  snapshot(): WakeUsageSnapshot {
-    return structuredClone(this.state);
   }
 }

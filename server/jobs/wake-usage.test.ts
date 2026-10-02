@@ -37,6 +37,21 @@ describe("wake usage", () => {
   });
 });
 
+describe("wake usage of a deleted bot", () => {
+  it("loses its row, keeps what its wakes cost in the totals, and persists that", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-wake-usage-"));
+    dirs.push(dir);
+    const usage = new JobWakeUsage(dir, () => 1_700_000_000_000);
+    usage.record({ botId: "bot-gone", inputTokens: 100, outputTokens: 10, costUsd: 0.5 });
+    usage.record({ botId: "bot-kept", inputTokens: 200, outputTokens: 20 });
+    usage.retainBots((botId) => botId === "bot-kept");
+    const totals = usage.snapshot();
+    expect(Object.keys(totals.byBot)).toEqual(["bot-kept"]);
+    expect(totals).toMatchObject({ wakes: 2, inputTokens: 300, pricedWakes: 1, costUsd: 0.5 });
+    expect(new JobWakeUsage(dir).snapshot()).toEqual(totals);
+  });
+});
+
 describe("job notices of a deleted bot", () => {
   it("are dropped from every thread, a room's included, and nobody else's are", () => {
     queueJobNotice("room-1", { jobId: "job_a", botId: "bot-gone", text: "a", wake: false });

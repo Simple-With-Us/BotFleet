@@ -12,7 +12,7 @@
 // hovers high without the machine being in trouble.  The gate is for the
 // last few percent, and the owner can move it (`jobs.admission`).
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { readFileSync, statfsSync } from "node:fs";
 
 export interface AdmissionThresholds {
@@ -62,25 +62,67 @@ export function parseLinuxSwap(text: string): number | null {
 
 const SWAP_CACHE_MS = 10_000;
 
-/** The real host.  Each read is bounded (a 2 s `sysctl`), cached for a few
- *  seconds, and never throws: an unreadable figure is "unknown", which
- *  admits, because a broken probe must not switch jobs off. */
-export function createHostProbe(): HostProbe {
-  let swapAt = 0;
+/** What `createHostProbe` reads the host with.  Injected so the probe is
+ *  tested without a Mac under pressure. */
+export interface HostProbeDeps {
+  platform?: NodeJS.Platform;
+  now?: () => number;
+  /** `sysctl vm.swapusage`'s output, read without blocking. */
+  readDarwinSwap?: () => Promise<string>;
+  /** `/proc/meminfo`'s text. */
+  readLinuxMeminfo?: () => string;
+}
+
+/** A 2 s bound on a command that normally answers in a few milliseconds. */
+const sysctlSwap = (): Promise<string> =>
+  new Promise((resolve, reject) => {
+    execFile("/usr/sbin/sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => (error ? reject(error) : resolve(stdout)));
+  });
+
+/** The real host.  The probe answers from a reading at most a few seconds
+ *  old and never waits for the next one: on macOS the swap figure comes from
+ *  a `sysctl` run in the background, because a harness at load 100 or more
+ *  that waited on it would stall every stream and route behind it (twice per
+ *  `job_start`).  An unreadable figure is "unknown", which admits, because a
+ *  broken probe must not switch jobs off — and so does one not read yet, which
+ *  is why the first reading is started as the probe is built. */
+export function createHostProbe(deps: HostProbeDeps = {}): HostProbe {
+  const platform = deps.platform ?? process.platform;
+  const now = deps.now ?? Date.now;
+  const readDarwinSwap = deps.readDarwinSwap ?? sysctlSwap;
+  const readLinuxMeminfo = deps.readLinuxMeminfo ?? (() => readFileSync("/proc/meminfo", "utf8"));
+  let swapAt = Number.NEGATIVE_INFINITY;
   let swapValue: number | null = null;
+  let refreshing = false;
+  const refreshDarwin = () => {
+    if (refreshing) return;
+    refreshing = true;
+    swapAt = now();
+    readDarwinSwap()
+      .then(
+        (text) => {
+          swapValue = parseDarwinSwap(text);
+        },
+        () => {
+          swapValue = null;
+        },
+      )
+      .finally(() => {
+        refreshing = false;
+      });
+  };
+  if (platform === "darwin") refreshDarwin();
   return {
     swapUsedPercent() {
-      const now = Date.now();
-      if (now - swapAt < SWAP_CACHE_MS) return swapValue;
-      swapAt = now;
+      if (now() - swapAt < SWAP_CACHE_MS) return swapValue;
+      if (platform === "darwin") {
+        refreshDarwin();
+        return swapValue;
+      }
+      swapAt = now();
       try {
-        if (process.platform === "darwin") {
-          swapValue = parseDarwinSwap(execFileSync("/usr/sbin/sysctl", ["vm.swapusage"], { encoding: "utf8", timeout: 2_000 }));
-        } else if (process.platform === "linux") {
-          swapValue = parseLinuxSwap(readFileSync("/proc/meminfo", "utf8"));
-        } else {
-          swapValue = null;
-        }
+        // a procfs read: instant, so it needs no background step
+        swapValue = platform === "linux" ? parseLinuxSwap(readLinuxMeminfo()) : null;
       } catch {
         swapValue = null;
       }

@@ -269,6 +269,10 @@ export interface JobRegistryDeps {
   graceMs?: number;
   logMaxBytes?: number;
   recordMax?: number;
+  /** Most disk the logs of finished jobs may hold between them. */
+  finishedLogBudgetBytes?: number;
+  /** How long a finished job's record and log are kept. */
+  finishedMaxAgeMs?: number;
   spawn?: (spec: JobSpawnSpec) => JobSpawnResult;
   probe?: HostProbe;
   listProcesses?: JobProcessLister;
@@ -284,8 +288,19 @@ const FRAME_FINISHED_LIMIT = 20;
  *  or restarting, which a SIGTERM cannot tell apart. */
 export const JOB_STOPPED_REASON = "BotFleet's server stopped";
 
-/** How often finished records are checked for a deleted thread or bot. */
+/** How often finished records are checked for a deleted thread or bot, and
+ *  held to their age and disk budget. */
 const FORGET_CHECK_MS = 60_000;
+
+/** The logs of finished jobs are kept for a week, and no more than this much
+ *  of them: the oldest go first.  (500 records of 8 MiB each would be 4 GiB on
+ *  a Mac whose disk gates sit at 2 GB free.) */
+export const JOB_FINISHED_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+export const JOB_FINISHED_LOG_BUDGET_BYTES = 256 * 1024 * 1024;
+
+/** A finished job whose process could have left strays that matter this long
+ *  after it ended.  Past it the sweep has had every chance to stop them. */
+const SWEEP_RELEVANT_MS = 24 * 60 * 60_000;
 
 /** Output faster than this is a runaway (`yes`, an error loop), not a log. */
 export const JOB_FLOOD_BYTES_PER_SECOND = 64 * 1024 * 1024;
@@ -446,6 +461,8 @@ export class JobRegistry {
   private readonly tickMs: number;
   private readonly logMaxBytes: number;
   private readonly recordMax: number;
+  private readonly finishedLogBudgetBytes: number;
+  private readonly finishedMaxAgeMs: number;
   private readonly awakeNow: () => number;
   private readonly maxTickCreditMs: number;
   private readonly floodBytesPerSecond: number;
@@ -487,6 +504,8 @@ export class JobRegistry {
     this.logMaxBytes = deps.logMaxBytes ?? JOB_LOG_MAX_BYTES;
     this.floodBytesPerSecond = deps.floodBytesPerSecond ?? JOB_FLOOD_BYTES_PER_SECOND;
     this.recordMax = deps.recordMax ?? JOB_RECORD_MAX;
+    this.finishedLogBudgetBytes = deps.finishedLogBudgetBytes ?? JOB_FINISHED_LOG_BUDGET_BYTES;
+    this.finishedMaxAgeMs = deps.finishedMaxAgeMs ?? JOB_FINISHED_MAX_AGE_MS;
     this.lastTick = this.awakeNow();
     this.lastLogCheck = this.awakeNow();
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
@@ -823,13 +842,7 @@ export class JobRegistry {
     for (const id of ids) {
       const record = this.records.get(id);
       if (!record || isJobActive(record)) continue;
-      this.records.delete(id);
-      this.adoptable.delete(id);
-      this.lastLogEnd.delete(id);
-      this.removeFiles(record);
-      // still ours to sweep, should anything it started outlive it
-      this.forgotten.add(id);
-      if (this.forgotten.size > JOB_RECORD_MAX) this.forgotten.delete(this.forgotten.values().next().value!);
+      this.drop(record);
       threads.add(record.threadId);
     }
     if (threads.size === 0) return;
@@ -926,7 +939,10 @@ export class JobRegistry {
     this.lastTick = awake;
     // Finished records (up to 500) are checked once a minute, not every tick.
     const checkFinished = awake - this.lastForgetCheck >= FORGET_CHECK_MS;
-    if (checkFinished) this.lastForgetCheck = awake;
+    if (checkFinished) {
+      this.lastForgetCheck = awake;
+      if (this.prune() > 0) this.save();
+    }
     for (const record of this.records.values()) {
       if (this.adoptable.has(record.id)) continue; // adopt() settles these
       if (record.status !== "running") {
@@ -1010,9 +1026,24 @@ export class JobRegistry {
     }
   }
 
+  /** Whether a stray could exist: a job of ours that ended within a day, or
+   *  one deleted since this run began.  Older finished jobs have had two
+   *  hundred sweeps to be cleaned up after. */
+  private mayHaveStrays(): boolean {
+    if (this.forgotten.size > 0) return true;
+    const since = this.now() - SWEEP_RELEVANT_MS;
+    for (const record of this.records.values()) {
+      if (!isJobActive(record) && (record.endedAt ?? record.startedAt) >= since) return true;
+    }
+    return false;
+  }
+
   /** Stop every process still carrying the id of a job of ours that is
    *  over.  Resolves with how many it stopped. */
   async sweep(): Promise<number> {
+    // Listing every process's environment is the expensive part, and there
+    // is nothing to find unless a job of ours ended lately (or was deleted).
+    if (!this.mayHaveStrays()) return 0;
     const found = await this.listProcesses();
     const strays = found.filter((proc) => {
       if (proc.pid === process.pid) return false;
@@ -1197,18 +1228,54 @@ export class JobRegistry {
     return snapshot;
   }
 
-  /** Over the record cap, the oldest finished records go, with their files.
-   *  A running job is never dropped. */
-  private prune(): void {
-    if (this.records.size <= this.recordMax) return;
+  /** Finished records are held to three limits, oldest first: how many
+   *  (the record cap), how old (a week), and how much disk their logs take
+   *  between them.  A running job is never dropped.  Resolves with how many
+   *  went. */
+  private prune(): number {
     const finished = [...this.records.values()]
       .filter((record) => !isJobActive(record))
       .sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt));
-    for (const record of finished) {
-      if (this.records.size <= this.recordMax) break;
-      this.records.delete(record.id);
-      this.removeFiles(record);
+    let dropped = 0;
+    const cutoff = this.now() - this.finishedMaxAgeMs;
+    while (finished.length > 0 && (this.records.size > this.recordMax || (finished[0]!.endedAt ?? finished[0]!.startedAt) < cutoff)) {
+      this.drop(finished.shift()!);
+      dropped += 1;
     }
+    // Every log is held to the cap while its job runs, so a handful of
+    // finished ones cannot reach the budget: stat them only when they could.
+    if (finished.length * this.logMaxBytes > this.finishedLogBudgetBytes) {
+      const sizes = new Map<string, number>();
+      let total = 0;
+      for (const record of finished) {
+        let size = 0;
+        try {
+          size = statSync(record.logPath).size;
+        } catch {
+          /* never written, or already gone */
+        }
+        sizes.set(record.id, size);
+        total += size;
+      }
+      while (finished.length > 0 && total > this.finishedLogBudgetBytes) {
+        const oldest = finished.shift()!;
+        total -= sizes.get(oldest.id) ?? 0;
+        this.drop(oldest);
+        dropped += 1;
+      }
+    }
+    return dropped;
+  }
+
+  /** Delete a finished job's record and files.  Anything it started that
+   *  outlives it is still ours to sweep, so its id is remembered. */
+  private drop(record: JobRecord): void {
+    this.records.delete(record.id);
+    this.adoptable.delete(record.id);
+    this.lastLogEnd.delete(record.id);
+    this.removeFiles(record);
+    this.forgotten.add(record.id);
+    if (this.forgotten.size > JOB_RECORD_MAX) this.forgotten.delete(this.forgotten.values().next().value!);
   }
 
   private removeFiles(record: JobRecord): void {

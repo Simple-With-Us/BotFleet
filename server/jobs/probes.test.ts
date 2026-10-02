@@ -3,7 +3,7 @@
 // keep nothing else it reads.
 import { describe, expect, it } from "vitest";
 
-import { admissionRefusal, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
+import { admissionRefusal, createHostProbe, parseDarwinSwap, parseLinuxSwap } from "./admission.ts";
 import { parseEnvListing, parseProcStatPgid } from "./sweep.ts";
 
 describe("swap readings", () => {
@@ -43,5 +43,64 @@ describe("the sweep's process listing", () => {
   it("reads a Linux process group from /proc/<pid>/stat, past a name with spaces", () => {
     expect(parseProcStatPgid("4242 (my (odd) proc) S 1 4240 4240 0 -1")).toBe(4240);
     expect(parseProcStatPgid("garbage")).toBeNull();
+  });
+});
+
+describe("the host probe", () => {
+  const swap = (percent: number) => `vm.swapusage: total = 1000.00M  used = ${percent * 10}.00M  free = ${(100 - percent) * 10}.00M  (encrypted)`;
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  it("answers from its last reading and never waits for the next one", async () => {
+    let clock = 0;
+    const reads: Array<(text: string) => void> = [];
+    const probe = createHostProbe({
+      platform: "darwin",
+      now: () => clock,
+      readDarwinSwap: () => new Promise<string>((resolve) => reads.push(resolve)),
+    });
+    // the first reading starts as the probe is built, and is not waited for
+    expect(reads).toHaveLength(1);
+    expect(probe.swapUsedPercent()).toBeNull();
+    reads[0]!(swap(50));
+    await settle();
+    expect(probe.swapUsedPercent()).toBe(50);
+    // fresh: no second read
+    clock = 9_000;
+    expect(probe.swapUsedPercent()).toBe(50);
+    expect(reads).toHaveLength(1);
+    // stale: one background read, however many asks, and the old figure answers meanwhile
+    clock = 11_000;
+    expect(probe.swapUsedPercent()).toBe(50);
+    expect(probe.swapUsedPercent()).toBe(50);
+    expect(reads).toHaveLength(2);
+    reads[1]!(swap(97));
+    await settle();
+    expect(probe.swapUsedPercent()).toBe(97);
+  });
+
+  it("treats a read that failed as unknown, which admits, and tries again later", async () => {
+    let clock = 0;
+    let reads = 0;
+    const probe = createHostProbe({
+      platform: "darwin",
+      now: () => clock,
+      readDarwinSwap: () => {
+        reads += 1;
+        return reads === 1 ? Promise.resolve(swap(60)) : Promise.reject(new Error("sysctl timed out"));
+      },
+    });
+    await settle();
+    expect(probe.swapUsedPercent()).toBe(60);
+    clock = 20_000;
+    probe.swapUsedPercent();
+    await settle();
+    expect(probe.swapUsedPercent()).toBeNull();
+    expect(reads).toBe(2);
+  });
+
+  it("reads Linux's procfs in place, and has no swap figure anywhere else", () => {
+    const linux = createHostProbe({ platform: "linux", readLinuxMeminfo: () => "SwapTotal: 1000 kB\nSwapFree: 250 kB\n" });
+    expect(linux.swapUsedPercent()).toBe(75);
+    expect(createHostProbe({ platform: "win32" }).swapUsedPercent()).toBeNull();
   });
 });

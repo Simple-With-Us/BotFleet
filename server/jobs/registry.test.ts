@@ -360,6 +360,31 @@ posix("records", () => {
     expect(JSON.stringify(onDisk)).not.toContain("logPath");
   });
 
+  it("drops the oldest finished logs once they pass the disk budget, and any finished job after a week", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const h = harness({ spawn: spawnFn, logMaxBytes: 100, finishedLogBudgetBytes: 250 });
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      h.clock.now += 1000;
+      const started = start(h, `job ${i}`, `t${i}`, `b${i}`);
+      if (!started.ok) throw new Error(started.error);
+      ids.push(started.job.id);
+      writeFileSync(logOf(h, started.job.id), "x".repeat(100));
+      children.at(-1)!.child.emit("exit", 0, null);
+    }
+    // 400 bytes of finished logs against a 250 byte budget: the two oldest go
+    expect(h.registry.list().map((job) => job.id).sort()).toEqual([ids[2]!, ids[3]!].sort());
+    expect(existsSync(logOf(h, ids[0]!))).toBe(false);
+    expect(existsSync(logOf(h, ids[2]!))).toBe(true);
+    // a week on, the once-a-minute check drops the rest
+    h.clock.now += 7 * 24 * 3_600_000 + 1;
+    h.awake.now += 60_000;
+    h.registry.tick();
+    expect(h.registry.list()).toEqual([]);
+    expect(stored(h.dir)).toEqual([]);
+    expect(existsSync(logOf(h, ids[3]!))).toBe(false);
+  });
+
   it("broadcasts one debounced full-set frame per thread, never with output", async () => {
     const { spawnFn, children } = fakeSpawn();
     const h = harness({ spawn: spawnFn });
@@ -571,6 +596,52 @@ posix("the sweep", () => {
     expect(await h.registry.sweep()).toBe(1);
     await until(() => !alive(stray.pid!));
     expect(alive(bystander.pid!)).toBe(true);
+  });
+});
+
+posix("the sweep's costs", () => {
+  it("lists no process while no job of ours ended lately, and again once one does", async () => {
+    const { spawnFn, children } = fakeSpawn();
+    let listings = 0;
+    const h = harness({
+      spawn: spawnFn,
+      listProcesses: async () => {
+        listings += 1;
+        return [];
+      },
+    });
+    expect(await h.registry.sweep()).toBe(0);
+    const started = start(h, "build");
+    if (!started.ok) throw new Error(started.error);
+    // a running job is not over: nothing of it can be a stray yet
+    expect(await h.registry.sweep()).toBe(0);
+    expect(listings).toBe(0);
+    children[0]!.child.emit("exit", 0, null);
+    await h.registry.sweep();
+    expect(listings).toBe(1);
+    // a day and more later it has had every sweep it needed
+    h.clock.now += 25 * 3_600_000;
+    await h.registry.sweep();
+    expect(listings).toBe(1);
+  });
+
+  it("still stops the strays of a job the record cap dropped", async () => {
+    const { spawnFn, children } = fakeSpawn();
+    const stray = spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
+    strays.push(stray);
+    let listed: Array<{ pid: number; pgid: number; jobId: string }> = [];
+    const h = harness({ spawn: spawnFn, recordMax: 1, listProcesses: async () => listed });
+    const first = start(h, "first", "thread-1");
+    if (!first.ok) throw new Error(first.error);
+    children[0]!.child.emit("exit", 0, null);
+    h.clock.now += 1000;
+    const second = start(h, "second", "thread-2");
+    if (!second.ok) throw new Error(second.error);
+    children[1]!.child.emit("exit", 0, null);
+    expect(h.registry.get(first.job.id)).toBeNull();
+    listed = [{ pid: stray.pid!, pgid: stray.pid!, jobId: first.job.id }];
+    expect(await h.registry.sweep()).toBe(1);
+    await until(() => !alive(stray.pid!));
   });
 });
 

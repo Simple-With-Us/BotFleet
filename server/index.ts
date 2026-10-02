@@ -1630,6 +1630,8 @@ const jobRegistry = new JobRegistry({
 });
 /** What job wake turns cost, counted apart from every other turn. */
 const jobWakeUsage = new JobWakeUsage(join(DATA_DIR, "jobs"));
+// a bot deleted while the harness was down has no row to keep
+jobWakeUsage.retainBots((botId) => Boolean(store.bot(botId)));
 const jobWakes = new JobWakeCoordinator({
   wakeEnabled: () => jobSettings().wake,
   isRoom: (threadId) => Boolean(store.groupByThread(threadId)),
@@ -1716,7 +1718,10 @@ function stopJobsForDeleted(threadIds: Iterable<string>, reason: string, botId?:
     jobWakes.forgetThread(threadId);
   }
   // a deleted room member's notices wait on threads that outlive it
-  if (botId) dropJobNoticesForBot(botId);
+  if (botId) {
+    dropJobNoticesForBot(botId);
+    jobWakeUsage.retainBots((id) => Boolean(store.bot(id)));
+  }
 }
 
 /** Take this bot's job notices on this thread for the turn about to read
