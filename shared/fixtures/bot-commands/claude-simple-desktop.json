@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "botId": "b-atlas",
+  "threadId": "t-7f2c",
+  "surface": "desktop",
+  "busy": false,
+  "engine": {
+    "instanceId": "claude",
+    "displayName": "Claude",
+    "model": "claude-opus-5-5",
+    "modelLabel": "Opus 5.5",
+    "effort": "high",
+    "commandSupport": "announced"
+  },
+  "groups": [
+    {
+      "id": "botfleet",
+      "label": "BotFleet",
+      "state": "ready",
+      "note": null,
+      "commands": [
+        {
+          "id": "botfleet:stop",
+          "name": "stop",
+          "label": "/stop",
+          "title": "Stop",
+          "description": "Stop the running turn and clear queued messages.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:new",
+          "name": "new",
+          "label": "/new",
+          "title": "New Conversation",
+          "description": "Start a fresh conversation; this one stays saved.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "idle",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:status",
+          "name": "status",
+          "label": "/status",
+          "title": "Status",
+          "description": "Engine, model, effort, context and spend.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:model",
+          "name": "model",
+          "label": "/model",
+          "title": "Model",
+          "description": "Pick a model this engine offers.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "model-picker",
+          "args": {
+            "required": false,
+            "hint": "Filter models",
+            "maxLength": 60
+          },
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:effort",
+          "name": "effort",
+          "label": "/effort",
+          "title": "Effort",
+          "description": "Pick an effort level this model supports.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "effort-picker",
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:help",
+          "name": "help",
+          "label": "/help",
+          "title": "Help",
+          "description": "List the commands this bot accepts here.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        }
+      ]
+    },
+    {
+      "id": "engine",
+      "label": "Claude",
+      "state": "ready",
+      "note": null,
+      "commands": [
+        {
+          "id": "engine:compact",
+          "name": "compact",
+          "label": "/compact",
+          "title": "Compact",
+          "description": "Summarize the conversation to free context.",
+          "source": "engine",
+          "invoke": "server",
+          "clientAction": null,
+          "args": {
+            "required": false,
+            "hint": "Optional focus for the summary",
+            "maxLength": 500
+          },
+          "availability": "idle",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": true,
+          "collidesWith": null
+        },
+        {
+          "id": "engine:context",
+          "name": "context",
+          "label": "/context",
+          "title": "Context",
+          "description": "Show what fills this conversation's context.",
+          "source": "engine",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "idle",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        }
+      ]
+    }
+  ]
+}

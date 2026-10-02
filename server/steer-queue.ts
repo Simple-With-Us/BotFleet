@@ -161,6 +161,29 @@ export function cancelSteeredMessage(threadId: string, messageId: string): boole
   return true;
 }
 
+/** The ids of the sends waiting on a thread, in arrival order.  The caller
+ * reads them before `dropSteeredMessages` so it can forget what it keyed on
+ * them (a relayed message's unattended mark). */
+export function queuedMessageIds(threadId: string): string[] {
+  return (queues.get(threadId)?.items ?? []).map((item) => item.messageId);
+}
+
+/** How many sends are waiting on a thread. */
+export function queuedMessageCountFor(threadId: string): number {
+  return queues.get(threadId)?.items.length ?? 0;
+}
+
+/** Drop every send waiting on a thread so none of them drains.  A typed /stop
+ * means stop everything, including the corrections queued behind the turn;
+ * the Stop button keeps its stop-then-steer behavior and never calls this.
+ * Returns how many were dropped. */
+export function dropSteeredMessages(threadId: string): number {
+  const entry = queues.get(threadId);
+  if (!entry) return 0;
+  queues.delete(threadId);
+  return entry.items.length;
+}
+
 /** Count pending sends without exposing message text to diagnostics. */
 export function queuedMessageCount(): number {
   return [...queues.values()].reduce((total, entry) => total + entry.items.length, 0);

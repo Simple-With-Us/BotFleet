@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "botId": "b-ledger",
+  "threadId": "t-03de",
+  "surface": "desktop",
+  "busy": false,
+  "engine": {
+    "instanceId": "minimax",
+    "displayName": "MiniMax",
+    "model": "MiniMax-M2.7",
+    "modelLabel": "MiniMax M2.7",
+    "effort": null,
+    "commandSupport": "none"
+  },
+  "groups": [
+    {
+      "id": "botfleet",
+      "label": "BotFleet",
+      "state": "ready",
+      "note": null,
+      "commands": [
+        {
+          "id": "botfleet:stop",
+          "name": "stop",
+          "label": "/stop",
+          "title": "Stop",
+          "description": "Stop the running turn and clear queued messages.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:new",
+          "name": "new",
+          "label": "/new",
+          "title": "New Conversation",
+          "description": "Start a fresh conversation; this one stays saved.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "idle",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:status",
+          "name": "status",
+          "label": "/status",
+          "title": "Status",
+          "description": "Engine, model, effort, context and spend.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:model",
+          "name": "model",
+          "label": "/model",
+          "title": "Model",
+          "description": "Pick a model this engine offers.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "model-picker",
+          "args": {
+            "required": false,
+            "hint": "Filter models",
+            "maxLength": 60
+          },
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:tasks",
+          "name": "tasks",
+          "label": "/tasks",
+          "title": "Tasks",
+          "description": "Switch, rename or remove a conversation.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "tasks",
+          "args": {
+            "required": false,
+            "hint": "Filter conversations",
+            "maxLength": 60
+          },
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:computer",
+          "name": "computer",
+          "label": "/computer",
+          "title": "Computer",
+          "description": "Watch this bot's computer live.",
+          "source": "botfleet",
+          "invoke": "client",
+          "clientAction": "computer",
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        },
+        {
+          "id": "botfleet:help",
+          "name": "help",
+          "label": "/help",
+          "title": "Help",
+          "description": "List the commands this bot accepts here.",
+          "source": "botfleet",
+          "invoke": "server",
+          "clientAction": null,
+          "args": null,
+          "availability": "always",
+          "enabled": true,
+          "disabledReason": null,
+          "runsModelTurn": false,
+          "collidesWith": null
+        }
+      ]
+    }
+  ]
+}

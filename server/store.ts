@@ -185,6 +185,21 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
+  /** Marks a row that belongs to a slash command rather than to the
+   * conversation.  `id` ties together the rows of one invocation: the
+   * `invocation` (what was typed), the `reply` (what BotFleet answered) and the
+   * `output` (what the engine's own command printed).  A marked row is drawn as
+   * a command chip or card, and is never replayed to a model: it is left out of
+   * the transcript a turn is built from.  Clients that predate the marker show
+   * a plain bubble. */
+  command?: {
+    id: string;
+    name: string;
+    source: "botfleet" | "engine";
+    role: "invocation" | "reply" | "output";
+    surface: "desktop" | "ios" | "imessage" | "linq";
+    ok?: boolean;
+  };
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
@@ -344,6 +359,11 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+  /** The input tokens of the most recent settled turn that reported any, which
+   * is how full the model's context window was after it (cache reads count:
+   * they fill the window).  Unlike `input`, it is not a running total.  Absent
+   * until a turn reports input. */
+  lastInput?: number;
 }
 
 /** Running timing aggregate for one task, banked at each settled turn from
@@ -2065,7 +2085,12 @@ export class Store {
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
+    const previousLastInput = task.usage?.lastInput;
     task.usage = mergeTaskUsage(task.usage, turn);
+    // Context fullness is the LAST turn's input, not a running sum.  A turn
+    // that reports no input says nothing about it, so the earlier figure stands.
+    if (turn.input !== undefined && Number.isFinite(turn.input) && turn.input >= 0) task.usage.lastInput = Math.trunc(turn.input);
+    else if (previousLastInput !== undefined) task.usage.lastInput = previousLastInput;
     if (turn.stats) task.stats = mergeTaskStats(task.stats, turn.stats);
     if (instanceId) {
       const byInstance = (task.usageByInstance ??= {});

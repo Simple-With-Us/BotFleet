@@ -20,6 +20,18 @@ describe("buildNotification", () => {
     expect(buildNotification("routine-failed", bot, "thread-1", "boom")?.title).toBe("Scout's routine failed");
   });
 
+  it("masks a credential in the body before it is clipped and pushed", () => {
+    // assembled at runtime so no token-shaped literal sits in the source
+    const key = ["sk", "-ant-", "api03-", "TESTONLY", "0123456789abcdef0123456789abcdef"].join("");
+    const finished = buildNotification("done", bot, "thread-1", `Rotated it. The new key is ${key} and it works.`);
+    expect(finished?.body).not.toContain(key);
+    expect(finished?.body).not.toContain("TESTONLY");
+    expect(finished?.body).toContain("Rotated it.");
+    // a key long enough to be cut by the clip is still masked first
+    const long = buildNotification("done", bot, "thread-1", `${"x".repeat(120)} ${key}`);
+    expect(long?.body).not.toContain("TESTONLY");
+  });
+
   it("stays silent for a bot whose notifications are off", () => {
     const quiet = { ...bot, notifications: false };
     for (const kind of ["approval", "question", "done", "routine-failed"] as const) {

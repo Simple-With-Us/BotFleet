@@ -11,6 +11,8 @@
 // local notifications while the companion is open, and APNs from the
 // sidecar when a paired phone is not streaming.
 
+import { redactSecretsInText } from "../shared/redact.ts";
+
 export type NotifyKind = "approval" | "question" | "done" | "routine-failed" | "takeover";
 
 export interface Notification {
@@ -88,7 +90,9 @@ export function buildNotification(
   // stays a pure policy function with no clock of its own.
   if (extra?.snoozed === true) return null;
 
-  const body = summarize(detail);
+  // Redacted before it is clipped: a push body leaves the machine, and a key
+  // cut in half by the clip would no longer match any pattern.
+  const body = summarize(redactSecretsInText(detail));
   const title =
     kind === "approval"
       ? `${bot.name} needs approval`

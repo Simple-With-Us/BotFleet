@@ -718,6 +718,14 @@ export class ProviderRegistry {
     return promise;
   }
 
+  /** The last completed describe's answer for one engine, or null before any
+   *  sweep has finished.  Reads what is already known and never probes, which
+   *  is why the command menu uses it: asking for the menu must not start a
+   *  CLI. */
+  lastDescribed(instanceId: InstanceId): DescribedInstance | null {
+    return this.lastDone?.result.find((info) => info.instanceId === instanceId) ?? null;
+  }
+
   /** Make `result` the last completed describe and tell listeners if it
    * changed anything. */
   private commit(result: DescribedInstance[], answeredAt: number, persist: boolean): void {
