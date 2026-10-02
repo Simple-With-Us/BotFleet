@@ -65,7 +65,7 @@ import { initializeHarnessOwnership, harnessOwnerProof } from "../electron/harne
 import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
-import { runtimeBuildIdentity, runtimeReadiness } from "./runtime-identity.ts";
+import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
 import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
 import {
@@ -566,6 +566,18 @@ void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
+// BOTFLEET-2M / Sentry 7768010831: createUpdateControl wires readiness into a
+// 2s status timer. Mid-update harness restart can fire that timer across the
+// top-level awaits below (infisical.preload, registry.load, …) before later
+// module bindings exist. Keep this Map — and the boot gate readiness reads —
+// initialized synchronously before construction so emitIfChanged never walks
+// an uninitialized binding.
+let bootComplete = false;
+/** Room rounds held only so credential restore can drain; counted out of
+ * queuedRooms when allowCredentialQueues is set. Must exist before
+ * createUpdateControl: currentRuntimeReadiness for-of's it on the status path. */
+const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
+
 // "Is there a newer BotFleet, and install it" — asked from this Mac or from
 // a paired phone.  The updater it starts stops this harness partway through,
 // so it can never be our child: it is launched detached and reports through
@@ -613,10 +625,9 @@ const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
 let activeUpdateAdmissions = 0;
 const cfg = loadConfig();
-// Flipped once, at the end of this file, when everything a secret change
-// might rebuild or re-point exists.  A snapshot that lands before then is
-// applied to `cfg` and nothing more.
-let bootComplete = false;
+// bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
+// once at the end of this file when everything a secret change might rebuild
+// exists; a snapshot that lands before then is applied to `cfg` only.
 // The secret store resolves before anything reads `cfg`.  `loadConfig()` above
 // ran while the snapshot was still empty, so the whole config is read again
 // once the preload lands — that second read is what puts a stored value in
@@ -2455,7 +2466,6 @@ const pendingMemberFallback = new Map<
   // fallback another engine's failure armed.
   { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
 >();
-const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
   threadId: string;
@@ -8900,9 +8910,16 @@ function isLoopbackAddress(address: string | undefined): boolean {
 }
 
 function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueues = false) {
-  for (const [key, round] of credentialPendingRoomRounds) {
-    if (!hasQueuedRoomRound(round.threadId, round.botId)) credentialPendingRoomRounds.delete(key);
-  }
+  // Status timer / capabilities can run before module init finishes. Other
+  // readiness counters still live below the top-level awaits; refuse Install
+  // until bootComplete rather than throwing on a half-built harness.
+  if (!bootComplete) return runtimeReadiness({ boot: 1 });
+  // Belt: never for-of a non-Map even if this binding is somehow replaced.
+  const pendingRoundCount = sweepMapIfPresent(
+    credentialPendingRoomRounds,
+    (_key: string, round: { threadId: string; botId: string }) =>
+      !hasQueuedRoomRound(round.threadId, round.botId),
+  );
   return runtimeReadiness({
     // Restore routes may exclude only their own still-held HTTP admission.
     // Other requests, including ones still reading a body, remain blockers.
@@ -8911,7 +8928,7 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
     completions: completionFolds.size,
     groupOperations: groupTurnOperations.size,
     queuedSends: queuedMessageCount(),
-    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? credentialPendingRoomRounds.size : 0)),
+    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? pendingRoundCount : 0)),
     delegations: pendingDelegationSnapshot().length,
     connectors: pendingConnectorResumes.size,
     secrets: pendingSecretResumes.size,
