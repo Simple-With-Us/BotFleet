@@ -19,14 +19,27 @@ export function runtimeReadiness(counts: Record<string, number>) {
 
 /** Walk a Map that might not exist yet (boot race) and drop stale entries.
  * Returns the surviving size, or 0 when `value` is not a Map — never throws
- * TypeError: X is not iterable (BOTFLEET-2M / Sentry 7768010831). */
+ * TypeError: X is not iterable (BOTFLEET-2M / Sentry 7768010831).
+ *
+ * Overloads keep `V` from a typed Map (so callbacks see `round.threadId`, not
+ * `unknown`). The `unknown` overload covers the defensive non-Map belt. */
+export function sweepMapIfPresent<K, V>(
+  value: Map<K, V>,
+  shouldDelete: (key: K, entry: V) => boolean,
+): number;
+export function sweepMapIfPresent(
+  value: null | undefined | unknown,
+  shouldDelete?: (key: unknown, entry: unknown) => boolean,
+): number;
 export function sweepMapIfPresent<K, V>(
   value: Map<K, V> | null | undefined | unknown,
-  shouldDelete: (key: K, entry: V) => boolean,
+  shouldDelete?: (key: K, entry: V) => boolean,
 ): number {
   if (!(value instanceof Map)) return 0;
-  for (const [key, entry] of value as Map<K, V>) {
-    if (shouldDelete(key, entry)) value.delete(key);
+  const map = value as Map<K, V>;
+  const drop = shouldDelete ?? (() => false);
+  for (const [key, entry] of map) {
+    if (drop(key, entry)) map.delete(key);
   }
-  return value.size;
+  return map.size;
 }

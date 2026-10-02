@@ -25,7 +25,9 @@ describe("sweepMapIfPresent", () => {
       ["keep", { threadId: "t1", botId: "b1" }],
       ["drop", { threadId: "t2", botId: "b2" }],
     ]);
-    expect(sweepMapIfPresent(pending, (_k, round) => round.threadId === "t2")).toBe(1);
+    expect(
+      sweepMapIfPresent(pending, (_k: string, round: { threadId: string; botId: string }) => round.threadId === "t2"),
+    ).toBe(1);
     expect([...pending.keys()]).toEqual(["keep"]);
   });
 });

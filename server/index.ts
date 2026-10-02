@@ -8917,7 +8917,8 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
   // Belt: never for-of a non-Map even if this binding is somehow replaced.
   const pendingRoundCount = sweepMapIfPresent(
     credentialPendingRoomRounds,
-    (_key, round) => !hasQueuedRoomRound(round.threadId, round.botId),
+    (_key: string, round: { threadId: string; botId: string }) =>
+      !hasQueuedRoomRound(round.threadId, round.botId),
   );
   return runtimeReadiness({
     // Restore routes may exclude only their own still-held HTTP admission.
