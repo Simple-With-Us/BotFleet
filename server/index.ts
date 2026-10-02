@@ -400,6 +400,7 @@ import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
+import { isSharedVpsMode } from "./vps-shared-session.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import {
   automationRolloverCaps,
@@ -5059,6 +5060,7 @@ async function startTurn(
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
             hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
+            vpsShared: isSharedVpsMode(cfg),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -7127,6 +7129,7 @@ async function runGroupMemberTurn(
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
         hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
+        vpsShared: isSharedVpsMode(cfg),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the

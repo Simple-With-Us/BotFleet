@@ -141,6 +141,23 @@ describe("computerSystemPrompt", () => {
     expect(prompt).toContain("This Mac");
   });
 
+  it("does not claim a VPS is isolated when the container is shared", () => {
+    const mounts = nameMounts([mount("vps"), mount("local")]);
+
+    // Default and per-bot both keep the historical isolated wording, so a
+    // caller that has not learned about shared mode moves nothing.
+    const perBot = computerSystemPrompt(mounts, { hostPlatform: "darwin" });
+    expect(perBot).toContain("one container per bot, not shared with the other bots");
+    expect(computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: false })).toBe(perBot);
+
+    // Shared mode hands every bot its own desktop session inside ONE container.
+    // Telling it otherwise invites a bot to assume desktop state it does not own.
+    const shared = computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: true });
+    expect(shared).not.toContain("not shared with the other bots");
+    expect(shared).toContain("its own desktop session");
+    expect(shared).toContain("nobody else sees or clicks your desktop");
+  });
+
   it("states the owner's selection rule: remote by default, host only when it earns it", () => {
     const prompt = computerSystemPrompt(nameMounts([mount("vps"), mount("local")]), {
       hostPlatform: "darwin",
