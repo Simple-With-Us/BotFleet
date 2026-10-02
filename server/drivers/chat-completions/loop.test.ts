@@ -409,6 +409,45 @@ describe("runTurnLoop — the turn is settled by exactly one place", () => {
     }
   });
 
+  it("hands the model a job notice between rounds, once, as an appended user message (jobs P1)", async () => {
+    // A background job that ends mid-turn reaches the model before its next
+    // call, so it does not start the same work again.  Appended after the
+    // tool results — the prefix the provider already saw never changes.
+    const h = harness([wantsTools([call("c1", "bash")]), wantsTools([call("c2", "bash")]), answer("done")]);
+    const queued = [["Background job job_x `pnpm test` finished: exit code 0 after 4m 12s."], [], []];
+    let drains = 0;
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => queued[drains++] ?? [],
+      },
+    });
+    expect(exit).toBe("settled");
+    const round2 = h.roundsSeen[1]!;
+    expect(round2.at(-2)).toMatchObject({ role: "tool", tool_call_id: "c1" });
+    expect(round2.at(-1)).toEqual({
+      role: "user",
+      content: "[BotFleet notice]\nBackground job job_x `pnpm test` finished: exit code 0 after 4m 12s.",
+    });
+    // round 2's prefix is round 1's, untouched; the notice never repeats
+    expect(round2.slice(0, h.roundsSeen[0]!.length)).toEqual(h.roundsSeen[0]);
+    expect(h.roundsSeen[2]!.filter((m) => m.content.startsWith("[BotFleet notice]"))).toHaveLength(1);
+    expect(drains).toBe(2);
+  });
+
+  it("keeps looping when a notice drain throws", async () => {
+    const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => {
+          throw new Error("drain exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+  });
+
   it("still emits its one terminal event when the tool host's settle throws", async () => {
     const h = harness([answer("done")]);
     const exit = await h.run({

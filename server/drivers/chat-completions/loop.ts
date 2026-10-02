@@ -552,7 +552,7 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         // the contract says a host never throws; this normalises the one
         // that does rather than letting it end the turn
         host
-          .execute(decoded, { signal, requestApproval })
+          .execute(decoded, { signal, requestApproval, turnId: deps.base().turnId })
           .catch((e: unknown) => {
             const message = e instanceof Error ? e.message : String(e);
             return { kind: "error", content: `Tool ${decoded.name} failed: ${message}`, detail: message } as TurnToolOutcome;
@@ -881,6 +881,21 @@ export async function runTurnLoop(deps: TurnLoopDeps): Promise<TurnLoopExit> {
         exit = "suspended";
         stopReasonOverride = suspended.stopReason;
         break;
+      }
+
+      // Between rounds, before the next model call: anything the harness is
+      // holding for this turn — a background job that just ended — goes in
+      // as one more user message, so the model reads it before it decides
+      // what to do next (and does not start the same work again).  Appended,
+      // never spliced, so the prefix the provider already saw is unchanged.
+      let notices: string[] = [];
+      try {
+        notices = deps.toolHost?.drainNotices?.() ?? [];
+      } catch (error) {
+        console.error("tool host notice drain failed", error);
+      }
+      if (notices.length > 0) {
+        messages.push({ role: "user", content: `[BotFleet notice]\n${notices.join("\n")}` });
       }
     }
   } catch (e) {

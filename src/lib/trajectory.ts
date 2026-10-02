@@ -1200,6 +1200,7 @@ const AUTOMATION_LABEL: Record<string, string> = {
   resource: "Resource trigger",
   delegation: "Delegation",
   imessage: "iMessage",
+  job: "Background job",
 };
 
 /** What the person (or an automation) said, from the thread's messages.  A

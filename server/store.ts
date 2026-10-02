@@ -120,7 +120,7 @@ export interface Message {
    * and instead of collapsing every non-webhook/imessage system message
    * into a generic "Routine" label regardless of what actually triggered
    * it. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
@@ -207,6 +207,11 @@ export interface Message {
   /** steer-queue entry this drained user line came from. The client pending
    * chip matches on this id, not on equal text. Absent on ordinary sends. */
   queueId?: string;
+  /** A "Job Finished" row (background jobs P1): an `activity` message whose
+   * `tool` chip still reads sensibly to a client that predates this field,
+   * plus what the chat needs to draw the row.  Never output: that is read
+   * over `/api/jobs/:id/output`. */
+  job?: import("../shared/jobs.ts").JobRowData;
 }
 
 export type GroupDefaultResponder =

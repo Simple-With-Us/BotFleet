@@ -1020,6 +1020,14 @@ describe("unattendedModelDowngrade", () => {
     expect(out).not.toHaveProperty("effort");
   });
 
+  it("keeps a job's wake turn on the bot's own model, though it is unattended (owner ruling b)", () => {
+    for (const selection of [gemini, claude]) {
+      expect(
+        unattendedModelDowngrade(selection, { unattended: true, automationSource: "job", effortLevels: ["low"] }),
+      ).toEqual(selection);
+    }
+  });
+
   it("downgrades fresh webhook and resource deliveries, which carry automationSource not unattended", () => {
     for (const automationSource of ["webhook", "resource"]) {
       expect(

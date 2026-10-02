@@ -178,3 +178,27 @@ Questions for you:
 - Thread telemetry `78129d55` (completed): PRs #730 and #773.
 - P0 containment `670389e9` (P1, open).
 - Jobs program `01d09729` (P2, open).
+
+## Owner Rulings (2026-10-01)
+
+The owner answered the open questions on Oct 1, 2026.  These rulings override the recommendations above where they differ.
+
+- **(a) Order:** build P0, then P1, now.
+- **(b) Wake turns are unattended:** a job wake turn counts as unattended.  It goes through spend-ceiling accounting and sits inside the same untrusted-data boundary webhooks use.  It keeps the bot's same model: there is no cheaper-model fallback for job wakes.
+- **(c) Job approval:** a bot set to full-auto (its Auto mode) starts jobs without asking.  Every other bot gets an approval card for every `job_start`, and an abandoned ask counts as a deny.  `job_start` has its own `job:<program>` approval namespace and never inherits bash approvals.
+- **(d) iPhone (P4):** the phone may stop jobs and read job output.
+- **(e) On by default:** jobs are on by default for HTTP-lane bots at P1.
+
+## P1 Implementation Notes
+
+Where P1 settled a detail the design above leaves open, after review on PR #784.
+
+- **Ruling (c), as read:** "starts jobs without asking" is read as Auto mode's own behavior.  The destructive and sensitive guards that stop every other Auto-mode tool still stop `job_start`, so a job is never easier to start than the same command through bash, and a `job_start` in a turn a webhook, resource alert or text started still asks.  Both are for the owner to confirm; they are the conservative reading.
+- **Command length:** `job_start` refuses a command longer than an approval card shows whole (2,000 characters, whitespace folded) before any card appears, and tells the bot to write a script file.  Nobody approves a hidden tail.
+- **Run limits:** the default and the longest run are the owner's to change, so they are stated in the system prompt's jobs section from the live settings, not in the tool descriptions.
+- **Finished logs:** kept a week, and no more than 256 MiB of them between all finished jobs, oldest first, on top of the 500-record cap.  A dropped job's id stays in the sweep's list.
+- **Other engines:** a bot switched to an engine without the job tools while its jobs ran is told what ended, without the sentence that sends it to `job_output`, and is not woken for it.
+- **Wake turns and Auto mode:** a wake turn is unattended (ruling b), and an unattended turn does not inherit Auto mode.  Ruling (c) is the exception: a full-auto bot's `job_start` is still auto-approved in its own job wake, so it can start the next job.  Every other tool in that turn, and a `job_start` in a turn a webhook, resource alert or text started, still asks.  The destructive, sensitive and cut-summary guards apply throughout.
+- **Updates (a deviation from Restart v1 above, for the owner to confirm):** the updater's quiesce no longer stops jobs, because a quiesce can be rolled back.  The restart that follows an update stops them and marks them lost, the same as any shutdown, so the end state is the same as the design's and a rolled-back update loses nothing.  While the fence is up a job may finish, and its bot is told on the next turn after the restart, not woken.
+- **Tokens per wake:** each settled wake turn's tokens and cost are totalled apart from other turns, overall and per bot, at `GET /api/jobs/wake-usage`.  That is the measurement the P2 decision on CLI bots waits for.
+- **Boot:** a group whose leader is gone is never signalled by its number.  The sweep stops exactly the processes carrying the lost job's `BOTFLEET_JOB_ID`.

@@ -27,6 +27,9 @@ export interface ActiveTurnOwner {
   selection: ModelSelection;
   fallbackPolicy: ModelSelection;
   computerInputs?: TurnComputerInputs;
+  /** What started the turn when nobody typed it: `job` is a background
+   *  job's wake, whose cost is counted on its own (server/jobs/wake-usage.ts). */
+  automationSource?: string;
   /** Set when a settings change took away a provider this dispatch holds or
    * could reach.  A dispatch that has not reached its provider yet has no
    * session to interrupt, so its own pre-dispatch checks must see this and

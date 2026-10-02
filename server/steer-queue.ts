@@ -170,3 +170,71 @@ export function queuedMessageCount(): number {
 export function _queuedCount(threadId: string): number {
   return queues.get(threadId)?.items.length ?? 0;
 }
+
+// ── job notices for a running turn (background jobs P1) ─────────────────
+// A background job that ends while its bot is mid-turn on the same thread
+// cannot start a turn of its own (one turn per bot), and must not wait for
+// the turn to end: the bot may be about to start the same work again.  Its
+// notice waits here, and the HTTP tool loop drains it between model rounds
+// (server/drivers/chat-completions/loop.ts), so the bot reads it before its
+// next model call.  A notice the turn never drained is delivered by the next
+// turn on the thread: the opening reminder, or a wake turn of its own
+// (server/jobs/wake.ts).
+//
+// Memory-only, like every other queue in this file.  A restart loses it,
+// and that is safe: the jobs registry marks every job that was running at a
+// restart lost, and queues fresh notices for jobs it settles at boot.
+
+/** One job's end, as the bot reads it. */
+export interface JobNoticeItem {
+  jobId: string;
+  botId: string;
+  /** One redacted line: what ended, how, and after how long. */
+  text: string;
+  /** Whether this notice may wake an idle bot (`onComplete: "wake"`). */
+  wake: boolean;
+}
+
+const jobNotices = new Map<string, JobNoticeItem[]>(); // threadId → waiting notices
+
+/** Hold a job's notice until a turn on its thread can carry it.  A second
+ *  notice for the same job replaces the first. */
+export function queueJobNotice(threadId: string, item: JobNoticeItem): void {
+  const items = (jobNotices.get(threadId) ?? []).filter((queued) => queued.jobId !== item.jobId);
+  items.push(item);
+  jobNotices.set(threadId, items);
+}
+
+/** Take every notice waiting on this thread.  The caller delivers them. */
+export function drainJobNotices(threadId: string): JobNoticeItem[] {
+  const items = jobNotices.get(threadId) ?? [];
+  jobNotices.delete(threadId);
+  return items;
+}
+
+/** Put notices back that a dispatch could not deliver (the bot turned out to
+ *  be busy, or the harness was reloading), ahead of anything newer. */
+export function restoreJobNotices(threadId: string, items: readonly JobNoticeItem[]): void {
+  if (items.length === 0) return;
+  const newer = (jobNotices.get(threadId) ?? []).filter((queued) => !items.some((item) => item.jobId === queued.jobId));
+  jobNotices.set(threadId, [...items, ...newer]);
+}
+
+/** The notices waiting on this thread, left in place. */
+export function pendingJobNotices(threadId: string): readonly JobNoticeItem[] {
+  return jobNotices.get(threadId) ?? [];
+}
+
+/** Forget a deleted thread's notices. */
+export function dropJobNotices(threadId: string): void {
+  jobNotices.delete(threadId);
+}
+
+/** Forget a deleted bot's notices on every thread (a room outlives it). */
+export function dropJobNoticesForBot(botId: string): void {
+  for (const [threadId, items] of jobNotices) {
+    const kept = items.filter((item) => item.botId !== botId);
+    if (kept.length === 0) jobNotices.delete(threadId);
+    else if (kept.length !== items.length) jobNotices.set(threadId, kept);
+  }
+}

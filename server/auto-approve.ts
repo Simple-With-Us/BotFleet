@@ -103,8 +103,39 @@ export function looksDestructive(text: string): boolean {
  * client so the two sides can never disagree about what was granted. */
 const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
 
+/** Background job tools (jobs P1).  Their grants live in a namespace of their
+ *  own, `job:<program>`, so a remembered `Bash:git` never starts a job, and
+ *  the owner ruled (2026-10-01, ruling c) that every job start asks unless
+ *  the bot is in Auto mode — so a `job:` key is never remembered at all. */
+const JOB_TOOLS = new Set(["job_start"]);
+
+export function isJobTool(tool: string): boolean {
+  return JOB_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase());
+}
+
+/** The program a job summary (`job: pnpm test`) starts, by the same rule a
+ *  command tool's key uses: the first bare word, past env assignments and
+ *  sudo. */
+function firstProgram(command: string): string {
+  const words = command.trim().split(/\s+/);
+  let i = 0;
+  while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
+  return (words[i] ?? "").split("/").pop()?.replace(/[^\w.-]/g, "") ?? "";
+}
+
+/** A job summary whose command was cut to fit the card.  The cut tail is
+ *  unseen, so nothing may approve it but a person. */
+function truncatedJobSummary(summary: string): boolean {
+  return summary.endsWith("…");
+}
+
 export function approvalKey(tool: string, summary: string, scope?: "local-computer" | "disposable-computer"): string {
   const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
+  if (JOB_TOOLS.has(bare)) {
+    const program = firstProgram(summary.replace(/^job:\s*/, ""));
+    const key = program ? `job:${program}` : "job";
+    return scope === "local-computer" ? `${scope}:${key}` : key;
+  }
   if (!COMMAND_TOOLS.has(bare)) return scope === "local-computer" ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
@@ -146,6 +177,9 @@ const COARSE_PROGRAMS = new Set([
  * for them. */
 export function isCoarseApprovalKey(key: string): boolean {
   const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
+  // A remembered job grant would start background work with nobody asked,
+  // which ruling (c) forbids for every bot not in Auto mode.
+  if (unscoped === "job" || unscoped.startsWith("job:")) return true;
   const colon = unscoped.indexOf(":");
   const tool = colon === -1 ? unscoped : unscoped.slice(0, colon);
   if (!COMMAND_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase())) return false;
@@ -162,6 +196,8 @@ export function coarseAlwaysAllowRefused(
   context?: { scope?: "local-computer" | "disposable-computer" },
 ): boolean {
   if (!isCoarseApprovalKey(key)) return false;
+  const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
+  if (unscoped === "job" || unscoped.startsWith("job:")) return true;
   if (key.startsWith("local-computer:")) return true;
   if (context?.scope === "local-computer") return true;
   // A native Bash/shell ask runs in the provider process on the host even
@@ -185,6 +221,8 @@ export function offerableApprovalKey(
   scope?: "local-computer" | "disposable-computer",
 ): string | undefined {
   if (scope === "local-computer") return undefined;
+  // every job start asks (ruling c): there is no grant to offer
+  if (isJobTool(tool)) return undefined;
   if (looksDestructive(summary) || looksDestructive(tool)) return undefined;
   if (looksSensitive(summary)) return undefined;
   const key = approvalKey(tool, summary, scope);
@@ -232,6 +270,9 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
+    /** The unattended turn is a background job's wake (or continues one):
+     *  nothing outside BotFleet started it.  Only `job_start` reads it. */
+    jobWake?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
   },
@@ -245,19 +286,33 @@ export function autoVerdict(
   // stood in the way", which cannot be told apart from an ordinary
   // "nobody granted this" card without knowing both halves.
   const key = approvalKey(tool, summary, context?.scope);
-  const unsafeCommand = unsafeCommandSummary(tool, summary);
+  const jobTool = isJobTool(tool);
+  // A job's whole command is on the card, compound or not (ruling c: Auto
+  // mode starts jobs without asking).  One cut to fit is the exception.
+  const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
   const grant =
     destructive || sensitive || unsafeCommand
       ? null
-      : bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
+      : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
         : bot.autoApprove
-          ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
+          ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
           : null;
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
+    // Owner ruling (c), 2026-10-01: a bot in Auto mode starts background
+    // jobs without asking.  The ruling answered the decision doc's open
+    // question about exactly this turn — a job's wake, with nobody watching,
+    // that has to start the next job — so the wake turn keeps Auto mode for
+    // `job_start` and nothing else.  The destructive, sensitive and
+    // cut-summary checks above already took `grant` away when they apply,
+    // and a turn some outside event started (a webhook, a resource alert, a
+    // text) is not a job wake and keeps the block below.
+    if (jobTool && context.jobWake && grant?.source === "auto-mode") {
+      return { approve: grant.approve, source: grant.source, rule: grant.rule };
+    }
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
     // else wrote, so it does not inherit that decision — the guard above is a

@@ -435,6 +435,10 @@ export interface TurnToolRuntime {
    *  for as long as the card is open, then delegates to the harness's
    *  permission broker (`TurnToolHost.requestApproval`). */
   requestApproval(ask: { tool: string; summary: string; approvalScope?: "local-computer" | "disposable-computer" }): Promise<RequestOutcome>;
+  /** The turn this call belongs to, when the driver's loop knows it.  A
+   *  tool that leaves something behind the turn (a background job) records
+   *  it, so the thing can be traced back to the turn that made it. */
+  turnId?: TurnId;
 }
 
 /** The harness side of a driver-owned tool loop.  A driver that declares
@@ -469,6 +473,12 @@ export interface TurnToolHost {
    *  work outlives the turn that nothing will report on.  Never throws.
    *  HTTP tool lane only; a CLI engine's own shells are its own (P2). */
   settle?(): void;
+  /** Notices the harness holds for this running turn — a background job of
+   *  the bot's that ended mid-turn (server/steer-queue.ts).  The driver's
+   *  tool loop calls it between model rounds and hands any lines to the
+   *  model before its next call.  Each line is delivered once.  Absent, or
+   *  an empty array, means nothing to say. */
+  drainNotices?(): string[];
 }
 
 export interface TurnStartResult {

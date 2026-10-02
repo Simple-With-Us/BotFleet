@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Search,
   Square,
+  SquareTerminal,
   X,
 } from "lucide-react";
 import { formatTokens, formatUsd } from "@/lib/usage";
@@ -78,6 +79,8 @@ import { BUBBLE_EDITOR_WIDTH, BUBBLE_WIDTH, bubbleRow } from "@/lib/bubble-metri
 import { useFocusMessage } from "@/lib/focus-message";
 import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
+import { jobWakeSubtitle } from "../../shared/jobs";
 import { ToolLine } from "./ToolLine";
 import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
@@ -963,6 +966,8 @@ const MessagesList = memo(function MessagesList({
                   />
                 );
               }
+              // a job's end is news, not a step: shown whatever the setting
+              if (m.job) return <JobFinishedRow job={m.job} />;
               if (!showToolCalls && !m.comm) return null;
               return <ActivityChip bot={bot} message={m} />;
             }
@@ -1074,14 +1079,23 @@ const MessagesList = memo(function MessagesList({
                 // the hardcoded "Scheduled Run" a manual Run Now or a
                 // resource alert would otherwise wear.  Subtitle is the
                 // instruction's own first line, same as before.
+                // A job's wake says how the job ended, not its id and the
+                // words addressed to the bot (those stay under Run Details).
+                const jobWake = m.automationSource === "job";
                 return withSystemChrome(
                   <WebhookCard
                     view={{
                       headline: automationSourceLabel(m.automationSource, body),
-                      subtitle: firstLine && firstLine !== "Scheduled Run" ? firstLine.slice(0, 80) : undefined,
+                      subtitle: jobWake
+                        ? jobWakeSubtitle(body)
+                        : firstLine && firstLine !== "Scheduled Run" ? firstLine.slice(0, 80) : undefined,
                       payload: body || undefined,
                     }}
-                    icon={<Clock size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />}
+                    icon={
+                      jobWake
+                        ? <SquareTerminal size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />
+                        : <Clock size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />
+                    }
                     detailsNoun="Run Details"
                   />,
                 );
@@ -1588,6 +1602,8 @@ export function ChatView({ bot }: { bot: Bot }) {
           >
             <Search size={18} />
           </button>
+          {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
+          <JobsMenu threadId={bot.threadId} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}

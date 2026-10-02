@@ -29,6 +29,9 @@ export function automationSourceLabel(source: string | undefined, body: string):
       return "Scheduled Run";
     case "delegation":
       return "Delegated Task";
+    // a background job ended and woke its bot (jobs P1)
+    case "job":
+      return "Background Job";
     default:
       if (isDelegationMessage({ role: "system", text: body })) {
         return "Delegated Task";
