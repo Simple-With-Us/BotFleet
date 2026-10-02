@@ -172,16 +172,20 @@ describe("the MCP lane's job_output", () => {
     const started = await executeMcpJobStart(h.deps, { command: "sleep 30" });
     const id = firstId(String(started.body.text));
     let waited = 0;
-    // A proxy, not Object.assign: `waitForEnd` lives on the prototype.
-    const watched = new Proxy(h.registry, {
-      get(target, prop, receiver) {
-        if (prop !== "waitForEnd") return Reflect.get(target, prop, receiver);
-        return (jobId: string, ms: number) => {
-          waited = ms;
-          return target.waitForEnd(jobId, 0);
-        };
+    // The real registry behind an explicit shim, so `waitForEnd` is the only
+    // thing that changes and the read still comes from the real log.
+    const watched: McpLaneJobDeps["registry"] = {
+      start: (request) => h.registry.start(request),
+      refusal: (request) => h.registry.refusal(request),
+      get: (id) => h.registry.get(id),
+      list: (filter) => h.registry.list(filter),
+      readForModel: (id, maxBytes) => h.registry.readForModel(id, maxBytes),
+      waitForEnd: (jobId, ms, signal) => {
+        waited = ms;
+        return h.registry.waitForEnd(jobId, 0, signal);
       },
-    });
+      kill: (id, by) => h.registry.kill(id, by),
+    };
     const out = await executeMcpJobOutput({ ...h.deps, registry: watched }, { job_id: id, wait_seconds: 9_000 });
     expect(waited).toBe(120_000);
     expect(String(out.body.text)).toMatch(/120-second maximum/);
