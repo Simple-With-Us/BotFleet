@@ -52,6 +52,32 @@ describe("ENGINE_CAPABILITIES registry", () => {
     expect(map.get("grok-4.7-build-fast")).toBe("grok");
   });
 
+  it("attributes grok-build-0.1 to Grok and keeps shared Composer 2.5 off Grok's unique mapping", () => {
+    const map = uniqueModelToEngineId();
+    // Unique to Grok: an xAI id no other engine serves.
+    expect(map.get("grok-build-0.1")).toBe("grok");
+    // Composer 2.5 is Cursor's model and Grok Build serves it too, so both
+    // engines list it and it stays unmapped.  If only Grok listed it, a
+    // metadata-free Composer bucket on a Cursor instance would be credited to
+    // Grok instead of resolving through its own instance (Cursor).
+    expect(ENGINE_CAPABILITIES.grok.defaultModels.map((m) => m.id)).toContain("composer-2.5");
+    expect(ENGINE_CAPABILITIES.cursor.defaultModels.map((m) => m.id)).toContain("composer-2.5");
+    expect(map.has("composer-2.5")).toBe(false);
+    expect(map.get("composer-2.5")).not.toBe("grok");
+    // Existing Cursor attribution is unchanged.
+    expect(map.get("cursor-default")).toBe("cursor");
+  });
+
+  it("labels the Grok Build catalog additions", () => {
+    const labelOf = (engine: string, id: string) =>
+      ENGINE_CAPABILITIES[engine].defaultModels.find((m) => m.id === id)?.display;
+    expect(labelOf("grok", "grok-build-0.1")).toBe("Grok Build 0.1");
+    expect(labelOf("grok", "composer-2.5")).toBe("Composer 2.5");
+    expect(labelOf("cursor", "composer-2.5")).toBe("Composer 2.5");
+    // Grok's lead row and default stay Grok 4.7.
+    expect(ENGINE_CAPABILITIES.grok.defaultModels[0].id).toBe("grok-4.7");
+  });
+
   it("exposes one entry for every known engine id", () => {
     for (const id of KNOWN_ENGINE_IDS) {
       expect(ENGINE_CAPABILITIES[id], `missing registry entry for ${id}`).toBeDefined();
@@ -265,30 +291,17 @@ describe("ENGINE_CAPABILITIES registry", () => {
     // The matrix lists the ids a live mcode session actually advertises, so
     // the engine's declared models and the picker's rows agree.
     expect(mcode.defaultModels.map((m) => m.id)).toEqual([
-      "MiniMax-M3",
-      "MiniMax-M3-thinking",
       "MiniMax-M3.1-Flash-Preview-thinking",
       "MiniMax-M2.7-highspeed-thinking",
-      "MiniMax-M2.7-thinking",
     ]);
     // The flash preview tier is the one a current mcode install defaults to,
     // so it must be reachable in the matrix too.  It is deliberately not the
     // first row: a preview id is never what a fresh install hands someone who
     // has not asked for it.
-    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3");
+    expect(mcode.defaultModels[0].id).toBe("MiniMax-M3.1-Flash-Preview-thinking");
     expect(
       mcode.defaultModels.find((m) => m.id === "MiniMax-M3.1-Flash-Preview-thinking")?.ctxTokens,
     ).toBe(1_000_000);
-  });
-
-  it("leaves MiniMax-M3 unmapped rather than crediting one of its two engines", () => {
-    // The shared flagship model id belongs to both MiniMax engines, so the
-    // unique-model map must not first-win it onto either one.  Engine-tagged
-    // usage still attributes correctly through engineIdFromDriverKind.
-    const map = uniqueModelToEngineId();
-    expect(map.get("MiniMax-M3")).toBeUndefined();
-    expect(engineIdFromDriverKind("minimax")).toBe("minimax");
-    expect(engineIdFromDriverKind("mcodeAgent")).toBe("mcode");
   });
 
   it("pricingModeLabel reads consistently with the pricing block", () => {

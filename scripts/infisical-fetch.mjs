@@ -15,9 +15,9 @@
 // `maskValue` below, because the runner's parser stops at the first newline.
 // A login/list failure never crashes the job -- callers still get their
 // GH_FALLBACK_<NAME> values, or the missing-name warning/error below.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 function splitNames(raw) {
   return String(raw ?? "")
@@ -181,7 +181,18 @@ export async function run({ env = process.env, fetchImpl = fetch, log = (line) =
   }
 }
 
-const isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+// Compare physical paths.  Node's ESM loader realpaths the entry module, so an
+// invocation through a symlinked directory (macOS /var -> /private/var) never
+// matches process.argv[1] when compared as text.
+function isEntryModule() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+const isMain = isEntryModule();
 if (isMain) {
   run().catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));

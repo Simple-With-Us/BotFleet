@@ -5,12 +5,20 @@
 // real app-server, it never exits on its own — the driver kills it.
 //
 //   FAKE_CODEX_MODE   happy (default) | approval | resume | stream | windows-command |
-//                     mcp-elicitation | logged-in-stdout | logged-out | unauthorized |
-//                     resume-unauthorized | resume-transient
+//                     mcp-elicitation | mcp-elicitation-job-start (a mounted
+//                     server's own `job_start`) | logged-in-stdout | logged-out | unauthorized |
+//                     resume-unauthorized | resume-transient |
+//                     multi-agent (the main thread's spawn_agent call, then a
+//                     helper thread's notifications, turn/completed included,
+//                     interleaved with the main thread's on the same
+//                     connection, every one naming its threadId as 0.159 does)
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
+//   FAKE_CODEX_DOWN_FILE  optional path; while the file exists, `app-server`
+//                     exits at once, the way a probe fails under host load,
+//                     so a test can take the live catalog away mid-run
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_CODEX_MODE ?? "happy";
 
@@ -19,6 +27,8 @@ if (process.argv[2] === "--version") {
   process.exit(0);
 }
 if (process.argv[2] === "login" && process.argv[3] === "status") {
+  // A probe that gets no answer it can read (what a timed-out one sees).
+  if (mode === "login-silent") process.exit(0);
   if (mode === "logged-out") {
     process.stderr.write("Not logged in\n");
     process.exit(1);
@@ -29,11 +39,19 @@ if (process.argv[2] === "login" && process.argv[3] === "status") {
   statusStream.write("Logged in using ChatGPT\n");
   process.exit(0);
 }
+if (process.env.FAKE_CODEX_DOWN_FILE && existsSync(process.env.FAKE_CODEX_DOWN_FILE)) process.exit(1);
 const calls: Array<{ method: string; params: unknown }> = [];
 let decision: unknown = null;
 
 const out = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
-const notify = (method: string, params: unknown) => out({ jsonrpc: "2.0", method, params });
+const MAIN_THREAD = "codex-thread-1";
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+type NotificationParams = { [field: string]: JsonValue };
+const notify = (method: string, params: NotificationParams) =>
+  out({ jsonrpc: "2.0", method, params: mode === "multi-agent" ? { threadId: MAIN_THREAD, turnId: "turn-main", ...params } : params });
+// A helper thread's traffic, on the same connection as the main thread's.
+const notifyHelper = (method: string, params: NotificationParams) =>
+  out({ jsonrpc: "2.0", method, params: { threadId: "codex-thread-helper-1", turnId: "turn-helper", ...params } });
 
 const dump = () => {
   if (process.env.FAKE_CODEX_DUMP) {
@@ -158,7 +176,7 @@ process.stdin.on("data", (chunk) => {
           out({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "model not found" } });
           break;
         }
-        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "codex-thread-1" }, model: "fake-codex-model" } });
+        out({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: MAIN_THREAD }, model: "fake-codex-model" } });
         break;
       case "turn/start": {
         if (mode === "unauthorized") {
@@ -216,18 +234,36 @@ process.stdin.on("data", (chunk) => {
           : "ls -la";
         notify("item/started", { item: { id: "i1", type: "commandExecution", command } });
         notify("item/started", { item: { id: "w1", type: "webSearch", query: "BotFleet" } });
-        if (mode === "mcp-elicitation" || mode === "remote-computer-elicitation") {
+        if (mode === "multi-agent") {
+          // the main thread spawns the helper (0.159's collabAgentToolCall
+          // item; the helper's thread is named once the call completes)...
+          const spawn = { id: "spawn-1", type: "collabAgentToolCall", tool: "spawnAgent", senderThreadId: MAIN_THREAD, agentsStates: {}, prompt: "look around" };
+          notify("item/started", { item: { ...spawn, receiverThreadIds: [], status: "inProgress" } });
+          notify("item/completed", { item: { ...spawn, receiverThreadIds: ["codex-thread-helper-1"], status: "completed" } });
+          // ...and the helper runs its own turn to completion before the main thread finishes
+          notifyHelper("turn/started", { turn: { id: "turn-helper", status: "inProgress" } });
+          notifyHelper("item/started", { item: { id: "h1", type: "commandExecution", command: "HELPER COMMAND" } });
+          notifyHelper("item/agentMessage/delta", { itemId: "hm1", delta: "HELPER DELTA" });
+          notifyHelper("item/completed", { item: { id: "h1", type: "commandExecution", status: "completed" } });
+          notifyHelper("item/completed", { item: { id: "hm1", type: "agentMessage", text: "HELPER TEXT" } });
+          notifyHelper("thread/tokenUsage/updated", { tokenUsage: { total: { inputTokens: 9999, cachedInputTokens: 0, outputTokens: 999 } } });
+          notifyHelper("error", { error: { message: "HELPER ERROR" }, willRetry: false });
+          notifyHelper("turn/completed", { turn: { id: "turn-helper", status: "failed", error: { message: "HELPER FAILED" } } });
+        }
+        if (mode === "mcp-elicitation" || mode === "mcp-elicitation-job-start" || mode === "remote-computer-elicitation") {
           out({
             jsonrpc: "2.0",
             id: 101,
             method: "mcpServer/elicitation/request",
             params: {
-              serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : "agents",
+              serverName: mode === "remote-computer-elicitation" ? "computer_shared_vm" : mode === "mcp-elicitation-job-start" ? "ci" : "agents",
               mode: "form",
               _meta: { codex_approval_kind: "mcp_tool_call", tool_params: mode === "remote-computer-elicitation" ? { command: "bash -c echo hi" } : {} },
               message: mode === "remote-computer-elicitation"
                 ? 'Allow the computer_shared_vm MCP server to run tool "bash"?'
-                : 'Allow the agents MCP server to run tool "list_bots"?',
+                : mode === "mcp-elicitation-job-start"
+                  ? 'Allow the ci MCP server to run tool "job_start"?'
+                  : 'Allow the agents MCP server to run tool "list_bots"?',
               requestedSchema: { type: "object", properties: {} },
             },
           });

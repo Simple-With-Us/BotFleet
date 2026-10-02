@@ -57,7 +57,8 @@ export function spokenApprovalPrompt(pending: Pending, requester: string): strin
   return `${requester} asks: ${title}${/[.!?]$/.test(title) ? "" : "."} Review the schedule and instructions on screen. Should I confirm it?`;
 }
 
-function label(pending: Pending): string {
+/** The composer strip's line for a waiting approval. */
+export function pendingApprovalLabel(pending: Pending): string {
   if (isRoutineApproval(pending)) {
     return pending.message.card?.routineRequest?.operation.action === "create"
       ? "Confirm this routine"
@@ -70,6 +71,7 @@ function label(pending: Pending): string {
     Write: "File-change approval requested",
     Edit: "File-change approval requested",
     edit: "File-change approval requested",
+    job_start: "Background job approval requested",
   };
   return nice[pending.tool] ?? "Approval requested";
 }
@@ -96,7 +98,7 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
             {index + 1} of {count}
           </span>
         )}
-        <span className="text-[13px] text-ink">{label(pending)}</span>
+        <span className="text-[13px] text-ink">{pendingApprovalLabel(pending)}</span>
         <span className="font-mono text-[11px] text-ink-secondary">
           {isRoutineApproval(pending)
             ? pending.message.card?.routineRequest?.operation.action === "create"

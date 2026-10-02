@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { describeRun, groupActivityRuns, RUN_FOLD_MIN } from "./activity-runs";
+import { describeRun, groupActivityRuns, nestHelperSteps, RUN_FOLD_MIN } from "./activity-runs";
 import type { Message } from "@/state/store";
 import type { ToolKind } from "../../shared/tool-activity";
 
@@ -142,5 +142,44 @@ describe("describeRun", () => {
 
   it("says how many steps failed, because that is the reason to open it", () => {
     expect(describeRun([tool("Edit"), tool("Bash", false)])).toBe("2 steps · Edit, Run · 1 failed");
+  });
+});
+
+describe("nestHelperSteps", () => {
+  const step = (id: string, itemId: string, parentItemId?: string): Message =>
+    ({ id, at: ++seq, role: "bot", kind: "activity", tool: { name: "Read", ok: true, itemId, parentItemId } });
+
+  it("moves parallel helpers' steps under the row that started each helper", () => {
+    const taskA = step("a", "task-a");
+    const taskB = step("b", "task-b");
+    const a1 = step("a1", "a-read-1", "task-a");
+    const b1 = step("b1", "b-read-1", "task-b");
+    const a2 = step("a2", "a-read-2", "task-a");
+    const own = step("own", "bot-read");
+    const reply = text("done");
+    const ordered = nestHelperSteps([taskA, taskB, a1, b1, own, a2, reply]);
+    expect(ordered.map((m) => m.id)).toEqual(["a", "a1", "a2", "b", "b1", "own", reply.id]);
+  });
+
+  it("returns the same array when nothing is a helper step", () => {
+    const messages = [step("x", "x-1"), text("hi")];
+    expect(nestHelperSteps(messages)).toBe(messages);
+  });
+
+  it("keeps a step whose parent row is not in the window where it was", () => {
+    const orphan = step("o", "o-1", "task-gone");
+    const messages = [text("before"), orphan, text("after")];
+    expect(nestHelperSteps(messages)).toBe(messages);
+  });
+
+  it("never drops a row from a malformed chain", () => {
+    const loopA = step("la", "la-1", "lb-1");
+    const loopB = step("lb", "lb-1", "la-1");
+    const root = step("r", "r-1");
+    const child = step("c", "c-1", "r-1");
+    const ordered = nestHelperSteps([loopA, root, loopB, child]);
+    expect(ordered).toHaveLength(4);
+    expect(new Set(ordered.map((m) => m.id))).toEqual(new Set(["la", "lb", "r", "c"]));
+    expect(ordered.indexOf(child)).toBe(ordered.indexOf(root) + 1);
   });
 });

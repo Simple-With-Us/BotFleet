@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { hasEngineSpendActivity, unpricedTurnCount } from "./UsageSection.tsx";
+import { hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
   it("maps unique model ids and leaves shared ids unmapped", () => {
@@ -128,10 +128,16 @@ describe("modelDisplayName", () => {
   it("falls back gracefully for unknown models", () => {
     expect(modelDisplayName("unknown-provider-model")).toBe("unknown-provider-model");
   });
+
+  it("labels retired Claude and Grok ids from their model class, not a stale table", () => {
+    expect(modelDisplayName("claude-3-7-sonnet")).toBe("Claude Sonnet 3.7");
+    expect(modelDisplayName("grok-4.6")).toBe("Grok 4.6");
+    expect(modelDisplayName("gpt-5.6-luna")).toBe("GPT-5.6 Luna");
+  });
 });
 
 describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
-  it("matches first-paint registry defaults for Cursor and DeepSeek Harness", () => {
+  it("matches first-paint registry defaults for Cursor and Harness", () => {
     const cursorPreset = findMatchingPreset("cursor", "Cursor Ultra", null);
     expect(cursorPreset).toBeDefined();
     expect(cursorPreset?.label).toBe("Cursor Ultra");
@@ -153,7 +159,7 @@ describe("ENGINE_PLAN_OPTIONS & findMatchingPreset", () => {
     expect(legacyMatch).toBeDefined();
   });
 
-  it("does not include a confusing $0 custom row for DeepSeek Harness", () => {
+  it("does not include a confusing $0 custom row for Harness", () => {
     const options = ENGINE_PLAN_OPTIONS["deepseek-harness"];
     expect(options.length).toBe(1);
     expect(options[0].costPerMonth).toBeNull();
@@ -284,5 +290,34 @@ describe("engine spend activity", () => {
   it("sums both windows for the coverage note", () => {
     expect(unpricedTurnCount({ spend5hUsd: 0, spend7dUsd: 0, unpricedTurns5h: 7, unpricedTurns7d: 31 })).toBe(38);
     expect(unpricedTurnCount(undefined)).toBe(0);
+  });
+});
+
+describe("hidesIdleUnavailableEngineRow", () => {
+  it("keeps a row whose probe just did not answer in time", () => {
+    // The owner's "only 2-3 engines" report: a slow `--version` read as
+    // "CLI not found" and Engine Quotas hid the row.
+    expect(
+      hidesIdleUnavailableEngineRow({
+        snapshot: { state: "unavailable", transient: true, reason: "Cursor did not answer in time" },
+      }),
+    ).toBe(false);
+  });
+
+  it("still hides engines that were never set up", () => {
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "`codex` CLI not found" } })).toBe(true);
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "Disabled in settings" } })).toBe(true);
+  });
+
+  it("hides the ASCII.dev Box engine until a Box token is configured", () => {
+    expect(
+      hidesIdleUnavailableEngineRow({
+        snapshot: { state: "unavailable", hidden: true, reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' },
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps a configured engine that is failing right now", () => {
+    expect(hidesIdleUnavailableEngineRow({ snapshot: { state: "unavailable", reason: "box API unreachable: fetch failed" } })).toBe(false);
   });
 });

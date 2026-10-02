@@ -20,15 +20,14 @@ describe("MiniMax published rates", () => {
     expect(formatPerMillionUsd(0.6)).toBe("$0.60");
     expect(formatPerMillionUsd(2.4)).toBe("$2.40");
     expect(minimaxPriceRows().map((row) => [row.model, row.input, row.cache, row.output, row.badge])).toEqual([
-      ["MiniMax M3", "$0.30", "$0.06", "$1.20", "Default · ≤512K ctx"],
-      ["MiniMax M2.7", "$0.30", "$0.06", "$1.20", "API"],
+      ["MiniMax M3.1 Flash Preview", "$0.30", "$0.06", "$1.20", "Default · ≤512K ctx"],
       ["MiniMax M2.7 Highspeed", "$0.60", "$0.06", "$2.40", "API"],
     ]);
   });
 
-  it("has exactly one row per catalog model id — MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed", () => {
+  it("has exactly one row per catalog model id — MiniMax-M3.1-Flash-Preview, MiniMax-M2.7-highspeed", () => {
     expect(Object.keys(MINIMAX_PRICE_PER_MILLION).sort()).toEqual(
-      ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3"].sort(),
+      ["MiniMax-M2.7-highspeed", "MiniMax-M3.1-Flash-Preview"].sort(),
     );
     // a coverage test can only force a decision when a model is ADDED to
     // the catalog with no row — it cannot, on its own, detect a model
@@ -36,7 +35,7 @@ describe("MiniMax published rates", () => {
     // driver's catalog, which is exactly what server/drivers/minimax.test.ts's
     // "has a real price row for every model in its own catalog" check is
     // for, against the driver's own live MinimaxDriver.models.
-    expect(minimaxPriceRows()).toHaveLength(3);
+    expect(minimaxPriceRows()).toHaveLength(2);
   });
 
   it("every row parses to finite, positive USD numbers", () => {
@@ -52,8 +51,8 @@ describe("MiniMax published rates", () => {
     }
   });
 
-  it("keeps MiniMax-M3's over-512K tier at double the base rate, with no upper bound of its own", () => {
-    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3"]!;
+  it("keeps MiniMax-M3.1-Flash-Preview's over-512K tier at double the base rate, with no upper bound of its own", () => {
+    const [base, over] = MINIMAX_PRICE_PER_MILLION["MiniMax-M3.1-Flash-Preview"]!;
     expect(base.maxInputTokens).toBe(512_000);
     expect(over.maxInputTokens).toBeUndefined();
     expect(over.input).toBeCloseTo(base.input * 2, 10);

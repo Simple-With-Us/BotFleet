@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import {
   applicationAttachmentError,
@@ -10,6 +12,7 @@ import {
   SAFE_STORAGE_EXPORT_FLAG,
   shouldExportSafeStorageBeforeRename,
   authenticatedRuntimeError,
+  bootOutHarnessForQuiesce,
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
   dependencyFingerprint,
@@ -30,9 +33,11 @@ import {
   rollbackReadinessError,
   run,
   settledRunOutcome,
+  signalProcess,
   stableApplicationProcessError,
   startedHarnessLabel,
   swapPreparedFiles,
+  terminateVerified,
   validateBuiltBundle,
   waitForLaunchdBootout,
 } from "./update-botfleet-mac.mjs";
@@ -860,8 +865,10 @@ test("rollback boots out the legacy label when startHarness bootstrapped the leg
     legacyLabel: "com.jay.botfleet-server",
     legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
   };
-  // Legacy-only Mac: the fallback bootstraps the legacy-named plist, whose
-  // job still runs as com.jay.botfleet-server.
+  // Legacy-only Mac: the fallback bootstraps the legacy-named plist.  Its job
+  // may run under either label (a Mac migrated in place declares the renamed
+  // one in that file); the path mapping assumes the legacy label, and rollback
+  // boots out the renamed label regardless, so both are covered.
   const started = harnessBootstrapPlist(config, { plistExists: false, legacyPlistExists: true });
   assert.equal(started, config.legacyPlist);
   assert.equal(harnessLaunchdLabel(config, started), config.legacyLabel);
@@ -962,6 +969,216 @@ test("rollback confirms a bootout label is absent, retrying a slow teardown with
   assert.equal(stuckProbes, 4, "a surviving job is retried, not awaited forever");
 });
 
+// A process table for terminateVerified.  Each entry is { command, cwd, alive }
+// plus optional hooks: exitDuringPs and exitDuringLsof end the process while
+// that inspection is still running, which is the window a loaded Mac (load
+// average 200-400) leaves open for seconds; ignoresTerm survives SIGTERM and
+// killError makes the signal itself fail.
+function processTable(entries) {
+  const table = new Map(Object.entries(entries).map(([pid, entry]) => [Number(pid), { alive: true, ...entry }]));
+  const signals = [];
+  const deps = {
+    isAlive: (pid) => table.get(pid)?.alive === true,
+    commandOf: async (pid) => {
+      const entry = table.get(pid);
+      if (!entry?.alive) return "";
+      if (entry.exitDuringPs) { entry.alive = false; return ""; }
+      return entry.command;
+    },
+    cwdOf: async (pid) => {
+      const entry = table.get(pid);
+      if (!entry?.alive) return "";
+      if (entry.exitDuringLsof) entry.alive = false;
+      return entry.cwd;
+    },
+    kill: (pid, signal) => {
+      const entry = table.get(pid);
+      if (entry?.killError) throw entry.killError;
+      if (!entry?.alive) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH", errno: -3, syscall: "kill" });
+      signals.push([pid, signal]);
+      if (signal === "SIGTERM" && !entry.ignoresTerm) entry.alive = false;
+    },
+    wait: async () => {},
+  };
+  return { table, signals, deps };
+}
+
+const quiesceConfig = {
+  appPath: "/Applications/BotFleet.app",
+  checkout: "/Users/test/apps/botfleet-server",
+  gracefulExitMs: 0,
+  termExitMs: 0,
+};
+const electronMain = "/Applications/BotFleet.app/Contents/MacOS/BotFleet";
+const electronHelper = "/Applications/BotFleet.app/Contents/Frameworks/BotFleet Helper.app/Contents/MacOS/BotFleet Helper --type=utility";
+const checkoutHarness = "node --import tsx server/index.ts";
+
+test("signalProcess reports an already-exited process as gone and still throws every other failure", async () => {
+  const esrch = Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  assert.equal(signalProcess(4242, "SIGTERM", () => { throw esrch; }), false);
+  const sent = [];
+  assert.equal(signalProcess(4242, "SIGTERM", (pid, signal) => { sent.push([pid, signal]); }), true);
+  assert.deepEqual(sent, [[4242, "SIGTERM"]]);
+  const eperm = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  assert.throws(
+    () => signalProcess(4242, "SIGTERM", () => { throw eperm; }),
+    (error) => /Could not send SIGTERM to BotFleet process 4242: kill EPERM/.test(error.message) && error.cause === eperm,
+  );
+  // The real process.kill: a reaped child's pid answers ESRCH.  Signal 0 only
+  // probes, so nothing is ever delivered to anyone even if the pid is reused.
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(child, "exit");
+  assert.equal(signalProcess(child.pid, 0), false);
+  assert.equal(signalProcess(process.pid, 0), true);
+});
+
+test("quiesce treats a process that exits between verification and SIGTERM as stopped, not as kill ESRCH", async () => {
+  // 2026-10-02 apply: SIGTERM reached the Electron main process, its quit took
+  // the companion and helpers down with it, and the next helper in the loop
+  // had passed ps and lsof but was gone by the time the updater signalled it.
+  const { table, signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/" },
+    // Verified by ps and lsof, then gone before the signal: kill would ESRCH.
+    502: { command: electronHelper, cwd: "/", exitDuringLsof: true },
+    503: { command: electronHelper, cwd: "/" },
+  });
+  const previous = { runtimePids: [501], appPids: [501, 502, 503], processCommands: {}, processCwds: {} };
+  await terminateVerified([501, 502, 503], previous, quiesceConfig, { current: [501, 502, 503], ...deps });
+  assert.deepEqual(signals, [[501, "SIGTERM"], [503, "SIGTERM"]], "the gone helper is skipped and the rest still get SIGTERM");
+  assert.equal([...table.values()].some((entry) => entry.alive), false);
+  // Rollback calls the strict form with no `current`; the same race must not
+  // fail it either, or a quiesce failure turns into a failed rollback.
+  const strict = processTable({
+    501: { command: electronMain, cwd: "/" },
+    502: { command: electronHelper, cwd: "/", exitDuringLsof: true },
+  });
+  await terminateVerified([501, 502], previous, quiesceConfig, strict.deps);
+  assert.deepEqual(strict.signals, [[501, "SIGTERM"]]);
+});
+
+test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", async () => {
+  const { signals, deps } = processTable({
+    501: { command: electronMain, cwd: "/", exitDuringPs: true },
+    16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
+  });
+  const previous = { runtimePids: [], appPids: [], processCommands: {}, processCwds: {} };
+  // Strict: 501 was resolved as a current holder, but an empty identity from a
+  // process that no longer exists is not a foreign executable.
+  await terminateVerified([501, 16529], previous, quiesceConfig, deps);
+  assert.deepEqual(signals, [[16529, "SIGTERM"]]);
+});
+
+test("quiesce re-resolves the harness when its pid changed between capture and quiesce", async () => {
+  // Capture recorded harness pid 233.  By quiesce that harness is gone, 233
+  // names an unrelated process, and the replacement harness 16529 holds the
+  // database and answers port 8799.
+  const { table, signals, deps } = processTable({
+    233: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" },
+    16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
+  });
+  const previous = {
+    runtimePids: [233],
+    appPids: [],
+    processCommands: { 233: checkoutHarness },
+    processCwds: { 233: quiesceConfig.checkout },
+  };
+  await terminateVerified([...previous.runtimePids, 16529], previous, quiesceConfig, { current: [16529], ...deps });
+  assert.deepEqual(signals, [[16529, "SIGTERM"]], "the replacement is stopped and the recycled pid is never signalled");
+  assert.equal(table.get(233).alive, true, "the unrelated process is left alone and not waited on");
+  // A captured pid that has simply exited is dropped by the liveness filter.
+  const exited = processTable({ 16529: { command: checkoutHarness, cwd: quiesceConfig.checkout } });
+  await terminateVerified([233, 16529], previous, quiesceConfig, { current: [16529], ...exited.deps });
+  assert.deepEqual(exited.signals, [[16529, "SIGTERM"]]);
+  // No false success: a process resolved NOW as holding BotFleet state must
+  // still verify, whether quiesce names it current or rollback calls strictly.
+  const holder = processTable({ 233: { command: "/usr/libexec/unrelated-daemon --serve", cwd: "/" } });
+  await assert.rejects(
+    terminateVerified([233], previous, quiesceConfig, { current: [233], ...holder.deps }),
+    /Process 233 still holds BotFleet state but its executable is not an expected BotFleet path/,
+  );
+  await assert.rejects(
+    terminateVerified([233], previous, quiesceConfig, holder.deps),
+    /Process 233 still holds BotFleet state/,
+  );
+  assert.deepEqual(holder.signals, []);
+});
+
+test("quiesce still refuses a process that rejects or survives SIGTERM, and never escalates to SIGKILL", async () => {
+  const eperm = Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+  const refused = processTable({ 501: { command: electronMain, cwd: "/", killError: eperm } });
+  await assert.rejects(
+    terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, { current: [501], ...refused.deps }),
+    /Could not send SIGTERM to BotFleet process 501: kill EPERM/,
+  );
+  const stubborn = processTable({ 501: { command: electronMain, cwd: "/", ignoresTerm: true } });
+  await assert.rejects(
+    terminateVerified([501], { processCommands: {}, processCwds: {} }, quiesceConfig, { current: [501], ...stubborn.deps }),
+    /BotFleet did not exit after graceful quit and SIGTERM \(pid 501\); refusing SIGKILL/,
+  );
+  assert.deepEqual(stubborn.signals, [[501, "SIGTERM"]]);
+});
+
+test("quiesce confirms a harness bootout with launchctl print and boots out a job loaded since capture", async () => {
+  const config = {
+    domain: "gui/501",
+    label: "app.botfleet.server",
+    legacyLabel: "com.jay.botfleet-server",
+    plist: "/Users/test/Library/LaunchAgents/app.botfleet.server.plist",
+    legacyPlist: "/Users/test/Library/LaunchAgents/com.jay.botfleet-server.plist",
+  };
+  const launchctl = (loadedNow, { absentAfterBootout = true } = {}) => {
+    const booted = [];
+    return {
+      booted,
+      deps: {
+        print: async (label) => ({ code: loadedNow.includes(label) ? 0 : 113 }),
+        // bootout exits nonzero even when it worked or the job was already gone.
+        bootout: async (label) => { booted.push(label); return { code: 5 }; },
+        confirmAbsent: async () => absentAfterBootout,
+      },
+    };
+  };
+  // Captured loaded, already gone by quiesce: a nonzero bootout is not a refusal.
+  const gone = launchctl([]);
+  const capturedLoaded = { launchdLoaded: true, legacyLaunchdLoaded: false };
+  await bootOutHarnessForQuiesce(config, capturedLoaded, gone.deps);
+  assert.deepEqual(gone.booted, [config.label]);
+  // Still loaded after bootout: refuse rather than install under KeepAlive.
+  const stuck = launchctl([config.label], { absentAfterBootout: false });
+  await assert.rejects(
+    bootOutHarnessForQuiesce(config, { launchdLoaded: true, legacyLaunchdLoaded: false }, stuck.deps),
+    /Could not boot out app\.botfleet\.server before install: gui\/501\/app\.botfleet\.server is still loaded/,
+  );
+  // Not loaded at capture, bootstrapped since (a watchdog restart): booted out
+  // now, and recorded so rollback restores it like a captured job.
+  const restarted = launchctl([config.label]);
+  const capturedStopped = { launchdLoaded: false, legacyLaunchdLoaded: false };
+  await bootOutHarnessForQuiesce(config, capturedStopped, restarted.deps);
+  assert.deepEqual(restarted.booted, [config.label]);
+  assert.equal(capturedStopped.launchdLoaded, true);
+  assert.deepEqual(
+    rollbackHarnessBootstrapPlists(config, capturedStopped, { plistExists: true, legacyPlistExists: true }),
+    [config.plist],
+  );
+  // The aliased configuration still boots its one label out exactly once.
+  const aliased = { ...config, label: config.legacyLabel };
+  const once = launchctl([config.legacyLabel]);
+  await bootOutHarnessForQuiesce(aliased, { launchdLoaded: false, legacyLaunchdLoaded: false }, once.deps);
+  assert.deepEqual(once.booted, [config.legacyLabel]);
+});
+
+test("quiesce re-resolves current holders, bundle processes and port owners before signalling", async () => {
+  const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
+  const quiesce = source.indexOf("quiesce: async (previous) => {");
+  const assertQuiesced = source.indexOf("assertQuiesced: async () => {", quiesce);
+  assert.ok(quiesce >= 0 && assertQuiesced > quiesce);
+  const body = source.slice(quiesce, assertQuiesced);
+  assert.match(body, /await bootOutHarnessForQuiesce\(config, previous\)/);
+  assert.match(body, /Promise\.all\(config\.ports\.map\(probeHealth\)\)/);
+  assert.match(body, /ownedRuntimePids\(\{ holders: currentHolders, bundlePids: currentBundlePids, health \}\)/);
+  assert.match(body, /\{ current \}/);
+});
+
 test("rollback verifies each bootout with launchctl print before restoring files", async () => {
   const source = await readFile(join(scripts, "update-botfleet-mac.mjs"), "utf8");
   const rollback = source.indexOf("rollback: async (prepared, previous, originalError) => {");
@@ -1001,7 +1218,9 @@ test("production updater has no force-kill or unrelated desktop-process cleanup"
     assert.equal(source.includes(forbidden), false, `must not contain ${forbidden}`);
   }
   assert.doesNotMatch(source, /process\.kill\([^\n]+"SIGKILL"/);
-  assert.match(source, /process\.kill\(pid, "SIGTERM"\)/);
+  assert.doesNotMatch(source, /signalProcess\([^\n]+"SIGKILL"/);
+  assert.match(source, /signalProcess\(pid, "SIGTERM", kill\)/);
+  assert.match(source, /kill = \(target, name\) => process\.kill\(target, name\)/);
   assert.match(source, /runtime\.safeToRestart !== true/);
   assert.match(source, /runtime\.sourceCommit !== expectedBuild\.targetCommit/);
   assert.match(source, /Database ownership is ambiguous/);
@@ -1453,4 +1672,70 @@ test("a relaunch of a finished run does nothing and exits successfully", async (
   assert.equal(process.exitCode, undefined);
 });
 
+// The wrapper bootstraps the updater into `mktemp -d "${TMPDIR}/..."`.  On
+// macOS TMPDIR is under /var/folders and /var is a symlink to /private/var.
+// Node's ESM loader realpaths the entry module, so import.meta.url named
+// /private/var/... while process.argv[1] kept /var/..., the entry guard was
+// false, main() never ran, and every ubf run exited 0 without a word.  This
+// test reproduces that with an explicit symlinked directory so it fails on any
+// platform that can create one, not only on a Mac.
+async function symlinkedCopy(t, files) {
+  const root = await mkdtemp(join(tmpdir(), "botfleet-entry-guard-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const physical = join(root, "physical");
+  const linked = join(root, "linked");
+  for (const file of files) {
+    const target = join(physical, file);
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(join(scripts, "..", file), target);
+  }
+  // "junction" is ignored on POSIX and lets Windows create the link without
+  // elevated privileges.
+  await symlink(physical, linked, "junction");
+  // Guard the premise: the two spellings must really differ.
+  assert.notEqual(await realpath(linked), linked);
+  return { linked, root };
+}
 
+test("the updater runs its entry point when invoked through a symlinked directory", async (t) => {
+  // Exactly the files the wrapper archives into its bootstrap directory, laid
+  // out the same way.  Keeping the list here also proves the entry module
+  // stays self-contained: a new import would fail to resolve in this copy.
+  const { linked, root } = await symlinkedCopy(t, [
+    "scripts/update-botfleet-mac.mjs",
+    "scripts/mac-update-transaction.mjs",
+    "scripts/update-progress.mjs",
+    "electron/update-credential-preparation.mjs",
+  ]);
+  // --help returns before any configuration, lock, network or data directory
+  // is touched.  HOME and the BotFleet paths still point at scratch so a
+  // regression elsewhere cannot reach this machine's real checkout or app.
+  const result = await run(process.execPath, [join(linked, "scripts", "update-botfleet-mac.mjs"), "--help"], {
+    env: {
+      HOME: join(root, "home"),
+      BOTFLEET_UPDATE_ALLOW_NON_DARWIN: "1",
+      BOTFLEET_CHECKOUT: join(root, "checkout"),
+      BOTFLEET_APP_PATH: join(root, "BotFleet.app"),
+      BOTFLEET_DATA_DIR: join(root, "data"),
+      BOTFLEET_UPDATE_LOCK: join(root, "update.lock"),
+      BOTFLEET_UPDATE_ROOT: join(root, "updates"),
+    },
+    allowFailure: true,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  // A silent exit 0 is the bug, so the exit code alone proves nothing.
+  assert.match(result.stdout, /^Usage:/m, "main() must run and print the usage text");
+  assert.match(result.stdout, /pending-update-resume\.json/, "usage must say what --force interrupts");
+});
+
+test("another script with the same entry guard runs through a symlinked directory", async (t) => {
+  const { linked } = await symlinkedCopy(t, ["scripts/verify-release-tag.mjs"]);
+  const result = await run(process.execPath, [join(linked, "scripts", "verify-release-tag.mjs")], {
+    env: { GH_TOKEN: "" },
+    allowFailure: true,
+  });
+  // Reaching the token check proves the guard fired.  It never gets as far as
+  // a network request without a token.
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
+});

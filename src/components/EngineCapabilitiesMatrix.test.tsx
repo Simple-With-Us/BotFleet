@@ -20,6 +20,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   EngineCapabilitiesMatrix,
+  engineAvailability,
   MATRIX_CAPABILITY_COL_PX,
   MATRIX_CARD_PADDING_PX,
   MATRIX_CONTENT_BUDGET_PX,
@@ -44,7 +45,7 @@ const html = renderToStaticMarkup(createElement(EngineCapabilitiesMatrix));
 
 /** `renderToStaticMarkup` drops event handlers and class maps that never made
  *  it onto an element, so the behaviour assertions below read the component
- *  source.  Same pattern the ComputerEngineCallout and ui-copy tests use. */
+ *  source.  Same pattern the BoxEngineCallout and ui-copy tests use. */
 const source = readFileSync(new URL("./EngineCapabilitiesMatrix.tsx", import.meta.url), "utf8");
 
 describe("EngineCapabilitiesMatrix layout budget", () => {
@@ -191,5 +192,25 @@ describe("EngineCapabilitiesMatrix cell vocabulary", () => {
         expect(capabilityNoteFor(entry, key), `${id}/${key}`).toBeTruthy();
       }
     }
+  });
+});
+
+describe("engineAvailability", () => {
+  const claude = ENGINE_CAPABILITIES.claude;
+  const instance = (snapshot: Record<string, unknown>) => ({
+    instanceId: "claude",
+    driverKind: "claudeAgent",
+    displayName: "Claude",
+    snapshot,
+    models: { default: "", options: [] },
+  }) as never;
+
+  it("says Checking, not 'Command-line app not found', when the probe did not answer in time", () => {
+    expect(claude).toBeDefined();
+    expect(
+      engineAvailability(claude!, [instance({ state: "unavailable", transient: true, reason: "Claude did not answer in time" })]),
+    ).toBe("checking");
+    expect(engineAvailability(claude!, [instance({ state: "unavailable", reason: "`claude` CLI not found" })])).toBe("cli-missing");
+    expect(engineAvailability(claude!, [instance({ state: "available", version: "2.1.284" })])).toBe("ready");
   });
 });

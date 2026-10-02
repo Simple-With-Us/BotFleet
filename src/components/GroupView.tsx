@@ -36,9 +36,10 @@ import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
 import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { ToolLine } from "./ToolLine";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
@@ -290,10 +291,11 @@ const Transcript = memo(function Transcript({
   const memberOf = (id?: string) => members.find((b) => b.id === id);
   // Several bots working at once turn a room into a wall of chips; fold the
   // finished ones when summarizeToolCalls is enabled.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   const focus = state.focusMessage;
   const focusedId = focus && !focus.consumed && focus.threadId === group.threadId ? focus.messageId : null;
   return (
@@ -345,6 +347,8 @@ const Transcript = memo(function Transcript({
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
             </div>
+          ) : m.kind === "activity" && m.job ? (
+            <JobFinishedRow job={m.job} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -1345,6 +1349,8 @@ export function GroupView({ group }: { group: Group }) {
           >
             <Search size={18} />
           </button>
+          {/* Members' background jobs on this room's thread: notices only, never a wake. */}
+          <JobsMenu threadId={group.threadId} room />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
@@ -1627,6 +1633,7 @@ export function GroupView({ group }: { group: Group }) {
         locked={setupPending}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
       />
       </div>
       </div>

@@ -3,6 +3,7 @@ import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
+import { BotFallbackModels } from "./BotFallbackModels";
 import { ModelPicker } from "./ModelPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
@@ -21,7 +22,8 @@ import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
-import { modelEffortLevels } from "@/lib/model-effort";
+import { effortLabel } from "@/lib/model-effort";
+import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
 import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
 
 function Field({
@@ -372,6 +374,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "speakReplies"
         | "speechDevices"
         | "voice"
+        | "voiceSummaryMode"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
@@ -596,50 +599,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               }
             />
             
-            {bot.modelSelection.fallbacks?.map((fallback, i) => (
-              <div key={i} className="flex flex-col gap-2 pt-4 border-t border-hairline/40">
-                <div className="flex items-center justify-between">
-                  <div className="text-[13px] font-medium text-ink">Fallback #{i + 1}</div>
-                  <button 
-                    onClick={() => {
-                       const next = [...(bot.modelSelection.fallbacks || [])];
-                       next.splice(i, 1);
-                       patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                    }}
-                    className="text-[12px] text-red-500 hover:underline"
-                  >
-                    Remove
-                  </button>
-                </div>
-                <ModelPicker
-                  bot={bot}
-                  contained
-                  selection={fallback}
-                  onChange={(sel) => {
-                     const next = [...(bot.modelSelection.fallbacks || [])];
-                     next[i] = sel;
-                     patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                  }}
-                />
-              </div>
-            ))}
-            
-            {(bot.modelSelection.fallbacks?.length || 0) < 2 && (
-              <button
-                onClick={() => {
-                   const next = [...(bot.modelSelection.fallbacks || []), { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model }];
-                   patch({ modelSelection: { ...bot.modelSelection, fallbacks: next } });
-                }}
-                className="mt-2 text-left text-[13px] text-blue-500 hover:underline"
-              >
-                Add Fallback Model
-              </button>
-            )}
+            <BotFallbackModels bot={bot} onChange={(modelSelection) => patch({ modelSelection })} />
           </div>
 
           {(() => {
-            const selectedOpt = engine?.models.options.find((o) => o.id === bot.modelSelection.model);
-            const effortLevels = modelEffortLevels(engine, selectedOpt, bot.modelSelection.model);
+            const effortLevels = selectionEffortLevels(engine, bot.modelSelection);
             if (!effortLevels.length && !bot.modelSelection.effort) return null;
             return (
               <div className="rounded-xl bg-card p-4">
@@ -660,23 +624,22 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                       <button
                         key={level ?? "default"}
                         aria-pressed={bot.modelSelection.effort === level}
-                        onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: level } })}
+                        onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, level) })}
                         className={cn(
-                          "flex-1 py-1.5 text-[13px] capitalize",
+                          "flex-1 py-1.5 text-[13px]",
                           i > 0 && "border-l border-hairline/40",
                           bot.modelSelection.effort === level
                             ? "bg-control text-ink"
                             : "text-ink-secondary hover:bg-control/60 hover:text-ink",
                         )}
                       >
-                        {/* the others capitalize cleanly; "xhigh" would read "X-High" */}
-                        {level === "xhigh" ? "X-High" : (level ?? "Default")}
+                        {effortLabel(level)}
                       </button>
                     ))}
                   </div>
                 ) : (
                   <button
-                    onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: undefined } })}
+                    onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, undefined) })}
                     className="mt-3 rounded-lg border border-hairline/40 bg-control px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-control/80"
                   >
                     Clear Saved Reasoning ({bot.modelSelection.effort})

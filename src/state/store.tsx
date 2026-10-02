@@ -21,7 +21,9 @@ import type { BotColor, BotMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
 import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
+import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ContextInjectionRef } from "../../shared/context-injection";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -95,12 +97,15 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  /** A "Job Finished" row: a background job of the bot's ended. */
+  job?: import("../../shared/jobs").JobRowData;
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
+  voiceText?: string;
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
@@ -127,7 +132,23 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
+    /** The helper (native subagent) step this one ran inside: the parent
+     * row's `itemId`.  The chat nests the row under that parent instead of
+     * interleaving parallel helpers' steps with the bot's own. */
+    parentItemId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */
@@ -218,8 +239,13 @@ export interface GroupTask {
 
 export interface ModelSelection {
   instanceId: string;
+  /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
+   *  shared/model-lineage.ts.  The picker sends `null` when a person picks
+   *  a pinned model, so the harness does not carry an older float forward. */
+  latest?: string | null;
   fallbacks?: ModelSelection[];
 }
 
@@ -233,6 +259,9 @@ export interface Task {
   lastActivity?: number;
   /** what this task has spent, banked once per settled turn */
   usage?: TaskUsage;
+  /** Timing aggregate banked with `usage`; absent on tasks from before it
+   *  existed.  Durations are milliseconds. */
+  stats?: TaskStats;
   /** Per-instance breakdown of `usage`, banked from the selection that
    *  actually ran each turn (post-fallback).  `engineId` is the registry
    *  engine resolved at bank time, so attribution survives deleting the
@@ -255,6 +284,19 @@ export interface Task {
    * window left open across one is not, which is why the sidebar checks the
    * clock too.  See `shared/thread-snooze.ts`. */
   snoozedUntil?: number;
+}
+
+/** Mirror of the server's `TaskStats`: running timing totals for a task,
+ *  in milliseconds, banked once per settled turn.  Aggregates only. */
+export interface TaskStats {
+  turns: number;
+  steps: number;
+  modelMs: number;
+  toolMs: number;
+  ttftMsSum?: number;
+  ttftSamples?: number;
+  tpsTokens?: number;
+  tpsMs?: number;
 }
 
 export interface TaskUsage {
@@ -322,6 +364,9 @@ export interface Bot {
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
+   * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
+  voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
@@ -655,6 +700,13 @@ export interface InstanceInfo {
   snapshot: {
     state: "available" | "unavailable";
     reason?: string;
+    /** The probe gave no answer (timeout) — show "Checking", not a setup
+     *  problem.  See server/contracts.ts ProviderSnapshot.transient. */
+    transient?: boolean;
+    /** Optional integration not set up (the ASCII.dev Box engine with no Box token): kept
+     *  out of engine lists until it is. */
+    hidden?: boolean;
+    /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
@@ -689,6 +741,9 @@ export interface InstanceInfo {
   };
   models: {
     default: string;
+    /** Set when the provider itself just listed this catalog, so a saved id
+     *  missing from it can honestly be called "Not in catalog". */
+    live?: boolean;
     options: Array<{
       id: string;
       label: string;
@@ -763,7 +818,14 @@ export type AppSettingsSection =
 export interface AppState {
   bots: Bot[];
   groups: Group[];
+  /** Background jobs per thread, as the harness's last `jobs` frame (or the
+   *  hydrate's `GET /api/jobs`) gave them: running first, then finished. */
+  jobsByThread: Record<string, import("../../shared/jobs").JobSnapshot[]>;
   instances: InstanceInfo[];
+  /** When the server produced `instances` (its `describedAt`), so an older
+   *  answer arriving late — a slow GET, the hydrate racing the `instances`
+   *  push, a PATCH response — never replaces a newer one. */
+  instancesDescribedAt: number;
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
@@ -864,6 +926,10 @@ function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string
 export type BotAnnouncement = Omit<Bot, "messages"> & { messages?: Message[] };
 
 export type Action =
+  /** Every job the harness knows, from `GET /api/jobs` at hydrate. */
+  | { type: "jobsHydrated"; jobs: import("../../shared/jobs").JobSnapshot[] }
+  /** One thread's full set, from a `jobs` frame. */
+  | { type: "jobsFrame"; threadId: string; jobs: import("../../shared/jobs").JobSnapshot[] }
   | {
       type: "hydrate";
       bots: Bot[];
@@ -901,7 +967,16 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string }
+  | {
+      type: "sendGroup";
+      groupId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | {
       type: "patchGroup";
       groupId: string;
@@ -919,10 +994,23 @@ export type Action =
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
-  | { type: "instances"; instances: InstanceInfo[] }
+  | { type: "instances"; instances: InstanceInfo[]; describedAt?: number }
+  /** The stream could not resume, so the harness may be a new process whose
+   *  `describedAt` clock owes nothing to the last one's: forget the mark (not
+   *  the list) so the next answer is not judged against it. */
+  | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyToId?: string }
+  | {
+      type: "send";
+      botId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
@@ -1254,6 +1342,13 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     case "resourceTriggersHydrated":
       return { ...state, resourceTriggers: action.triggers };
+    case "jobsHydrated": {
+      const jobsByThread: AppState["jobsByThread"] = {};
+      for (const job of action.jobs) (jobsByThread[job.threadId] ??= []).push(job);
+      return { ...state, jobsByThread };
+    }
+    case "jobsFrame":
+      return { ...state, jobsByThread: { ...state.jobsByThread, [action.threadId]: action.jobs } };
     case "resourceTriggerPatched": {
       const exists = state.resourceTriggers.some((trigger) => trigger.id === action.trigger.id);
       return {
@@ -1283,8 +1378,16 @@ export function reducer(state: AppState, action: Action): AppState {
       const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
       return { ...state, groups, selectedId };
     }
-    case "instances":
-      return { ...state, instances: action.instances };
+    case "instances": {
+      // Every response carries the server's describedAt; drop one older than
+      // what is already shown.  A payload without one (an older server) is
+      // applied as before.
+      const at = typeof action.describedAt === "number" ? action.describedAt : undefined;
+      if (at !== undefined && at < state.instancesDescribedAt) return state;
+      return { ...state, instances: action.instances, instancesDescribedAt: at ?? state.instancesDescribedAt };
+    }
+    case "instancesOrderReset":
+      return state.instancesDescribedAt === 0 ? state : { ...state, instancesDescribedAt: 0 };
     case "configStatus":
       return {
         ...state,
@@ -1894,7 +1997,9 @@ const MAX_KEPT_SCREEN_FRAMES = 8;
 export const initialState: AppState = {
   bots: [],
   groups: [],
+  jobsByThread: {},
   instances: [],
+  instancesDescribedAt: 0,
   config: null,
   selectedId: "",
   activeView: "chat",
@@ -2284,7 +2389,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 });
               }
             })
-            .catch(showError);
+            .catch((error) => {
+              showError(error);
+              action.onError?.(error instanceof Error ? error.message : String(error));
+            });
           break;
         }
         case "editMessage":
@@ -2438,7 +2546,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
             body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          }).catch(showError);
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         case "patchGroup": {
           const previous = groupBeforePatch;
@@ -2644,7 +2755,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         {
           label: "engines",
           request: api("/api/instances")
-            .then(({ instances }) => alive && rawDispatch({ type: "instances", instances })),
+            .then(({ instances, describedAt }) => alive && rawDispatch({ type: "instances", instances, describedAt })),
         },
         {
           label: "settings",
@@ -2667,6 +2778,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           label: "resource triggers",
           request: api("/api/resource-triggers")
             .then(({ triggers }) => alive && rawDispatch({ type: "resourceTriggersHydrated", triggers: triggers ?? [] })),
+        },
+        // Background jobs: the full set, so a reconnect that could not
+        // replay the frames it missed is right again at once.
+        {
+          label: "jobs",
+          request: api("/api/jobs").then(({ jobs }) => alive && rawDispatch({ type: "jobsHydrated", jobs: jobs ?? [] })),
         },
       ];
       await runHydrationRequests(requests);
@@ -2857,8 +2974,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "resource-trigger.deleted":
           rawDispatch({ type: "resourceTriggerDeleted", triggerId: frame.triggerId });
           break;
+        // a thread's whole job set (debounced on the server); never output
+        case "jobs":
+          if (typeof frame.threadId === "string" && Array.isArray(frame.jobs)) {
+            rawDispatch({ type: "jobsFrame", threadId: frame.threadId, jobs: frame.jobs });
+          }
+          break;
         case "runtime": {
           const event = frame.event;
+          // the Trajectory tab's door: free unless that thread's tab is open
+          publishRuntimeEvent(event);
           if (event.type === "content.delta") {
             // Batch token deltas per animation frame (t3code-style): a fast
             // stream dispatches once per frame instead of once per token, so
@@ -2907,8 +3032,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             config: configStatusFromFrame(frame),
           });
           api("/api/instances")
-            .then(({ instances }) => rawDispatch({ type: "instances", instances }))
+            .then(({ instances, describedAt }) => rawDispatch({ type: "instances", instances, describedAt }))
             .catch(() => {});
+          break;
+        // A describe finished on the server (a background sweep behind a
+        // stale answer, or a slow engine's probe landing late).  Applied
+        // directly — re-fetching here would only start another sweep.
+        case "instances":
+          if (Array.isArray(frame.instances)) {
+            rawDispatch({ type: "instances", instances: frame.instances, describedAt: frame.describedAt });
+          }
           break;
       }
     };
@@ -2924,6 +3057,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (frame.kind === "hello") {
         clearTimeout(hydrationFallback);
         if (frame.resumed !== true) {
+          // The events missed while disconnected are not coming back over the
+          // stream: an open Trajectory tab re-reads its thread's log.
+          publishRuntimeGap();
           // The snapshot replaces the pre-gap transcript.  Discard both
           // rendered fragments and queued deltas from that older boundary.
           deltaBuffer.current.clear();
@@ -2933,6 +3069,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           setStream(EMPTY_STREAM);
           pendingFrames.length = 0;
+          // A harness that restarted stamps from its own clock, which a
+          // backwards correction can leave below the last process's final
+          // stamp.  Keep the engine list, drop the mark, so the hydrate's
+          // fetch (and later pushes) are not discarded as "older".
+          rawDispatch({ type: "instancesOrderReset" });
         }
         if (shouldHydrateAfterHello(frame.resumed === true, hydrationFailed)) hydrate();
         return;
@@ -2961,8 +3102,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // "Check again"/"Refresh" click, or a just-saved CLI/fullAuto override.
   const refreshInstances = useCallback(async (opts?: { fresh?: boolean }) => {
     try {
-      const { instances } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
-      rawDispatch({ type: "instances", instances });
+      const { instances, describedAt } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
+      rawDispatch({ type: "instances", instances, describedAt });
     } catch {
       /* offline or server down — the existing list stays */
     }

@@ -20,6 +20,7 @@ export type BotUpdatePatch = Partial<
     | "speechDevices"
     | "maxToolRounds"
     | "voice"
+    | "voiceSummaryMode"
     | "pinned"
     | "hidden"
     | "section"

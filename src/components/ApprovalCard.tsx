@@ -35,6 +35,7 @@ function toolLabel(tool?: string): string {
     WebSearch: "search the web",
     schedule_routine: "schedule a routine",
     manage_routine: "change a routine",
+    job_start: "start a background job",
   };
   return nice[tool] ?? bare;
 }
@@ -80,6 +81,12 @@ export function ApprovalCard({
       >
         {card.subtitle}
       </pre>
+
+      {displayTool === "job_start" && (
+        <p className="mt-2 text-[12.5px] text-ink-secondary">
+          {"It keeps running in the background after you allow it.\u00a0 You can stop it from Background Jobs in the chat header."}
+        </p>
+      )}
 
       {card.held && (
         <div className="mt-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12.5px] text-warning">

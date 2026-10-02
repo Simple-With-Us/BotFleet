@@ -87,6 +87,13 @@ export interface ToolGateContext {
    *  into Linq, has a workspace bot number configured, AND enabled voice
    *  (`imessageLinq.allowVoiceByDefault`). */
   linq?: boolean;
+  /** The background job tools (job_start, job_output, job_list, job_kill)
+   *  are mounted this turn: the engine runs BotFleet's emulated jobs
+   *  (`capabilities.backgroundJobs === "emulated"`), the bot holds This
+   *  Computer, and the owner has not switched jobs off.  Deliberately
+   *  independent of `agents` and the comms depth: a job is the bot's own
+   *  work, not a hop to a peer. */
+  jobs?: boolean;
 }
 
 /** How a tool asks a person before it runs.  Consumed by the permission
@@ -1136,6 +1143,116 @@ const LINQ_VOICE_MESSAGE: HarnessTool = {
   },
 };
 
+// ── background jobs (P1, docs/plans/2026-10-01-background-jobs-and-subagents-decision.md) ──
+// HTTP lane only in P1: a CLI engine reaches them over MCP in P2.  The
+// numbers below (16 KB, 75 s) are literals because this file imports
+// nothing; registry.test.ts pins them to shared/jobs.ts.
+
+const jobsEnabled = (ctx: ToolGateContext) => Boolean(ctx.jobs);
+
+/** Longest command text an approval card carries whole.  `job_start` refuses
+ *  a longer command before any card is shown (server/tools/jobs.ts), so a
+ *  person never clicks Allow on a hidden tail.  That refusal is the whole
+ *  guard: a bot in full auto starts its jobs without a card
+ *  (server/auto-approve.ts), so the length limit holds for it as well. */
+export const JOB_SUMMARY_MAX_CHARS = 2000;
+
+/** A job's command as an approval card shows it: every run of whitespace
+ *  folded to one space.  The card cuts it at JOB_SUMMARY_MAX_CHARS, so this
+ *  is also the length a command is held to. */
+export function jobCommandForCard(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+// The run limits (the default and the longest a bot may ask for) are the
+// owner's to change (`jobs.defaultMinutes`, `jobs.maxMinutes`), so neither
+// description states them: the system prompt's jobs section does, from the
+// live settings (server/jobs/prompt.ts), and job_start's own reply says the
+// limit the job got.
+const JOB_START: HarnessTool = {
+  name: "job_start",
+  description:
+    "Start a long-running shell command in the background on the host computer and return at once. Use it for builds, test suites, dev servers and anything that may take longer than a minute; use bash for quick commands. The job runs in its own process group at low priority with a run limit (the default and the longest allowed are in your instructions; set timeout_minutes to change it). You are told when it ends, so do not poll it, and do not start the same work again while it runs.",
+  schema: {
+    type: "object",
+    properties: {
+      command: {
+        type: "string",
+        description: `The shell command to run, exactly as you would type it, at most ${JOB_SUMMARY_MAX_CHARS} characters: it is shown whole to whoever approves it. For anything longer, write a script file and run that.`,
+      },
+      timeout_minutes: {
+        type: "integer",
+        description: "Run limit in minutes. Leave it out for the default; a number above the longest allowed is lowered to it. The job is stopped when it runs this long.",
+      },
+    },
+    required: ["command"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: jobsEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+  promptFragment:
+    "Use job_start for commands that may run longer than a minute (builds, test suites, servers): it returns at once and you are told when the job ends, so never poll it.",
+  approval: {
+    policy: "ask",
+    summary: (args) => {
+      const raw = typeof args.command === "string" ? args.command : "";
+      const command = jobCommandForCard(raw);
+      if (!command) return "job";
+      const clipped = command.length > JOB_SUMMARY_MAX_CHARS ? `${command.slice(0, JOB_SUMMARY_MAX_CHARS - 1)}…` : command;
+      return `job: ${clipped}`;
+    },
+  },
+};
+
+const JOB_OUTPUT: HarnessTool = {
+  name: "job_output",
+  description:
+    "Read what one of your background jobs printed since you last read it: at most 16 KB, ending with the job's status line, for example [status: completed, exit code: 1, 4m 12s]. wait_seconds (at most 75) waits for the job to end first. Call it when you need the output now, not to check on a job: you are told when it ends.",
+  schema: {
+    type: "object",
+    properties: {
+      job_id: { type: "string", description: "The job's id, from job_start or job_list." },
+      wait_seconds: {
+        type: "integer",
+        description: "Wait up to this many seconds (at most 75) for the job to end before reading. Defaults to 0.",
+      },
+    },
+    required: ["job_id"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: jobsEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+  // the 75-second wait plus the read, under the loop's own 90-second ceiling
+  timeoutMs: 90_000,
+};
+
+const JOB_LIST: HarnessTool = {
+  name: "job_list",
+  description: "List your background jobs: running ones first, then finished ones, newest first, with each one's status and how long it ran.",
+  schema: { type: "object", properties: {} },
+  surfaces: { mcp: false, http: true },
+  gate: jobsEnabled,
+  sideEffect: "read",
+  settles: "immediate",
+};
+
+const JOB_KILL: HarnessTool = {
+  name: "job_kill",
+  description:
+    "Stop one of your background jobs and every process it started (SIGTERM, then SIGKILL after 5 seconds). You are not sent a notice for a job you stop yourself.",
+  schema: {
+    type: "object",
+    properties: { job_id: { type: "string", description: "The job's id, from job_start or job_list." } },
+    required: ["job_id"],
+  },
+  surfaces: { mcp: false, http: true },
+  gate: jobsEnabled,
+  sideEffect: "write",
+  settles: "immediate",
+};
+
 /** Every tool the registry owns, in the order the MCP lane publishes them —
  *  spelled out here, not derived, so reordering this array is a deliberate
  *  edit rather than something that silently reorders the MCP wire list. */
@@ -1176,6 +1293,10 @@ export const HARNESS_TOOLS: readonly HarnessTool[] = [
   GITHUB_ISSUE_VIEW,
   GITHUB_ISSUE_LIST,
   LINQ_VOICE_MESSAGE,
+  JOB_START,
+  JOB_OUTPUT,
+  JOB_LIST,
+  JOB_KILL,
 ];
 
 const BY_NAME = new Map(HARNESS_TOOLS.map((tool) => [tool.name, tool]));

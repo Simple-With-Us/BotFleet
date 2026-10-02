@@ -522,6 +522,44 @@ export interface ResolveTurnComputerMountsInput<Lease> {
   deps: TurnComputerDeps<Lease>;
 }
 
+/** Drop each destination the redesigned per-provider settings
+ *  (`botDefaults.computerProviders`) disable.  A missing `computerProviders`
+ *  keeps the legacy allowlist's answer bit-for-bit.  Shared by the turn's
+ *  mount resolution and `hostShellGranted`, so the two cannot disagree. */
+export function filterGrantedByProviders(
+  granted: ComputerDestination[],
+  cfg: AppConfig,
+  cloudBackend: "box" | "vps",
+): ComputerDestination[] {
+  const providers = cfg.botDefaults?.computerProviders;
+  if (!providers) return granted;
+  let next = granted;
+  if (next.includes("cloud")) {
+    const backendEnabled = cloudBackend === "box" ? providers.asciiBox === true : providers.selfHostedVps === true;
+    if (!backendEnabled) next = next.filter((d) => d !== "cloud");
+  }
+  if (providers.localVm !== true) next = next.filter((d) => d !== "vm");
+  if (providers.localMac !== true) next = next.filter((d) => d !== "local");
+  return next;
+}
+
+/** Whether the bot may run shell commands on this host — `bash` and
+ *  background jobs on the HTTP tool lane.  The grant half of the
+ *  `hasHostComputer` derivation in the mount resolution below (This
+ *  Computer, or a Local VM grant with the host terminal allowed); the engine
+ *  half is the caller's.  The jobs registry asks it on every tick, so any
+ *  setting that narrows a bot's computers stops its jobs, whichever screen
+ *  it was changed on. */
+export function hostShellGranted(
+  bot: Pick<TurnComputerBot, "computers" | "cloudBackend">,
+  cfg: AppConfig,
+  allowed: ComputerDestination[] | null,
+): boolean {
+  const { granted } = resolveGrants(bot.computers, undefined, cfg.botDefaults?.computers, allowed);
+  const filtered = filterGrantedByProviders(granted, cfg, resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend));
+  return filtered.includes("local") || (filtered.includes("vm") && cfg.localVm?.allowHostTerminal === true);
+}
+
 export async function resolveTurnComputerMounts<Lease>(
   input: ResolveTurnComputerMountsInput<Lease>,
 ): Promise<TurnComputerMounts<Lease>> {
@@ -603,14 +641,7 @@ async function resolveMounts<Lease>(
   // fallback alike; a missing `computerProviders` keeps the legacy
   // behavior bit-for-bit.
   const providers = cfg.botDefaults?.computerProviders;
-  if (providers) {
-    if (granted.includes("cloud")) {
-      const backendEnabled = cloudBackend === "box" ? providers.asciiBox === true : providers.selfHostedVps === true;
-      if (!backendEnabled) granted = granted.filter((d) => d !== "cloud");
-    }
-    if (providers.localVm !== true) granted = granted.filter((d) => d !== "vm");
-    if (providers.localMac !== true) granted = granted.filter((d) => d !== "local");
-  }
+  granted = filterGrantedByProviders(granted, cfg, cloudBackend);
   // Recompute `wantsCloud`, `wantsVm` and `wantsLocal` after the
   // per-provider filter so the mount branches below see the post-filter
   // grant.
@@ -765,13 +796,13 @@ async function resolveMounts<Lease>(
   if ((wantsCloudFiltered || autoCloud) && cloudBackend === "box" && deps.box.boxConfigured(cfg)) {
     if (!mountsCloudComputer && wantsCloudFiltered) {
       if (shouldThrowOnCloudFailure) {
-        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the Computer engine");
+        throw new Error("this model engine cannot use computer tools — choose Claude, an ACP engine, or the ASCII.dev Box engine");
       }
       deps.notice("cloud computer not mounted: this model engine cannot use computer tools", false);
     }
     let b = await deps.box.findBox(cfg, bot.id).catch(() => null);
     if (!(await deps.checkpoint())) return stopped();
-    // Explicit Cloud and the box-native Computer engine provision on first
+    // Explicit Cloud and the box-native ASCII.dev Box engine provision on first
     // use.  Auto remains non-surprising and only reuses an existing box.
     if (!b && mountsCloudComputer && (wantsCloudFiltered || engine.driverKind === "boxAgent")) {
       deps.broadcast({ kind: "computer", botId: bot.id, state: "provisioning" });

@@ -103,8 +103,68 @@ export function looksDestructive(text: string): boolean {
  * client so the two sides can never disagree about what was granted. */
 const COMMAND_TOOLS = new Set(["bash", "shell", "execute", "run_command", "computer_exec", "terminal"]);
 
+/** Background job tools (jobs P1).  Their grants live in a namespace of their
+ *  own, `job:<program>`, so a remembered `Bash:git` never starts a job, and
+ *  the owner ruled (2026-10-01, and again 2026-10-02) that every job start
+ *  asks unless the bot is in Auto mode — so a `job:` key is never remembered
+ *  at all. */
+const JOB_TOOLS = new Set(["job_start"]);
+
+export function isJobTool(tool: string): boolean {
+  return JOB_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase());
+}
+
+/** The unprefixed name of the harness's own job tool, as its HTTP tool lane
+ *  offers it to a bot (server/tools/registry.ts).  A name alone never makes a
+ *  request the harness's own: a Codex bot reports a third-party MCP tool by
+ *  its bare name too (server/drivers/codex.ts), so `job_start` from a mounted
+ *  server arrives spelled exactly the same.  Whose call it is comes from where
+ *  the request was raised, see `isOwnJobStartRequest`. */
+export function isOwnJobStart(tool: string): boolean {
+  return tool === "job_start";
+}
+
+/** The harness's own `job_start`, decided by ORIGIN: the request is one the
+ *  in-process tool host opened on the permission broker
+ *  (server/tools/approvals.ts, server/tools/host.ts).  That is the only way
+ *  the harness raises a job start in P1, and no engine and no third-party MCP
+ *  server can open a request there.  This, and only this, is the call the
+ *  owner's ruling covers; a tool a mounted server happens to call `job_start`
+ *  keeps every guard that any other MCP tool has.  The MCP lane (jobs P2) has
+ *  its own endpoint and must raise its asks the same way, on the broker, to be
+ *  counted here.  Read it synchronously from the `request.opened` handler: the
+ *  broker registers an ask before it publishes the event, and settles it only
+ *  after the event has been handled. */
+export function isOwnJobStartRequest(
+  broker: { isOpen(threadId: string, requestId: string): boolean },
+  event: { tool: string; threadId: string; requestId?: string },
+): boolean {
+  return isOwnJobStart(event.tool) && Boolean(event.requestId) && broker.isOpen(event.threadId, event.requestId!);
+}
+
+/** The program a job summary (`job: pnpm test`) starts, by the same rule a
+ *  command tool's key uses: the first bare word, past env assignments and
+ *  sudo. */
+function firstProgram(command: string): string {
+  const words = command.trim().split(/\s+/);
+  let i = 0;
+  while (i < words.length && (/^[A-Z_][A-Z0-9_]*=/.test(words[i]) || words[i] === "sudo")) i += 1;
+  return (words[i] ?? "").split("/").pop()?.replace(/[^\w.-]/g, "") ?? "";
+}
+
+/** A job summary whose command was cut to fit the card.  The cut tail is
+ *  unseen, so nothing may approve it but a person. */
+function truncatedJobSummary(summary: string): boolean {
+  return summary.endsWith("…");
+}
+
 export function approvalKey(tool: string, summary: string, scope?: "local-computer" | "disposable-computer"): string {
   const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
+  if (JOB_TOOLS.has(bare)) {
+    const program = firstProgram(summary.replace(/^job:\s*/, ""));
+    const key = program ? `job:${program}` : "job";
+    return scope === "local-computer" ? `${scope}:${key}` : key;
+  }
   if (!COMMAND_TOOLS.has(bare)) return scope === "local-computer" ? `${scope}:${tool}` : tool;
   // first bare word of the command, skipping env assignments and sudo
   const words = summary.trim().split(/\s+/);
@@ -146,6 +206,9 @@ const COARSE_PROGRAMS = new Set([
  * for them. */
 export function isCoarseApprovalKey(key: string): boolean {
   const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
+  // A remembered job grant would start background work with nobody asked,
+  // which ruling (c) forbids for every bot not in Auto mode.
+  if (unscoped === "job" || unscoped.startsWith("job:")) return true;
   const colon = unscoped.indexOf(":");
   const tool = colon === -1 ? unscoped : unscoped.slice(0, colon);
   if (!COMMAND_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase())) return false;
@@ -162,6 +225,8 @@ export function coarseAlwaysAllowRefused(
   context?: { scope?: "local-computer" | "disposable-computer" },
 ): boolean {
   if (!isCoarseApprovalKey(key)) return false;
+  const unscoped = key.startsWith("local-computer:") ? key.slice("local-computer:".length) : key;
+  if (unscoped === "job" || unscoped.startsWith("job:")) return true;
   if (key.startsWith("local-computer:")) return true;
   if (context?.scope === "local-computer") return true;
   // A native Bash/shell ask runs in the provider process on the host even
@@ -185,6 +250,8 @@ export function offerableApprovalKey(
   scope?: "local-computer" | "disposable-computer",
 ): string | undefined {
   if (scope === "local-computer") return undefined;
+  // every job start asks (ruling c): there is no grant to offer
+  if (isJobTool(tool)) return undefined;
   if (looksDestructive(summary) || looksDestructive(tool)) return undefined;
   if (looksSensitive(summary)) return undefined;
   const key = approvalKey(tool, summary, scope);
@@ -232,10 +299,33 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
+    /** The request is the harness's own `job_start`, by origin: the in-process
+     *  tool host opened it on the permission broker (`isOwnJobStartRequest`).
+     *  The tool name alone is not enough, since an engine reports a mounted
+     *  MCP server's tool by its bare name too.  Only the job-start ruling
+     *  reads it. */
+    ownJobStart?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
   },
 ): AutoVerdict {
+  // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
+  // auto never gets an approval card for the harness's own `job_start`.  It
+  // stands ahead of everything below on purpose, so no guard and no kind of
+  // turn can turn it back into a card: not the destructive and sensitive
+  // patterns, not the cut-summary check, and not the unattended block, so a
+  // turn a webhook, a resource alert, a text or a job's own wake started
+  // starts its job too.  The ruling is about this one tool, and "own" is
+  // decided by where the request came from (`context.ownJobStart`), with the
+  // name as a second lock, never by the name alone: a mounted MCP server's
+  // `job_start` reaches here spelled the same on Codex, and it keeps every
+  // guard.  Bash and every other tool keep all of theirs, and a bot that is
+  // not in full auto falls through to the checks below, where a job start is
+  // never granted and a card is the only way in.
+  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+    const key = approvalKey(tool, summary, context.scope);
+    return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
+  }
   // the guards outrank the grants, so an "always allow" can never widen
   // into them
   const destructive = matchFirst(DESTRUCTIVE, summary) ?? matchFirst(DESTRUCTIVE, tool);
@@ -245,14 +335,20 @@ export function autoVerdict(
   // stood in the way", which cannot be told apart from an ordinary
   // "nobody granted this" card without knowing both halves.
   const key = approvalKey(tool, summary, context?.scope);
-  const unsafeCommand = unsafeCommandSummary(tool, summary);
+  const jobTool = isJobTool(tool);
+  // A job's whole command is on the card, compound or not.  One cut to fit
+  // is unseen, so no person is asked to approve it.  (The harness's own
+  // `job_start` never gets here from a full-auto bot, and refuses a command
+  // too long for the card before any card is shown, so this is what keeps a
+  // lookalike tool's cut summary from riding an Auto grant.)
+  const unsafeCommand = jobTool ? truncatedJobSummary(summary) : unsafeCommandSummary(tool, summary);
   const grant =
     destructive || sensitive || unsafeCommand
       ? null
-      : bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
+      : !jobTool && bot.alwaysAllow?.includes(key) && !coarseAlwaysAllowRefused(key, context)
         ? { approve: `auto-approved ${key} (always allowed)`, source: "always-allow" as const, rule: key }
         : bot.autoApprove
-          ? { approve: `auto-approved ${tool}`, source: "auto-mode" as const, rule: undefined }
+          ? { approve: `auto-approved ${jobTool ? key : tool}`, source: "auto-mode" as const, rule: jobTool ? key : undefined }
           : null;
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };

@@ -166,6 +166,40 @@ describe("Store", () => {
     });
   });
 
+  it("addTaskUsage banks per-turn timing as aggregates only, and it survives a restart", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    expect(store.taskByThread(bot.id, bot.threadId)?.stats).toBeUndefined();
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 40,
+      costUsd: null,
+      stats: { steps: 3, modelMs: 4000, toolMs: 1500, ttftMs: 600, outputTokens: 40 },
+    });
+    // a turn with no timing (no live clock entry) leaves the aggregate alone
+    store.addTaskUsage(bot.id, bot.threadId, { input: 10, output: 1, costUsd: null });
+    store.addTaskUsage(bot.id, bot.threadId, {
+      input: 100,
+      output: 60,
+      costUsd: null,
+      stats: { steps: 0, modelMs: 2000, toolMs: 0, outputTokens: 60 },
+    });
+    store.flushBotsNow();
+    const stats = new Store(selection).taskByThread(bot.id, bot.threadId)?.stats;
+    expect(stats).toEqual({
+      turns: 2,
+      steps: 3,
+      modelMs: 6000,
+      toolMs: 1500,
+      ttftMsSum: 600,
+      ttftSamples: 1,
+      tpsTokens: 100,
+      tpsMs: 6000,
+    });
+    // aggregates only: a fixed handful of numbers, never a per-turn array
+    expect(Object.values(stats ?? {}).every((v) => typeof v === "number")).toBe(true);
+  });
+
   it("persists the per-bot composio gate", () => {
     const store = new Store(selection);
     const bot = store.createBot();
@@ -1049,6 +1083,51 @@ describe("Store task working folder", () => {
     expect(store.taskByAutomationKey(bot.id, "webhook:wh_1")?.threadId).toBe(bot.threadId);
     expect(store.stampAutomationKey(bot.id, bot.threadId, "routine:other")?.automationKey).toBe("webhook:wh_1");
   });
+
+  it("rolloverAutomationTask mints a fresh task under the same automationKey and keeps history", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const first = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.addTaskUsage(bot.id, first.threadId, { input: 100, output: 10, costUsd: null });
+    store.appendMessage(first.threadId, { role: "system", kind: "text", text: "old wake", automationSource: "webhook" });
+    store.appendMessage(first.threadId, { role: "bot", kind: "text", text: "old reply" });
+
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_compile", {
+      title: "Compile gates",
+      activate: true,
+    })!;
+    expect(rolled.threadId).not.toBe(first.threadId);
+    expect(rolled.automationKey).toBe("webhook:wh_compile");
+    expect(store.taskByThread(bot.id, first.threadId)?.automationKey).toBeUndefined();
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_compile")?.threadId).toBe(rolled.threadId);
+    // Old history stays put.
+    expect(store.messagesFor(first.threadId).some((m) => m.text === "old wake")).toBe(true);
+    // New task starts thin with a pointer, not the old transcript.
+    const seed = store.messagesFor(rolled.threadId);
+    expect(seed).toHaveLength(1);
+    expect(seed[0]?.role).toBe("system");
+    expect(seed[0]?.text).toContain(first.threadId);
+    expect(seed[0]?.text).not.toContain("old wake");
+    // createTask still reunites on the NEW owner.
+    const again = store.createTask(bot.id, "Compile gates", false, "webhook:wh_compile")!;
+    expect(again.threadId).toBe(rolled.threadId);
+  });
+
+  it("rolloverAutomationTask clears the key from aliases so lookup cannot stick on a merged source", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const home = store.taskByThread(bot.id, bot.threadId)!;
+    home.automationKey = "webhook:keep";
+    home.automationKeyAliases = ["webhook:wh_alias"];
+    store.flushBotsNow();
+    const rolled = store.rolloverAutomationTask(bot.id, "webhook:wh_alias", { title: "Alias", activate: false })!;
+    expect(store.taskByAutomationKey(bot.id, "webhook:wh_alias")?.threadId).toBe(rolled.threadId);
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKeyAliases ?? []).not.toContain("webhook:wh_alias");
+    // Unrelated primary key on the old task is untouched.
+    expect(store.taskByThread(bot.id, home.threadId)?.automationKey).toBe("webhook:keep");
+  });
+
 
   it("pins the default (null) when the bot has no folder, so a later folder can't move a live session", () => {
     const store = new Store(selection);

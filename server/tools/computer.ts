@@ -16,13 +16,13 @@
 // on `hostComputer` only, so a workspace-only bot never gets bash and
 // therefore never gets to `cd` out either.
 
-import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import { isInside, realOrResolved } from "../bot-cwd.ts";
 import type { TurnToolCall, TurnToolOutcome, TurnToolRuntime } from "../contracts.ts";
 import type { AgentToolCallContext } from "./agents.ts";
+import { commandLabel, runInProcessGroup, type TurnProcessGroups } from "./process-group.ts";
 import { modelShellEnv } from "./shell-env.ts";
 
 // DR5 — `read_file` results are embedded verbatim in the transcript, and the
@@ -41,6 +41,11 @@ import { modelShellEnv } from "./shell-env.ts";
 export const READ_FILE_DEFAULT_LINE_LIMIT = 400;
 export const READ_FILE_MAX_BYTES = 64 * 1024;
 
+/** How long one `bash` call may run before its whole process group is stopped. */
+export const BASH_TIMEOUT_MS = 60_000;
+/** Per-stream output ceiling for one `bash` call. */
+const BASH_MAX_BUFFER = 4 * 1024 * 1024;
+
 export type ComputerToolExecutor = (
   call: TurnToolCall,
   ctx: AgentToolCallContext,
@@ -57,6 +62,13 @@ export interface ComputerToolsOptions {
     /** The precomputed realpath of the bot's workspace root. */
     workspaceRealpath: string;
   };
+  /** Where `bash` records the process group of every command it starts, so
+   *  the turn can stop whatever is still running when it ends.  The tool
+   *  host passes one per turn; absent, nothing is tracked past the call. */
+  processGroups?: TurnProcessGroups;
+  /** Tests only: a shorter `bash` deadline and SIGTERM-to-SIGKILL grace. */
+  bashTimeoutMs?: number;
+  groupKillGraceMs?: number;
 }
 
 function resolvePath(target: string, cwd?: string): string {
@@ -106,7 +118,8 @@ function confineOrReject(
 export function createComputerTools(options: ComputerToolsOptions = {}): Record<string, ComputerToolExecutor> {
   const workingDir = options.cwd && existsSync(options.cwd) ? options.cwd : process.cwd();
 
-  const bash: ComputerToolExecutor = async (call) => {
+  const bashTimeoutMs = options.bashTimeoutMs ?? BASH_TIMEOUT_MS;
+  const bash: ComputerToolExecutor = async (call, _ctx, runtime) => {
     const rawCmd = call.arguments.command;
     if (typeof rawCmd !== "string" || !rawCmd.trim()) {
       return { kind: "error", content: "command argument must be a non-empty string", detail: "invalid_argument" };
@@ -116,49 +129,68 @@ export function createComputerTools(options: ComputerToolsOptions = {}): Record<
     const shell = process.platform === "win32" ? "cmd.exe" : (process.env.SHELL || "/bin/zsh");
     const shellArgs = process.platform === "win32" ? ["/c", command] : ["-c", command];
 
-    return new Promise<TurnToolOutcome>((resolvePromise) => {
-      execFile(
-        shell,
-        shellArgs,
-        {
-          cwd: workingDir,
-          timeout: 60_000,
-          maxBuffer: 4 * 1024 * 1024,
-          env: modelShellEnv(),
-        },
-        (error, stdout, stderr) => {
-          if (error && (error as unknown as { killed?: boolean }).killed) {
-            return resolvePromise({
-              kind: "error",
-              content: "Command timed out after 60 seconds",
-              detail: "timeout",
-            });
-          }
-
-          const outText = String(stdout || "").trim();
-          const errText = String(stderr || "").trim();
-          const parts: string[] = [];
-
-          if (outText) parts.push(outText);
-          if (errText) parts.push(`STDERR:\n${errText}`);
-
-          if (error) {
-            const exitCode = (error as unknown as { code?: number | string }).code ?? 1;
-            parts.push(`Process exited with code ${exitCode}`);
-            return resolvePromise({
-              kind: "error",
-              content: parts.join("\n\n") || `Command exited with code ${exitCode}`,
-              detail: `exit ${exitCode}`,
-            });
-          }
-
-          return resolvePromise({
-            kind: "result",
-            content: parts.join("\n\n") || "(command completed with no output)",
-          });
-        },
-      );
+    // Its own process group: a timeout or a Stop reaches everything the
+    // command started, not just the shell (server/tools/process-group.ts).
+    const run = await runInProcessGroup(shell, shellArgs, {
+      cwd: workingDir,
+      env: modelShellEnv(),
+      timeoutMs: bashTimeoutMs,
+      maxBuffer: BASH_MAX_BUFFER,
+      signal: runtime.signal,
+      groups: options.processGroups,
+      label: commandLabel(command),
+      graceMs: options.groupKillGraceMs,
     });
+
+    switch (run.stopped) {
+      case "timeout":
+        return {
+          kind: "error",
+          content: `Command timed out after ${Math.round(bashTimeoutMs / 1000)} seconds.  It was stopped, along with every process it started.`,
+          detail: "timeout",
+        };
+      case "aborted":
+        return { kind: "error", content: "Command was stopped before it finished.", detail: "stopped" };
+      case "output_limit":
+        return {
+          kind: "error",
+          content: `Command printed more than ${BASH_MAX_BUFFER / (1024 * 1024)} MB, so it was stopped.  Redirect the output to a file and read the part you need.`,
+          detail: "output_limit",
+        };
+      case "spawn_error":
+        return { kind: "error", content: `Could not start the shell: ${run.spawnError ?? "unknown error"}`, detail: "spawn_error" };
+      default:
+        break;
+    }
+
+    const outText = run.stdout.trim();
+    const errText = run.stderr.trim();
+    const parts: string[] = [];
+
+    if (outText) parts.push(outText);
+    if (errText) parts.push(`STDERR:\n${errText}`);
+    // Nothing reports on a process left behind, and it is stopped when the
+    // turn ends: say so, so the model neither waits on it nor starts it again.
+    const leftNote = run.leftRunning
+      ? "A process this command started is still running.  It will be stopped when this turn ends."
+      : null;
+
+    if (run.code !== 0) {
+      const exitCode = run.code ?? run.signal ?? 1;
+      parts.push(`Process exited with code ${exitCode}`);
+      if (leftNote) parts.push(leftNote);
+      return {
+        kind: "error",
+        content: parts.join("\n\n") || `Command exited with code ${exitCode}`,
+        detail: `exit ${exitCode}`,
+      };
+    }
+
+    if (leftNote) parts.push(leftNote);
+    return {
+      kind: "result",
+      content: parts.join("\n\n") || "(command completed with no output)",
+    };
   };
 
   const readFile: ComputerToolExecutor = async (call) => {

@@ -377,6 +377,22 @@ const appConfigSchema = z.object({
      *  window to be trusted with stopping the fleet. */
     spendCeilingMinPricedShare: z.number().min(0).max(1).optional(),
   }).optional(),
+  // Background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-
+  // subagents-decision.md).  On by default for HTTP-lane bots; `wake: false`
+  // is the kill switch for wake turns.  Every number is clamped again where
+  // it is used (server/jobs/registry.ts resolveJobsSettings): no setting can
+  // lift a job's run limit past 6 hours.
+  jobs: z.object({
+    enabled: z.boolean().optional(),
+    wake: z.boolean().optional(),
+    defaultMinutes: z.number().int().min(1).max(360).optional(),
+    maxMinutes: z.number().int().min(1).max(360).optional(),
+    cpuCores: z.number().min(1).max(64).optional(),
+    admission: z.object({
+      maxSwapPercent: z.number().min(1).max(100).optional(),
+      minFreeDiskMb: z.number().min(0).optional(),
+    }).optional(),
+  }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
   // upgraded install never goes quiet without saying why.
@@ -530,6 +546,16 @@ export interface AppConfig {
   /** Usage-monitor telemetry. `ingestUrl` is the operator's own endpoint —
    * BotFleet ships none — and `projects` classifies a turn's working
    * directory, bot name, or task title into a project slug. */
+  /** Background jobs (jobs P1).  See the schema above for what each field
+   *  means; absent is on, with the decision doc's defaults. */
+  jobs?: {
+    enabled?: boolean;
+    wake?: boolean;
+    defaultMinutes?: number;
+    maxMinutes?: number;
+    cpuCores?: number;
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+  };
   usage?: {
     ingestUrl?: string;
     ingestToken?: string;
@@ -964,6 +990,10 @@ export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet")
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
+/** Full tool inputs and outputs, and injected context text, per thread —
+ * bounded, rotated, and fetched only when a row is opened
+ * (server/item-io-store.ts). */
+export const ITEM_IO_DIR = join(DATA_DIR, "item-io");
 
 function migrateLegacyHomeDir(current: string, legacyNames: readonly string[]): void {
   if (existsSync(current)) return;
@@ -983,7 +1013,7 @@ export function ensureDirs() {
   // one-time migration from the pre-rename data dirs — bots, transcripts,
   // config and keys all carry over. Skip when tests isolate via OMB_DATA_DIR.
   if (!process.env.OMB_DATA_DIR) migrateLegacyHomeDir(DATA_DIR, LEGACY_HOME_DATA_DIRS);
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR]) mkdirSync(dir, { recursive: true });
 }
 
 /** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider

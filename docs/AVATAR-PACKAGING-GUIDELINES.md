@@ -5,7 +5,7 @@ This document provides the definitive framework, rules, and filesystem structure
 ## 1. The State Machine (How it works)
 
 BotFleet avatars are not just static images; they are reactive, state-driven animated characters. 
-The avatar player uses a 3-part animation lifecycle to transition smoothly between actions:
+The avatar player uses a 3-part animation lifecycle to transition smoothly between actions - but only for the 13 transition expressions listed in section 2.  The other 27 expressions have no enter or return GIF, so they never run that lifecycle; they render from their still, or from a `_hold.gif` when one is supplied.
 
 1. **Enter** (`[action]_enter.gif`): A smooth transition *from* the idle/resting state *into* the action.
 2. **Hold** (`[action]_hold.gif`): A looping animation that plays continuously while the action is happening.
@@ -14,41 +14,23 @@ The avatar player uses a 3-part animation lifecycle to transition smoothly betwe
 
 *Flow:* `Resting` → (Trigger: Bot starts thinking) → `thinking_enter.gif` → `thinking_hold.gif` (loops) → (Trigger: Bot finishes) → `thinking_return.gif` → `Resting`.
 
-## 2. Common Bot Actions (The Vocabulary)
+## 2. Core Actions & Expressions (The 40-Expression Contract)
 
-To be fully compatible with BotFleet, an avatar pack should cover as many of these core 39 states as possible. If a specific state isn't provided, BotFleet gracefully falls back to the `resting` face.
+The runtime source of truth is `src/components/tv-face/manifest.ts`: `TVFACE_MANIFEST` maps 50 bot states onto **40 unique expressions**, and `TVFACE_HAS_ENTER_RETURN` names the **13 expressions that ship transition GIFs**.  This doc reflects that manifest; verify against it before generating assets.
 
-### Lifecycle & Core States
-- `resting` (Default idle state)
-- `sleeping` / `waking`
-- `listening` (Waiting for user input)
-- `thinking` (Processing / reasoning)
-- `searching` (Looking up data / web browsing)
-- `working` (General task execution)
+### The 13 Transition Expressions (Enter + Hold + Return GIFs, Plus a Still)
+`listening`, `thinking`, `typing`, `speaking`, `computer`, `fleet`, `crash`, `memory`, `tools`, `routine`, `screen`, `git`, `webhook`
 
-### Product Cycle & I/O
-- `loading`
-- `typing` (Writing code or text)
-- `speaking` (TTS / Dictating)
-- `sending` / `receiving` / `uploading`
-- `notifying` / `alerting`
-- `powering_down`
+Each of these requires `_enter.gif`, `_hold.gif`, and `_return.gif` plus a transparent still: **39 GIFs + 13 stills per skin**.
 
-### Tools & Integration
-- `fleet` (Multi-agent coordination / orbit)
-- `crash` (Error state / recovery)
-- `memory` (Accessing storage/memory)
-- `tools` (Using an MCP tool)
-- `routine` (Running a background job/progress)
-- `screen` (Focusing on UI/Desktop)
-- `git` (Committing code)
-- `webhook` (Sending data)
-- `computer` (Using a computer terminal)
+### The 27 Non-Transition Expressions (Still Required, Hold Optional)
+`resting`, `sleeping`, `waking`, `searching`, `working`, `happy`, `excited`, `celebrate`, `confused`, `curious`, `sad`, `alerting`, `angry`, `scared`, `surprised`, `suspicious`, `shy`, `bored`, `drowsy`, `proud`, `playful`, `laughing`, `loading`, `sending`, `receiving`, `notifying`, `powering_down`
 
-### Reactions & Emotions
-- Positive: `happy`, `excited`, `celebrate`, `proud`, `playful`, `laughing`
-- Neutral: `curious`, `surprised`, `shy`, `bored`, `drowsy`
-- Negative: `confused`, `sad`, `angry`, `scared`, `suspicious`
+A transparent `[expression].png` is **required** for each of these.  A `_hold.gif` is **optional, but the player uses it whenever it is present**: `planFrame()` returns a `hold` step for these expressions on the same-state, rest-to-active, and active-to-active paths, and `pathForStep()` then requests `[expression]_hold.gif`, falling back to the still only after that request fails.  So a missing hold is not a broken avatar — it is a static one — but shipping no holds for a pack the default one already covers means a guaranteed 404 on every request.  The default skin ships 12 non-transition holds: `alerting`, `angry`, `excited`, `happy`, `laughing`, `loading`, `notifying`, `resting`, `searching`, `sleeping`, `surprised`, `working`.  Enter and return are the parts that genuinely do not apply here: `TVFACE_HAS_ENTER_RETURN` covers only the 13 expressions in the previous section, and `planFrame()` never plans an enter or return outside that set.  Per skin: **27 stills**, plus any holds you choose to add.
+
+**Per-skin totals for the shipped `orange` (default) skin: 54 GIFs + 46 stills.**  The 54 GIFs are 39 transition GIFs (13 expressions x enter/hold/return), 12 non-transition hold GIFs, and 3 ambient loops (`anticipate.gif`, `blink.gif`, `idle_loop.gif`).  The 46 stills are one per each of the 40 manifest expressions, plus 6 that ship outside the manifest contract: `orbit`, `progress`, `radar`, `spawning`, `uploading`, and `speaking_hold_preview` — the last of which is an unreferenced build artifact rather than a runtime target.
+
+If a specific state's asset isn't provided, BotFleet gracefully falls back to the `resting` face.
 
 ## 3. Filesystem Structure (The `.botface` / `.zip` format)
 
@@ -70,7 +52,7 @@ AvatarName/
 ```
 
 ### The `manifest.json`
-Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.
+Every pack must include a `manifest.json` that maps BotFleet's internal states to the filenames in your `gifs/` and `stills/` folders.  Only list skins whose art actually ships: `SHIPPED_SKINS` (`src/components/tv-face/TVFaceAvatar.tsx`) is currently **orange-only** — blue, green, purple, pink, red, and yellow are planned skins with no assets yet, and any color without shipped art renders the default skin rather than 404ing.  `orange` IS the default skin (`public/tv-face/skins/default`).
 
 ```json
 {
@@ -78,7 +60,7 @@ Every pack must include a `manifest.json` that maps BotFleet's internal states t
   "version": "1.0.0",
   "author": "BotFleet",
   "defaultSkin": "orange",
-  "skins": ["orange", "blue", "green", "purple", "pink", "red", "yellow"],
+  "skins": ["orange"],
   "format": "gif",
   "resolution": "480x480",
   "mapping": {
@@ -104,8 +86,8 @@ When generating assets for a BotFleet avatar, strictly adhere to these constrain
      - *Why:* BotFleet state changes happen quickly. If an "enter" transition is too long, the bot might finish its task before the animation finishes playing. Keep it snappy and responsive.
    - **Hold Loops**:
      - *Must be:* Seamlessly looping.
-     - *Recommended:* 2 to 4 seconds per cycle.
-     - *Why:* A hold animation plays continuously while a bot works. If the loop is too short (e.g., 0.5 seconds), the avatar will look jittery and frantic. If it is too long, the file size will become bloated.
+     - *Recommended:* 5 to 8 seconds per cycle.
+     - *Why:* Fast 2-second loops look jittery and annoying if you have to watch them for 45 seconds while a build runs. Deep-work holds should be slow and ambient.
    - **Idle / Ambient Loops (Optional)**:
      - *Recommended:* 4 to 8 seconds. 
      - *Why:* The resting face is on screen 90% of the time. Occasional blinks or subtle floating should be spaced out so it doesn't distract the user.

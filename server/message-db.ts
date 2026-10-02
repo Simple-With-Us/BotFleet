@@ -172,6 +172,17 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   return { messages, activeLeafId };
 }
 
+/** Cheap row count for one thread — used by automation rollover so we
+ * do not load the whole transcript just to decide whether to mint a fresh
+ * task.  Cached in-memory threads still prefer `messages.length`; callers
+ * that already hold the cache should use that instead. */
+export function countMessages(threadId: string): number {
+  const row = db()
+    .prepare("SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?")
+    .get(threadId) as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 export function insertMessage(threadId: string, message: Message): void {
   db()
     .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")

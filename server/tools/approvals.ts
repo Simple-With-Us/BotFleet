@@ -90,7 +90,12 @@ export interface PermissionBroker {
   /** How many asks are open right now.  A test seam and a leak detector:
    *  this must be 0 once every turn has settled. */
   pending(): number;
-  /** Whether this exact ask is open.  Test seam. */
+  /** Whether this exact ask is open on THIS broker, which is to say the
+   *  in-process tool host raised it.  No engine and no mounted MCP server
+   *  can open one here, so this is how the `request.opened` handler tells
+   *  the harness's own `job_start` from a third-party tool that borrows the
+   *  name (`isOwnJobStartRequest`, server/auto-approve.ts).  Also a test
+   *  seam. */
   isOpen(threadId: string, requestId: string): boolean;
 }
 

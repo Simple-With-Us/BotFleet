@@ -384,6 +384,83 @@ describe("runTurnLoop — the turn is settled by exactly one place", () => {
     expect(h.roundsSeen).toHaveLength(0);
     expect(terminals(h.events)).toHaveLength(1);
   });
+
+  it("settles the tool host once, before the terminal event, on a clean finish and on Stop (jobs P0)", async () => {
+    // The host's settle is the lost-job detector: whatever a tool started and
+    // left running is stopped with the turn, before anything can dispatch
+    // the next one from its turn.completed.
+    for (const stop of [false, true]) {
+      const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+      const settledAt: number[] = [];
+      await h.run({
+        toolHost: {
+          execute: async () => {
+            if (stop) h.abort.abort();
+            return { kind: "result", content: "ok" } as TurnToolOutcome;
+          },
+          settle: () => {
+            settledAt.push(h.events.length);
+          },
+        },
+      });
+      expect(settledAt).toHaveLength(1);
+      const terminalIndex = h.events.findIndex((e) => e.type === "turn.completed");
+      expect(settledAt[0]).toBeLessThanOrEqual(terminalIndex);
+    }
+  });
+
+  it("hands the model a job notice between rounds, once, as an appended user message (jobs P1)", async () => {
+    // A background job that ends mid-turn reaches the model before its next
+    // call, so it does not start the same work again.  Appended after the
+    // tool results — the prefix the provider already saw never changes.
+    const h = harness([wantsTools([call("c1", "bash")]), wantsTools([call("c2", "bash")]), answer("done")]);
+    const queued = [["Background job job_x `pnpm test` finished: exit code 0 after 4m 12s."], [], []];
+    let drains = 0;
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => queued[drains++] ?? [],
+      },
+    });
+    expect(exit).toBe("settled");
+    const round2 = h.roundsSeen[1]!;
+    expect(round2.at(-2)).toMatchObject({ role: "tool", tool_call_id: "c1" });
+    expect(round2.at(-1)).toEqual({
+      role: "user",
+      content: "[BotFleet notice]\nBackground job job_x `pnpm test` finished: exit code 0 after 4m 12s.",
+    });
+    // round 2's prefix is round 1's, untouched; the notice never repeats
+    expect(round2.slice(0, h.roundsSeen[0]!.length)).toEqual(h.roundsSeen[0]);
+    expect(h.roundsSeen[2]!.filter((m) => m.content.startsWith("[BotFleet notice]"))).toHaveLength(1);
+    expect(drains).toBe(2);
+  });
+
+  it("keeps looping when a notice drain throws", async () => {
+    const h = harness([wantsTools([call("c1", "bash")]), answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "ok" }),
+        drainNotices: () => {
+          throw new Error("drain exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+  });
+
+  it("still emits its one terminal event when the tool host's settle throws", async () => {
+    const h = harness([answer("done")]);
+    const exit = await h.run({
+      toolHost: {
+        execute: async () => ({ kind: "result", content: "unused" }),
+        settle: () => {
+          throw new Error("settle exploded");
+        },
+      },
+    });
+    expect(exit).toBe("settled");
+    expect(terminals(h.events)).toHaveLength(1);
+  });
 });
 
 describe("runTurnLoop — usage", () => {
@@ -647,6 +724,23 @@ describe("runTurnLoop — tool results are real", () => {
     });
     const started = h.events.filter((e) => e.type === "item.started");
     expect(started.map((e) => e.itemId)).toEqual(["c2"]);
+  });
+
+  it("attaches the whole result the model was told to a finished tool, beside the clipped detail", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    const whole = `first line\n${"r".repeat(600)}\nlast line`;
+    await h.run({ toolHost: hostReturning({ kind: "result", content: whole, detail: "first line" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ itemId: "c1", ok: true, detail: "first line" });
+    expect(done.io?.output).toEqual({ text: whole, truncated: false, length: whole.length });
+  });
+
+  it("files a failing tool's message the same way", async () => {
+    const h = harness([wantsTools([call("c1")]), answer("ok")]);
+    await h.run({ toolHost: hostReturning({ kind: "error", content: "Tool bash failed: boom", detail: "boom" }) });
+    const done = h.events.find((e) => e.type === "item.completed" && e.itemType === "tool")!;
+    expect(done).toMatchObject({ ok: false, detail: "boom" });
+    expect(done.io?.output?.text).toBe("Tool bash failed: boom");
   });
 
   it("closes the chips of tools that never finished when the turn is stopped", async () => {
