@@ -106,8 +106,10 @@ export interface DraftSnapshot {
 }
 
 /** A failed send folded back into the composer as it is now.  The failed text
- * goes first (it was written first) and anything typed since is kept after
- * it; chips are joined by id, so a restore never doubles one. */
+ * goes first and anything typed since is kept after it; chips are joined by
+ * id, so a restore never doubles one.  The order is the order the pieces
+ * arrive here, not the order they were written: if two sends are in flight
+ * and fail one after the other, the one that fails last goes first. */
 export function mergeRestoredDraft(current: DraftSnapshot, sent: DraftSnapshot): DraftSnapshot {
   const text = !current.text.trim()
     ? sent.text
@@ -125,7 +127,11 @@ type LiveRestore = (sent: DraftSnapshot) => void;
 
 // The composers that are on screen right now, by conversation.  An open
 // composer owns the text its person is looking at (storage can be full or
-// blocked and still hold nothing), so a restore goes to it first.
+// blocked and still hold nothing), so a restore goes to it first.  Dictation
+// keeps its own copy of the box from the moment the mic goes on and rewrites
+// the box from it on every partial transcript, so a restore that lands while
+// the mic is on is overwritten by the next partial.  That is how typing during
+// dictation already behaves, so it is left alone.
 const liveDrafts = new Map<string, LiveRestore>();
 
 export function registerLiveDraft(id: string, restore: LiveRestore): () => void {
@@ -234,6 +240,15 @@ export interface SentDraft<Reply> extends DraftSnapshot {
   draftId: string;
   threadId: string;
   reply?: Reply;
+}
+
+/** Two messages held for the same busy room become one, the earlier first.  A
+ * room holds a single message while a member speaks, and replacing it with a
+ * second would drop the first for good.  The later message's reply target wins
+ * and the earlier one's stands when the later has none, so a refusal restores
+ * the target that was actually sent. */
+export function foldSentDrafts<Reply>(earlier: SentDraft<Reply>, later: SentDraft<Reply>): SentDraft<Reply> {
+  return { ...later, ...mergeRestoredDraft(later, earlier), reply: later.reply ?? earlier.reply };
 }
 
 /** Returns what a composer calls when the server refuses or cannot be reached

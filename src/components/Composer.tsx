@@ -10,7 +10,7 @@ import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
+import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
@@ -363,7 +363,11 @@ export function Composer({
         dispatch({ type: "interruptGroup", groupId: group.id });
         dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       } else {
-        setQueued({ text: t, replyToId: replyTo?.id, sent });
+        // one message is held at a time: a second joins it, never replaces it
+        setQueued((held) => {
+          const merged = held ? foldSentDrafts(held.sent, sent) : sent;
+          return { text: composeMessage(merged.text, merged.attachments), replyToId: merged.reply?.id, sent: merged };
+        });
       }
       setText("");
       setAttachments([]);
