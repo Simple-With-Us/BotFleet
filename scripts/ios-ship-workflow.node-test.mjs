@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -181,4 +182,71 @@ test("scheduled-ship-gate skips empty last-ship on schedule", () => {
   const run = spawnSync("bash", [script], { encoding: "utf8" });
   assert.equal(run.status, 0, run.stdout + run.stderr);
   assert.match(run.stdout, /scheduled-ship-gate: all tests passed/);
+});
+
+// A GitHub-hosted macos-latest runner has no ~/.secrets directory. Before
+// 2026-10-02 asc-api.mjs read ONLY ~/.secrets/appstore-connect.env, so a
+// runner holding a perfectly good APPLE_API_* credential in the environment
+// still could not authenticate -- and ship-testflight.sh piped asc-api.mjs's
+// stderr to /dev/null, so the reason never reached the run log.
+test("asc-api.mjs resolves its credential from all three sources", () => {
+  const asc = read("scripts/ios-fleet/asc-api.mjs");
+  assert.match(asc, /function resolveCredential\(\)/);
+  // Source 1: ASC_* already exported.  Source 2: the local env file.
+  // Source 3: the APPLE_API_* names ios-ship.yml exports from Infisical.
+  assert.match(asc, /process\.env\.ASC_KEY_ID/);
+  assert.match(asc, /appstore-connect\.env/);
+  assert.match(asc, /APPLE_API_KEY_P8_BASE64/);
+  // The base64 p8 is materialized privately and unlinked on exit.
+  assert.match(asc, /Buffer\.from\(cleaned, "base64"\)/);
+  assert.match(asc, /mkdtempSync\(join\(tmpdir\(\), "asc-key-"\)\)/);
+  assert.match(asc, /mode: 0o600/);
+  assert.match(asc, /process\.on\("exit", cleanupTempKeys\)/);
+  // Never print a value -- only the source and the key-id LENGTH.
+  assert.match(asc, /key id length \$\{cred\.keyId\.length\}/);
+  assert.doesNotMatch(asc, /console\.(log|error)\([^)]*privateKeyPem/);
+});
+
+test("asc-api.mjs says what it tried instead of failing on a missing file", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "asc-nohome-"));
+  try {
+    const clean = { PATH: process.env.PATH || "", HOME: tmp };
+    // No credential anywhere: name every source rather than dying on ENOENT.
+    const none = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+      encoding: "utf8",
+      env: clean,
+    });
+    assert.equal(none.status, 1);
+    assert.match(none.stderr, /no App Store Connect credential found/);
+    assert.match(none.stderr, /APPLE_API_KEY_P8_BASE64/);
+
+    // APPLE_API_* present but undecodable: proves the env IS read, and says so.
+    const bad = spawnSync(process.execPath, [join(ROOT, "scripts/ios-fleet/asc-api.mjs"), "latest-build-seq", "app.botfleet", "1.0"], {
+      encoding: "utf8",
+      env: {
+        ...clean,
+        APPLE_API_KEY_ID: "AAAAAAAAAA",
+        APPLE_API_ISSUER_ID: "00000000-0000-0000-0000-000000000000",
+        APPLE_API_KEY_P8_BASE64: "bm90LWEtcGVt",
+      },
+    });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("asc_latest_seq surfaces asc-api stderr and does not require the env file", () => {
+  const ship = read("scripts/ios-fleet/ship-testflight.sh");
+  // The old line threw away the only diagnostic that says WHY (HTTP 401).
+  assert.doesNotMatch(ship, /asc-api\.mjs" latest-build-seq[^\n]*2>\/dev\/null/);
+  assert.match(ship, /2>"\$errf"/);
+  assert.match(ship, /logerr "asc-seq: \$\{line\}"/);
+  // A missing ~/.secrets file is no longer an automatic UNVERIFIED.
+  assert.match(ship, /asc_credential_available\(\)/);
+  assert.doesNotMatch(ship, /if \[\[ ! -f "\$SECRETS_ENV" \]\]; then\n\s*logerr "asc-seq: no /);
+  // Cleanup must not write to the captured-value stream: an `rm` wrapper that
+  // reports on stdout once turned a correct sequence into an arithmetic error.
+  assert.match(ship, /rm -f "\$errf" >\/dev\/null 2>&1 \|\| true/);
 });
