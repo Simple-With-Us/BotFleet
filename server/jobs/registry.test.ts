@@ -725,9 +725,12 @@ describe("reads never split a secret", () => {
   // in between: no read may carry a line of its body, whatever the window.
   describe("a private key printed in more than one write", () => {
     const bodyLine = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
-    const keyHead = "-----BEGIN PRIVATE KEY-----\n";
+    // Assembled, so no private-key header sits in the source for the secret
+    // scanner (gitleaks' `private-key` rule) to take for a real key.
+    const keyKind = "PRIVATE KEY";
+    const keyHead = `-----BEGIN ${keyKind}-----\n`;
     const keyBody = (lines: number) => `${bodyLine}\n`.repeat(lines);
-    const keyTail = "-----END PRIVATE KEY-----\n";
+    const keyTail = `-----END ${keyKind}-----\n`;
 
     it("holds a key that opens the log until its END marker is printed", () => {
       const { spawnFn } = fakeSpawn();
