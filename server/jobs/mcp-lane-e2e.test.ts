@@ -46,7 +46,7 @@ const textOf = (r: any): string =>
 function readBody(req: any): Promise<any> {
   return new Promise((resolve) => {
     let data = "";
-    req.on("data", (c) => (data += c));
+    req.on("data", (c: Buffer) => (data += c.toString("utf8")));
     req.on("end", () => {
       try {
         resolve(data ? JSON.parse(data) : {});

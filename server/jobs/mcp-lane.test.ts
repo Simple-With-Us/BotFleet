@@ -21,7 +21,6 @@ import {
   type McpLaneJobDeps,
 } from "./mcp-lane.ts";
 import { JobRegistry, DEFAULT_JOBS_SETTINGS } from "./registry.ts";
-import { JOB_OUTPUT_MAX_BYTES } from "../../shared/jobs.ts";
 
 const made: Array<{ dir: string; registry: JobRegistry }> = [];
 
@@ -71,7 +70,7 @@ function harness(options: { platform?: NodeJS.Platform; enabled?: boolean } = {}
     cwd: root,
     onComplete: "wake",
     wakes: true,
-    requestApproval: (ask) => {
+    requestApproval: async (ask) => {
       asks.push(ask);
       return answer;
     },
