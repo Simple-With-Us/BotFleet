@@ -15,6 +15,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { uptime } from "node:os";
 
 import { z } from "zod";
 
@@ -218,7 +219,13 @@ export async function adoptGroupLedger(path: string | null): Promise<string[]> {
   saveLedger();
   if (!POSIX || earlier.length === 0) return [];
   const lost: Array<z.infer<typeof GroupLedgerFile>[number]> = [];
+  // Wall time this machine booted (the same instant `sysctl kern.boottime`
+  // gives).  Nothing started before it can still be running, so a group
+  // recorded before it is someone else's now, whatever its number — the case
+  // a leaderless group cannot prove on its own.
+  const bootedAt = Date.now() - uptime() * 1000;
   for (const record of earlier) {
+    if (record.spawnedAt < bootedAt - LEADER_START_SLACK_MS) continue;
     if (ledger.has(record.pgid) || !groupAlive(record.pgid)) continue;
     if (pidAlive(record.pgid)) {
       // something holds the leader's pid: ours only if it is that very shell

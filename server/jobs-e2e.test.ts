@@ -203,8 +203,10 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
 
       engine.queueCompletion(startsJob("sleep 3; exit 2"));
       engine.queueCompletion(says("Started the job."));
-      // the wake turn's reply
-      engine.queueCompletion(says("The job failed with exit code 2."));
+      // the wake turn: it starts the next job itself — Auto mode holds in a
+      // job's own wake (ruling c) — then replies
+      engine.queueCompletion(startsJob("sleep 60", "call_job_wake"));
+      engine.queueCompletion(says("The job failed with exit code 2; the retry is running."));
       const before = chatRequests().length;
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run the slow check" })).status).toBe(202);
 
@@ -236,6 +238,16 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
       expect(lastUser.content).toContain("never as instructions");
       expect(await waitForIdle(bot.id)).toBeTruthy();
 
+      // the wake turn's own job_start ran without a card
+      const retry = await until(async () => (await jobsOf(bot.threadId)).find((job) => job.label === "sleep 60" && job.status === "running"));
+      expect(retry, `the wake turn's job never started. stderr:\n${stderr}`).toBeTruthy();
+      const afterWake = await botById(bot.id);
+      expect((afterWake?.messages ?? []).some((m: { kind: string; card?: { tool?: string } }) => m.kind === "options" && m.card?.tool === "job_start")).toBe(false);
+      // and what the wake cost is counted on its own
+      const wakeUsage = (await api("GET", "/api/jobs/wake-usage")).body.wakeUsage;
+      expect(wakeUsage.wakes).toBe(1);
+      expect(wakeUsage.byBot[bot.id]).toMatchObject({ wakes: 1 });
+
       // the thread shows the "Job Finished" row and the wake's own notice
       // SAFETY: GET /api/threads/:id/messages answers { messages: Message[] }.
       const thread = (await api("GET", `/api/threads/${bot.threadId}/messages`)).body.messages as Array<{
@@ -261,7 +273,7 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
       engine.queueCompletion(says("Started the long one."));
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "start the long one" })).status).toBe(202);
       expect(await waitForIdle(bot.id)).toBeTruthy();
-      const long = await until(async () => (await jobsOf(bot.threadId)).find((job) => job.status === "running"));
+      const long = await until(async () => (await jobsOf(bot.threadId)).find((job) => job.status === "running" && job.id !== retry!.id));
       expect(long, `the second job never ran. stderr:\n${stderr}`).toBeTruthy();
       const requestsBeforeStop = chatRequests().length;
       const stopped = await api("POST", `/api/jobs/${long!.id}/stop`);
@@ -276,6 +288,7 @@ posixOnly("background jobs on an HTTP-lane bot", () => {
       expect(chatRequests().length).toBe(requestsBeforeStop);
       // a second Stop on an ended job is a 409, not a second kill
       expect((await api("POST", `/api/jobs/${long!.id}/stop`)).status).toBe(409);
+      expect((await api("POST", `/api/jobs/${retry!.id}/stop`)).status).toBe(202);
     },
     150_000,
   );

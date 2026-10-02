@@ -22,7 +22,10 @@
 //   - The spend ceiling and the `jobs.wake: false` kill switch stop wakes
 //     without dropping notices.
 //   - A wake that cannot dispatch (busy, reloading, quiescing) puts its
-//     notices back and waits for the next settle.
+//     notices back and waits for the next settle — and, because a bot can
+//     go idle without a turn settling (a provider reload ending, a stalled
+//     turn released, a failed room dispatch), it is also retried on a timer
+//     until it starts or something else delivers its notices.
 
 import type { JobSnapshot } from "../../shared/jobs.ts";
 import type { JobNoticeItem } from "../steer-queue.ts";
@@ -43,6 +46,8 @@ export interface JobWakeDeps {
    *  Rejects when the dispatch could not start. */
   startWake(botId: string, threadId: string, prompt: string, jobIds: string[]): Promise<void>;
   mergeWindowMs?: number;
+  /** How long a wake that could not start waits before it tries again. */
+  retryMs?: number;
   maxConsecutive?: number;
   /** Schedules the merge window's end; tests capture it rather than wait. */
   setTimer?: (fn: () => void, ms: number) => WakeTimer;
@@ -66,6 +71,7 @@ export function wakePrompt(items: readonly JobNoticeItem[]): string {
 export class JobWakeCoordinator {
   private readonly deps: JobWakeDeps;
   private readonly mergeWindowMs: number;
+  private readonly retryMs: number;
   private readonly maxConsecutive: number;
   private readonly setTimer: (fn: () => void, ms: number) => WakeTimer;
   /** threadId → wakes used since the owner last typed there. */
@@ -74,10 +80,13 @@ export class JobWakeCoordinator {
   private readonly scheduled = new Map<string, { botId: string; timer: WakeTimer }>();
   /** threadId → botId: a wake that is due, held until the bot settles. */
   private readonly waiting = new Map<string, string>();
+  /** threadId → the retry timer of a waiting wake. */
+  private readonly retries = new Map<string, WakeTimer>();
 
   constructor(deps: JobWakeDeps) {
     this.deps = deps;
     this.mergeWindowMs = deps.mergeWindowMs ?? 5_000;
+    this.retryMs = deps.retryMs ?? 30_000;
     this.maxConsecutive = deps.maxConsecutive ?? 3;
     this.setTimer =
       deps.setTimer ??
@@ -113,16 +122,36 @@ export class JobWakeCoordinator {
     // oxlint-disable-next-line unicorn/no-useless-spread
     for (const [threadId, waitingBot] of [...this.waiting]) {
       if (waitingBot !== botId) continue;
-      this.waiting.delete(threadId);
+      this.unpark(threadId);
       void this.fire(threadId, botId);
     }
+  }
+
+  /** Hold a due wake until the bot settles, and try again on a timer too. */
+  private park(threadId: string, botId: string): void {
+    this.waiting.set(threadId, botId);
+    if (this.retries.has(threadId)) return;
+    const timer = this.setTimer(() => {
+      this.retries.delete(threadId);
+      const waitingBot = this.waiting.get(threadId);
+      if (waitingBot === undefined) return;
+      this.waiting.delete(threadId);
+      void this.fire(threadId, waitingBot);
+    }, this.retryMs);
+    this.retries.set(threadId, timer);
+  }
+
+  private unpark(threadId: string): void {
+    this.waiting.delete(threadId);
+    this.retries.get(threadId)?.cancel();
+    this.retries.delete(threadId);
   }
 
   /** Forget a deleted thread. */
   forgetThread(threadId: string): void {
     this.scheduled.get(threadId)?.timer.cancel();
     this.scheduled.delete(threadId);
-    this.waiting.delete(threadId);
+    this.unpark(threadId);
     this.used.delete(threadId);
   }
 
@@ -144,7 +173,7 @@ export class JobWakeCoordinator {
       return;
     }
     if (this.deps.botBusy(botId)) {
-      this.waiting.set(threadId, botId);
+      this.park(threadId, botId);
       return;
     }
     const items = this.deps.drainNotices(threadId);
@@ -157,7 +186,7 @@ export class JobWakeCoordinator {
       // next settle tries again.
       this.used.set(threadId, Math.max(0, (this.used.get(threadId) ?? 1) - 1));
       this.deps.restoreNotices(threadId, items);
-      this.waiting.set(threadId, botId);
+      this.park(threadId, botId);
       this.deps.log?.(`[jobs] wake for ${threadId.slice(0, 8)} did not start: ${error instanceof Error ? error.message : String(error)}`);
     }
   }

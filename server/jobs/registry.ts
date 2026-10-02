@@ -12,27 +12,36 @@
 //   - Caps: 3 running jobs per thread, 4 per bot, 8 per host.  Past a cap,
 //     `job_start` is refused, never queued.
 //   - Limits: 60 minutes unless the bot names one, at most 240 (an owner may
-//     raise the ceiling to 6 hours).  Deadlines count AWAKE time: a periodic
-//     tick credits elapsed time, but never more than two ticks' worth at once,
-//     so a Mac that slept overnight does not wake to every job timed out.
-//   - Output: an 8 MiB log, cut back to its newest half when it passes that.
-//     `jobs.json` keeps at most 500 records; the oldest finished go first,
-//     with their files.
+//     raise the ceiling to 6 hours).  Deadlines count AWAKE time: the tick
+//     credits the monotonic clock's advance (`performance.now()`, which does
+//     not run while the Mac sleeps — mach continuous time is the one that
+//     does), so a Mac that slept overnight does not wake to every job timed
+//     out, and a starved event loop still credits every awake second.
+//   - Output: an 8 MiB log, cut back to its newest half when it passes that,
+//     checked twice a second while any job runs.  A job printing faster than
+//     64 MiB a second is stopped: nothing a person reads prints that fast,
+//     and the disk is the owner's.  `jobs.json` keeps at most 500 records; the
+//     oldest finished go first, with their files.
 //   - Stop: SIGTERM to the group, SIGKILL after 5 s.
-//   - Restart (v1): shutdown and the updater's quiesce stop every job and mark
-//     it `lost`.  At boot a job settles from its `exit` file when it has one;
-//     otherwise a leader whose start time still matches is killed, and the job
-//     is `lost`.  Nothing at boot wakes a bot.  A five-minute sweep stops any
-//     process still carrying the id of a job that is over.
+//   - Restart (v1): shutdown stops every job and marks it `lost` (a forced
+//     update stops them before it restarts).  At boot a job settles from its
+//     `exit` file when it has one; otherwise a leader whose start time still
+//     matches is killed, and the job is `lost`.  A group whose leader is gone
+//     is never signalled by its number — that number may now be someone
+//     else's group — so the sweep stops exactly the processes carrying the
+//     lost job's id instead.  Nothing at boot wakes a bot.  A five-minute
+//     sweep stops any process still carrying the id of a job that is over.
 //   - Redaction: labels and output pass `redactSecretsInText` on their way
-//     out; the raw command is never written to disk.
+//     out, and a read never ends inside a line when it can end at one, so a
+//     secret is never split across two reads where neither half matches;
+//     the raw command is never written to disk.
 //
 // What this file does NOT do: decide whether to wake a bot (server/jobs/
 // wake.ts), or ask anyone for approval (the tool host, behind the per-turn
 // grant).  It never publishes on the runtime bus either: a job's events must
 // not touch the 20-minute stall watchdog or fold into a turn.
 
-import { existsSync, ftruncateSync, mkdirSync, openSync, closeSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, closeSync, readFileSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { join } from "node:path";
 
@@ -165,7 +174,7 @@ const RecordFile = z.array(
     timeoutMs: z.number(),
     onComplete: z.enum(["wake", "notice", "none"]),
     notice: z.enum(["pending", "delivered", "none"]),
-    killedBy: z.enum(["model", "owner", "timeout", "system"]).optional(),
+    killedBy: z.enum(["model", "owner", "timeout", "limit", "system"]).optional(),
     reason: z.string().optional(),
     pid: z.number().int().positive().nullable(),
     spawnedAt: z.number(),
@@ -197,10 +206,14 @@ export type JobStartResult =
 export interface JobOutputChunk {
   /** Redacted text. */
   text: string;
-  /** Bytes still unread after this chunk. */
+  /** Bytes past this chunk that a further read returns now: more than one
+   *  read's worth was waiting.  Zero when the rest is only a line the job is
+   *  still printing, which waits for its end rather than being split. */
   remaining: number;
   /** Bytes the reader missed because the log cap cut them first. */
   dropped: number;
+  /** Bytes of a line the job is still printing, held back until it ends. */
+  held: number;
 }
 
 export interface OwnerOutput {
@@ -225,8 +238,10 @@ export interface JobRegistryDeps {
   /** Why a running job may not keep running, or null when it may: its bot
    *  or thread was deleted, or the bot lost the host-shell grant a job
    *  needs.  Asked on every tick, so a change made on any screen stops the
-   *  job within one tick, whatever route made it. */
-  stopReason?: (job: JobSnapshot) => string | null;
+   *  job within one tick, whatever route made it.  `forget`: the job's
+   *  thread or bot is gone, so once it has stopped its record and log go too
+   *  — a deleted conversation's output is not left for its bot to read. */
+  stopReason?: (job: JobSnapshot) => { reason: string; forget: boolean } | null;
   /** The debounced full-set frame for one thread. */
   broadcast: (frame: JobsFrame) => void;
   /** A job ended (any status).  `notice` is the line the bot should read,
@@ -235,7 +250,20 @@ export interface JobRegistryDeps {
    *  harness started, which must never wake a bot. */
   onFinished?: (job: JobSnapshot, notice: string | null, how: { row: boolean; boot: boolean }) => void;
   now?: () => number;
+  /** Milliseconds that advance only while the machine is awake: the job
+   *  deadline clock.  Default `performance.now()`, which libuv takes from
+   *  `mach_absolute_time` / `CLOCK_UPTIME_RAW` on macOS and
+   *  `CLOCK_MONOTONIC` on Linux — none of them run during sleep. */
+  awakeNow?: () => number;
+  /** Most awake time one tick may credit.  A safety net should the clock
+   *  above ever count a sleep after all: a sleep then costs a job a minute,
+   *  never its whole limit. */
+  maxTickCreditMs?: number;
   tickMs?: number;
+  /** How often running jobs' logs are held to their cap. */
+  logCheckMs?: number;
+  /** A job whose output grows faster than this is stopped. */
+  floodBytesPerSecond?: number;
   sweepMs?: number;
   frameDebounceMs?: number;
   graceMs?: number;
@@ -251,6 +279,89 @@ export interface JobRegistryDeps {
 
 /** Finished records a frame carries per thread, newest first. */
 const FRAME_FINISHED_LIMIT = 20;
+
+/** Why a job was lost when the harness stopped: true whether it is quitting
+ *  or restarting, which a SIGTERM cannot tell apart. */
+export const JOB_STOPPED_REASON = "BotFleet's server stopped";
+
+/** Output faster than this is a runaway (`yes`, an error loop), not a log. */
+export const JOB_FLOOD_BYTES_PER_SECOND = 64 * 1024 * 1024;
+
+/** A byte that can sit inside a credential: the redactor's patterns are
+ *  runs of these, so a cut between two of them can split a secret. */
+function tokenByte(byte: number): boolean {
+  return (
+    (byte >= 0x30 && byte <= 0x39) || // 0-9
+    (byte >= 0x41 && byte <= 0x5a) || // A-Z
+    (byte >= 0x61 && byte <= 0x7a) || // a-z
+    byte === 0x2b || byte === 0x2d || byte === 0x2e || byte === 0x2f || // + - . /
+    byte === 0x3d || byte === 0x5f || byte === 0x7e || // = _ ~
+    byte >= 0x80 // inside a multi-byte character: never a place to cut
+  );
+}
+
+const PEM_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/g;
+const PEM_END = /-----END [A-Z ]*PRIVATE KEY-----/;
+
+/** Where a read of `buffer[0, length)` may end without splitting a secret.
+ *
+ *  `final`: nothing more will ever follow (the job ended and this is the end
+ *  of its log), so everything goes.  Otherwise the read ends after the last
+ *  line break in it — the redactor's header and key-value patterns run to
+ *  the end of a line, so a whole line is the unit that redacts right.  A
+ *  window with no line break at all (one 16 KB line) ends at the last byte
+ *  that cannot be part of a token, so no token is split; only a window that
+ *  is one unbroken token is cut where it stands.  A private key whose END
+ *  marker is not in the window is left for the next read whole.
+ *
+ *  `full`: the window was filled, so more is waiting — the read must move
+ *  forward.  A window that is not full ends at the job's latest byte; its
+ *  unfinished last line waits (`0` when nothing whole is there yet). */
+export function safeReadEnd(buffer: Buffer, length: number, final: boolean, full: boolean): number {
+  if (final || length === 0) return length;
+  let end = 0;
+  for (let i = length - 1; i >= 0; i -= 1) {
+    const byte = buffer[i]!;
+    if (byte === 0x0a || byte === 0x0d) {
+      end = i + 1;
+      break;
+    }
+  }
+  if (end === 0 && full) {
+    for (let i = length - 1; i > 0; i -= 1) {
+      if (!tokenByte(buffer[i]!)) {
+        end = i + 1;
+        break;
+      }
+    }
+    if (end === 0) end = length;
+  }
+  if (end === 0) return 0;
+  // A private key cut before its END marker would leave its body bare in the
+  // next read (the PEM pattern anchors on BEGIN).  Hold the block back.
+  const text = buffer.subarray(0, end).toString("latin1");
+  let lastBegin = -1;
+  for (const match of text.matchAll(PEM_BEGIN)) lastBegin = match.index;
+  if (lastBegin > 0 && !PEM_END.test(text.slice(lastBegin))) {
+    // back to the start of the BEGIN line
+    const lineStart = text.lastIndexOf("\n", lastBegin);
+    return lineStart >= 0 ? lineStart + 1 : lastBegin;
+  }
+  return end;
+}
+
+/** Where a read that starts somewhere arbitrary (the owner's "newest 64 KB",
+ *  or the front of a log the cap trimmed) may start without opening inside a
+ *  secret: just after the first line break in its first 4 KB, when there is
+ *  one. */
+function safeReadStart(buffer: Buffer, length: number): number {
+  const limit = Math.min(length, 4096);
+  for (let i = 0; i < limit; i += 1) {
+    const byte = buffer[i]!;
+    if (byte === 0x0a || byte === 0x0d) return i + 1;
+  }
+  return 0;
+}
 
 function pidAlive(pid: number): boolean {
   try {
@@ -297,18 +408,34 @@ export class JobRegistry {
   private readonly tickMs: number;
   private readonly logMaxBytes: number;
   private readonly recordMax: number;
+  private readonly awakeNow: () => number;
+  private readonly maxTickCreditMs: number;
+  private readonly floodBytesPerSecond: number;
   private readonly frameTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly endWaiters = new Map<string, Set<() => void>>();
   /** Kills in flight, so a second Stop joins the first. */
   private readonly stopping = new Map<string, Promise<void>>();
+  /** Records read from `jobs.json` at construction that `adopt()` has not
+   *  settled yet.  Loaded at construction, not in `adopt()`, so a job that
+   *  starts before boot finishes (a routine or a resource trigger can) is
+   *  saved beside them rather than over them — and adopt settles only these. */
+  private readonly adoptable = new Set<string>();
+  /** Each running job's logical log size at the last log check. */
+  private readonly lastLogEnd = new Map<string, number>();
+  /** Ids of jobs whose records were deleted with their conversation: the
+   *  sweep still stops anything that carries one. */
+  private readonly forgotten = new Set<string>();
   private lastTick: number;
+  private lastLogCheck: number;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private logTimer: ReturnType<typeof setInterval> | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private exitHook: (() => void) | null = null;
 
   constructor(deps: JobRegistryDeps) {
     this.deps = deps;
     this.now = deps.now ?? Date.now;
+    this.awakeNow = deps.awakeNow ?? (() => performance.now());
     this.probe = deps.probe ?? createHostProbe();
     this.spawnJob = deps.spawn ?? spawnJobProcess;
     this.listProcesses = deps.listProcesses ?? createJobProcessLister();
@@ -316,10 +443,43 @@ export class JobRegistry {
     this.platform = deps.platform ?? process.platform;
     this.graceMs = deps.graceMs ?? GROUP_KILL_GRACE_MS;
     this.tickMs = deps.tickMs ?? 5_000;
+    this.maxTickCreditMs = deps.maxTickCreditMs ?? 60_000;
     this.logMaxBytes = deps.logMaxBytes ?? JOB_LOG_MAX_BYTES;
+    this.floodBytesPerSecond = deps.floodBytesPerSecond ?? JOB_FLOOD_BYTES_PER_SECOND;
     this.recordMax = deps.recordMax ?? JOB_RECORD_MAX;
-    this.lastTick = this.now();
+    this.lastTick = this.awakeNow();
+    this.lastLogCheck = this.awakeNow();
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
+    this.load();
+  }
+
+  /** Read `jobs.json` into memory.  Settling what an earlier run left
+   *  running is `adopt()`'s, at the end of boot. */
+  private load(): void {
+    let raw: string;
+    try {
+      raw = readFileSync(join(this.deps.dir, "jobs.json"), "utf8");
+    } catch {
+      return; // no history yet
+    }
+    let parsed: ReturnType<typeof RecordFile.safeParse>;
+    try {
+      parsed = RecordFile.safeParse(JSON.parse(raw));
+    } catch {
+      parsed = RecordFile.safeParse(null);
+    }
+    if (!parsed.success) {
+      this.deps.log?.("[jobs] jobs.json did not parse; starting with no job history");
+      return;
+    }
+    for (const record of parsed.data) {
+      this.records.set(record.id, {
+        ...record,
+        logPath: join(this.deps.dir, `${record.id}.log`),
+        exitPath: join(this.deps.dir, `${record.id}.exit`),
+      });
+      this.adoptable.add(record.id);
+    }
   }
 
   // ── reads ─────────────────────────────────────────────────────────────
@@ -360,32 +520,39 @@ export class JobRegistry {
 
   // ── start ─────────────────────────────────────────────────────────────
 
+  /** Why a job may not start for this bot on this thread right now, or null
+   *  when it may: the platform, the switch, the caps, and admission — every
+   *  refusal that does not depend on the command.  The tool host asks this
+   *  BEFORE it shows an approval card, so nobody is asked to approve a job
+   *  that could never start; `start()` asks it again, because the answer can
+   *  change while a card waits. */
+  refusal(request: Pick<JobStartRequest, "botId" | "threadId">): string | null {
+    if (this.platform === "win32") {
+      return "Background jobs are not available on Windows yet: BotFleet cannot reliably stop every process a job starts there.  Run short commands with bash instead.";
+    }
+    const settings = this.deps.settings();
+    if (!settings.enabled) return "Background jobs are turned off in BotFleet's settings.";
+    const active = [...this.records.values()].filter(isJobActive);
+    if (active.filter((record) => record.threadId === request.threadId).length >= JOB_CAP_PER_THREAD) {
+      return `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.`;
+    }
+    if (active.filter((record) => record.botId === request.botId).length >= JOB_CAP_PER_BOT) {
+      return `You already have ${JOB_CAP_PER_BOT} jobs running, the most a bot may.  Wait for one to finish, or stop one with job_kill.`;
+    }
+    if (active.length >= JOB_CAP_PER_HOST) {
+      return `This computer already runs ${JOB_CAP_PER_HOST} background jobs, the most BotFleet allows.  Try again when one finishes.`;
+    }
+    return admissionRefusal(this.probe, settings.admission, this.deps.dataDir, this.deps.spendBlocked());
+  }
+
   start(request: JobStartRequest): JobStartResult {
     const settings = this.deps.settings();
-    if (this.platform === "win32") {
-      return {
-        ok: false,
-        error: "Background jobs are not available on Windows yet: BotFleet cannot reliably stop every process a job starts there.  Run short commands with bash instead.",
-      };
-    }
-    if (!settings.enabled) return { ok: false, error: "Background jobs are turned off in BotFleet's settings." };
+    const refused = this.refusal(request);
+    if (refused) return { ok: false, error: refused };
     const command = request.command.trim();
     if (!command) return { ok: false, error: "command must be a non-empty string" };
     if (command.length > 16_000) return { ok: false, error: "command is too long (16,000 characters at most)." };
     if (!existsSync(request.cwd)) return { ok: false, error: `The working folder ${request.cwd} does not exist.` };
-
-    const active = [...this.records.values()].filter(isJobActive);
-    if (active.filter((record) => record.threadId === request.threadId).length >= JOB_CAP_PER_THREAD) {
-      return { ok: false, error: `This conversation already has ${JOB_CAP_PER_THREAD} jobs running, the most it may.  Wait for one to finish, or stop one with job_kill.` };
-    }
-    if (active.filter((record) => record.botId === request.botId).length >= JOB_CAP_PER_BOT) {
-      return { ok: false, error: `You already have ${JOB_CAP_PER_BOT} jobs running, the most a bot may.  Wait for one to finish, or stop one with job_kill.` };
-    }
-    if (active.length >= JOB_CAP_PER_HOST) {
-      return { ok: false, error: `This computer already runs ${JOB_CAP_PER_HOST} background jobs, the most BotFleet allows.  Try again when one finishes.` };
-    }
-    const refusal = admissionRefusal(this.probe, settings.admission, this.deps.dataDir, this.deps.spendBlocked());
-    if (refusal) return { ok: false, error: refusal };
 
     let minutes = settings.defaultMinutes;
     let note: string | undefined;
@@ -468,7 +635,12 @@ export class JobRegistry {
     if (!record) return null;
     const chunk = this.readLog(record, record.modelCursor, maxBytes);
     record.modelCursor = chunk.to;
-    return { text: chunk.text, remaining: chunk.end - chunk.to, dropped: chunk.dropped };
+    return {
+      text: chunk.text,
+      remaining: chunk.full ? chunk.end - chunk.to : 0,
+      dropped: chunk.dropped,
+      held: chunk.full ? 0 : chunk.end - chunk.to,
+    };
   }
 
   /** What the owner's View Output shows: from `since`, or the newest `limit`
@@ -478,7 +650,9 @@ export class JobRegistry {
     if (!record) return null;
     const end = this.logicalEnd(record);
     const from = options.since === undefined ? Math.max(record.droppedBytes, end - options.limit) : options.since;
-    const chunk = this.readLog(record, from, options.limit);
+    // "The newest N bytes" starts wherever N lands, which can be inside a
+    // line, and so inside a secret: start at the next line instead.
+    const chunk = this.readLog(record, from, options.limit, options.since === undefined && from > record.droppedBytes);
     record.ownerCursor = Math.max(record.ownerCursor, chunk.to);
     return { text: chunk.text, from: chunk.from, to: chunk.to, end: chunk.end, dropped: record.droppedBytes };
   }
@@ -511,23 +685,36 @@ export class JobRegistry {
     }
   }
 
-  private readLog(record: JobRecord, logicalFrom: number, maxBytes: number) {
+  /** Read `[logicalFrom, +maxBytes)` of a job's log, redacted.  The read
+   *  ends where no secret can be split (safeReadEnd); `alignStart` also
+   *  moves an arbitrary start to the next line.  `full`: more than this one
+   *  read's worth was waiting. */
+  private readLog(record: JobRecord, logicalFrom: number, maxBytes: number, alignStart = false) {
     const dropped = Math.max(0, record.droppedBytes - logicalFrom);
+    // The cap cut the front of the log since this reader's cursor: whatever
+    // is first on disk now may be the back half of a line, so align it.
+    const trimmed = logicalFrom < record.droppedBytes;
     const from = Math.max(logicalFrom, record.droppedBytes);
     const end = this.logicalEnd(record);
     const want = Math.max(0, Math.min(maxBytes, end - from));
-    if (want === 0) return { text: "", from, to: from, end, dropped };
+    if (want === 0) return { text: "", from, to: from, end, dropped, full: false };
+    const full = end - from > maxBytes;
     let fd: number | null = null;
     try {
       fd = openSync(record.logPath, "r");
       const buffer = Buffer.alloc(want);
       const read = readSync(fd, buffer, 0, want, from - record.droppedBytes);
-      // a partial character at the cut waits for the next read
-      const usable = read < want ? read : utf8Boundary(buffer, read);
-      const text = redactSecretsInText(buffer.subarray(0, usable).toString("utf8"));
-      return { text, from, to: from + usable, end, dropped };
+      const start = alignStart || trimmed ? safeReadStart(buffer, read) : 0;
+      const body = buffer.subarray(start, read);
+      // Everything the job will ever print is here: nothing to hold back.
+      const final = !isJobActive(record) && from + read >= end;
+      // then never split a character, a line, or a token
+      const cut = safeReadEnd(body, body.length, final, full);
+      const usable = final ? cut : utf8Boundary(body, cut);
+      const text = redactSecretsInText(body.subarray(0, usable).toString("utf8"));
+      return { text, from, to: from + start + usable, end, dropped, full };
     } catch {
-      return { text: "", from, to: from, end, dropped };
+      return { text: "", from, to: from, end, dropped, full: false };
     } finally {
       if (fd !== null) closeSync(fd);
     }
@@ -550,7 +737,10 @@ export class JobRegistry {
     record.status = "stopping";
     record.killedBy = by;
     if (reason) record.reason = reason;
-    record.onComplete = by === "model" ? "none" : by === "timeout" ? record.onComplete : "notice";
+    // The bot's own kill needs no notice; a limit it ran into (time, output)
+    // is news it must act on, so it may wake; anyone else's Stop is told on
+    // the bot's next turn without waking it.
+    record.onComplete = by === "model" ? "none" : by === "timeout" || by === "limit" ? record.onComplete : "notice";
     this.save();
     this.changed(record.threadId);
     const stop = (async () => {
@@ -569,11 +759,38 @@ export class JobRegistry {
   }
 
   /** Stop every running job matching `match` (a deleted thread or bot, a
-   *  revoked grant).  The bot is told on its next turn, never woken. */
-  async killWhere(match: (job: JobSnapshot) => boolean, reason: string): Promise<number> {
-    const targets = [...this.records.values()].filter((record) => isJobActive(record) && match(this.snapshot(record)));
-    await Promise.all(targets.map((record) => this.kill(record.id, "system", reason)));
-    return targets.length;
+   *  revoked grant).  The bot is told on its next turn, never woken.
+   *  `forget`: the jobs' conversation or bot is gone, so once each has
+   *  stopped its record and its log are deleted — finished ones included —
+   *  the way deleting a conversation deletes its transcript.  Resolves with
+   *  how many were running. */
+  async killWhere(match: (job: JobSnapshot) => boolean, reason: string, options: { forget?: boolean } = {}): Promise<number> {
+    const targets = [...this.records.values()].filter((record) => match(this.snapshot(record)));
+    const running = targets.filter(isJobActive);
+    await Promise.all(running.map((record) => this.kill(record.id, "system", reason)));
+    if (options.forget) this.forget(targets.map((record) => record.id));
+    return running.length;
+  }
+
+  /** Delete finished jobs' records and files.  A job still running keeps
+   *  its record: the sweep needs it to know the job's processes are ours. */
+  private forget(ids: readonly string[]): void {
+    const threads = new Set<string>();
+    for (const id of ids) {
+      const record = this.records.get(id);
+      if (!record || isJobActive(record)) continue;
+      this.records.delete(id);
+      this.adoptable.delete(id);
+      this.lastLogEnd.delete(id);
+      this.removeFiles(record);
+      // still ours to sweep, should anything it started outlive it
+      this.forgotten.add(id);
+      if (this.forgotten.size > JOB_RECORD_MAX) this.forgotten.delete(this.forgotten.values().next().value!);
+      threads.add(record.threadId);
+    }
+    if (threads.size === 0) return;
+    this.save();
+    for (const threadId of threads) this.changed(threadId);
   }
 
   /** Whether the group a record names is still the one this job started.
@@ -655,19 +872,30 @@ export class JobRegistry {
   // ── periodic work ─────────────────────────────────────────────────────
 
   /** Credit awake time, stop jobs past their limit or without a grant, and
-   *  hold logs to their cap.  The credit is capped at two ticks, so a Mac
-   *  that slept for hours resumes its jobs' clocks rather than expiring them. */
+   *  hold logs to their cap.  The credit is the awake clock's advance (it
+   *  does not run while the Mac sleeps), capped at `maxTickCreditMs` in case
+   *  it ever does: a late tick on a loaded Mac still credits every awake
+   *  second, and a sleep never expires a job. */
   tick(): void {
-    const now = this.now();
-    const credit = Math.max(0, Math.min(now - this.lastTick, this.tickMs * 2));
-    this.lastTick = now;
+    const awake = this.awakeNow();
+    const credit = Math.max(0, Math.min(awake - this.lastTick, this.maxTickCreditMs));
+    this.lastTick = awake;
     for (const record of this.records.values()) {
-      if (record.status !== "running") continue;
+      if (this.adoptable.has(record.id)) continue; // adopt() settles these
+      if (record.status !== "running") {
+        // A finished job whose conversation or bot is gone, deleted by a
+        // route that did not stop its jobs itself: drop its output too.
+        if (!isJobActive(record) && this.deps.stopReason?.(this.snapshot(record))?.forget) this.forget([record.id]);
+        continue;
+      }
       record.awakeMs += credit;
       this.capLog(record);
       const stop = this.deps.stopReason?.(this.snapshot(record)) ?? null;
       if (stop) {
-        void this.kill(record.id, "system", stop);
+        const id = record.id;
+        void this.kill(id, "system", stop.reason).then(() => {
+          if (stop.forget) this.forget([id]);
+        });
         continue;
       }
       if (record.awakeMs >= record.timeoutMs) {
@@ -676,8 +904,39 @@ export class JobRegistry {
     }
   }
 
+  /** Twice a second while jobs run: hold every running job's log to its cap,
+   *  and stop one printing faster than any log is read.  Between two 5 s
+   *  ticks a runaway (`yes`, an error loop) can write gigabytes. */
+  checkLogs(): void {
+    const awake = this.awakeNow();
+    const seconds = Math.max(0.001, (awake - this.lastLogCheck) / 1000);
+    this.lastLogCheck = awake;
+    for (const record of this.records.values()) {
+      if (record.status !== "running" || this.adoptable.has(record.id)) {
+        this.lastLogEnd.delete(record.id);
+        continue;
+      }
+      const end = this.logicalEnd(record);
+      const before = this.lastLogEnd.get(record.id);
+      this.lastLogEnd.set(record.id, end);
+      const grew = before === undefined ? 0 : end - before;
+      if (grew > this.logMaxBytes && grew / seconds > this.floodBytesPerSecond) {
+        const mib = Math.round(this.floodBytesPerSecond / (1024 * 1024));
+        void this.kill(record.id, "limit", `it printed more than ${mib} MiB of output a second`);
+      }
+      this.capLog(record);
+    }
+  }
+
   /** Keep the newest half of a log that passed the cap.  The job writes with
-   *  O_APPEND, so its next write lands after what is kept. */
+   *  O_APPEND, so its next write lands after what is kept.
+   *
+   *  The job keeps writing while this runs, so the steps are back to back
+   *  and the size is read twice: what the job appended between the read of
+   *  the tail and the truncate cannot be kept, and is counted as dropped, so
+   *  the next reader is told there is a gap.  (What it appends in the instant
+   *  between the truncate and the rewrite is overwritten, and cannot be
+   *  measured; that window is two adjacent system calls.) */
   private capLog(record: JobRecord): void {
     let size: number;
     try {
@@ -691,10 +950,12 @@ export class JobRegistry {
     try {
       fd = openSync(record.logPath, "r+");
       const tail = Buffer.alloc(keep);
-      const read = readSync(fd, tail, 0, keep, size - keep);
+      const at = fstatSync(fd).size;
+      const read = readSync(fd, tail, 0, keep, at - keep);
+      const cutAt = fstatSync(fd).size;
       ftruncateSync(fd, 0);
       writeSync(fd, tail, 0, read, 0);
-      record.droppedBytes += size - read;
+      record.droppedBytes += cutAt - read;
     } catch (error) {
       this.deps.log?.(`[jobs] could not cap ${record.id}'s log: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -707,8 +968,9 @@ export class JobRegistry {
   async sweep(): Promise<number> {
     const found = await this.listProcesses();
     const strays = found.filter((proc) => {
+      if (proc.pid === process.pid) return false;
       const record = this.records.get(proc.jobId);
-      return record !== undefined && !isJobActive(record) && proc.pid !== process.pid;
+      return record !== undefined ? !isJobActive(record) : this.forgotten.has(proc.jobId);
     });
     if (strays.length === 0) return 0;
     const jobs = [...new Set(strays.map((proc) => proc.jobId))];
@@ -734,9 +996,15 @@ export class JobRegistry {
 
   /** Start the tick and the sweep, and stop every job if the process exits. */
   startTimers(sweepMs: number = this.deps.sweepMs ?? 5 * 60_000): void {
-    this.lastTick = this.now();
+    this.lastTick = this.awakeNow();
+    this.lastLogCheck = this.awakeNow();
     this.tickTimer ??= setInterval(() => this.tick(), this.tickMs);
     this.tickTimer.unref?.();
+    // One stat per running job; nothing at all while none runs.
+    this.logTimer ??= setInterval(() => {
+      if (this.records.size > 0 && [...this.records.values()].some((record) => record.status === "running")) this.checkLogs();
+    }, this.deps.logCheckMs ?? 500);
+    this.logTimer.unref?.();
     this.sweepTimer ??= setInterval(() => {
       void this.sweep().catch(() => undefined);
     }, sweepMs);
@@ -749,8 +1017,10 @@ export class JobRegistry {
 
   dispose(): void {
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.logTimer) clearInterval(this.logTimer);
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.tickTimer = null;
+    this.logTimer = null;
     this.sweepTimer = null;
     if (this.exitHook) process.off("exit", this.exitHook);
     this.exitHook = null;
@@ -760,14 +1030,17 @@ export class JobRegistry {
 
   // ── restart ───────────────────────────────────────────────────────────
 
-  /** The updater's quiesce: stop every running job and mark it lost. */
-  async quiesce(): Promise<number> {
+  /** Stop every running job and mark it lost: the harness is shutting down
+   *  (`reason` says so), or a forced update is about to restart it.  Not the
+   *  updater's ordinary quiesce, which can still be rolled back — a job
+   *  killed for a restart that never came would be work lost for nothing. */
+  async quiesce(reason = JOB_STOPPED_REASON): Promise<number> {
     const active = [...this.records.values()].filter(isJobActive);
     await Promise.all(
       active.map(async (record) => {
         record.status = "stopping";
         record.killedBy = "system";
-        record.reason = "BotFleet restarted";
+        record.reason = reason;
         if (record.pid !== null) await killGroup(record.pid, this.graceMs, () => this.stillOurs(record));
         record.onComplete = "notice";
         this.finish(record, "lost");
@@ -785,7 +1058,7 @@ export class JobRegistry {
       if (record.pid !== null && this.stillOurs(record)) signalGroup(record.pid, "SIGKILL");
       record.status = "lost";
       record.killedBy = "system";
-      record.reason = "BotFleet shut down";
+      record.reason = JOB_STOPPED_REASON;
       record.endedAt = this.now();
       record.onComplete = "notice";
       record.notice = "pending";
@@ -794,27 +1067,15 @@ export class JobRegistry {
     if (dirty) this.save();
   }
 
-  /** Read `jobs.json` and settle every job an earlier run left running.
-   *  Wakes nobody: a settled job's notice waits for the bot's next turn. */
+  /** Settle every job an earlier run left running (the records `load()`
+   *  read at construction).  Wakes nobody: a settled job's notice waits for
+   *  the bot's next turn. */
   async adopt(): Promise<{ settled: number; lost: number }> {
-    let loaded: JobRecord[] = [];
-    try {
-      const parsed = RecordFile.safeParse(JSON.parse(readFileSync(join(this.deps.dir, "jobs.json"), "utf8")));
-      if (parsed.success) {
-        loaded = parsed.data.map((record) => ({
-          ...record,
-          logPath: join(this.deps.dir, `${record.id}.log`),
-          exitPath: join(this.deps.dir, `${record.id}.exit`),
-        }));
-      } else {
-        this.deps.log?.("[jobs] jobs.json did not parse; starting with no job history");
-      }
-    } catch {
-      /* no history yet */
-    }
+    const loaded = [...this.adoptable].map((id) => this.records.get(id)).filter((record) => record !== undefined);
+    this.adoptable.clear();
     let settled = 0;
     let lost = 0;
-    for (const record of loaded) this.records.set(record.id, record);
+    let leaderless = false;
     for (const record of loaded) {
       // Nothing at boot wakes a bot: whatever ends up announced is a notice
       // for the bot's next turn.
@@ -835,11 +1096,19 @@ export class JobRegistry {
         continue;
       }
       if (record.pid !== null && groupAlive(record.pid)) {
-        let ours = true;
         if (pidAlive(record.pid)) {
-          ours = !record.leaderExited && (await this.leaderStartedNear(record.pid, record.spawnedAt));
+          // The leader's pid is held: it is ours only if that very shell
+          // still holds it, which its start time proves.
+          if (!record.leaderExited && (await this.leaderStartedNear(record.pid, record.spawnedAt))) {
+            await killGroup(record.pid, this.graceMs, () => this.stillOurs(record));
+          }
+        } else {
+          // A live group with no leader proves nothing: after a reboot, or
+          // once our group ended, the number can be anybody's group whose
+          // leader exited.  Never signal it by number.  The job's own
+          // processes carry its id, and the sweep below stops exactly those.
+          leaderless = true;
         }
-        if (ours) await killGroup(record.pid, this.graceMs, () => this.stillOurs(record));
       }
       record.killedBy = "system";
       record.reason = "BotFleet restarted";
@@ -849,6 +1118,9 @@ export class JobRegistry {
     this.prune();
     this.save();
     if (settled + lost > 0) this.deps.log?.(`[jobs] boot: ${settled} job(s) settled from their exit files, ${lost} marked lost`);
+    // Not awaited: listing every process's environment can take seconds on
+    // a loaded Mac, and boot must not wait on it.
+    if (leaderless) void this.sweep().catch(() => undefined);
     return { settled, lost };
   }
 
@@ -946,7 +1218,7 @@ export function noticeLine(job: JobSnapshot): string {
       return `${head} failed${job.signal ? `: ended by ${job.signal}` : ""} after ${took}.${read}`;
     case "killed":
       if (job.killedBy === "owner") return `${head} was stopped by the owner after ${took}.${read}`;
-      if (job.killedBy === "timeout") return `${head} was stopped because ${job.reason ?? "it ran past its limit"}.${read}`;
+      if (job.killedBy === "timeout" || job.killedBy === "limit") return `${head} was stopped because ${job.reason ?? "it ran past its limit"}.${read}`;
       if (job.killedBy === "model") return `${head} was stopped by you after ${took}.`;
       return `${head} was stopped${job.reason ? ` because ${job.reason}` : ""} after ${took}.${read}`;
     case "lost":

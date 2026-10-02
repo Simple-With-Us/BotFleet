@@ -29,9 +29,11 @@ export type JobOnComplete = "wake" | "notice" | "none";
  *  telling. */
 export type JobNoticeState = "pending" | "delivered" | "none";
 
-/** Who ended a job early.  `system` is the harness: the thread or bot was
- *  deleted, or the bot lost its computer grant. */
-export type JobKilledBy = "model" | "owner" | "timeout" | "system";
+/** Who ended a job early.  `limit` is a BotFleet limit other than the
+ *  clock: the job printed faster than any log is read.  `system` is the
+ *  harness: the thread or bot was deleted, the bot lost its computer grant,
+ *  or the harness stopped. */
+export type JobKilledBy = "model" | "owner" | "timeout" | "limit" | "system";
 
 /** One job, as every client sees it.  Never carries output: that is read
  *  over REST, on demand. */
@@ -124,17 +126,29 @@ export function jobExitChip(job: Pick<JobSnapshot, "status" | "exitCode" | "sign
     case "completed":
       return "Exited 0";
     case "failed":
+      // `ulimit -t` ends a job with SIGXCPU, which a shell reports as 152:
+      // the limit is the news, not the number.
+      if (job.signal === "SIGXCPU") return "CPU limit reached";
       if (job.exitCode !== null) return `Exited ${job.exitCode}`;
       return job.signal ? `Ended by ${job.signal}` : "Failed";
     case "killed":
       if (job.killedBy === "owner") return "Killed by you";
       if (job.killedBy === "model") return "Stopped by the bot";
       if (job.killedBy === "timeout") return "Timed out";
+      if (job.killedBy === "limit") return "Output limit";
       return "Stopped";
     case "lost":
       return "Lost after restart";
   }
 }
+
+const JOB_STOPPED_BY: Record<JobKilledBy, string> = {
+  model: "you",
+  owner: "the owner",
+  timeout: "timeout",
+  limit: "output limit",
+  system: "system",
+};
 
 /** The line `job_output` ends with:
  *  `[status: completed, exit code: 1, 4m 12s]`. */
@@ -145,7 +159,7 @@ export function jobStatusLine(
   const parts: string[] = [`status: ${job.status}`];
   if (job.exitCode !== null && !isJobActive(job)) parts.push(`exit code: ${job.exitCode}`);
   if (job.signal && !isJobActive(job)) parts.push(`signal: ${job.signal}`);
-  if (job.status === "killed" && job.killedBy) parts.push(`stopped by: ${job.killedBy === "model" ? "you" : job.killedBy === "owner" ? "the owner" : job.killedBy}`);
+  if (job.status === "killed" && job.killedBy) parts.push(`stopped by: ${JOB_STOPPED_BY[job.killedBy]}`);
   parts.push(formatJobDuration(jobElapsedMs(job, now)));
   return `[${parts.join(", ")}]`;
 }
@@ -177,7 +191,16 @@ export function jobFailedRecently(
 ): boolean {
   if (job.endedAt === null || now - job.endedAt > windowMs) return false;
   if (job.status === "failed" || job.status === "lost") return true;
-  return job.status === "killed" && job.killedBy === "timeout";
+  return job.status === "killed" && (job.killedBy === "timeout" || job.killedBy === "limit");
+}
+
+/** Whether a job's end counts as a failure for the transcript row: red step,
+ *  the mascot's failure motion, the roster's alert.  A Stop — the owner's,
+ *  the bot's own, or BotFleet's for a deleted conversation — is not one; a
+ *  limit the job ran into is. */
+export function jobEndedBadly(job: Pick<JobSnapshot, "status" | "killedBy">): boolean {
+  if (job.status === "failed" || job.status === "lost") return true;
+  return job.status === "killed" && (job.killedBy === "timeout" || job.killedBy === "limit");
 }
 
 /** A job id as every route and tool accepts it. */

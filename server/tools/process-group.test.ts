@@ -4,7 +4,7 @@
 // the bug was exactly that a stopped shell left its children running.
 import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, uptime } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -289,6 +289,22 @@ describe.skipIf(process.platform === "win32")("process group bookkeeping (real p
     expect(await adoptGroupLedger(ledgerFile)).toEqual(["sleep 30 & wait"]);
     await until(() => !groupAlive(leftover), 8_000, "the leftover group to be stopped");
     expect(alive(stranger)).toBe(true);
+
+    // A record from before this machine booted names nothing of ours,
+    // whatever holds its number now — even a live group whose leader is gone.
+    // the leader exits at once; its two sleeps live on in its group
+    const shell = spawn("sh", ["-c", "sleep 30 & sleep 30 & exit 0"], { detached: true, stdio: "ignore" });
+    const leaderless = shell.pid!;
+    await new Promise((resolve) => shell.on("exit", resolve));
+    expect(alive(leaderless)).toBe(false);
+    expect(groupAlive(leaderless)).toBe(true);
+    writeFileSync(
+      ledgerFile,
+      JSON.stringify([{ pgid: leaderless, label: "before the reboot", spawnedAt: Date.now() - (uptime() + 3600) * 1000, leaderExited: false }]),
+    );
+    expect(await adoptGroupLedger(ledgerFile)).toEqual([]);
+    expect(groupAlive(leaderless)).toBe(true);
+    process.kill(-leaderless, "SIGKILL");
 
     // from now on this run's groups are on record while they run, and
     // forgotten when they end

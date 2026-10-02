@@ -164,6 +164,56 @@ describe("job wakes", () => {
     expect(t.wakes).toHaveLength(1);
   });
 
+  it("tries a wake that could not start again on a timer, with no turn settling", async () => {
+    // a provider reload ended, or a stalled turn was released: the bot is
+    // idle again, and no turn.completed will say so
+    const t = setup();
+    t.state.fail = true;
+    t.finish(job("job_a"));
+    await t.fireTimers(); // the merge window: the dispatch fails
+    expect(t.wakes).toHaveLength(0);
+    const retry = t.timers.find((timer) => !timer.cleared && timer.ms === 30_000);
+    expect(retry).toBeDefined();
+    t.state.fail = false;
+    await t.fireTimers();
+    expect(t.wakes.map((wake) => wake.jobIds)).toEqual([["job_a"]]);
+  });
+
+  it("retries a wake parked behind a busy bot that went idle without settling", async () => {
+    const t = setup();
+    t.state.busy.add("bot-a");
+    t.finish(job("job_a"));
+    await t.fireTimers(); // parked: busy
+    expect(t.wakes).toHaveLength(0);
+    // still busy at the first retry: parked again, one timer, not two
+    await t.fireTimers();
+    expect(t.wakes).toHaveLength(0);
+    expect(t.timers.filter((timer) => !timer.cleared)).toHaveLength(1);
+    t.state.busy.delete("bot-a");
+    await t.fireTimers();
+    expect(t.wakes).toHaveLength(1);
+  });
+
+  it("calls the retry off when the bot settles first, or the thread is deleted", async () => {
+    const t = setup();
+    t.state.busy.add("bot-a");
+    t.finish(job("job_a"));
+    await t.fireTimers();
+    const retry = t.timers.find((timer) => timer.ms === 30_000)!;
+    t.state.busy.delete("bot-a");
+    t.coordinator.botSettled("bot-a");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(t.wakes).toHaveLength(1);
+    expect(retry.cleared).toBe(true);
+
+    t.state.busy.add("bot-b");
+    t.finish(job("job_b", "thread-b", "bot-b"));
+    await t.fireTimers();
+    const second = t.timers.find((timer) => timer.ms === 30_000 && !timer.cleared)!;
+    t.coordinator.forgetThread("thread-b");
+    expect(second.cleared).toBe(true);
+  });
+
   it("writes a prompt a person can read in the thread", () => {
     const prompt = wakePrompt([{ jobId: "j", botId: "b", text: "Background job j `x` finished.", wake: true }]);
     expect(prompt).toContain("Background job j `x` finished.");

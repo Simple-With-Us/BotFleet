@@ -229,3 +229,12 @@ export function pendingJobNotices(threadId: string): readonly JobNoticeItem[] {
 export function dropJobNotices(threadId: string): void {
   jobNotices.delete(threadId);
 }
+
+/** Forget a deleted bot's notices on every thread (a room outlives it). */
+export function dropJobNoticesForBot(botId: string): void {
+  for (const [threadId, items] of jobNotices) {
+    const kept = items.filter((item) => item.botId !== botId);
+    if (kept.length === 0) jobNotices.delete(threadId);
+    else if (kept.length !== items.length) jobNotices.set(threadId, kept);
+  }
+}

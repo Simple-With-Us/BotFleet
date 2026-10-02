@@ -103,7 +103,7 @@ export interface TurnToolHostContext {
   /** The background job tools for this turn (jobs P1).  Present exactly when
    *  the dispatch offered them in the catalog — the same one boolean feeds
    *  both, so a job tool the model was not offered finds no executor here. */
-  jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "maxWaitSeconds" | "turnId">;
+  jobs?: Pick<JobToolsOptions, "registry" | "onComplete" | "wakes" | "maxWaitSeconds" | "turnId">;
   /** Job notices waiting for this turn (server/steer-queue.ts): the driver's
    *  tool loop drains them between model rounds. */
   drainNotices?: () => string[];
@@ -296,6 +296,13 @@ export function createTurnToolHost(ctx: TurnToolHostContext): TurnToolHost {
         // and the reason `list_bots` does not put a card in front of anyone.
         // A record that names a `condition` asks only when that condition
         // holds, so a read stays free until the path is a credential store.
+        // A job that could not start whatever the command (Windows, a cap,
+        // admission) is refused BEFORE the card: nobody is asked to approve
+        // something that was never going to run.
+        if (call.name === "job_start" && ctx.jobs) {
+          const refused = ctx.jobs.registry.refusal({ botId: ctx.botId, threadId: ctx.threadId });
+          if (refused) return failed(refused, "refused");
+        }
         const approval = harnessTool(call.name)?.approval;
         const asked = approval !== undefined && approval.policy === "ask"
           ? (approval.condition

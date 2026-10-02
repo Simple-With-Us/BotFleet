@@ -415,9 +415,24 @@ describe("job_start approvals", () => {
     expect(verdict.rule).toBe("command-needs-full-review");
   });
 
-  it("asks a full-auto bot in an unattended turn — a job's wake turn included", () => {
-    // The judgment call between rulings (b) and (c): a wake turn is
-    // unattended, and an unattended turn never inherits Auto mode.
+  it("starts a full-auto bot's next job from its own wake turn without a card (ruling c)", () => {
+    const verdict = autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ...host, unattended: true, jobWake: true });
+    expect(verdict.approve).toBe("auto-approved local-computer:job:pnpm");
+    expect(verdict.source).toBe("auto-mode");
+  });
+
+  it("keeps every guard in a wake turn, and asks a bot that is not full-auto", () => {
+    const wake = { ...host, unattended: true, jobWake: true };
+    expect(autoVerdict({ autoApprove: true }, "job_start", "job: rm -rf ./build", wake).source).toBe("destructive-guard");
+    expect(autoVerdict({ autoApprove: true }, "job_start", "job: cat ~/.ssh/id_ed25519", wake).source).toBe("sensitive-guard");
+    expect(autoVerdict({ autoApprove: true }, "job_start", `job: ${"x".repeat(1999)}…`, wake).rule).toBe("command-needs-full-review");
+    expect(autoVerdict({ autoApprove: false }, "job_start", "job: pnpm test", wake).approve).toBeNull();
+  });
+
+  it("keeps the unattended block for every other tool in a wake turn, and for a job in any other unattended turn", () => {
+    const wake = { ...host, unattended: true, jobWake: true };
+    expect(autoVerdict({ autoApprove: true }, "bash", "pnpm test", wake).source).toBe("unattended-block");
+    // a webhook's, a resource alert's or a text's turn is not a job wake
     const verdict = autoVerdict({ autoApprove: true }, "job_start", "job: pnpm test", { ...host, unattended: true });
     expect(verdict.approve).toBeNull();
     expect(verdict.source).toBe("unattended-block");

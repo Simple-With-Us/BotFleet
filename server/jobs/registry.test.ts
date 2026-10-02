@@ -22,6 +22,8 @@ interface Harness {
   frames: JobsFrame[];
   finished: Array<{ job: JobSnapshot; notice: string | null; how: { row: boolean; boot: boolean } }>;
   clock: { now: number };
+  /** The awake clock deadlines run on (it does not advance in a sleep). */
+  awake: { now: number };
   host: { swap: number | null; disk: number | null; spend: boolean };
   settings: { value: JobsSettings };
 }
@@ -50,6 +52,7 @@ function harness(overrides: Partial<JobRegistryDeps> = {}, dir?: string): Harnes
   const frames: JobsFrame[] = [];
   const finished: Harness["finished"] = [];
   const clock = { now: 1_700_000_000_000 };
+  const awake = { now: 1_000 };
   const host: Harness["host"] = { swap: 50, disk: 100 * 1024 ** 3, spend: false };
   const settings = { value: { ...DEFAULT_JOBS_SETTINGS } };
   const registry = new JobRegistry({
@@ -61,12 +64,13 @@ function harness(overrides: Partial<JobRegistryDeps> = {}, dir?: string): Harnes
     onFinished: (job, notice, how) => finished.push({ job, notice, how }),
     probe: { swapUsedPercent: () => host.swap, freeDiskBytes: () => host.disk },
     now: () => clock.now,
+    awakeNow: () => awake.now,
     graceMs: 300,
     frameDebounceMs: 5,
     listProcesses: async () => [],
     ...overrides,
   });
-  const h = { registry, dir: root, frames, finished, clock, host, settings };
+  const h = { registry, dir: root, frames, finished, clock, awake, host, settings };
   made.push(h);
   return h;
 }
@@ -278,16 +282,19 @@ posix("running real processes", () => {
 
   it("cuts a log past its cap back to the newest half, and tells the next reader", async () => {
     const h = harness({ logMaxBytes: 1000 });
-    const started = start(h, "head -c 3000 /dev/zero | tr '\\0' a; printf END; sleep 30");
+    // 300 lines of "aaaaaaaaa", then END: 3004 bytes
+    const started = start(h, "yes aaaaaaaaa | head -c 3000; printf 'END\\n'; sleep 30");
     if (!started.ok) throw new Error(started.error);
     const log = join(h.dir, "jobs", `${started.job.id}.log`);
-    await until(() => existsSync(log) && statSync(log).size >= 3003);
+    await until(() => existsSync(log) && statSync(log).size >= 3004);
     h.registry.tick();
     expect(statSync(log).size).toBeLessThanOrEqual(1000);
     const chunk = h.registry.readForModel(started.job.id, 16_384)!;
-    expect(chunk.dropped).toBe(2503);
-    expect(chunk.text.endsWith("END")).toBe(true);
-    expect(chunk.text.length).toBe(500);
+    expect(chunk.dropped).toBe(2504);
+    expect(chunk.text.endsWith("END\n")).toBe(true);
+    // the cut landed mid-line; the reader starts at the next whole line
+    expect(chunk.text.startsWith("aaaaaaaaa\n")).toBe(true);
+    expect(chunk.text.split("\n").slice(0, -2).every((line) => line === "aaaaaaaaa")).toBe(true);
   });
 
   it("returns at most the asked bytes, never splitting a character, and counts what is left", async () => {
@@ -364,37 +371,64 @@ posix("records", () => {
 });
 
 posix("awake-time deadlines", () => {
-  it("credits at most two ticks across a sleep, then times the job out on awake time", async () => {
+  it("credits nothing for a sleep, then times the job out on awake time", async () => {
     const { spawnFn } = fakeSpawn();
     const h = harness({ spawn: spawnFn, tickMs: 5_000 });
     h.settings.value = { ...h.settings.value, defaultMinutes: 1 };
     const started = start(h, "sleep 9999");
     if (!started.ok) throw new Error(started.error);
-    // the Mac slept for ten hours
+    // the Mac slept for ten hours: the wall clock moved, the awake one did not
     h.clock.now += 10 * 3600_000;
     h.registry.tick();
     expect(h.registry.get(started.job.id)?.status).toBe("running");
-    // five more awake seconds at a time: 10 s credited so far, 50 to go
-    for (let i = 0; i < 9; i++) {
-      h.clock.now += 5_000;
+    // five awake seconds at a time: 55 s credited, 5 to go
+    for (let i = 0; i < 11; i++) {
+      h.awake.now += 5_000;
       h.registry.tick();
     }
     expect(h.registry.get(started.job.id)?.status).toBe("running");
-    h.clock.now += 5_000;
+    h.awake.now += 5_000;
     h.registry.tick();
     await until(() => h.registry.get(started.job.id)?.status === "killed");
     expect(h.registry.get(started.job.id)?.killedBy).toBe("timeout");
   });
 
+  it("credits every awake second when a loaded Mac's ticks come late", async () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn, tickMs: 5_000 });
+    h.settings.value = { ...h.settings.value, defaultMinutes: 1 };
+    const started = start(h, "sleep 9999");
+    if (!started.ok) throw new Error(started.error);
+    // the 5 s tick fired 30 s late, twice: a minute of awake time
+    h.awake.now += 30_000;
+    h.registry.tick();
+    expect(h.registry.get(started.job.id)?.status).toBe("running");
+    h.awake.now += 30_000;
+    h.registry.tick();
+    await until(() => h.registry.get(started.job.id)?.status === "killed");
+  });
+
+  it("caps one tick's credit, should the awake clock ever count a sleep", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn, tickMs: 5_000 });
+    h.settings.value = { ...h.settings.value, defaultMinutes: 2 };
+    const started = start(h, "sleep 9999");
+    if (!started.ok) throw new Error(started.error);
+    h.awake.now += 10 * 3600_000;
+    h.registry.tick();
+    // a minute credited, not ten hours
+    expect(h.registry.get(started.job.id)?.status).toBe("running");
+  });
+
   it("stops a job whose bot lost its grant, on the next tick", async () => {
     const { spawnFn } = fakeSpawn();
-    let reason: string | null = null;
+    let reason: { reason: string; forget: boolean } | null = null;
     const h = harness({ spawn: spawnFn, stopReason: () => reason });
     const started = start(h, "sleep 9999");
     if (!started.ok) throw new Error(started.error);
     h.registry.tick();
     expect(h.registry.get(started.job.id)?.status).toBe("running");
-    reason = "the bot no longer has This Computer";
+    reason = { reason: "the bot no longer has This Computer", forget: false };
     h.registry.tick();
     await until(() => h.registry.get(started.job.id)?.status === "killed");
     expect(h.registry.get(started.job.id)).toMatchObject({ killedBy: "system", reason: "the bot no longer has This Computer" });
@@ -433,6 +467,62 @@ posix("restart", () => {
     await until(() => !alive(leader));
     expect(second.finished.every((entry) => entry.how.boot)).toBe(true);
     expect(second.finished.every((entry) => entry.job.onComplete !== "wake")).toBe(true);
+  });
+
+  it("never signals a leaderless group by its number; the sweep stops only processes carrying the job's id", async () => {
+    // A group whose leader exited while a child lives on — after a reboot,
+    // exactly what someone else's leftover `cmd &` looks like.
+    const leader = spawn("/bin/sh", ["-c", "sleep 30 & echo $!"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+    strays.push(leader);
+    let out = "";
+    leader.stdout!.on("data", (chunk: Buffer) => (out += chunk.toString()));
+    await new Promise((resolve) => leader.on("exit", resolve));
+    const child = Number(out.trim());
+    const pgid = leader.pid!;
+    expect(alive(child)).toBe(true);
+
+    const first = harness();
+    const base = {
+      botId: "bot-a",
+      threadId: "thread-a",
+      origin: "botfleet",
+      kind: "shell",
+      label: "earlier",
+      cwd: first.dir,
+      status: "running",
+      exitCode: null,
+      signal: null,
+      startedAt: 1,
+      endedAt: null,
+      timeoutMs: 60_000,
+      onComplete: "wake",
+      notice: "none",
+      pid: pgid,
+      spawnedAt: Date.now(),
+      leaderExited: false,
+      modelCursor: 0,
+      ownerCursor: 0,
+      droppedBytes: 0,
+      awakeMs: 0,
+      announced: false,
+    };
+    const notOurs = "job_01JZZZZZZZZZZZZZZZZZZZZZZD";
+    writeFileSync(join(first.dir, "jobs", "jobs.json"), JSON.stringify([{ ...base, id: notOurs }]));
+    first.registry.dispose();
+    made.splice(made.indexOf(first), 1);
+    // nothing in the process table carries this job's id: a stranger's group
+    const second = harness({ now: Date.now, listProcesses: async () => [] }, first.dir);
+    expect(await second.registry.adopt()).toEqual({ settled: 0, lost: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(alive(child)).toBe(true);
+
+    // the same group, this time carrying the job's id: ours, and stopped
+    const ours = "job_01JZZZZZZZZZZZZZZZZZZZZZZE";
+    writeFileSync(join(first.dir, "jobs", "jobs.json"), JSON.stringify([{ ...base, id: ours }]));
+    second.registry.dispose();
+    const third = harness({ now: Date.now, listProcesses: async () => [{ pid: child, pgid, jobId: ours }] }, first.dir);
+    expect(await third.registry.adopt()).toEqual({ settled: 0, lost: 1 });
+    await until(() => !alive(child));
   });
 
   it("quiesce stops every running job and marks it lost", async () => {
@@ -476,6 +566,211 @@ posix("the sweep", () => {
     expect(await h.registry.sweep()).toBe(1);
     await until(() => !alive(stray.pid!));
     expect(alive(bystander.pid!)).toBe(true);
+  });
+});
+
+/** The log a fake-spawned job "printed": the test writes it directly. */
+const logOf = (h: Harness, id: string) => join(h.dir, "jobs", `${id}.log`);
+
+describe("reads never split a secret", () => {
+  const token = `sk-proj-${"A1b2C3d4E5".repeat(4)}`;
+
+  it("ends a full read at a line, so a token across the 16 KB boundary is redacted whole", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    const started = start(h, "printer");
+    if (!started.ok) throw new Error(started.error);
+    // filler lines up to just before 16384, then a line whose token straddles it
+    const filler = `${`${"f".repeat(99)}\n`.repeat(163)}${"f".repeat(59)}\n`; // 16360 bytes
+    expect(Buffer.byteLength(`${filler}key: `)).toBeLessThan(16_384);
+    expect(Buffer.byteLength(`${filler}key: ${token}`)).toBeGreaterThan(16_384);
+    writeFileSync(logOf(h, started.job.id), `${filler}key: ${token}\nafter\n`);
+    const first = h.registry.readForModel(started.job.id, 16_384)!;
+    const second = h.registry.readForModel(started.job.id, 16_384)!;
+    expect(first.text).toBe(filler);
+    expect(first.remaining).toBeGreaterThan(0);
+    expect(first.text + second.text).not.toContain(token.slice(0, 20));
+    expect(second.text).not.toContain(token.slice(-20));
+    expect(second.text).toContain("after\n");
+  });
+
+  it("ends a full read with no line break at a byte no token holds", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    const started = start(h, "printer");
+    if (!started.ok) throw new Error(started.error);
+    // one 16 KB+ line: words, with the token across the boundary
+    const words = "word ".repeat(3276); // 16380 bytes
+    writeFileSync(logOf(h, started.job.id), `${words}${token} tail`);
+    const first = h.registry.readForModel(started.job.id, 16_384)!;
+    expect(first.text).toBe(words);
+  });
+
+  it("holds a private key back until its END marker fits in one read", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    const started = start(h, "printer");
+    if (!started.ok) throw new Error(started.error);
+    const filler = `${"f".repeat(99)}\n`.repeat(160); // 16000 bytes
+    const body = `${"MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(2)}\n`.repeat(20);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${body}-----END PRIVATE KEY-----\n`;
+    writeFileSync(logOf(h, started.job.id), `${filler}${pem}done\n`);
+    const first = h.registry.readForModel(started.job.id, 16_384)!;
+    const second = h.registry.readForModel(started.job.id, 16_384)!;
+    expect(first.text).toBe(filler);
+    expect(second.text).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC");
+    expect(second.text).toContain("done\n");
+  });
+
+  it("holds the line a running job is still printing, and says nothing is waiting", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    const started = start(h, "printer");
+    if (!started.ok) throw new Error(started.error);
+    writeFileSync(logOf(h, started.job.id), "line one\nhalf a li");
+    const first = h.registry.readForModel(started.job.id, 16_384)!;
+    expect(first).toMatchObject({ text: "line one\n", remaining: 0, held: 9 });
+    // the job ended: nothing more will follow, so the rest goes as it is
+    children[0]!.child.emit("exit", 0, null);
+    const second = h.registry.readForModel(started.job.id, 16_384)!;
+    expect(second).toMatchObject({ text: "half a li", remaining: 0, held: 0 });
+  });
+
+  it("starts the owner's newest-bytes view at a whole line", () => {
+    const { spawnFn, children } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    const started = start(h, "printer");
+    if (!started.ok) throw new Error(started.error);
+    writeFileSync(logOf(h, started.job.id), `secret-line ${token}\nsecond line\nthird line\n`);
+    children[0]!.child.emit("exit", 0, null);
+    const view = h.registry.readForOwner(started.job.id, { limit: 40 })!;
+    expect(view.text).toBe("second line\nthird line\n");
+  });
+});
+
+describe("the log watch", () => {
+  it("stops a job that prints faster than the flood limit, and holds its log to the cap", async () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn, logMaxBytes: 1000, floodBytesPerSecond: 100_000 });
+    const started = start(h, "yes");
+    if (!started.ok) throw new Error(started.error);
+    h.registry.checkLogs(); // the baseline
+    writeFileSync(logOf(h, started.job.id), `${"y\n".repeat(150_000)}`); // 300 KB in one second
+    h.awake.now += 1_000;
+    h.registry.checkLogs();
+    expect(statSync(logOf(h, started.job.id)).size).toBeLessThanOrEqual(1000);
+    await until(() => h.registry.get(started.job.id)?.status === "killed");
+    expect(h.registry.get(started.job.id)).toMatchObject({ killedBy: "limit", onComplete: "wake" });
+    expect(h.registry.get(started.job.id)?.reason).toContain("MiB of output a second");
+  });
+
+  it("leaves a chatty but ordinary job alone", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn, logMaxBytes: 1000, floodBytesPerSecond: 100_000 });
+    const started = start(h, "build");
+    if (!started.ok) throw new Error(started.error);
+    h.registry.checkLogs();
+    writeFileSync(logOf(h, started.job.id), "x\n".repeat(25_000)); // 50 KB over a second
+    h.awake.now += 1_000;
+    h.registry.checkLogs();
+    expect(h.registry.get(started.job.id)?.status).toBe("running");
+    expect(h.registry.readForModel(started.job.id, 16_384)!.dropped).toBeGreaterThan(0);
+  });
+});
+
+describe("before boot finishes", () => {
+  it("loads the earlier run's records at once, so a job started before adopt() is saved beside them and never settled by it", async () => {
+    const first = harness();
+    const forged = {
+      id: "job_01JZZZZZZZZZZZZZZZZZZZZZZC",
+      botId: "bot-a",
+      threadId: "thread-a",
+      origin: "botfleet",
+      kind: "shell",
+      label: "earlier",
+      cwd: first.dir,
+      status: "running",
+      exitCode: null,
+      signal: null,
+      startedAt: 1,
+      endedAt: null,
+      timeoutMs: 60_000,
+      onComplete: "wake",
+      notice: "none",
+      pid: 2_000_000_321,
+      spawnedAt: 1,
+      leaderExited: false,
+      modelCursor: 0,
+      ownerCursor: 0,
+      droppedBytes: 0,
+      awakeMs: 0,
+      announced: false,
+    };
+    writeFileSync(join(first.dir, "jobs", "jobs.json"), JSON.stringify([forged]));
+    first.registry.dispose();
+    made.splice(made.indexOf(first), 1);
+
+    const { spawnFn } = fakeSpawn();
+    const second = harness({ spawn: spawnFn }, first.dir);
+    // a routine's turn starts a job while boot is still settling
+    const early = start(second, "early", "thread-b");
+    if (!early.ok) throw new Error(early.error);
+    expect(stored(second.dir).map((record) => record.id).sort()).toEqual([early.job.id, forged.id].sort());
+    expect(await second.registry.adopt()).toEqual({ settled: 0, lost: 1 });
+    expect(second.registry.get(forged.id)?.status).toBe("lost");
+    expect(second.registry.get(early.job.id)?.status).toBe("running");
+  });
+});
+
+describe("refusing before the ask", () => {
+  it("names every refusal that does not depend on the command", () => {
+    const { spawnFn } = fakeSpawn();
+    const h = harness({ spawn: spawnFn });
+    expect(h.registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toBeNull();
+    for (let i = 0; i < 3; i++) start(h, `job ${i}`);
+    expect(h.registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("3 jobs running");
+    h.host.disk = 1024;
+    expect(h.registry.refusal({ botId: "bot-b", threadId: "thread-b" })).toContain("short on disk space");
+    expect(harness({ platform: "win32" }).registry.refusal({ botId: "bot-a", threadId: "thread-a" })).toContain("not available on Windows");
+  });
+});
+
+describe("a deleted conversation's jobs", () => {
+  it("are stopped, then forgotten with their logs; a stray of theirs is still swept", async () => {
+    const { spawnFn, children } = fakeSpawn();
+    const stray = spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
+    strays.push(stray);
+    let listed: Array<{ pid: number; pgid: number; jobId: string }> = [];
+    const h = harness({ spawn: spawnFn, listProcesses: async () => listed });
+    const done = start(h, "done", "thread-gone");
+    const running = start(h, "running", "thread-gone");
+    const kept = start(h, "kept", "thread-kept");
+    if (!done.ok || !running.ok || !kept.ok) throw new Error("did not start");
+    children[0]!.child.emit("exit", 0, null);
+    writeFileSync(logOf(h, done.job.id), "private output\n");
+    expect(await h.registry.killWhere((job) => job.threadId === "thread-gone", "its conversation was deleted", { forget: true })).toBe(1);
+    expect(h.registry.get(done.job.id)).toBeNull();
+    expect(h.registry.get(running.job.id)).toBeNull();
+    expect(existsSync(logOf(h, done.job.id))).toBe(false);
+    expect(h.registry.get(kept.job.id)?.status).toBe("running");
+    expect(stored(h.dir).map((record) => record.id)).toEqual([kept.job.id]);
+    listed = [{ pid: stray.pid!, pgid: stray.pid!, jobId: done.job.id }];
+    expect(await h.registry.sweep()).toBe(1);
+    await until(() => !alive(stray.pid!));
+  });
+
+  it("finished ones are forgotten on the next tick when a route deleted the thread without stopping them", () => {
+    const { spawnFn, children } = fakeSpawn();
+    let gone = false;
+    const h = harness({ spawn: spawnFn, stopReason: () => (gone ? { reason: "its conversation was deleted", forget: true } : null) });
+    const done = start(h, "done");
+    if (!done.ok) throw new Error(done.error);
+    children[0]!.child.emit("exit", 0, null);
+    h.registry.tick();
+    expect(h.registry.get(done.job.id)).not.toBeNull();
+    gone = true;
+    h.registry.tick();
+    expect(h.registry.get(done.job.id)).toBeNull();
   });
 });
 

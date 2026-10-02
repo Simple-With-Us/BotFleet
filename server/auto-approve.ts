@@ -270,6 +270,9 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
+    /** The unattended turn is a background job's wake (or continues one):
+     *  nothing outside BotFleet started it.  Only `job_start` reads it. */
+    jobWake?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
   },
@@ -299,6 +302,17 @@ export function autoVerdict(
   if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
   if (unsafeCommand) return { approve: null, source: "no-grant", rule: "command-needs-full-review" };
   if (context?.unattended) {
+    // Owner ruling (c), 2026-10-01: a bot in Auto mode starts background
+    // jobs without asking.  The ruling answered the decision doc's open
+    // question about exactly this turn — a job's wake, with nobody watching,
+    // that has to start the next job — so the wake turn keeps Auto mode for
+    // `job_start` and nothing else.  The destructive, sensitive and
+    // cut-summary checks above already took `grant` away when they apply,
+    // and a turn some outside event started (a webhook, a resource alert, a
+    // text) is not a job wake and keeps the block below.
+    if (jobTool && context.jobWake && grant?.source === "auto-mode") {
+      return { approve: grant.approve, source: grant.source, rule: grant.rule };
+    }
     // Auto mode is something a person switched on for turns they are present
     // for. A webhook turn begins with nobody watching, on a payload someone
     // else wrote, so it does not inherit that decision — the guard above is a
