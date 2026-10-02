@@ -50,7 +50,7 @@ import {
   type CredentialTargetId,
 } from "../shared/credential-request.ts";
 
-import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, offerableApprovalKey } from "./auto-approve.ts";
+import { approvalKey, autoVerdict, coarseAlwaysAllowRefused, isJobTool, isOwnJobStartRequest, offerableApprovalKey } from "./auto-approve.ts";
 import { requestReview, resolveAutoReviewMode, shouldReview } from "./auto-review.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
@@ -2814,9 +2814,11 @@ bus.subscribe((event: RuntimeEvent) => {
 //
 // Each mark remembers what set it.  `job`: a background job's wake (jobs P1)
 // — nothing outside BotFleet started it, so the turn keeps the bot's own
-// model (owner ruling b) and Auto mode may start its next job (ruling c).
-// `outside`: a webhook, a resource alert, a text, or work handed on from one.
-// A wake never weakens a mark an outside event set: the stronger one stays.
+// model (owner ruling b).  `outside`: a webhook, a resource alert, a text, or
+// work handed on from one.  A wake never weakens a mark an outside event set:
+// the stronger one stays.  The mark does not decide job approvals: a
+// full-auto bot's own `job_start` is auto-approved under either, and under no
+// mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
 const UNATTENDED_TTL_MS = 30 * 60_000;
@@ -3327,9 +3329,15 @@ bus.subscribe((event: RuntimeEvent) => {
         (requestOwner ? store.bot(requestOwner.botId) : undefined) ??
         (speaker ? store.bot(speaker.botId) : undefined);
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      // Whose `job_start` this is comes from where it was raised, never from
+      // its name: only the in-process tool host opens asks on the permission
+      // broker, while a Codex bot reports a mounted MCP server's tool by its
+      // bare name, `job_start` included.  Read now, before anything awaits.
+      const ownJobStart = permission && isOwnJobStartRequest(permissionBroker, event);
       const verdict = permission && asker && event.requestId
         ? autoVerdict(asker, event.tool, event.summary, {
           unattended,
+          ownJobStart,
           scope: event.approvalScope,
         })
         : null;

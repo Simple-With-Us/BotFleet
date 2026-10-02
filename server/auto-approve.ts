@@ -114,14 +114,32 @@ export function isJobTool(tool: string): boolean {
   return JOB_TOOLS.has(tool.replace(/^mcp__.+?__/, "").toLowerCase());
 }
 
-/** The harness's own `job_start`: the unprefixed name its HTTP tool lane
- *  offers a bot (server/tools/registry.ts).  This, and only this, is the call
- *  the owner's ruling covers.  A tool a third-party MCP server happens to
- *  call `job_start` (`mcp__x__job_start`) is that server's, so it keeps every
- *  guard that any other MCP tool has.  The MCP lane's own spelling (jobs P2)
- *  joins this check when it exists. */
+/** The unprefixed name of the harness's own job tool, as its HTTP tool lane
+ *  offers it to a bot (server/tools/registry.ts).  A name alone never makes a
+ *  request the harness's own: a Codex bot reports a third-party MCP tool by
+ *  its bare name too (server/drivers/codex.ts), so `job_start` from a mounted
+ *  server arrives spelled exactly the same.  Whose call it is comes from where
+ *  the request was raised, see `isOwnJobStartRequest`. */
 export function isOwnJobStart(tool: string): boolean {
   return tool === "job_start";
+}
+
+/** The harness's own `job_start`, decided by ORIGIN: the request is one the
+ *  in-process tool host opened on the permission broker
+ *  (server/tools/approvals.ts, server/tools/host.ts).  That is the only way
+ *  the harness raises a job start in P1, and no engine and no third-party MCP
+ *  server can open a request there.  This, and only this, is the call the
+ *  owner's ruling covers; a tool a mounted server happens to call `job_start`
+ *  keeps every guard that any other MCP tool has.  The MCP lane (jobs P2) has
+ *  its own endpoint and must raise its asks the same way, on the broker, to be
+ *  counted here.  Read it synchronously from the `request.opened` handler: the
+ *  broker registers an ask before it publishes the event, and settles it only
+ *  after the event has been handled. */
+export function isOwnJobStartRequest(
+  broker: { isOpen(threadId: string, requestId: string): boolean },
+  event: { tool: string; threadId: string; requestId?: string },
+): boolean {
+  return isOwnJobStart(event.tool) && Boolean(event.requestId) && broker.isOpen(event.threadId, event.requestId!);
 }
 
 /** The program a job summary (`job: pnpm test`) starts, by the same rule a
@@ -281,6 +299,12 @@ export function autoVerdict(
   context?: {
     /** the turn was started by an outside event, with nobody at the keyboard */
     unattended?: boolean;
+    /** The request is the harness's own `job_start`, by origin: the in-process
+     *  tool host opened it on the permission broker (`isOwnJobStartRequest`).
+     *  The tool name alone is not enough, since an engine reports a mounted
+     *  MCP server's tool by its bare name too.  Only the job-start ruling
+     *  reads it. */
+    ownJobStart?: boolean;
     /** the request controls the user's active desktop */
     scope?: "local-computer" | "disposable-computer";
   },
@@ -291,12 +315,15 @@ export function autoVerdict(
   // turn can turn it back into a card: not the destructive and sensitive
   // patterns, not the cut-summary check, and not the unattended block, so a
   // turn a webhook, a resource alert, a text or a job's own wake started
-  // starts its job too.  The ruling is about this one tool.  Bash and every
-  // other tool keep all of their guards, and a bot that is not in full auto
-  // falls through to the checks below, where a job start is never granted
-  // and a card is the only way in.
-  if (bot.autoApprove && isOwnJobStart(tool)) {
-    const key = approvalKey(tool, summary, context?.scope);
+  // starts its job too.  The ruling is about this one tool, and "own" is
+  // decided by where the request came from (`context.ownJobStart`), with the
+  // name as a second lock, never by the name alone: a mounted MCP server's
+  // `job_start` reaches here spelled the same on Codex, and it keeps every
+  // guard.  Bash and every other tool keep all of theirs, and a bot that is
+  // not in full auto falls through to the checks below, where a job start is
+  // never granted and a card is the only way in.
+  if (bot.autoApprove && context?.ownJobStart === true && isOwnJobStart(tool)) {
+    const key = approvalKey(tool, summary, context.scope);
     return { approve: `auto-approved ${key}`, source: "auto-mode", rule: key };
   }
   // the guards outrank the grants, so an "always allow" can never widen
