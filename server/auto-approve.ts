@@ -155,7 +155,13 @@ const filePath = z.string().min(1);
  * is carried as "" (and a tool with no path key at all as an empty list), which
  * the path check refuses: nothing that cannot be located is approved. */
 export function fileWritePaths<Input extends object>(tool: string, input: Input | undefined): string[] | undefined {
-  if (!FILE_WRITE_TOOLS.has(tool.toLowerCase())) return undefined;
+  // Strip the MCP namespace first, the way `commandRiskFor` and
+  // `isCoarseApprovalKey` do.  Testing the raw name meant an MCP filesystem
+  // tool (`mcp__fs__write`) matched nothing, returned no path, and so had its
+  // write auto-approved with no containment check at all — the one direction
+  // where skipping the check is not the safe default.
+  const bare = tool.replace(/^mcp__.+?__/, "");
+  if (!FILE_WRITE_TOOLS.has(bare.toLowerCase())) return undefined;
   const paths: string[] = [];
   for (const [key, value] of Object.entries(input ?? {})) {
     if (!FILE_PATH_KEYS.has(key)) continue;
@@ -269,7 +275,10 @@ export function approvalKey(tool: string, summary: string, scope?: "local-comput
  * be truncated, or when a shell has more than one operation. This is a
  * temporary fail-closed guard until drivers carry full permission input. */
 function unsafeCommandSummary(tool: string, summary: string): boolean {
-  const bare = tool.replace(/^mcp__[^_]+__/, "").toLowerCase();
+  // The same namespace strip as `commandRiskFor`; `[^_]+` could not span the
+  // underscores in a tool like `mcp__computer_local_vm__bash`, so the name
+  // never matched and this guard quietly did not apply to it.
+  const bare = tool.replace(/^mcp__.+?__/, "").toLowerCase();
   if (!COMMAND_TOOLS.has(bare)) return false;
   if (summary.length >= 160) return true;
   // Conservative on purpose: shell metacharacters inside quoted strings

@@ -89,9 +89,17 @@ function stagesOf(source: string): string[][] {
       started = true;
     } else if (ch === "\\") {
       if (i + 1 < source.length) {
+        const next = source[i + 1] ?? "";
         i += 1;
-        word += source[i] ?? "";
-        started = true;
+        // A backslash before a newline is a line CONTINUATION: the shell drops
+        // both characters and joins the lines.  Escaping it instead spelled
+        // the newline into the word, so `gi\<newline>t clean -fdx` parsed as
+        // the program `gi\nt`, matched no rule, and auto-approved
+        // `git clean -fdx` — a two-character spelling of a carded command.
+        if (next !== "\n" && next !== "\r") {
+          word += next;
+          started = true;
+        }
       }
     } else if (ch === "\n" || ch === ";" || ch === "|" || ch === "&" || ch === "(" || ch === ")") {
       endStage();
@@ -217,6 +225,50 @@ function peel(tokens: string[]): Peeled {
 }
 
 const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash"]);
+
+/** The Windows shells.  They take their script with `-c` / `-Command` /
+ * `/c` rather than the POSIX spelling above, and they are the only shells a
+ * Windows box has, so leaving them out meant `cmd /c git clean -fdx` and
+ * `powershell -Command "git clean -fdx"` matched no rule at all. */
+const WINDOWS_SHELLS = new Set(["cmd", "powershell", "pwsh", "pwsh-preview"]);
+
+/** The string a Windows shell was asked to run, or null when it was not.
+ * Both shells take the REST of the line as the command, not a single quoted
+ * argument, so `powershell -c git clean -fdx` is the same ask as
+ * `powershell -c "git clean -fdx"`.  A base64 `-EncodedCommand` is a command
+ * this module cannot read, so it is carded rather than passed as unknown.
+ * PowerShell accepts any unambiguous prefix of a parameter name, so `-enc`
+ * and `-encodedc` are `-EncodedCommand`; `-ExecutionPolicy` is not, because
+ * it is not a prefix of it, and neither is `-exec` — the two diverge at the
+ * second letter. */
+function windowsShellScript(program: string, args: string[]): CommandRisk | string | null {
+  const lower = program.toLowerCase();
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = (args[i] ?? "").toLowerCase();
+    if (arg === "--") break;
+    if (lower === "cmd") {
+      if (arg === "/c" || arg === "/k") return args.slice(i + 1).join(" ");
+      continue;
+    }
+    if (arg.startsWith("-") && ENCODED_COMMAND.startsWith(arg.slice(1)) && arg.length > 1) return OPAQUE_SHELL;
+    if (arg === "-c" || arg === "-command" || arg.startsWith("-command:")) {
+      return arg.includes(":") ? arg.slice(arg.indexOf(":") + 1) : args.slice(i + 1).join(" ");
+    }
+    // `-NoProfile -ExecutionPolicy Bypass -Command …`: an option that carries
+    // its own value, skipped so the value is never read as the script
+    if (arg === "-file" || arg === "-f" || arg === "-workingdirectory" || arg === "-wd") {
+      i += 1;
+      continue;
+    }
+  }
+  return null;
+}
+
+/** A command the guard cannot read, so it cannot clear it. */
+const OPAQUE_SHELL: CommandRisk = system("opaque-shell");
+
+/** `-EncodedCommand`, matched by prefix the way PowerShell itself does. */
+const ENCODED_COMMAND = "encodedcommand";
 
 /** The string a shell was asked to run with `-c`, or null when it was not. */
 function shellScript(args: string[]): string | null {
@@ -396,6 +448,11 @@ function riskOfProgram(words: string[], venvEnv: boolean, depth: number): Comman
   if (SHELLS.has(program)) {
     const script = shellScript(args);
     return script === null ? null : unwrapped(script, depth);
+  }
+  if (WINDOWS_SHELLS.has(program)) {
+    const script = windowsShellScript(program, args);
+    if (script === null) return null;
+    return typeof script === "string" ? unwrapped(script, depth) : script;
   }
   if (program === "su") {
     const at = args.indexOf("-c");

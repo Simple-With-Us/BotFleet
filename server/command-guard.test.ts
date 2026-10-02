@@ -51,6 +51,17 @@ const destructive: Array<[string, string]> = [
   ["git-clean", "sh -c \"bash -c 'git clean -fd'\""],
   ["git-clean", 'eval "git clean -fd"'],
   ["git-clean", "env -S 'git clean -fd'"],
+  // the Windows shells, which take their script with `/c` and `-Command`
+  ["git-clean", "cmd /c git clean -fdx"],
+  ["git-clean", "cmd.exe /c \"git clean -fdx\""],
+  ["git-clean", "cmd /k git clean -fdx"],
+  ["git-clean", "powershell -c git clean -fdx"],
+  ["git-clean", "pwsh -Command 'git clean -fdx'"],
+  ["git-clean", "pwsh -NoProfile -Command 'git clean -fdx'"],
+  // a backslash before a newline is a line continuation, not a literal
+  // newline: the shell drops both characters and joins the lines
+  ["git-clean", "gi\\\nt clean -fdx"],
+  ["git-clean", "git clea\\\nn -fd"],
   // chaining that the shell guard already treats as multi-stage
   ["git-clean", "echo hi && git clean -fd"],
   ["git-clean", "ls; git clean -fd"],
@@ -106,6 +117,9 @@ const destructive: Array<[string, string]> = [
 ];
 
 const system: Array<[string, string]> = [
+  // a command this guard cannot read is not a command it can clear
+  ["opaque-shell", "powershell -EncodedCommand ZQBjAGgAbwB0ACAAYQBjACAAYwBsAGUAYQBuACAAAC0AZgBkAHgA"],
+  ["opaque-shell", "pwsh -enc ZQBjAGgAbwB0ACAAYQBjACAAYwBsAGUAYQBuACAAAC0AZgBkAHgA"],
   // launchd and cron
   ["launchctl", "launchctl load ~/Library/LaunchAgents/x.plist"],
   ["launchctl", "launchctl unload -w ~/Library/LaunchAgents/x.plist"],

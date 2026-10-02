@@ -36,7 +36,7 @@ pnpm exec vitest run server/auto-mode-guards-wiring.test.ts
 
 A passing run shows:
 
-- **Command rows:** each destructive and system command stops under the rule that names it, however it is spelled (quoted, wrapped in `sudo`, `env`, `sh -c`, prefixed with `VAR=value`, behind `git -C`, chained).  Ordinary commands next to each row keep auto-approving: `git status`, `git checkout -b`, `git clean -n`, `npm install`, `npm run test -- -g slow`, `rm` of a file in the workspace, `crontab -l`, `launchctl list`, `brew list`.
+- **Command rows:** each destructive and system command stops under the rule that names it, however it is spelled (quoted, wrapped in `sudo`, `env`, `sh -c`, `cmd /c`, `powershell -Command`, prefixed with `VAR=value`, behind `git -C`, chained, or split across a backslash line continuation).  A command this guard cannot read — a base64 `powershell -EncodedCommand` — stops as `opaque-shell` rather than passing as unknown.  Ordinary commands next to each row keep auto-approving: `git status`, `git checkout -b`, `git clean -n`, `npm install`, `npm run test -- -g slow`, `rm` of a file in the workspace, `crontab -l`, `launchctl list`, `brew list`.
 - **Path containment:** a write through a symlink in the workspace, below a dangling symlink, past a `..` that follows a symlink, to a sibling folder that shares a name prefix, or to the home folder is refused.  A new file under folders that do not exist yet is judged by its nearest existing parent.
 - **Verdicts:** a stopped request carries `destructive-guard`, `sensitive-guard` or `system-guard` with the rule that decided, even with the program or tool in the bot's always-allow list and even in an unattended turn.  The model reviewer only looks at undecided requests, so it never sees any of them.
 - **Cards:** the approval card says why auto mode stopped to ask, and offers no "Always allow".
@@ -52,8 +52,9 @@ A passing run shows:
 ## Known Limits
 
 - The rows read the command text.  A program run through a variable (`$TOOL clean`) or a script file is out of their sight, and so is a symlink swapped in between the check and the write.  This is a "you probably did not mean to hand this over unattended" backstop, not a sandbox.
+- The path check follows symlinks but not hardlinks.  A hardlink placed inside a permitted root and pointing at a file outside it shares that file's inode, so a write through the link lands on the real file; planting the link normally names the target somewhere the sensitive-file rows would card, but the containment check itself does not see it.
 - The verdict cannot see whether a Python virtualenv is active, so a bare `pip install` asks.  `pip install` through a virtualenv's own `bin/pip`, or with `VIRTUAL_ENV=` in the command, does not.
-- Only Claude's Write, Edit, MultiEdit and NotebookEdit carry a path today.  Other engines' file tools are judged as before.
+- A path is only read from a tool named Write, Edit, MultiEdit or NotebookEdit, after any `mcp__<server>__` namespace is stripped, so an MCP server's `write` is confined too.  A file tool under any other name — another engine's, or an MCP tool that spells its action differently — carries no path and is judged as before.
 - The checks only see what reaches the permission broker.  The Claude CLI in `acceptEdits` mode accepts edits inside its own working folder without asking, so a legacy task that runs with no folder set (the CLI then starts in the home folder) never raises an ask for a file under home, and a `bypassPermissions` (full auto) instance has no broker at all.  Both come from the CLI's documented behavior and were not reproduced against a real CLI here.
 - A command summary is read as the command text.  Codex's older approval shape and an ACP command sent as an array do not carry that text, so the rows have nothing to match there.
 

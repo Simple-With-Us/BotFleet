@@ -794,8 +794,17 @@ describe("fileWritePaths", () => {
   it("says nothing about tools that are not Claude file tools", () => {
     expect(fileWritePaths("Bash", { command: "ls" })).toBeUndefined();
     expect(fileWritePaths("Read", { file_path: "/ws/a.ts" })).toBeUndefined();
-    expect(fileWritePaths("mcp__fs__write", { file_path: "/ws/a.ts" })).toBeUndefined();
-    expect(fileWritePaths("mcp__x__Write", { file_path: "/ws/a.ts" })).toBeUndefined();
+  });
+
+  // An MCP server's write tool writes files exactly as `Write` does, so its
+  // paths are confined the same way.  The namespace is stripped, not the
+  // check: an unrecognised name still returns nothing, and a recognised one
+  // behind `mcp__` is judged like any other write.
+  it("sees a file write behind an MCP namespace", () => {
+    expect(fileWritePaths("mcp__fs__write", { file_path: "/ws/a.ts" })).toEqual(["/ws/a.ts"]);
+    expect(fileWritePaths("mcp__x__Write", { file_path: "/ws/a.ts" })).toEqual(["/ws/a.ts"]);
+    expect(fileWritePaths("mcp__computer_local_vm__bash", { command: "ls" })).toBeUndefined();
+    expect(fileWritePaths("mcp__x__shell", { command: "ls" })).toBeUndefined();
   });
 });
 
