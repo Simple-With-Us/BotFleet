@@ -32,6 +32,7 @@ import {
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
   run,
+  runtimePreflight,
   settledRunOutcome,
   signalProcess,
   stableApplicationProcessError,
@@ -1529,6 +1530,35 @@ test("post-start identity accepts new work while the pre-install readiness gate 
     authenticatedRuntimeError({ ...runtime, uiHash: "d".repeat(64) }, owner, prepared, { requireIdle: false }),
     /does not match the prepared application build/,
   );
+});
+
+// A crashed or booted-out harness leaves harness-owner.json behind naming a pid
+// that is gone.  That is a stopped app, not a machine that has never adopted
+// this build, and the refusal has to say so: the old text sent an operator
+// looking for a first-adoption procedure that does not exist for a crash.
+test("preflight names a stale owner record as a stopped harness, not a first adoption", async (t) => {
+  const dead = spawn(process.execPath, ["-e", ""]);
+  const deadPid = dead.pid;
+  await once(dead, "exit");
+
+  const dataDirectory = await mkdtemp(join(tmpdir(), "ubf-stale-owner-"));
+  await chmod(dataDirectory, 0o700);
+  t.after(() => rm(dataDirectory, { recursive: true, force: true }));
+  const record = join(dataDirectory, "harness-owner.json");
+  await writeFile(record, JSON.stringify({ version: 1, pid: deadPid, port: 8799, nonce: "a".repeat(64) }));
+  await chmod(record, 0o600);
+
+  const stale = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(stale.safe, false);
+  assert.match(stale.reason, new RegExp(`harness \\(pid ${deadPid}\\) is not running`));
+  assert.doesNotMatch(stale.reason, /first adoption/);
+
+  // With no record at all the genuine first-adoption text still applies, so the
+  // fix narrows the message instead of replacing it.
+  await rm(record);
+  const absent = await runtimePreflight({ dataDirectory }, null);
+  assert.equal(absent.safe, false);
+  assert.match(absent.reason, /first adoption/);
 });
 
 test("packaged identity comes from the build output rather than an ambient label", async () => {

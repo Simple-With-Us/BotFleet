@@ -680,18 +680,32 @@ function validOwner(owner) {
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
 }
 
-async function readOwner(dataDirectory) {
+/**
+ * Classify the owner record instead of collapsing it to a boolean.  "No record"
+ * and "a record naming a process that is gone" are different operator problems:
+ * the first is a machine that has never adopted this build, the second is a
+ * harness that crashed or was booted out.  Both used to answer null, so the
+ * caller reported the second as a first adoption and named a manual procedure
+ * that does not apply to it.
+ */
+async function ownerRecordState(dataDirectory) {
   const path = join(dataDirectory, "harness-owner.json");
+  let owner;
   try {
     await assertPrivateRegularFile(path, "Harness owner record");
-    const owner = JSON.parse(await readFile(path, "utf8"));
+    owner = JSON.parse(await readFile(path, "utf8"));
     if (!validOwner(owner)) throw new Error("Harness owner record is invalid");
-    if (!processIsAlive(owner.pid)) return null;
-    return owner;
   } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    if (error?.code === "ENOENT") return { state: "absent" };
     throw error;
   }
+  if (!processIsAlive(owner.pid)) return { state: "stale", owner };
+  return { state: "live", owner };
+}
+
+async function readOwner(dataDirectory) {
+  const { state, owner } = await ownerRecordState(dataDirectory);
+  return state === "live" ? owner : null;
 }
 
 export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle }) {
@@ -720,8 +734,14 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
 }
 
 async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
-  const owner = await readOwner(config.dataDirectory);
-  if (!owner) return null;
+  const { state, owner } = await ownerRecordState(config.dataDirectory);
+  // A record naming a dead pid is a stopped or crashed harness, not an
+  // unadopted one.  Say which it is, so the operator restarts the app instead
+  // of looking for a first-adoption procedure that does not exist.
+  if (state === "stale") {
+    return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running; start the app and retry` };
+  }
+  if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
     headers: { Authorization: `Bearer ${owner.nonce}` },
     accept: [200],
