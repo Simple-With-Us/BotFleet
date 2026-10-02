@@ -66,6 +66,7 @@ import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
 import { runtimeBuildIdentity, runtimeReadiness } from "./runtime-identity.ts";
+import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
 import {
   avatarGenerationRequestSchema,
@@ -4332,6 +4333,10 @@ function drainQueuedSends() {
       excludeMessageIds: excludeIds,
       linqChatId,
       unattended: relayed || undefined,
+      // person-initiated: the person's OWN messages, held only because the
+      // bot was busy.  Draining them is that person asking, so it wakes a
+      // stopped bot — the same as typing them into an idle bot.
+      personInitiated: true,
     }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
@@ -4389,6 +4394,14 @@ async function startTurn(
     modelSelection?: ModelSelection;
     from?: Message["from"];
     comm?: Message["comm"];
+    /**
+     * True only when a PERSON asked for this specific turn.  Every
+     * system-initiated dispatch — update resume, boot recovery, a card
+     * continuation, a job, a routine, a webhook — leaves this false, so a bot
+     * they stopped cannot be re-dispatched behind their back.  See
+     * `server/bot-stop-policy.ts`.
+     */
+    personInitiated?: boolean;
   },
 ) {
   if (runtimeQuiescing) {
@@ -4396,7 +4409,18 @@ async function startTurn(
   }
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
-  if (!opts?.automationSource) {
+  // A stop is a decision about the BOT, not about the turn in flight, so it
+  // is enforced here — the one place every dispatch passes through — rather
+  // than in each caller.  A resume used to clear the stop on its way past
+  // (no `automationSource` on a replayed human prompt) and start the bot.
+  const stopDecision = decideBotStop({
+    stopped: routines?.isBotSnoozed(botId) === true,
+    personInitiated: opts?.personInitiated === true,
+  });
+  if (stopDecision.action === "refuse") {
+    throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
+  }
+  if (stopDecision.clearsStop) {
     routines?.clearBotSnooze(botId);
   }
   if (providerReloadInProgress) {
@@ -6528,6 +6552,15 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
       return;
     }
     if (channelId) finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume");
+    // A deliberate stop is not a resume failure.  Record it as the person
+    // stopping the bot, drop the marker, and do NOT remember a failure — a
+    // remembered one is permanent noise on a thread nobody is trying to run.
+    if (isBotStoppedError(error)) {
+      console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped`);
+      releaseBootResume(bot.id, threadId);
+      store.patchBot(bot.id, { inflightThreadId: undefined });
+      return;
+    }
     console.error(`boot recovery failed for ${bot.name} (${threadId}):`, error);
     // Terminal, and remembered: without this the next boot finds the same
     // marker, dispatches the same doomed turn, and fails the same way — 29
@@ -7571,6 +7604,12 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
     cardContinuation: true,
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
+    // A stopped bot is a decision, not a fault: settle the card quietly rather
+    // than parking it in a retry loop that can never succeed.
+    if (isBotStoppedError(error)) {
+      markConnectorResumeFailed(entry.threadId, entry.resumeKey, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) pendingConnectorResumes.set(`${entry.threadId}:${entry.resumeKey}`, entry);
     else markConnectorResumeFailed(entry.threadId, entry.resumeKey, message);
@@ -7676,6 +7715,12 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
     cardContinuation: true,
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
+    // See the connector resume above: a stopped bot settles the card instead
+    // of retrying forever.
+    if (isBotStoppedError(error)) {
+      markSecretResumeFailed(entry.threadId, entry.messageId, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) {
       pendingSecretResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
@@ -8577,6 +8622,10 @@ function drainCredentialFallbacks(): void {
       modelSelection: entry.selection,
       automationSource: entry.userMessage.automationSource,
       unattended: isUnattended(entry.botId),
+      // person-initiated: the person answered the card, so they are asking
+      // for the turn to continue — the same as retyping it.  A stop set
+      // while the card was open is lifted by that answer, not overridden.
+      personInitiated: true,
     }).catch((error) => {
       if (isExternalCredentialPendingError(error)) pendingCredentialFallback.set(key, entry);
       else console.error(`credential fallback resume failed for ${entry.botId}:`, error);
@@ -8938,6 +8987,10 @@ async function resumeInterruptedChatTurns(
           threadId: resumeThreadId,
           userMessage: resumePrompt,
           automationSource: resumePrompt.automationSource,
+          // NOT person-initiated, even though the replayed prompt is a
+          // person's message.  The person who wrote it is not asking now; the
+          // system is.  This is the call that used to clear their own stop and
+          // restart the bot they had parked.
           ...(resumePrompt.automationSource === "delegation" ? {
             commsDepth: 1,
             unattended: isUnattended(resumeBot.id),
@@ -8946,6 +8999,12 @@ async function resumeInterruptedChatTurns(
           } : {}),
         });
       } catch (error) {
+        if (isBotStoppedError(error)) {
+          // Their stop outranks our replay.  Say so in the log rather than
+          // retrying: the thread stays put until the person starts the bot.
+          console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped`);
+          continue;
+        }
         // The provider rejected the redispatch before it could emit a
         // terminal event. Consume only this re-armed watch and record it.
         finalizeDelegationWatch(resumeThreadId, false, "", "Delegated turn could not resume");
@@ -8984,6 +9043,39 @@ function rollbackForcedQuiesce(
   resourceTriggers.start();
   infisical.start();
   void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback");
+}
+
+/** How long a forced quiesce waits for interrupted work to actually settle.
+ *
+ * The old fixed `200ms` sleep was the single reason "update failed while bots
+ * were running" was such a common report.  Interrupting a bot asks its
+ * provider subprocess to stop; that subprocess then has to exit, its
+ * `turn.completed` fold has to run, and `busy` has to clear.  A CLI that
+ * takes two seconds to die is normal, and at 200 ms the readiness re-check
+ * still saw `turns: N`, concluded the machine was busy, and ROLLED THE WHOLE
+ * UPDATE BACK — after having already interrupted the bots.  So the update
+ * failed, and the work it had already stopped still had to be resumed by
+ * hand.  Bounded so a genuinely wedged subprocess still refuses promptly
+ * rather than hanging the updater; the refusal path is unchanged, it just
+ * no longer fires on a bot that was on its way out. */
+const QUIESCE_DRAIN_TIMEOUT_MS = 15_000;
+/** Poll interval while draining.  Short enough to feel immediate, long enough
+ * that a large fleet does not spin the readiness scan. */
+const QUIESCE_DRAIN_POLL_MS = 250;
+
+/** Wait for interrupted work to settle, up to the drain timeout.
+ *
+ * Returns as soon as the runtime reports idle.  Deliberately does NOT throw:
+ * the caller re-reads readiness itself and decides, so this only decides how
+ * long to wait, never whether the update may proceed. */
+async function drainAfterInterrupt(): Promise<void> {
+  const deadline = Date.now() + QUIESCE_DRAIN_TIMEOUT_MS;
+  // The first check is immediate: a bot whose fold already ran needs no wait.
+  if (currentRuntimeReadiness().safeToRestart) return;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, QUIESCE_DRAIN_POLL_MS));
+    if (currentRuntimeReadiness().safeToRestart) return;
+  }
 }
 
 async function beginRuntimeQuiesce(force = false) {
@@ -9092,7 +9184,7 @@ async function beginRuntimeQuiesce(force = false) {
       }
     }
 
-    await new Promise((r) => setTimeout(r, 200));
+    await drainAfterInterrupt();
 
     // Report the actual final safety state.  Forcing interrupts the routines
     // and busy bots above, but anything else still counted — a queued send, a
@@ -11749,6 +11841,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           ...(fromImessage ? { automationSource: "imessage" as const } : {}),
           unattended: relaySourced || undefined,
+          // person-initiated: a person sent this.  Relayed or not, someone
+          // typed it on purpose, which is how a stopped bot is meant to be
+          // woken — `interrupt` stops automation, not the owner.
+          personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
       };
@@ -11810,6 +11906,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         replyTo,
         automationSource: message.automationSource,
         unattended: message.role === "system" ? isUnattended(bot.id) : undefined,
+        // person-initiated: a person hitting retry/rewind on a message.
+        personInitiated: true,
       });
       return json(res, 202, { ok: true });
     }
