@@ -129,7 +129,7 @@ function localPrompt(toolLoopSurface: boolean): string {
 
 /** One line per computer when several are mounted, naming the tool prefix so
  * the agent can tell them apart at the point of use. */
-function multiLine(mount: ComputerMount): string {
+function multiLine(mount: ComputerMount, opts: { vpsShared?: boolean } = {}): string {
   const tools = `\`${mount.name}\` tools (prefixed \`mcp__${mount.name}__\`)`;
   switch (mount.kind) {
     case "vm":
@@ -137,7 +137,13 @@ function multiLine(mount: ComputerMount): string {
     case "box":
       return `${mount.label} — your own cloud Linux desktop, through the ${tools}. In Chrome prefer browser_snapshot with browser_click/browser_fill; use computer_exec for shell work.`;
     case "vps":
-      return `${mount.label} — your own isolated, self-hosted remote Linux desktop (one container per bot, not shared with the other bots), through the ${tools}. Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`;
+      // Shared mode hands every bot its own desktop session inside ONE
+      // container, so telling the bot it is isolated misdescribes the surface
+      // it is actually sharing — it invites a bot to assume desktop state it
+      // does not own.
+      return opts.vpsShared
+        ? `${mount.label} — your own self-hosted remote Linux desktop, running in a container the other bots share.  Every bot gets its own desktop session inside it, so nobody else sees or clicks your desktop.  Use the ${tools}.  Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`
+        : `${mount.label} — your own isolated, self-hosted remote Linux desktop (one container per bot, not shared with the other bots), through the ${tools}. Its filesystem is disposable, so push long-lived work to a remote instead of leaving it there.`;
     case "local":
       return `${mount.label} — the user's own machine, through the ${tools}. Every action here is brokered for the user's approval, so it is slower and more intrusive than a remote desktop.`;
   }
@@ -172,6 +178,10 @@ export function computerSystemPrompt(
      * cannot describe the same grant differently. */
     toolLoopSurface?: boolean;
     hasHostTerminal?: boolean;
+    /** True when the Self-hosted VPS runs in shared mode, where every bot
+     *  shares one container and only holds its own desktop session inside it.
+     *  Without this the prompt claims an isolation shared mode does not have. */
+    vpsShared?: boolean;
   } = {},
 ): string {
   if (mounts.length === 0) return "";
@@ -199,7 +209,7 @@ export function computerSystemPrompt(
 
   const host = mounts.find(isHostMount);
   const remote = mounts.find((m) => !isHostMount(m));
-  const lines = mounts.map((m) => `- ${multiLine(m)}`).join("\n");
+  const lines = mounts.map((m) => `- ${multiLine(m, opts)}`).join("\n");
   const policy = host && remote ? selectionPolicy(remote, host) : "";
   return (
     ` You have ${mounts.length} computers, each with its own separate set of tools:\n${lines}\n` +
