@@ -29,7 +29,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(SERVER_DIR, "index.ts"), "utf8");
+// Normalise line endings before matching.  A source-invariant test must not
+// depend on how the runner checked the repo out: without this, the one
+// assertion that anchors on `) {\n  if (runtimeQuiescing)` silently fails
+// on a CRLF checkout, which is every Windows runner.  (It did — this file
+// was the only test in the server suite matching on an explicit `\n`.)
+const source = readFileSync(join(SERVER_DIR, "index.ts"), "utf8").replace(/\r\n/g, "\n");
 
 interface CallSite {
   line: number;
