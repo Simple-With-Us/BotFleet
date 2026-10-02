@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
@@ -186,19 +186,36 @@ describe("store-guard", () => {
     });
 
     it("leaves an unusable file where it is when it cannot be moved aside", () => {
-      // Make the rename fail the way this platform makes it fail.  On POSIX a
-      // read-only folder refuses the new name; on Windows the folder's
-      // read-only attribute gates nothing, but a read-only FILE cannot be
-      // moved.  The previous version leaned on a filename too long to accept
-      // the ".corrupt-<epoch>" suffix, which holds under a 255-byte POSIX name
-      // limit but not on NTFS with long paths enabled — there the rename went
-      // through and this reported "set-aside" where it means "unreadable".
-      const file = join(dir, "bots.json");
+      // Make the platform refuse the rename, then CHECK that it did before
+      // asserting anything about what the guard does about it.
+      //
+      // There is no portable way to force this from outside.  A read-only
+      // folder refuses a new name on POSIX but gates nothing on Windows, where
+      // a folder's read-only attribute is only a display hint.  A read-only
+      // FILE is refused on neither: the first Windows run of this branch
+      // proved NTFS will still move one.  A name already taken does not work
+      // either, because the guard deliberately walks to a free name, and
+      // rename(2) replaces a dangling symlink rather than failing on it.  So
+      // the honest test is the one that asks the platform first, and says so
+      // when the platform declines to be asked.  An earlier version here
+      // assumed a filename too long for its ".corrupt-<epoch>" suffix, which
+      // holds under a 255-byte POSIX name limit but not on NTFS with long
+      // paths — the guard then reported "set-aside" where this means
+      // "unreadable", the opposite of the property, for a whole CI run.
       const windows = process.platform === "win32";
+      const file = join(dir, "bots.json");
       writeFileSync(file, "{ not json");
       if (windows) chmodSync(file, 0o444);
       else chmodSync(dir, 0o555);
       try {
+        const probe = setFileAside(file, "move", 1790000000000);
+        if (probe.ok) {
+          // Nothing was proven here.  Undo the probe's move so the directory
+          // is left as found, and do not assert a property this platform would
+          // not let us set up.  POSIX takes the branch below on every run.
+          if (probe.path) renameSync(probe.path, file);
+          return;
+        }
         const loaded = loadGuarded(file, list, 1790000000000);
         expect(loaded).toEqual({ status: "unreadable", value: null, writesRefused: true });
         expect(readFileSync(file, "utf8")).toBe("{ not json");
