@@ -97,6 +97,7 @@
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
     "clutch": "github:jaywedgeworth22/Clutch#7fbd88d89625402a8b47631dd207045482236837",
+    "harness": "github:jaywedgeworth22/Harness#93bbbfdb26a84970dc9083a887dad93ca3eee0cf",
     "lucide-react": "^0.539.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",

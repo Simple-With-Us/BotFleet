@@ -320,6 +320,16 @@ function ModelRow({
         {option.loaded && (
           <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
         )}
+                {option.contextWindow && (
+          <span
+            className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
+            title={`${option.contextWindow.toLocaleString()} tokens max`}
+          >
+            {option.contextWindow >= 1000000
+              ? `${Math.round(option.contextWindow / 1000000)}M`
+              : `${Math.round(option.contextWindow / 1000)}K`}
+          </span>
+        )}
         {option.badge && (
           <span
             className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
