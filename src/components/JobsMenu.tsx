@@ -41,8 +41,9 @@ const GAP = "  ";
 /** The dropdown's footer.  True wherever this page runs: a job ends when
  *  the harness that started it stops or restarts (v1 restart rule) — which
  *  quitting the Mac app does only when the app started that harness, so the
- *  footer names the server, not the app. */
-export const JOBS_FOOTER = `Jobs run on this computer.${GAP}They end when BotFleet's server stops or restarts, as it does for an update.`;
+ *  footer names the server first, and says when the app is the one that
+ *  stops it. */
+export const JOBS_FOOTER = `Jobs run on this computer.${GAP}They end when BotFleet's server stops: quitting the Mac app does that when the app started it, and so does an update.`;
 
 /** A finished job stays in the header this long; the thread's row keeps it. */
 export const JOB_RECENT_MS = 30 * 60_000;
@@ -133,17 +134,32 @@ function shownReason(job: Pick<JobSnapshot, "status" | "reason" | "killedBy">): 
   return reasonLine(job.reason);
 }
 
+/** A running job's dot is blue in every skin: "running" is not a mood, and
+ *  several skins' accent is orange, brown or green, which reads as a warning
+ *  (the design says the dot pulses blue). */
+const RUNNING_DOT = "bg-blue-500 motion-safe:animate-pulse";
+
 function statusDotClass(job: Pick<JobSnapshot, "status" | "killedBy">): string {
-  if (isJobActive(job)) return "bg-accent motion-safe:animate-pulse";
+  if (isJobActive(job)) return RUNNING_DOT;
   if (job.status === "completed") return "bg-success";
   return jobEndedBadly(job) ? "bg-danger" : "bg-ink-secondary/60";
 }
 
 function toneClass(tone: JobsPillTone): string {
-  return tone === "failed" ? "bg-danger" : tone === "running" ? "bg-accent motion-safe:animate-pulse" : "bg-ink-secondary/50";
+  return tone === "failed" ? "bg-danger" : tone === "running" ? RUNNING_DOT : "bg-ink-secondary/50";
 }
 
 const useIsoLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
+
+/** The live clock's schedule: the time now, then the time once a second.
+ *  Returns what stops it.  It never reads the clock's own state: an effect
+ *  that read `now` and set it would run again on every commit that changed
+ *  it, which is every millisecond, and re-render the header without end. */
+export function startLiveClock(setNow: (at: number) => void, readClock: () => number = Date.now, everyMs = 1000): () => void {
+  setNow(readClock());
+  const timer = setInterval(() => setNow(readClock()), everyMs);
+  return () => clearInterval(timer);
+}
 
 /** A clock for the pill and the durations.  It ticks once a second while
  *  `live` (a job runs, or the menu is open).  Otherwise it does not tick,
@@ -151,13 +167,15 @@ const useIsoLayoutEffect = typeof window === "undefined" ? useEffect : useLayout
  *  job leaving the header — and catches up when a frame arrives. */
 function useNow(jobs: readonly JobSnapshot[], live: boolean, fixed?: number): number {
   const [now, setNow] = useState(() => fixed ?? Date.now());
+  // Its own effect, keyed on `live` alone (see startLiveClock).
   useEffect(() => {
-    if (fixed !== undefined) return;
-    if (live) {
-      setNow(Date.now());
-      const timer = window.setInterval(() => setNow(Date.now()), 1000);
-      return () => window.clearInterval(timer);
-    }
+    if (fixed !== undefined || !live) return;
+    return startLiveClock(setNow);
+  }, [live, fixed]);
+  // Idle: wait for the next boundary.  This one does read `now`, and only
+  // ever sets it from a timer, never while it runs.
+  useEffect(() => {
+    if (fixed !== undefined || live) return;
     const current = Date.now();
     // stopped when the last job did: catch up once, then wait for the
     // next boundary

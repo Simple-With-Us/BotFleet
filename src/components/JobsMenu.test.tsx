@@ -1,9 +1,10 @@
 // SSR tests for the background-jobs pill, its dropdown, the output sheet
 // and the thread's "Job Finished" row (jobs P1).  Rendered with
 // react-dom/server, so the clock is fixed and the open states are passed in.
+import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { initialState, reducer } from "@/state/store";
 import { jobEndedBadly, jobExitChip, jobWakeSubtitle, type JobSnapshot } from "../../shared/jobs";
@@ -18,6 +19,7 @@ import {
   jobsPillLabel,
   jobsPillTone,
   nextJobsBoundary,
+  startLiveClock,
   visibleJobs,
 } from "./JobsMenu";
 
@@ -85,6 +87,9 @@ describe("the jobs pill", () => {
     expect(html).toContain('data-tone="running"');
     expect(html).toContain("motion-safe:animate-pulse");
     expect(html).not.toMatch(/[^:]animate-pulse/);
+    // blue in every skin: a skin's accent can be orange, which reads as a warning
+    expect(html).toContain("bg-blue-500 motion-safe:animate-pulse");
+    expect(html).not.toContain("bg-accent");
     expect(html).toContain('aria-label="Background Jobs: 2 running"');
   });
 
@@ -158,10 +163,12 @@ describe("the jobs dropdown", () => {
     expect(html).toContain('aria-label="Stop pnpm test"');
   });
 
-  it("says jobs end with BotFleet's server, true in every mode, with a real sentence gap", () => {
-    expect(JOBS_FOOTER).toBe("Jobs run on this computer.\u00a0 They end when BotFleet's server stops or restarts, as it does for an update.");
+  it("says jobs end with BotFleet's server, and that quitting the Mac app does it when the app started it", () => {
+    expect(JOBS_FOOTER).toBe(
+      "Jobs run on this computer.\u00a0 They end when BotFleet's server stops: quitting the Mac app does that when the app started it, and so does an update.",
+    );
     expect(html).toContain("Jobs run on this computer.\u00a0 They end");
-    expect(html).not.toContain("Quitting the BotFleet app");
+    expect(html).toContain("quitting the Mac app does that when the app started it");
     expect(html).not.toContain("&amp;nbsp;");
     expect(html).not.toContain("&nbsp;");
   });
@@ -307,5 +314,34 @@ describe("the jobs state", () => {
     state = reducer(state, { type: "jobsFrame", threadId: "thread-1", jobs: [failed] });
     expect(state.jobsByThread["thread-1"]?.map((j) => j.id)).toEqual([failed.id]);
     expect(state.jobsByThread["thread-2"]).toHaveLength(1);
+  });
+});
+
+describe("the live clock", () => {
+  it("sets the time once at the start and once a second after, until stopped", () => {
+    vi.useFakeTimers();
+    try {
+      const seen: number[] = [];
+      let at = 1_000;
+      const stop = startLiveClock((value) => seen.push(value), () => (at += 1), 1000);
+      expect(seen).toEqual([1_001]);
+      vi.advanceTimersByTime(3_000);
+      // one read per tick, however many commits follow: a clock that reads
+      // the time more often than it ticks is the render loop this guards
+      expect(seen).toEqual([1_001, 1_002, 1_003, 1_004]);
+      stop();
+      vi.advanceTimersByTime(5_000);
+      expect(seen).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps `now` out of the live effect's dependencies, so setting it cannot re-run the effect", () => {
+    // The SSR tests above never run an effect, so they cannot see the loop
+    // an effect that sets `now` and lists it makes (one render per
+    // millisecond, measured).  This pins the one line that prevents it.
+    const source = readFileSync(new URL("./JobsMenu.tsx", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    expect(source).toContain("return startLiveClock(setNow);\n  }, [live, fixed]);");
   });
 });
