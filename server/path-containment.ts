@@ -129,7 +129,18 @@ export function checkWriteTargets(paths: readonly string[], options: WriteCheckO
   const home = options.home ?? homedir();
   const confinement = {
     roots: usableRoots(options.roots, home),
-    protectedDirs: protectedCwdDirs(home, options.dataDir),
+    // Spelled by the same resolver that walks the paths being judged, because
+    // `isInside` is a string comparison and the two sides must agree.  On
+    // Windows a configured path can be an 8.3 short name
+    // (`C:\Users\RUNNER~1\...`) while `physicalLocation` reports the long form
+    // (`C:\Users\runneradmin\...`): the roots above are resolved for exactly
+    // that reason, and leaving these raw put two spellings on either side of
+    // one comparison, so a write into `~/.config/gh` came back as merely
+    // "outside-roots" instead of "protected-dir".  `realOrResolved` in `judge`
+    // is the other, non-native resolver; `physicalLocation` is the one that
+    // agrees with the readings.  A dir that cannot be walked keeps the
+    // best-effort spelling so it is still compared rather than dropped.
+    protectedDirs: protectedCwdDirs(home, options.dataDir).map((dir) => physicalLocation(dir) ?? realOrResolved(dir)),
   };
   const real = new Set<string>();
   let why: string | undefined;

@@ -22,7 +22,13 @@ let home: string;
 let options: WriteCheckOptions;
 
 beforeAll(() => {
-  base = realpathSync(mkdtempSync(join(tmpdir(), "omb-containment-")));
+  // The `.native` spelling, because that is the spelling `checkWriteTargets`
+  // reports: it walks paths with `realpathSync.native`, which on Windows
+  // expands an 8.3 short name into the long form, while the non-native
+  // `realpathSync` below leaves it short.  Resolving the scratch folder the
+  // same way keeps every `join(ws, ...)` expectation comparable with the
+  // `real` paths the module hands back.
+  base = realpathSync.native(mkdtempSync(join(tmpdir(), "omb-containment-")));
   ws = join(base, "ws");
   outside = join(base, "outside");
   fakeTmp = join(base, "faketmp");
@@ -166,6 +172,27 @@ describe("roots that are too wide to mean anything", () => {
     const workspace = join(home, ".botfleet", "workspaces", "bot1");
     expect(check(join(workspace, "MEMORY.md"), { roots: [workspace] })).toMatchObject({ contained: true });
     expect(check(join(home, ".botfleet", "config.json"), { roots: [workspace] })).toMatchObject({ contained: false });
+  });
+
+  // The case the Windows CI run caught, pinned so it cannot come back.  The
+  // module walks a path with `realpathSync.native` (which expands an 8.3
+  // short name to the long form) but its protected dirs used to be compared
+  // with the non-native `realpathSync` (which leaves it short), so a home
+  // spelled the short way degraded `~/.config/gh` from "protected-dir" to a
+  // mere "outside-roots" and the credential folder was no longer named as
+  // such.  On macOS and Linux both spellings are the same string and this is
+  // a tautology; on Windows `raw` is the short form and `long` the long one,
+  // which is exactly the pair that disagreed.
+  it("refuses a credential folder however the caller spells home", () => {
+    const raw = mkdtempSync(join(tmpdir(), "omb-home-"));
+    const long = realpathSync.native(raw);
+    const config = join(raw, ".config", "gh");
+    mkdirSync(config, { recursive: true });
+    for (const spelled of [raw, long]) {
+      expect(check(join(config, "hosts.yml"), { roots: [spelled], home: spelled, dataDir: join(spelled, ".botfleet") }))
+        .toMatchObject({ contained: false, why: "protected-dir" });
+    }
+    removeTempDir(raw);
   });
 });
 
