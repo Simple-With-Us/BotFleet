@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import { removeTempDir, spawnDetached, waitForExit } from "./testing/cleanup.ts";
 import { startFakeOpenAiServer, type FakeOpenAiServer } from "./testing/fake-openai-server.ts";
 import { freePortBlock } from "./testing/ports.ts";
@@ -13,6 +14,27 @@ import { harnessReady } from "./testing/harness-ready.ts";
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const posixOnly = describe.skipIf(process.platform === "win32");
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+type WireTask = { threadId: string; cwd?: string; workspaceContext?: TaskWorkspaceContext };
+type WireBot = { id: string; busy?: boolean; tasks?: WireTask[] };
+type WireGroup = { id: string; working?: boolean };
+type WireMessage = { role?: string; kind?: string; text?: string; tool?: { name?: string } };
+type ApiResponseBody = {
+  bot?: WireBot;
+  group?: WireGroup;
+  task?: WireTask;
+  bots?: WireBot[];
+  groups?: WireGroup[];
+  messages?: WireMessage[];
+  conversationMode?: string;
+  error?: string;
+};
+type ApiResult = { status: number; body: ApiResponseBody };
+
+function required<T>(value: T | undefined, field: string): T {
+  if (value === undefined) throw new Error(`API fixture response omitted ${field}`);
+  return value;
+}
+
 const says = (text: string) => ({
   kind: "sse" as const,
   frames: [`{"choices":[{"delta":{"content":${JSON.stringify(text)}}}]}`, "[DONE]"],
@@ -25,7 +47,7 @@ posixOnly("App-bound private task API", () => {
   let base: string;
   let stderr = "";
 
-  const api = async (method: string, path: string, body?: Record<string, JsonValue>, headers: Record<string, string> = {}) => {
+  const api = async (method: string, path: string, body?: Record<string, JsonValue>, headers: Record<string, string> = {}): Promise<ApiResult> => {
     const requestHeaders = { ...headers };
     if (body !== undefined) requestHeaders["content-type"] = "application/json";
     const response = await fetch(`${base}${path}`, {
@@ -33,17 +55,19 @@ posixOnly("App-bound private task API", () => {
       headers: requestHeaders,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    return { status: response.status, body: await response.json() };
+    // SAFETY: This test talks only to the local fixture server; its route responses match the concrete fields in ApiResponseBody, and required() checks fields before use.
+    const responseBody = await response.json() as ApiResponseBody;
+    return { status: response.status, body: responseBody };
   };
 
   const makeBot = async (instanceId = "minimax") => {
     const created = await api("POST", "/api/bots");
     expect(created.status).toBe(201);
-    const patched = await api("PATCH", `/api/bots/${created.body.bot.id}`, {
+    const patched = await api("PATCH", `/api/bots/${required(created.body.bot, "bot").id}`, {
       modelSelection: { instanceId, model: instanceId === "grok" ? "grok-4-fast" : "MiniMax-M3" },
     });
     expect(patched.status).toBe(200);
-    return patched.body.bot;
+    return required(patched.body.bot, "bot");
   };
 
   const makeGroup = async (memberIds: string[], cwd?: string) => {
@@ -54,12 +78,18 @@ posixOnly("App-bound private task API", () => {
     });
     expect(created.status).toBe(201);
     if (cwd !== undefined) {
-      const patched = await api("PATCH", `/api/groups/${created.body.group.id}`, { cwd });
+      const createdGroup = required(created.body.group, "group");
+      const patched = await api("PATCH", `/api/groups/${createdGroup.id}`, { cwd });
       expect(patched.status).toBe(200);
-      return patched.body.group;
+      return required(patched.body.group, "group");
     }
-    return created.body.group;
+    return required(created.body.group, "group");
   };
+
+  const taskFrom = (response: ApiResult) => required(response.body.task, "task");
+  const messagesFrom = (response: ApiResult) => required(response.body.messages, "messages");
+  const botsFrom = (response: ApiResult) => required(response.body.bots, "bots");
+  const groupsFrom = (response: ApiResult) => required(response.body.groups, "groups");
 
   beforeAll(async () => {
     engine = await startFakeOpenAiServer();
@@ -128,16 +158,16 @@ posixOnly("App-bound private task API", () => {
       workspaceContext: { kind: "local", appRef: { kind: "group", id: "spoofed" }, cwd: "/tmp" },
     });
     expect(captured.status).toBe(201);
-    const context = captured.body.task.workspaceContext;
+    const capturedTask = taskFrom(captured);
+    const context = required(capturedTask.workspaceContext, "task.workspaceContext");
     expect(context).toMatchObject({ kind: "local", appRef: { kind: "group", id: group.id }, cwd: realpathSync(nested) });
     expect(context.capturedAt).toEqual(expect.any(Number));
     expect(context.cwd).not.toBe(realpathSync(changedRoot));
-    // SAFETY: HTTP 201 guarantees `task` is the created wire task, whose threadId is a string.
-    const appThreadId = captured.body.task.threadId as string;
+    const appThreadId = capturedTask.threadId;
     expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "keep this transcript" })).status).toBe(202);
     const transcriptDeadline = Date.now() + 10_000;
     let transcript = await api("GET", `/api/threads/${appThreadId}/messages`);
-    while (!transcript.body.messages.some((message: { role?: string; text?: string }) =>
+    while (!messagesFrom(transcript).some((message) =>
       message.role === "bot" && message.text === "saved transcript")) {
       if (Date.now() > transcriptDeadline) throw new Error(`task transcript did not arrive. stderr: ${stderr.slice(-2000)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -150,23 +180,24 @@ posixOnly("App-bound private task API", () => {
       workspaceContext: { kind: "local", appRef: { kind: "group", id: group.id }, cwd: changedRoot },
     });
     expect(unassigned.status).toBe(201);
-    expect(unassigned.body.task.workspaceContext).toBeUndefined();
+    const unassignedTask = taskFrom(unassigned);
+    expect(unassignedTask.workspaceContext).toBeUndefined();
 
     expect((await api("PATCH", `/api/groups/${group.id}`, { name: "Renamed App", cwd: changedRoot })).status).toBe(200);
-    const tasks = (await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id).tasks;
-    const stillBound = tasks.find((task: { threadId: string }) => task.threadId === appThreadId);
+    const tasks = required(botsFrom(await api("GET", "/api/bots")).find((entry) => entry.id === bot.id)?.tasks, "bot.tasks");
+    const stillBound = required(tasks.find((task) => task.threadId === appThreadId), "bound task");
     expect(stillBound.workspaceContext).toEqual(context);
     expect(stillBound.cwd).toBe(realpathSync(nested));
-    expect(tasks.find((task: { threadId: string }) => task.threadId === unassigned.body.task.threadId).workspaceContext).toBeUndefined();
-    expect(transcript.body.messages.some((message: { text?: string }) => message.text === "keep this transcript")).toBe(true);
+    expect(tasks.find((task) => task.threadId === unassignedTask.threadId)?.workspaceContext).toBeUndefined();
+    expect(messagesFrom(transcript).some((message) => message.text === "keep this transcript")).toBe(true);
 
     const simple = await api("PATCH", "/api/conversation-mode", { conversationMode: "simple", mergeThreads: true });
     expect(simple.status).toBe(409);
-    expect((await api("GET", "/api/config")).body.conversationMode).toBe("projects");
+    expect(required((await api("GET", "/api/config")).body.conversationMode, "conversationMode")).toBe("projects");
     const after = await api("GET", "/api/bots");
-    const afterTasks = after.body.bots.find((entry: { id: string }) => entry.id === bot.id).tasks;
-    expect(afterTasks.map((task: { threadId: string }) => task.threadId)).toContain(appThreadId);
-    expect((await api("GET", `/api/threads/${appThreadId}/messages`)).body.messages).toHaveLength(transcript.body.messages.length);
+    const afterTasks = required(botsFrom(after).find((entry) => entry.id === bot.id)?.tasks, "bot.tasks");
+    expect(afterTasks.map((task) => task.threadId)).toContain(appThreadId);
+    expect(messagesFrom(await api("GET", `/api/threads/${appThreadId}/messages`))).toHaveLength(messagesFrom(transcript).length);
   });
 
   it("rejects invalid, missing, unassigned, and phone-protected App folders", async () => {
@@ -199,6 +230,7 @@ posixOnly("App-bound private task API", () => {
     const group = await makeGroup([bot.id], cwd);
     const created = await api("POST", `/api/bots/${bot.id}/tasks`, { appRef: { kind: "group", id: group.id } });
     expect(created.status).toBe(201);
+    const createdTask = taskFrom(created);
 
     const sendAndAssertRefused = async (threadId: string) => {
       const before = engine.requests.filter((request) => request.url.includes("/chat/completions")).length;
@@ -207,30 +239,31 @@ posixOnly("App-bound private task API", () => {
       expect(engine.requests.filter((request) => request.url.includes("/chat/completions"))).toHaveLength(before);
     };
 
-    await sendAndAssertRefused(created.body.task.threadId);
-    expect((await api("PATCH", `/api/bots/${bot.id}/tasks/${created.body.task.threadId}`, { groupId: group.id })).status).toBe(200);
-    expect((await api("POST", `/api/groups/${group.id}/tasks/${created.body.task.threadId}`)).status).toBe(200);
+    await sendAndAssertRefused(createdTask.threadId);
+    expect((await api("PATCH", `/api/bots/${bot.id}/tasks/${createdTask.threadId}`, { groupId: group.id })).status).toBe(200);
+    expect((await api("POST", `/api/groups/${group.id}/tasks/${createdTask.threadId}`)).status).toBe(200);
     const beforeRoomTurn = engine.requests.filter((request) => request.url.includes("/chat/completions")).length;
     const roomSend = await api("POST", `/api/groups/${group.id}/messages`, {
       text: "room App folder must stay local",
-      threadId: created.body.task.threadId,
+      threadId: createdTask.threadId,
     });
     expect(roomSend.status, JSON.stringify(roomSend.body)).toBe(202);
     const roomDeadline = Date.now() + 10_000;
-    let roomMessages = await api("GET", `/api/threads/${created.body.task.threadId}/messages`);
-    while (!roomMessages.body.messages.some((message: { kind?: string; tool?: { name?: string } }) =>
+    let roomMessages = await api("GET", `/api/threads/${createdTask.threadId}/messages`);
+    while (!messagesFrom(roomMessages).some((message) =>
       message.kind === "activity" && message.tool?.name?.includes("local App folder"))) {
       if (Date.now() > roomDeadline) throw new Error(`room App refusal activity did not arrive. stderr: ${stderr.slice(-2000)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
-      roomMessages = await api("GET", `/api/threads/${created.body.task.threadId}/messages`);
+      roomMessages = await api("GET", `/api/threads/${createdTask.threadId}/messages`);
     }
     expect(engine.requests.filter((request) => request.url.includes("/chat/completions"))).toHaveLength(beforeRoomTurn);
-    const roomAfterRefusal = (await api("GET", "/api/bots")).body.groups.find((entry: { id: string }) => entry.id === group.id);
+    const botsAfterRoom = await api("GET", "/api/bots");
+    const roomAfterRefusal = required(groupsFrom(botsAfterRoom).find((entry) => entry.id === group.id), "App group");
     expect(roomAfterRefusal.working).not.toBe(true);
-    expect((await api("GET", "/api/bots")).body.bots.find((entry: { id: string }) => entry.id === bot.id).busy).not.toBe(true);
-    expect((await api("PATCH", `/api/groups/${group.id}/tasks/${created.body.task.threadId}`, { botId: bot.id })).status).toBe(200);
-    expect((await api("POST", `/api/bots/${bot.id}/tasks/${created.body.task.threadId}`)).status).toBe(200);
-    await sendAndAssertRefused(created.body.task.threadId);
+    expect(required(botsFrom(botsAfterRoom).find((entry) => entry.id === bot.id), "bot").busy).not.toBe(true);
+    expect((await api("PATCH", `/api/groups/${group.id}/tasks/${createdTask.threadId}`, { botId: bot.id })).status).toBe(200);
+    expect((await api("POST", `/api/bots/${bot.id}/tasks/${createdTask.threadId}`)).status).toBe(200);
+    await sendAndAssertRefused(createdTask.threadId);
     expect((await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Busy-state probe" })).status).toBe(201);
   });
 
