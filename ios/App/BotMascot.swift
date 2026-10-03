@@ -29,6 +29,8 @@ enum BotPalette {
         "yellow": "#D8A729",
         "teal": "#01A492",
         "coral": "#E5634E",
+        "white": "#E8EAED",
+        "black": "#2D3036",
     ]
 
     static func color(_ name: String) -> Color {

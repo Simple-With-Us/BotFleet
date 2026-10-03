@@ -24,11 +24,12 @@ describe("tvFaceFrameChanged", () => {
 
 describe("tvFaceSkinDir", () => {
   it("maps every color to a skins directory that actually ships", () => {
-    // Only public/tv-face/skins/default ships. Named skins without assets
-    // must fall back to it, not 404 (the BF-Designer finding on #700).
+    // orange IS default; every other BotColor has its own pack under
+    // public/tv-face/skins/{color}. Unknown colors fall back to default
+    // rather than 404 (the BF-Designer finding on #700).
     expect(tvFaceSkinDir("orange")).toBe("default");
-    for (const color of ["blue", "green", "purple", "pink", "red", "yellow"] as const) {
-      expect(tvFaceSkinDir(color)).toBe("default");
+    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral", "white", "black"] as const) {
+      expect(tvFaceSkinDir(color)).toBe(color);
     }
     // Unknown and "default" itself take the same safe path.
     expect(tvFaceSkinDir("default")).toBe("default");

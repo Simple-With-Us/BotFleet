@@ -1,0 +1,187 @@
+// TV-Face avatar for iOS — same enter/hold/return player as the web
+// `TVFaceAvatar.tsx`. Assets load from FleetLink by default (transparent
+// GIF packs); a custom baseURL can point at a paired computer or bundled pack.
+import SwiftUI
+import Combine
+
+/// Where TV-Face stills + GIFs are fetched from.
+public enum TVFaceAssetSource: Sendable {
+    /// Public FleetLink CDN packs.
+    case fleetLink
+    /// Custom base, e.g. "https://host/tv-face/skins" or a file URL.
+    case custom(URL)
+
+    var baseURL: URL {
+        switch self {
+        case .fleetLink:
+            return URL(string: "https://fleetlink.online/TV-Face/botfleet")!
+        case .custom(let url):
+            return url
+        }
+    }
+
+    func url(color: String, expression: TVFaceExpression, kind: TVFaceFrameKind) -> URL {
+        let skin = TVFaceManifest.skinDir(color)
+        // FleetLink layout: orange at pack root; other colors under /{color}/.
+        // Local/app layout would use /skins/{skin}/ — we support both:
+        // FleetLink uses color name (or root for orange/default).
+        let root: URL
+        if case .fleetLink = self {
+            if skin == "default" {
+                root = baseURL
+            } else {
+                root = baseURL.appendingPathComponent(skin)
+            }
+        } else {
+            root = baseURL.appendingPathComponent(skin)
+        }
+        switch kind {
+        case .still:
+            return root.appendingPathComponent("stills/\(expression.rawValue).png")
+        case .enter, .hold, .return:
+            return root.appendingPathComponent("gifs/\(expression.rawValue)_\(kind.rawValue).gif")
+        }
+    }
+}
+
+@MainActor
+final class TVFacePlayer: ObservableObject {
+    @Published var imageData: Data?
+    @Published var expressionLabel: String = "resting"
+
+    private var previous: TVFaceExpression = .resting
+    private var color: String
+    private var source: TVFaceAssetSource
+    private var task: Task<Void, Never>?
+    private var cache: [URL: Data] = [:]
+
+    init(color: String, source: TVFaceAssetSource = .fleetLink) {
+        self.color = color
+        self.source = source
+    }
+
+    func setColor(_ color: String) {
+        guard color != self.color else { return }
+        self.color = color
+        // Force replay of current expression under the new skin.
+        let expr = previous
+        previous = .resting
+        play(expression: expr, animated: true)
+    }
+
+    func play(state: BotState, animated: Bool) {
+        play(expression: TVFaceManifest.expression(for: state), animated: animated)
+    }
+
+    func play(expression next: TVFaceExpression, animated: Bool) {
+        task?.cancel()
+        if !animated {
+            previous = next
+            expressionLabel = next.rawValue
+            task = Task { await show(expression: next, kind: .still) }
+            return
+        }
+        let steps = TVFacePlanner.plan(from: previous, to: next)
+        previous = next
+        task = Task { [weak self] in
+            guard let self else { return }
+            for step in steps {
+                if Task.isCancelled { return }
+                await self.show(expression: step.expression, kind: step.kind)
+                self.expressionLabel = step.expression.rawValue
+                if step.delayAfterMs > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(step.delayAfterMs) * 1_000_000)
+                }
+            }
+        }
+    }
+
+    private func show(expression: TVFaceExpression, kind: TVFaceFrameKind) async {
+        let url = source.url(color: color, expression: expression, kind: kind == .still ? .still : kind)
+        if let cached = cache[url] {
+            imageData = cached
+            return
+        }
+        // Fallback chain: requested → still of same expression → resting still.
+        if let data = await fetch(url) {
+            cache[url] = data
+            imageData = data
+            return
+        }
+        let still = source.url(color: color, expression: expression, kind: .still)
+        if let data = await fetch(still) {
+            cache[still] = data
+            imageData = data
+            return
+        }
+        let rest = source.url(color: color, expression: .resting, kind: .still)
+        if let data = await fetch(rest) {
+            cache[rest] = data
+            imageData = data
+        }
+    }
+
+    private func fetch(_ url: URL) async -> Data? {
+        if url.isFileURL {
+            return try? Data(contentsOf: url)
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 12
+        request.setValue("GrokBot-iOS-TVFace/1.0", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return nil
+            }
+            return data
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// Drop-in TV-Face avatar. Pass `animated: true` for enter/hold/return; false
+/// for a resting still (lists, widgets).
+struct TVFaceAvatar: View {
+    let color: String
+    var state: BotState = .idle
+    var size: CGFloat = 52
+    var animated: Bool = false
+    var source: TVFaceAssetSource = .fleetLink
+
+    @StateObject private var player: TVFacePlayer
+
+    init(
+        color: String,
+        state: BotState = .idle,
+        size: CGFloat = 52,
+        animated: Bool = false,
+        source: TVFaceAssetSource = .fleetLink
+    ) {
+        self.color = color
+        self.state = state
+        self.size = size
+        self.animated = animated
+        self.source = source
+        _player = StateObject(wrappedValue: TVFacePlayer(color: color, source: source))
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.001) // hit target
+            if let data = player.imageData {
+                AnimatedGIFView(data: data)
+                    .frame(width: size, height: size)
+            } else {
+                ProgressView()
+                    .frame(width: size, height: size)
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+        .onAppear { player.play(state: state, animated: animated) }
+        .onChange(of: state) { _, new in player.play(state: new, animated: animated) }
+        .onChange(of: color) { _, new in player.setColor(new); player.play(state: state, animated: animated) }
+        .onChange(of: animated) { _, new in player.play(state: state, animated: new) }
+    }
+}

@@ -29,18 +29,12 @@ export interface TVFaceAvatarProps {
   animated?: boolean;
 }
 
-/** Skins whose art actually ships under public/tv-face/skins. Blue, green,
- * purple, pink, red, and yellow are PLANNED skins with no assets yet:
- * mapping them to their own directories 404s every GIF and still. Until
- * the art lands, every color renders the default skin — and the profile
- * picker's preview shows exactly what the bot will get.
- *
- * This was previously INVERTED: it named exactly the six skins whose
- * directories did not exist, so a bot set to blue built a 404 path. It is
- * asserted against the real directory listing in tvFaceSkins.test.ts, because
- * a hand-maintained whitelist next to a hand-maintained directory listing is
- * how it drifted in the first place. */
-export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>(["orange"]);
+/** Skins whose art actually ships under public/tv-face/skins.
+ * orange maps to default. Every BotColor ships (incl. white/black). green uses red glyphs.
+ * Asserted against the real directory listing in tvFaceSkins.test.ts. */
+export const SHIPPED_SKINS: ReadonlySet<TVFaceSkin> = new Set<TVFaceSkin>([
+  "orange","blue","green","purple","pink","red","cyan","yellow","teal","coral","white","black",
+]);
 
 /** The skins directory a color renders from. `orange` IS the default skin
  * (public/tv-face/skins/default); every unshipped color falls back to it
