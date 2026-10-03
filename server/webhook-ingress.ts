@@ -167,7 +167,7 @@ export function createWebhookIngressHandler(
         applinks: {
           details: [
             {
-              appIDs: ["CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
+              appIDs: ["CC8UTF7ATG.app.botfleet", "CC8UTF7ATG.app.botfleet.ios", "CC8UTF7ATG.app.botfleet.macos"],
               components: [{ "/": "/*" }],
             },
           ],
