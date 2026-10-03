@@ -131,18 +131,77 @@ function parseClaudeLoggedIn(stdout: string | undefined): boolean | undefined {
   }
 }
 
+/** How often `claudeSignedIn` may attempt to renew an idle 8h access token
+ * via `claude -p "/usage"`.  Matches CodeCaps: renewal is single-flight and at
+ * most once every 10 minutes, avoiding token refresh storms. */
+export const CLAUDE_RENEW_COOLDOWN_MS = 10 * 60_000;
+
+export const CLAUDE_RENEW_ARGS = [
+  "-p",
+  "--settings",
+  '{"disableAllHooks":true}',
+  "--strict-mcp-config",
+  "--no-session-persistence",
+  "--output-format",
+  "json",
+  "/usage",
+] as const;
+
+let lastRenewalAttempt = 0;
+let inFlightRenewal: Promise<boolean> | null = null;
+
+export function resetClaudeRenewalThrottleForTesting(): void {
+  lastRenewalAttempt = 0;
+  inFlightRenewal = null;
+}
+
+/** Checks if the /usage response indicates successful token refresh. */
+export function parseClaudeRenewalSuccess(stdout: string | undefined): boolean {
+  try {
+    const res: unknown = JSON.parse(stdout ?? "");
+    if (typeof res !== "object" || res === null) return false;
+    return "is_error" in res && (res as { is_error: boolean }).is_error === false;
+  } catch {
+    return false;
+  }
+}
+
+function attemptClaudeRenewal(
+  cli: string,
+  env: NodeJS.ProcessEnv,
+  run: typeof execCli,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (inFlightRenewal) return inFlightRenewal;
+  inFlightRenewal = new Promise<boolean>((resolve) => {
+    run(cli, [...CLAUDE_RENEW_ARGS], { timeout: timeoutMs, env }, (err, stdout) => {
+      if (err || !stdout) return resolve(false);
+      resolve(parseClaudeRenewalSuccess(stdout));
+    });
+  }).finally(() => {
+    inFlightRenewal = null;
+  });
+  return inFlightRenewal;
+}
+
 /** Whether `claude` has been signed in: true, false, or undefined when the
  * probe could not tell.
  *
- * Credential storage is deliberately not inspected here. Claude Code uses the
+ * Credential storage is deliberately not inspected here.  Claude Code uses the
  * macOS Keychain for OAuth, a JSON file on some platforms, and may gain other
- * backends over time. Presence checks also accept stale credentials. The CLI's
+ * backends over time.  Presence checks also accept stale credentials.  The CLI's
  * own machine-readable auth command is the source of truth for every backend.
  *
  * The answer is three-valued because a probe that ran out of time is not a
  * sign-out.  Parsed JSON is definitive whatever the exit code: a genuinely
- * signed-out CLI exits 1 AND prints `{"loggedIn":false}`.  A fast failure with
- * no JSON (an older CLI without the `auth` subcommand) still fails closed.
+ * signed-out CLI exits 1 AND prints `{"loggedIn":false}`.  However, Claude Code's
+ * 8-hour access token expires whenever the CLI sits idle, even while its ~28-day
+ * refresh token remains valid.  Because `claude auth status` does NOT refresh
+ * the token, a raw `auth status` returns `loggedIn:false` on every idle wake.
+ * When `loggedIn:false` is reported, this driver makes Claude Code renew its own
+ * credentials via a zero-cost `claude -p "/usage"` call before concluding that
+ * the user is signed out.
+ *
  * Only a timeout or kill — no answer at all — is undefined, and the caller
  * keeps whatever it last knew.
  */
@@ -151,17 +210,31 @@ export function claudeSignedIn(
   env: NodeJS.ProcessEnv,
   run: typeof execCli = execCli,
   timeoutMs: number = claudeAuthTimeoutMs(),
+  allowRenew: boolean = true,
 ): Promise<boolean | undefined> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    run(cli, ["auth", "status", "--json"], { timeout: timeoutMs, env }, (error, stdout) => {
+    run(cli, ["auth", "status", "--json"], { timeout: timeoutMs, env }, async (error, stdout) => {
       const answer = parseClaudeLoggedIn(stdout);
-      if (answer !== undefined) return resolve(answer);
+      if (answer === true) return resolve(true);
+
       const elapsed = Date.now() - startedAt;
-      if (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= timeoutMs)) {
+      if (answer === undefined && (isProbeTimeout(error) || (!stdout?.trim() && elapsed >= timeoutMs))) {
         logProbeFailure("claude", `${cli} auth status --json`, error, elapsed);
         return resolve(undefined);
       }
+
+      // If auth status reported false and renewal has not been tried recently,
+      // ask Claude Code to renew its own 8h token using its valid refresh token.
+      if (allowRenew && answer === false && Date.now() - lastRenewalAttempt > CLAUDE_RENEW_COOLDOWN_MS) {
+        lastRenewalAttempt = Date.now();
+        const renewed = await attemptClaudeRenewal(cli, env, run, timeoutMs);
+        if (renewed) {
+          const rechecked = await claudeSignedIn(cli, env, run, timeoutMs, false);
+          return resolve(rechecked ?? true);
+        }
+      }
+
       resolve(false);
     });
   });

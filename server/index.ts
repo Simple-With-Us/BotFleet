@@ -3781,7 +3781,7 @@ bus.subscribe((event: RuntimeEvent) => {
       };
       // Resolve the registry engine (driver kind) once so usage banking
       // keeps attributing correctly even after the connection is deleted.
-      // DeepSeek Harness can run MiniMax models (e.g. MiniMax-M3) — attribute
+      // Clutch can run MiniMax models (e.g. MiniMax-M3) — attribute
       // those turns to MiniMax so MiniMax usage is separated from DeepSeek.
       const isMiniMaxTurn = Boolean(
         actualSelection.model && (
