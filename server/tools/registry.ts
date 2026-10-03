@@ -1187,7 +1187,7 @@ const JOB_START: HarnessTool = {
     },
     required: ["command"],
   },
-  surfaces: { mcp: false, http: true },
+  surfaces: { mcp: true, http: true },
   gate: jobsEnabled,
   sideEffect: "write",
   settles: "immediate",
@@ -1220,19 +1220,41 @@ const JOB_OUTPUT: HarnessTool = {
     },
     required: ["job_id"],
   },
-  surfaces: { mcp: false, http: true },
+  surfaces: { mcp: true, http: true },
   gate: jobsEnabled,
   sideEffect: "read",
   settles: "immediate",
   // the 75-second wait plus the read, under the loop's own 90-second ceiling
   timeoutMs: 90_000,
+  // The MCP lane waits longer (jobs P2): an MCP call has no in-process round
+  // loop to pay for between rounds, so the wait is all the bot spends.  The
+  // HTTP ceiling above is the loop's own 90-second budget and cannot move, so
+  // the deviation is per-surface rather than one raised number.
+  wire: {
+    mcp: {
+      reason: "jobs P2: the MCP lane has no in-process round loop, so a 120 s wait costs the bot only the wait; the HTTP lane's 75 s sits under a 90 s round budget that cannot move.",
+      description:
+        "Read what one of your background jobs printed since you last read it: at most 16 KB, ending with the job's status line, for example [status: completed, exit code: 1, 4m 12s]. wait_seconds (at most 120) waits for the job to end first. Call it when you need the output now, not to check on a job: you are told when it ends.",
+      schema: {
+        type: "object",
+        properties: {
+          job_id: { type: "string", description: "The job's id, from job_start or job_list." },
+          wait_seconds: {
+            type: "integer",
+            description: "Wait up to this many seconds (at most 120) for the job to end before reading. Defaults to 0.",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+  },
 };
 
 const JOB_LIST: HarnessTool = {
   name: "job_list",
   description: "List your background jobs: running ones first, then finished ones, newest first, with each one's status and how long it ran.",
   schema: { type: "object", properties: {} },
-  surfaces: { mcp: false, http: true },
+  surfaces: { mcp: true, http: true },
   gate: jobsEnabled,
   sideEffect: "read",
   settles: "immediate",
@@ -1247,7 +1269,7 @@ const JOB_KILL: HarnessTool = {
     properties: { job_id: { type: "string", description: "The job's id, from job_start or job_list." } },
     required: ["job_id"],
   },
-  surfaces: { mcp: false, http: true },
+  surfaces: { mcp: true, http: true },
   gate: jobsEnabled,
   sideEffect: "write",
   settles: "immediate",

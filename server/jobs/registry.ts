@@ -80,6 +80,9 @@ export interface JobsSettings {
   enabled: boolean;
   /** A finished job may wake an idle bot (the `jobs.wake` kill switch). */
   wake: boolean;
+  /** Command-line engines are offered the job tools over MCP too (jobs P2).
+   *  The owner's `jobs.cliLanes` switch, on unless they turned it off. */
+  cliLanes: boolean;
   defaultMinutes: number;
   /** The most a bot may ask for: 240 unless the owner raised it (≤ 360). */
   maxMinutes: number;
@@ -92,6 +95,7 @@ export interface JobsSettings {
 export const DEFAULT_JOBS_SETTINGS: JobsSettings = {
   enabled: true,
   wake: true,
+  cliLanes: true,
   defaultMinutes: JOB_DEFAULT_MINUTES,
   maxMinutes: JOB_MODEL_MAX_MINUTES,
   admission: DEFAULT_ADMISSION,
@@ -102,6 +106,10 @@ export const DEFAULT_JOBS_SETTINGS: JobsSettings = {
 export interface JobsConfigInput {
   enabled?: boolean;
   wake?: boolean;
+  /** Jobs are offered to command-line engines over MCP as well (jobs P2).
+   *  Absent is on, per the owner's ruling (e); `false` returns the tools to
+   *  the HTTP lane only. */
+  cliLanes?: boolean;
   defaultMinutes?: number;
   maxMinutes?: number;
   admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
@@ -124,6 +132,7 @@ export function resolveJobsSettings(input: JobsConfigInput | undefined): JobsSet
   return {
     enabled: input?.enabled !== false,
     wake: input?.wake !== false,
+    cliLanes: input?.cliLanes !== false,
     defaultMinutes,
     maxMinutes,
     admission: {

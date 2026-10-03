@@ -201,9 +201,13 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect((own as { parentItemId?: string }).parentItemId).toBeUndefined();
   });
 
-  it("reports no background jobs and no helpers until the jobs program reaches it", async () => {
+  it("reports emulated background jobs and no helpers", async () => {
     await create();
-    expect(instance.adapter.capabilities.backgroundJobs).toBe("none");
+    // jobs P2: the job tools ride the MCP server Codex already mounts.  The
+    // job process is spawned by the harness, not by Codex, so it is NOT inside
+    // the codex sandbox — the approval card is what stands between a Codex bot
+    // and a job, and a full-auto Codex bot is under ruling (c) instead.
+    expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
     expect(instance.adapter.capabilities.helpers).toBe("none");
   });
 

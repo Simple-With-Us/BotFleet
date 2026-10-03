@@ -379,12 +379,15 @@ const appConfigSchema = z.object({
   }).optional(),
   // Background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-
   // subagents-decision.md).  On by default for HTTP-lane bots; `wake: false`
-  // is the kill switch for wake turns.  Every number is clamped again where
-  // it is used (server/jobs/registry.ts resolveJobsSettings): no setting can
-  // lift a job's run limit past 6 hours.
+  // is the kill switch for wake turns, and `cliLanes: false` returns the job
+  // tools to the HTTP lane only (jobs P2, which mounts them for command-line
+  // engines over MCP).  Every number is clamped again where it is used
+  // (server/jobs/registry.ts resolveJobsSettings): no setting can lift a
+  // job's run limit past 6 hours.
   jobs: z.object({
     enabled: z.boolean().optional(),
     wake: z.boolean().optional(),
+    cliLanes: z.boolean().optional(),
     defaultMinutes: z.number().int().min(1).max(360).optional(),
     maxMinutes: z.number().int().min(1).max(360).optional(),
     cpuCores: z.number().min(1).max(64).optional(),
@@ -551,6 +554,7 @@ export interface AppConfig {
   jobs?: {
     enabled?: boolean;
     wake?: boolean;
+    cliLanes?: boolean;
     defaultMinutes?: number;
     maxMinutes?: number;
     cpuCores?: number;

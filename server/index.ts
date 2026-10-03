@@ -296,6 +296,17 @@ import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { JobWakeUsage } from "./jobs/wake-usage.ts";
 import {
+  executeMcpJobKill,
+  executeMcpJobList,
+  executeMcpJobOutput,
+  executeMcpJobStart,
+  mountCliJobTurn,
+  readCliJobTurn,
+  unmountCliJobTurn,
+  type McpLaneJobDeps,
+} from "./jobs/mcp-lane.ts";
+import { jobLane as jobLaneFor } from "./jobs/engine-lanes.ts";
+import {
   JOB_ID_PATTERN,
   JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP,
   isJobActive,
@@ -985,7 +996,7 @@ const phoneProxyPath = SPAWNED_PROXIES.phone;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
-function agentsIntegration(botId: string, threadId: string, depth: number) {
+function agentsIntegration(botId: string, threadId: string, depth: number, options: { jobs?: boolean } = {}) {
   return {
     command: process.execPath,
     args: [agentsProxyPath],
@@ -998,6 +1009,12 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
       // can speak for the bot it was spawned for and no further.
       OMB_COMMS_TOKEN: mintCommsGrant(botId, threadId, depth),
       OMB_TURN_DEPTH: String(depth),
+      // Background jobs (jobs P2).  The harness's own verdict, handed down as
+      // one bit: the proxy publishes the job tools only when this is "1", and
+      // the `/api/internal/jobs` endpoints re-check the same mount before
+      // doing anything.  Absent on every other lane, so a proxy spawned
+      // without jobs cannot offer them.
+      ...(options.jobs ? { OMB_JOBS: "1" } : {}),
     },
   };
 }
@@ -1675,6 +1692,22 @@ const jobWakes = new JobWakeCoordinator({
   startWake: async (botId, threadId, prompt, jobIds) => {
     await startTurn(botId, prompt, { threadId, automationSource: "job" });
     jobRegistry.markNoticesDelivered(jobIds);
+  },
+  // A busy COMMAND-LINE turn is told on the turn it is already in (jobs P2),
+  // never woken: Claude steers mid-turn, and an engine that cannot steer
+  // returns false so the notice rides its next turn's opening reminder
+  // instead.  The HTTP lane has no such hook and keeps parking a busy bot.
+  steerBusyNotice: (botId, threadId, prompt) => {
+    const bot = store.bot(botId);
+    const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
+    const adapter = instance?.adapter;
+    // Both guards, not one: `steer` is how a message enters a running turn
+    // and `queueing` is the capability that says this engine can hold one.
+    // Claude is the only driver that implements both today, so every other
+    // engine takes the `false` and leaves the notice for its next turn.
+    if (!adapter?.steer || adapter.capabilities.queueing !== true) return false;
+    if (providerReloadInProgress) return false;
+    return adapter.steer(threadId, prompt);
   },
   log: (line) => console.warn(line),
 });
@@ -2813,7 +2846,13 @@ bus.subscribe((event: RuntimeEvent) => {
 // from INSIDE a tool call, so by the time any terminal event names this
 // thread there is no tool left to consume an answer.
 bus.subscribe((event: RuntimeEvent) => {
-  if (event.type === "turn.completed") permissionBroker.abandonThread(event.threadId, "teardown");
+  if (event.type === "turn.completed") {
+    permissionBroker.abandonThread(event.threadId, "teardown");
+    // The turn's job tools go with it.  A comms token is minted per turn and
+    // can outlive it, so leaving the mount up would let a replayed token
+    // start a job against a finished turn's working folder.
+    unmountCliJobTurn(event.threadId, event.turnId);
+  }
 });
 
 // Bots currently working with nobody at the keyboard — a webhook turn, or a
@@ -4949,6 +4988,26 @@ async function startTurn(
       const granted_mounts = turnComputers.mounts;
       const previewCapture = turnComputers.previewCapture;
       applyComputerMounts(integrations, granted_mounts);
+      // HTTP chat-completions drivers run their own model-to-tool rounds and
+      // emit the same single terminal event as CLI drivers.  Hoisted above the
+      // integrations because the job mount (jobs P2) is one of them, and two
+      // spellings of the same gate would be two chances to disagree.
+      const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
+      const hasHostComputer = turnComputers.hasHostComputer;
+      // Background jobs.  One derivation for both lanes (server/jobs/
+      // engine-lanes.ts), read once here: the prompt, the mounted tools and
+      // the mounted turn must all be the same answer, and a second copy of
+      // this expression is a second chance for them to disagree.
+      const jobLane = jobLaneFor(instance.adapter.capabilities, jobSettings(), hasHostComputer);
+      const jobsForTurn = jobLane.lane === "http";
+      const jobsForCliTurn = jobLane.lane === "mcp";
+      const jobsMounted = jobLane.lane !== "none";
+      if (!jobsMounted && instance.adapter.capabilities.backgroundJobs === "emulated") {
+        // Only worth a line when an engine that COULD have jobs was refused
+        // one, which is the case a maintainer is looking for.
+        console.warn(`[jobs] no job tools for ${instance.driverKind}: ${jobLane.reason}`);
+      }
+
       // Agent control tools include peer comms and the secure credential
       // request card. A comms-invoked turn (depth ≥ cap) gets none — hard recursion
       // stop, so the user's tokens can't be burned by a bot-to-bot loop.
@@ -4966,7 +5025,23 @@ async function startTurn(
         commsDepth < MAX_COMMS_DEPTH &&
         instance.adapter.capabilities.agentsMcp === true
       ) {
-        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth);
+        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, { jobs: jobsMounted });
+      }
+      // Jobs for a command-line turn (jobs P2).  Mounted HERE, beside the
+      // agents integration that carries the tools, and unmounted when the turn
+      // settles: a comms token outlives its turn, and without this a token
+      // replayed after the turn would find job tools with a stale folder.
+      // `cwd` is the same working folder the turn's own tools are confined to.
+      if (jobsForCliTurn) {
+        mountCliJobTurn({
+          botId: bot.id,
+          threadId,
+          cwd: cwd ?? bot.cwd ?? process.cwd(),
+          provider: instance.driverKind,
+          providerInstanceId: instance.instanceId,
+          onComplete: "wake",
+          wakes: jobSettings().wake,
+        });
       }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit delegation nudge — the agent still does the ask_bot call
@@ -5034,9 +5109,6 @@ async function startTurn(
       if (providerReloadInProgress) await waitForProviderReloads();
       if (!dispatchStillCurrent()) return;
       watchdog.watch(threadId, bot.id);
-      // HTTP chat-completions drivers run their own model-to-tool rounds and
-      // emit the same single terminal event as CLI drivers.
-      const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
       // One catalog, used twice: what the model is told it has, and what the
       // host will actually run.  Deriving both from the same call is what
       // keeps a hallucinated tool from finding an executor that would run it
@@ -5046,7 +5118,6 @@ async function startTurn(
       // this the catalog would always see `chiefOfStaff: false` and a real
       // Chief's HTTP-lane turn would never be offered the tool its own
       // prompt (chiefOfStaffSystemPrompt) tells it it has.
-      const hasHostComputer = turnComputers.hasHostComputer;
       // Bot RAG is host logic, not an MCP mount — any toolLoop driver
       // qualifies once it is configured, independent of the `qdrantMcp`
       // capability CLI/ACP engines use to mount the real MCP server (see
@@ -5092,15 +5163,6 @@ async function startTurn(
         usesDriverToolLoop && worksInWorkspace && !hasHostComputer && confinementRoot
           ? { workspaceRealpath: realOrResolved(confinementRoot) }
           : undefined;
-      // Background jobs (P1): an engine that runs BotFleet's emulated jobs, a
-      // bot that holds This Computer, and jobs not switched off.  One boolean,
-      // handed to the catalog and to the host alike, so a job tool the model
-      // was not offered finds no executor.
-      const jobsForTurn =
-        usesDriverToolLoop &&
-        hasHostComputer &&
-        instance.adapter.capabilities.backgroundJobs === "emulated" &&
-        jobSettings().enabled;
       const turnTools = buildTurnTools(
         { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn },
         { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
@@ -5159,7 +5221,7 @@ async function startTurn(
         // the owner's jobs setting does.
         // `jobs.wake: false` changes the promise: told on the next turn, not
         // woken, so the bot does not end its turn waiting for a wake.
-        { id: "jobs", label: "Background jobs", text: jobsForTurn ? jobsPrompt(jobSettings().wake, jobSettings()) : "" },
+        { id: "jobs", label: "Background jobs", text: jobsMounted ? jobsPrompt(jobSettings().wake, jobSettings()) : "" },
         // The Chief roster and the status capsule are byte-stable across a
         // teammate's busy flip (PR #617), which is what lets them stay on
         // the stable half.
@@ -5230,7 +5292,7 @@ async function startTurn(
       };
       // Running jobs and waiting job notices open the turn (taken now, at
       // dispatch, so a notice that landed while the turn was set up rides it).
-      const jobReminder = jobTurnReminder(bot.id, threadId, jobsForTurn);
+      const jobReminder = jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
       const turnInput = {
         threadId,
@@ -5393,6 +5455,14 @@ async function startTurn(
         bindLinqChatToTurn(threadId, `pending:${threadId}`, bot.id, opts.linqChatId);
       }
       const started = await instance.adapter.sendTurn(turnInput);
+      // The engine's turn id is known only now, so the mounted job turn is
+      // re-stamped with it (requirement 6): a CLI-lane job records the turn
+      // that made it, the way an HTTP-lane job records its tool runtime's.
+      // A remount keeps every other field the harness set at dispatch.
+      if (started.turnId && jobsForCliTurn) {
+        const mounted = readCliJobTurn(bot.id, threadId);
+        if (mounted) mountCliJobTurn({ ...mounted, turnId: started.turnId });
+      }
       if (opts?.linqChatId && started.turnId) {
         bindLinqChatToTurn(threadId, started.turnId, bot.id, opts.linqChatId);
       }
@@ -9549,6 +9619,57 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           credentialId: body.credentialId,
           reason: typeof body.reason === "string" ? body.reason : undefined,
         });
+        return json(res, result.status, result.body);
+      }
+      // Background jobs for the MCP lane (jobs P2).  The comms token is the
+      // caller's only identity: the grant names the bot and thread, and the
+      // bodies below run against THAT binding, never against a bot id the
+      // model put in the arguments.  So a job may only be read or stopped by
+      // the bot that owns it, whatever the model sends.
+      if (path === "/api/internal/jobs" || path.startsWith("/api/internal/jobs/")) {
+        const token = bearerToken(req.headers.authorization);
+        const grant = token ? commsGrants.get(token) : undefined;
+        if (!grant) return json(res, 403, { error: "forbidden: job tools need this turn's comms token" });
+        // The turn's own job tools, or none.  Absent a mount there is no cwd
+        // and no provider identity, so this is the CLI lane's "no mount, no
+        // tools" rule — the same one the HTTP lane carries as `ctx.jobs`.
+        const turn = readCliJobTurn(grant.botId, grant.threadId);
+        if (!turn) return json(res, 403, { error: "forbidden: job tools are not mounted on this turn" });
+        const deps: McpLaneJobDeps = {
+          registry: jobRegistry,
+          botId: turn.botId,
+          threadId: turn.threadId,
+          ...(turn.turnId ? { turnId: turn.turnId } : {}),
+          cwd: turn.cwd,
+          onComplete: turn.onComplete,
+          wakes: turn.wakes,
+          // The permission broker, not an engine round trip.  This is what
+          // makes the owner's full-auto ruling reach this lane: the ask is
+          // opened in-process, so `isOwnJobStartRequest` recognises it as
+          // the harness's own and answers a full-auto bot with no card.
+          requestApproval: (ask) =>
+            permissionBroker.request({
+              threadId: turn.threadId,
+              botId: turn.botId,
+              provider: turn.provider,
+              ...(turn.providerInstanceId ? { providerInstanceId: turn.providerInstanceId } : {}),
+              ...(turn.signal ? { signal: turn.signal } : {}),
+              ...ask,
+            }),
+        };
+        const args = method === "GET" ? {} : await readBody(req);
+        const action = path.slice("/api/internal/jobs".length).replace(/^\//, "");
+        const result =
+          action === "" || action === "list"
+            ? executeMcpJobList(deps)
+            : action === "start"
+              ? await executeMcpJobStart(deps, args)
+              : action === "output"
+                ? await executeMcpJobOutput(deps, args, turn.signal)
+                : action === "kill"
+                  ? await executeMcpJobKill(deps, args)
+                  : null;
+        if (!result) return json(res, 404, { error: "not found" });
         return json(res, result.status, result.body);
       }
       if (method === "POST" && path === "/api/internal/connectors/mcp") {

@@ -2113,8 +2113,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           // through the broker (see sendTurn), so the asks still reach a person.
           localComputerMcp: true,
           // Native background work is switched off (CLAUDE_CONTAINMENT_ENV);
-          // BotFleet's own job tools reach Claude over MCP in P2.
-          backgroundJobs: "none",
+          // BotFleet's own job tools reach Claude over MCP in P2, mounted on
+          // the same `agents` server that already carries ask_bot.
+          backgroundJobs: "emulated",
           // Every helper frame carries parent_tool_use_id, and its steps nest
           // under the Task/Agent row that started it.  One level deep; the
           // three-at-once cap is the CLI's and advisory (CLAUDE_CONTAINMENT_ENV).

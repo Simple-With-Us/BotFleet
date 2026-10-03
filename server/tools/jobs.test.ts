@@ -79,14 +79,16 @@ const call = (name: string, args: TurnToolCall["arguments"]): TurnToolCall => ({
 const xs = (content: string) => content.split("\n").filter((line) => /^x+$/.test(line)).join("").length;
 
 describe("the job tools' catalog", () => {
-  it("is offered on the HTTP lane only when jobs are mounted, whatever the comms depth", () => {
+  it("is offered on both lanes when jobs are mounted, whatever the comms depth", () => {
     const names = (jobs: boolean, commsDepth: number) =>
       toolsFor("http", { agents: false, commsDepth, maxCommsDepth: 1, chiefOfStaff: false, localComputer: true, jobs }).map((t) => t.name);
     expect(names(true, 5)).toEqual(expect.arrayContaining(["job_start", "job_output", "job_list", "job_kill"]));
     expect(names(false, 0)).not.toContain("job_start");
-    expect(toolsFor("mcp", { agents: true, commsDepth: 0, maxCommsDepth: 1, chiefOfStaff: false, jobs: true }).map((t) => t.name)).not.toContain(
-      "job_start",
-    );
+    // jobs P2: the MCP lane mounts the same four on the same single gate.
+    const mcp = toolsFor("mcp", { agents: true, commsDepth: 0, maxCommsDepth: 1, chiefOfStaff: false, jobs: true }).map((t) => t.name);
+    expect(mcp).toEqual(expect.arrayContaining(["job_start", "job_output", "job_list", "job_kill"]));
+    const off = toolsFor("mcp", { agents: true, commsDepth: 0, maxCommsDepth: 1, chiefOfStaff: false, jobs: false }).map((t) => t.name);
+    expect(off).not.toContain("job_start");
   });
 
   it("finds no executor for a job tool the turn was not offered", async () => {
