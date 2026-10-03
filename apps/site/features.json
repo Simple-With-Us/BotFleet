@@ -4,7 +4,8 @@
     "repo": "https://github.com/jaywedgeworth22/BotFleet",
     "upstream": "https://github.com/milind-soni/OpenMausBot",
     "releases": "https://github.com/jaywedgeworth22/BotFleet/releases",
-    "macDownload": "https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg"
+    "macDownload": "https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg",
+    "macDownloadIntel": "https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet-intel.dmg"
   },
   "exampleFleet": ["Builder", "Reviewer", "Scout"],
   "sections": [
@@ -56,8 +57,8 @@
           "prov": { "type": "host", "note": "In testing" }
         },
         {
-          "title": "Gemini &amp; Antigravity Engines",
-          "desc": "Gemini and Antigravity engine options, including tool access and local computer dispatch where configured and approved.",
+          "title": "Antigravity Engine &amp; Gemini Models",
+          "desc": "Antigravity is the engine, and it serves Google's Gemini 3.7 and 3.8 Flash catalog alongside its own models.  Tool access and local computer dispatch work where configured and approved.  There is no separate Gemini engine — Gemini appears under Antigravity.",
           "prov": { "type": "pr", "prs": [144, 151], "state": "merged", "note": "In testing" }
         },
         {
