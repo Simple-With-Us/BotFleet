@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>TV-Face v4 — Pure Sample SVG Runtime</title>
+  <style>
+    body{margin:0;font-family:system-ui,sans-serif;background:#0b0f14;color:#e5e7eb}
+    header{padding:1.2rem 1.5rem;border-bottom:1px solid #1f2937}
+    h1{margin:0 0 .35rem;color:#22d3ee;font-size:1.25rem}
+    .sub,.note,.prose{color:#94a3b8;max-width:54rem;font-size:.92rem;line-height:1.55;white-space:pre-wrap}
+    main{padding:1.25rem;display:grid;gap:1.1rem}
+    .card{background:#111827;border:1px solid #1f2937;border-radius:16px;padding:1rem 1.2rem}
+    .row{display:flex;flex-wrap:wrap;gap:1rem;align-items:center}
+    button,select{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:.45rem .7rem;font:inherit;cursor:pointer}
+    button:hover,select:hover{border-color:#22d3ee}
+    .checker{background:
+      linear-gradient(45deg,#ccc 25%,transparent 25%),
+      linear-gradient(-45deg,#ccc 25%,transparent 25%),
+      linear-gradient(45deg,transparent 75%,#ccc 75%),
+      linear-gradient(-45deg,transparent 75%,#ccc 75%);
+      background-size:20px 20px;background-position:0 0,0 10px,10px -10px,-10px 0;
+      background-color:#eee;border-radius:12px;padding:1rem;display:inline-flex;gap:.5rem;flex-wrap:wrap}
+    a{color:#22d3ee}
+    code{font-size:.85em;background:#1a1f2a;padding:.1rem .3rem;border-radius:4px}
+    ul.sub{margin:.4rem 0 0;padding-left:1.1rem;white-space:normal}
+  </style>
+  <script src="./tv-face.js"></script>
+</head>
+<body>
+<header>
+  <h1>TV-Face SVG v4</h1>
+  <p class="sub">Pure <code>sample(t)</code> runtime.  Craft studied from <a href="https://bloub.vercel.app">bloub</a> (MIT): ease-out morphs, freeze-on-chain, blinkIn, per-state morph durations, rest = gaze + blink.  Silhouette stays TV-Face — not the x.ai blob.</p>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div class="checker">
+        <tv-face id="face" size="280px" casing="orange" state="resting" phase="rest" float></tv-face>
+      </div>
+      <div>
+        <div class="row" style="margin-bottom:.6rem">
+          <label>State
+            <select id="state">
+              <option>resting</option>
+              <option>thinking</option>
+              <option>working</option>
+              <option>waiting</option>
+              <option>celebrate</option>
+              <option>error</option>
+              <option>sleeping</option>
+            </select>
+          </label>
+          <label>Casing
+            <select id="casing">
+              <option>orange</option><option>blue</option><option>purple</option><option>pink</option>
+              <option>green</option><option>cyan</option><option>red</option><option>yellow</option>
+              <option>teal</option><option>coral</option><option>white</option><option>black</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <button id="play">Play hold</button>
+          <button id="stop">Return rest</button>
+          <button id="talk">Toggle talk</button>
+          <button id="chain">Chain mid-fade</button>
+        </div>
+        <p class="note" style="margin-top:.75rem">Chain mid-fade fires thinking then working before morph ends.  Freezes the composite pose and blends (bloub departFige).</p>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2 style="margin:0 0 .4rem;font-size:1rem;color:#22d3ee">Bloub craft mapped here</h2>
+    <ul class="sub">
+      <li><code>sample(t)</code> pure of absolute time + state machine</li>
+      <li>Per-state <code>morph</code> durations (0.30–0.50s) with <code>easeOutQuint</code></li>
+      <li><code>blinkIn</code> on thinking / waiting / celebrate entry</li>
+      <li>Freeze mid-fade when chaining before morph completes</li>
+      <li>Rest liveliness = loopNoise gaze + deterministic blinks (no hard float)</li>
+      <li>LOOK_MORPH-style 0.24s gaze continuity target</li>
+    </ul>
+    <p class="prose" style="margin-top:.6rem">Notes: <a href="../../docs/SVG-BLOUB-NOTES.md">SVG-BLOUB-NOTES.md</a>.  Hub: <a href="../../AVATARS.html">AVATARS.html</a>.</p>
+  </div>
+</main>
+<script>
+  const face = document.getElementById('face');
+  const state = document.getElementById('state');
+  const casing = document.getElementById('casing');
+  let talking = false;
+  state.addEventListener('change', () => {
+    if (state.value === 'resting') face.stop();
+    else face.play(state.value, { holdMs: Infinity });
+  });
+  casing.addEventListener('change', () => face.setCasing(casing.value));
+  document.getElementById('play').onclick = () => face.play(state.value || 'thinking', { holdMs: Infinity });
+  document.getElementById('stop').onclick = () => { state.value = 'resting'; face.stop(); };
+  document.getElementById('talk').onclick = () => {
+    talking = !talking;
+    if (talking) face.startTalking(4);
+    else face.stopTalking();
+  };
+  document.getElementById('chain').onclick = async () => {
+    face.play('thinking', { holdMs: Infinity });
+    await new Promise(r => setTimeout(r, 180)); // mid-morph
+    face.play('working', { holdMs: Infinity });
+    state.value = 'working';
+  };
+</script>
+</body>
+</html>
