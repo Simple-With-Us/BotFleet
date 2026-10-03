@@ -1,0 +1,19 @@
+{
+  "name": "BotFleet TV-Face Framework",
+  "version": "3.0.0",
+  "updated": "2026-09-26",
+  "cursorStateMap": {
+    "sleeping": "sleeping", "waking": "waking", "idle": "resting",
+    "listening": "listening", "thinking": "thinking", "searching": "searching", "working": "working",
+    "happy": "happy", "excited": "excited", "celebrate": "celebrate", "confused": "confused",
+    "curious": "curious", "sad": "sad", "surprised": "curious", "proud": "happy",
+    "playful": "celebrate", "angry": "alerting", "scared": "alerting", "shy": "sad",
+    "bored": "sleeping", "drowsy": "sleeping", "laughing": "happy", "suspicious": "curious",
+    "orbit": "fleet", "radar": "searching", "progress": "loading",
+    "spawning": "waking", "humming": "resting", "loading": "loading",
+    "dictating": "speaking", "writing": "typing", "sending": "sending",
+    "receiving": "receiving", "uploading": "sending", "notifying": "notifying",
+    "alerting": "alerting", "dragging": "working", "bouncing": "excited",
+    "powering-down": "powering_down"
+  }
+}
