@@ -115,8 +115,8 @@ export function SharedVpsRuntimeCard() {
         subtitle="This workspace runs bots on your own VPS."
       >
         <div className="text-[13px] text-ink-secondary">
-          Per-bot mode: each bot gets its own VPS container.{" "} The VPS mode is set in the server
-          config (<code>botDefaults.vpsMode</code>); there is no settings control for it.
+          Per-bot mode: each bot gets its own VPS container.{"\u00a0 "}The VPS mode is set in the
+          server config (<code>botDefaults.vpsMode</code>); there is no settings control for it.
         </div>
       </Card>
     );
@@ -129,13 +129,13 @@ export function SharedVpsRuntimeCard() {
     <Card
       id="setting-computers-shared-vps"
       title="Shared VPS VM"
-      subtitle="The shared Cua Linux sandbox running on your VPS, with a separate desktop for each bot. Bots share cookies, sign-ins, files, and installed apps/CLI tools."
+      subtitle="The shared Cua Linux sandbox running on your VPS, with a separate desktop for each bot.\u00a0 Bots share cookies, sign-ins, files, and installed apps/CLI tools."
     >
       <div className="flex flex-col gap-4">
         {unavailable ? (
           <div className="flex gap-2 text-[13px] text-ink-secondary">
             <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
-            <span>Could not inspect the VPS runtime. {error}</span>
+            <span>Could not inspect the VPS runtime.{"\u00a0 "}{error}</span>
           </div>
         ) : !status ? (
           <div className="flex items-center gap-2 text-[13px] text-ink-secondary">
@@ -157,7 +157,7 @@ export function SharedVpsRuntimeCard() {
             )}
             <div className="text-[13px] text-ink-secondary">
               {!selfHostedVpsEnabled
-                ? "Self-hosted VPS is disabled in workspace providers. Turn it on above to let bots use this."
+                ? "Self-hosted VPS is disabled in workspace providers.\u00a0 Turn it on above to let bots use this."
                 : running
                   ? "The VPS container is up and running."
                   : "The VPS container will be provisioned automatically when a bot needs it."}
