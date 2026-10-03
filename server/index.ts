@@ -56,6 +56,8 @@ import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
+import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
+import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import { resolveStaticFile } from "./static-files.ts";
 import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
 import { incomingRecording, recordingReview } from "./recorded-message.ts";
@@ -4657,6 +4659,8 @@ async function startTurn(
       { status: 409, pickUnusable: true },
     );
   }
+  const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
+  if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
   const instanceId = instance.instanceId;
   // Box-backed cloud borrows the boxAgent default model (and no per-bot effort).
   // VPS-backed cloud keeps the bot's modelSelection — that is the engine that
@@ -5448,6 +5452,8 @@ async function startTurn(
         if (jobReminder.text) drafts.push({ source: "automation", text: jobReminder.text });
         recordInjections(drafts);
       }
+      const finalWorkspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, cwd);
+      if (finalWorkspaceError) throw new Error(finalWorkspaceError);
       // Bind before sendTurn so assistant_text emitted during the launch
       // still has a chat id.  The pending key is migrated onto the
       // provider turnId once sendTurn returns.
@@ -6971,6 +6977,19 @@ async function runGroupMemberTurn(
     onDispatchError?.(message);
     return true;
   }
+  const contextTask = store.groupTaskByThread(group.id, threadId);
+  const workspaceError = taskWorkspaceExecutionError(
+    contextTask?.workspaceContext, instance.driverKind, undefined, contextTask?.pinnedCwd,
+  );
+  if (workspaceError) {
+    store.appendMessage(threadId, {
+      role: "bot", kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${workspaceError}`, ok: false },
+    });
+    onDispatchError?.(workspaceError);
+    return true;
+  }
   // A 1:1 or another room turn may have claimed this bot while connected-app
   // setup was in flight. Re-check immediately before the synchronous claim so
   // one bot can never own two provider processes.
@@ -7399,8 +7418,12 @@ async function runGroupMemberTurn(
     watchdog.watch(threadId, bot.id);
     // This member's running jobs and job notices open its room turn too.
     const roomJobReminder = jobTurnReminder(bot.id, threadId, roomJobs);
-    instance.adapter
-      .sendTurn({
+    // Recheck after awaited computer setup and use the same rejection cleanup
+    // as a provider failure, so a vanished folder cannot strand ownership.
+    Promise.resolve().then(() => {
+      const finalWorkspaceError = taskWorkspaceExecutionError(contextTask?.workspaceContext, instance.driverKind, undefined, cwd);
+      if (finalWorkspaceError) throw new Error(finalWorkspaceError);
+      return instance.adapter.sendTurn({
         threadId,
         text: roomJobReminder.text ? `${roomJobReminder.text}\n\n${text}` : text,
         system: roomSystem.text,
@@ -7414,7 +7437,8 @@ async function runGroupMemberTurn(
         autoApprove: bot.autoApprove === true,
         unattended: isUnattended(bot.id),
         ...memberTurnSelection(selection),
-      })
+      });
+    })
       .then((started) => {
         // delivered only once the model has the reminder (see the 1:1 lane)
         if (started.dispatched === false) restoreJobNotices(threadId, roomJobReminder.items);
@@ -12319,7 +12343,54 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (bot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
       const body = await readBody(req);
-      const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined);
+      let workspaceContext: TaskWorkspaceContext | undefined;
+      if (body.appRef !== undefined) {
+        const parsedRef = z.object({ kind: z.literal("group"), id: z.string().regex(/^[\w-]+$/) }).safeParse(body.appRef);
+        if (!parsedRef.success) return json(res, 400, { error: "appRef must identify an App group" });
+        const ref = parsedRef.data;
+        // Only an explicit stable ID binds a private task to an App.  Section
+        // names, the selected tab, and matching folders never imply membership.
+        const resolveFolder = (): { cwd: string } | { status: number; error: string } => {
+          const group = store.group(ref.id);
+          if (!group) return { status: 404, error: "no such App group" };
+          if (group.dm || !group.memberIds.includes(bot.id)) {
+            return { status: 400, error: "choose an App group assigned to this bot" };
+          }
+          if (!group.cwd) return { status: 400, error: "this App group needs a working folder first" };
+          const checked = validateBotCwd(group.cwd);
+          if (!checked.ok) return { status: 400, error: checked.error };
+          if (!checked.cwd) return { status: 400, error: "this App group needs a working folder first" };
+          const cwd = realOrResolved(checked.cwd);
+          if (req.headers["x-botfleet-companion"] === "1") {
+            const refused = cwdConfinementError(cwd, phoneCwdConfinement());
+            if (refused) return { status: 403, error: `${refused} — pick it in BotFleet on your computer` };
+          }
+          return { cwd };
+        };
+        const folder = resolveFolder();
+        if ("error" in folder) return json(res, folder.status, { error: folder.error });
+        try {
+          workspaceContext = await captureTaskWorkspaceContext({ kind: "group", id: ref.id }, folder.cwd);
+        } catch (error) {
+          if (error instanceof TaskWorkspaceContextError) return json(res, 400, { error: error.message });
+          throw error;
+        }
+        // Metadata probes yield.  Membership, folder access, and defaults may
+        // change during them; reject stale input before creating any thread.
+        const current = resolveFolder();
+        if ("error" in current) return json(res, current.status, { error: current.error });
+        if (current.cwd !== workspaceContext.cwd) {
+          return json(res, 409, { error: "the App folder changed during task setup — try again" });
+        }
+      }
+      const currentBot = store.bot(bot.id);
+      if (!currentBot) return json(res, 404, { error: "no such bot" });
+      if (currentBot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
+      if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
+        return json(res, 409, { error: "workspace settings changed during task setup — try again" });
+      }
+      const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined,
+        true, undefined, workspaceContext);
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
@@ -13572,10 +13643,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (patch.conversationMode === undefined) {
         return json(res, 400, { error: "nothing to save" });
       }
-      cfg.conversationMode = parseConversationMode(patch.conversationMode);
-      saveConfig({ conversationMode: cfg.conversationMode });
-      const mergeThreads = body.mergeThreads === true && cfg.conversationMode === "simple";
+      const nextMode = parseConversationMode(patch.conversationMode);
+      const mergeThreads = body.mergeThreads === true && nextMode === "simple";
       if (mergeThreads) store.mergeAllExtraThreads();
+      cfg.conversationMode = nextMode;
+      saveConfig({ conversationMode: cfg.conversationMode });
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
