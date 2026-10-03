@@ -1084,7 +1084,7 @@ describe("DSH MiniMax M3.1 reasoning effort", () => {
     const run = async (threadId: string, effort?: "xhigh") => {
       instance = await DshAgentDriver.create({
         instanceId: "dsh-m31-test",
-        displayName: "DSH",
+        displayName: "Clutch",
         environment: { HOME: scratch },
         enabled: true,
         config: { cli: FAKE_CLI, fullAuto: false },

@@ -215,8 +215,8 @@ interface DriverLineage {
 // Keyed by driverKind, because one class ("Sonnet") can be reached through
 // several engines and each engine's own catalog decides what it offers.
 //
-// TODO(model-lineage): minimax, mcodeAgent and dshAgent (DeepSeek Harness)
-// are deliberately absent.  Their catalogs are owned by the MiniMax/Harness
+// TODO(model-lineage): minimax, mcodeAgent and dshAgent (Clutch)
+// are deliberately absent.  Their catalogs are owned by the MiniMax/Clutch
 // lanes (PR #729, the harness-dsh-ids lane), and the DeepSeek V4.1 ids are
 // not yet proven accepted on this Mac, so migrating onto them could turn a
 // working saved slot into a rejected one.  Add a family here once those

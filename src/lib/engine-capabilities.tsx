@@ -146,7 +146,7 @@ const ANTIGRAVITY_ULTRA_NOTE =
   "Google AI subscription.  Gemini API rates below are the public catalog for the what-if projection, not an invoice.";
 
 const DEEPSEEK_HARNESS_NOTE =
-  "Harness runs models over the harness ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
+  "Clutch runs models over the Clutch ACP bridge.  Billing is DeepSeek pay-as-you-go at the public API catalog.  There is no subscription line on this engine.";
 
 /** The registry's owner contract.  Named rather than spelled
  *  `Record<string, EngineCapabilityEntry>` at the binding so the string index
@@ -471,7 +471,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
 
   "deepseek-harness": {
     id: "deepseek-harness",
-    displayName: "Harness",
+    displayName: "Clutch",
     capabilityBadgeColor: "bg-rose-600 text-white",
     group: "Cloud",
     pricing: {
@@ -516,11 +516,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
-      headline: "DeepSeek models over the harness ACP bridge, billed pay-as-you-go.",
+      headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
       prose: [
-        "Harness runs DeepSeek models through BotFleet's harness ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on Harness yet.",
+        "BotFleet does not support image attachments on Clutch yet.",
       ],
     },
     defaultModels: [
