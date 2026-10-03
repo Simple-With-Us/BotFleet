@@ -303,11 +303,12 @@ export interface TaskRecord {
    *  before the field existed; those attribute whole-task, by the
    *  configured selection. */
   usageByInstance?: Record<string, InstanceUsage>;
-  /** the folder this task's turns run in, pinned on its first turn from
-   * the bot's `cwd` at that moment. Pinned, not read live: Claude keeps
-   * sessions per project directory and Codex threads carry their cwd, so
-   * a folder that moved under a live session would break resume. `null`
-   * = pinned to the default (home); absent = not pinned yet. */
+  /** the folder this task's turns run in.  New tasks snapshot a bot-specific
+   * `cwd` when present; otherwise dispatch can still apply its workspace
+   * fallback.  Pinned, not read live: Claude keeps sessions per project
+   * directory and Codex threads carry their cwd, so a folder that moved
+   * under a live session would break resume.  `null` = explicitly pinned to
+   * the default (home); absent = not pinned yet. */
   cwd?: string | null;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
@@ -2289,6 +2290,7 @@ export class Store {
       title: title?.trim() || UNTITLED_TASK,
       createdAt: Date.now(),
       resumeCursors: {},
+      ...(bot.cwd !== undefined ? { cwd: bot.cwd } : {}),
       ...(automationKey ? { automationKey } : {}),
     };
     bot.tasks = [task, ...(bot.tasks ?? [])];

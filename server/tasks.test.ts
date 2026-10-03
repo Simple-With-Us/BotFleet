@@ -51,6 +51,18 @@ describe("tasks", () => {
     expect(store.messagesFor(firstThread).length).toBeGreaterThan(0);
   });
 
+  it("pins a new task to the current bot folder before its first turn", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    store.patchBot(bot.id, { cwd: "/tmp/project-a" });
+
+    const task = store.createTask(bot.id)!;
+    expect(task.cwd).toBe("/tmp/project-a");
+
+    store.patchBot(bot.id, { cwd: "/tmp/project-b" });
+    expect(store.pinTaskCwd(bot.id, task.threadId)).toBe("/tmp/project-a");
+  });
+
   it("can create a detached routine task without changing the visible conversation", async () => {
     const { store } = await freshStore();
     const bot = store.createBot();
