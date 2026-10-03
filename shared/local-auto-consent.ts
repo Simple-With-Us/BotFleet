@@ -43,7 +43,7 @@ export const COMPUTER_PROVIDER_LABEL: Record<ComputerProviderId, string> = {
 export const COMPUTER_PROVIDER_DISABLE_IMPACT: Record<ComputerProviderId, string> = {
   asciiBox: "Turning this off blocks every bot that currently uses ASCII.dev Box.  Each affected bot would need a new computer picked manually.",
   selfHostedVps: "Turning this off stops new use of the VPS; existing containers and workspaces stay until removed.  Bots that use it lose the VPS until they get another computer.",
-  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their private or shared VM desktop.",
+  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their VM desktop.",
   localMac: "Turning this off keeps every bot off this computer.  Bots that use This Computer lose it, and Auto approvals stop working for them.",
 };
 
