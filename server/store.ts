@@ -2290,9 +2290,9 @@ export class Store {
       title: title?.trim() || UNTITLED_TASK,
       createdAt: Date.now(),
       resumeCursors: {},
-      ...(bot.cwd !== undefined ? { cwd: bot.cwd } : {}),
       ...(automationKey ? { automationKey } : {}),
     };
+    if (bot.cwd !== undefined) task.cwd = bot.cwd;
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {
       bot.threadId = task.threadId;
