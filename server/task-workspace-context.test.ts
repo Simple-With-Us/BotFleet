@@ -48,17 +48,15 @@ describe("captureTaskWorkspaceContext", () => {
     const before = Date.now();
     const context = await captureTaskWorkspaceContext(appRef, cwd);
 
-    expect(context).toEqual({
-      kind: "local",
-      appRef,
-      cwd,
-      git: {
-        checkoutRoot,
-        branch: "fixture-branch",
-        headCommit: git(checkoutRoot, "rev-parse", "HEAD"),
-      },
-      capturedAt: expect.any(Number),
-    });
+    expect(context.kind).toBe("local");
+    expect(context.appRef).toEqual(appRef);
+    expect(context.cwd).toBe(cwd);
+    if (!context.git) throw new Error("Expected Git metadata for the fixture checkout");
+    // Windows Git may use long names and forward slashes while the fixture
+    // retains an 8.3 path alias.  Native realpath resolves both spellings.
+    expect(realpathSync.native(context.git.checkoutRoot)).toBe(realpathSync.native(checkoutRoot));
+    expect(context.git.branch).toBe("fixture-branch");
+    expect(context.git.headCommit).toBe(git(checkoutRoot, "rev-parse", "HEAD"));
     expect(context.capturedAt).toBeGreaterThanOrEqual(before);
     expect(context.capturedAt).toBeLessThanOrEqual(Date.now());
   });
