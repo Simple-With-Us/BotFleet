@@ -4,7 +4,16 @@
 // change left the old skin's GIF on screen.
 import { describe, expect, it } from "vitest";
 
-import { planFrame, tvFaceFrameChanged, tvFaceSkinDir, TVFACE_TRANSITION_MS } from "./TVFaceAvatar";
+import {
+  planFrame,
+  tvFaceFrameChanged,
+  tvFaceSkinDir,
+  transitionDelayMs,
+  isUrgentExpression,
+  TVFACE_TRANSITION_MS,
+  TVFACE_URGENT,
+  SHIPPED_SKINS,
+} from "./TVFaceAvatar";
 
 describe("tvFaceFrameChanged", () => {
   it("stays quiet when nothing about the frame changed", () => {
@@ -16,37 +25,82 @@ describe("tvFaceFrameChanged", () => {
   });
 
   it("replays on a skin-only change - the GIF path embeds the skin", () => {
-    // Regression pin for the #695 review finding: color change with an
-    // unchanged expression must still refresh the displayed asset.
     expect(tvFaceFrameChanged({ expression: "resting", skin: "default" }, { expression: "resting", skin: "blue" })).toBe(true);
   });
 });
 
 describe("tvFaceSkinDir", () => {
-  it("maps every color to a skins directory that actually ships", () => {
-    // Only public/tv-face/skins/default ships. Named skins without assets
-    // must fall back to it, not 404 (the BF-Designer finding on #700).
+  it("maps orange to the default pack directory", () => {
     expect(tvFaceSkinDir("orange")).toBe("default");
-    for (const color of ["blue", "green", "purple", "pink", "red", "yellow"] as const) {
-      expect(tvFaceSkinDir(color)).toBe("default");
-    }
-    // Unknown and "default" itself take the same safe path.
     expect(tvFaceSkinDir("default")).toBe("default");
+  });
+
+  it("maps every shipped BotColor to its own directory", () => {
+    for (const color of ["blue", "green", "purple", "pink", "red", "yellow", "cyan", "teal", "coral"] as const) {
+      expect(SHIPPED_SKINS.has(color), `${color} should be shipped`).toBe(true);
+      expect(tvFaceSkinDir(color)).toBe(color);
+    }
+  });
+
+  it("falls back to default for unshipped colors so they never 404", () => {
+    // chartreuse is not a BotColor and is not shipped.
     expect(tvFaceSkinDir("chartreuse" as never)).toBe("default");
   });
 });
 
+describe("urgent interrupt", () => {
+  it("names the approval/error/scare cues as urgent", () => {
+    for (const e of ["alerting", "crash", "angry", "scared", "notifying"] as const) {
+      expect(isUrgentExpression(e)).toBe(true);
+      expect(TVFACE_URGENT.has(e)).toBe(true);
+    }
+  });
+
+  it("does not treat everyday work as urgent", () => {
+    for (const e of ["thinking", "typing", "speaking", "working", "listening"] as const) {
+      expect(isUrgentExpression(e)).toBe(false);
+    }
+  });
+
+  it("cuts straight to hold when the destination is urgent, even from rest", () => {
+    // No enter wait — approval/error must land immediately.
+    expect(planFrame("resting", "alerting")).toEqual([
+      { expression: "alerting", kind: "hold", delayAfterMs: 0 },
+    ]);
+    expect(planFrame("thinking", "crash")).toEqual([
+      { expression: "crash", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("still plays a full return when going home from an urgent hold", () => {
+    // Leaving crash back to rest can keep the return if crash has one.
+    const steps = planFrame("crash", "resting");
+    expect(steps[0].kind).toBe("return");
+    expect(steps[0].expression).toBe("crash");
+    expect(steps[steps.length - 1]).toEqual({ expression: "resting", kind: "still", delayAfterMs: 0 });
+  });
+});
+
+describe("transitionDelayMs", () => {
+  it("returns 0 for urgent enter targets", () => {
+    expect(transitionDelayMs("enter", "alerting")).toBe(0);
+  });
+
+  it("matches TVFACE_TRANSITION_MS at speed 1 for normal enters", () => {
+    expect(transitionDelayMs("enter", "thinking")).toBe(TVFACE_TRANSITION_MS);
+  });
+
+  it("halves the wait at speed 2 without re-encoding the GIF", () => {
+    expect(transitionDelayMs("enter", "thinking", 2)).toBe(500);
+  });
+});
+
 describe("planFrame", () => {
-  // Real shipped expression names, and deliberately drawn from the set that
-  // actually has enter/return art on disk.
-  // Every member below is in TVFACE_HAS_ENTER_RETURN, so each has enter AND
-  // return art on disk. Picking an expression outside the set makes these
-  // assertions meaningless, because such an expression has no return file.
   const withTransitions = [
     "listening", "thinking", "typing", "speaking", "computer", "memory",
   ] as const;
 
-  it("plays enter then hold when leaving rest", () => {
+  it("plays enter then hold when leaving rest for a non-urgent expression", () => {
     expect(planFrame("resting", "typing")).toEqual([
       { expression: "typing", kind: "enter", delayAfterMs: TVFACE_TRANSITION_MS },
       { expression: "typing", kind: "hold", delayAfterMs: 0 },
@@ -54,7 +108,6 @@ describe("planFrame", () => {
   });
 
   it("plays return then the resting still when going back to rest", () => {
-    // "typing" is in TVFACE_HAS_ENTER_RETURN, so it has a return on disk.
     expect(planFrame("typing", "resting")).toEqual([
       { expression: "typing", kind: "return", delayAfterMs: TVFACE_TRANSITION_MS },
       { expression: "resting", kind: "still", delayAfterMs: 0 },
@@ -62,9 +115,6 @@ describe("planFrame", () => {
   });
 
   it("cuts straight to the new hold between two active states - no enter", () => {
-    // The pop fix. Every `_enter` is anchored to resting.png while the
-    // previous `_hold` ends wherever it ends, so playing an enter here jumped
-    // on every state-to-state transition.
     expect(planFrame("thinking", "typing")).toEqual([
       { expression: "typing", kind: "hold", delayAfterMs: 0 },
     ]);
@@ -88,13 +138,14 @@ describe("planFrame", () => {
       ["working", "resting"],
       ["thinking", "speaking"],
       ["resting", "resting"],
+      ["thinking", "alerting"],
     ] as const) {
       const steps = planFrame(from, to);
       expect(steps[steps.length - 1].delayAfterMs).toBe(0);
     }
   });
 
-  it("only ever emits an enter when coming from rest", () => {
+  it("only ever emits an enter when coming from rest (and not urgent)", () => {
     for (const from of withTransitions) {
       for (const to of withTransitions) {
         if (from === to) continue;
@@ -104,7 +155,7 @@ describe("planFrame", () => {
   });
 
   it("only ever emits a return when going to rest", () => {
-    for (const from of withTransitions) {  // every member has a return on disk
+    for (const from of withTransitions) {
       const steps = planFrame(from, "resting");
       expect(steps.filter((s) => s.kind === "return")).toHaveLength(1);
       expect(steps[steps.length - 1].expression).toBe("resting");
@@ -112,10 +163,13 @@ describe("planFrame", () => {
   });
 
   it("skips the return for an expression that has no transition art", () => {
-    // happy has a hold but no return, so going home from it must land
-    // directly on the resting still rather than requesting a 404.
     const steps = planFrame("happy", "resting");
     expect(steps).toEqual([{ expression: "resting", kind: "still", delayAfterMs: 0 }]);
   });
-});
 
+  it("honours transitionSpeed on enter waits", () => {
+    const steps = planFrame("resting", "thinking", { speed: 2 });
+    expect(steps[0]).toEqual({ expression: "thinking", kind: "enter", delayAfterMs: 500 });
+    expect(steps[1]).toEqual({ expression: "thinking", kind: "hold", delayAfterMs: 0 });
+  });
+});
