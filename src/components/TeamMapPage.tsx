@@ -229,7 +229,7 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
               </h2>
             </div>
             <p className="mt-1.5 max-w-[520px] text-[12.5px] leading-relaxed text-ink-secondary">
-              A team brief shown to every bot in this section at the start of each turn. Only you can edit it.
+              A team brief shown to every bot in this section at the start of each turn.{"\u00a0 "}Only you can edit it.
             </p>
           </div>
           <button
@@ -420,7 +420,7 @@ export function TeamMapPage() {
             ))}
             {edges.length === 0 && (
               <div className="rounded-xl border border-dashed border-hairline bg-panel px-4 py-6 text-center text-[12.5px] text-ink-secondary">
-                No bot-to-bot handoffs yet. Ask a Chief of Staff to delegate a task and it will appear here live.
+                No bot-to-bot handoffs yet.{"\u00a0 "}Ask a Chief of Staff to delegate a task and it will appear here live.
               </div>
             )}
           </div>

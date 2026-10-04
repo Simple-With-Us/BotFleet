@@ -546,7 +546,7 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
             <p className="mt-2 text-[11px]">Based on retained history.{'\u00a0 '}Combined deliveries count once per execution; cancellations and denials are excluded from the completion rate.</p>
           </section>
           {error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
-          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer. Open its task to continue the run.</div>}
+          {run?.status === "waiting" && <div className="rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-3 text-[13px] text-warning">This bot needs your answer.{"\u00a0 "}Open its task to continue the run.</div>}
         </div>
         <div className="flex flex-wrap items-center gap-2 border-t border-hairline/40 px-5 py-4">
           {routine && <button disabled={working} onClick={() => void invoke(`/api/routines/${routine.id}/run`)} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Play size={14} />Run Now</button>}
@@ -876,7 +876,7 @@ export function RoutinesPage() {
               {visibleBots.length === 0 && <CalendarClock size={58} className="text-ink-secondary/40" />}
             </div>
             <h2 className="text-[18px] font-semibold text-ink">Put your bot fleet on a rhythm</h2>
-            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work. Every run becomes a separate task with its own result.</p>
+            <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Plan research briefs, daily check-ins, recurring reviews, or one-time work.{"\u00a0 "}Every run becomes a separate task with its own result.</p>
             <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="mt-5 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-[13px] font-medium text-white hover:brightness-110 disabled:opacity-40"><Plus size={15} />Create Your First Routine</button>
             {visibleBots.length === 0 && <p className="mt-3 text-[12px] text-warning">Create a bot first, then come back to schedule it.</p>}
           </div>
