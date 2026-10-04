@@ -143,7 +143,7 @@ export function TVFaceAvatar({
   const skinDir = tvFaceSkinDir(color);
 
   const [currentGif, setCurrentGif] = useState<string>("");
-  const [imgKey, setImgKey] = useState<string>("");
+  const [imgKey, setImgKey] = useState<string>(() => `${skinDir}:${expression}:still`);
   const holdEpochRef = useRef(0);
   const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
