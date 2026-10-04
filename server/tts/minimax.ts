@@ -335,9 +335,9 @@ export function sanitizeForTTS(text: string): string {
     // keep the operator in "5 - 3 = 2" — a minus sign between two numbers is
     // arithmetic, not a clause dash, and reads as "five, three" otherwise
     .replace(
-      /(\S) - (\S)/g,
+      /(\S) - (?=(\S))/g,
       (_m, before: string, after: string) =>
-        (/\d/.test(before) && /\d/.test(after)) ? `${before} - ${after}` : `${before}, ${after}`,
+        (/\d/.test(before) && /\d/.test(after)) ? `${before} - ` : `${before}, `,
     )
     // Replace ellipses (ASCII "..." and the Unicode "…") with a single period
     .replace(/(?:\.{2,}|…+)/g, ".")

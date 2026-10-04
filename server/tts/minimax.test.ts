@@ -248,9 +248,14 @@ describe("synthesize", () => {
       const { sanitizeForTTS } = await driver();
       // arithmetic: the operator has to survive or it reads as "five, three"
       expect(sanitizeForTTS("5 - 3 = 2")).toBe("5 - 3 = 2");
+      expect(sanitizeForTTS("5 - 3 - 1 = 1")).toBe("5 - 3 - 1 = 1");
       // a digit on one side only is still a clause dash
       expect(sanitizeForTTS("Step 1 - then deploy")).toBe("Step 1, then deploy");
       expect(sanitizeForTTS("Start - middle end")).toBe("Start, middle end");
+      // consecutive clause dashes with single non-space characters
+      expect(sanitizeForTTS("a - b - c")).toBe("a, b, c");
+      expect(sanitizeForTTS("I - a - programmer")).toBe("I, a, programmer");
+      expect(sanitizeForTTS("a - b - c - d")).toBe("a, b, c, d");
     });
 
     it("collapses a Unicode ellipsis to a single period", async () => {

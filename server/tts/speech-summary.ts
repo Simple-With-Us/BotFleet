@@ -189,7 +189,7 @@ export async function summarizeForVoice(
         const summary = parsed.data.choices?.[0]?.message?.content?.trim();
         if (summary) {
           // Strip any accidental brackets or tags
-          return sanitizeForTTS(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+          return sanitizeForTTS(speakable(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "")));
         }
       }
     }
@@ -219,7 +219,7 @@ export async function summarizeForVoice(
       if (fbParsed.success) {
         const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
         if (fbSummary) {
-          return sanitizeForTTS(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+          return sanitizeForTTS(speakable(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "")));
         }
       }
     }
