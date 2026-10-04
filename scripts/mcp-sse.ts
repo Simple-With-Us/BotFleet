@@ -1,230 +1,285 @@
-import { createServer, IncomingMessage, ServerResponse } from 'node:http';
-import { spawn, ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import fs from 'node:fs';
+#!/usr/bin/env node
+// Model Context Protocol (MCP) HTTP & SSE Server for BotFleet Admin.
+// Serves remote MCP clients (such as MCP Agent on iOS, Cursor Cloud, and Claude Desktop)
+// over HTTP and Server-Sent Events (SSE) by wrapping the core tool dispatch in scripts/mcp-server.ts.
 
-// SSE gateway for the seat's stdio MCP server (scripts/mcp-server.ts), so
-// remote clients - the iOS app - can reach it over authenticated HTTP/SSE.
-// node:http only: this repo has no express dependency.
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
+import { processMcpMessage, TOOLS } from "./mcp-server.ts";
 
-/** Resolve the bearer token once, from the seat secrets file or the env.
- *  Fail-closed: with no token configured there is nothing safe to compare
- *  against, so the gateway refuses to start rather than fall back to a
- *  guessable literal. */
-function resolveAuthToken(): string | null {
-    try {
-        const envFile = fs.readFileSync(path.join(process.env.HOME || '/Users/jay', '.secrets', 'seat-mcp.env'), 'utf8');
-        // Anchored to the line start, and the token runs to the first
-        // whitespace: an inline comment after the value (always
-        // whitespace-separated) stays out of the credential, while a '#'
-        // inside the value itself is kept verbatim.
-        const match = envFile.match(/^SEAT_MCP_TOKEN=(\S+)/m);
-        if (match && match[1]) return match[1];
-    } catch (e) { }
-    const fromEnv = process.env.SEAT_MCP_TOKEN?.trim();
-    return fromEnv || null;
+const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
+const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
+const HARNESS_URL = process.env.BOTFLEET_URL || "http://127.0.0.1:8799";
+const AUTH_TOKEN = (process.env.BOTFLEET_MCP_TOKEN || process.env.BOTFLEET_TOKEN || "").trim();
+
+// Ensure the underlying mcp-server.ts knows where to find the harness
+if (!process.env.BOTFLEET_URL) {
+  process.env.BOTFLEET_URL = HARNESS_URL;
 }
 
-const AUTH_TOKEN = resolveAuthToken();
-if (!AUTH_TOKEN) {
-    console.error('[FATAL] SEAT_MCP_TOKEN is not configured (checked ~/.secrets/seat-mcp.env and the environment); refusing to start unauthenticated.');
-    process.exit(1);
+interface SseSession {
+  id: string;
+  res: ServerResponse;
+  createdAt: number;
+  lastPing: number;
 }
 
-const PORT = Number(process.env.PORT) || 8794;
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const activeSessions = new Map<string, SseSession>();
 
-interface Session { id: string; process: ChildProcess; res: ServerResponse; }
-const sessions = new Map<string, Session>();
-
-/** Kill a spawned MCP child exactly once, whether the trigger is client
- *  disconnect, response close, or natural exit. */
-function killOnce(child: ChildProcess): void {
-    if (child.exitCode === null && !child.killed) child.kill();
+function log(msg: string): void {
+  const ts = new Date().toISOString();
+  process.stdout.write(`[${ts}] [botfleet-mcp-sse] ${msg}\n`);
 }
 
-/** Pipe a child stdout stream of NDJSON into `emit`, one complete line at a
- *  time.  Chunks split anywhere, so split only on newlines and hold the
- *  partial tail; flush whatever remains when the stream ends. */
-function pipeNdjsonLines(stream: NodeJS.ReadableStream | null, emit: (line: string) => void): void {
-    if (!stream) return;
-    let pending = '';
-    stream.on('data', (data) => {
-        pending += data.toString();
-        const lines = pending.split('\n');
-        pending = lines.pop() ?? '';
-        for (const line of lines) {
-            if (line.trim()) emit(line);
-        }
+function logError(msg: string): void {
+  const ts = new Date().toISOString();
+  process.stderr.write(`[${ts}] [botfleet-mcp-sse] ERROR: ${msg}\n`);
+}
+
+function setCorsHeaders(res: ServerResponse): void {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Accept, X-Requested-With, Baggage, Sentry-Trace, Mcp-Session-Id",
+  );
+  res.setHeader("Access-Control-Expose-Headers", "Content-Type, Mcp-Session-Id");
+}
+
+function sendJson(res: ServerResponse, status: number, data: unknown, isHead = false): void {
+  setCorsHeaders(res);
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.statusCode = status;
+  if (isHead) {
+    res.end();
+  } else {
+    res.end(JSON.stringify(data) + "\n");
+  }
+}
+
+function isAuthorized(req: IncomingMessage): boolean {
+  if (!AUTH_TOKEN) return true;
+  const auth = req.headers.authorization;
+  if (!auth) return false;
+  const parts = auth.split(" ");
+  if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") return false;
+  return parts[1] === AUTH_TOKEN;
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      // 10 MB payload limit for tool calls/messages
+      if (body.length > 10 * 1024 * 1024) {
+        req.destroy();
+        reject(new Error("Payload too large"));
+      }
     });
-    stream.on('end', () => {
-        if (pending.trim()) emit(pending);
-        pending = '';
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
+
+const server = createServer(async (req, res) => {
+  setCorsHeaders(res);
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+
+  // Health and discovery endpoints
+  if ((req.method === "GET" || req.method === "HEAD") && (pathname === "/health" || pathname === "/api/health" || pathname === "/")) {
+    sendJson(
+      res,
+      200,
+      {
+        status: "ok",
+        app: "botfleet-admin-mcp",
+        listen: `${HOST}:${PORT}`,
+        harness: HARNESS_URL,
+        tools: TOOLS.length,
+        activeSessions: activeSessions.size,
+      },
+      req.method === "HEAD",
+    );
+    return;
+  }
+
+  // Authentication check for MCP endpoints if configured
+  if (!isAuthorized(req)) {
+    sendJson(res, 401, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32001, message: "Unauthorized: Invalid or missing Bearer token" },
     });
-}
+    return;
+  }
 
-function spawnMcp(): ChildProcess {
-    return spawn('pnpm', ['run', 'mcp'], { cwd: path.resolve(__dirname, '..'), stdio: ['pipe', 'pipe', 'inherit'] });
-}
-
-function sseHeaders(res: ServerResponse): void {
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-    });
-}
-
-function send(res: ServerResponse, status: number, body: string): void {
-    res.writeHead(status, { 'Content-Type': 'text/plain' });
-    res.end(body);
-}
-
-function readJsonBody(req: IncomingMessage): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-        let raw = '';
-        req.on('data', (chunk) => { raw += chunk; });
-        req.on('end', () => {
-            try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); }
-        });
-        req.on('error', reject);
-    });
-}
-
-/** Bearer auth with the iOS app's double-"Bearer" workaround.  Never logs
- *  the Authorization header: it carries the token. */
-function authorize(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
-    console.log(`[REQUEST] ${req.method} ${url.pathname}`);
-
-    let authHeader = req.headers.authorization || '';
-    authHeader = authHeader.replace(/^Bearer\s+Bearer\s+/i, 'Bearer ');
-    const providedToken = authHeader.split(' ')[1];
-
-    if (!authHeader.startsWith('Bearer ') || providedToken !== AUTH_TOKEN) {
-        console.log(`[AUTH FAILED] Missing or invalid token for ${req.method} ${url.pathname}`);
-        send(res, 401, 'Unauthorized');
-        return false;
-    }
-    return true;
-}
-
-function handleStreamablePost(req: IncomingMessage, res: ServerResponse, body: unknown): void {
-    console.log(`[STREAMABLE HTTP] Got POST request`);
-    const mcpProcess = spawnMcp();
-
-    sseHeaders(res);
-    pipeNdjsonLines(mcpProcess.stdout, (line) => {
-        res.write(`data: ${line}\n\n`);
-    });
-
-    mcpProcess.on('exit', () => {
-        res.end();
-    });
-
-    // Client disconnect must not orphan the spawned MCP server.
-    res.on('close', () => {
-        killOnce(mcpProcess);
-    });
-
-    mcpProcess.stdin?.write(JSON.stringify(body) + '\n');
-    mcpProcess.stdin?.end();
-}
-
-function handleSseGet(req: IncomingMessage, res: ServerResponse): void {
+  // SSE Transport connection (GET)
+  // Supports /mcp/sse, /mcp/sse/, /sse, /mcp
+  const isSsePath = pathname === "/mcp/sse" || pathname === "/sse" || pathname === "/mcp";
+  if (req.method === "GET" && isSsePath) {
     const sessionId = randomUUID();
-    console.log(`[SSE OPEN] Session ${sessionId}`);
-    sseHeaders(res);
+    log(`New SSE client connecting... Session: ${sessionId} from ${req.socket.remoteAddress}`);
 
-    const mcpProcess = spawnMcp();
-    sessions.set(sessionId, { id: sessionId, process: mcpProcess, res });
-
-    res.write(`event: endpoint\ndata: /mcp/messages?sessionId=${sessionId}\n\n`);
-
-    pipeNdjsonLines(mcpProcess.stdout, (line) => {
-        res.write(`event: message\ndata: ${line}\n\n`);
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "Mcp-Session-Id": sessionId,
     });
 
-    // A dead MCP child means a dead session: end the stream and drop the
-    // session so a later POST /mcp/messages 404s instead of writing into a
-    // dead pipe.  Guarded so the req close path below stays idempotent.
-    mcpProcess.on('exit', (code, signal) => {
-        console.log(`[MCP EXIT] Session ${sessionId} child exited (code ${code}, signal ${signal})`);
-        sessions.delete(sessionId);
-        if (!res.writableEnded) res.end();
+    const session: SseSession = {
+      id: sessionId,
+      res,
+      createdAt: Date.now(),
+      lastPing: Date.now(),
+    };
+    activeSessions.set(sessionId, session);
+
+    // Initial endpoint announcement event as per MCP specification
+    // The client will use this URI to POST JSON-RPC messages
+    const endpointUri = `/mcp/messages?sessionId=${sessionId}`;
+    res.write(`event: endpoint\ndata: ${endpointUri}\n\n`);
+
+    req.on("close", () => {
+      log(`SSE client disconnected: ${sessionId}`);
+      activeSessions.delete(sessionId);
     });
 
-    req.on('close', () => {
-        console.log(`[SSE CLOSE] Session ${sessionId}`);
-        killOnce(mcpProcess);
-        sessions.delete(sessionId);
-    });
-}
+    return;
+  }
 
-const server = createServer((req, res) => {
-    void (async () => {
-        const url = new URL(req.url || '/', 'http://127.0.0.1');
+  // POST endpoint for messages
+  // Can be called via /mcp/messages, /messages, or directly on /mcp/sse, /mcp, /
+  if (req.method === "POST") {
+    let rawBody = "";
+    try {
+      rawBody = await readBody(req);
+    } catch (err) {
+      sendJson(res, 400, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: (err as Error).message || "Parse error" },
+      });
+      return;
+    }
 
-        if (req.method === 'OPTIONS') {
-            res.writeHead(200);
-            res.end();
-            return;
+    const sessionId = url.searchParams.get("sessionId") || (req.headers["mcp-session-id"] as string | undefined);
+
+    if (sessionId && activeSessions.has(sessionId)) {
+      // SSE Session route:
+      // Acknowledge the POST request immediately with 202 Accepted,
+      // and transmit the JSON-RPC reply over the active SSE stream.
+      const session = activeSessions.get(sessionId)!;
+      res.statusCode = 202;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.end(JSON.stringify({ ok: true, status: "accepted" }) + "\n");
+
+      try {
+        const responseJson = await processMcpMessage(rawBody);
+        if (responseJson && !session.res.writableEnded) {
+          session.res.write(`event: message\ndata: ${responseJson}\n\n`);
         }
-        if (!authorize(req, res, url)) return;
-
-        if (req.method === 'POST' && (url.pathname === '/mcp' || url.pathname === '/mcp/sse')) {
-            let body: unknown;
-            try {
-                body = await readJsonBody(req);
-            } catch (e) {
-                send(res, 400, 'Bad JSON');
-                return;
-            }
-            handleStreamablePost(req, res, body);
-            return;
+      } catch (err) {
+        logError(`Error processing message for session ${sessionId}: ${err}`);
+        if (!session.res.writableEnded) {
+          const errReply = JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32603, message: (err as Error).message || "Internal error" },
+          });
+          session.res.write(`event: message\ndata: ${errReply}\n\n`);
         }
+      }
+      return;
+    }
 
-        if (req.method === 'GET' && (url.pathname === '/mcp' || url.pathname === '/mcp/sse')) {
-            handleSseGet(req, res);
-            return;
-        }
+    // Direct Streamable HTTP POST route (no SSE session required):
+    // Useful for clients using streamable HTTP transport or direct RPC calls
+    try {
+      const responseJson = await processMcpMessage(rawBody);
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+      });
+      res.end(responseJson || "{}\n");
+    } catch (err) {
+      logError(`Error processing direct POST message: ${err}`);
+      sendJson(res, 500, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32603, message: (err as Error).message || "Internal error" },
+      });
+    }
+    return;
+  }
 
-        if (req.method === 'POST' && url.pathname === '/mcp/messages') {
-            const sessionId = url.searchParams.get('sessionId') || '';
-            if (!sessionId || !sessions.has(sessionId)) {
-                send(res, 404, 'Session not found');
-                return;
-            }
-            let body: unknown;
-            try {
-                body = await readJsonBody(req);
-            } catch (e) {
-                send(res, 400, 'Bad JSON');
-                return;
-            }
-            // The child can die while the body is in flight: the exit handler
-            // deletes the session during the await above, so re-check instead
-            // of trusting the earlier sessions.has().  A dead session (or a
-            // child whose stdin is already gone) is a 404, never a TypeError.
-            const session = sessions.get(sessionId);
-            const stdin = session?.process.stdin;
-            if (!session || !stdin || stdin.destroyed || !stdin.writable) {
-                send(res, 404, 'Session not found');
-                return;
-            }
-            stdin.write(JSON.stringify(body) + '\n');
-            send(res, 202, 'Accepted');
-            return;
-        }
-
-        console.log(`[404] Route not found: ${url.pathname}`);
-        send(res, 404, 'Not found');
-    })().catch((err) => {
-        console.error('[ERROR]', err);
-        if (!res.headersSent) send(res, 500, 'Internal error');
-        else res.end();
-    });
+  // Fallback for unhandled routes
+  sendJson(res, 404, { error: `Not found: ${req.method} ${pathname}` });
 });
 
-server.listen(PORT, '127.0.0.1', () => console.log(`Started on ${PORT}`));
+// Periodic keepalive ping to prevent intermediary proxies (like Cloudflare) from terminating idle SSE connections
+const PING_INTERVAL_MS = 15_000;
+const pingInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of activeSessions.entries()) {
+    if (session.res.writableEnded) {
+      activeSessions.delete(id);
+      continue;
+    }
+    session.res.write(": keepalive\r\n\r\n");
+    session.lastPing = now;
+  }
+}, PING_INTERVAL_MS);
+
+export function startServer(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(PORT, HOST, () => {
+      log(`BotFleet MCP HTTP/SSE server listening on http://${HOST}:${PORT}`);
+      log(`Harness target: ${HARNESS_URL}`);
+      log(`Ready to accept connections from botfleetadmin.jays.services`);
+      resolve();
+    });
+  });
+}
+
+function handleShutdown(signal: string): void {
+  log(`Received ${signal}, shutting down gracefully...`);
+  clearInterval(pingInterval);
+
+  for (const session of activeSessions.values()) {
+    try {
+      session.res.end();
+    } catch {}
+  }
+  activeSessions.clear();
+
+  server.close(() => {
+    log("Server closed");
+    process.exit(0);
+  });
+
+  // Force close after 5s grace period
+  setTimeout(() => {
+    process.exit(0);
+  }, 5000).unref();
+}
+
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
+
+if (process.argv[1] && (process.argv[1].endsWith("mcp-sse.ts") || process.argv[1].endsWith("mcp-sse.js"))) {
+  startServer().catch((err) => {
+    logError(`Failed to start server: ${err}`);
+    process.exit(1);
+  });
+}
