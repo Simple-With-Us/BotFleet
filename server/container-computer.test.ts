@@ -29,6 +29,7 @@ import {
   DEFAULT_CONTAINER_LIMITS,
   LIMITS_LABEL,
   adaptContainerLimits,
+  declaredHardening,
   authorizeBoxGateway,
   defaultCommandRunner,
   healCuaShimsScript,
@@ -1233,7 +1234,7 @@ describe("adaptive container limits", () => {
 
   it("shrinks to an OrbStack-sized runtime (3 CPUs, 4 GiB) instead of failing to start", () => {
     expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 3, memoryGib: 3 });
-    expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 2 });
+    expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 1 });
   });
 
   it("honours a configured ceiling and never exceeds 4 / 8", () => {
@@ -1259,6 +1260,22 @@ describe("adaptive container limits", () => {
     expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(DEFAULT_CONTAINER_LIMITS);
     expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(DEFAULT_CONTAINER_LIMITS);
     expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("judges declaredHardening against safety floors and rejects self-declared sub-minimum limits", () => {
+    expect(declaredHardening({ [LIMITS_LABEL]: "3x3" })).toEqual({
+      nanoCpus: 3_000_000_000,
+      memoryBytes: 3 * 1024 ** 3,
+    });
+    // Labels declaring under 2 CPUs or under MIN_CONTAINER_MEMORY_GIB must fall back to DEFAULT_CONTAINER_LIMITS
+    expect(declaredHardening({ [LIMITS_LABEL]: "1x1" })).toEqual({
+      nanoCpus: DEFAULT_CONTAINER_LIMITS.cpus * 1_000_000_000,
+      memoryBytes: DEFAULT_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+    });
+    expect(declaredHardening(null)).toEqual({
+      nanoCpus: DEFAULT_CONTAINER_LIMITS.cpus * 1_000_000_000,
+      memoryBytes: DEFAULT_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+    });
   });
 
   it("creates the container with the adapted caps and records them in a label", () => {

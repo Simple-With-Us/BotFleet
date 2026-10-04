@@ -850,7 +850,7 @@ export function RoutinesPage() {
             <><strong className="font-medium text-ink">Webhook</strong> = an event endpoint that creates a fresh task. Connected services can call it when something happens; the receiving bot keeps its existing tools and permissions.</>
           )}
         </div>
-        {section === "calendar" && <div className="mt-3 flex flex-wrap items-center gap-2">
+        {section === "calendar" && <div style={noDragStyle} className="mt-3 flex flex-wrap items-center gap-2">
           <div className="flex items-center rounded-xl border border-hairline/50 bg-panel p-0.5">
             <button onClick={() => move(-1)} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink" aria-label="Previous Dates"><ChevronLeft size={16} /></button>
             <button onClick={goToday} className="px-2.5 py-1.5 text-[12px] font-medium text-ink hover:text-accent">Today</button>

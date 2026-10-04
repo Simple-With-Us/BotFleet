@@ -1111,7 +1111,7 @@ export async function vpsSyncCliCredentials(
   cfg: AppConfig,
   target: VpsTarget = SHARED_VPS_TARGET,
   runner: VpsCommandRunner = defaultRunner,
-  homeDir = homedir(),
+  homeDir = process.env.HOME || process.env.USERPROFILE || homedir(),
 ): Promise<VpsSyncCredentialsResult> {
   const alias = vpsSshAlias(cfg);
   if (!alias) {

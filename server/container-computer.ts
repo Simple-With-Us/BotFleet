@@ -153,7 +153,9 @@ export function adaptContainerLimits(
   if (!host) return ceiling;
   const cpus = host.cpus && host.cpus > 0 ? Math.min(ceiling.cpus, Math.floor(host.cpus)) : ceiling.cpus;
   const hostGib = host.memoryBytes && host.memoryBytes > 0 ? Math.floor((host.memoryBytes / 1024 ** 3) * 0.75) : null;
-  const memoryGib = hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, Math.max(MIN_CONTAINER_MEMORY_GIB, hostGib));
+  // Only hold the 2 GiB floor back when the runtime can actually supply it.
+  const memoryGib =
+    hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, hostGib < MIN_CONTAINER_MEMORY_GIB ? Math.max(1, hostGib) : hostGib);
   return { cpus: Math.max(1, cpus), memoryGib };
 }
 
@@ -1160,12 +1162,15 @@ export function podmanSecurityIsHardened(
 
 /** The exact caps a container declared at creation (see `limitsFromLabels`),
  * as the byte and nano-CPU figures the runtime reports back. */
-function declaredHardening(labels: Record<string, string> | undefined | null): {
+export function declaredHardening(labels: Record<string, string> | undefined | null): {
   memoryBytes: number;
   nanoCpus: number;
 } {
   const declared = limitsFromLabels(labels);
-  return { memoryBytes: declared.memoryGib * 1024 ** 3, nanoCpus: declared.cpus * 1_000_000_000 };
+  // A declared value may never lower the hardening floor: an absent or
+  // under-specified label is judged against the historical 4 CPU / 8 GiB cap.
+  const usable = declared.cpus >= 2 && declared.memoryGib >= MIN_CONTAINER_MEMORY_GIB ? declared : DEFAULT_CONTAINER_LIMITS;
+  return { memoryBytes: usable.memoryGib * 1024 ** 3, nanoCpus: usable.cpus * 1_000_000_000 };
 }
 
 /** Where the well-known host names point inside a managed container.

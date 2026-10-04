@@ -725,6 +725,7 @@ describe("VPS computer", () => {
     };
     let home: string;
     let previousHome: string | undefined;
+    let previousUserProfile: string | undefined;
 
     beforeEach(() => {
       resetVpsCliSyncThrottle();
@@ -732,11 +733,15 @@ describe("VPS computer", () => {
       home = mkdtempSync(join(tmpdir(), "vps-concurrent-home-"));
       writeFileSync(join(home, ".gitconfig"), "[user]\n  name = Test\n");
       previousHome = process.env.HOME;
+      previousUserProfile = process.env.USERPROFILE;
       process.env.HOME = home;
+      process.env.USERPROFILE = home;
     });
     afterEach(() => {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
       rmSync(home, { recursive: true, force: true });
     });
 
