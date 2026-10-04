@@ -4,23 +4,34 @@
 // over HTTP and Server-Sent Events (SSE) by wrapping the core tool dispatch in scripts/mcp-server.ts.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
-import { processMcpMessage, TOOLS } from "./mcp-server.ts";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { homedir } from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { redactSecretsInText } from "../shared/redact.ts";
 
 const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
 const HARNESS_URL = process.env.BOTFLEET_URL || "http://127.0.0.1:8799";
 function resolveAuthToken(): string | null {
-  try {
-    const envFile = fs.readFileSync(path.join(process.env.HOME || "/Users/jay", ".secrets", "seat-mcp.env"), "utf8");
-    const match = envFile.match(/^SEAT_MCP_TOKEN=(\S+)/m);
-    if (match && match[1]) return match[1];
-  } catch (e) {}
+  // 1. Environment first, so an operator rotating the token -- or Infisical
+  //    injecting it in CI -- always wins over the local handoff file.
   const fromEnv =
     process.env.SEAT_MCP_TOKEN?.trim() || process.env.BOTFLEET_MCP_TOKEN?.trim() || process.env.BOTFLEET_TOKEN?.trim();
-  return fromEnv || null;
+  if (fromEnv) return fromEnv;
+
+  // 2. Local-Mac handoff file, as a fallback only.  Surrounding quotes are
+  //    stripped because clients send the bare token, so a quoted file value
+  //    would never match and every request would 401.
+  try {
+    const envFile = fs.readFileSync(path.join(homedir(), ".secrets", "seat-mcp.env"), "utf8");
+    const match = envFile.match(/^SEAT_MCP_TOKEN=(.*)$/m);
+    const value = match?.[1]?.trim().replace(/^["']|["']$/g, "");
+    if (value) return value;
+  } catch {
+    // No local handoff file: the environment is the only source.
+  }
+  return null;
 }
 
 const AUTH_TOKEN = resolveAuthToken();
@@ -31,10 +42,14 @@ if (!AUTH_TOKEN) {
   process.exit(1);
 }
 
-// Ensure the underlying mcp-server.ts knows where to find the harness
+// Ensure the underlying mcp-server.ts knows where to find the harness.
+// mcp-server.ts captures BOTFLEET_URL at module scope, so the default has to be
+// installed before that module is evaluated -- a static import would be too late,
+// leaving configuredUrl undefined and the tool layer probing arbitrary ports.
 if (!process.env.BOTFLEET_URL) {
   process.env.BOTFLEET_URL = HARNESS_URL;
 }
+const { processMcpMessage, TOOLS } = await import("./mcp-server.ts");
 
 interface SseSession {
   id: string;
@@ -53,6 +68,14 @@ function log(msg: string): void {
 function logError(msg: string): void {
   const ts = new Date().toISOString();
   process.stderr.write(`[${ts}] [botfleet-mcp-sse] ERROR: ${msg}\n`);
+}
+
+/** Downstream errors are built from untrusted MCP input, so their text can
+ *  carry request or tool context.  Everything derived from one goes through the
+ *  shared redactor and is clipped to a single log line. */
+function safeErrorText(err: unknown): string {
+  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return redactSecretsInText(raw).replace(/\s+/g, " ").trim().slice(0, 300);
 }
 
 function setCorsHeaders(res: ServerResponse): void {
@@ -77,15 +100,25 @@ function sendJson(res: ServerResponse, status: number, data: unknown, isHead = f
 }
 
 /** Bearer auth with the iOS app's double-"Bearer" workaround. Never logs
- *  the Authorization header: it carries the token. */
+ *  the Authorization header: it carries the token.  The comparison is
+ *  constant-time (length-guarded, like authorizedComms in server/index.ts) so a
+ *  network caller cannot learn the token a byte at a time. */
 function isAuthorized(req: IncomingMessage): boolean {
+  if (!AUTH_TOKEN) {
+    logError(`Missing or invalid token for ${req.method} ${req.url}`);
+    return false;
+  }
+
   let authHeader = req.headers.authorization || "";
   authHeader = authHeader.replace(/^Bearer\s+Bearer\s+/i, "Bearer ");
-  
+
   const parts = authHeader.split(" ");
   const providedToken = parts[1];
 
-  if (!authHeader.toLowerCase().startsWith("bearer ") || providedToken !== AUTH_TOKEN) {
+  const expected = Buffer.from(AUTH_TOKEN, "utf8");
+  const got = Buffer.from(providedToken ?? "", "utf8");
+
+  if (!authHeader.toLowerCase().startsWith("bearer ") || got.length !== expected.length || !timingSafeEqual(got, expected)) {
     logError(`Missing or invalid token for ${req.method} ${req.url}`);
     return false;
   }
@@ -95,11 +128,19 @@ function isAuthorized(req: IncomingMessage): boolean {
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
+    let tooLarge = false;
     req.on("data", (chunk) => {
+      if (tooLarge) return;
       body += chunk;
       // 10 MB payload limit for tool calls/messages
       if (body.length > 10 * 1024 * 1024) {
-        req.destroy();
+        // Drain the rest of the request instead of destroying the socket:
+        // destroying it would reset the connection, so the JSON-RPC error the
+        // caller sends could never be written and an oversized body would look
+        // like a crash.
+        tooLarge = true;
+        body = "";
+        req.resume();
         reject(new Error("Payload too large"));
       }
     });
@@ -108,7 +149,21 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-const server = createServer(async (req, res) => {
+const server = createServer((req, res) => {
+  // createServer does not observe the promise a listener returns, so an
+  // unhandled rejection here would take the process down.  Every throw is
+  // caught and answered on the response instead.
+  void handleRequest(req, res).catch((err) => {
+    logError(`Unhandled request error: ${safeErrorText(err)}`);
+    if (!res.headersSent) {
+      sendJson(res, 500, { jsonrpc: "2.0", id: null, error: { code: -32603, message: "Internal error" } });
+    } else {
+      res.end();
+    }
+  });
+});
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   setCorsHeaders(res);
 
   if (req.method === "OPTIONS") {
@@ -117,7 +172,15 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  // llhttp accepts characters in the Host header value that URL rejects, so
+  // parsing is guarded: a malformed Host is a 400, not a crashed process.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  } catch {
+    sendJson(res, 400, { error: "Invalid request target" });
+    return;
+  }
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
 
   // Health and discovery endpoints
@@ -129,7 +192,8 @@ const server = createServer(async (req, res) => {
         status: "ok",
         app: "botfleet-admin-mcp",
         listen: `${HOST}:${PORT}`,
-        harness: HARNESS_URL,
+        // The harness target is deliberately absent: this route is
+        // unauthenticated, so it must not reflect internal routing details.
         tools: TOOLS.length,
         activeSessions: activeSessions.size,
       },
@@ -153,7 +217,9 @@ const server = createServer(async (req, res) => {
   const isSsePath = pathname === "/mcp/sse" || pathname === "/sse" || pathname === "/mcp";
   if (req.method === "GET" && isSsePath) {
     const sessionId = randomUUID();
-    log(`New SSE client connecting... Session: ${sessionId} from ${req.socket.remoteAddress}`);
+    // No peer address: an IP is personal data and the session id is already an
+    // opaque client identifier.
+    log(`New SSE client connecting... Session: ${sessionId}`);
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream; charset=utf-8",
@@ -199,7 +265,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const sessionId = url.searchParams.get("sessionId") || (req.headers["mcp-session-id"] as string | undefined);
+    // Node hands this header back as string | string[], so it is narrowed here
+    // rather than cast: an assertion would hide a repeated header behind a
+    // lookup that could never match.
+    const headerSession = req.headers["mcp-session-id"];
+    const sessionId =
+      url.searchParams.get("sessionId") || (Array.isArray(headerSession) ? headerSession[0] : headerSession);
 
     if (sessionId && activeSessions.has(sessionId)) {
       // SSE Session route:
@@ -216,7 +287,7 @@ const server = createServer(async (req, res) => {
           session.res.write(`event: message\ndata: ${responseJson}\n\n`);
         }
       } catch (err) {
-        logError(`Error processing message for session ${sessionId}: ${err}`);
+        logError(`Error processing message for session ${sessionId}: ${safeErrorText(err)}`);
         if (!session.res.writableEnded) {
           const errReply = JSON.stringify({
             jsonrpc: "2.0",
@@ -229,16 +300,38 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (sessionId) {
+      // A POST that named a session we no longer hold is stale, not direct:
+      // the closed connection, a restarted gateway, or a forged id.  Falling
+      // through would run the tool on a channel the client is not reading,
+      // duplicating side effects for tools flagged destructiveHint.
+      sendJson(res, 404, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32002, message: "Session not found" },
+      });
+      return;
+    }
+
     // Direct Streamable HTTP POST route (no SSE session required):
     // Useful for clients using streamable HTTP transport or direct RPC calls
     try {
       const responseJson = await processMcpMessage(rawBody);
+      if (responseJson == null) {
+        // No response is expected (a notification, or an empty body).  The
+        // Streamable HTTP transport reads that as 202; a 200 with a `{}` body
+        // fails its JSON-RPC response check and errors the client right after
+        // a successful initialize.
+        res.writeHead(202);
+        res.end();
+        return;
+      }
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
       });
-      res.end(responseJson || "{}\n");
+      res.end(responseJson);
     } catch (err) {
-      logError(`Error processing direct POST message: ${err}`);
+      logError(`Error processing direct POST message: ${safeErrorText(err)}`);
       sendJson(res, 500, {
         jsonrpc: "2.0",
         id: null,
@@ -250,7 +343,7 @@ const server = createServer(async (req, res) => {
 
   // Fallback for unhandled routes
   sendJson(res, 404, { error: `Not found: ${req.method} ${pathname}` });
-});
+}
 
 // Periodic keepalive ping to prevent intermediary proxies (like Cloudflare) from terminating idle SSE connections
 const PING_INTERVAL_MS = 15_000;

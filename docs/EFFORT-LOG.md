@@ -187,6 +187,9 @@ Protocol: /Users/jay/apps/EFFORT-LOG-PROTOCOL.md (canonical). Live board: this f
 (mirror: docs/EFFORT-LOG.md in the repo). As of 2026-08-29.
 
 ## In Progress
+- **2026-10-03 - AG - IN_PROGRESS - [BF][AG] Step 3 Fleet Matrix: Horizontal App Deck, typed badge counters, and matrix navigation.** <!-- wb-agent-report:bb42a38811fb490fa2adc8b0c3207154 -->
+- **2026-10-03 - GROK-BUILD - IN_PROGRESS - Align workspace settings vocabulary across PR 813 and PR 814.** <!-- wb-agent-report:7832117c072741f5878f2105d80984f2 -->
+- **2026-10-03 - AG - PLANNED - [BF][FLEET] Benchmark Paseo architecture & UX (getpaseo/paseo) for BotFleet enhancements.** <!-- wb-agent-report:fa8e6d86b54245fd9e3f9c9d0e7d7e4d -->
 - **2026-10-04 - AG - IN_PROGRESS - [BF][AG] MiniMax TTS acoustic punctuation sanitizer & fix lastSeq TDZ ReferenceError.** <!-- wb-agent-report:7d1426c148004f15926e58df4466e691 -->
 - **2026-10-03 — CODEX — COMPLETED — Bind App tasks to repository/workspace context (board `176cec2498c44041989f90f001b9f19f`, issue #816).**  PRs #820 (task-folder snapshot), #822 (server App context), and #824 (creation/display client, squash `041dcaae0b2a0ad51fa473c8b6ec0152e8b17610`) are merged.  Explicit App choice preserves the server-saved exact folder across default changes, transfers, and App removal; Unassigned/legacy creation and serial execution remain supported.  Final full hosted CI `37172121805` passed every job on `45ff47b66`; E2E `37172121816` passed all 30 cases, and all five chooser/desktop/narrow/busy screenshots were inspected.  Narrow headers keep controls inside 320px/390px screens.  This completes the binding slice defined by #816; AG owns matrix/navigation (#827), while thread attention and checkout write admission remain separate work.  Merged is not a deployment claim.  Living Notes update is pending because four fresh Apple Events reads timed out before mutation; the closeout delta is preserved locally. <!-- wb-agent-report:176cec2498c44041989f90f001b9f19f -->
 - **2026-10-03 - BF-DESIGNER - IN_PROGRESS - Shared VPS card: #810 deleted the sentence gap instead of encoding it, and 3 more sites were already broken.** <!-- wb-agent-report:8e9e90e81bc740dd8f2d0797eca4138a -->
@@ -266,9 +269,6 @@ Protocol: /Users/jay/apps/EFFORT-LOG-PROTOCOL.md (canonical). Live board: this f
 
 
 ## Completed
-- **2026-10-03 - AG - IN_PROGRESS - [BF][AG] Step 3 Fleet Matrix: Horizontal App Deck, typed badge counters, and matrix navigation.** <!-- wb-agent-report:bb42a38811fb490fa2adc8b0c3207154 -->
-- **2026-10-03 - GROK-BUILD - IN_PROGRESS - Align workspace settings vocabulary across PR 813 and PR 814.** <!-- wb-agent-report:7832117c072741f5878f2105d80984f2 -->
-- **2026-10-03 - AG - PLANNED - [BF][FLEET] Benchmark Paseo architecture & UX (getpaseo/paseo) for BotFleet enhancements.** <!-- wb-agent-report:fa8e6d86b54245fd9e3f9c9d0e7d7e4d -->
 - **2026-09-25 - CLAUDE - PLANNED - classifyError verdict depends on input shape.** <!-- wb-agent-report:b0b98c24aef44fa6aaf8606f163f1c23 -->
 - **2026-09-24 - CODEX - PLANNED - Page BotFleet messages in SQLite and bound server thread cache.** <!-- wb-agent-report:c524b2b1daa240a0937ff141cac70a6c -->
 - **2026-10-03 — CODEX — COMPLETED (PR #817 merged `edd429303`) — Paseo adoption study (board `3262c05e45de4b81abd5fd72b0b82281`, branch `codex/paseo-adoption-study`).**  Pinned source review, accepted peer corrections, and the implementation sequence are recorded in `docs/plans/2026-10-03-paseo-adoption.md`.  Documentation checks passed.  No Paseo runtime or source import. <!-- wb-agent-report:3262c05e45de4b81abd5fd72b0b82281 -->
