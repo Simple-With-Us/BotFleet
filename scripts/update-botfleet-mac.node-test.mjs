@@ -27,6 +27,7 @@ import {
   loadPrepared,
   main,
   parseArguments,
+  parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
   rollbackHarnessBootoutLabels,
@@ -2026,4 +2027,16 @@ test("a server-only swap moves the dependency tree and never renames the bundle"
     assert.equal(failed.rollbackDependenciesHold, false, "a false flag would restore the wrong generation");
     assert.equal(await readFile(join(retry.liveDependencies, "marker"), "utf8"), "old-deps");
   });
+});
+
+test("only a well-formed health body establishes readiness", () => {
+  // `body?.ready !== false` accepts all of these, because every one of them is
+  // "not false" — including a truncated body, an HTML error page, and a bare
+  // `{}`.  Any of them would have declared a candidate ready.
+  assert.equal(parseHealthBody({ app: "botfleet", ready: true }), true);
+  assert.equal(parseHealthBody({ app: "botfleet", ready: false }), false);
+  for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
+    { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
+    assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
 });

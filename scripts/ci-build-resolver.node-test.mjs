@@ -28,11 +28,24 @@ function json(body, status = 200) {
   return async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 }
 
-const successfulRuns = {
-  workflow_runs: [
-    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" },
-  ],
-};
+// Shaped like a real Actions API response: the resolver checks these fields
+// before reading any of them.
+const aRun = (fields) => ({
+  id: 1,
+  head_sha: COMMIT,
+  status: "completed",
+  conclusion: "success",
+  event: "push",
+  ...fields,
+});
+const artifact = (fields) => ({
+  id: 1,
+  name: artifactNameFor(COMMIT),
+  expired: false,
+  archive_download_url: "https://api.github.com/artifacts/1/zip",
+  ...fields,
+});
+const successfulRuns = { workflow_runs: [aRun({})] };
 
 async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), "ci-resolver-"));
@@ -70,18 +83,25 @@ test("only a successful run for this exact commit is usable", () => {
   // not a build of what we are about to install.
   assert.equal(selectCommitRun(successfulRuns.workflow_runs, COMMIT)?.id, 1);
   assert.equal(selectCommitRun(successfulRuns.workflow_runs, OTHER), null);
-  assert.equal(selectCommitRun([{ id: 2, head_sha: COMMIT, conclusion: "failure", event: "push" }], COMMIT), null);
-  assert.equal(selectCommitRun([{ id: 3, head_sha: COMMIT, conclusion: "success", event: "schedule" }], COMMIT), null);
+  assert.equal(selectCommitRun([aRun({ id: 2, conclusion: "failure" })], COMMIT), null);
+  assert.equal(selectCommitRun([aRun({ id: 3, event: "schedule" })], COMMIT), null);
+  assert.equal(selectCommitRun([aRun({ id: 4, conclusion: null, status: "in_progress" })], COMMIT), null);
   assert.equal(selectCommitRun([], COMMIT), null);
   assert.equal(selectCommitRun(undefined, COMMIT), null);
+  // A malformed entry is skipped rather than read: `conclusion: "success"` on
+  // an object with no `id` is not a run we can download from.
+  assert.equal(selectCommitRun([{ head_sha: COMMIT, conclusion: "success", event: "push" }], COMMIT), null);
+  assert.equal(selectCommitRun("not an array", COMMIT), null);
 });
 
 test("an expired artifact is not an artifact", () => {
-  assert.equal(findCommitArtifact([{ name: artifactNameFor(COMMIT), expired: false }], COMMIT)?.name, artifactNameFor(COMMIT));
+  assert.equal(findCommitArtifact([artifact({})], COMMIT)?.name, artifactNameFor(COMMIT));
   // 30-day retention means this is a real, reachable state for a Mac that was
   // off for a month, and it must read as "no build", never as a valid one.
-  assert.equal(findCommitArtifact([{ name: artifactNameFor(COMMIT), expired: true }], COMMIT), null);
-  assert.equal(findCommitArtifact([{ name: "botfleet-mac-somethingelse" }], COMMIT), null);
+  assert.equal(findCommitArtifact([artifact({ expired: true })], COMMIT), null);
+  assert.equal(findCommitArtifact([artifact({ name: "botfleet-mac-somethingelse" })], COMMIT), null);
+  assert.equal(findCommitArtifact([{ name: artifactNameFor(COMMIT) }], COMMIT), null, "no download url is not an artifact");
+  assert.equal(findCommitArtifact("not an array", COMMIT), null);
 });
 
 test("a manifest is only accepted for the commit that was asked for, with matching bytes", () => {
@@ -110,6 +130,15 @@ test("a manifest is only accepted for the commit that was asked for, with matchi
     () => verifyManifest({ ...manifest, artifact: "BotFleet.app" }, { commit: COMMIT, bytes }),
     (error) => error.cause === "bad-manifest",
   );
+  // The artifact name is concatenated into a path, so a traversal is the case
+  // that matters; requiring a plain basename is the whole defence.
+  for (const name of ["../../../../tmp/evil.zip", "nested/BotFleet.zip", "/abs/BotFleet.zip", ".zip"]) {
+    assert.throws(
+      () => verifyManifest({ ...manifest, artifact: name }, { commit: COMMIT, bytes }),
+      (error) => error.cause === "bad-manifest",
+      `${name} must be refused`,
+    );
+  }
 });
 
 test("a commit with no hosted build says so, and says how to make one", async (t) => {

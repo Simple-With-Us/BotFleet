@@ -24,7 +24,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const DEFAULT_REPOSITORY = "jaywedgeworth22/BotFleet";
 const WORKFLOW_FILE = "mac-commit-build.yml";
@@ -36,6 +36,11 @@ const WORKFLOW_FILE = "mac-commit-build.yml";
 const API_TIMEOUT_MS = 30_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const DOWNLOAD_ATTEMPTS = 3;
+// An overall budget for the whole transfer, not per attempt.  Without it the
+// worst case is 3 x 10 minutes inside prepareUpdate while the updater holds its
+// lock — roughly twice as long as the local build this path replaced, on the
+// default path.  A slow link must not cost more than the thing it accelerates.
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 12 * 60 * 1000;
 const DOWNLOAD_RETRY_DELAY_MS = 5_000;
 const MANIFEST_SCHEMA_VERSION = 1;
 const FULL_COMMIT = /^[a-f0-9]{40}$/;
@@ -71,7 +76,7 @@ export function classifyResolutionFailure({ status, timedOut, spawnError } = {})
   return "unknown";
 }
 
-function resolutionMessage({ cause, commit, status, repository, detail }) {
+function resolutionMessage({ cause, commit, status, repository, detail, conclusion }) {
   const sha = FULL_COMMIT.test(commit || "") ? commit : `${String(commit || "").slice(0, 12) || "unknown"} (not a full commit)`;
   switch (cause) {
     case "no-build":
@@ -93,6 +98,12 @@ function resolutionMessage({ cause, commit, status, repository, detail }) {
       return (
         `Could not reach GitHub to fetch a build for ${sha} (${cause}${detail ? `: ${detail}` : ""}).  This is a ` +
         `network problem, NOT a missing build — re-run before assuming the commit was never built.`
+      );
+    case "build-failed":
+      return (
+        `A hosted build exists for ${sha} but it did not succeed${conclusion ? ` (${conclusion})` : ""}.  ` +
+        `Re-run it, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.  ` +
+        `Note that this workflow cancels superseded builds, so a build cancelled by a newer commit on main is expected.`
       );
     case "github-unavailable":
       return `GitHub returned HTTP ${status} while looking up a build for ${sha}.  This is a GitHub-side problem, not a missing build.`;
@@ -136,9 +147,14 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
   return response.json();
 }
 
-async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, label }) {
+async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label }) {
   let lastError = null;
+  const budgetDeadline = Date.now() + totalTimeoutMs;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt += 1) {
+    const remaining = budgetDeadline - Date.now();
+    if (remaining <= 0) break;
+    // Each attempt gets what is left of the budget, never more.
+    timeoutMs = Math.min(timeoutMs, remaining);
     try {
       const response = await fetchImpl(url, {
         headers,
@@ -154,13 +170,21 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
         const retryable = response.status === 429 || response.status >= 500;
         lastError = new ResolutionError(`Downloading ${label} failed with HTTP ${response.status}`, cause);
         lastError.status = response.status;
-        if (!retryable) throw lastError;
+        // Mark it before throwing: this throw is inside the try, so without the
+        // flag our own catch below would treat it as retryable and sit through
+        // all three attempts, which is exactly what the comment above says we
+        // are avoiding.
+        if (!retryable) {
+          lastError.fatal = true;
+          throw lastError;
+        }
       } else {
         return Buffer.from(await response.arrayBuffer());
       }
     } catch (error) {
       if (error instanceof ResolutionError) {
-        if (error.cause === "no-build" || error.cause === "rate-limited" || error.cause === "unauthorized") throw error;
+        if (error.fatal) throw error;
+        if (["no-build", "rate-limited", "unauthorized"].includes(error.cause)) throw error;
         lastError = error;
       } else {
         const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
@@ -179,21 +203,59 @@ function authHeaders(env = process.env) {
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
+/**
+ * Shape checks for the two GitHub responses this module reads.
+ *
+ * These are hand-written rather than zod on purpose, and that is not a
+ * shortcut: the updater bootstraps itself by archiving a five-file graph into
+ * a temp directory with no node_modules beside it (see update-botfleet.sh), so
+ * it cannot import a third-party validator at all.  Every other module in that
+ * graph imports nothing but node: builtins.  The intent of the rule — never
+ * read a field off an untrusted response without checking its shape — is met
+ * here explicitly; adding zod would break updater bootstrap on every Mac.
+ */
+function assertWorkflowRun(value) {
+  if (typeof value?.id !== "number" ||
+      typeof value?.head_sha !== "string" ||
+      typeof value?.conclusion !== "string" && value?.conclusion !== null ||
+      typeof value?.status !== "string" ||
+      typeof value?.event !== "string") {
+    return null;
+  }
+  return value;
+}
+
+function assertArtifact(value) {
+  if (typeof value?.id !== "number" ||
+      typeof value?.name !== "string" ||
+      typeof value?.expired !== "boolean" ||
+      typeof value?.archive_download_url !== "string") {
+    return null;
+  }
+  return value;
+}
+
 /** The newest successful run for this exact commit, and nothing else. */
 export function selectCommitRun(runs, commit) {
+  if (!Array.isArray(runs)) return null;
   return (
-    (runs || []).find(
-      (run) =>
-        run?.head_sha === commit &&
-        run?.conclusion === "success" &&
-        (run?.event === "push" || run?.event === "workflow_dispatch"),
-    ) || null
+    runs
+      .map(assertWorkflowRun)
+      .find((run) => run && run.head_sha === commit && run.conclusion === "success" &&
+        (run.event === "push" || run.event === "workflow_dispatch")) || null
   );
 }
 
 export function findCommitArtifact(artifacts, commit) {
+  if (!Array.isArray(artifacts)) return null;
   const wanted = artifactNameFor(commit);
-  return (artifacts || []).find((artifact) => artifact?.name === wanted && !artifact?.expired) || null;
+  return artifacts.map(assertArtifact).find((item) => item && item.name === wanted && !item.expired) || null;
+}
+
+/** The newest attempt at this commit, valid shape or not, for diagnosis. */
+function anyRunForCommit(runs, commit) {
+  if (!Array.isArray(runs)) return null;
+  return runs.find((item) => item?.head_sha === commit) || null;
 }
 
 /**
@@ -219,8 +281,18 @@ export function verifyManifest(manifest, { commit, bytes }) {
       "checksum-mismatch",
     );
   }
-  if (typeof manifest.artifact !== "string" || !manifest.artifact.endsWith(".zip")) {
-    throw new ResolutionError(`Hosted build manifest names no zip artifact: ${manifest.artifact}`, "bad-manifest");
+  // This name comes off the network and is concatenated into a path.  Requiring
+  // a plain basename is the whole defence: `../../somewhere/evil.zip` would
+  // otherwise be read and unpacked outside the scratch directory.  Checking
+  // only that it ends in .zip is not a path check.
+  if (typeof manifest.artifact !== "string" ||
+      !manifest.artifact.endsWith(".zip") ||
+      basename(manifest.artifact) !== manifest.artifact ||
+      manifest.artifact === ".zip") {
+    throw new ResolutionError(
+      `Hosted build manifest names an unusable artifact: ${JSON.stringify(manifest.artifact)}`,
+      "bad-manifest",
+    );
   }
   return { ...manifest, verifiedBytes: bytes.length };
 }
@@ -229,11 +301,13 @@ function run(command, args, options) {
   return new Promise((done, fail) => {
     const child = spawn(command, args, { ...options, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    // Drain stderr so the child can never block on a full pipe, but discard it.
+    child.stderr.resume();
     child.once("error", fail);
-    child.once("close", (code) => (code === 0 ? done(stdout) : fail(new Error(`${command} exited ${code}: ${stderr.slice(0, 400)}`))));
+    // Raw child stderr is untrusted output that can carry a path, an argument,
+    // or a token; it is not echoed into an error a caller may log or persist.
+    // The exit code is the diagnosis; stderr stays on this machine.
+    child.once("close", (code) => (code === 0 ? done(stdout) : fail(new Error(`${command} exited with code ${code}`))));
   });
 }
 
@@ -293,11 +367,25 @@ export async function downloadBuiltBundle({
   const runs = (await requestJson(runsUrl, { headers, fetchImpl }))?.workflow_runs;
   const run_ = selectCommitRun(runs, commit);
   if (!run_) {
-    const sawRun = (runs || []).some((item) => item?.head_sha === commit);
-    const cause = sawRun ? "github-unavailable" : "no-build";
+    // A run that exists for this commit but failed, was cancelled, or is still
+    // running is NOT a GitHub outage.  Reporting it as one sent the operator to
+    // retry something retrying cannot fix, and — because the cause was not
+    // no-build — also blocked the `auto` fallback that exists for exactly this.
+    // A build this workflow cancelled because a newer commit landed is the
+    // expected case here, not a failure.
+    const attempted = anyRunForCommit(runs, commit);
+    if (attempted) {
+      const conclusion = attempted.status === "in_progress"
+        ? "still running"
+        : attempted.conclusion || "unknown";
+      throw new ResolutionError(
+        resolutionMessage({ cause: "build-failed", commit, conclusion, repository }),
+        "build-failed",
+      );
+    }
     throw new ResolutionError(
-      resolutionMessage({ cause, commit, status: sawRun ? 200 : 404, repository }),
-      cause,
+      resolutionMessage({ cause: "no-build", commit, status: 404, repository }),
+      "no-build",
     );
   }
   const artifacts = (await requestJson(`${apiBase(repository)}/actions/runs/${run_.id}/artifacts?per_page=100`, { headers, fetchImpl }))?.artifacts;
