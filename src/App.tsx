@@ -1,5 +1,5 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState , useCallback} from "react";
 import { Loader2, Menu, X } from "lucide-react";
 import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -14,6 +14,7 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
+import { threadIdForApp } from "@/lib/task-app-thread";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -119,6 +120,15 @@ function Shell() {
   // engine whose probe has not answered yet is not proof of an empty Mac.
   const noEngines = state.connected && noEngineCanRun(state.instances);
 
+  const openBotInApp = useCallback((botId: string, appId: string) => {
+    const b = state.bots.find((x) => x.id === botId);
+    const threadId = threadIdForApp(b, appId);
+    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+    if (threadId && threadId !== b?.threadId) {
+      dispatch({ type: "switchTask", botId, threadId });
+    }
+  }, [state.bots, dispatch]);
+
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.
   useEffect(() => {
@@ -133,20 +143,28 @@ function Shell() {
         const target = bots[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
-          dispatch({ type: "select", id: target.id });
+          if (selectedAppId) {
+            openBotInApp(target.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: target.id });
+          }
         }
       } else if (e.shiftKey && (e.key === "[" || e.key === "]")) {
         const idx = bots.findIndex((b) => b.id === state.selectedId);
         const next = bots[(idx + (e.key === "]" ? 1 : -1) + bots.length) % bots.length];
         if (next) {
           e.preventDefault();
-          dispatch({ type: "select", id: next.id });
+          if (selectedAppId) {
+            openBotInApp(next.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: next.id });
+          }
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state.bots, state.selectedId, dispatch]);
+  }, [state.bots, state.selectedId, selectedAppId, dispatch, openBotInApp]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);
@@ -306,15 +324,6 @@ function Shell() {
   // `select` only changes client state.  Messages, reactions, recordings, and
   // loadEarlier follow `bot.threadId`, so a pin onto another thread would
   // render a transcript the store never loaded.
-  const openBotInApp = (botId: string, appId: string) => {
-    const b = state.bots.find((x) => x.id === botId);
-    const explicitTask = (b?.tasks ?? []).find((t) => t.workspaceContext?.appRef.id === appId);
-    const threadId = explicitTask?.threadId ?? b?.threadId;
-    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
-    if (threadId && threadId !== b?.threadId) {
-      dispatch({ type: "switchTask", botId, threadId });
-    }
-  };
 
   return (
     <div className="flex h-full flex-col">
