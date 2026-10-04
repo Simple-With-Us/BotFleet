@@ -8,12 +8,14 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { redactSecretsInText } from "../shared/redact.ts";
 
-export const McpRequestSchema = z.object({
-  jsonrpc: z.string().optional(),
-  id: z.union([z.string(), z.number(), z.null()]).optional(),
-  method: z.string(),
-  params: z.unknown().optional(),
-}).passthrough();
+export const McpRequestSchema = z
+  .object({
+    jsonrpc: z.string().optional(),
+    id: z.union([z.string(), z.number(), z.null()]).optional(),
+    method: z.string(),
+    params: z.union([z.record(z.string(), z.unknown()), z.array(z.unknown())]).optional(),
+  })
+  .strict();
 
 const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
@@ -150,7 +152,7 @@ function readBody(req: IncomingMessage): Promise<string> {
           const raw = JSON.parse(Buffer.concat(chunks).toString("utf8"));
           const parsed = McpRequestSchema.safeParse(raw);
           if (!parsed.success) {
-            reject(parsed.error);
+            reject(new Error("Invalid JSON-RPC request structure"));
             return;
           }
           resolve(JSON.stringify(parsed.data));
