@@ -1206,7 +1206,6 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
     [originalBot, explicitThreadId],
   );
   const { state, dispatch } = useStore();
-<<<<<<< HEAD
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
   const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
@@ -1215,8 +1214,6 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
     ? { WebkitAppRegion: "no-drag" }
     : undefined;
-=======
->>>>>>> 20824c3f (fix(ui): Restore UI files that were corrupted by previous commit)
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
@@ -1569,6 +1566,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
       <CallOverlay bot={bot} />
       {/* Header */}
       <div
+        style={dragStyle}
         className={cn(
           // @container so the chips on the right can fold gracefully
           "@container/chathead flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-5 py-3",
@@ -1576,7 +1574,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-lg px-1.5 py-1 md:w-auto md:max-w-[45%]">
+        <div style={noDragStyle} className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-lg px-1.5 py-1 md:w-auto md:max-w-[45%]">
           <button
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
             className="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
@@ -1608,7 +1606,7 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
           )}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
-        <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
           <ThreadViewSwitch view={threadView} onChange={setThreadView} />
           {/* Always here, so the switch beside it never slides under the pointer:
               in Trajectory the same magnifier searches the steps. */}
