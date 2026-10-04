@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import type { TaskWorkspaceContext } from '../../shared/task-workspace-context';
+import { writeFile } from 'node:fs/promises';
 
 declare global {
   interface Window {
@@ -137,10 +138,10 @@ async function mockServer(page: Page, options: { eligible?: boolean; busy?: bool
   return fixture;
 }
 
-async function openBot(page: Page, expectNewButton = true) {
+async function openBot(page: Page, expectNewButton = true, botName = 'Atlas') {
   await page.addInitScript(() => localStorage.setItem('omb-email-gate', 'skipped'));
   await page.goto('/');
-  const botRow = page.getByRole('complementary', { name: 'Bots and Navigation' }).getByText('Atlas', { exact: true }).first();
+  const botRow = page.getByRole('complementary', { name: 'Bots and Navigation' }).getByText(botName, { exact: true }).first();
   await expect(botRow).toBeVisible();
   await botRow.click();
   if (expectNewButton) await expect(page.getByRole('button', { name: 'New Thread' })).toBeVisible();
@@ -243,10 +244,9 @@ test('choosing an App saves its server snapshot and retains the folder after def
         overflowingVisibleElements: overflowing,
       };
     });
-    await testInfo.attach('task-app-context-overflow-geometry', {
-      body: JSON.stringify(geometry, null, 2),
-      contentType: 'application/json',
-    });
+    const geometryPath = testInfo.outputPath('task-app-context-overflow-geometry.json');
+    await writeFile(geometryPath, JSON.stringify(geometry, null, 2), 'utf8');
+    await testInfo.attach('task-app-context-overflow-geometry', { path: geometryPath, contentType: 'application/json' });
   }
   await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay')).toHaveCount(0);
   expect(errors).toEqual([]);
@@ -334,5 +334,40 @@ test('a busy bot cannot start another thread', async ({ page }) => {
 
   await expect(page.getByRole('button', { name: 'New Thread' })).toBeDisabled();
   await expect(page.getByRole('dialog', { name: 'New Thread' })).toHaveCount(0);
+  expect(fixture.posts).toHaveLength(0);
+});
+
+test('a long bot name and Stop control fit narrow headers', async ({ page }, testInfo) => {
+  const longName = 'Atlas With A Deliberately Long Name That Must Wrap';
+  const fixture = await mockServer(page, { busy: true });
+  fixture.bot.name = longName;
+  await openBot(page, true, longName);
+
+  const controls = [
+    { name: 'Find in Conversation', locator: page.getByRole('button', { name: 'Find in Conversation' }) },
+    { name: 'Stop this turn', locator: page.getByTitle('Stop this turn') },
+    { name: 'More Actions', locator: page.getByRole('button', { name: 'More Actions' }) },
+  ];
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 844 });
+    try {
+      await expect.poll(
+        () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),
+        { timeout: 5_000, message: `The document should not overflow at ${width}px.` },
+      ).toBe(true);
+      for (const control of controls) {
+        await expect(control.locator, `${control.name} should remain visible at ${width}px.`).toBeVisible();
+        const bounds = await control.locator.boundingBox();
+        expect(bounds, `${control.name} should have visible bounds at ${width}px.`).not.toBeNull();
+        if (!bounds) continue;
+        expect(bounds.x, `${control.name} should not extend left of ${width}px viewport.`).toBeGreaterThanOrEqual(0);
+        expect(bounds.x + bounds.width, `${control.name} should fit within ${width}px viewport.`).toBeLessThanOrEqual(width + 1);
+      }
+    } finally {
+      const screenshot = testInfo.outputPath(`task-app-context-busy-${width}.png`);
+      await page.screenshot({ path: screenshot, fullPage: true });
+      await testInfo.attach(`task-app-context-busy-${width}`, { path: screenshot, contentType: 'image/png' });
+    }
+  }
   expect(fixture.posts).toHaveLength(0);
 });

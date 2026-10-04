@@ -46,7 +46,7 @@ pnpm exec vite build
 pnpm exec playwright test tests/e2e/task-app-context.spec.ts
 ```
 
-The browser fixture intercepts every `/api/**` request, including a catch-all, and supplies temporary in-memory App/task records.  It covers App eligibility, canonical server snapshots, changed defaults, removed Apps, unassigned creation, busy and Simple modes, and repeated native-menu focus.  Screenshots are written to Playwright test output and retained by the hosted E2E workflow for desktop, narrow-screen, and chooser inspection.  The fixture never contacts the running harness.
+The browser fixture intercepts every `/api/**` request, including a catch-all, and supplies temporary in-memory App/task records.  It covers App eligibility, canonical server snapshots, changed defaults, removed Apps, unassigned creation, busy and Simple modes, and repeated native-menu focus.  Screenshots are written to Playwright test output and retained by the hosted E2E workflow for desktop, narrow-screen, and chooser inspection.  The fixture never contacts the running harness.  Narrow checks retain a strict document-width assertion and verify header-control bounds at 320px and 390px with a busy bot and long name; header actions wrap instead of escaping the screen.  Failure artifacts retain the narrow screenshot and element geometry for diagnosis.
 
 ## Remaining Milestone Work
 
