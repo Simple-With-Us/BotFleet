@@ -42,12 +42,15 @@ describe("Personal Voice reply bounds", () => {
     expect(bound).toBeLessThan(personalVoice);
   });
 
-  it("keeps the same bound in force below the early return", () => {
+  it("evaluates the empty-utterances bound before the early return", () => {
     const source = routeSource();
-    // Two guards remain: the shared size bound, and the empty-utterance
-    // rejection that only makes sense once the size bound has passed.
-    expect(source.match(/reply exceeds voice clip limit/g)).toHaveLength(2);
-    expect(source).toMatch(/if \(!utterances\.length\) return json\(res, 413/);
+    const emptyBound = source.indexOf("!utterances.length");
+    const personalVoice = source.indexOf("tts.isPersonalVoice(owner.voice)");
+
+    expect(emptyBound).toBeGreaterThan(-1);
+    expect(personalVoice).toBeGreaterThan(-1);
+    expect(emptyBound).toBeLessThan(personalVoice);
+    expect(source.match(/reply exceeds voice clip limit/g)).toHaveLength(1);
   });
 
   it("bounds the reply text a Personal Voice owner can reach the helper with", () => {
