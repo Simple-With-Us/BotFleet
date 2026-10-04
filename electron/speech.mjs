@@ -328,11 +328,11 @@ export function speakPersonalVoice(text, voiceId) {
       fn();
     };
     const timer = setTimeout(() => {
-      if (personalVoiceChild === session) personalVoiceChild = null;
+      // Keep the session registered: the helper can only be stopped through the
+      // marker, and the close handler owns the sessionDir cleanup.
       try {
         writeFileSync(stopPath, "stop");
       } catch {}
-      rmSync(sessionDir, { recursive: true, force: true });
       settle(() => reject(new Error("Personal Voice did not finish speaking.")));
     }, budgetMs);
     timer.unref?.();
