@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 
 let home: string;
 
@@ -17,7 +18,23 @@ async function freshStore() {
   vi.stubEnv("HOME", home);
   vi.stubEnv("USERPROFILE", home);
   const { Store, UNTITLED_TASK, titleFromMessage } = await import("./store.ts");
-  return { store: new Store(() => ({ instanceId: "claude", model: "m" })), UNTITLED_TASK, titleFromMessage };
+  return { store: new Store(() => ({ instanceId: "claude", model: "m" })), Store, UNTITLED_TASK, titleFromMessage };
+}
+
+function context(groupId: string, cwd: string): TaskWorkspaceContext {
+  return {
+    kind: "local",
+    appRef: { kind: "group", id: groupId },
+    cwd,
+    git: { checkoutRoot: join(home, "checkout"), branch: "feature", headCommit: "a".repeat(40) },
+    capturedAt: 1_700_000_000_000,
+  };
+}
+
+function expectConflict(run: () => void): void {
+  let error: unknown;
+  try { run(); } catch (caught) { error = caught; }
+  expect(error).toMatchObject({ status: 409 });
 }
 
 afterEach(async () => {
@@ -61,6 +78,32 @@ describe("tasks", () => {
 
     store.patchBot(bot.id, { cwd: "/tmp/project-b" });
     expect(store.pinTaskCwd(bot.id, task.threadId)).toBe("/tmp/project-a");
+  });
+
+  it("keeps an explicit App workspace snapshot when the bot folder changes and after reload", async () => {
+    const { store, Store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const chosenCwd = join(home, "checkout", "package");
+    const snapshot = context(app.id, chosenCwd);
+    store.patchBot(bot.id, { cwd: chosenCwd });
+
+    const task = store.createTask(bot.id, "Build package", true, undefined, snapshot)!;
+    expect(task.workspaceContext).toEqual(snapshot);
+    expect(task.cwd).toBe(chosenCwd);
+
+    store.patchBot(bot.id, { cwd: join(home, "checkout-similar"), name: "Renamed bot" });
+    store.patchGroup(app.id, { cwd: join(home, "checkout-other"), name: "Renamed App Section" });
+    expect(store.pinTaskCwd(bot.id, task.threadId)).toBe(chosenCwd);
+    expect(store.taskByThread(bot.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    const beforeNone = structuredClone(store.taskByThread(bot.id, task.threadId));
+    expect(() => store.pinTaskCwd(bot.id, task.threadId, undefined, { none: true })).toThrow();
+    expect(store.taskByThread(bot.id, task.threadId)).toEqual(beforeNone);
+    store.flushBotsNow();
+
+    const reloaded = new Store(() => ({ instanceId: "claude", model: "m" }));
+    expect(reloaded.taskByThread(bot.id, task.threadId)?.workspaceContext).toEqual(snapshot);
+    expect(reloaded.taskByThread(bot.id, task.threadId)?.cwd).toBe(chosenCwd);
   });
 
   it("can create a detached routine task without changing the visible conversation", async () => {
@@ -141,6 +184,90 @@ describe("tasks", () => {
     const texts = store.messagesFor(first).map((message) => message.text);
     expect(texts.some((text) => text?.includes("Merged"))).toBe(true);
     expect(texts).toContain("side note");
+  });
+
+  it("refuses an incompatible App task merge without changing transcripts or automation aliases", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const plain = bot.threadId;
+    const source = store.createTask(bot.id, "Automated work", false, "routine:app", context(app.id, join(home, "checkout")))!;
+    store.taskByThread(bot.id, plain)!.automationKeyAliases = ["routine:existing"];
+    store.appendMessage(plain, { role: "user", kind: "text", text: "Plain inbox" });
+    store.appendMessage(source.threadId, { role: "user", kind: "text", text: "Bound work" });
+    const beforePlain = structuredClone(store.messagesFor(plain));
+    const beforeSource = structuredClone(store.messagesFor(source.threadId));
+
+    expectConflict(() => store.mergeBotTasks(bot.id, source.threadId, plain));
+    expect(store.tasks(bot.id).map((task) => task.threadId)).toContain(source.threadId);
+    expect(store.messagesFor(plain)).toEqual(beforePlain);
+    expect(store.messagesFor(source.threadId)).toEqual(beforeSource);
+    expect(store.taskByThread(bot.id, plain)?.automationKeyAliases).toEqual(["routine:existing"]);
+    expect(store.taskByAutomationKey(bot.id, "routine:app")?.threadId).toBe(source.threadId);
+  });
+
+  it("refuses a merge between tasks bound to different App groups", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const firstApp = store.createGroup("First App", [bot.id]);
+    const secondApp = store.createGroup("Second App", [bot.id]);
+    const cwd = join(home, "shared-checkout");
+    const first = store.createTask(bot.id, "First App work", false, undefined, context(firstApp.id, cwd))!;
+    const second = store.createTask(bot.id, "Second App work", false, undefined, context(secondApp.id, cwd))!;
+
+    expectConflict(() => store.mergeBotTasks(bot.id, second.threadId, first.threadId));
+    expect(store.taskByThread(bot.id, first.threadId)?.workspaceContext?.appRef.id).toBe(firstApp.id);
+    expect(store.taskByThread(bot.id, second.threadId)?.workspaceContext?.appRef.id).toBe(secondApp.id);
+  });
+
+  it("allows a merge when App and directory match despite different Git labels", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const cwd = join(home, "checkout");
+    const first = store.createTask(bot.id, "First", false, undefined, context(app.id, cwd))!;
+    const later = { ...context(app.id, cwd), capturedAt: 1_800_000_000_000, git: undefined };
+    const second = store.createTask(bot.id, "Second", false, undefined, later)!;
+
+    expect(store.mergeBotTasks(bot.id, second.threadId, first.threadId)).not.toBeNull();
+    expect(store.taskByThread(bot.id, first.threadId)?.workspaceContext).toEqual(context(app.id, cwd));
+  });
+
+  it("preflights every task before a bulk merge changes any transcript", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const inbox = bot.threadId;
+    const plain = store.createTask(bot.id, "Plain extra", false)!;
+    const bound = store.createTask(bot.id, "Bound extra", false, undefined, context(app.id, join(home, "checkout")))!;
+    store.appendMessage(inbox, { role: "user", kind: "text", text: "Inbox" });
+    store.appendMessage(plain.threadId, { role: "user", kind: "text", text: "Plain" });
+    store.appendMessage(bound.threadId, { role: "user", kind: "text", text: "Bound" });
+    const beforeInbox = structuredClone(store.messagesFor(inbox));
+    const beforePlain = structuredClone(store.messagesFor(plain.threadId));
+    const beforeBound = structuredClone(store.messagesFor(bound.threadId));
+
+    expectConflict(() => store.mergeAllExtraThreads());
+    expect(store.tasks(bot.id)).toHaveLength(3);
+    expect(store.messagesFor(inbox)).toEqual(beforeInbox);
+    expect(store.messagesFor(plain.threadId)).toEqual(beforePlain);
+    expect(store.messagesFor(bound.threadId)).toEqual(beforeBound);
+  });
+
+  it("keeps the App workspace on automation rollover after the bot folder changes", async () => {
+    const { store } = await freshStore();
+    const bot = store.createBot();
+    const app = store.createGroup("Project App", [bot.id]);
+    const snapshot = context(app.id, join(home, "checkout"));
+    store.patchBot(bot.id, { cwd: snapshot.cwd });
+    const previous = store.createTask(bot.id, "Nightly build", false, "routine:build", snapshot)!;
+    store.patchBot(bot.id, { cwd: join(home, "unrelated") });
+
+    const rolled = store.rolloverAutomationTask(bot.id, "routine:build", { activate: false })!;
+    expect(rolled.threadId).not.toBe(previous.threadId);
+    expect(rolled.cwd).toBe(snapshot.cwd);
+    expect(rolled.workspaceContext).toEqual(snapshot);
+    expect(store.taskByThread(bot.id, previous.threadId)?.workspaceContext).toEqual(snapshot);
   });
 
   it("merges every extra bot thread into the active conversation", async () => {
