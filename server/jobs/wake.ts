@@ -50,6 +50,13 @@ export interface JobWakeDeps {
   /** Start the wake turn: `startTurn` with `automationSource: "job"`.
    *  Rejects when the dispatch could not start. */
   startWake(botId: string, threadId: string, prompt: string, jobIds: string[]): Promise<void>;
+  /** Tell a BUSY command-line turn about its notices instead of waking it
+   *  (jobs P2).  Claude steers mid-turn; an engine that cannot steer returns
+   *  `false` and the notice rides the next turn's opening reminder.  Resolves
+   *  `true` only when the running turn actually took the text — a `false` is
+   *  the caller's cue to put the notices back.  Absent on the HTTP lane, which
+   *  keeps parking a busy bot and waking it when it settles. */
+  steerBusyNotice?(botId: string, threadId: string, prompt: string): Promise<boolean> | boolean;
   mergeWindowMs?: number;
   /** How long a wake that could not start waits before it tries again. */
   retryMs?: number;
@@ -70,6 +77,17 @@ export function wakePrompt(items: readonly JobNoticeItem[]): string {
     ...items.map((item) => item.text),
     "",
     "Your background job ended while you were idle.  Read its output with job_output if you need it, finish the work it was for, and tell the owner only what they need to act on.",
+  ].join("\n");
+}
+
+/** The same notices steered into a turn that is ALREADY running (jobs P2).
+ *  Not `wakePrompt`: the bot is working, not idle, and telling it otherwise
+ *  would have it narrate a wake that never happened. */
+export function steerPrompt(items: readonly JobNoticeItem[]): string {
+  return [
+    ...items.map((item) => item.text),
+    "",
+    "Your background job ended while you were working.  Read its output with job_output if you need it, and fold it into the work you are already doing.",
   ].join("\n");
 }
 
@@ -182,6 +200,18 @@ export class JobWakeCoordinator {
       return;
     }
     if (this.deps.botBusy(botId)) {
+      // A command-line turn is already running, so the notices belong on the
+      // turn the bot is already in rather than in a new one (jobs P2).  Taken
+      // only when the engine can actually steer, and the notices go back if it
+      // cannot: either way NO wake is scheduled, which is what keeps a busy
+      // bot from being woken by a job over and over.
+      if (this.deps.steerBusyNotice) {
+        const items = this.deps.drainNotices(threadId);
+        if (items.length > 0) {
+          if (await this.deps.steerBusyNotice(botId, threadId, steerPrompt(items))) return;
+          this.deps.restoreNotices(threadId, items);
+        }
+      }
       this.park(threadId, botId);
       return;
     }

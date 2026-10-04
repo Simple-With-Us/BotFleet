@@ -170,28 +170,28 @@ function classifyByStatusCode(text: string): ErrorClassification | undefined {
  */
 export function classifyError(err: FailureInput): ErrorClassification {
   const text = messageOf(err);
+  let isInterrupted = false;
+  let hasExitCode = false;
+
   if (err && "exitCode" in err) {
+    hasExitCode = true;
     const { exitCode: code } = err;
-    if (code !== null && code < 0) return { transient: false, reason: "interrupted" };
-    for (const { pattern, reason } of TRANSIENT_PATTERNS) {
-      if (pattern.test(text)) return { transient: true, reason };
-    }
-    for (const { pattern, reason } of TERMINAL_PATTERNS) {
-      if (pattern.test(text)) return { transient: false, reason };
-    }
-    const byCode = classifyByStatusCode(text);
-    if (byCode) return byCode;
-    return { transient: false, reason: "terminal_exit" };
+    if (code !== null && code < 0) isInterrupted = true;
+  }
+
+  if (isInterrupted) return { transient: false, reason: "interrupted" };
+
+  for (const { pattern, reason } of TRANSIENT_PATTERNS) {
+    if (pattern.test(text)) return { transient: true, reason };
   }
   for (const { pattern, reason } of TERMINAL_PATTERNS) {
     if (pattern.test(text)) return { transient: false, reason };
   }
-  for (const { pattern, reason } of TRANSIENT_PATTERNS) {
-    if (pattern.test(text)) return { transient: true, reason };
-  }
+  
   const byCode = classifyByStatusCode(text);
   if (byCode) return byCode;
-  return { transient: false, reason: "unknown" };
+  
+  return { transient: false, reason: hasExitCode ? "terminal_exit" : "unknown" };
 }
 
 /** Capped exponential delay with jitter, in milliseconds. Attempt 0 (the

@@ -265,7 +265,7 @@ const DRIVER_DISPLAY_NAME = new Map<string, string>([
   ["minimax", "MiniMax"],
   ["claudeAgent", "Claude"],
   ["grokAgent", "Grok"],
-  ["dshAgent", "DeepSeek"],
+  ["dshAgent", "Clutch"],
   ["deepseekAgent", "DeepSeek"],
   ["droidAgent", "Droid"],
   ["cursorAgent", "Cursor"],

@@ -1,0 +1,30 @@
+title: >-
+  Use two spaces between sentences in every human-facing string and
+  agent-written paragraph
+rule: >-
+  Every human-facing string, and every paragraph an agent writes (chat replies
+  to the owner, PR titles/bodies, commit messages, Slack posts, docs), must use
+  two spaces between sentences (owner strengthened 2026-08-19: "For any and all
+  paragraphs in any context, always use 2 spaces..."). Emit it so the gap
+  survives the renderer: in a chat reply (Claude Code terminal/desktop
+  transcript, any agent chat UI) type the literal HTML entity text `&nbsp;`
+  right after the period, then a normal space — `Sentence one.&nbsp; Sentence
+  two.`. Two literal spaces are collapsed by GitHub-flavored markdown in chat,
+  and a raw U+00A0 character typed directly is normalized away in the transcript
+  view — neither works in chat. In a file (read as source, never through that
+  renderer), keep literal two ASCII spaces and do not switch file content to
+  NBSP or `&nbsp;`. Theme default is light.
+severity: medium
+scope: pull-request
+path: '**/*'
+examples:
+  - snippet: 'PR body: "Adds visual spec. Masks dynamic regions."'
+    isCorrect: false
+  - snippet: |-
+      Chat: "Adds visual spec.&nbsp; Masks dynamic regions."
+      File: "Adds visual spec.  Masks dynamic regions."
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

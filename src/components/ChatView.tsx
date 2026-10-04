@@ -1549,12 +1549,12 @@ export function ChatView({ bot }: { bot: Bot }) {
       <div
         className={cn(
           // @container so the chips on the right can fold gracefully
-          "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
+          "@container/chathead flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2 rounded-lg px-1.5 py-1">
+        <div className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-lg px-1.5 py-1 md:w-auto md:max-w-[45%]">
           <button
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
             className="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
@@ -1575,7 +1575,7 @@ export function ChatView({ bot }: { bot: Bot }) {
             onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
             onActivate={() => dispatch({ type: "toggleSettings", open: true })}
             showEditButton
-            className="truncate min-w-[80px] text-[15px] font-semibold text-ink"
+            className="truncate min-w-0 text-[15px] font-semibold text-ink"
             inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
           {bot.chiefOfStaff && (
@@ -1586,7 +1586,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           )}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
           <ThreadViewSwitch view={threadView} onChange={setThreadView} />
           {/* Always here, so the switch beside it never slides under the pointer:
               in Trajectory the same magnifier searches the steps. */}

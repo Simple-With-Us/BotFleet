@@ -111,11 +111,17 @@ describe("LocalVmLeasePool", () => {
     expect(pool.forTarget("bot:b").current(busy, 1_002)).toMatchObject({ botId: "bot-b" });
   });
 
-  it("keeps shared mode serialized because every bot resolves to the same target", () => {
+  it("keeps one lane per bot in shared mode instead of serializing every bot on the container key", () => {
+    // Shared Local VM now hands each bot its own lane, so two bots share the
+    // CONTAINER without sharing a desktop.  The pool itself is unchanged: what
+    // moved is which lane key a bot resolves to.
     const pool = new LocalVmLeasePool(100);
     const busy = () => true;
+    const lane = (botId: string) => `localvm-bot:${botId}`;
 
-    expect(pool.forTarget("shared").claim("thread-a", "bot-a", busy, 1_000)).toBe(true);
-    expect(pool.forTarget("shared").claim("thread-b", "bot-b", busy, 1_001)).toBe(false);
+    expect(pool.forTarget(lane("bot-a")).claim("thread-a", "bot-a", busy, 1_000)).toBe(true);
+    expect(pool.forTarget(lane("bot-b")).claim("thread-b", "bot-b", busy, 1_001)).toBe(true);
+    // A second turn on the SAME bot's lane is still refused.
+    expect(pool.forTarget(lane("bot-a")).claim("thread-c", "bot-c", busy, 1_002)).toBe(false);
   });
 });

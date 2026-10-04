@@ -60,6 +60,12 @@ const REGISTRY_TOOLS = mcpToolDefinitions({
   commsDepth: 0,
   maxCommsDepth: 1,
   chiefOfStaff: true,
+  // Jobs P2.  The harness sets OMB_JOBS=1 only on a turn it decided to mount
+  // the job tools on, so this gate is the harness's own verdict and not a
+  // second guess at it: no env, no job tools on this wire.  The settings it
+  // reads are the same per-turn values the HTTP lane's tool host gets, so the
+  // two lanes' descriptions cannot drift.
+  jobs: process.env.OMB_JOBS === "1",
 });
 
 // The publication order shipped CLI engines already see.  Spelled out so
@@ -74,6 +80,9 @@ const MCP_TOOL_ORDER = [
   "list_routines",
   "propose_routine",
   "propose_routine_action",
+  // Background jobs (jobs P2).  Listed after the fleet tools so a turn that
+  // mounts them publishes its existing surface unchanged first.
+  ...(process.env.OMB_JOBS === "1" ? ["job_start", "job_output", "job_list", "job_kill"] : []),
 ];
 
 const TOOLS_BY_NAME = new Map(REGISTRY_TOOLS.map((tool) => [tool.name, tool]));
@@ -105,6 +114,20 @@ async function api(path: string, init?: RequestInit): Promise<Json> {
 
 function jsonRecord(value: unknown): value is Json {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** One background-job tool call (jobs P2).  A hop to the harness, which owns
+ *  the registry, the fences, the refusals and the approval.  The token in
+ * *this* process is the identity, so no bot or thread is ever named here;
+ *  `isError` is carried straight back because a refused start (an unanswered
+ *  card, a Windows host, an admission refusal) must read as a refusal to the
+ *  model and not as a job that started. */
+async function jobCall(action: "start" | "output" | "list" | "kill", args: Json): Promise<{ text: string; isError?: boolean }> {
+  const r = await api(action === "list" ? "/api/internal/jobs" : `/api/internal/jobs/${action}`, {
+    method: "POST",
+    body: JSON.stringify(args),
+  });
+  return { text: typeof r.text === "string" ? r.text : JSON.stringify(r), isError: r.isError === true };
 }
 
 function routineAction(value: unknown): RoutineAction | null {
@@ -278,6 +301,22 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       body: JSON.stringify(body),
     });
     return confirmationResult(r, `${action.replace("_", " ")} on routine ${routineId}`);
+  }
+  // Background jobs (jobs P2).  Every one of these is a thin hop: the harness
+  // owns the registry, the fences, the refusals and the approval, and decides
+  // the caller's identity from this process's own comms token.  Nothing here
+  // names a bot, a thread or a job the model did not name — the token does.
+  if (name === "job_start") {
+    return jobCall("start", args);
+  }
+  if (name === "job_output") {
+    return jobCall("output", args);
+  }
+  if (name === "job_list") {
+    return jobCall("list", args);
+  }
+  if (name === "job_kill") {
+    return jobCall("kill", args);
   }
   return { text: `Unknown tool: ${name}`, isError: true };
 }

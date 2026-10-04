@@ -56,6 +56,8 @@ import * as checkpoints from "./checkpoints.ts";
 import { appendDecision, readDecisions } from "./decision-log.ts";
 import { checkWriteTargets } from "./path-containment.ts";
 import { cwdConfinementError, protectedCwdDirs, realOrResolved, validateBotCwd, type CwdConfinement } from "./bot-cwd.ts";
+import { captureTaskWorkspaceContext, TaskWorkspaceContextError, taskWorkspaceExecutionError } from "./task-workspace-context.ts";
+import type { TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import { resolveStaticFile } from "./static-files.ts";
 import { attachmentExists, extensionForMime, FILE_MAX_BYTES, IMAGE_MAX_BYTES, isImageMime, readAttachment, saveAttachment, saveImage, type SavedAttachment } from "./attachments.ts";
 import { incomingRecording, recordingReview } from "./recorded-message.ts";
@@ -65,7 +67,8 @@ import { initializeHarnessOwnership, harnessOwnerProof } from "../electron/harne
 import { authorizedRuntime } from "../electron/runtime-identity.mjs";
 import { planCredentialRestore } from "../electron/credential-restore.mjs";
 import { workspaceCredentialPending } from "../electron/workspace-credentials.mjs";
-import { runtimeBuildIdentity, runtimeReadiness } from "./runtime-identity.ts";
+import { runtimeBuildIdentity, runtimeReadiness, sweepMapIfPresent } from "./runtime-identity.ts";
+import { botStopRefusalMessage, decideBotStop, isBotStoppedError } from "./bot-stop-policy.ts";
 import { createUpdateControl, packagedInstalledAt } from "./update-control.ts";
 import {
   avatarGenerationRequestSchema,
@@ -296,6 +299,17 @@ import { JobRegistry, resolveJobsSettings } from "./jobs/registry.ts";
 import { JobWakeCoordinator } from "./jobs/wake.ts";
 import { JobWakeUsage } from "./jobs/wake-usage.ts";
 import {
+  executeMcpJobKill,
+  executeMcpJobList,
+  executeMcpJobOutput,
+  executeMcpJobStart,
+  mountCliJobTurn,
+  readCliJobTurn,
+  unmountCliJobTurn,
+  type McpLaneJobDeps,
+} from "./jobs/mcp-lane.ts";
+import { jobLane as jobLaneFor } from "./jobs/engine-lanes.ts";
+import {
   JOB_ID_PATTERN,
   JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP,
   isJobActive,
@@ -326,6 +340,8 @@ import { getSentry, isSentryActive } from "./sentry.ts";
 import { infisical, type RefreshReason } from "./infisical.ts";
 import { InfisicalError } from "./infisical-client.ts";
 import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, vaultNames, type SecretFieldSpec } from "./secret-map.ts";
+import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
+import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
@@ -394,12 +410,17 @@ import { readSkillFolder } from "./skill-folder.ts";
 import { readCuaConnection } from "./local-computer.ts";
 import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
+import {
+  ensureContainerComputerSession,
+  localVmSharedBotSession,
+} from "./local-vm-shared-session.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
 import { findRecallCli, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
+import { isSharedVpsMode } from "./vps-shared-session.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import {
   automationRolloverCaps,
@@ -566,6 +587,18 @@ void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
+// BOTFLEET-2M / Sentry 7768010831: createUpdateControl wires readiness into a
+// 2s status timer. Mid-update harness restart can fire that timer across the
+// top-level awaits below (infisical.preload, registry.load, …) before later
+// module bindings exist. Keep this Map — and the boot gate readiness reads —
+// initialized synchronously before construction so emitIfChanged never walks
+// an uninitialized binding.
+let bootComplete = false;
+/** Room rounds held only so credential restore can drain; counted out of
+ * queuedRooms when allowCredentialQueues is set. Must exist before
+ * createUpdateControl: currentRuntimeReadiness for-of's it on the status path. */
+const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
+
 // "Is there a newer BotFleet, and install it" — asked from this Mac or from
 // a paired phone.  The updater it starts stops this harness partway through,
 // so it can never be our child: it is launched detached and reports through
@@ -613,10 +646,9 @@ const stopTranscriptSweeps = startTranscriptRetentionSweeps(transcriptDirs);
 let runtimeQuiescing = false;
 let activeUpdateAdmissions = 0;
 const cfg = loadConfig();
-// Flipped once, at the end of this file, when everything a secret change
-// might rebuild or re-point exists.  A snapshot that lands before then is
-// applied to `cfg` and nothing more.
-let bootComplete = false;
+// bootComplete is declared above createUpdateControl (BOTFLEET-2M). Flipped
+// once at the end of this file when everything a secret change might rebuild
+// exists; a snapshot that lands before then is applied to `cfg` only.
 // The secret store resolves before anything reads `cfg`.  `loadConfig()` above
 // ran while the snapshot was still empty, so the whole config is read again
 // once the preload lands — that second read is what puts a stored value in
@@ -969,7 +1001,7 @@ const phoneProxyPath = SPAWNED_PROXIES.phone;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
-function agentsIntegration(botId: string, threadId: string, depth: number) {
+function agentsIntegration(botId: string, threadId: string, depth: number, options: { jobs?: boolean } = {}) {
   return {
     command: process.execPath,
     args: [agentsProxyPath],
@@ -982,6 +1014,12 @@ function agentsIntegration(botId: string, threadId: string, depth: number) {
       // can speak for the bot it was spawned for and no further.
       OMB_COMMS_TOKEN: mintCommsGrant(botId, threadId, depth),
       OMB_TURN_DEPTH: String(depth),
+      // Background jobs (jobs P2).  The harness's own verdict, handed down as
+      // one bit: the proxy publishes the job tools only when this is "1", and
+      // the `/api/internal/jobs` endpoints re-check the same mount before
+      // doing anything.  Absent on every other lane, so a proxy spawned
+      // without jobs cannot offer them.
+      ...(options.jobs ? { OMB_JOBS: "1" } : {}),
     },
   };
 }
@@ -1662,6 +1700,22 @@ const jobWakes = new JobWakeCoordinator({
   startWake: async (botId, threadId, prompt, jobIds) => {
     await startTurn(botId, prompt, { threadId, automationSource: "job" });
     jobRegistry.markNoticesDelivered(jobIds);
+  },
+  // A busy COMMAND-LINE turn is told on the turn it is already in (jobs P2),
+  // never woken: Claude steers mid-turn, and an engine that cannot steer
+  // returns false so the notice rides its next turn's opening reminder
+  // instead.  The HTTP lane has no such hook and keeps parking a busy bot.
+  steerBusyNotice: (botId, threadId, prompt) => {
+    const bot = store.bot(botId);
+    const instance = bot ? registry.get(bot.modelSelection.instanceId) : undefined;
+    const adapter = instance?.adapter;
+    // Both guards, not one: `steer` is how a message enters a running turn
+    // and `queueing` is the capability that says this engine can hold one.
+    // Claude is the only driver that implements both today, so every other
+    // engine takes the `false` and leaves the notice for its next turn.
+    if (!adapter?.steer || adapter.capabilities.queueing !== true) return false;
+    if (providerReloadInProgress) return false;
+    return adapter.steer(threadId, prompt);
   },
   log: (line) => console.warn(line),
 });
@@ -2467,7 +2521,6 @@ const pendingMemberFallback = new Map<
   // fallback another engine's failure armed.
   { groupId: string; botId: string; selection: ModelSelection; instanceId?: string }
 >();
-const credentialPendingRoomRounds = new Map<string, { threadId: string; botId: string }>();
 const pendingCredentialFallback = new Map<string, {
   botId: string;
   threadId: string;
@@ -2810,7 +2863,13 @@ bus.subscribe((event: RuntimeEvent) => {
 // from INSIDE a tool call, so by the time any terminal event names this
 // thread there is no tool left to consume an answer.
 bus.subscribe((event: RuntimeEvent) => {
-  if (event.type === "turn.completed") permissionBroker.abandonThread(event.threadId, "teardown");
+  if (event.type === "turn.completed") {
+    permissionBroker.abandonThread(event.threadId, "teardown");
+    // The turn's job tools go with it.  A comms token is minted per turn and
+    // can outlive it, so leaving the mount up would let a replayed token
+    // start a job against a finished turn's working folder.
+    unmountCliJobTurn(event.threadId, event.turnId);
+  }
 });
 
 // Bots currently working with nobody at the keyboard — a webhook turn, or a
@@ -2885,6 +2944,14 @@ const localVmLifecycleBusy = new Set<string>();
 // Keyed by thread AND bot: see `releaseLocalVmThread` and `TurnOwnerClaims`.
 const localVmThreadTargets = new TurnOwnerClaims<LocalVmTarget>();
 const localVmActiveThreads = new Map<string, { threadId: string; botId: string }>();
+/** Active lanes per CONTAINER key.
+ *
+ * In shared mode several bots hold distinct lanes on the one shared container,
+ * so the single `localVmActiveThreads` entry per container is gone.  The idle
+ * teardown asks "is anyone still driving THIS container", which is a count
+ * across lanes, not a lookup of one entry — without this, bot A's lane going
+ * idle would let the teardown remove the container bot B is still clicking in. */
+const localVmContainerActiveLanes = new Map<string, number>();
 let localVmImageBusy = false;
 let localVmProvisionBusy = false;
 let localVmModeChangeBusy = false;
@@ -2900,11 +2967,47 @@ function localVmTargetForBot(botId?: string): LocalVmTarget {
   if (cfg.localVm?.mode === "per-bot" && botId) {
     return perBotLocalVmTarget(botId);
   }
+  // Shared mode: one container, one desktop per bot.  `key` stays the shared
+  // container so lifecycle, idle teardown and the viewer keep seeing a single
+  // desktop; the per-bot session is what gives the bot its own display, socket
+  // and screenshot, and the lease lane below is what makes its turn its own.
+  if (botId) {
+    const session = localVmSharedBotSession(botId);
+    return { ...SHARED_LOCAL_VM_TARGET, laneKey: `localvm-bot:${session.short}`, session };
+  }
   return SHARED_LOCAL_VM_TARGET;
 }
 
+/** Lease lane for a target: per-bot in shared mode, the container otherwise. */
+function localVmLaneKey(target: LocalVmTarget): string {
+  return target.laneKey ?? target.key;
+}
+
 function localVmLeaseFor(target: LocalVmTarget): LocalVmLease {
-  return localVmLeases.forTarget(target.key);
+  return localVmLeases.forTarget(localVmLaneKey(target));
+}
+
+/** Mark a lane active or inactive, keeping the per-container count exact so the
+ * idle backstop cannot tear down a container another bot is still using. */
+function setLocalVmLaneActive(
+  target: LocalVmTarget,
+  threadId: string,
+  botId: string,
+  active: boolean,
+): void {
+  const lane = localVmLaneKey(target);
+  const current = localVmActiveThreads.get(lane);
+  if (active) {
+    localVmActiveThreads.set(lane, { threadId, botId });
+  } else if (current && current.threadId === threadId && current.botId === botId) {
+    localVmActiveThreads.delete(lane);
+  } else {
+    return;
+  }
+  const delta = active ? 1 : -1;
+  const next = (localVmContainerActiveLanes.get(target.key) ?? 0) + delta;
+  if (next > 0) localVmContainerActiveLanes.set(target.key, next);
+  else localVmContainerActiveLanes.delete(target.key);
 }
 
 function localVmIdleFor(target: LocalVmTarget): LocalVmIdleTimer {
@@ -2912,7 +3015,10 @@ function localVmIdleFor(target: LocalVmTarget): LocalVmIdleTimer {
   if (idle) return idle;
   idle = new LocalVmIdleTimer(
     LOCAL_VM_IDLE_MS,
-    () => localVmImageBusy || localVmLifecycleBusy.has(target.key) || localVmActiveThreads.has(target.key),
+    () =>
+      localVmImageBusy ||
+      localVmLifecycleBusy.has(target.key) ||
+      (localVmContainerActiveLanes.get(target.key) ?? 0) > 0,
     async () => {
       localVmLifecycleBusy.add(target.key);
       try {
@@ -2969,8 +3075,7 @@ function releaseLocalVmThread(threadId: string, botId?: string): void {
   const target = localVmThreadTargets.release(threadId, owner);
   if (!target) return;
   localVmLeaseFor(target).release(threadId, owner);
-  const active = localVmActiveThreads.get(target.key);
-  if (active && active.threadId === threadId && active.botId === owner) localVmActiveThreads.delete(target.key);
+  setLocalVmLaneActive(target, threadId, owner, false);
 }
 
 /** Claim the Local VM for one turn, or throw the reason it cannot be had.
@@ -2990,7 +3095,7 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
     throw new Error("this Local VM is already being used by another turn — wait for that turn to finish");
   }
   localVmThreadTargets.set(threadId, botId, target);
-  localVmActiveThreads.set(target.key, { threadId, botId });
+  setLocalVmLaneActive(target, threadId, botId, true);
   localVmIdleFor(target).touch();
   let localVm = await containerComputerStatus(undefined, undefined, target);
   try {
@@ -3000,6 +3105,21 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   }
   if (!localVm.ready || !localVm.runtime) {
     throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
+  }
+  // The container is up but this bot's desktop may not be: in shared mode each
+  // bot owns its own display + socket, and the first turn for a bot is the one
+  // that has to start it.  Idempotent, so every later turn is a no-op.  The
+  // shared `:1` supervisor desktop is never touched.
+  if (target.session) {
+    try {
+      await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+    } catch (error) {
+      throw new Error(
+        `could not start this bot's shared VM desktop on ${target.session.display}: ${
+          error instanceof Error ? error.message : String(error)
+        } (App Settings → Local VM)`,
+      );
+    }
   }
   return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
 }
@@ -3678,7 +3798,7 @@ bus.subscribe((event: RuntimeEvent) => {
       };
       // Resolve the registry engine (driver kind) once so usage banking
       // keeps attributing correctly even after the connection is deleted.
-      // DeepSeek Harness can run MiniMax models (e.g. MiniMax-M3) — attribute
+      // Clutch can run MiniMax models (e.g. MiniMax-M3) — attribute
       // those turns to MiniMax so MiniMax usage is separated from DeepSeek.
       const isMiniMaxTurn = Boolean(
         actualSelection.model && (
@@ -4345,6 +4465,10 @@ function drainQueuedSends() {
       excludeMessageIds: excludeIds,
       linqChatId,
       unattended: relayed || undefined,
+      // person-initiated: the person's OWN messages, held only because the
+      // bot was busy.  Draining them is that person asking, so it wakes a
+      // stopped bot — the same as typing them into an idle bot.
+      personInitiated: true,
     }).catch((err) => {
       store.appendMessage(threadId, {
         role: "bot",
@@ -4402,6 +4526,14 @@ async function startTurn(
     modelSelection?: ModelSelection;
     from?: Message["from"];
     comm?: Message["comm"];
+    /**
+     * True only when a PERSON asked for this specific turn.  Every
+     * system-initiated dispatch — update resume, boot recovery, a card
+     * continuation, a job, a routine, a webhook — leaves this false, so a bot
+     * they stopped cannot be re-dispatched behind their back.  See
+     * `server/bot-stop-policy.ts`.
+     */
+    personInitiated?: boolean;
   },
 ) {
   if (runtimeQuiescing) {
@@ -4409,7 +4541,18 @@ async function startTurn(
   }
   const bot = store.bot(botId);
   if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
-  if (!opts?.automationSource) {
+  // A stop is a decision about the BOT, not about the turn in flight, so it
+  // is enforced here — the one place every dispatch passes through — rather
+  // than in each caller.  A resume used to clear the stop on its way past
+  // (no `automationSource` on a replayed human prompt) and start the bot.
+  const stopDecision = decideBotStop({
+    stopped: routines?.isBotSnoozed(botId) === true,
+    personInitiated: opts?.personInitiated === true,
+  });
+  if (stopDecision.action === "refuse") {
+    throw Object.assign(new Error(botStopRefusalMessage()), { status: 409, code: "bot_stopped" });
+  }
+  if (stopDecision.clearsStop) {
     routines?.clearBotSnooze(botId);
   }
   if (providerReloadInProgress) {
@@ -4531,6 +4674,8 @@ async function startTurn(
       { status: 409, pickUnusable: true },
     );
   }
+  const workspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, task.cwd);
+  if (workspaceError) throw Object.assign(new Error(workspaceError), { status: 409 });
   const instanceId = instance.instanceId;
   // Box-backed cloud borrows the boxAgent default model (and no per-bot effort).
   // VPS-backed cloud keeps the bot's modelSelection — that is the engine that
@@ -4862,6 +5007,26 @@ async function startTurn(
       const granted_mounts = turnComputers.mounts;
       const previewCapture = turnComputers.previewCapture;
       applyComputerMounts(integrations, granted_mounts);
+      // HTTP chat-completions drivers run their own model-to-tool rounds and
+      // emit the same single terminal event as CLI drivers.  Hoisted above the
+      // integrations because the job mount (jobs P2) is one of them, and two
+      // spellings of the same gate would be two chances to disagree.
+      const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
+      const hasHostComputer = turnComputers.hasHostComputer;
+      // Background jobs.  One derivation for both lanes (server/jobs/
+      // engine-lanes.ts), read once here: the prompt, the mounted tools and
+      // the mounted turn must all be the same answer, and a second copy of
+      // this expression is a second chance for them to disagree.
+      const jobLane = jobLaneFor(instance.adapter.capabilities, jobSettings(), hasHostComputer);
+      const jobsForTurn = jobLane.lane === "http";
+      const jobsForCliTurn = jobLane.lane === "mcp";
+      const jobsMounted = jobLane.lane !== "none";
+      if (!jobsMounted && instance.adapter.capabilities.backgroundJobs === "emulated") {
+        // Only worth a line when an engine that COULD have jobs was refused
+        // one, which is the case a maintainer is looking for.
+        console.warn(`[jobs] no job tools for ${instance.driverKind}: ${jobLane.reason}`);
+      }
+
       // Agent control tools include peer comms and the secure credential
       // request card. A comms-invoked turn (depth ≥ cap) gets none — hard recursion
       // stop, so the user's tokens can't be burned by a bot-to-bot loop.
@@ -4879,7 +5044,23 @@ async function startTurn(
         commsDepth < MAX_COMMS_DEPTH &&
         instance.adapter.capabilities.agentsMcp === true
       ) {
-        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth);
+        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, { jobs: jobsMounted });
+      }
+      // Jobs for a command-line turn (jobs P2).  Mounted HERE, beside the
+      // agents integration that carries the tools, and unmounted when the turn
+      // settles: a comms token outlives its turn, and without this a token
+      // replayed after the turn would find job tools with a stale folder.
+      // `cwd` is the same working folder the turn's own tools are confined to.
+      if (jobsForCliTurn) {
+        mountCliJobTurn({
+          botId: bot.id,
+          threadId,
+          cwd: cwd ?? bot.cwd ?? process.cwd(),
+          provider: instance.driverKind,
+          providerInstanceId: instance.instanceId,
+          onComplete: "wake",
+          wakes: jobSettings().wake,
+        });
       }
       // @mentions in the user's message (the composer's tagging UI) become
       // an explicit delegation nudge — the agent still does the ask_bot call
@@ -4947,9 +5128,6 @@ async function startTurn(
       if (providerReloadInProgress) await waitForProviderReloads();
       if (!dispatchStillCurrent()) return;
       watchdog.watch(threadId, bot.id);
-      // HTTP chat-completions drivers run their own model-to-tool rounds and
-      // emit the same single terminal event as CLI drivers.
-      const usesDriverToolLoop = instance.adapter.capabilities.toolLoop === true;
       // One catalog, used twice: what the model is told it has, and what the
       // host will actually run.  Deriving both from the same call is what
       // keeps a hallucinated tool from finding an executor that would run it
@@ -4959,7 +5137,6 @@ async function startTurn(
       // this the catalog would always see `chiefOfStaff: false` and a real
       // Chief's HTTP-lane turn would never be offered the tool its own
       // prompt (chiefOfStaffSystemPrompt) tells it it has.
-      const hasHostComputer = turnComputers.hasHostComputer;
       // Bot RAG is host logic, not an MCP mount — any toolLoop driver
       // qualifies once it is configured, independent of the `qdrantMcp`
       // capability CLI/ACP engines use to mount the real MCP server (see
@@ -5005,15 +5182,6 @@ async function startTurn(
         usesDriverToolLoop && worksInWorkspace && !hasHostComputer && confinementRoot
           ? { workspaceRealpath: realOrResolved(confinementRoot) }
           : undefined;
-      // Background jobs (P1): an engine that runs BotFleet's emulated jobs, a
-      // bot that holds This Computer, and jobs not switched off.  One boolean,
-      // handed to the catalog and to the host alike, so a job tool the model
-      // was not offered finds no executor.
-      const jobsForTurn =
-        usesDriverToolLoop &&
-        hasHostComputer &&
-        instance.adapter.capabilities.backgroundJobs === "emulated" &&
-        jobSettings().enabled;
       const turnTools = buildTurnTools(
         { ...integrations, localComputer: hasHostComputer, workspace: worksInWorkspace, recall: hasRecall, phone: hasPhone, linq: hasLinq, jobs: jobsForTurn },
         { chiefOfStaff: Boolean(bot.chiefOfStaff), linq: hasLinq },
@@ -5038,6 +5206,7 @@ async function startTurn(
             // the host through `bash` and the file tools, never a desktop.
             toolLoopSurface: httpOnlyToolSurface,
             hasHostTerminal: hasHostComputer && !granted_mounts.some((m) => m.kind === "local"),
+            vpsShared: isSharedVpsMode(cfg),
           }),
         },
         // `integrations.composio` exists only when the selected driver
@@ -5071,7 +5240,7 @@ async function startTurn(
         // the owner's jobs setting does.
         // `jobs.wake: false` changes the promise: told on the next turn, not
         // woken, so the bot does not end its turn waiting for a wake.
-        { id: "jobs", label: "Background jobs", text: jobsForTurn ? jobsPrompt(jobSettings().wake, jobSettings()) : "" },
+        { id: "jobs", label: "Background jobs", text: jobsMounted ? jobsPrompt(jobSettings().wake, jobSettings()) : "" },
         // The Chief roster and the status capsule are byte-stable across a
         // teammate's busy flip (PR #617), which is what lets them stay on
         // the stable half.
@@ -5142,7 +5311,7 @@ async function startTurn(
       };
       // Running jobs and waiting job notices open the turn (taken now, at
       // dispatch, so a notice that landed while the turn was set up rides it).
-      const jobReminder = jobTurnReminder(bot.id, threadId, jobsForTurn);
+      const jobReminder = jobTurnReminder(bot.id, threadId, jobsMounted);
       jobNoticeItems = jobReminder.items;
       const turnInput = {
         threadId,
@@ -5298,6 +5467,8 @@ async function startTurn(
         if (jobReminder.text) drafts.push({ source: "automation", text: jobReminder.text });
         recordInjections(drafts);
       }
+      const finalWorkspaceError = taskWorkspaceExecutionError(task.workspaceContext, instance.driverKind, opts?.runOn, cwd);
+      if (finalWorkspaceError) throw new Error(finalWorkspaceError);
       // Bind before sendTurn so assistant_text emitted during the launch
       // still has a chat id.  The pending key is migrated onto the
       // provider turnId once sendTurn returns.
@@ -5305,6 +5476,14 @@ async function startTurn(
         bindLinqChatToTurn(threadId, `pending:${threadId}`, bot.id, opts.linqChatId);
       }
       const started = await instance.adapter.sendTurn(turnInput);
+      // The engine's turn id is known only now, so the mounted job turn is
+      // re-stamped with it (requirement 6): a CLI-lane job records the turn
+      // that made it, the way an HTTP-lane job records its tool runtime's.
+      // A remount keeps every other field the harness set at dispatch.
+      if (started.turnId && jobsForCliTurn) {
+        const mounted = readCliJobTurn(bot.id, threadId);
+        if (mounted) mountCliJobTurn({ ...mounted, turnId: started.turnId });
+      }
       if (opts?.linqChatId && started.turnId) {
         bindLinqChatToTurn(threadId, started.turnId, bot.id, opts.linqChatId);
       }
@@ -6541,6 +6720,15 @@ function recoverInflightTurn(botId: string, action: BootRecoveryAction = "contin
       return;
     }
     if (channelId) finalizeDelegationWatch(threadId, false, "", "Delegated turn could not resume");
+    // A deliberate stop is not a resume failure.  Record it as the person
+    // stopping the bot, drop the marker, and do NOT remember a failure — a
+    // remembered one is permanent noise on a thread nobody is trying to run.
+    if (isBotStoppedError(error)) {
+      console.log(`boot recovery: not resuming ${bot.name} (${threadId}) — the bot is stopped`);
+      releaseBootResume(bot.id, threadId);
+      store.patchBot(bot.id, { inflightThreadId: undefined });
+      return;
+    }
     console.error(`boot recovery failed for ${bot.name} (${threadId}):`, error);
     // Terminal, and remembered: without this the next boot finds the same
     // marker, dispatches the same doomed turn, and fails the same way — 29
@@ -6802,6 +6990,19 @@ async function runGroupMemberTurn(
       tool: { name: `error: ${message}`, ok: false },
     });
     onDispatchError?.(message);
+    return true;
+  }
+  const contextTask = store.groupTaskByThread(group.id, threadId);
+  const workspaceError = taskWorkspaceExecutionError(
+    contextTask?.workspaceContext, instance.driverKind, undefined, contextTask?.pinnedCwd,
+  );
+  if (workspaceError) {
+    store.appendMessage(threadId, {
+      role: "bot", kind: "activity",
+      from: { botId: bot.id, name: bot.name, color: bot.color },
+      tool: { name: `error: ${workspaceError}`, ok: false },
+    });
+    onDispatchError?.(workspaceError);
     return true;
   }
   // A 1:1 or another room turn may have claimed this bot while connected-app
@@ -7097,6 +7298,7 @@ async function runGroupMemberTurn(
         hostPlatform: process.platform,
         toolLoopSurface: httpOnlyToolSurface,
         hasHostTerminal: hasHostComputer && !turnComputers.mounts.some((m) => m.kind === "local"),
+        vpsShared: isSharedVpsMode(cfg),
       }),
     },
     // The room lane mounts the same recall proxy the 1:1 lane does (see the
@@ -7231,8 +7433,12 @@ async function runGroupMemberTurn(
     watchdog.watch(threadId, bot.id);
     // This member's running jobs and job notices open its room turn too.
     const roomJobReminder = jobTurnReminder(bot.id, threadId, roomJobs);
-    instance.adapter
-      .sendTurn({
+    // Recheck after awaited computer setup and use the same rejection cleanup
+    // as a provider failure, so a vanished folder cannot strand ownership.
+    Promise.resolve().then(() => {
+      const finalWorkspaceError = taskWorkspaceExecutionError(contextTask?.workspaceContext, instance.driverKind, undefined, cwd);
+      if (finalWorkspaceError) throw new Error(finalWorkspaceError);
+      return instance.adapter.sendTurn({
         threadId,
         text: roomJobReminder.text ? `${roomJobReminder.text}\n\n${text}` : text,
         system: roomSystem.text,
@@ -7246,7 +7452,8 @@ async function runGroupMemberTurn(
         autoApprove: bot.autoApprove === true,
         unattended: isUnattended(bot.id),
         ...memberTurnSelection(selection),
-      })
+      });
+    })
       .then((started) => {
         // delivered only once the model has the reminder (see the 1:1 lane)
         if (started.dispatched === false) restoreJobNotices(threadId, roomJobReminder.items);
@@ -7584,6 +7791,12 @@ function dispatchConnectorResume(entry: { botId: string; threadId: string; resum
     cardContinuation: true,
     onDispatchError: (message) => markConnectorResumeFailed(entry.threadId, entry.resumeKey, message),
   }).catch((error) => {
+    // A stopped bot is a decision, not a fault: settle the card quietly rather
+    // than parking it in a retry loop that can never succeed.
+    if (isBotStoppedError(error)) {
+      markConnectorResumeFailed(entry.threadId, entry.resumeKey, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) pendingConnectorResumes.set(`${entry.threadId}:${entry.resumeKey}`, entry);
     else markConnectorResumeFailed(entry.threadId, entry.resumeKey, message);
@@ -7689,6 +7902,12 @@ function dispatchSecretResume(entry: SecretResumeEntry) {
     cardContinuation: true,
     onDispatchError: (message) => markSecretResumeFailed(entry.threadId, entry.messageId, message),
   }).catch((error) => {
+    // See the connector resume above: a stopped bot settles the card instead
+    // of retrying forever.
+    if (isBotStoppedError(error)) {
+      markSecretResumeFailed(entry.threadId, entry.messageId, botStopRefusalMessage());
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (/already working/i.test(message)) {
       pendingSecretResumes.set(`${entry.threadId}:${entry.messageId}`, entry);
@@ -8590,6 +8809,10 @@ function drainCredentialFallbacks(): void {
       modelSelection: entry.selection,
       automationSource: entry.userMessage.automationSource,
       unattended: isUnattended(entry.botId),
+      // person-initiated: the person answered the card, so they are asking
+      // for the turn to continue — the same as retyping it.  A stop set
+      // while the card was open is lifted by that answer, not overridden.
+      personInitiated: true,
     }).catch((error) => {
       if (isExternalCredentialPendingError(error)) pendingCredentialFallback.set(key, entry);
       else console.error(`credential fallback resume failed for ${entry.botId}:`, error);
@@ -8864,9 +9087,16 @@ function isLoopbackAddress(address: string | undefined): boolean {
 }
 
 function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueues = false) {
-  for (const [key, round] of credentialPendingRoomRounds) {
-    if (!hasQueuedRoomRound(round.threadId, round.botId)) credentialPendingRoomRounds.delete(key);
-  }
+  // Status timer / capabilities can run before module init finishes. Other
+  // readiness counters still live below the top-level awaits; refuse Install
+  // until bootComplete rather than throwing on a half-built harness.
+  if (!bootComplete) return runtimeReadiness({ boot: 1 });
+  // Belt: never for-of a non-Map even if this binding is somehow replaced.
+  const pendingRoundCount = sweepMapIfPresent(
+    credentialPendingRoomRounds,
+    (_key: string, round: { threadId: string; botId: string }) =>
+      !hasQueuedRoomRound(round.threadId, round.botId),
+  );
   return runtimeReadiness({
     // Restore routes may exclude only their own still-held HTTP admission.
     // Other requests, including ones still reading a body, remain blockers.
@@ -8875,7 +9105,7 @@ function currentRuntimeReadiness(ownAdmissionActive = false, allowCredentialQueu
     completions: completionFolds.size,
     groupOperations: groupTurnOperations.size,
     queuedSends: queuedMessageCount(),
-    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? credentialPendingRoomRounds.size : 0)),
+    queuedRooms: Math.max(0, _queuedRoomCount() - (allowCredentialQueues ? pendingRoundCount : 0)),
     delegations: pendingDelegationSnapshot().length,
     connectors: pendingConnectorResumes.size,
     secrets: pendingSecretResumes.size,
@@ -8951,6 +9181,10 @@ async function resumeInterruptedChatTurns(
           threadId: resumeThreadId,
           userMessage: resumePrompt,
           automationSource: resumePrompt.automationSource,
+          // NOT person-initiated, even though the replayed prompt is a
+          // person's message.  The person who wrote it is not asking now; the
+          // system is.  This is the call that used to clear their own stop and
+          // restart the bot they had parked.
           ...(resumePrompt.automationSource === "delegation" ? {
             commsDepth: 1,
             unattended: isUnattended(resumeBot.id),
@@ -8959,6 +9193,12 @@ async function resumeInterruptedChatTurns(
           } : {}),
         });
       } catch (error) {
+        if (isBotStoppedError(error)) {
+          // Their stop outranks our replay.  Say so in the log rather than
+          // retrying: the thread stays put until the person starts the bot.
+          console.log(`[${context}] not resuming ${resumeBot.name} — the bot is stopped`);
+          continue;
+        }
         // The provider rejected the redispatch before it could emit a
         // terminal event. Consume only this re-armed watch and record it.
         finalizeDelegationWatch(resumeThreadId, false, "", "Delegated turn could not resume");
@@ -8997,6 +9237,39 @@ function rollbackForcedQuiesce(
   resourceTriggers.start();
   infisical.start();
   void resumeInterruptedChatTurns(interruptedBots, "quiesce-rollback");
+}
+
+/** How long a forced quiesce waits for interrupted work to actually settle.
+ *
+ * The old fixed `200ms` sleep was the single reason "update failed while bots
+ * were running" was such a common report.  Interrupting a bot asks its
+ * provider subprocess to stop; that subprocess then has to exit, its
+ * `turn.completed` fold has to run, and `busy` has to clear.  A CLI that
+ * takes two seconds to die is normal, and at 200 ms the readiness re-check
+ * still saw `turns: N`, concluded the machine was busy, and ROLLED THE WHOLE
+ * UPDATE BACK — after having already interrupted the bots.  So the update
+ * failed, and the work it had already stopped still had to be resumed by
+ * hand.  Bounded so a genuinely wedged subprocess still refuses promptly
+ * rather than hanging the updater; the refusal path is unchanged, it just
+ * no longer fires on a bot that was on its way out. */
+const QUIESCE_DRAIN_TIMEOUT_MS = 15_000;
+/** Poll interval while draining.  Short enough to feel immediate, long enough
+ * that a large fleet does not spin the readiness scan. */
+const QUIESCE_DRAIN_POLL_MS = 250;
+
+/** Wait for interrupted work to settle, up to the drain timeout.
+ *
+ * Returns as soon as the runtime reports idle.  Deliberately does NOT throw:
+ * the caller re-reads readiness itself and decides, so this only decides how
+ * long to wait, never whether the update may proceed. */
+async function drainAfterInterrupt(): Promise<void> {
+  const deadline = Date.now() + QUIESCE_DRAIN_TIMEOUT_MS;
+  // The first check is immediate: a bot whose fold already ran needs no wait.
+  if (currentRuntimeReadiness().safeToRestart) return;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, QUIESCE_DRAIN_POLL_MS));
+    if (currentRuntimeReadiness().safeToRestart) return;
+  }
 }
 
 async function beginRuntimeQuiesce(force = false) {
@@ -9105,7 +9378,7 @@ async function beginRuntimeQuiesce(force = false) {
       }
     }
 
-    await new Promise((r) => setTimeout(r, 200));
+    await drainAfterInterrupt();
 
     // Report the actual final safety state.  Forcing interrupts the routines
     // and busy bots above, but anything else still counted — a queued send, a
@@ -9385,6 +9658,57 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           credentialId: body.credentialId,
           reason: typeof body.reason === "string" ? body.reason : undefined,
         });
+        return json(res, result.status, result.body);
+      }
+      // Background jobs for the MCP lane (jobs P2).  The comms token is the
+      // caller's only identity: the grant names the bot and thread, and the
+      // bodies below run against THAT binding, never against a bot id the
+      // model put in the arguments.  So a job may only be read or stopped by
+      // the bot that owns it, whatever the model sends.
+      if (path === "/api/internal/jobs" || path.startsWith("/api/internal/jobs/")) {
+        const token = bearerToken(req.headers.authorization);
+        const grant = token ? commsGrants.get(token) : undefined;
+        if (!grant) return json(res, 403, { error: "forbidden: job tools need this turn's comms token" });
+        // The turn's own job tools, or none.  Absent a mount there is no cwd
+        // and no provider identity, so this is the CLI lane's "no mount, no
+        // tools" rule — the same one the HTTP lane carries as `ctx.jobs`.
+        const turn = readCliJobTurn(grant.botId, grant.threadId);
+        if (!turn) return json(res, 403, { error: "forbidden: job tools are not mounted on this turn" });
+        const deps: McpLaneJobDeps = {
+          registry: jobRegistry,
+          botId: turn.botId,
+          threadId: turn.threadId,
+          ...(turn.turnId ? { turnId: turn.turnId } : {}),
+          cwd: turn.cwd,
+          onComplete: turn.onComplete,
+          wakes: turn.wakes,
+          // The permission broker, not an engine round trip.  This is what
+          // makes the owner's full-auto ruling reach this lane: the ask is
+          // opened in-process, so `isOwnJobStartRequest` recognises it as
+          // the harness's own and answers a full-auto bot with no card.
+          requestApproval: (ask) =>
+            permissionBroker.request({
+              threadId: turn.threadId,
+              botId: turn.botId,
+              provider: turn.provider,
+              ...(turn.providerInstanceId ? { providerInstanceId: turn.providerInstanceId } : {}),
+              ...(turn.signal ? { signal: turn.signal } : {}),
+              ...ask,
+            }),
+        };
+        const args = method === "GET" ? {} : await readBody(req);
+        const action = path.slice("/api/internal/jobs".length).replace(/^\//, "");
+        const result =
+          action === "" || action === "list"
+            ? executeMcpJobList(deps)
+            : action === "start"
+              ? await executeMcpJobStart(deps, args)
+              : action === "output"
+                ? await executeMcpJobOutput(deps, args, turn.signal)
+                : action === "kill"
+                  ? await executeMcpJobKill(deps, args)
+                  : null;
+        if (!result) return json(res, 404, { error: "not found" });
         return json(res, result.status, result.body);
       }
       if (method === "POST" && path === "/api/internal/connectors/mcp") {
@@ -11762,6 +12086,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           recording,
           ...(fromImessage ? { automationSource: "imessage" as const } : {}),
           unattended: relaySourced || undefined,
+          // person-initiated: a person sent this.  Relayed or not, someone
+          // typed it on purpose, which is how a stopped bot is meant to be
+          // woken — `interrupt` stops automation, not the owner.
+          personInitiated: true,
         });
         return { status: 202, body: { ok: true } };
       };
@@ -11823,6 +12151,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         replyTo,
         automationSource: message.automationSource,
         unattended: message.role === "system" ? isUnattended(bot.id) : undefined,
+        // person-initiated: a person hitting retry/rewind on a message.
+        personInitiated: true,
       });
       return json(res, 202, { ok: true });
     }
@@ -12028,7 +12358,54 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       if (bot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
       const body = await readBody(req);
-      const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined);
+      let workspaceContext: TaskWorkspaceContext | undefined;
+      if (body.appRef !== undefined) {
+        const parsedRef = z.object({ kind: z.literal("group"), id: z.string().regex(/^[\w-]+$/) }).safeParse(body.appRef);
+        if (!parsedRef.success) return json(res, 400, { error: "appRef must identify an App group" });
+        const ref = parsedRef.data;
+        // Only an explicit stable ID binds a private task to an App.  Section
+        // names, the selected tab, and matching folders never imply membership.
+        const resolveFolder = (): { cwd: string } | { status: number; error: string } => {
+          const group = store.group(ref.id);
+          if (!group) return { status: 404, error: "no such App group" };
+          if (group.dm || !group.memberIds.includes(bot.id)) {
+            return { status: 400, error: "choose an App group assigned to this bot" };
+          }
+          if (!group.cwd) return { status: 400, error: "this App group needs a working folder first" };
+          const checked = validateBotCwd(group.cwd);
+          if (!checked.ok) return { status: 400, error: checked.error };
+          if (!checked.cwd) return { status: 400, error: "this App group needs a working folder first" };
+          const cwd = realOrResolved(checked.cwd);
+          if (req.headers["x-botfleet-companion"] === "1") {
+            const refused = cwdConfinementError(cwd, phoneCwdConfinement());
+            if (refused) return { status: 403, error: `${refused} — pick it in BotFleet on your computer` };
+          }
+          return { cwd };
+        };
+        const folder = resolveFolder();
+        if ("error" in folder) return json(res, folder.status, { error: folder.error });
+        try {
+          workspaceContext = await captureTaskWorkspaceContext({ kind: "group", id: ref.id }, folder.cwd);
+        } catch (error) {
+          if (error instanceof TaskWorkspaceContextError) return json(res, 400, { error: error.message });
+          throw error;
+        }
+        // Metadata probes yield.  Membership, folder access, and defaults may
+        // change during them; reject stale input before creating any thread.
+        const current = resolveFolder();
+        if ("error" in current) return json(res, current.status, { error: current.error });
+        if (current.cwd !== workspaceContext.cwd) {
+          return json(res, 409, { error: "the App folder changed during task setup — try again" });
+        }
+      }
+      const currentBot = store.bot(bot.id);
+      if (!currentBot) return json(res, 404, { error: "no such bot" });
+      if (currentBot.busy) return json(res, 409, { error: "this bot is working — let it finish before starting a task" });
+      if (!allowsMultipleBotThreads(parseConversationMode(cfg.conversationMode))) {
+        return json(res, 409, { error: "workspace settings changed during task setup — try again" });
+      }
+      const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined,
+        true, undefined, workspaceContext);
       if (!task) return json(res, 500, { error: "couldn't create that task" });
       const fresh = botWithThread(store.bot(bot.id)!);
       broadcast({ kind: "bot", bot: fresh });
@@ -13286,10 +13663,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (patch.conversationMode === undefined) {
         return json(res, 400, { error: "nothing to save" });
       }
-      cfg.conversationMode = parseConversationMode(patch.conversationMode);
-      saveConfig({ conversationMode: cfg.conversationMode });
-      const mergeThreads = body.mergeThreads === true && cfg.conversationMode === "simple";
+      const nextMode = parseConversationMode(patch.conversationMode);
+      const mergeThreads = body.mergeThreads === true && nextMode === "simple";
       if (mergeThreads) store.mergeAllExtraThreads();
+      cfg.conversationMode = nextMode;
+      saveConfig({ conversationMode: cfg.conversationMode });
       const status = configStatus();
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
@@ -13969,6 +14347,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           error: "Updating Infisical settings and credentials in the same request is not supported.\u00A0 Save Infisical settings first.",
         });
       }
+      // The knob twin of the check above, narrower: a knob save rides the
+      // write-through path in `knob-write-through.ts`, but a patch that ALSO
+      // moves the store's own connection (project, site, environment, path,
+      // identity) would land the knob write in the OLD project before the
+      // connection moves.  Refuse the combination outright.  A patch that
+      // carries only `infisical.refreshMinutes` is a knob write like any
+      // other and is handled below.
+      if (
+        patchChangesInfisicalConnection(patch) &&
+        KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined)
+      ) {
+        return json(res, 400, {
+          error: "Updating the Infisical connection and managed settings in the same request is not supported.\u00A0 Save the Infisical connection first.",
+        });
+      }
 
       const vaultForSave = infisical.getStatus();
       const vaultKnownNames = new Set(vaultNames());
@@ -14058,6 +14451,39 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       for (const { spec } of managedInPatch) blankSecretField(patch, spec);
+      // The tunable-knob twin of the credential write-through above, via
+      // `server/knob-write-through.ts`: a knob the store manages goes to the
+      // store first and only then is dropped from the patch bound for disk,
+      // so a failed write leaves both sides exactly as they were.  On a
+      // partial failure the writes that already landed are in the vault while
+      // this process still holds the old values, so the store and this
+      // process are reconciled before answering — the same reconciliation the
+      // credential path runs two blocks up.
+      const knobWrite = await writeThroughKnobs(patch, {
+        enabled: vaultForSave.enabled,
+        writeThrough: vaultForSave.writeThrough,
+        environment: vaultForSave.environment,
+        unreachable: vaultUnreachable,
+        knownNames: vaultKnownNames,
+        sourceOf: (id) => knobSource(id),
+        writeSecret: (name, value) => infisical.writeSecret(name, value),
+      });
+      if (!knobWrite.ok) {
+        if (knobWrite.written.length > 0) {
+          await applyResolvedSecrets("settings").catch((applyError) => {
+            console.error(
+              `[infisical] apply after a partial knob write-through failed: ${applyError instanceof Error ? applyError.message : String(applyError)}`,
+            );
+          });
+        }
+        return json(res, knobWrite.status, {
+          error: knobWrite.error,
+          field: knobWrite.field,
+          infisicalName: knobWrite.infisicalName,
+          written: knobWrite.written,
+          failed: knobWrite.failed,
+        });
+      }
       // Bot identities and permission fields can change while the provider
       // and secret-store checks above await.  Bind the save to the exact
       // fleet that was displayed before persisting a host-capable default.

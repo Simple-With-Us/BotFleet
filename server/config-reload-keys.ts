@@ -5,8 +5,10 @@ import type { ComputerProviderId } from "../shared/local-auto-consent.ts";
 // provider and interrupts every in-flight turn, so only a key a driver
 // actually reads may trigger it.
 //
-// Profile, voice, VPS, and room timeout changes do not rebuild the fleet:
-// no driver reads them.  Terminology is only a display word, so renaming
+// Profile, voice, VPS, background-job and room timeout changes do not
+// rebuild the fleet: no driver reads them.  `jobs` is read per use from the
+// live config (`resolveJobsSettings(cfg.jobs)`), so a job-limit save takes
+// effect without interrupting a single in-flight turn.  Terminology is only a display word, so renaming
 // rooms must never kill a turn that is running.  `botDefaults` (the
 // workspace computer providers, VPS mode, the New Bots default and the
 // legacy allowlist) is read per turn by `resolveTurnComputerMounts` from
@@ -21,6 +23,7 @@ export const CONFIG_KEYS_WITHOUT_PROVIDER_RELOAD: ReadonlySet<string> = new Set(
   "imageGen",
   "vps",
   "rooms",
+  "jobs",
   "localVm",
   "autoUpdate",
   "ingress",

@@ -25,6 +25,7 @@ import type { ConnectorToolGrant } from "../shared/connector-tools.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { ToolKind } from "../shared/tool-activity.ts";
 import type { ContextInjectionRef } from "../shared/context-injection.ts";
+import { taskWorkspaceContextsMatch, type TaskWorkspaceContext } from "../shared/task-workspace-context.ts";
 import {
   applyOwnerDirective,
   classifyModel,
@@ -233,6 +234,8 @@ export interface GroupTaskRecord {
   createdAt: number;
   pinnedCwd?: string | null;
   pinnedMessageId?: string;
+  /** Explicit App binding preserved when a private task moves into a room. */
+  workspaceContext?: TaskWorkspaceContext;
 }
 
 /** A room: a shared thread where several bots + the user talk. Plain
@@ -307,12 +310,15 @@ export interface TaskRecord {
    *  before the field existed; those attribute whole-task, by the
    *  configured selection. */
   usageByInstance?: Record<string, InstanceUsage>;
-  /** the folder this task's turns run in, pinned on its first turn from
-   * the bot's `cwd` at that moment. Pinned, not read live: Claude keeps
-   * sessions per project directory and Codex threads carry their cwd, so
-   * a folder that moved under a live session would break resume. `null`
-   * = pinned to the default (home); absent = not pinned yet. */
+  /** the folder this task's turns run in.  New tasks snapshot a bot-specific
+   * `cwd` when present; otherwise dispatch can still apply its workspace
+   * fallback.  Pinned, not read live: Claude keeps sessions per project
+   * directory and Codex threads carry their cwd, so a folder that moved
+   * under a live session would break resume.  `null` = explicitly pinned to
+   * the default (home); absent = not pinned yet. */
   cwd?: string | null;
+  /** Creation-time App and local checkout snapshot, independent of bot defaults. */
+  workspaceContext?: TaskWorkspaceContext;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
   modelSelection?: ModelSelection;
@@ -1399,6 +1405,9 @@ export class Store {
     if (!from.tasks || from.tasks.length < 2) return null;
     const task = from.tasks.find((entry) => entry.threadId === threadId);
     if (!task) return null;
+    if (task.workspaceContext && task.workspaceContext.appRef.id !== toGroupId) {
+      throw Object.assign(new Error("this conversation belongs to another App — move it to its original App group"), { status: 409 });
+    }
 
     from.tasks = from.tasks.filter((entry) => entry.threadId !== threadId);
     if (from.threadId === threadId) {
@@ -1461,6 +1470,9 @@ export class Store {
     const from = bot.tasks.find((entry) => entry.threadId === fromThreadId);
     const into = bot.tasks.find((entry) => entry.threadId === intoThreadId);
     if (!from || !into) return null;
+    if (!taskWorkspaceContextsMatch(from.workspaceContext, into.workspaceContext)) {
+      throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
+    }
 
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
@@ -1505,6 +1517,9 @@ export class Store {
     const from = group.tasks.find((entry) => entry.threadId === fromThreadId);
     const into = group.tasks.find((entry) => entry.threadId === intoThreadId);
     if (!from || !into) return null;
+    if (!taskWorkspaceContextsMatch(from.workspaceContext, into.workspaceContext)) {
+      throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
+    }
 
     const incoming = this.messagesFor(fromThreadId);
     if (incoming.length > 0) {
@@ -1526,6 +1541,17 @@ export class Store {
   /** Fold every extra bot and room conversation into the active thread.
    * Used when switching the workspace to Simple with merge opted in. */
   mergeAllExtraThreads(): { bots: number; groups: number; threads: number } {
+    // Preflight the entire operation before moving any transcript or alias.
+    // Simple-mode conversion must not hide a task whose binding prevented merge.
+    for (const owner of [...this.bots, ...this.groups.filter((group) => !group.dm)]) {
+      const into = owner.tasks?.find((task) => task.threadId === owner.threadId);
+      for (const task of owner.tasks ?? []) {
+        if (task.threadId !== owner.threadId
+          && !taskWorkspaceContextsMatch(task.workspaceContext, into?.workspaceContext)) {
+          throw Object.assign(new Error("these conversations have different App bindings — keep them separate"), { status: 409 });
+        }
+      }
+    }
     let bots = 0;
     let groups = 0;
     let threads = 0;
@@ -1566,6 +1592,9 @@ export class Store {
     if (!bot || !group || group.dm || !bot.tasks || bot.tasks.length < 2) return null;
     const task = bot.tasks.find((entry) => entry.threadId === threadId);
     if (!task) return null;
+    if (task.workspaceContext && task.workspaceContext.appRef.id !== groupId) {
+      throw Object.assign(new Error("this conversation belongs to another App — move it to its original App group"), { status: 409 });
+    }
 
     bot.tasks = bot.tasks.filter((entry) => entry.threadId !== threadId);
     if (bot.threadId === threadId) {
@@ -1573,15 +1602,14 @@ export class Store {
       bot.threadId = next.threadId;
       bot.resumeCursors = {};
     }
-    group.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        ...(task.cwd === undefined ? {} : { pinnedCwd: task.cwd }),
-      },
-      ...(group.tasks ?? []),
-    ];
+    const moved: GroupTaskRecord = {
+      threadId: task.threadId,
+      title: task.title,
+      createdAt: task.createdAt,
+    };
+    if (task.cwd !== undefined) moved.pinnedCwd = task.cwd;
+    if (task.workspaceContext) moved.workspaceContext = structuredClone(task.workspaceContext);
+    group.tasks = [moved, ...(group.tasks ?? [])];
 
     this.saveBots();
     this.saveGroups();
@@ -1608,16 +1636,15 @@ export class Store {
       group.pinnedCwd = next.pinnedCwd;
       group.pinnedMessageId = next.pinnedMessageId;
     }
-    bot.tasks = [
-      {
-        threadId: task.threadId,
-        title: task.title,
-        createdAt: task.createdAt,
-        resumeCursors: {},
-        ...(task.pinnedCwd === undefined ? {} : { cwd: task.pinnedCwd }),
-      },
-      ...(bot.tasks ?? []),
-    ];
+    const moved: TaskRecord = {
+      threadId: task.threadId,
+      title: task.title,
+      createdAt: task.createdAt,
+      resumeCursors: {},
+    };
+    if (task.pinnedCwd !== undefined) moved.cwd = task.pinnedCwd;
+    if (task.workspaceContext) moved.workspaceContext = structuredClone(task.workspaceContext);
+    bot.tasks = [moved, ...(bot.tasks ?? [])];
 
     this.saveGroups();
     this.saveBots();
@@ -2157,6 +2184,11 @@ export class Store {
     const bot = this.bot(botId);
     const task = bot ? this.taskByThread(botId, threadId) : undefined;
     if (!bot || !task) return null;
+    if (task.workspaceContext) {
+      if (opts.none) throw new Error("a local App task cannot discard its working folder");
+      if (task.cwd !== task.workspaceContext.cwd) throw new Error("inconsistent App task working folder");
+      return task.workspaceContext.cwd;
+    }
     if (opts.none) {
       if (task.cwd !== null) {
         task.cwd = null;
@@ -2194,6 +2226,10 @@ export class Store {
         this.emit({ type: "group", groupId: group.id });
       }
       return group.pinnedCwd;
+    }
+    if (task.workspaceContext) {
+      if (task.pinnedCwd !== task.workspaceContext.cwd) throw new Error("inconsistent App task working folder");
+      return task.workspaceContext.cwd;
     }
     if (task.pinnedCwd === undefined) {
       task.pinnedCwd = group.cwd ?? null;
@@ -2306,7 +2342,7 @@ export class Store {
     const title = opts?.title?.trim() || previous?.title || "Automation";
     const activate = opts?.activate ?? true;
     // createTask reunites on a matching key — we already cleared it.
-    const neu = this.createTask(botId, title, activate, automationKey);
+    const neu = this.createTask(botId, title, activate, automationKey, previous?.workspaceContext);
     if (!neu) return null;
     if (previousThreadId) {
       this.appendMessage(neu.threadId, {
@@ -2326,7 +2362,13 @@ export class Store {
   /** A fresh context on the same bot: new thread, new session, same
    * persona/tools/computer. Becomes the active task.  A matching
    * `automationKey` returns the existing task instead of minting another. */
-  createTask(botId: string, title?: string, activate = true, automationKey?: string): TaskRecord | null {
+  createTask(
+    botId: string,
+    title?: string,
+    activate = true,
+    automationKey?: string,
+    workspaceContext?: TaskWorkspaceContext,
+  ): TaskRecord | null {
     const bot = this.bot(botId);
     if (!bot) return null;
     if (automationKey) {
@@ -2343,6 +2385,10 @@ export class Store {
       resumeCursors: {},
       ...(automationKey ? { automationKey } : {}),
     };
+    if (workspaceContext) {
+      task.cwd = workspaceContext.cwd;
+      task.workspaceContext = structuredClone(workspaceContext);
+    } else if (bot.cwd !== undefined) task.cwd = bot.cwd;
     bot.tasks = [task, ...(bot.tasks ?? [])];
     if (activate) {
       bot.threadId = task.threadId;

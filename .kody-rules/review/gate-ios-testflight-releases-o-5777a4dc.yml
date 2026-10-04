@@ -1,0 +1,44 @@
+title: >-
+  Gate iOS/TestFlight releases on a signing-safe workflow and verify UI changes
+  with automated screenshots
+rule: >-
+  Do not upload the iPhone companion to TestFlight until the matching App Store
+  Connect app record and a signing-safe workflow are ready (owner requested
+  external testing on 2026-09-27; release lane tracked in issue #22). Keep the
+  manual iOS release workflow (`docs/rollouts/2026-09-27-ios-manual-release.md`)
+  disabled until replacement signing credentials are ready — workflow
+  preparation does not establish an uploaded or installable beta, and releases
+  must be verified separately. The iPhone app (`ios/Sources`, scheme
+  `HogHunterIOS`) is a read-only viewer of the Mac snapshot over Bonjour
+  (`_hoghunter._tcp`), with no quit route and a pairing code that is not
+  advertised; Share With iPhone stays off until the owner turns it on in Mac
+  Settings. UI changes must be covered by automated visual verification where
+  feasible: Playwright screenshot assertions for web surfaces and `xcrun simctl
+  io booted screenshot` for the iOS simulator — the owner never takes manual
+  screenshots and does not run local UI preview sessions; native Mac app UI is
+  verified through code review and CI.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: >-
+      Do not upload until the matching App Store Connect app record and a
+      signing-safe workflow are ready.
+    isCorrect: true
+  - snippet: >-
+      Keep it disabled until replacement signing credentials are ready; workflow
+      preparation does not establish an uploaded or installable beta.
+    isCorrect: true
+  - snippet: >-
+      Upload the iOS build to TestFlight as soon as the manual release workflow
+      file is committed
+    isCorrect: false
+  - snippet: >-
+      UI changes must be covered by automated visual verification where
+      feasible: Playwright screenshot assertions for web surfaces, `xcrun simctl
+      io booted screenshot` for iOS simulator.
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

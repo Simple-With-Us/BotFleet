@@ -674,24 +674,51 @@ async function healthTopology(ports, options = {}) {
   return healthTopologyResult(await Promise.all(ports.map(probeHealth)), options);
 }
 
+const OWNER_KEYS = ["version", "pid", "port", "nonce"];
+
+/**
+ * Strict on the unknown-key case as well as the field cases, so a record
+ * carrying anything beyond the four documented fields is refused rather than
+ * partially believed.  The updater is the one module in this directory that
+ * imports nothing from node_modules — only node: builtins and two sibling
+ * project modules — because it has to run while the app, the checkout and the
+ * stage's own dependency tree are all in flux, and it installs that tree
+ * itself.  It therefore cannot take a schema package at this trust boundary.
+ */
 function validOwner(owner) {
-  return owner?.version === 1 && Number.isInteger(owner.pid) && owner.pid > 0 &&
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) return false;
+  if (Object.keys(owner).some((key) => !OWNER_KEYS.includes(key))) return false;
+  return owner.version === 1 && Number.isInteger(owner.pid) && owner.pid > 0 &&
     Number.isInteger(owner.port) && owner.port > 0 && owner.port <= 65535 &&
     typeof owner.nonce === "string" && /^[a-f0-9]{64}$/.test(owner.nonce);
 }
 
-async function readOwner(dataDirectory) {
+/**
+ * Classify the owner record instead of collapsing it to a boolean.  "No record"
+ * and "a record naming a process that is gone" are different operator problems:
+ * the first is a machine that has never adopted this build, the second is a
+ * harness that crashed or was booted out.  Both used to answer null, so the
+ * caller reported the second as a first adoption and named a manual procedure
+ * that does not apply to it.
+ */
+async function ownerRecordState(dataDirectory) {
   const path = join(dataDirectory, "harness-owner.json");
+  let owner;
   try {
     await assertPrivateRegularFile(path, "Harness owner record");
-    const owner = JSON.parse(await readFile(path, "utf8"));
+    owner = JSON.parse(await readFile(path, "utf8"));
     if (!validOwner(owner)) throw new Error("Harness owner record is invalid");
-    if (!processIsAlive(owner.pid)) return null;
-    return owner;
   } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    if (error?.code === "ENOENT") return { state: "absent" };
     throw error;
   }
+  if (!processIsAlive(owner.pid)) return { state: "stale", owner };
+  return { state: "live", owner };
+}
+
+async function readOwner(dataDirectory) {
+  const { state, owner } = await ownerRecordState(dataDirectory);
+  return state === "live" ? owner : null;
 }
 
 export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requireIdle }) {
@@ -720,8 +747,22 @@ export function authenticatedRuntimeError(runtime, owner, expectedBuild, { requi
 }
 
 async function strictRuntimePreflight(config, expectedBuild, { requireIdle }) {
-  const owner = await readOwner(config.dataDirectory);
-  if (!owner) return null;
+  const { state, owner } = await ownerRecordState(config.dataDirectory);
+  // A record naming a dead pid is a stopped or crashed harness, not an
+  // unadopted one.  Say which it is, so the operator restarts the app instead
+  // of looking for a first-adoption procedure that does not exist.
+  //
+  // Descriptive only, deliberately.  This reason is shared with
+  // runtimeIdentityPreflight, and applyPreparedUpdate starts the harness and
+  // then polls it, so a dead pid is the expected state on the first poll
+  // before the new one has written its own record.  An imperative here would
+  // tell the operator to start the app at the exact moment the updater had
+  // already started it, and would contradict the caller's own failure text
+  // ("Updated harness did not prove its expected build").
+  if (state === "stale") {
+    return { safe: false, reason: `BotFleet harness (pid ${owner.pid}) is not running` };
+  }
+  if (state !== "live") return null;
   const response = await requestJson(`http://127.0.0.1:${owner.port}/api/runtime`, {
     headers: { Authorization: `Bearer ${owner.nonce}` },
     accept: [200],

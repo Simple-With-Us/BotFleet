@@ -11,6 +11,7 @@ import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
+import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { describeDsn } from "./sentry.ts";
 import {
   parseConversationMode,
@@ -381,12 +382,15 @@ const appConfigSchema = z.object({
   }).optional(),
   // Background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-
   // subagents-decision.md).  On by default for HTTP-lane bots; `wake: false`
-  // is the kill switch for wake turns.  Every number is clamped again where
-  // it is used (server/jobs/registry.ts resolveJobsSettings): no setting can
-  // lift a job's run limit past 6 hours.
+  // is the kill switch for wake turns, and `cliLanes: false` returns the job
+  // tools to the HTTP lane only (jobs P2, which mounts them for command-line
+  // engines over MCP).  Every number is clamped again where it is used
+  // (server/jobs/registry.ts resolveJobsSettings): no setting can lift a
+  // job's run limit past 6 hours.
   jobs: z.object({
     enabled: z.boolean().optional(),
     wake: z.boolean().optional(),
+    cliLanes: z.boolean().optional(),
     defaultMinutes: z.number().int().min(1).max(360).optional(),
     maxMinutes: z.number().int().min(1).max(360).optional(),
     cpuCores: z.number().min(1).max(64).optional(),
@@ -553,6 +557,7 @@ export interface AppConfig {
   jobs?: {
     enabled?: boolean;
     wake?: boolean;
+    cliLanes?: boolean;
     defaultMinutes?: number;
     maxMinutes?: number;
     cpuCores?: number;
@@ -1333,6 +1338,12 @@ export function loadConfig(): AppConfig {
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
   resolveSecretFields(cfg, process.env, infisicalSnapshot());
+  // The tunable-knob twin of the line above, from `server/knob-map.ts`: for
+  // a knob name the vault holds, the vault wins over the file.  Runs after
+  // the credential overlay so both layers read the same snapshot, and both
+  // are no-ops when the store is unconfigured.  Runtime reads never consult
+  // the vault — they read this resolved `cfg` from memory.
+  resolveKnobFields(cfg, infisicalSnapshot());
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
@@ -1509,6 +1520,14 @@ export function saveConfig(
     // means a caller tried to persist something the store owns.
     console.warn(`[secrets] not persisting vault-managed values: ${strippedFromDisk.join(", ")}`);
   }
+  // The tunable-knob twin: whatever the store is currently canonical for
+  // does not get baked into `~/.botfleet/config.json` either, or the file
+  // starts shadowing the store it is supposed to defer to.  Knob values are
+  // not sensitive, so this is about authority, not cleartext.
+  const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
+  if (strippedKnobsFromDisk.length > 0) {
+    console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   // Under the cross-process lock (electron/config-file-lock.mjs) -- the same
   // one the Electron auto-updater and boot migrations take -- so the read,
@@ -1565,8 +1584,12 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // `deepseek` was missing for the same reason and had the same bug: the key
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
-  // machine identity does not repeat it a third time.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  // machine identity does not repeat it a third time.  `jobs` was missing
+  // too: background-job tunables (the knob table in `server/knob-map.ts`)
+  // resolve from the file when the vault is off, so a save that never
+  // reaches disk breaks the vault-over-file contract for exactly the knobs
+  // this rollout manages.
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

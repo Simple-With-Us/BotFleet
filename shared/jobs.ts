@@ -95,6 +95,10 @@ export const JOB_LOG_MAX_BYTES = 8 * 1024 * 1024;
 export const JOB_RECORD_MAX = 500;
 /** Longest `job_output` may wait for a job on the HTTP tool lane. */
 export const JOB_OUTPUT_WAIT_MAX_SECONDS_HTTP = 75;
+/** Longest `job_output` may wait for a job over MCP (jobs P2).  Longer than
+ *  the HTTP lane's 75 s: an MCP tool call has no in-process round loop to
+ *  pay for between rounds, so the wait itself is all the bot spends. */
+export const JOB_OUTPUT_WAIT_MAX_SECONDS_MCP = 120;
 
 export function isJobActive(job: Pick<JobSnapshot, "status">): boolean {
   return job.status === "running" || job.status === "stopping";

@@ -1024,11 +1024,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         images: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
         // Jobs matrix (docs/plans/2026-10-01-background-jobs-and-subagents-decision.md):
-        // BotFleet jobs arrive over MCP in P2.  Native helpers run; their
-        // steps nest under the spawn_agent row and the rest of their threads
-        // is kept out of the turn (handleNotification).  Typed Helper cards
-        // are P3, so this still reports none.
-        backgroundJobs: "none",
+        // BotFleet's own job tools reach Codex over the MCP
+        // server it already mounts.  Truthful about containment: the job
+        // process is spawned by the HARNESS, not by Codex, so it is not
+        // inside the codex sandbox.  The approval card is what stands between
+        // a Codex bot and a job, and a full-auto Codex bot is under the
+        // owner's full-auto ruling (b) instead — which is exactly the trade
+        // the decision doc records for Codex.
+        backgroundJobs: "emulated",
         helpers: "none",
       },
       sendTurn,
