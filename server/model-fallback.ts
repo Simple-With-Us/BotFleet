@@ -482,10 +482,10 @@ export interface RedundantFallback {
  *  Settings shows.
  *
  *  `selectTurnFallback` skips any candidate that is `sameEngine` as the engine
- *  that just failed, and skips any repeat of a candidate it already walked.  So
- *  a chain of `primary → f1 → primary` is three entries in the picker and TWO
- *  real tiers, with nothing anywhere saying so — the settings panel counts what
- *  was typed, not what will happen.
+ *  that just failed (line 615) — and nothing else, so only an ADJACENT repeat
+ *  is unreachable.  A chain of `primary → f1 → primary` is three entries in the
+ *  picker and three real tiers; a chain of `primary → f1 → f1` is three entries
+ *  and two.  The settings panel counts what was typed, not what will happen.
  *
  *  Reported rather than corrected: the owner may reasonably WANT a primary
  *  repeated at the end of its own chain (it costs nothing and documents the

@@ -142,7 +142,8 @@ export interface RoutineRun {
    *  `turn.completed` that closes it. */
   setupFailed?: boolean;
   /** Why this run is sitting QUEUED instead of dispatching.  Set by the
-   *  scheduler when `botState` reports `blocked`; cleared on dispatch. */
+   *  scheduler when `canStart` refuses the dispatch (see `dispatchHoldReason`);
+   *  cleared on dispatch and on any skip path that bypasses `canStart`. */
   holdReason?: string;
   engineId?: string;
   driver?: string;
@@ -1153,6 +1154,9 @@ export class RoutineManager {
           if (withinGap(lastStartedAt, this.now(), gapMinutes)) {
             const opensAt = gapEndsAt(lastStartedAt, gapMinutes);
             if (opensAt !== null) this.scheduleGapWake(opensAt);
+            // Same as the skip paths above: the gap is a quiet cooldown, not
+            // a hold, so a stale reason must not render for the whole window.
+            this.clearHoldReason(run);
             continue;
           }
         }

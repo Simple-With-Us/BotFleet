@@ -1084,6 +1084,11 @@ function dispatchHoldFor(
   return undefined;
 }
 
+/** The verdict `canStart` just computed, for the paired `dispatchHoldReason`
+ *  lookup to consume.  Set on every canStart call, cleared when the reason is
+ *  read, so a later tick (or an unpaired lookup) always re-evaluates. */
+let pendingDispatchHold: { key: string; hold: DispatchHold | undefined } | undefined;
+
 /** Comms grants minted per turn, bound to the bot they were issued for.
  *
  *  The boot token above is a front door, and it was the only door: every bot
@@ -5727,13 +5732,28 @@ routines = new RoutineManager({
       load: readHostLoad(),
     });
   },
-  canStart: (botId, threadId, runOn) => !dispatchHoldFor(botId, threadId, runOn, { count: true }),
+  canStart: (botId, threadId, runOn) => {
+    const hold = dispatchHoldFor(botId, threadId, runOn, { count: true });
+    // The scheduler asks for the reason immediately after a `false` here, for
+    // the same run on the same tick.  Stash the verdict so the reason lookup
+    // below reuses it instead of running the whole predicate a second time.
+    // Consumed on read: the next tick must re-evaluate, not reuse this.
+    pendingDispatchHold = { key: `${botId}${threadId ?? ""}${runOn}`, hold };
+    return !hold;
+  },
   // The reason behind a `false` from canStart, read by the scheduler when it
   // leaves a run QUEUED.  Takes the run's own destination and thread for the
   // same reason canStart does, and passes `count: false` so asking why does not
   // also count a second prevented dispatch.
-  dispatchHoldReason: (botId, threadId, runOn) =>
-    dispatchHoldFor(botId, threadId, runOn, { count: false })?.reason,
+  dispatchHoldReason: (botId, threadId, runOn) => {
+    const key = `${botId}${threadId ?? ""}${runOn}`;
+    if (pendingDispatchHold && pendingDispatchHold.key === key) {
+      const { hold } = pendingDispatchHold;
+      pendingDispatchHold = undefined;
+      return hold?.reason;
+    }
+    return dispatchHoldFor(botId, threadId, runOn, { count: false })?.reason;
+  },
   // Liveness only.  It has no thread and no runOn, so it CANNOT judge a hold:
   // doing so hardcoded a destination and put the local spend ceiling and the
   // local credential gate in front of CLOUD runs, which both deliberately

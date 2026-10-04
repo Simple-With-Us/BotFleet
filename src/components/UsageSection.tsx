@@ -28,6 +28,7 @@ import {
 import { engineMeterNote, isPlanLevelSkip, quotaProviderForDriver, windowsForDriver } from "../../server/quota-window-map";
 import { botUsage, botUsageByModel, cachedInput, costCaption, formatTokens, formatUsd, hasFiniteCost, sumUsage, usageDetail } from "@/lib/usage";
 import { productErrorHeadline } from "@/lib/product-error";
+import { z } from "zod";
 
 interface QuotaCooldownInfo {
   botId: string;
@@ -149,6 +150,27 @@ export interface RedundantChain {
   effective: number;
   redundant: { instanceId: string; model: string; reason: "same-as-primary" | "duplicate" }[];
 }
+
+/** Trust-boundary schemas for `GET /api/usage`'s `fallbackChains`.  The
+ *  payload crosses HTTP, so the array check alone is not enough: counts and
+ *  nested redundant entries are validated before anything reaches state. */
+const RedundantFallbackSchema = z.object({
+  instanceId: z.string(),
+  model: z.string(),
+  reason: z.enum(["same-as-primary", "duplicate"]),
+});
+
+const RedundantChainSchema = z.object({
+  botId: z.string(),
+  name: z.string(),
+  scope: z.enum(["bot", "task"]).optional(),
+  threadId: z.string().nullable().optional(),
+  total: z.number(),
+  effective: z.number(),
+  redundant: z.array(RedundantFallbackSchema),
+});
+
+const RedundantChainArraySchema = z.array(RedundantChainSchema);
 
 /** Whether an engine row has enough to be worth showing.
  *
@@ -368,7 +390,8 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
             setEngineSpend(data.engineSpend);
           }
           if (Array.isArray(data?.doomed)) setDoomed(data.doomed);
-          if (Array.isArray(data?.fallbackChains)) setRedundantChains(data.fallbackChains);
+          const parsedChains = RedundantChainArraySchema.safeParse(data?.fallbackChains);
+          if (parsedChains.success) setRedundantChains(parsedChains.data);
         })
         .catch(() => {});
     };

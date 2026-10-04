@@ -41,23 +41,20 @@ export function toolRoundsCaption(): string {
  *  and disagreeing about it. */
 /** Why the scheduler may not start a bot's work right now.
  *
- *  `blocked` is the fourth value, and it exists because a breaker that refuses
- *  work silently is indistinguishable from a scheduler that is stuck: a
- *  recurring run sits `queued` with no explanation, and the bot reads `ready`
- *  in the roster, so the only visible symptom is automation that stopped and
- *  nothing saying why.
- *
- *  It was deliberately NOT added before.  The scheduler's loop is
- *  `if (busy) continue; if (missing) failRun(...)` and then it dispatches —
- *  so any value that is not `busy` or `missing` reaches the dispatch attempt
- *  and is refused further down by the very gate that produced it.  A fourth
- *  value would have looked like a fix while changing nothing.  The loop now
- *  handles `blocked` explicitly, which is what makes the value honest.
+ *  Only the three values the loop actually branches on.  A fourth value such
+ *  as `"blocked"` (a breaker refusing work silently) was considered and
+ *  rejected: the tick loop is `if (busy) continue; if (missing) failRun(...)`
+ *  and then it dispatches, so any value that is not `busy` or `missing`
+ *  reaches the dispatch attempt and is indistinguishable from `"ready"` at
+ *  every call site.  Adding the value without a branch for it would have
+ *  looked like a fix while changing nothing.  The loop must handle `blocked`
+ *  explicitly (routines.ts `tick`) before the value may be produced — and no
+ *  producer exists yet (index.ts `botState` returns only these three).
  *
  *  Declared once here rather than spelled out in `routines.ts`, `webhooks.ts`
  *  and `resource-triggers.ts`, where three independent copies of the union had
  *  already drifted apart once. */
-export type BotDispatchState = "ready" | "busy" | "missing" | "blocked";
+export type BotDispatchState = "ready" | "busy" | "missing";
 
 /** One reason a dispatch is being held, in words fit for a receipt.
  *
