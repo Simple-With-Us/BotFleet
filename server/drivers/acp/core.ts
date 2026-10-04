@@ -901,7 +901,21 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        const stop = () => {
+          killCliTree(child);
+          const pid = child.pid;
+          if (pid && child.exitCode === null && child.signalCode === null) {
+            const forceTimer = setTimeout(() => {
+              try {
+                if (process.platform !== "win32") process.kill(-pid, "SIGKILL");
+                else child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, FORCE_EXIT_AFTER_MS);
+            forceTimer.unref?.();
+          }
+        };
         const stopAndWaitForExit = async () => {
           state.deadlineTerminating = true;
           const pid = child.pid;
