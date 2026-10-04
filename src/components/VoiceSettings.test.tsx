@@ -48,8 +48,33 @@ describe("VoiceSettings", () => {
     );
 
     expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
-    expect(html).toContain("This bot uses an Apple Personal Voice.  Synthesis runs on-device on your authorized Mac or iPhone.");
-    expect(html).toContain("title=\"Hear this Apple Personal Voice\"");
+    expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
+    // In plain environment without window.ogb.personalVoice.speak, the button explains device requirement
+    expect(html).toContain("title=\"Personal Voices play on-device on a Mac or iPhone\"");
+    expect(html).toContain("aria-label=\"Personal Voices play on-device on a Mac or iPhone\"");
+  });
+
+  it("enables Try button when desktop personalVoice speak bridge is available", () => {
+    const origWindow = globalThis.window;
+    try {
+      globalThis.window = {
+        ogb: {
+          personalVoice: {
+            speak: vi.fn(),
+          } as unknown as NonNullable<Window["ogb"]>["personalVoice"],
+        } as unknown as Window["ogb"],
+      } as unknown as Window & typeof globalThis;
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: sampleBot("personal:com.apple.speech.voice.Jay"),
+          onPatch: () => {},
+        })
+      );
+      expect(html).toContain("title=\"Hear this Apple Personal Voice\"");
+      expect(html).toContain("aria-label=\"Hear this Apple Personal Voice\"");
+    } finally {
+      globalThis.window = origWindow;
+    }
   });
 
   it("renders standard current voice for non-personal custom voice", () => {

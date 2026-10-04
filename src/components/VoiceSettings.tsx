@@ -193,7 +193,7 @@ export function VoiceSettings({
       if (result.error) {
         setCloneError(result.error);
       } else {
-        setCloneSuccess(`Voice "${label}" cloned and ready.  Pick it from the list below.`);
+        setCloneSuccess(`Voice "${label}" cloned and ready.\u00A0 Pick it from the list below.`);
         setCloneLabel("");
         setCloneFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
@@ -214,7 +214,16 @@ export function VoiceSettings({
   const selectedVoice = bot.voice ?? "";
   const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   const isSelectedPersonal = isPersonalVoice(selectedVoice);
+  const canSpeakPersonal = Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
   const ready = configured && Boolean(selectedVoice || tts.voice);
+  const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
+  const previewTitle = isSelectedPersonal
+    ? canSpeakPersonal
+      ? "Hear this Apple Personal Voice"
+      : "Personal Voices play on-device on a Mac or iPhone"
+    : ready
+      ? "Hear this voice"
+      : "Pick a voice first";
 
   const defaultVoiceRecord = tts.voice ? voices.find((v) => v.id === tts.voice) : null;
   const defaultVoiceDisplay = defaultVoiceRecord
@@ -229,7 +238,7 @@ export function VoiceSettings({
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Give this bot a voice for calls and spoken replies using MiniMax.  The voice choice belongs to this bot; the MiniMax key is shared by the workspace.
+        Give this bot a voice for calls and spoken replies using MiniMax.{"\u00A0 "}The voice choice belongs to this bot; the MiniMax key is shared by the workspace.
       </div>
 
       {/* ── MiniMax Key Input ── */}
@@ -353,8 +362,7 @@ export function VoiceSettings({
           <div className="mb-3 rounded-lg border border-hairline/40 bg-inset p-3">
             <div className="text-[12.5px] font-medium text-ink">Clone Voice From Audio</div>
             <p className="mt-0.5 mb-2 text-[12px] text-ink-secondary">
-              Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice
-              clone.  The clone appears in the voice list below.
+              Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice clone.{"\u00A0 "}The clone appears in the voice list below.
             </p>
             <div className="mb-2 flex gap-2">
               <input
@@ -432,9 +440,9 @@ export function VoiceSettings({
           </select>
           <button
             onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts?.voice, botId: bot.id })}
-            disabled={!ready && !isSelectedPersonal}
-            title={isSelectedPersonal ? "Hear this Apple Personal Voice" : ready ? "Hear this voice" : "Pick a voice first"}
-            aria-label="Hear this voice"
+            disabled={previewDisabled}
+            title={previewTitle}
+            aria-label={previewTitle}
             className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Volume2 size={14} /> Try
@@ -442,7 +450,7 @@ export function VoiceSettings({
         </div>
         {isSelectedPersonal && (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            This bot uses an Apple Personal Voice.  Synthesis runs on-device on your authorized Mac or iPhone.
+            This bot uses an Apple Personal Voice.{"\u00A0 "}Synthesis runs on-device on your authorized Mac or iPhone.
           </div>
         )}
       </div>
@@ -485,14 +493,14 @@ export function VoiceSettings({
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Speech to Text</div>
-        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.  Recordings sent from iPhone keep the original audio and transcript on their message.</p>
+        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.{"\u00A0 "}Recordings sent from iPhone keep the original audio and transcript on their message.</p>
         <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured.</p>
       </div>
 
       {/* ── Play Replies On ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Play Replies On</div>
-        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.  Voice clips stay on their messages for replay.</p>
+        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.{"\u00A0 "}Voice clips stay on their messages for replay.</p>
         <div className="mt-3 flex gap-4">
           {([['mac', 'Mac'], ['iphone', 'Play on iPhone (while app is open)']] as const).map(([device, label]) => {
             const selected = bot.speechDevices ? bot.speechDevices.includes(device) : device === 'mac' && Boolean(bot.speakReplies);
