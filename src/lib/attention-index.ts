@@ -64,6 +64,13 @@ export interface AttentionSummaryRollup {
   totalUnread: number;
 }
 
+export interface AttentionMessage {
+  id?: string;
+  parentId?: string | null;
+  kind: string;
+  tool?: { name: string };
+}
+
 export interface MinimalBot {
   id: string;
   name: string;
@@ -74,13 +81,48 @@ export interface MinimalBot {
   hidden?: boolean;
   hasError?: boolean;
   errorReason?: string;
-  messages?: readonly { kind: string; tool?: { name: string } }[];
+  /** Leaf of the visible branch.  Absent falls back to the flat list. */
+  activeLeafId?: string | null;
+  messages?: readonly AttentionMessage[];
 }
 
-export function isBotTurnError(bot: { messages?: readonly { kind: string; tool?: { name: string } }[] }): boolean {
-  if (!bot.messages || bot.messages.length === 0) return false;
-  const last = bot.messages[bot.messages.length - 1];
-  return last?.kind === "activity" && Boolean(last.tool?.name.startsWith("error:"));
+/** Same parent walk as `visibleMessages` in the store.  Without a leaf, or
+ * when that leaf is not in the payload, the flat list is the visible thread. */
+function visibleAttentionMessages<T extends AttentionMessage>(
+  messages: readonly T[] | undefined,
+  activeLeafId: string | null | undefined,
+): readonly T[] {
+  if (!messages || messages.length === 0) return [];
+  if (!activeLeafId) return messages;
+  const byId = new Map<string, T>();
+  for (const message of messages) {
+    if (message.id) byId.set(message.id, message);
+  }
+  if (!byId.has(activeLeafId)) return messages;
+  const path: T[] = [];
+  const seen = new Set<string>();
+  let cur = byId.get(activeLeafId);
+  while (cur) {
+    if (cur.id) {
+      if (seen.has(cur.id)) break;
+      seen.add(cur.id);
+    }
+    path.push(cur);
+    cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+  }
+  return path.reverse();
+}
+
+function messageIsTurnError(message: AttentionMessage | undefined): boolean {
+  return message?.kind === "activity" && Boolean(message.tool?.name.startsWith("error:"));
+}
+
+export function isBotTurnError(bot: {
+  activeLeafId?: string | null;
+  messages?: readonly AttentionMessage[];
+}): boolean {
+  const visible = visibleAttentionMessages(bot.messages, bot.activeLeafId);
+  return messageIsTurnError(visible.at(-1));
 }
 
 export interface MinimalGroup {
@@ -119,9 +161,10 @@ export function computeRoomAttentionIndex(
       const errorBots: AttentionParticipant[] = assignedBots
         .filter((b) => b.activity === "dead" || b.hasError || isBotTurnError(b))
         .map((b) => {
-          const turnError = isBotTurnError(b);
-          const errorDetail = turnError && b.messages
-            ? b.messages[b.messages.length - 1].tool?.name.slice(6).trim()
+          const visibleTail = visibleAttentionMessages(b.messages, b.activeLeafId).at(-1);
+          const turnError = messageIsTurnError(visibleTail);
+          const errorDetail = turnError
+            ? visibleTail?.tool?.name.slice(6).trim()
             : undefined;
           return {
             botId: b.id,

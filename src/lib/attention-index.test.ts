@@ -215,4 +215,47 @@ describe("computeRoomAttentionIndex", () => {
     expect(result[0].errors.bots[0].botName).toBe("Builder");
     expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
   });
+
+  it("reads a turn error from the visible branch, not the flat message tail", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-fork", "bot-stale"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-fork",
+        name: "Builder",
+        activity: "idle",
+        activeLeafId: "err",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+          { id: "abandoned", kind: "text", parentId: "root" },
+        ],
+      },
+      {
+        id: "bot-stale",
+        name: "Scout",
+        activity: "idle",
+        activeLeafId: "live",
+        messages: [
+          { id: "root", kind: "text", parentId: null },
+          { id: "live", kind: "text", parentId: "root" },
+          { id: "old-err", kind: "activity", parentId: "root", tool: { name: "error: abandoned branch" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    expect(isBotTurnError(bots[1])).toBe(false);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots.map((bot) => bot.botName)).toEqual(["Builder"]);
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
+  });
 });

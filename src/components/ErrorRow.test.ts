@@ -170,11 +170,17 @@ describe("ErrorRow recovery", () => {
   it("formats sentences with two visible spaces in rendered copy", () => {
     expect(formatSentenceGap("Error occurred. Please try again.")).toBe("Error occurred.\u00A0 Please try again.");
     expect(formatSentenceGap("Single sentence.")).toBe("Single sentence.");
+    expect(formatSentenceGap("Failed.\n\nNext paragraph starts.")).toBe("Failed.\n\nNext paragraph starts.");
+    expect(formatSentenceGap("Failed.\n  Indented detail.")).toBe("Failed.\n  Indented detail.");
+    expect(formatSentenceGap("The task failed. Please retry.\nTrace: boom")).toBe(
+      "The task failed.\u00A0 Please retry.\nTrace: boom",
+    );
     const html = renderToStaticMarkup(
       createElement(ErrorRow, {
-        message: "The task failed. Please retry.",
+        message: "The task failed. Please retry.\n\nNext paragraph.",
       }),
     );
-    expect(html).toContain("The task failed.\u00A0 Please retry.");
+    expect(html).toContain("whitespace-pre-wrap");
+    expect(html).toContain("The task failed.\u00A0 Please retry.\n\nNext paragraph.");
   });
 });
