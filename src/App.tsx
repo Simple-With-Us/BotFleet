@@ -302,6 +302,20 @@ function Shell() {
     });
   }, [dispatch]);
 
+  // Pin the app thread, and switch the server's active task when it differs.
+  // `select` only changes client state.  Messages, reactions, recordings, and
+  // loadEarlier follow `bot.threadId`, so a pin onto another thread would
+  // render a transcript the store never loaded.
+  const openBotInApp = (botId: string, appId: string) => {
+    const b = state.bots.find((x) => x.id === botId);
+    const explicitTask = (b?.tasks ?? []).find((t) => t.workspaceContext?.appRef.id === appId);
+    const threadId = explicitTask?.threadId ?? b?.threadId;
+    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+    if (threadId && threadId !== b?.threadId) {
+      dispatch({ type: "switchTask", botId, threadId });
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* fixed-position popup, bottom-left — outside the layout flow */}
@@ -384,11 +398,7 @@ function Shell() {
             onSelectBotInApp={(botId, appId) => {
               setMatrixOverviewActive(false);
               setSelectedAppId(appId);
-              const b = state.bots.find(x => x.id === botId);
-              const tasks = b?.tasks ?? [];
-              const explicitTask = tasks.find(t => t.workspaceContext?.appRef.id === appId);
-              const threadId = explicitTask?.threadId ?? b?.threadId;
-              dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+              openBotInApp(botId, appId);
             }}
             onSelectGroupChat={(groupId) => {
               setMatrixOverviewActive(false);
@@ -414,20 +424,7 @@ function Shell() {
                   setMatrixOverviewActive(false);
                   // Remember the app we were viewing, so AppDeck shows it
                   setSelectedAppId(appId);
-                  
-                  // Find the bot's thread for this app
-                  const bot = state.bots.find(b => b.id === botId);
-                  const tasks = bot?.tasks ?? [];
-                  const explicitTask = tasks.find(t => t.workspaceContext?.appRef.id === appId);
-                  // If no specific thread exists yet, we just fall back to bot's active thread or a new selection state.
-                  // But `viewedThreadId` will hold the explicitly chosen thread.
-                  const threadId = explicitTask?.threadId ?? bot?.threadId;
-
-                  dispatch({
-                    type: "select",
-                    id: botId,
-                    viewedThreadId: threadId
-                  });
+                  openBotInApp(botId, appId);
                 }}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
