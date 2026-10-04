@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 
 import type {
@@ -7,6 +6,8 @@ import type {
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
+  RuntimeEvent,
+  RuntimeEventListener,
   SendTurnInput,
   TurnStartResult,
 } from "../contracts.ts";
@@ -41,7 +42,14 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
   },
   async create(input: DriverCreateInput<CliWrapperConfig>): Promise<ProviderInstance> {
     const { config, instanceId, displayName } = input;
-    
+    const listeners = new Set<RuntimeEventListener>();
+
+    const emit = (event: RuntimeEvent) => {
+      for (const listener of listeners) {
+        listener(event);
+      }
+    };
+
     const adapter: ProviderAdapter = {
       provider: "cli-wrapper",
       capabilities: {
@@ -49,89 +57,107 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
       },
       async sendTurn(turnInput: SendTurnInput): Promise<TurnStartResult> {
         const turnId = newId();
-        
-        let args = [...config.args];
+
+        const args = [...config.args];
         if (config.passPromptAs === "arg") {
-          args.push(turnInput.prompt);
+          args.push(turnInput.text);
         }
 
         const child = spawn(config.command, args, {
-          cwd: turnInput.context.cwd ?? process.cwd(),
-          env: { ...process.env, ...turnInput.environment },
+          cwd: process.cwd(),
+          env: process.env,
           stdio: ["pipe", "pipe", "pipe"],
         });
 
         if (config.passPromptAs === "stdin") {
-          child.stdin.write(turnInput.prompt);
+          child.stdin.write(turnInput.text);
           child.stdin.end();
         }
 
         child.stdout.on("data", (chunk: Buffer) => {
-          turnInput.onEvent({
+          emit({
             eventId: newEventId(),
+            provider: "cli-wrapper",
+            providerInstanceId: instanceId,
+            createdAt: new Date().toISOString(),
             turnId,
-            type: "text",
+            threadId: turnInput.threadId,
+            type: "content.delta",
+            streamKind: "assistant_text",
             delta: chunk.toString("utf8"),
           });
         });
 
         child.stderr.on("data", (chunk: Buffer) => {
-          turnInput.onEvent({
+          emit({
             eventId: newEventId(),
+            provider: "cli-wrapper",
+            providerInstanceId: instanceId,
+            createdAt: new Date().toISOString(),
             turnId,
-            type: "text",
+            threadId: turnInput.threadId,
+            type: "content.delta",
+            streamKind: "assistant_text",
             delta: `[stderr] ${chunk.toString("utf8")}`,
           });
         });
 
         child.on("close", (code) => {
-          turnInput.onEvent({
+          emit({
             eventId: newEventId(),
+            provider: "cli-wrapper",
+            providerInstanceId: instanceId,
+            createdAt: new Date().toISOString(),
             turnId,
+            threadId: turnInput.threadId,
             type: "turn.completed",
-            usage: { inputTokens: 0, outputTokens: 0, roundTrips: 1 },
+            ok: code === 0,
+            usage: { input: 0, output: 0 },
           });
         });
 
         child.on("error", (err) => {
-          turnInput.onEvent({
+          emit({
             eventId: newEventId(),
+            provider: "cli-wrapper",
+            providerInstanceId: instanceId,
+            createdAt: new Date().toISOString(),
             turnId,
+            threadId: turnInput.threadId,
             type: "turn.completed",
-            error: { reason: "unknown", transient: false, detail: err.message },
+            ok: false,
+            stopReason: err.message,
           });
         });
 
         return { turnId };
       },
-      async interruptTurn(threadId, turnId) {
+      async interruptTurn() {
         // Not implemented for simple CLI
       },
-      async respondToRequest(threadId, requestId, decision) {
+      async respondToRequest() {
         return "unavailable";
       },
-      async sendMidTurnMessage(threadId, turnId, message) {
-        // Not implemented
+      hasSession: () => false,
+      stopAll: async () => {},
+      onEvent: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
       },
-      async dispose() {
-      }
     };
 
     return {
       instanceId,
       driverKind: "cli-wrapper",
       displayName,
-      enabled: true,
-      models: this.models,
+      enabled: input.enabled,
+      models: CliWrapperDriver.models,
       adapter,
       async snapshot(): Promise<ProviderSnapshot> {
         return {
-          instanceId,
-          driverKind: "cli-wrapper",
-          displayName,
-          enabled: true,
-          config,
-          models: { ...CliWrapperDriver.models },
+          state: "available",
+          authenticated: true,
+          version: null,
         };
       },
       async dispose() {},
