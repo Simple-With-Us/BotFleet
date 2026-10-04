@@ -53,6 +53,11 @@ const LocalVmWorkspace = lazy(() =>
 const SkillRecorderPage = lazy(() =>
   import("@/components/SkillRecorderPage").then((m) => ({ default: m.SkillRecorderPage })),
 );
+import { AppDeck } from "@/components/AppDeck";
+
+const FleetMatrixView = lazy(() =>
+  import("@/components/FleetMatrixView").then((m) => ({ default: m.FleetMatrixView })),
+);
 const TeamMapPage = lazy(() =>
   import("@/components/TeamMapPage").then((m) => ({ default: m.TeamMapPage })),
 );
@@ -84,6 +89,15 @@ function Shell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
+  const hasApps = state.groups.some((g) => !g.dm);
+
+  // If a group was chosen in the sidebar or store, keep selectedAppId aligned
+  useEffect(() => {
+    if (group && !group.dm) {
+      setSelectedAppId(group.id);
+    }
+  }, [group?.id]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -335,46 +349,85 @@ function Shell() {
           menuButtonRef.current?.focus();
         }}
       />
-      {state.activeView === "team-map" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <TeamMapPage />
-        </Suspense>
-      ) : state.activeView === "routines" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <RoutinesPage />
-        </Suspense>
-      ) : state.activeView === "skill-recorder" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <SkillRecorderPage />
-        </Suspense>
-      ) : localVmWorkspaceBotId ? (
-        <Suspense fallback={<PanelFallback />}>
-          <LocalVmWorkspace
-            primaryBotId={localVmWorkspaceBotId}
-            overlayOpen={nativeViewOverlayOpen}
-            onClose={() => setLocalVmWorkspaceBotId(null)}
-            onOpenComputer={openComputerFromWorkspace}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {hasApps && (
+          <AppDeck
+            activeAppId={selectedAppId}
+            onSelectApp={(appId) => {
+              setSelectedAppId(appId);
+              if (appId) {
+                dispatch({ type: "select", id: appId });
+              }
+            }}
+            activeBotId={bot?.id}
+            onSelectBot={(botId) => {
+              dispatch({ type: "select", id: botId });
+            }}
+            onSelectGroupChat={(groupId) => {
+              dispatch({ type: "select", id: groupId });
+            }}
+            isGroupChatActive={Boolean(group && group.id === selectedAppId)}
           />
-        </Suspense>
-      ) : noEngines ? (
-        <NoEngines />
-      ) : group ? (
-        <GroupView key={group.id} group={group} />
-      ) : bot ? (
-        <ChatView key={bot.id} bot={bot} />
-      ) : (
-        <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
-          <Loader2 size={20} className="animate-spin" />
-          <div className="text-[14px]">
-            {state.connected ? "No bots yet" : "Connecting to the bot server…"}
-          </div>
-          {!state.connected && !window.ogb && (
-            <div className="text-[12px]">
-              Start it with <code className="rounded bg-raised px-1.5 py-0.5">pnpm dev:server</code>
-            </div>
+        )}
+        <div className="relative min-h-0 flex-1">
+          {selectedAppId === null && hasApps && state.activeView === "chat" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <FleetMatrixView
+                onSelectApp={(appId) => {
+                  setSelectedAppId(appId);
+                  dispatch({ type: "select", id: appId });
+                }}
+                onSelectBot={(botId) => {
+                  dispatch({ type: "select", id: botId });
+                }}
+                onOpenAppRoom={(appId) => {
+                  setSelectedAppId(appId);
+                  dispatch({ type: "select", id: appId });
+                }}
+              />
+            </Suspense>
+          ) : state.activeView === "team-map" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <TeamMapPage />
+            </Suspense>
+          ) : state.activeView === "routines" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <RoutinesPage />
+            </Suspense>
+          ) : state.activeView === "skill-recorder" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <SkillRecorderPage />
+            </Suspense>
+          ) : localVmWorkspaceBotId ? (
+            <Suspense fallback={<PanelFallback />}>
+              <LocalVmWorkspace
+                primaryBotId={localVmWorkspaceBotId}
+                overlayOpen={nativeViewOverlayOpen}
+                onClose={() => setLocalVmWorkspaceBotId(null)}
+                onOpenComputer={openComputerFromWorkspace}
+              />
+            </Suspense>
+          ) : noEngines ? (
+            <NoEngines />
+          ) : group ? (
+            <GroupView key={group.id} group={group} />
+          ) : bot ? (
+            <ChatView key={bot.id} bot={bot} />
+          ) : (
+            <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
+              <Loader2 size={20} className="animate-spin" />
+              <div className="text-[14px]">
+                {state.connected ? "No bots yet" : "Connecting to the bot server…"}
+              </div>
+              {!state.connected && !window.ogb && (
+                <div className="text-[12px]">
+                  Start it with <code className="rounded bg-raised px-1.5 py-0.5">pnpm dev:server</code>
+                </div>
+              )}
+            </main>
           )}
-        </main>
-      )}
+        </div>
+      </div>
       {(state.settingsOpen || state.computerOpen || state.inspectorOpen) && (
         <div
           aria-hidden
