@@ -834,6 +834,8 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Explicitly selected thread for the active bot (e.g., from App Matrix). Null follows bot.threadId. */
+  viewedThreadId: string | null;
   /** Local task-creation dialog; never changes the bot's running thread. */
   taskCreationBotId: string | null;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
@@ -1007,7 +1009,7 @@ export type Action =
    *  the list) so the next answer is not judged against it. */
   | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
-  | { type: "select"; id: string }
+  | { type: "select"; id: string; viewedThreadId?: string | null }
   | {
       type: "send";
       botId: string;
@@ -1421,7 +1423,7 @@ export function reducer(state: AppState, action: Action): AppState {
       }
       const wasUnread = state.bots.find((b) => b.id === action.id)?.unread;
       const next = updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -2026,6 +2028,7 @@ export const initialState: AppState = {
   instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  viewedThreadId: null,
   taskCreationBotId: null,
   activeView: "chat",
   selectedRoutineId: null,

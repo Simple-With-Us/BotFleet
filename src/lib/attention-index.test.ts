@@ -88,12 +88,13 @@ describe("computeRoomAttentionIndex", () => {
     expect(st.unread.hasUnread).toBe(true);
   });
 
-  it("handles implicit section matching when memberIds does not list bot explicitly", () => {
+  it("does not infer membership from mutable section labels or names", () => {
     const groups: MinimalGroup[] = [
       {
         id: "group-ct",
         name: "Congress.Trade",
-        memberIds: [],
+        section: "Finance",
+        memberIds: [], // Explicitly empty
         unread: false,
       },
     ];
@@ -102,16 +103,52 @@ describe("computeRoomAttentionIndex", () => {
       {
         id: "bot-ct",
         name: "Trader",
-        section: "Congress.Trade",
+        section: "Congress.Trade", // Matches group name
+        activity: "dead",
+        unread: true,
+      },
+      {
+        id: "bot-finance",
+        name: "FinanceBot",
+        section: "Finance", // Matches group section
         activity: "waiting-on-you",
-        unread: false,
+        unread: true,
       },
     ];
 
     const result = computeRoomAttentionIndex(groups, bots);
     expect(result).toHaveLength(1);
-    expect(result[0].memberIds).toContain("bot-ct");
-    expect(result[0].needsAction.count).toBe(1);
+    // Neither bot should be inferred as a member
+    expect(result[0].memberIds).toEqual([]);
+    expect(result[0].errors.count).toBe(0);
+    expect(result[0].needsAction.count).toBe(0);
+    expect(result[0].unread.count).toBe(0);
+    expect(result[0].unread.hasUnread).toBe(false);
+  });
+
+  it("computes unread attention without lossy collapse across room and member channels", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-1",
+        name: "Dev",
+        memberIds: ["bot-speaker"],
+        unread: true, // Room chat itself is unread
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-speaker",
+        name: "Speaker",
+        activity: "idle",
+        unread: true, // Direct bot thread is unread
+      },
+    ];
+
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].unread.hasUnread).toBe(true);
+    // Unread count reflects total unread conversation surfaces (room chat + member bot thread)
+    expect(result[0].unread.count).toBe(2);
   });
 
   it("summarizes fleet attention accurately", () => {
