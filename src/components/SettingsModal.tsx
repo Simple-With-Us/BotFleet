@@ -348,7 +348,7 @@ function CustomIngressFields() {
           checked={enabled}
           onChange={toggleEnabled}
           className="accent-ink"
-          aria-label="Enable custom webhook domain"
+          aria-label="Enable Custom Webhook Domain"
         />
         Enable Custom Webhook Domain
       </label>
@@ -365,13 +365,13 @@ function CustomIngressFields() {
             // a new URL invalidates the previous test result
             if (test && test.kind !== "running") setTest(null);
           }}
-          placeholder="https://agents.botfleet.app"
+          placeholder="https://bots.botfleet.app"
           disabled={!enabled || useFreeUrl}
           className={inputClass}
         />
         <div className="text-[12px] text-ink-secondary leading-relaxed">
           {enabled
-            ? "If you run your own Cloudflare Tunnel (e.g. agents.botfleet.app), enter its public URL here to route webhooks."
+            ? "If you run your own Cloudflare Tunnel (e.g. bots.botfleet.app), enter its public URL here to route webhooks."
             : `When this is off, the saved URL is kept on disk but BotFleet advertises its local webhook receiver instead.${"\u00A0 "}Flip the switch back on to apply it again.`}
         </div>
       </div>
@@ -528,7 +528,7 @@ function UpdatesRow() {
                 }
               }}
             />
-            Enable automatic update checks
+            Enable Automatic Update Checks
           </label>
         )}
         {saveError && (
@@ -662,7 +662,7 @@ function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured. Simple is Grok-style with named bots, while ${labels.plural} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.  Simple is Grok-style with named bots, while ${labels.plural} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
@@ -670,7 +670,7 @@ function ConversationModeRow() {
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
           const displaySubtitle = mode === "projects"
-            ? `Categories with any number of threads under them. Each thread picks a model. Named bots stay hidden.`
+            ? `Categories with any number of threads under them.  Each thread picks a model.  Named bots stay hidden.`
             : copy.subtitle;
           return (
             <button
