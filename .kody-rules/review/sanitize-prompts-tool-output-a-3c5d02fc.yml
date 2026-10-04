@@ -1,0 +1,26 @@
+title: Sanitize prompts, tool output, and transcripts before logging or persisting
+rule: >-
+  Any code that logs, serializes to disk, sends to telemetry, or echoes back to
+  the web UI must pass conversation content, tool call arguments/results, and
+  environment-derived paths through the shared sanitizer
+  (src/shared/sanitize-context.ts) rather than raw JSON.stringify/console.log.
+  Do not emit full request bodies, Authorization headers, or raw ACP/MCP
+  payloads at info level; use the sanitized shape and redact credential-like
+  fields.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: |-
+      import { sanitizeContext } from '../shared/sanitize-context.js';
+
+      logger.info('acp request', { context: sanitizeContext(ctx) });
+    isCorrect: true
+  - snippet: |-
+      console.log('acp request', JSON.stringify(req.body));
+      logger.debug('headers', req.headers.authorization);
+    isCorrect: false
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

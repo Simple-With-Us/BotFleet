@@ -1,0 +1,50 @@
+title: >-
+  Search fleet recall before re-deriving lessons, and never put secrets in
+  contributions
+rule: >-
+  Before re-deriving a lesson, debugging something that smells familiar, or
+  asking the owner a question a past decision probably answered, search the
+  shared `fleet-agents` memory corpus with `recall "<query>"` (e.g. `recall "pm2
+  orphan holds port"`, `recall "how do we rotate the Coolify token" --app fleet
+  --limit 3`) or the MCP tool `recall_search(query, limit?, category?, app?,
+  source?, seat?, since_days?)`. Treat a hit as a lead, not a verdict: open the
+  board row, note, or doc it cites before relying on it. Rank 1 is resemblance,
+  not correctness — for a ruling, preference, or infra-fact question, read the
+  top 5 and never act on rank 1 alone; check the source's date because a hit's
+  `created_at` is the file's, not the section's. If a hit supersedes another,
+  contribute the correction with `--force` (a one-detail fix otherwise reads as
+  a near-duplicate and is refused). At closeout, contribute one reusable
+  paragraph (40-4000 characters, category `lesson | preference | infrastructure
+  | decision | runbook`) via `recall contribute "<one paragraph>" --category
+  lesson --app <slug>` or `recall_contribute(text, category, app?, seat, title?,
+  url?)`, keeping it to one idea. Never put secrets, tokens, or transcripts in a
+  contribution. Near-duplicates are refused, so search first and corroborate
+  rather than repeat; facts that already have a home (board rows, Notes, effort
+  logs, docs) are ingested nightly, so contribute directly only for a lesson
+  with no natural home. If recall is unavailable, say so once at the start
+  instead of guessing (access check:
+  https://github.com/jaywedgeworth22/AI-Fleet-Coordinator/blob/main/docs/RECALL-ACCESS-CHECK.md),
+  and never point Socratic.Trade's embedding provider at the fleet endpoint
+  because the embedding spaces are not compatible (measured 2026-08-31).
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: recall "how do we rotate the Coolify token" --app fleet --limit 3
+    isCorrect: true
+  - snippet: >-
+      recall contribute "Rotated the Coolify token to sk-live-9f2b... and
+      restarted pm2." --category lesson --app fleet
+    isCorrect: false
+  - snippet: >-
+      recall "pm2 orphan holds port"  # then open the cited board row before
+      acting
+    isCorrect: true
+  - snippet: >-
+      # Acting immediately on the first recall hit for a ruling/preference
+      question without reading the top 5 or the cited source.
+    isCorrect: false
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

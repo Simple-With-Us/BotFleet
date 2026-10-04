@@ -8,7 +8,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
-import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
+import {
+  finishSpeech,
+  listPersonalVoices,
+  speakPersonalVoice,
+  startSpeech,
+  stopPersonalVoice,
+  stopSpeech,
+} from "./speech.mjs";
 import {
   recorderPermissionStatus,
   saveSkillRecording,
@@ -1797,6 +1804,19 @@ ipcMain.handle("speech:finish", () => {
   if (nativeActions.appleSpeech) finishSpeech();
 });
 
+ipcMain.handle("personal-voice:available", () => nativeActions.appleSpeech);
+ipcMain.handle("personal-voice:list", async () => {
+  if (!nativeActions.appleSpeech) return [];
+  return listPersonalVoices();
+});
+ipcMain.handle("personal-voice:speak", async (_event, text, voiceId) => {
+  if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
+  return speakPersonalVoice(text, voiceId);
+});
+ipcMain.handle("personal-voice:stop", () => {
+  if (nativeActions.appleSpeech) stopPersonalVoice();
+});
+
 ipcMain.handle("skill-recorder:permissions", () => recorderPermissionStatus());
 ipcMain.handle("skill-recorder:start", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -2489,6 +2509,9 @@ app.on("before-quit", (e) => {
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
+  // a speaking Personal Voice helper parks in its own run loop until the stop
+  // marker appears; write it so quitting never leaves one behind
+  if (nativeActions.appleSpeech) stopPersonalVoice();
   stopRecorder();
   const cleanup = Promise.race([
     Promise.all([

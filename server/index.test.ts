@@ -5322,7 +5322,7 @@ describe("resumable event stream", () => {
   });
 
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
-    for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
+    for (const cursor of ["deadbeef:1", "12345678:999999"]) {
       const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
       try {
         const hello = await stream.until((f) => f.kind === "hello");
@@ -5333,6 +5333,12 @@ describe("resumable event stream", () => {
         stream.close();
       }
     }
+  });
+
+  it("rejects a malformed cursor with HTTP 400", async () => {
+    const res = await fetch(`${BASE}/api/events?since=not-a-cursor`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 });
 

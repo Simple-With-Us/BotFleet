@@ -1,0 +1,55 @@
+title: Validate and narrow external input instead of using any/ts-ignore
+rule: >-
+  Request bodies, headers, query params, and third-party API responses must be
+  parsed into explicit types before use: read `await request.json()` as
+  `unknown`, then narrow with a type guard or schema validation, and return
+  `400` on invalid input. `any`, `as any`, `@ts-ignore`, and `@ts-expect-error`
+  are not allowed in Worker source for payloads or `Env` bindings. The
+  repository's type check must pass for every change (`npm run check` -> `tsc
+  --noEmit`), and new or modified routes should keep at least one test under
+  `test/*.test.mjs` runnable with `npm test`.
+severity: high
+scope: pull-request
+path: '**/*'
+examples:
+  - snippet: |-
+      interface VehicleUpdate {
+        odometerKm: number;
+      }
+
+      export default {
+        async fetch(request: Request): Promise<Response> {
+          const body: any = await request.json();
+          const km = body.odometerKm as number;
+          // @ts-ignore
+          return new Response(JSON.stringify({ km }));
+        },
+      };
+    isCorrect: false
+  - snippet: |-
+      interface VehicleUpdate {
+        odometerKm: number;
+      }
+
+      function isVehicleUpdate(value: unknown): value is VehicleUpdate {
+        return (
+          typeof value === "object" &&
+          value !== null &&
+          typeof (value as { odometerKm?: unknown }).odometerKm === "number"
+        );
+      }
+
+      export default {
+        async fetch(request: Request): Promise<Response> {
+          const body: unknown = await request.json();
+          if (!isVehicleUpdate(body)) {
+            return new Response("invalid payload", { status: 400 });
+          }
+          return new Response(JSON.stringify({ km: body.odometerKm }));
+        },
+      };
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

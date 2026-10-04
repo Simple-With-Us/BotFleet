@@ -156,4 +156,44 @@ describe("Speaker lifecycle", () => {
     await speaking;
     expect(speaker.state.status).toBe("idle");
   });
+
+  it("speaks on-device via personalVoice bridge without calling server fetch", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const speakMock = vi.fn().mockResolvedValue(undefined);
+    const stopMock = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("window", {
+      ogb: {
+        personalVoice: {
+          speak: speakMock,
+          stop: stopMock,
+        },
+      },
+    });
+
+    const speaker = new Speaker();
+    const speaking = speaker.speak("Personal voice reply", {
+      voiceId: "personal:com.apple.speech.voice.Jay",
+      botId: "bot_1",
+    });
+
+    await speaking;
+    expect(speakMock).toHaveBeenCalledWith("Personal voice reply", "personal:com.apple.speech.voice.Jay");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(speaker.state.status).toBe("idle");
+
+    speaker.stop();
+    expect(stopMock).toHaveBeenCalled();
+  });
+
+  it("handles unsupported platform for personal voice when ogb bridge is absent", async () => {
+    vi.stubGlobal("window", {});
+    const speaker = new Speaker();
+    await speaker.speak("Personal voice reply", {
+      voiceId: "personal:com.apple.speech.voice.Jay",
+      botId: "bot_1",
+    });
+
+    expect(speaker.state.error).toContain("Apple Personal Voice speaks on authorized Apple devices");
+  });
 });
