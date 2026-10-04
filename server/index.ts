@@ -586,12 +586,77 @@ void adoptGroupLedger(join(DATA_DIR, "process-groups.json")).catch((error) => {
   console.error("could not stop process groups an earlier run left running", error);
 });
 
+// ── SSE fan-out to clients ─────────────────────────────────────────────
+// SseClient, wants(), writeToClient(), and ReplayBuffer live in
+// sse-broadcast.ts so the backpressure and byte-cap-eviction paths — hard
+// to exercise through a real socket without genuinely stalling a client —
+// get a fast, deterministic unit test (HS16, HS17).
+const sseClients = new Set<SseClient>();
+
+/** Every frame is numbered, and the last few hundred (or 4 MB, whichever
+ * is smaller) are kept, so a client whose connection dropped can ask for
+ * what it missed instead of re-downloading every transcript.  The desktop
+ * reconnects in milliseconds and barely needs this; a phone reconnects
+ * every time it unlocks.
+ *
+ * The stream id makes the cursor safe across restarts: sequence numbers
+ * begin again at 1 on boot, so a cursor from a previous run must be
+ * rejected rather than used to replay a different run's frames.  It rides
+ * inside the SSE `id:` field, which means a browser EventSource resumes
+ * correctly through its own Last-Event-ID with no client code at all. */
+const STREAM_ID = randomUUID().slice(0, 8);
+const REPLAY_MAX = 500;
+const REPLAY_MAX_BYTES = 4 * 1024 * 1024; // 4 MB — see ReplayBuffer.push
+let lastSeq = 0;
+const replayBuffer = new ReplayBuffer(REPLAY_MAX, REPLAY_MAX_BYTES);
+
+/** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
+ * remember to resume.  Returns null when it belongs to another run. */
+function cursorSeq(raw: string | string[] | undefined): number | null {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!value) return null;
+  const [stream, seq] = value.split(":");
+  if (stream !== STREAM_ID) return null;
+  const parsed = Number(seq);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function broadcast(payload: Record<string, unknown>) {
+  const seq = ++lastSeq;
+  const kind = String(payload.kind ?? "");
+  const frame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...payload, seq })}\n\n`;
+  // Live desktop captures can each be hundreds of kilobytes and become stale
+  // as soon as the next one arrives. Keep their sequence slots so resume-gap
+  // detection stays honest, but never retain their base64 payloads.
+  replayBuffer.push(seq, kind, frame);
+  const botId = String(payload.botId);
+  for (const client of [...sseClients]) {
+    const result = writeToClient(client, frame, kind, botId);
+    if (result === "slow-end") {
+      console.warn(`[sse] client exceeded ${SLOW_CLIENT_BYTE_LIMIT} buffered bytes; disconnecting so it reconnects and resumes from its cursor`);
+      sseClients.delete(client);
+      screenPollers.viewerChanged();
+    } else if (result === "error") {
+      sseClients.delete(client);
+      screenPollers.viewerChanged();
+    }
+  }
+}
+
+// ── live screen: capture only while a viewer watches ───────────────────
+const screenPollers = new ScreenPollers(
+  (botId) => [...sseClients].some((client) =>
+    !client.res.destroyed && client.screens && (!client.screenBotIds || client.screenBotIds.has(botId))),
+  (botId, frame) => broadcast({ kind: "screen", botId, ...frame }),
+);
+
 // BOTFLEET-2M / Sentry 7768010831: createUpdateControl wires readiness into a
 // 2s status timer. Mid-update harness restart can fire that timer across the
 // top-level awaits below (infisical.preload, registry.load, …) before later
-// module bindings exist. Keep this Map — and the boot gate readiness reads —
-// initialized synchronously before construction so emitIfChanged never walks
-// an uninitialized binding.
+// module bindings exist. Keep this Map — and the boot gate readiness reads,
+// as well as lastSeq / STREAM_ID / replayBuffer / broadcast — initialized
+// synchronously before construction so emitIfChanged never walks an
+// uninitialized binding.
 let bootComplete = false;
 /** Room rounds held only so credential restore can drain; counted out of
  * queuedRooms when allowCredentialQueues is set. Must exist before
@@ -2117,40 +2182,6 @@ function messageWindow(threadId: string, messageId: string, limit: number) {
   return { messages: all.slice(start, stop).map(slimMessage), hasMore: start > 0 };
 }
 
-// ── SSE fan-out to clients ─────────────────────────────────────────────
-// SseClient, wants(), writeToClient(), and ReplayBuffer live in
-// sse-broadcast.ts so the backpressure and byte-cap-eviction paths — hard
-// to exercise through a real socket without genuinely stalling a client —
-// get a fast, deterministic unit test (HS16, HS17).
-const sseClients = new Set<SseClient>();
-
-/** Every frame is numbered, and the last few hundred (or 4 MB, whichever
- * is smaller) are kept, so a client whose connection dropped can ask for
- * what it missed instead of re-downloading every transcript. The desktop
- * reconnects in milliseconds and barely needs this; a phone reconnects
- * every time it unlocks.
- *
- * The stream id makes the cursor safe across restarts: sequence numbers
- * begin again at 1 on boot, so a cursor from a previous run must be
- * rejected rather than used to replay a different run's frames. It rides
- * inside the SSE `id:` field, which means a browser EventSource resumes
- * correctly through its own Last-Event-ID with no client code at all. */
-const STREAM_ID = randomUUID().slice(0, 8);
-const REPLAY_MAX = 500;
-const REPLAY_MAX_BYTES = 4 * 1024 * 1024; // 4 MB — see ReplayBuffer.push
-let lastSeq = 0;
-const replayBuffer = new ReplayBuffer(REPLAY_MAX, REPLAY_MAX_BYTES);
-
-/** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
- * remember to resume. Returns null when it belongs to another run. */
-function cursorSeq(raw: string | string[] | undefined): number | null {
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (!value) return null;
-  const [stream, seq] = value.split(":");
-  if (stream !== STREAM_ID) return null;
-  const parsed = Number(seq);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
-}
 
 
 // ── runtime-event redaction for the wire ─────────────────────────────────
@@ -2241,27 +2272,6 @@ function redactRuntimeEventForWire(event: RuntimeEvent): RuntimeEvent {
   }
 }
 
-function broadcast(payload: Record<string, unknown>) {
-  const seq = ++lastSeq;
-  const kind = String(payload.kind ?? "");
-  const frame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...payload, seq })}\n\n`;
-  // Live desktop captures can each be hundreds of kilobytes and become stale
-  // as soon as the next one arrives. Keep their sequence slots so resume-gap
-  // detection stays honest, but never retain their base64 payloads.
-  replayBuffer.push(seq, kind, frame);
-  const botId = String(payload.botId);
-  for (const client of [...sseClients]) {
-    const result = writeToClient(client, frame, kind, botId);
-    if (result === "slow-end") {
-      console.warn(`[sse] client exceeded ${SLOW_CLIENT_BYTE_LIMIT} buffered bytes; disconnecting so it reconnects and resumes from its cursor`);
-      sseClients.delete(client);
-      screenPollers.viewerChanged();
-    } else if (result === "error") {
-      sseClients.delete(client);
-      screenPollers.viewerChanged();
-    }
-  }
-}
 
 // A describe that finished behind a stale-while-revalidate answer (or a slow
 // engine's probe that landed after its sweep) reaches open windows without
@@ -4468,13 +4478,6 @@ function drainQueuedSends() {
     });
   });
 }
-
-// ── live screen: capture only while a viewer watches ───────────────────
-const screenPollers = new ScreenPollers(
-  (botId) => [...sseClients].some((client) =>
-    !client.res.destroyed && client.screens && (!client.screenBotIds || client.screenBotIds.has(botId))),
-  (botId, frame) => broadcast({ kind: "screen", botId, ...frame }),
-);
 
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
 /** What started a turn nobody typed: a routine's trigger, or `job` — a

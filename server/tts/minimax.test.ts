@@ -226,4 +226,32 @@ describe("synthesize", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message.toLowerCase()).toContain("couldn't reach");
   });
+
+  describe("sanitizeForTTS", () => {
+    it("converts em-dashes and en-dashes into pauses with comma-space", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Option A—fastest option–available now")).toBe("Option A, fastest option, available now");
+    });
+
+    it("converts floating hyphens into pauses and cleans ellipses", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Start - middle... end")).toBe("Start, middle. end");
+    });
+
+    it("normalizes consecutive commas and trailing spaces", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Hello — , world...  ")).toBe("Hello, world.");
+    });
+
+    it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", "sk");
+      const post = seen.find((s) => s.method === "POST" && s.url.includes("/v1/t2a_v2"));
+      expect(post).toBeDefined();
+      const body = JSON.parse(post!.body);
+      expect(body.text).toBe("Step one, do this, next. finish");
+    });
+  });
 });
+
