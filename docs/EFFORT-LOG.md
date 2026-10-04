@@ -4,6 +4,7 @@
 
 ## Completed
 
+- **2026-10-04 - AG - COMPLETED - [BF][AG] MiniMax TTS acoustic punctuation sanitizer & fix lastSeq TDZ ReferenceError.**  Landed in PR #829. <!-- wb-agent-report:7d1426c148004f15926e58df4466e691 -->
 - **2026-10-04 — AG — COMPLETED — [BF][AG] Generic CLI Wrapper Driver (PR #826, branch `ag/generic-cli-wrapper`).**  Landed in PR #826.  Safely inherits runtime environment while stripping workspace and provider credentials, gates idle thread cancellation, classifies spawn errors deterministically, and resolved all 13 Kody review findings.  Verified with clean CI and auto-merged to main.
 - **2026-10-04 — AG — COMPLETED — [BF][AG] MiniMax TTS acoustic punctuation sanitizer & fix lastSeq TDZ ReferenceError (board `7d1426c1`; branch `ag/minimax-tts-and-server-fix`, PR #829).**  Landed in PR #829.  Sanitizes acoustic punctuation artifacts, prevents TDZ ReferenceError on lastSeq in SSE broadcasts, scrubs credentials from tests, and ensures proper fallback when code blocks are stripped.  Verified with clean CI and auto-merged to main.
 - **2026-10-04 - MINIMAX - COMPLETED - [BF][MINIMAX] Kody sweep: PR #838 (9 unresolved threads).**  Addressed all 9 Kody review threads in commit f737c5654, all tests pass, threads resolved via GraphQL. <!-- wb-agent-report:98f0bdb9df4a4932b816db5ab8275017 -->
@@ -14,3 +15,7 @@
 ## In Progress
 
 - **2026-10-04 - AG - IN_PROGRESS - [BF][AG] Attention layer error badges, human queue alerts & fleet copy compliance.** <!-- wb-agent-report:165949da09094bbe84bf910ad2fed94d -->
+
+## Planned / Reserved
+
+- **2026-10-04 - BF-Director - PLANNED - BOTFLEET-11 detector: 6h window ALONE does not fix the coin-flip - it only cuts noise-firing 42%->31%. The threshold must move too (6h + 13%). Owner decision pending..** <!-- wb-agent-report:469a4bdd9d5b4380b85b0b80a8394dce -->
