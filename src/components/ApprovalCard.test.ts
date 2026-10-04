@@ -69,7 +69,7 @@ describe("ApprovalCard routine proposals", () => {
 
     const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
     expect(markup).toContain("Delete “Daily inbox”?");
-    expect(markup).toContain("Routine deleted");
+    expect(markup).toContain("Routine Deleted");
   });
 
   it("does not imply a run-now request has already started", () => {
@@ -93,7 +93,7 @@ describe("ApprovalCard routine proposals", () => {
     };
 
     const markup = renderToStaticMarkup(createElement(ApprovalCard, { message }));
-    expect(markup).toContain("Routine run queued");
+    expect(markup).toContain("Routine Run Queued");
     expect(markup).not.toContain("Routine started");
   });
 
