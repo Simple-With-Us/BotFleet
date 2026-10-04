@@ -444,6 +444,7 @@ import { readHostLoad } from "./drivers/acp/init-deadline.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
+import * as pluginsModule from "./plugins.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -839,6 +840,29 @@ console.log(observabilityBootLine(await observability.apply()));
 // that keeps a rotated credential current, not the one boot depends on.
 infisical.start();
 bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
+
+// ── plugin runtime bootstrap ───────────────────────────────────────────────
+// The plugin system is user data: it lives in <DATA_DIR>/plugins, ships
+// disabled, and runs in the server process.  Wire it after observability
+// so a plugin's logger can route through the same Sentry path; wire it
+// after registry.load so a plugin's getBots() sees the live fleet.
+pluginsModule.initPluginRuntime({
+  listBots: () => store.bots.map((bot) => ({
+    id: bot.id,
+    name: bot.name,
+    status: typeof bot.busy === "boolean" ? (bot.busy ? "running" : "stopped") : "unknown",
+    driver: bot.modelSelection?.instanceId ?? "unknown",
+  })),
+  listConfigKeys: () => Object.keys(cfg).filter((key) => !/key|token|secret|credential/i.test(key)),
+  readConfig: <T = unknown>(key: string): T | undefined => (cfg as Record<string, unknown>)[key] as T | undefined,
+  logger: (level, name, message) => {
+    const tag = `[plugin:${name}]`;
+    if (level === "error") console.error(tag, message);
+    else if (level === "warn") console.warn(tag, message);
+    else console.log(tag, message);
+  },
+});
+await pluginsModule.bootPluginRuntime();
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -14901,6 +14925,69 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "DELETE") return json(res, 200, await composio.removeAccount(cfg, m[1], m[2]));
     m = path.match(/^\/api\/connectors\/([\w-]+)$/);
     if (m && method === "DELETE") return json(res, 200, await composio.removeService(cfg, m[1]));
+
+    // ── plugins (drop-in extensions, see docs/plugins/DESIGN.md) ──
+    // The plugin system lives outside the repo.  It ships DISABLED until
+    // the user enables it after reading the manifest, mirrors the skills
+    // trust model, and uses the same route dispatch style as the rest of
+    // this file.  Validation errors return { error, issues: [...] } so
+    // the UI can render one row per problem.
+    if (method === "GET" && path === "/api/plugins") {
+      return json(res, 200, { plugins: pluginsModule.listPlugins() });
+    }
+    if (method === "POST" && path === "/api/plugins/install") {
+      const body = await readBody(req);
+      const source = typeof body.source === "string" ? body.source : "";
+      if (!source.trim()) return json(res, 400, { error: "source is required" });
+      const result = await pluginsModule.installPlugin(source);
+      if ("error" in result) return json(res, 400, { error: result.error });
+      return json(res, 200, result);
+    }
+    m = path.match(/^\/api\/plugins\/([\w][\w-]*)$/);
+    if (m && method === "GET") {
+      const result = pluginsModule.getPlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (m && method === "DELETE") {
+      const result = await pluginsModule.removePlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (m && method === "POST" && path.endsWith("/enable")) {
+      const result = await pluginsModule.enablePlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (m && method === "POST" && path.endsWith("/disable")) {
+      const result = await pluginsModule.disablePlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (m && method === "POST" && path.endsWith("/update")) {
+      const result = await pluginsModule.updatePlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    if (m && method === "POST" && path.endsWith("/reload")) {
+      const result = await pluginsModule.reloadPlugin(m[1]!);
+      if ("error" in result) return json(res, 404, { error: result.error });
+      return json(res, 200, result);
+    }
+    const cardMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/);
+    if (cardMatch && method === "GET") {
+      const result = await pluginsModule.getPluginCardData(cardMatch[1]!, cardMatch[2]!);
+      if ("error" in result) return json(res, 409, { error: result.error });
+      return json(res, 200, { data: result.data });
+    }
+    const cmdMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/);
+    if (cmdMatch && method === "POST") {
+      const body = await readBody(req);
+      const args = typeof body.args === "string" ? body.args : "";
+      const result = await pluginsModule.runPluginCommand(cmdMatch[1]!, cmdMatch[2]!, args);
+      if ("error" in result) return json(res, 409, { error: result.error });
+      return json(res, 200, result);
+    }
 
     // Inline credential cards never receive the credential value. Electron
     // saves it through the OS-backed store first; this route only verifies

@@ -33,6 +33,9 @@ const GroupSettingsPanel = lazy(() =>
 const PluginsPanel = lazy(() =>
   import("@/components/PluginsPanel").then((m) => ({ default: m.PluginsPanel })),
 );
+const PluginsManagerView = lazy(() =>
+  import("@/components/PluginsManagerView").then((m) => ({ default: m.PluginsManagerView })),
+);
 const ComputerPanel = lazy(() =>
   import("@/components/ComputerPanel").then((m) => ({ default: m.ComputerPanel })),
 );
@@ -502,6 +505,11 @@ function Shell() {
       {state.pluginsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <PluginsPanel />
+        </Suspense>
+      )}
+      {state.pluginsManagerOpen && (
+        <Suspense fallback={<PanelFallback />}>
+          <PluginsManagerView onClose={() => dispatch({ type: "togglePluginsManager", open: false })} />
         </Suspense>
       )}
       {/* mounted after the modals: same z-50 tier, so DOM order keeps the

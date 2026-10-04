@@ -1,0 +1,28 @@
+{
+  "name": "fleet-overview",
+  "version": "1.0.0",
+  "description": "Dashboard card with bot counts by status and a /fleet slash command that summarizes the fleet.",
+  "author": "BotFleet",
+  "license": "Apache-2.0",
+  "botfleet": ">=1",
+  "entry": "plugin.mjs",
+  "capabilities": ["read.bots", "read.status"],
+  "contributes": {
+    "cards": [
+      {
+        "id": "fleet-overview",
+        "title": "Fleet Overview",
+        "description": "Bot counts by status.",
+        "layout": "stat-grid",
+        "fields": ["total", "running", "stopped", "errored"]
+      }
+    ],
+    "commands": [
+      {
+        "name": "fleet",
+        "description": "Summarize the fleet: total bots, running, stopped.",
+        "args": []
+      }
+    ]
+  }
+}
