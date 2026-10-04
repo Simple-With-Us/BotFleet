@@ -38,6 +38,10 @@ scope: file
 path: '**/*'
 examples:
   - snippet: >-
+      swift package clean --package-path companion
+
+      swift package clean --package-path CompanionCore
+
       swift build -c release
 
       codesign --force --sign "Developer ID Application: Jay Wedgeworth, LLC
