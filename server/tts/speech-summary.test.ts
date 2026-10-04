@@ -187,5 +187,20 @@ describe("summarizeForVoice", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT read out raw git commit hashes");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
   });
+
+  it("sanitizes em-dashes, en-dashes, and floating hyphens on short replies", async () => {
+    const res = await summarizeForVoice("Quick check—looks good - done... ready");
+    expect(res).toBe("Quick check, looks good, done. ready");
+  });
+
+  it("sanitizes em-dashes and ellipses returned by model", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Here is your update—first step completed - and waiting... for you" } }] }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is your update, first step completed, and waiting. for you");
+  });
 });
+
 
