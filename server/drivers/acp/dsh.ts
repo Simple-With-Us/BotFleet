@@ -327,6 +327,7 @@ export const DSH_INIT_TIMEOUT_MS = 120_000;
 export const dshSupport = {
   ...clutchDshSupport,
   initTimeoutMs: DSH_INIT_TIMEOUT_MS,
+  images: true,
   models: STATIC_DSH_MODELS,
   resolveModels: (environment) => readDshModelCatalog(environment),
   loginNote: clutchDshSupport.loginNote ?? "DSH CLI auth missing — add ~/.dsh/.credentials.yaml",

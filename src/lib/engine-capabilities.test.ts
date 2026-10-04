@@ -482,19 +482,17 @@ describe("ENGINE_CAPABILITIES user-facing copy", () => {
     expect(entry.whyThisEngine).toEqual({
       headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments are per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4.1-Pro carries a No Vision badge.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "BotFleet does not support image attachments on Clutch yet.",
       ],
     });
-    expect(entry.capabilities.imageAttachments).toBe("no");
+    expect(entry.capabilities.imageAttachments).toBe("yes");
     const copy = [
       entry.pricing.notes ?? "",
       entry.pricing.api.notes ?? "",
       entry.whyThisEngine.headline,
       ...entry.whyThisEngine.prose,
     ].join("\n");
-    expect(copy).toContain("BotFleet does not support image attachments");
     expect(copy).not.toContain("Bundled with Claude Max");
     expect(copy).not.toContain("Claude Max");
     expect(copy).not.toContain("same Claude Max seat");
