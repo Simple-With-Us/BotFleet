@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -15,8 +15,10 @@ import {
   promoteStaging,
   pruneReleases,
   releasePath,
+  releasesRoot,
   resolveCurrent,
   stagingPath,
+  stagingRoot,
   storeRoot,
   swapCurrent,
 } from "./harness-release-store.mjs";
@@ -75,9 +77,13 @@ async function stage(env, commit, marker) {
 test("the store's paths are all under one root and refuse a non-commit", async (t) => {
   const { env } = await store(t);
   assert.equal(storeRoot(env), storeRoot(env));
-  assert.ok(releasePath(A, env).endsWith(`/releases/${A}`));
-  assert.ok(stagingPath(A, env).endsWith(`/staging/${A}`));
-  assert.ok(currentLink(env).endsWith("/current"));
+  // Compare against path.join rather than forward-slash literals: the module
+  // builds every path with path.join, which is separator-correct everywhere, and
+  // a test that hardcodes "/" fails on Windows for a reason that has nothing to
+  // do with the code under test.
+  assert.equal(releasePath(A, env), join(releasesRoot(env), A));
+  assert.equal(stagingPath(A, env), join(stagingRoot(env), A));
+  assert.equal(currentLink(env), join(storeRoot(env), "current"));
   // A short or symbolic value would address a directory that no commit owns.
   for (const bad of ["abc1234", "main", "", "../../etc", "HEAD"]) {
     assert.throws(() => releasePath(bad, env), /non-commit/, `"${bad}" must be refused`);
@@ -368,4 +374,14 @@ test("retention ranks by when a release was promoted, not by its commit name", a
   const remaining = await listReleases(env);
   assert.deepEqual(remaining, [A, C], "the OLDEST release is the one pruned, and the live one is kept");
   assert.ok(!remaining.includes(B), "keeping B would retain the stale release as the rollback target");
+});
+
+test("the commit is read from a path with the platform's own separator", () => {
+  // The name was extracted with a hard-coded "/", which on Windows makes every
+  // path look like a single segment — so currentCommit answered null for a
+  // perfectly valid pointer, and did so silently.  Pinned here with a Windows
+  // path so the bug cannot come back even on a machine whose tests all pass.
+  const windowsPointer = "C:\\Users\\jay\\.botfleet\\releases\\" + A;
+  assert.equal(windowsPointer.split(win32.sep).pop(), A, "the last segment must be recoverable on Windows");
+  assert.equal(windowsPointer.split("/").pop(), windowsPointer, "which is exactly what the hard-coded split returned");
 });
