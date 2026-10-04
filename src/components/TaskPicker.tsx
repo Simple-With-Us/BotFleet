@@ -6,7 +6,8 @@
 // long job and a quick question can sit side by side under one bot.
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Pencil, Plus, Trash2 } from "lucide-react";
-import { useStore, formatTime, type Bot, type Group, type Task } from "@/state/store";
+import { useStore, formatTime, getConversationMode, type Bot, type Group, type Task } from "@/state/store";
+import { allowsMultipleBotThreads } from "../../shared/conversation-mode";
 import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
 import { formatTokens } from "@/lib/format-tokens";
@@ -60,7 +61,7 @@ function ConversationTaskPicker({
   threadId: string;
   tasks: PickerTask[];
   busy: boolean;
-  onNew: () => void;
+  onNew?: () => void;
   onSwitch: (threadId: string) => void;
   onRename: (threadId: string, title: string) => void;
   onDelete: (threadId: string) => void;
@@ -297,17 +298,19 @@ function ConversationTaskPicker({
               );
             })}
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              onNew();
-              closeMenu();
-            }}
-            disabled={busy}
-            className="mt-1 flex w-full items-center gap-2 border-t border-hairline/40 px-3 py-2 text-left text-[13px] text-ink hover:bg-raised/50 disabled:opacity-40"
-          >
-            <Plus size={13} className="text-ink-secondary" /> New task
-          </button>
+          {onNew && (
+            <button
+              type="button"
+              onClick={() => {
+                onNew();
+                closeMenu();
+              }}
+              disabled={busy}
+              className="mt-1 flex w-full items-center gap-2 border-t border-hairline/40 px-3 py-2 text-left text-[13px] text-ink hover:bg-raised/50 disabled:opacity-40"
+            >
+              <Plus size={13} className="text-ink-secondary" /> New task
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -315,13 +318,14 @@ function ConversationTaskPicker({
 }
 
 export function TaskPicker({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   return (
     <ConversationTaskPicker
       threadId={bot.threadId}
       tasks={bot.tasks ?? []}
       busy={Boolean(bot.busy)}
-      onNew={() => dispatch({ type: "requestNewTask", botId: bot.id })}
+      onNew={allowsMultipleBotThreads(getConversationMode(state.config))
+          ? () => dispatch({ type: "requestNewTask", botId: bot.id }) : undefined}
       onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
       onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
       onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}

@@ -5,8 +5,9 @@
 // double-click or right-click to rename, plus to start a fresh one.
 import { useEffect, useRef, useState } from "react";
 import { GitMerge, Plus, X } from "lucide-react";
-import { useStore, formatTime, getRoomTerminology, type Bot, type Group, type Task } from "@/state/store";
+import { useStore, formatTime, getConversationMode, getRoomTerminology, type Bot, type Group, type Task } from "@/state/store";
 import { TaskWorkspaceLabel } from "./TaskWorkspaceLabel";
+import { allowsMultipleBotThreads } from "../../shared/conversation-mode";
 import { cn } from "@/lib/cn";
 import { nextRename } from "@/lib/rename";
 import { TASK_RENAME_HINT, taskPickerPointerIntent } from "./TaskPicker";
@@ -30,7 +31,7 @@ function ConversationThreadTabs({
   threadId: string;
   tasks: TabTask[];
   busy: boolean;
-  onNew: () => void;
+  onNew?: () => void;
   onSwitch: (threadId: string) => void;
   onRename: (threadId: string, title: string) => void;
   onDelete: (threadId: string) => void;
@@ -202,17 +203,19 @@ function ConversationThreadTabs({
           <span className="hidden sm:inline">Merge Threads</span>
         </button>
       )}
-      <button
-        type="button"
-        onClick={onNew}
-        disabled={busy}
-        title={busy ? "Let this turn finish first" : "New thread — a fresh conversation"}
-        aria-label="New Thread"
-        className="flex shrink-0 items-center gap-1 border-l border-hairline/40 px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-40"
-      >
-        <Plus size={14} />
-        <span className="hidden sm:inline">New</span>
-      </button>
+      {onNew && (
+        <button
+          type="button"
+          onClick={onNew}
+          disabled={busy}
+          title={busy ? "Let this turn finish first" : "New thread — a fresh conversation"}
+          aria-label="New Thread"
+          className="flex shrink-0 items-center gap-1 border-l border-hairline/40 px-3 text-[13px] text-ink-secondary hover:bg-raised hover:text-ink disabled:opacity-40"
+        >
+          <Plus size={14} />
+          <span className="hidden sm:inline">New</span>
+        </button>
+      )}
       {current ? <span className="sr-only">Current thread: {current.title}</span> : null}
       {pendingMerge && onMerge && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4" role="dialog" aria-labelledby="merge-threads-title">
@@ -255,7 +258,8 @@ export function ThreadTabs({ bot }: { bot: Bot }) {
         threadId={bot.threadId}
         tasks={tasks}
         busy={Boolean(bot.busy)}
-        onNew={() => dispatch({ type: "requestNewTask", botId: bot.id })}
+        onNew={allowsMultipleBotThreads(getConversationMode(state.config))
+          ? () => dispatch({ type: "requestNewTask", botId: bot.id }) : undefined}
         onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
         onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
         onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}

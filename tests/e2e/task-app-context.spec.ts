@@ -1,4 +1,11 @@
 import { expect, test, type Page } from '@playwright/test';
+import type { TaskWorkspaceContext } from '../../shared/task-workspace-context';
+
+declare global {
+  interface Window {
+    __taskMenuAction?: (action: string) => void;
+  }
+}
 
 // Every /api request is fulfilled here.  Vite preview proxies unknown /api
 // calls to the running harness, so the catch-all must never fall through.
@@ -14,7 +21,7 @@ const NOW = 1_700_000_000_000;
 type AppRef = { kind: 'group'; id: string };
 type PostBody = { appRef?: AppRef };
 
-const json = (body: object) => ({
+const json = (body: unknown) => ({
   status: 200,
   contentType: 'application/json',
   body: JSON.stringify(body),
@@ -55,6 +62,7 @@ function bot(busy = false) {
 }
 
 async function mockServer(page: Page, options: { eligible?: boolean; busy?: boolean; conversationMode?: 'projects' | 'simple' } = {}) {
+  const posts: PostBody[] = [];
   const fixture = {
     bot: bot(options.busy),
     groups: [
@@ -63,7 +71,7 @@ async function mockServer(page: Page, options: { eligible?: boolean; busy?: bool
       group('group-nonmember', 'Other Bot App', ['bot-elsewhere'], { cwd: '/fixture/other' }),
       group('group-no-folder', 'No Folder App', [BOT_ID], { pinnedCwd: '/fixture/pinned-only' }),
     ],
-    posts: [] as PostBody[],
+    posts,
   };
 
   await page.route('**/api/**', async (route) => {
@@ -87,16 +95,20 @@ async function mockServer(page: Page, options: { eligible?: boolean; busy?: bool
       const workspaceContext = body.appRef
         ? { kind: 'local' as const, appRef: body.appRef, cwd: SAVED_FOLDER, capturedAt: NOW + 100 }
         : undefined;
+      const createdTask: { threadId: string; title: string; createdAt: number; cwd?: string; workspaceContext?: TaskWorkspaceContext } = {
+        threadId: NEW_THREAD,
+        title: 'New Thread',
+        createdAt: NOW + 100,
+      };
+      if (workspaceContext) {
+        createdTask.cwd = SAVED_FOLDER;
+        createdTask.workspaceContext = workspaceContext;
+      }
       fixture.bot = {
         ...fixture.bot,
         threadId: NEW_THREAD,
         tasks: [
-          {
-            threadId: NEW_THREAD,
-            title: 'New Thread',
-            createdAt: NOW + 100,
-            ...(workspaceContext ? { cwd: SAVED_FOLDER, workspaceContext } : {}),
-          },
+          createdTask,
           ...fixture.bot.tasks.filter((task) => task.threadId !== NEW_THREAD),
         ],
         messages: [],
@@ -224,13 +236,12 @@ async function installNativeMenuStub(page: Page) {
         },
       },
     });
-    (window as typeof window & { __taskMenuAction?: (action: string) => void }).__taskMenuAction =
-      (action) => menuAction?.(action);
+    window.__taskMenuAction = (action) => menuAction?.(action);
   });
 }
 
 async function triggerNativeNewThread(page: Page) {
-  await page.evaluate(() => (window as typeof window & { __taskMenuAction?: (action: string) => void }).__taskMenuAction?.('new-task'));
+  await page.evaluate(() => window.__taskMenuAction?.('new-task'));
 }
 
 test('repeated native New Thread actions keep the chooser focused and protect the old draft', async ({ page }) => {
@@ -258,6 +269,7 @@ test('native New Thread is inert in Simple mode', async ({ page }) => {
   await installNativeMenuStub(page);
   const fixture = await mockServer(page, { conversationMode: 'simple' });
   await openBot(page, false);
+  await expect(page.getByRole('button', { name: 'New Thread' })).toHaveCount(0);
 
   await triggerNativeNewThread(page);
   await page.waitForTimeout(250);
