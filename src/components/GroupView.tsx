@@ -135,6 +135,10 @@ function GroupTextRow({
   attachedImages: ReturnType<typeof splitAttachedImages> | null;
 }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
+  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
   const [copied, setCopied] = useState(false);
   const copyContent = attachedImages?.display ?? m.text ?? "";
   const requestId = m.card?.requestId;
