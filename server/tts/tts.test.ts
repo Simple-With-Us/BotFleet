@@ -329,16 +329,16 @@ describe("Apple Personal Voice", () => {
     expect(isPersonalVoice(undefined)).toBe(false);
   });
 
-  it("reports voiceReady as false for server synthesis", async () => {
+  it("reports voiceReady as true for on-device Apple platforms", async () => {
     const { voiceReady } = await voice();
-    expect(voiceReady(cfg({ key: "k" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
-    expect(voiceReady(cfg({ provider: "system" }), "personal:com.apple.speech.voice.Jay")).toBe(false);
+    expect(voiceReady(cfg({ key: "k" }), "personal:com.apple.speech.voice.Jay")).toBe(true);
+    expect(voiceReady(cfg({ provider: "system" }), "personal:com.apple.speech.voice.Jay")).toBe(true);
   });
 
   it("throws clear error when server speak is attempted with personal voice", async () => {
     const { speak } = await voice();
     expect(() => speak(cfg({ key: "k" }), "Hello", "personal:com.apple.speech.voice.Jay")).toThrow(
-      "Apple Personal Voices speak on-device on authorized iOS companion devices and cannot be synthesized on the server.",
+      "Apple Personal Voices speak on-device on authorized Apple devices (macOS and iOS) and cannot be synthesized on the server.",
     );
   });
 });
