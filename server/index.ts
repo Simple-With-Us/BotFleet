@@ -438,7 +438,9 @@ import { resolveLinqBinding } from "./linq/dispatch.ts";
 import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
-import { ResourceTriggerManager } from "./resource-triggers.ts";
+import { ResourceTriggerManager, webhookDispatchHot } from "./resource-triggers.ts";
+import { createHostProbe, type HostProbe } from "./jobs/admission.ts";
+import { readHostLoad } from "./drivers/acp/init-deadline.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -2896,6 +2898,26 @@ bus.subscribe((event: RuntimeEvent) => {
 // mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
+/** Built on first webhook admission so importing this module does not probe. */
+let unattendedHostProbe: HostProbe | undefined;
+const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
+
+/** A catalog row for non-thinking Flash, preferring the seat's own engine.
+ *  mcode's picker does not offer this id, so a thinking mcode seat moves to
+ *  dsh, then the MiniMax HTTP engine, and only when that engine is enabled
+ *  and lists the id.  No such row means the caller leaves thinking in place. */
+function nonThinkingFlashSelection(currentInstanceId: string): { instanceId: string; model: string } | undefined {
+  const offers = (instanceId: string): boolean => {
+    const instance = registry.get(instanceId);
+    if (!instance || instance.enabled === false) return false;
+    return instance.models.options.some((option) => option.id === NON_THINKING_MINIMAX_FLASH);
+  };
+  if (offers(currentInstanceId)) return { instanceId: currentInstanceId, model: NON_THINKING_MINIMAX_FLASH };
+  for (const instanceId of ["dsh", "minimax"]) {
+    if (offers(instanceId)) return { instanceId, model: NON_THINKING_MINIMAX_FLASH };
+  }
+  return undefined;
+}
 const UNATTENDED_TTL_MS = 30 * 60_000;
 
 function markUnattended(botId: string, source: UnattendedSource = "outside") {
@@ -4621,6 +4643,7 @@ async function startTurn(
   const inheritsUnattended = inheritedUnattended(opts, () => isUnattended(bot.id));
   selection = unattendedModelDowngrade(selection, {
     unattended: inheritsUnattended,
+    nonThinkingFlash: nonThinkingFlashSelection(selection.instanceId),
     // A card continuation of a job's wake continues the wake, so it keeps
     // the bot's own model and effort too (ruling b).
     automationSource:
@@ -5557,6 +5580,16 @@ routines = new RoutineManager({
   // queued routine receipts durable while the registry is being rebuilt,
   // then tick them after the authenticated credential has landed.
   admit: () => !runtimeQuiescing && !providerConfigBusy,
+  // Defer new webhook wakes while the host is hot.  The probe is the jobs
+  // admission swap cache (non-blocking) plus the ACP init load reading.
+  // Resource wakes are not shed: that is how Housekeeper still runs.
+  hostHot: () => {
+    unattendedHostProbe ??= createHostProbe();
+    return webhookDispatchHot({
+      swapUsedPercent: unattendedHostProbe.swapUsedPercent(),
+      load: readHostLoad(),
+    });
+  },
   canStart: (botId, threadId, runOn) => {
     const bot = store.bot(botId);
     const task = bot && threadId ? store.taskByThread(bot.id, threadId) : undefined;
