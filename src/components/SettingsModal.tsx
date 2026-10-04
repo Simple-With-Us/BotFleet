@@ -628,6 +628,7 @@ function UpdateNotificationsRow() {
 function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
+  const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };
   const [saving, setSaving] = useState(false);
   const [pendingSimple, setPendingSimple] = useState(false);
   const save = async (conversationMode: ConversationMode, mergeThreads = false) => {
@@ -660,13 +661,17 @@ function ConversationModeRow() {
   };
   return (
     <Card
-      title="Workspace Layout"
-      subtitle="Simple is Grok-style: named bots with one conversation each, plus group threads.  Projects hide named bots and treat the room word as a category that any number of threads can sit under."
+      title="Workspace Arrangement"
+      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured. Simple is Grok-style with named bots, while ${labels.plural} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
+          const displayTitle = mode === "projects" ? labels.plural : copy.title;
+          const displaySubtitle = mode === "projects"
+            ? `Categories with any number of threads under them. Each thread picks a model. Named bots stay hidden.`
+            : copy.subtitle;
           return (
             <button
               key={mode}
@@ -679,8 +684,8 @@ function ConversationModeRow() {
                 selected ? "border-accent bg-accent/10" : "border-hairline/40 hover:bg-raised/60",
               )}
             >
-              <div className="text-[14px] font-medium text-ink">{copy.title}</div>
-              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{copy.subtitle}</div>
+              <div className="text-[14px] font-medium text-ink">{displayTitle}</div>
+              <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">{displaySubtitle}</div>
             </button>
           );
         })}
@@ -1361,11 +1366,11 @@ export function SettingsModal() {
                   >
                     <SkinPicker />
                   </Card>
-                  <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
-                    <ConversationModeRow />
-                  </div>
                   <div id="setting-general-terminology" className={highlightClass("setting-general-terminology")}>
                     <TerminologyRow />
+                  </div>
+                  <div id="setting-general-conversation-mode" className={highlightClass("setting-general-conversation-mode")}>
+                    <ConversationModeRow />
                   </div>
                   <Card
                     id="setting-general-room-turn-timeout"
