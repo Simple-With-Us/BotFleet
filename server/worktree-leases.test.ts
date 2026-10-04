@@ -17,19 +17,21 @@ afterAll(async () => {
 });
 
 function createTempDir(prefix: string): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const raw = mkdtempSync(join(tmpdir(), prefix));
+  const dir = realpathSync.native ? realpathSync.native(raw) : realpathSync(raw);
   scratchDirs.push(dir);
   return dir;
 }
 
 function runGit(cwd: string, ...args: string[]): string {
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
     env: {
       ...process.env,
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_CONFIG_GLOBAL: nullDevice,
+      GIT_CONFIG_SYSTEM: nullDevice,
       GIT_AUTHOR_NAME: "BotFleet Test",
       GIT_AUTHOR_EMAIL: "test@botfleet.app",
       GIT_COMMITTER_NAME: "BotFleet Test",

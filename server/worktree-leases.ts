@@ -1,11 +1,19 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { realOrResolved } from "./bot-cwd.ts";
 import { execCli } from "./procs.ts";
 import { ExactTurnLeases, type ExactTurnLease } from "./turn-safety.ts";
+
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync.native ? realpathSync.native(p) : realOrResolved(p);
+  } catch {
+    return realOrResolved(p);
+  }
+}
 
 export const WORKTREES_BASE_DIR = join(DATA_DIR, "worktrees");
 
@@ -122,7 +130,7 @@ export class WorktreeLeaseManager {
    * is not inside a Git repository.
    */
   async resolveRepoRoot(dir: string): Promise<string> {
-    const resolved = realOrResolved(dir);
+    const resolved = canonicalPath(dir);
     const result = await this.runGit(["rev-parse", "--show-toplevel"], resolved);
     if (result.code !== 0 || !result.stdout.trim()) {
       throw Object.assign(
@@ -130,7 +138,7 @@ export class WorktreeLeaseManager {
         { status: 400, code: "not_a_git_repo" },
       );
     }
-    return realOrResolved(result.stdout.trim());
+    return canonicalPath(result.stdout.trim());
   }
 
   /**
