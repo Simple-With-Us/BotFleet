@@ -30,6 +30,7 @@ import { usePageVisible } from "@/lib/page-visible";
 import {
   captureFailureIsActionable,
   decideCloudPreview,
+  FRAME_STALE_MS,
   type ScreenStreamState,
 } from "@/lib/computer-preview";
 import { CloudBackendPicker } from "./CloudBackendPicker";
@@ -416,25 +417,37 @@ export function ComputerPanel({
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
   const [screenStreamState, setScreenStreamState] = useState<ScreenStreamState>("connecting");
-  // Has THIS turn's stream actually delivered a frame?  The socket being open
-  // proves nothing: the server registers a screen poller inside `startTurn` and
-  // tears it down when the turn settles, so a stream can sit connected for a
-  // whole turn and never paint.  Gating the poll on the socket instead of on
-  // this is what left the panel on "Waiting for the first frame…" until the
-  // turn ended.  See src/lib/computer-preview.ts.
-  const [sawFrame, setSawFrame] = useState(false);
+  // Has THIS turn's stream delivered a frame, and when?  The socket being
+  // open proves nothing: the server registers a screen poller inside
+  // `startTurn` and tears it down when the turn settles, so a stream can sit
+  // connected for a whole turn and never paint.  And one delivered frame
+  // proves the stream *can* deliver, not that it still is — the server's
+  // poller swallows capture errors, so a box that goes quiet mid-turn would
+  // otherwise latch the fallback off.  Hence a timestamp, not a boolean.
+  const [lastFrameAt, setLastFrameAt] = useState(0);
+  // The clock the gate compares against.  A stream that stops delivering has
+  // to re-render once, when its last frame goes stale, or the fallback never
+  // starts.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!lastFrameAt) return;
+    const remaining = FRAME_STALE_MS - (Date.now() - lastFrameAt);
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(() => setNowMs(Date.now()), remaining + 10);
+    return () => window.clearTimeout(timer);
+  }, [lastFrameAt, nowMs]);
   const wasBusy = useRef(bot.busy);
   useEffect(() => {
     if (wasBusy.current === bot.busy) return;
     wasBusy.current = bot.busy;
     // A new turn brings its own turn-scoped poller, which has to prove itself.
-    if (bot.busy) setSawFrame(false);
+    if (bot.busy) setLastFrameAt(0);
   }, [bot.busy]);
   useEffect(() => {
     if (phase !== "ready" || panelView !== "computer" || viewerOpen || !pageVisible) return;
     setScreenStreamState("connecting");
     // A brand new stream has not demonstrated anything yet.
-    setSawFrame(false);
+    setLastFrameAt(0);
     const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
     let active = true;
     let failed = false;
@@ -455,7 +468,9 @@ export function ComputerPanel({
         const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
         if (parsed.success && parsed.data.botId === bot.id) {
           const frame = parsed.data;
-          setSawFrame(true);
+          const at = Date.now();
+          setLastFrameAt(at);
+          setNowMs(at);
           dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
         }
       } catch {
@@ -471,7 +486,8 @@ export function ComputerPanel({
     phase,
     panelView,
     botBusy: bot.busy === true,
-    sawFrame,
+    lastFrameAt,
+    nowMs,
     streamState: screenStreamState,
     viewerOpen,
     pageVisible,
@@ -584,7 +600,11 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
-  const latestPreview = screenStreamState === "failed" ? polledFrame ?? live : live ?? polledFrame;
+  // The store's `live` frame is never cleared, so whenever the gate is
+  // polling because the stream has not proven itself, `live` is a stale image
+  // from an earlier turn and must not shadow the capture that is actually
+  // keeping the preview alive.
+  const latestPreview = preview.preferPolled ? polledFrame ?? live : live ?? polledFrame;
   const cloudFrame =
     latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
