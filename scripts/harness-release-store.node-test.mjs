@@ -26,6 +26,37 @@ const A = "a".repeat(40);
 const B = "b".repeat(40);
 const C = "c".repeat(40);
 
+/**
+ * Wait until the child has told us it holds the descriptor open.
+ *
+ * A fixed delay only proves the scheduler gave the child time; it does not prove
+ * the child opened the file.  So the assertion could fail on a loaded machine
+ * and pass on a fast one, for reasons that have nothing to do with the code
+ * under test — which is worse than having no test, because it looks like a real
+ * failure.  The child writes a byte on stdout the instant the fd is open and we
+ * wait for that.
+ */
+function awaitOpenDescriptor(child, timeoutMs = 10_000) {
+  return new Promise((done) => {
+    let seen = "";
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      done(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      seen += chunk;
+      if (seen.includes("r")) finish(true);
+    });
+    child.once("error", () => finish(false));
+    child.once("close", () => finish(seen.includes("r")));
+  });
+}
+
 async function store(t) {
   const dir = await mkdtemp(join(tmpdir(), "botfleet-releases-"));
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
@@ -173,9 +204,9 @@ test("lsof tells us whether a live process still holds a tree", async (t) => {
   // lsof answers reliably: the harness holds its SQLite database and its
   // bundled modules open, which is exactly why a tree cannot be deleted while a
   // server is running from it.
-  const child = execFile("/bin/sh", ["-c", 'exec 3< "$1"; exec sleep 25', "_", join(held, "marker.txt")]);
+  const child = execFile("/bin/sh", ["-c", 'exec 3< "$1"; printf r; exec sleep 25', "_", join(held, "marker.txt")]);
   t.after(() => { child.kill("SIGKILL"); });
-  await new Promise((done) => setTimeout(done, 1200));
+  assert.equal(await awaitOpenDescriptor(child), true, "the child never signalled that it had the file open");
 
   assert.equal(await isHeld(held), true, "an open fd inside the tree must read as holding it");
   assert.equal(await isHeld(quiet), false, "an untouched tree must read as free");
@@ -193,9 +224,9 @@ test("lsof exiting non-zero while printing a match still means held", async (t) 
   }
   const { env } = await store(t);
   const inner = await stage(env, A, "x");
-  const child = execFile("/bin/sh", ["-c", 'exec 3< "$1"; cd "$(dirname "$1")"; exec sleep 20', "_", join(inner, "marker.txt")]);
+  const child = execFile("/bin/sh", ["-c", 'exec 3< "$1"; cd "$(dirname "$1")"; printf r; exec sleep 20', "_", join(inner, "marker.txt")]);
   t.after(() => { child.kill("SIGKILL"); });
-  await new Promise((done) => setTimeout(done, 1200));
+  assert.equal(await awaitOpenDescriptor(child), true, "the child never signalled that it had the file open");
 
   const parent = dirname(dirname(inner)); // the store root, one level above
   // Sanity: this really is the shape that misleads, so the case cannot rot.
@@ -291,4 +322,50 @@ test("the swap reports whether it was atomic, and is atomic where the platform a
   // Whatever the platform did, the pointer ends up on the requested release.
   assert.equal(await currentCommit(env), B);
   assert.equal(await realpath(currentLink(env)), await realpath(releasePath(B, env)));
+});
+
+test("retention ranks by when a release was promoted, not by its commit name", async (t) => {
+  // A commit SHA contains no time information.  Three releases promoted B, then
+  // A, then C: by NAME that sorts A, B, C; by TIME it is B, A, C.  Keeping the
+  // live release (C) and the most recent one of the rest means the doomed set is
+  // the OLDEST — so B goes.  A name-sorted list would have doomed A instead and
+  // kept B, leaving a rollback target that is not a rollback target.
+  const { env } = await store(t);
+  const byTime = [B, A, C]; // oldest first
+  const byName = [A, B, C].sort();
+  assert.notDeepEqual(byTime, byName, "this fixture must actually distinguish the two orderings");
+
+  const promoteAt = async (commit, when) => {
+    const path = stagingPath(commit, env);
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "marker.txt"), commit);
+    await rm(join(path, ".botfleet-release.json"), { force: true });
+    // The manifest is what carries the ordering, so write it the way promotion
+    // does and then let promoteStaging re-stamp it.
+    await writeFile(
+      join(path, ".botfleet-release.json"),
+      `${JSON.stringify({ schemaVersion: 1, commit, promotedAt: when })}\n`,
+    );
+    await rm(join(path, ".botfleet-release.json"), { force: true });
+    const real = Date.now();
+    await promoteStaging({ commit, env });
+    // Re-stamp promotedAt so the three releases are ordered deterministically
+    // instead of by whatever millisecond the test happened to run in.
+    const manifestPath = join(releasePath(commit, env), ".botfleet-release.json");
+    await rm(manifestPath, { force: true });
+    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, commit, promotedAt: when })}\n`);
+    assert.ok(real);
+  };
+
+  await promoteAt(B, "2026-10-01T00:00:00.000Z");
+  await promoteAt(A, "2026-10-02T00:00:00.000Z");
+  await promoteAt(C, "2026-10-03T00:00:00.000Z");
+  await swapCurrent({ commit: C, env });
+
+  assert.deepEqual(await listReleases(env), [B, A, C], "listing must be oldest-first by promotion");
+
+  await pruneReleases({ env, keep: 1, minAgeMs: 0, now: Date.now(), isHeldImpl: async () => false });
+  const remaining = await listReleases(env);
+  assert.deepEqual(remaining, [A, C], "the OLDEST release is the one pruned, and the live one is kept");
+  assert.ok(!remaining.includes(B), "keeping B would retain the stale release as the rollback target");
 });
