@@ -63,7 +63,7 @@ describe("VoiceSettings", () => {
     voice,
   } as unknown as Bot);
 
-  it("renders Apple Personal Voice label and Mac / iOS helper note when configured on bot", () => {
+  it("does not claim on-device synthesis when Personal Voice is off", () => {
     const html = renderToStaticMarkup(
       createElement(VoiceSettings, {
         bot: sampleBot("personal:com.apple.speech.voice.Jay"),
@@ -71,12 +71,41 @@ describe("VoiceSettings", () => {
       })
     );
 
-    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
-    expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
+    // Gate is off (requires-macos-14). Naming on-device Mac / iOS is false.
+    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay");
+    expect(html).not.toContain("On-device Mac / iOS");
+    expect(html).not.toContain("Synthesis runs on-device on your authorized Mac or iPhone");
+    expect(html).toContain("This bot uses an Apple Personal Voice.");
+    expect(html).toContain("Personal Voices need macOS 14 or later, or an iPhone");
     // In plain environment without window.ogb.personalVoice.speak, the button explains device requirement
     expect(html).toContain("title=\"Personal Voices need macOS 14 or later, or an iPhone\"");
     expect(html).toContain("aria-label=\"Personal Voices need macOS 14 or later, or an iPhone\"");
     expect(html).not.toContain("Personal Voices play on-device on a Mac or iPhone");
+  });
+
+  it("names on-device Mac / iOS only when Personal Voice can speak", () => {
+    mockPersonalVoice = true;
+    const origWindow = globalThis.window;
+    try {
+      globalThis.window = {
+        ogb: {
+          personalVoice: {
+            speak: vi.fn(),
+          } as unknown as NonNullable<Window["ogb"]>["personalVoice"],
+        } as unknown as Window["ogb"],
+      } as unknown as Window & typeof globalThis;
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: sampleBot("personal:com.apple.speech.voice.Jay"),
+          onPatch: () => {},
+        })
+      );
+      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
+      expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
+    } finally {
+      mockPersonalVoice = false;
+      globalThis.window = origWindow;
+    }
   });
 
   it("enables Try button when desktop personalVoice speak bridge is available", () => {
@@ -151,10 +180,14 @@ describe("VoiceSettings voice loading", () => {
     expect(loader).toContain("parsePersonalVoiceList(personal)");
     expect(loader).toContain("parseTtsVoicesResponse(raw)");
     expect(loader).toContain("setVoices([...personalEntries, ...apiVoices])");
+    // Listing must wait on the macOS 14 Personal Voice gate, not appleSpeech alone.
+    expect(loader).toContain("personalVoiceAllowed && window.ogb?.personalVoice?.list");
+    expect(SRC).toContain("capabilities.dictation.personalVoice === true");
+    expect(SRC).toContain("if (isPersonalVoice(next) && !personalVoiceAllowed) return;");
   });
 
   it("has the mount effect call that loader instead of fetching on its own", () => {
-    expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured\]\);/);
+    expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured, personalVoiceAllowed\]\);/);
     // A second, effect-local fetch is exactly what dropped the personal entries.
     expect(SRC.match(/api\("\/api\/tts\/voices"\)/g)).toHaveLength(1);
   });

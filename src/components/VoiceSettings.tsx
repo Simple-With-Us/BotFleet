@@ -51,12 +51,17 @@ export function VoiceSettings({
 
   const configured = Boolean(tts?.configured);
 
+  // Personal Voice is only a real choice when the desktop gate says so.
+  // Listing it on every Mac (appleSpeech) and saving it anyway is a picker
+  // that cannot speak here.
+  const personalVoiceAllowed = capabilities.dictation.personalVoice === true;
+
   // The single loader. Every refresh path (mount, key save, add, clone,
   // delete) goes through here, so the Personal Voice merge can never be
   // dropped by a refresh that only reloads the harness list.
   const loadVoices = () => {
     setLoadingVoices(true);
-    const personalVoices = window.ogb?.personalVoice?.list
+    const personalVoices = personalVoiceAllowed && window.ogb?.personalVoice?.list
       ? window.ogb.personalVoice.list().catch(() => [])
       : Promise.resolve([]);
     return Promise.all([
@@ -93,7 +98,7 @@ export function VoiceSettings({
 
   useEffect(() => {
     void loadVoices();
-  }, [configured]);
+  }, [configured, personalVoiceAllowed]);
 
   const saveKey = () => {
     const nextKey = key.trim();
@@ -429,7 +434,14 @@ export function VoiceSettings({
         <div className="flex gap-2">
           <select
             value={selectedVoice}
-            onChange={(e) => onPatch({ voice: e.target.value })}
+            onChange={(e) => {
+              const next = e.target.value;
+              // Refuse to save a Personal Voice when this computer cannot
+              // speak one. The list itself is already gated; this is the
+              // belt for a stale option or a race before capabilities arrive.
+              if (isPersonalVoice(next) && !personalVoiceAllowed) return;
+              onPatch({ voice: next });
+            }}
             aria-label={`${bot.name}'s voice`}
             className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
           >
@@ -441,7 +453,9 @@ export function VoiceSettings({
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
               <option value={selectedVoice}>
                 {isSelectedPersonal
-                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
+                  ? personalVoiceAllowed
+                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
+                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
                   : `${selectedVoice} (Current)`}
               </option>
             )}
@@ -464,7 +478,10 @@ export function VoiceSettings({
         </div>
         {isSelectedPersonal && (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            This bot uses an Apple Personal Voice.{"\u00A0 "}Synthesis runs on-device on your authorized Mac or iPhone.
+            This bot uses an Apple Personal Voice.
+            {canSpeakPersonal
+              ? <>{"\u00A0 "}Synthesis runs on-device on your authorized Mac or iPhone.</>
+              : <>{"\u00A0 "}{personalVoiceDisabledReason}.</>}
           </div>
         )}
       </div>
