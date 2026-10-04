@@ -16,11 +16,26 @@
 set -euo pipefail
 
 ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
+# `current` is a symlink into ~/.botfleet/releases/<commit>.  Resolve it once,
+# physically, so every later path is the real directory: `cd -P` means the
+# server's own working directory is the release rather than the pointer, which
+# matters because the updater's dependency fingerprint and bundle identity checks
+# both refuse a symlinked root, and because two processes that disagree about
+# which path they are in cannot be compared.
+if [ -d "$ROOT" ]; then
+  ROOT="$(cd -P "$ROOT" && pwd)"
+fi
 PORT="${BOTFLEET_PORT:-8799}"
 NODE="${BOTFLEET_NODE:-/opt/homebrew/bin/node}"
 PNPM="${BOTFLEET_PNPM:-pnpm}"
 HEAL_MINUTES="${BOTFLEET_HEAL_MINUTES:-15}"
-STAMP="${BOTFLEET_HEAL_STAMP:-$ROOT/.botfleet-heal-stamp}"
+# The heal stamp records "a self-heal was tried recently", so it is MUTABLE state
+# and cannot live inside a release directory: a release is read-only by
+# construction, and writing there fails on exactly the path that exists to report
+# a problem.  One stamp per machine rather than per root, because there is one
+# harness and a shared budget is the honest thing: a heal that is too recent for
+# one root is too recent for the other too.
+STAMP="${BOTFLEET_HEAL_STAMP:-$HOME/Library/Caches/BotFleet/server-start-heal-stamp}"
 LOG_FILE="${BOTFLEET_SERVER_LOG:-$HOME/Library/Logs/botfleet/server.log}"
 LOG_MAX_BYTES=$((20 * 1024 * 1024))
 PREFIX="[botfleet-server-start]"
@@ -139,7 +154,31 @@ looks_like_missing_module() {
   return 1
 }
 
+# Is $ROOT a promoted, immutable release?
+#
+# This is the whole reason self-heal needs a mode.  In a mutable checkout,
+# reinstalling dependencies in place is the correct repair: it fixes a
+# half-deleted node_modules and gets the harness back up in a minute.  In a
+# release directory it is the WRONG repair and a destructive one: the release is
+# supposed to be byte-identical to the commit it names, reinstalling mutates it
+# into something that is no longer the thing the updater verified, and it
+# cannot work at all if the directory is read-only.  The right action there is to
+# build a NEW release and swap the pointer, which is the updater's job, not this
+# script's.
+is_immutable_release() {
+  [ -f "$ROOT/.botfleet-release.json" ]
+}
+
 run_install_once() {
+  if is_immutable_release; then
+    # Not a failure to work around: a release with missing dependencies was
+    # already broken when it was promoted, and the repair belongs to the updater
+    # that promoted it.  Say so, and say what to run.
+    log_err "$ROOT is an immutable release (commit $(manifest_commit)), so its dependency tree is not repaired in place."
+    log_err "Repairing it here would mutate a verified release into something it was never checked as, and it is read-only anyway."
+    log_err "Build a new release instead:  ~/apps/update-botfleet.sh prepare && ~/apps/update-botfleet.sh apply --stage <stage>"
+    return 1
+  fi
   if stamp_recent; then
     log_err "dependency self-heal already attempted within ${HEAL_MINUTES}m (stamp: $STAMP)"
     log_err "manual fix: cd $ROOT && $PNPM install --frozen-lockfile"
@@ -152,6 +191,13 @@ run_install_once() {
   record_heal_attempt
   log "missing dependencies detected; running $PNPM install --frozen-lockfile in $ROOT"
   (cd "$ROOT" && "$PNPM" install --frozen-lockfile)
+}
+
+# The commit a release names, for the message above.  Best effort: this only ever
+# feeds a log line, and failing to read it must not change the exit behaviour.
+manifest_commit() {
+  /usr/bin/sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([a-f0-9]*\)".*/\1/p' \
+    "$ROOT/.botfleet-release.json" 2>/dev/null | /usr/bin/head -n 1
 }
 
 preflight() {
