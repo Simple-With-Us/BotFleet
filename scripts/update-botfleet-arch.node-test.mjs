@@ -51,3 +51,28 @@ test("the archive list names files that exist", async () => {
   }
   assert.ok(archived.size > 0);
 });
+
+test("the stage-entry allowlist has exactly one definition, and the server uses it", async () => {
+  // Two copies of this list existed: one in update-botfleet-mac.mjs and one in
+  // server/update-control.ts, each with a comment claiming parity with the
+  // other.  They drifted, and only the server's copy decides what the harness
+  // prunes, so every stage the default `ci` policy produced was kept forever
+  // with a full extra copy of the app and a multi-gigabyte dependency tree.
+  const updater = await readFile(join(root, "scripts/update-botfleet-mac.mjs"), "utf8");
+  const server = await readFile(join(root, "server/update-control.ts"), "utf8");
+
+  assert.doesNotMatch(updater, /const KNOWN_STAGE_ENTRIES = new Set/, "the updater must not redeclare the allowlist");
+  assert.doesNotMatch(server, /const KNOWN_STAGE_ENTRIES = new Set/, "the server must not redeclare the allowlist");
+  assert.doesNotMatch(server, /PROTECTED_STAGE_ENTRIES = new Set/);
+  assert.match(updater, /from "\.\/stage-entries\.mjs"/);
+  assert.match(server, /from "\.\.\/scripts\/stage-entries\.mjs"/);
+
+  // A `hosted` stage is the one the ci policy produces on every update, so if
+  // it is ever dropped from the shared list the leak returns silently.
+  const { KNOWN_STAGE_ENTRIES, stageIsPrunable } = await import("./stage-entries.mjs");
+  assert.ok(KNOWN_STAGE_ENTRIES.includes("hosted"), "a CI-built stage must be sweepable");
+  assert.equal(stageIsPrunable(["hosted", "node_modules", "source"]), true);
+  assert.equal(stageIsPrunable(["prepared.json", "hosted"]), false, "a reusable stage is load-bearing");
+  assert.equal(stageIsPrunable(["rollback", "hosted"]), false, "the rollback bundle is load-bearing");
+  assert.equal(stageIsPrunable(["hosted", "someones-notes.txt"]), false, "a person's file is not ours to delete");
+});

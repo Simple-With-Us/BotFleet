@@ -32,6 +32,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+// One definition, shared with the updater's own sweeper.  Two copies of this
+// allowlist existed and drifted, and the drift was a multi-gigabyte disk leak
+// rather than a cosmetic bug — see scripts/stage-entries.mjs.
+import { stageIsPrunable } from "../scripts/stage-entries.mjs";
 import { fileURLToPath } from "node:url";
 
 export const UPDATE_PROGRESS_SCHEMA_VERSION = 1;
@@ -75,19 +79,7 @@ const KEPT_RUN_ARTIFACTS = 8;
 /** What the updater itself puts in a stage directory — the same list
  * `scripts/update-botfleet-mac.mjs` sweeps by.  Anything else in there was
  * put there by a person, and a person decides when it goes. */
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app",
-  "node_modules",
-  "prepared.json",
-  "rollback",
-  "source",
-  "pending-recovery.json",
-  "credential-migration.json",
-]);
-/** A stage holding either of these is load-bearing: `prepared.json` is a
- * build a later `apply` can still install, and `rollback` holds the verified
- * bundle the installed app would be rolled back to. */
-const PROTECTED_STAGE_ENTRIES = new Set(["prepared.json", "rollback"]);
+
 
 export interface UpdateCommit {
   sha: string;
@@ -546,8 +538,7 @@ export function stagesToPrune(entries: StageDirectoryEntry[], options: {
   const protect = options.protect ?? [];
   const prunable = entries.filter((entry) => {
     if (protect.includes(entry.path)) return false;
-    if (entry.names.some((name) => PROTECTED_STAGE_ENTRIES.has(name))) return false;
-    return entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name));
+    return stageIsPrunable(entry.names);
   });
   return [...prunable]
     .sort((left, right) => right.stamp - left.stamp)
