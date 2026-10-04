@@ -27,6 +27,7 @@ import {
   loadPrepared,
   main,
   parseArguments,
+  parseHealthBody,
   pendingRecoveryReceiptPath,
   quiesceBootoutLabels,
   rollbackHarnessBootoutLabels,
@@ -1968,4 +1969,16 @@ test("a probe-reported cause wins over the busy-host default", async () => {
     /owner record naming a different process/,
   );
   assert.equal(calls, 1, "a real defect must not be retried as a slow host");
+});
+
+test("only a well-formed health body establishes readiness", () => {
+  // `body?.ready !== false` accepts every one of these, because each is "not
+  // false" — including a truncated body, an HTML error page, and a bare `{}`.
+  // Any of them would have declared a candidate ready.
+  assert.equal(parseHealthBody({ app: "botfleet", ready: true }), true);
+  assert.equal(parseHealthBody({ app: "botfleet", ready: false }), false);
+  for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
+    { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
+    assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
 });

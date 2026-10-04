@@ -981,6 +981,27 @@ export function smokeTestEnabled(env = process.env) {
  * still alive with no readiness and no exit is the busy case by elimination,
  * so the default has to be the busy case rather than an unlabelled unknown.
  */
+/**
+ * Decide readiness from an untrusted response body, strictly.
+ *
+ * `body?.ready !== false` treats a truncated body, an HTML error page, and a
+ * bare `{}` as ready, because every one of them is "not false".  This is a
+ * hand-written shape check rather than zod for a structural reason: the updater
+ * bootstraps itself by archiving a five-file graph into a temp directory with no
+ * node_modules beside it, so it cannot import a third-party validator at all.
+ * Every other module in that graph imports nothing but node: builtins.  The rule
+ * being satisfied is "never read a field off an untrusted response without
+ * checking its shape" — adding zod here would break updater bootstrap on every
+ * Mac, which is a far worse failure than a longer predicate.
+ */
+export function parseHealthBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  // The health contract is an object with an explicit boolean `ready` and an app
+  // name.  Anything else is not a health response we recognise.
+  if (typeof body.ready !== "boolean" || typeof body.app !== "string") return false;
+  return body.ready;
+}
+
 export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
   if (spawnError) return "spawn-failed";
   if (spawnTimedOut) return "sqlite-probe-timed-out";
@@ -1059,7 +1080,7 @@ function runBounded(command, args, { cwd, env, timeoutMs }) {
  * depending on the store's own file lifecycle: a lazy database is not a broken
  * one, and this gate must never fail a healthy build for being lazy.
  */
-async function smokeNativeSqlite({ serverDirectory, nodeBin, runImpl = runBounded }) {
+async function smokeNativeSqlite({ serverDirectory, nodeBin, nodeEnv, runImpl = runBounded }) {
   const script = [
     'import { DatabaseSync } from "node:sqlite";',
     'const db = new DatabaseSync(":memory:");',
@@ -1073,7 +1094,11 @@ async function smokeNativeSqlite({ serverDirectory, nodeBin, runImpl = runBounde
   const probePath = join(serverDirectory, `smoke-sqlite-${process.pid}-${randomUUID()}.mjs`);
   await writeFile(probePath, `${script}\n`, { mode: 0o600 });
   try {
-    const result = await runImpl(nodeBin, [probePath], { cwd: serverDirectory, timeoutMs: SMOKE_SQLITE_TIMEOUT_MS });
+    const result = await runImpl(nodeBin, [probePath], {
+      cwd: serverDirectory,
+      env: nodeEnv,
+      timeoutMs: SMOKE_SQLITE_TIMEOUT_MS,
+    });
     if (result.timedOut) return { ok: false, timedOut: true, detail: "probe exceeded its time budget" };
     if (result.spawnError) return { ok: false, timedOut: false, detail: `probe could not start: ${result.spawnError.message}` };
     if (result.stdout.includes("sqlite-ok")) return { ok: true, timedOut: false, detail: null };
@@ -1171,16 +1196,30 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
     throw new Error(`Could not reserve a loopback port for the staged smoke test (got ${port})`);
   }
 
-  const child = spawn(process.execPath, [join(staging, "index.js")], {
+  // Run the candidate on the runtime that will actually serve it: the packaged
+  // Electron binary under ELECTRON_RUN_AS_NODE=1, which is exactly how the
+  // harness launches it (server/index.ts's AGENTS_NODE_FLAG) and why
+  // electron-builder.yml keeps the runAsNode fuse on.  Using the updater's own
+  // Node would test a different runtime than the one under test — the
+  // Homebrew/nvm Node could have node:sqlite while Electron's bundled Node does
+  // not, or the reverse, and the probe would be answering a question nobody
+  // asked.  Dropping the flag would launch GUI Electron instead of the server.
+  const packagedBinary = join(bundlePath, "Contents/MacOS/BotFleet");
+  if (!(await exists(packagedBinary))) {
+    throw new Error(`Staged BotFleet candidate has no packaged executable: ${packagedBinary}`);
+  }
+  const child = spawn(packagedBinary, [join(staging, "index.js")], {
     cwd: staging,
     env: {
       PATH: process.env.PATH,
       HOME: home,
+      ELECTRON_RUN_AS_NODE: "1",
       OMB_PORT: String(port),
-      // A loopback DSN exercises SDK loading without contacting the owner's
-      // Sentry project; the probe must never emit a test event.
-      SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",
-      SENTRY_TRACES_SAMPLE_RATE: "0",
+      // No Sentry configuration at all, deliberately.  This child environment is
+      // built from scratch rather than inherited, so omitting the variable is
+      // what guarantees the probe cannot reach a real project.  A hard-coded
+      // loopback DSN would still be a DSN in source, and still one edit away
+      // from a real one.
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -1204,7 +1243,7 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
         const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
           signal: AbortSignal.timeout(SMOKE_HEALTH_REQUEST_TIMEOUT_MS),
         });
-        if (response.ok && (await response.json().catch(() => null))?.ready !== false) {
+        if (response.ok && parseHealthBody(await response.json().catch(() => null))) {
           ready = true;
           break;
         }
@@ -1232,7 +1271,11 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
         signal: child.signalCode,
       };
     }
-    const sqlite = await smokeNativeSqlite({ serverDirectory: staging, nodeBin: process.execPath });
+    const sqlite = await smokeNativeSqlite({
+      serverDirectory: staging,
+      nodeBin: packagedBinary,
+      nodeEnv: { ELECTRON_RUN_AS_NODE: "1" },
+    });
     return { ready: true, output, sqlite };
   } finally {
     child.kill("SIGKILL");
@@ -1316,7 +1359,14 @@ async function processTxtPaths(pid) {
  * into "it worked, just slowly".
  */
 function isRecoverableResolutionFailure(error) {
-  return error instanceof ResolutionError && error.cause === "no-build";
+  // "no-build" is the case `auto` exists for: the commit predates the workflow,
+  // or its build never ran.  "build-failed" belongs with it — a run that
+  // exists but did not succeed is equally not something a retry can fix, and
+  // it is the expected outcome whenever this workflow cancels a superseded
+  // build.  Everything else (network, rate limit, checksum, bad manifest) must
+  // still surface, because a silent local package would turn a broken pipeline
+  // or a tampered artifact into "it worked, just slowly".
+  return error instanceof ResolutionError && ["no-build", "build-failed"].includes(error.cause);
 }
 
 export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
@@ -2017,7 +2067,7 @@ function createOperations(config) {
           // `ci` must fail loudly: silently falling back to a 15-minute local
           // build would make the ruling a suggestion and hide a broken pipeline.
           if (policy === "ci" || !isRecoverableResolutionFailure(error)) throw error;
-          console.error(`Hosted build unavailable, packaging on this Mac instead: ${error.message}`);
+          console.error(`No usable hosted build, so packaging on this Mac instead: ${error.message}`);
         }
       }
       const identities = await output("security", ["find-identity", "-v", "-p", "codesigning"]);

@@ -25,9 +25,17 @@ false verdict:
 
 | Property | How | Failure cause |
 |---|---|---|
-| It boots with no `node_modules` in reach | Copies `Contents/Resources/server` out of the bundle and runs it on a reserved loopback port with a throwaway `HOME` | `server-exited`, `server-never-ready` |
-| It finishes booting, not just binds a port | Waits for `/api/health` with `ready !== false`, then requires `~/.botfleet/harness-owner.json` to name the probe's own pid | `server-never-ready` |
+| It boots with no `node_modules` in reach | Copies `Contents/Resources/server` out of the bundle and runs it on the **packaged Electron binary** with a reserved loopback port and a throwaway `HOME` | `server-exited`, `server-never-ready` |
+| It finishes booting, not just binds a port | Waits for `/api/health` and requires a **validated** body (a boolean `ready` and a string `app`), then requires `~/.botfleet/harness-owner.json` to name the probe's own pid | `server-never-ready` |
 | Its native SQLite binding loads | Opens and round-trips a row through `DatabaseSync` from `node:sqlite` on `:memory:` | `sqlite-unavailable`, `sqlite-probe-timed-out` |
+
+The probe runs the candidate on the runtime that will actually serve it: the
+packaged Electron binary under `ELECTRON_RUN_AS_NODE=1`, which is exactly how the
+harness launches it (`server/index.ts`'s `AGENTS_NODE_FLAG`) and why
+`electron-builder.yml` keeps the `runAsNode` fuse on.  Testing with the updater's
+own Node would answer a question nobody asked — the Homebrew or nvm Node could
+have `node:sqlite` while Electron's bundled Node does not, or the reverse, so the
+probe could fail a healthy build or pass a broken one.
 
 The store opens its database through `node:sqlite` (`server/message-db.ts`), a
 native binding that must load before the harness can run at all — the same
@@ -61,8 +69,9 @@ The probe never touches live state:
   `harness-owner.json` is read or overwritten;
 - a port reserved by the OS on `127.0.0.1:0`, asserted not to be one of
   `DEFAULT_PORTS`, so it can never collide with the running harness;
-- a loopback `SENTRY_DSN`, so SDK loading is exercised without emitting an event
-  to the owner's Sentry project;
+- no Sentry configuration at all: the child environment is built from scratch
+  rather than inherited, so omitting the variable is what guarantees the probe
+  cannot reach a real project;
 - scratch under the system temp dir, deliberately **not** under
   `BOTFLEET_UPDATE_ROOT`, whose entries are scanned for abandoned stages and
   rollback generations.
@@ -96,8 +105,10 @@ if (!result.ready || !result.sqlite?.ok) process.exit(1);
 ```
 
 Observed on this Mac, 2026-10-04, against the installed `d9e646ffc292` bundle:
-`ready: true`, `sqliteOk: true`, 17.2s wall clock, with the live harness on
-`:8799` still answering `ready: true` and no scratch left behind.
+`ready: true`, `sqliteOk: true`, 17.6s on a quiet machine and 51.4s while four
+other seats were compiling — which is the reason the boot budget is 180s rather
+than something tighter.  The live harness on `:8799` stayed `ready: true`
+throughout, with no scratch left behind and no stray processes.
 
 ## Bypass
 
