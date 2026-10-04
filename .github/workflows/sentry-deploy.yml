@@ -15,7 +15,7 @@ name: Sentry Deploy
 # runs on `workflow_run` after CI on `main`, so
 # `github.event.workflow_run.head_branch` is just "main" -- the originating
 # branch has to be recovered via the GitHub API).  Pattern and rationale:
-# jaywedgeworth22/Usage-Monitor docs/rollouts/2026-09-24-deploy-seat-tagging.md
+# Simple-With-Us/Usage-Monitor docs/rollouts/2026-09-24-deploy-seat-tagging.md
 # (also implemented there in .github/workflows/sentry-deploy.yml, PR #1536).
 #
 # Soft-fail: sentry-cli errors warn and exit 0 so this never blocks merges.

@@ -6,7 +6,7 @@
   "homepage": "https://botfleet.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jaywedgeworth22/BotFleet.git"
+    "url": "https://github.com/Simple-With-Us/BotFleet.git"
   },
   "author": {
     "name": "Jay Wedgeworth"
@@ -96,7 +96,7 @@
     "@sentry/react": "^10.73.0",
     "@trycua/cua-driver": "0.20.0",
     "clsx": "^2.1.1",
-    "clutch": "github:jaywedgeworth22/Clutch#7fbd88d89625402a8b47631dd207045482236837",
+    "clutch": "github:Simple-With-Us/Clutch#7fbd88d89625402a8b47631dd207045482236837",
     "lucide-react": "^0.539.0",
     "mermaid": "^12.0.0",
     "posthog-js": "^1.415.6",

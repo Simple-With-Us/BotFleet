@@ -532,7 +532,7 @@ export function buildFallbackIssueUrl(
   const points = Array.from(wellFormedTitle);
   const safeTitle = (points.length > 80 ? points.slice(0, 80).join("") + "…" : points.join(""));
   const encodedTitle = encodeURIComponent(safeTitle);
-  const base = `https://github.com/jaywedgeworth22/BotFleet/issues/new?title=${encodedTitle}&body=`;
+  const base = `https://github.com/Simple-With-Us/BotFleet/issues/new?title=${encodedTitle}&body=`;
   const budget = maxTotalLength - base.length - ISSUE_LABEL_SUFFIX.length;
   if (budget <= 0) return base + ISSUE_LABEL_SUFFIX;
 

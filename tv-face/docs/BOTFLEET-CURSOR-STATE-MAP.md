@@ -49,4 +49,4 @@ BotFleet ships 39 named states (`CursorAvatar.tsx` / `stateForBot`).  Custom ava
 - `stills/*.png` static fallback
 
 ## Download
-https://github.com/jaywedgeworth22/botfleet-tv-face/releases/tag/tv-face-v3
+https://github.com/Simple-With-Us/botfleet-tv-face/releases/tag/tv-face-v3

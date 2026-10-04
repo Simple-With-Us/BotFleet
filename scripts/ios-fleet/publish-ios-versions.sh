@@ -67,7 +67,7 @@ done
 [[ -n "$MARKETING" ]] || usage
 
 MANIFEST_REL="site/ios-versions.json"
-AFC_REPO="jaywedgeworth22/ai-fleet-coordinator"
+AFC_REPO="Simple-With-Us/ai-fleet-coordinator"
 DEFAULT_BRANCH="main"
 
 resolve_afc_root() {

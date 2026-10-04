@@ -1,6 +1,6 @@
 # DeepSeek Harness Review: Updates Since The Local Pin And What To Adopt In BotFleet Or Clutch
 
-Date: Wed, Sep 30, 2026 (Central Time).  Seat: Claude.  Board row 2e320207.  Trees: deepseek-ai/deepseek-harness main = dsh-v0.2.0-rc.2 (639ed015, MIT); local and Harness pin dsh 0.1.5-rc.2; jaywedgeworth22/Harness main 93bbbfd (to be renamed Clutch); BotFleet origin/main 75568a850 plus the merged Sep 30 docs PR #752.  Read-only.  Companion to docs/audits/2026-09-30-cherry-studio-and-upstream-openmausbot-review.md.
+Date: Wed, Sep 30, 2026 (Central Time).  Seat: Claude.  Board row 2e320207.  Trees: deepseek-ai/deepseek-harness main = dsh-v0.2.0-rc.2 (639ed015, MIT); local and Harness pin dsh 0.1.5-rc.2; Simple-With-Us/Harness main 93bbbfd (to be renamed Clutch); BotFleet origin/main 75568a850 plus the merged Sep 30 docs PR #752.  Read-only.  Companion to docs/audits/2026-09-30-cherry-studio-and-upstream-openmausbot-review.md.
 
 ## Scope And Method
 
@@ -88,7 +88,7 @@ What changed that matters:
 
 ## Recommended Handful For BotFleet
 
-Ordered by value for cost.  Driver-shape changes follow the AGENTS.md rule: edit `jaywedgeworth22/Harness` (`harness/dsh/acp`) first, then bump the git pin.
+Ordered by value for cost.  Driver-shape changes follow the AGENTS.md rule: edit `Simple-With-Us/Harness` (`harness/dsh/acp`) first, then bump the git pin.
 
 1. **Bash tool: kill the process tree on timeout and keep the partial output** (TS-8, with the 4 MiB maxBuffer gap from TS-7)
    - What: run `bash` through `spawnCli` with a timer and `killCliTree` instead of `execFile`; on timeout return the captured stdout and stderr with timed-out, signal and exit code reported separately; cap output with head, marker and tail instead of failing past 4 MiB.
@@ -424,7 +424,7 @@ Notes on the new feature rows, from the verifiers:
 - **Harness NOTICE:** it already records the derivation, but says upstream is "Licensed under the terms published by the upstream project" and that nothing is vendored.  Name MIT and add the copyright line now, and update the vendored-source note the first time any upstream file is copied.
 - **BotFleet NOTICE:** add a DSH entry in the same PR as the first copied text or code (likely candidates: the Seatbelt profile builder, the SSRF-pinned fetch transport and its tests, the conformance fixtures, the auto-review policy wording, the compaction prompt).
 - **Third-party pieces:** recognizer weights (SenseVoice, Silero VAD), sherpa-onnx, Playwright MCP and ripgrep carry their own licenses; check them before bundling.  DeepSeek brand assets must never be copied (BRAND_GUIDELINES.md).
-- **Engine shape rule:** per AGENTS.md, the DSH engine shape (catalog, version gate, error classifier, model-id round trip, credentials, MCP overlay) lives in jaywedgeworth22/Harness and is imported as `harness/dsh/acp`.  Items that touch it (I1, I12, I35, I41, X7, X11, X13, U1, U5, U8) are edited in Harness first, then BotFleet bumps the git dependency.  Never edit that shape in `server/drivers/acp/dsh.ts`.
+- **Engine shape rule:** per AGENTS.md, the DSH engine shape (catalog, version gate, error classifier, model-id round trip, credentials, MCP overlay) lives in Simple-With-Us/Harness and is imported as `harness/dsh/acp`.  Items that touch it (I1, I12, I35, I41, X7, X11, X13, U1, U5, U8) are edited in Harness first, then BotFleet bumps the git dependency.  Never edit that shape in `server/drivers/acp/dsh.ts`.
 - **No upstream contact:** do not file issues or PRs against deepseek-ai/deepseek-harness without per-case owner approval (Harness ADR 0003).
 
 ## Keeping Up

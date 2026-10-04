@@ -1,12 +1,12 @@
 ---
 name: windows-release
-description: Build, verify, and publish the Windows desktop build (NSIS installer + latest.yml) to the jaywedgeworth22/BotFleet repo. Use when cutting a release, shipping a new version to Windows users, or when a Windows user reports they are stuck on an old version. Windows only — does not cover the macOS dmg/notarization flow.
+description: Build, verify, and publish the Windows desktop build (NSIS installer + latest.yml) to the Simple-With-Us/BotFleet repo. Use when cutting a release, shipping a new version to Windows users, or when a Windows user reports they are stuck on an old version. Windows only — does not cover the macOS dmg/notarization flow.
 ---
 
 # Windows release
 
 Ships `BotFleet-<version>-setup.exe` and its update feed to
-[jaywedgeworth22/BotFleet](https://github.com/jaywedgeworth22/BotFleet),
+[Simple-With-Us/BotFleet](https://github.com/Simple-With-Us/BotFleet),
 the only publish target (see `electron-builder.yml` `publish`).
 
 **Scope: Windows only.** The macOS build is a separate flow (dmg + notarytool +
@@ -60,7 +60,7 @@ Get-Content release\win-unpacked\resources\app-update.yml  # feed config
 - Missing `server/index.js` → `utilityProcess.fork` fails → the 🐭 "Couldn't start
   the bot server" page.
 - Missing `ui/index.html` → server has nothing to serve → black window.
-- `app-update.yml` must carry `owner: jaywedgeworth22` / `repo: BotFleet` and, while the
+- `app-update.yml` must carry `owner: Simple-With-Us` / `repo: BotFleet` and, while the
   build is unsigned, **must not contain `publisherName`** — electron-updater would
   reject every update as untrusted.
 
@@ -81,7 +81,7 @@ carries both platforms.
 
 ```powershell
 Copy-Item release/BotFleet-<version>-setup.exe release/BotFleet-setup.exe
-gh release upload v<version> --repo jaywedgeworth22/BotFleet `
+gh release upload v<version> --repo Simple-With-Us/BotFleet `
   release/BotFleet-<version>-setup.exe `
   release/BotFleet-setup.exe `
   release/BotFleet-<version>-setup.exe.blockmap `

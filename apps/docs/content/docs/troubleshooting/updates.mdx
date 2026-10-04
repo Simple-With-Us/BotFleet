@@ -4,13 +4,13 @@ description: Recover from a stuck download or restart and understand supported u
 icon: RefreshCw
 ---
 
-Automatic updates are designed for macOS and Windows; Ubuntu packages are updated by installing a newly downloaded package.  Today the [current release](https://github.com/jaywedgeworth22/BotFleet/releases/latest) carries macOS installers but not the `latest-mac.yml` feed the updater reads, so **Check for updates** cannot find anything yet.  Until a release ships with its feed files, install newer builds by downloading them.
+Automatic updates are designed for macOS and Windows; Ubuntu packages are updated by installing a newly downloaded package.  Today the [current release](https://github.com/Simple-With-Us/BotFleet/releases/latest) carries macOS installers but not the `latest-mac.yml` feed the updater reads, so **Check for updates** cannot find anything yet.  Until a release ships with its feed files, install newer builds by downloading them.
 
 On a Mac that runs the harness from its own checkout there is a second path that does not need a published release at all: the app and the paired phone can ask the harness whether `~/apps/botfleet-server` is behind `origin/main`, and start the transactional updater from the Updates card.  See [Updating a self-hosted Mac](/docs/self-hosting/updating-this-mac).
 
 ## The download keeps spinning
 
-Leave the app open long enough for one complete attempt, then quit and reopen it.  A failed differential update should fall back to the full package.  If the same release remains stuck, download the current installer from the [official releases repository](https://github.com/jaywedgeworth22/BotFleet/releases/latest) and install it over the existing copy.
+Leave the app open long enough for one complete attempt, then quit and reopen it.  A failed differential update should fall back to the full package.  If the same release remains stuck, download the current installer from the [official releases repository](https://github.com/Simple-With-Us/BotFleet/releases/latest) and install it over the existing copy.
 
 ## Restart to update does nothing
 
@@ -21,5 +21,5 @@ Quit BotFleet completely and launch it again. If the version did not change, ins
 Open **App settings** and check the displayed version. A commit merged to `main` is not in the desktop app until a release workflow publishes a new version.
 
 <Callout type="warn" title="Use official artifacts">
-  Do not install update files forwarded through chat or uploaded to an unrelated repository.  Use the [BotFleet Releases page](https://github.com/jaywedgeworth22/BotFleet/releases) and its checksums.
+  Do not install update files forwarded through chat or uploaded to an unrelated repository.  Use the [BotFleet Releases page](https://github.com/Simple-With-Us/BotFleet/releases) and its checksums.
 </Callout>

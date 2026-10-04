@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Semi-automated feature-status sync.  Refreshes each feature's PR state
 // (open/merged/closed) in features.json from the GitHub API, and reports
-// merged PRs in jaywedgeworth22/BotFleet that no feature card cites yet —
+// merged PRs in Simple-With-Us/BotFleet that no feature card cites yet —
 // candidates for a new card.  Every BotFleet add-on stays in testing.
 // It never moves a feature between sections; that stays a human/agent judgment call.
 //
@@ -15,7 +15,7 @@ const path = new URL("./features.json", import.meta.url);
 const data = JSON.parse(readFileSync(path, "utf8"));
 
 const prs = JSON.parse(
-  execFileSync("gh", ["api", "repos/jaywedgeworth22/BotFleet/pulls?state=all&per_page=100"], { encoding: "utf8" })
+  execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100"], { encoding: "utf8" })
 );
 const stateOf = new Map(prs.map((p) => [p.number, p.merged_at ? "merged" : p.state]));
 

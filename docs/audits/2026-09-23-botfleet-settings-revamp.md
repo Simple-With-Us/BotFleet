@@ -1,6 +1,6 @@
 # BotFleet Settings — Engines + Usage Revamp
 
-Review date: September 23, 2026, Central Time.  Source baseline: [`e3923319`](https://github.com/jaywedgeworth22/BotFleet/commit/e3923319) (origin/main, the same `e3923319` the always-on harness checkout tracks).  Worktree: `~/apps/botfleet-mm-usage-engines` on branch `minimax/usage-engines-revamp`.  Companion worktrees for `companion/` (#525), the bundle rename, the TTS migration, computer-use, and MiniMax media are untouched.  Parent effort board: filed under `usage-engine-settings-revamp`.
+Review date: September 23, 2026, Central Time.  Source baseline: [`e3923319`](https://github.com/Simple-With-Us/BotFleet/commit/e3923319) (origin/main, the same `e3923319` the always-on harness checkout tracks).  Worktree: `~/apps/botfleet-mm-usage-engines` on branch `minimax/usage-engines-revamp`.  Companion worktrees for `companion/` (#525), the bundle rename, the TTS migration, computer-use, and MiniMax media are untouched.  Parent effort board: filed under `usage-engine-settings-revamp`.
 
 ## Context
 
