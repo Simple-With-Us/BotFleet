@@ -1,11 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
+import { z } from 'zod';
 
 // Personal Voice denial after Add Voice ID submits a personal: identifier.
 // The card is the real VoiceSettings component via
 // /?fixture=voice-settings-personal (see src/main.tsx). The desktop stub in
 // the fixture reports personalVoice false with requires-macos-14. There is
 // no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
-const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02 } as const;
+const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02, threshold: 0.2 } as const;
 
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
@@ -35,7 +36,27 @@ test('visual: Personal Voice denial after a personal: voice id is submitted', as
     const url = route.request().url();
     const method = route.request().method();
     if (url.includes('/api/tts/custom-voice') && method === 'POST') {
-      const body = route.request().postDataJSON() as { voiceId?: string; label?: string };
+      // Same boundary as POST /api/tts/custom-voice: reject a body that is
+      // not the voiceId/label object instead of trusting a cast.
+      let raw: unknown;
+      try {
+        raw = route.request().postDataJSON();
+      } catch {
+        await route.fulfill({ status: 400, contentType: 'application/json', body: '{}' });
+        return;
+      }
+      const parsedBody = z
+        .object({
+          voiceId: z.string().min(1),
+          label: z.string().optional(),
+        })
+        .strict()
+        .safeParse(raw);
+      if (!parsedBody.success) {
+        await route.fulfill({ status: 400, contentType: 'application/json', body: '{}' });
+        return;
+      }
+      const body = parsedBody.data;
       await route.fulfill({
         status: 200,
         contentType: 'application/json',

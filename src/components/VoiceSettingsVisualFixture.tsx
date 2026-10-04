@@ -83,6 +83,8 @@ function VoiceCard() {
     return <div data-testid="voice-settings-board">Loading voice settings…</div>;
   }
 
+  // satisfies Bot checks the fixture against the app's Bot contract.
+  // `as Bot` would let a missing or mistyped field through.
   const bot = {
     id: "bot-visual",
     name: "Assistant",
@@ -95,7 +97,7 @@ function VoiceCard() {
     modelSelection: { instanceId: "fixture", model: "default" },
     messages: [],
     voice,
-  } as Bot;
+  } satisfies Bot;
 
   return (
     <div
