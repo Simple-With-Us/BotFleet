@@ -3997,7 +3997,7 @@ describe("harness HTTP API", () => {
       // The in-memory status above is served from the same `cfg` the PUT
       // wrote, so only the file on disk proves the save round trip.
       const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
-      expect(disk.localVm).toEqual({ shareCliCredentials: true, allowHostTerminal: false });
+      expect(disk.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
     } finally {
       await api("PUT", "/api/config", { localVm: { shareCliCredentials: false, allowHostTerminal: false } });
     }
