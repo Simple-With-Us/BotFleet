@@ -282,6 +282,10 @@ export function RoutineEditor({
   onClose: () => void;
 }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
+  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
   const [name, setName] = useState(routine?.name ?? "");
   const [prompt, setPrompt] = useState(routine?.prompt ?? "");
   const [botId, setBotId] = useState(lockedBotId ?? routine?.botId ?? bots[0]?.id ?? "");
