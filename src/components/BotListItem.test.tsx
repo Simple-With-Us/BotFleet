@@ -76,6 +76,6 @@ describe("BotListItem click and selection reliability", () => {
   });
 
   it("keys ChatView by bot.id in App.tsx for clean remounting on bot switch", () => {
-    expect(APP_SRC).toContain("<ChatView key={bot.id} bot={bot} />");
+    expect(APP_SRC).toContain("<ChatView key={bot.id} bot={bot} explicitThreadId={state.viewedThreadId || undefined} />");
   });
 });
