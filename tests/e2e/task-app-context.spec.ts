@@ -147,6 +147,14 @@ async function openBot(page: Page, expectNewButton = true, botName = 'Atlas') {
   if (expectNewButton) await expect(page.getByRole('button', { name: 'New Thread' })).toBeVisible();
 }
 
+async function waitForMobileSidebarClosed(page: Page) {
+  const sidebar = page.getByRole('complementary', { name: 'Bots and Navigation' });
+  await expect.poll(
+    () => sidebar.evaluate((element) => element.getBoundingClientRect().right <= 1),
+    { timeout: 5_000, message: 'The mobile navigation drawer should be closed.' },
+  ).toBe(true);
+}
+
 function watchBrowserErrors(page: Page) {
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -171,7 +179,7 @@ test('choosing an App saves its server snapshot and retains the folder after def
     await expect(dialog.getByText(hidden, { exact: true })).toHaveCount(0);
   }
   const chooserScreenshot = testInfo.outputPath('task-app-context-chooser.png');
-  await page.screenshot({ path: chooserScreenshot, fullPage: true });
+  await page.screenshot({ path: chooserScreenshot, fullPage: true, animations: 'disabled' });
   await testInfo.attach('task-app-context-chooser', { path: chooserScreenshot, contentType: 'image/png' });
 
   await dialog.getByRole('button', { name: /Orion App.*Folder:/ }).click();
@@ -182,7 +190,7 @@ test('choosing an App saves its server snapshot and retains the folder after def
   await expect(savedLabel).toContainText(SAVED_FOLDER);
   await expect(page.getByRole('tablist', { name: 'Threads' })).toContainText('New Thread');
   const desktopScreenshot = testInfo.outputPath('task-app-context-desktop.png');
-  await page.screenshot({ path: desktopScreenshot, fullPage: true });
+  await page.screenshot({ path: desktopScreenshot, fullPage: true, animations: 'disabled' });
   await testInfo.attach('task-app-context-desktop', { path: desktopScreenshot, contentType: 'image/png' });
 
   fixture.groups[0] = group(APP_ID, APP_NAME, [BOT_ID], { cwd: '/fixture/orion/moved' });
@@ -202,13 +210,14 @@ test('choosing an App saves its server snapshot and retains the folder after def
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(unavailable).toBeVisible();
   try {
+    await waitForMobileSidebarClosed(page);
     await expect.poll(
       () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),
       { timeout: 5_000, message: 'The document should not overflow the narrow viewport.' },
     ).toBe(true);
   } finally {
     const narrowScreenshot = testInfo.outputPath('task-app-context-narrow.png');
-    await page.screenshot({ path: narrowScreenshot, fullPage: true });
+    await page.screenshot({ path: narrowScreenshot, fullPage: true, animations: 'disabled' });
     await testInfo.attach('task-app-context-narrow', { path: narrowScreenshot, contentType: 'image/png' });
     const geometry = await page.evaluate(() => {
       const viewportWidth = window.innerWidth;
@@ -351,6 +360,7 @@ test('a long bot name and Stop control fit narrow headers', async ({ page }, tes
   for (const width of [390, 320]) {
     await page.setViewportSize({ width, height: 844 });
     try {
+      await waitForMobileSidebarClosed(page);
       await expect.poll(
         () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),
         { timeout: 5_000, message: `The document should not overflow at ${width}px.` },
@@ -365,7 +375,7 @@ test('a long bot name and Stop control fit narrow headers', async ({ page }, tes
       }
     } finally {
       const screenshot = testInfo.outputPath(`task-app-context-busy-${width}.png`);
-      await page.screenshot({ path: screenshot, fullPage: true });
+      await page.screenshot({ path: screenshot, fullPage: true, animations: 'disabled' });
       await testInfo.attach(`task-app-context-busy-${width}`, { path: screenshot, contentType: 'image/png' });
     }
   }
