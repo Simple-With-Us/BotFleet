@@ -17,7 +17,7 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 
 /** The longest prompt that may ride in argv.  ARG_MAX is megabytes on Linux
  * but the whole Windows command line is one 32KB buffer, and a prompt that
@@ -92,6 +92,27 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
       } catch {
         // Already gone, or never got a pid.  The turn is settled either way.
       }
+    };
+
+    // One probe per instance, so the snapshot reports whether the configured
+    // command actually resolves instead of a hardcoded "available" that fails
+    // only at turn time (pi.ts probes the same way at pi.ts:975).
+    let probePromise: Promise<ProviderSnapshot> | null = null;
+    const probeCommand = (): Promise<ProviderSnapshot> => {
+      if (!probePromise) {
+        probePromise = new Promise<ProviderSnapshot>((resolve) => {
+          execCli(config.command, ["--version"], { env: childEnv(), timeout: 10_000 }, (err, stdout) => {
+            if (!err) {
+              const version = stdout.trim().split("\n")[0] || null;
+              resolve({ state: "available", authenticated: true, version });
+              return;
+            }
+            const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
+            resolve({ state: "unavailable", reason: failure.message });
+          });
+        });
+      }
+      return probePromise;
     };
 
     const adapter: ProviderAdapter = {
@@ -222,11 +243,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
       models: CliWrapperDriver.models,
       adapter,
       async snapshot(): Promise<ProviderSnapshot> {
-        return {
-          state: "available",
-          authenticated: true,
-          version: null,
-        };
+        return probeCommand();
       },
       async dispose() {
         await adapter.stopAll();
