@@ -90,6 +90,7 @@ function Shell() {
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
+  const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
@@ -98,6 +99,13 @@ function Shell() {
       setSelectedAppId(group.id);
     }
   }, [group?.id]);
+
+  // When selection changes via sidebar or store, yield matrix overview to the selected chat
+  useEffect(() => {
+    if (state.selectedId) {
+      setMatrixOverviewActive(false);
+    }
+  }, [state.selectedId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -353,34 +361,44 @@ function Shell() {
         {hasApps && (
           <AppDeck
             activeAppId={selectedAppId}
+            isMatrixOverviewActive={matrixOverviewActive}
             onSelectApp={(appId) => {
-              setSelectedAppId(appId);
-              if (appId) {
+              if (appId === null) {
+                setMatrixOverviewActive(true);
+                setSelectedAppId(null);
+              } else {
+                setMatrixOverviewActive(false);
+                setSelectedAppId(appId);
                 dispatch({ type: "select", id: appId });
               }
             }}
             activeBotId={bot?.id}
             onSelectBot={(botId) => {
+              setMatrixOverviewActive(false);
               dispatch({ type: "select", id: botId });
             }}
             onSelectGroupChat={(groupId) => {
+              setMatrixOverviewActive(false);
               dispatch({ type: "select", id: groupId });
             }}
-            isGroupChatActive={Boolean(group && group.id === selectedAppId)}
+            isGroupChatActive={Boolean(!matrixOverviewActive && group && group.id === selectedAppId)}
           />
         )}
         <div className="relative min-h-0 flex-1">
-          {selectedAppId === null && hasApps && state.activeView === "chat" ? (
+          {matrixOverviewActive && hasApps && state.activeView === "chat" ? (
             <Suspense fallback={<PanelFallback />}>
               <FleetMatrixView
                 onSelectApp={(appId) => {
+                  setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
                   dispatch({ type: "select", id: appId });
                 }}
                 onSelectBot={(botId) => {
+                  setMatrixOverviewActive(false);
                   dispatch({ type: "select", id: botId });
                 }}
                 onOpenAppRoom={(appId) => {
+                  setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
                   dispatch({ type: "select", id: appId });
                 }}

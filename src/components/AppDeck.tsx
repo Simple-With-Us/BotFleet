@@ -22,6 +22,7 @@ import {
 interface AppDeckProps {
   activeAppId: string | null;
   onSelectApp: (appId: string | null) => void;
+  isMatrixOverviewActive?: boolean;
   activeBotId?: string | null;
   onSelectBot?: (botId: string) => void;
   onSelectGroupChat?: (groupId: string) => void;
@@ -31,6 +32,7 @@ interface AppDeckProps {
 export function AppDeck({
   activeAppId,
   onSelectApp,
+  isMatrixOverviewActive,
   activeBotId,
   onSelectBot,
   onSelectGroupChat,
@@ -103,7 +105,7 @@ export function AppDeck({
           aria-label={`All ${terminology.plural} Matrix Overview`}
           className={cn(
             "group flex shrink-0 items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[12px] font-medium transition-colors",
-            activeAppId === null
+            activeAppId === null && isMatrixOverviewActive
               ? "border-primary/40 bg-raised text-ink shadow-xs"
               : "border-transparent text-ink-secondary hover:bg-raised/50 hover:text-ink",
           )}
