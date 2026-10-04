@@ -207,6 +207,39 @@ describe("augmentedPath", () => {
     }
   });
 
+  posixIt2("leaves a canonical dir already ahead of the farm where it is", () => {
+    // Hoisting exists to keep the installer dirs ahead of the ~/.local/bin
+    // symlink farm — not to promote them ahead of everything else.  When a
+    // canonical dir already outranks the farm it keeps its inherited place,
+    // so no other CLI's resolution changes.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    mkdirSync(systemDir, { recursive: true });
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [installerDir, systemDir, symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      const installer = parts.indexOf(installerDir);
+      const system = parts.indexOf(systemDir);
+      const symlinks = parts.indexOf(symlinkFarm);
+      expect(installer).toBeGreaterThanOrEqual(0);
+      expect(system).toBeGreaterThanOrEqual(0);
+      expect(symlinks).toBeGreaterThanOrEqual(0);
+      // The canonical dir keeps its inherited position relative to the
+      // system dir — hoisting only closes the gap to the farm.
+      expect(installer).toBeLessThan(system);
+      expect(installer).toBeLessThan(symlinks);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {
     const previous = process.env.LOCALAPPDATA;
     const localAppData = mkdtempSync(join(tmpdir(), "omb-localappdata-"));

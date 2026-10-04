@@ -153,13 +153,18 @@ const CANONICAL_INSTALLER_DIRS = [".minimax-code", ".kimi-code"];
  * each dir appear exactly once, hoisted position winning. */
 function promoteCanonicalDirs(parts: string[]): string[] {
   const symlinkFarm = join(homedir(), ".local", "bin");
-  if (!parts.includes(symlinkFarm)) return parts;
+  const farmIndex = parts.indexOf(symlinkFarm);
+  if (farmIndex === -1) return parts;
   const out: string[] = [];
   const seen = new Set<string>();
   const hoist = (): void => {
     for (const name of CANONICAL_INSTALLER_DIRS) {
       const dir = join(homedir(), name, "bin");
-      if (parts.includes(dir) && !seen.has(dir)) {
+      // Only relocate a canonical dir the farm currently outranks.  A dir
+      // that already sits ahead of the farm keeps its position, so the
+      // move never crosses entries that outranked the farm and no other
+      // CLI's resolution changes.
+      if (!seen.has(dir) && parts.indexOf(dir) > farmIndex) {
         out.push(dir);
         seen.add(dir);
       }
