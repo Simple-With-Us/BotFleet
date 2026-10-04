@@ -24,7 +24,7 @@ interface AppDeckProps {
   onSelectApp: (appId: string | null) => void;
   isMatrixOverviewActive?: boolean;
   activeBotId?: string | null;
-  onSelectBot?: (botId: string) => void;
+  onSelectBot?: (botId: string, appId?: string) => void;
   onSelectGroupChat?: (groupId: string) => void;
   isGroupChatActive?: boolean;
 }
@@ -310,7 +310,7 @@ export function AppDeck({
                 <button
                   key={b.id}
                   type="button"
-                  onClick={() => onSelectBot?.(b.id)}
+                  onClick={() => onSelectBot?.(b.id, activeGroup.id)}
                   aria-label={`${b.name} thread in ${activeGroup.name}`}
                   className={cn(
                     "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 font-medium transition-colors",

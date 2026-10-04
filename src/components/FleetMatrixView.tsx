@@ -21,7 +21,7 @@ import {
 
 interface FleetMatrixViewProps {
   onSelectApp: (appId: string) => void;
-  onSelectBot: (botId: string) => void;
+  onSelectBot: (botId: string, appId?: string) => void;
   onOpenAppRoom: (appId: string) => void;
 }
 
@@ -275,7 +275,7 @@ export function FleetMatrixView({
                           type="button"
                           onClick={() => {
                             onSelectApp(group.id);
-                            onSelectBot(bot.id);
+                            onSelectBot(bot.id, group.id);
                           }}
                           className={cn(
                             "inline-flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors",

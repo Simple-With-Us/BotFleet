@@ -133,6 +133,12 @@ function Shell() {
         const target = bots[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
+          if (selectedAppId) {
+            const taskForApp = target.tasks?.find((t) => t.workspaceContext?.appRef?.id === selectedAppId);
+            if (taskForApp && taskForApp.threadId !== target.threadId) {
+              dispatch({ type: "switchTask", botId: target.id, threadId: taskForApp.threadId });
+            }
+          }
           dispatch({ type: "select", id: target.id });
         }
       } else if (e.shiftKey && (e.key === "[" || e.key === "]")) {
@@ -140,6 +146,12 @@ function Shell() {
         const next = bots[(idx + (e.key === "]" ? 1 : -1) + bots.length) % bots.length];
         if (next) {
           e.preventDefault();
+          if (selectedAppId) {
+            const taskForApp = next.tasks?.find((t) => t.workspaceContext?.appRef?.id === selectedAppId);
+            if (taskForApp && taskForApp.threadId !== next.threadId) {
+              dispatch({ type: "switchTask", botId: next.id, threadId: taskForApp.threadId });
+            }
+          }
           dispatch({ type: "select", id: next.id });
         }
       }
@@ -377,8 +389,16 @@ function Shell() {
               }
             }}
             activeBotId={bot?.id}
-            onSelectBot={(botId) => {
+            onSelectBot={(botId, appId) => {
               setMatrixOverviewActive(false);
+              const clickedAppId = appId || selectedAppId;
+              const clickedBot = state.bots.find((b) => b.id === botId);
+              if (clickedBot && clickedAppId) {
+                const taskForApp = clickedBot.tasks?.find((t) => t.workspaceContext?.appRef?.id === clickedAppId);
+                if (taskForApp && taskForApp.threadId !== clickedBot.threadId) {
+                  dispatch({ type: "switchTask", botId, threadId: taskForApp.threadId });
+                }
+              }
               dispatch({ type: "select", id: botId });
             }}
             onSelectGroupChat={(groupId) => {
@@ -397,8 +417,16 @@ function Shell() {
                   setSelectedAppId(appId);
                   dispatch({ type: "select", id: appId });
                 }}
-                onSelectBot={(botId) => {
+                onSelectBot={(botId, appId) => {
                   setMatrixOverviewActive(false);
+                  const clickedAppId = appId || selectedAppId;
+                  const clickedBot = state.bots.find((b) => b.id === botId);
+                  if (clickedBot && clickedAppId) {
+                    const taskForApp = clickedBot.tasks?.find((t) => t.workspaceContext?.appRef?.id === clickedAppId);
+                    if (taskForApp && taskForApp.threadId !== clickedBot.threadId) {
+                      dispatch({ type: "switchTask", botId, threadId: taskForApp.threadId });
+                    }
+                  }
                   dispatch({ type: "select", id: botId });
                 }}
                 onOpenAppRoom={(appId) => {
