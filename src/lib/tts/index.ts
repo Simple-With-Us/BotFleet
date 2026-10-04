@@ -1,4 +1,5 @@
 import { spokenReply } from "../../../shared/voice-summary";
+import { TtsAudioBodySchema } from "./schema";
 // The speaker — one voice for the whole window.
 //
 // Deliberately a singleton: two bots talking over each other is never what
@@ -150,12 +151,9 @@ export class Speaker {
         const endpoint = `/api/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(opts.messageId)}/audio`;
         const response = await fetch(endpoint, { method: "POST", signal: controller.signal });
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `Voice service returned ${response.status}`);
-        const { audio, voiceText, utterances, onDevice } = (await response.json()) as {
-          audio: Array<{ path: string; mime: string }>;
-          voiceText?: string;
-          utterances?: string[];
-          onDevice?: boolean;
-        };
+        const parsed = TtsAudioBodySchema.safeParse(await response.json());
+        if (!parsed.success) throw new Error("Voice service returned an invalid response.");
+        const { audio, voiceText, utterances, onDevice } = parsed.data;
         if (onDevice || (!audio?.length && voiceText)) {
           if (typeof window !== "undefined" && window.ogb?.personalVoice?.speak) {
             const speechText = voiceText ?? text;

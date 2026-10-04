@@ -201,6 +201,12 @@ export function finishSpeech() {
 
 let personalVoiceChild = null;
 
+// A Personal Voice utterance is synthesised on-device at roughly 15 characters
+// per second, so budget generously per character and keep a floor for a short
+// reply whose synthesizer never calls back at all.
+const PERSONAL_VOICE_MIN_MS = 15_000;
+const PERSONAL_VOICE_MS_PER_CHAR = 250;
+
 export function listPersonalVoices() {
   if (process.platform !== "darwin") return Promise.resolve([]);
   try {
@@ -272,8 +278,14 @@ export function speakPersonalVoice(text, voiceId) {
     const outputPath = path.join(sessionDir, "stdout.ndjson");
     const errorPath = path.join(sessionDir, "stderr.log");
     const stopPath = path.join(sessionDir, "stop");
+    // argv is world-readable through `ps`, and this text is the bot's reply —
+    // a voice summary of the user's own private messages. Only the path goes
+    // on the command line; the text itself lives in a 0600 file inside a
+    // 0700 mkdtemp directory, exactly as the stop/finish markers do.
+    const textPath = path.join(sessionDir, "text.txt");
     writeFileSync(outputPath, "");
     writeFileSync(errorPath, "");
+    writeFileSync(textPath, String(text ?? ""), { mode: 0o600 });
 
     const proc = spawn(
       "/usr/bin/open",
@@ -290,16 +302,40 @@ export function speakPersonalVoice(text, voiceId) {
         "--speak-personal-voice",
         "--voice-id",
         String(voiceId ?? ""),
-        "--text",
-        String(text ?? ""),
+        "--text-file",
+        textPath,
         "--stop-file",
         stopPath,
       ],
       { stdio: "ignore" },
     );
 
-    const session = { proc, stopPath, sessionDir };
+    const session = { proc, stopPath, sessionDir, textPath };
     personalVoiceChild = session;
+
+    // The helper parks in RunLoop.main.run() until the synthesizer delegate
+    // fires or the stop marker appears, and the Personal Voice TCC prompt may
+    // never surface to an LSBackgroundOnly bundle. Without a deadline the
+    // promise never settles, the call queue never drains, and the session can
+    // neither speak nor listen again. Sized off the text so a long reply still
+    // gets room, with a floor for a reply that produces no audio at all.
+    const budgetMs = Math.max(PERSONAL_VOICE_MIN_MS, String(text ?? "").length * PERSONAL_VOICE_MS_PER_CHAR);
+    let settled = false;
+    const settle = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => {
+      if (personalVoiceChild === session) personalVoiceChild = null;
+      try {
+        writeFileSync(stopPath, "stop");
+      } catch {}
+      rmSync(sessionDir, { recursive: true, force: true });
+      settle(() => reject(new Error("Personal Voice did not finish speaking.")));
+    }, budgetMs);
+    timer.unref?.();
 
     proc.on("close", () => {
       if (personalVoiceChild === session) personalVoiceChild = null;
@@ -310,24 +346,24 @@ export function speakPersonalVoice(text, voiceId) {
           const parsed = JSON.parse(line);
           if (parsed.error) {
             rmSync(sessionDir, { recursive: true, force: true });
-            reject(new Error(parsed.error));
+            settle(() => reject(new Error(parsed.error)));
             return;
           }
           if (parsed.finished) {
             rmSync(sessionDir, { recursive: true, force: true });
-            resolve();
+            settle(resolve);
             return;
           }
         }
       } catch {}
       rmSync(sessionDir, { recursive: true, force: true });
-      resolve();
+      settle(resolve);
     });
 
     proc.on("error", (err) => {
       if (personalVoiceChild === session) personalVoiceChild = null;
       rmSync(sessionDir, { recursive: true, force: true });
-      reject(err);
+      settle(() => reject(err));
     });
   });
 }

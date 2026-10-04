@@ -2509,6 +2509,9 @@ app.on("before-quit", (e) => {
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
+  // a speaking Personal Voice helper parks in its own run loop until the stop
+  // marker appears; write it so quitting never leaves one behind
+  if (nativeActions.appleSpeech) stopPersonalVoice();
   stopRecorder();
   const cleanup = Promise.race([
     Promise.all([

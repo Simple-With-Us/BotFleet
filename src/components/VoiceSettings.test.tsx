@@ -1,5 +1,7 @@
 // Tests for VoiceSettings component covering Apple Personal Voice display.
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -102,6 +104,34 @@ describe("VoiceSettings", () => {
     expect(html).toContain("On-Demand");
     expect(html).toContain("All Messages");
     expect(html).toContain("Off");
+  });
+});
+
+/**
+ * The Personal Voice merge used to live only in the mount effect, while
+ * `loadVoices()` — the path every add / clone / delete / key-save refresh
+ * takes — overwrote the list with the harness voices alone. Those handlers
+ * change `bot.voice` and credentials but not `tts.configured`, so the effect
+ * never re-ran and the user's Personal Voices vanished from the picker until
+ * the tab was unmounted.
+ *
+ * Pinned at the source because the merge is a data-flow property of one
+ * loader, not of any rendered output; the same reasoning as `CallView.test.ts`.
+ */
+describe("VoiceSettings voice loading", () => {
+  const SRC = readFileSync(join(__dirname, "VoiceSettings.tsx"), "utf8");
+
+  it("performs the Personal Voice merge in the shared loader, not the effect", () => {
+    const loader = SRC.slice(SRC.indexOf("const loadVoices"), SRC.indexOf("useEffect", SRC.indexOf("const loadVoices")));
+    expect(loader).toContain("parsePersonalVoiceList(personal)");
+    expect(loader).toContain("parseTtsVoicesResponse(raw)");
+    expect(loader).toContain("setVoices([...personalEntries, ...apiVoices])");
+  });
+
+  it("has the mount effect call that loader instead of fetching on its own", () => {
+    expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured\]\);/);
+    // A second, effect-local fetch is exactly what dropped the personal entries.
+    expect(SRC.match(/api\("\/api\/tts\/voices"\)/g)).toHaveLength(1);
   });
 });
 

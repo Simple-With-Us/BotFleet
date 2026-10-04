@@ -100,9 +100,10 @@ export function CallTargetButton({
   // while leaving it working for anyone who deliberately picked the built-in voices.
   const voiceProviderConfigured = configured;
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
-  const isMac = capabilities.host.platform === "darwin" || window.ogb?.platform === "darwin";
   // Apple Personal Voices speak on-device on macOS and iOS companion devices.
-  const isPersonalSpeakable = isMac;
+  // The main process already gates the flag on the host's macOS version, so a
+  // macOS 13 Mac is not offered a call button that can only fail.
+  const isPersonalSpeakable = capabilities.dictation.personalVoice === true;
   const isVoiceSpeakable = (voice?: string) =>
     Boolean(voice) && (!isPersonalVoiceId(voice) || isPersonalSpeakable);
 

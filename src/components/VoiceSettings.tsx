@@ -8,6 +8,7 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
+import { parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 
@@ -48,49 +49,37 @@ export function VoiceSettings({
 
   const configured = Boolean(tts?.configured);
 
+  // The single loader. Every refresh path (mount, key save, add, clone,
+  // delete) goes through here, so the Personal Voice merge can never be
+  // dropped by a refresh that only reloads the harness list.
   const loadVoices = () => {
     setLoadingVoices(true);
-    return api("/api/tts/voices")
-      .then((r: { voices?: typeof voices; error?: string }) => {
-        setVoices(r.voices ?? []);
-        if (r.error) setError(r.error);
-      })
-      .catch(() => setVoices([]))
-      .finally(() => setLoadingVoices(false));
+    const personalVoices = window.ogb?.personalVoice?.list
+      ? window.ogb.personalVoice.list().catch(() => [])
+      : Promise.resolve([]);
+    return Promise.all([
+      api("/api/tts/voices").catch(() => ({})),
+      personalVoices,
+    ]).then(([raw, personal]) => {
+      const r = parseTtsVoicesResponse(raw);
+      const apiVoices = r.voices ?? [];
+      // Entries the harness already knows about win, so a Personal Voice that
+      // the server also lists is never shown twice under two labels.
+      const existing = new Set(apiVoices.map((voice) => voice.id));
+      const personalEntries = parsePersonalVoiceList(personal)
+        .filter((voice) => !existing.has(voice.id))
+        .map((voice) => ({
+          id: voice.id,
+          label: voice.name,
+          description: `Apple Personal Voice (${voice.locale ?? "en-US"})`,
+        }));
+      setVoices([...personalEntries, ...apiVoices]);
+      if (r.error) setError(r.error);
+    }).catch(() => setVoices([])).finally(() => setLoadingVoices(false));
   };
 
   useEffect(() => {
-    let alive = true;
-    setLoadingVoices(true);
-    const loadPvs = window.ogb?.personalVoice?.list
-      ? window.ogb.personalVoice.list().catch(() => [])
-      : Promise.resolve([]);
-
-    Promise.all([
-      api("/api/tts/voices").catch(() => ({ voices: [] })),
-      loadPvs,
-    ]).then(([r, pvs]: [
-      { voices?: typeof voices; error?: string },
-      Array<{ id: string; name: string; locale?: string }>,
-    ]) => {
-      if (!alive) return;
-      const apiVoices = r.voices ?? [];
-      const personalEntries = Array.isArray(pvs)
-        ? pvs.map((pv) => ({
-            id: pv.id,
-            label: pv.name,
-            description: `Apple Personal Voice (${pv.locale ?? "en-US"})`,
-          }))
-        : [];
-      const existing = new Set(apiVoices.map((v) => v.id));
-      const merged = [...personalEntries.filter((pv) => !existing.has(pv.id)), ...apiVoices];
-      setVoices(merged);
-      if (r.error) setError(r.error);
-    }).finally(() => alive && setLoadingVoices(false));
-
-    return () => {
-      alive = false;
-    };
+    void loadVoices();
   }, [configured]);
 
   const saveKey = () => {

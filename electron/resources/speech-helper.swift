@@ -176,11 +176,17 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
   guard let voiceIdx = args.firstIndex(of: "--voice-id"), voiceIdx + 1 < args.count else {
     fail("missing-voice-id")
   }
-  guard let textIdx = args.firstIndex(of: "--text"), textIdx + 1 < args.count else {
+  // The reply text arrives in a 0600 file rather than on argv: argv is
+  // world-readable through `ps`, and this text is a voice summary of the
+  // user's own messages.
+  guard let textIdx = args.firstIndex(of: "--text-file"), textIdx + 1 < args.count else {
     fail("missing-text")
   }
   let requestedVoiceId = args[voiceIdx + 1]
-  let text = args[textIdx + 1]
+  let textPath = args[textIdx + 1]
+  guard let text = try? String(contentsOfFile: textPath, encoding: .utf8) else {
+    fail("missing-text")
+  }
   let rawId = requestedVoiceId
     .replacingOccurrences(of: "apple-personal:", with: "")
     .replacingOccurrences(of: "personal:", with: "")
@@ -214,11 +220,17 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
 
   let doSpeak = {
     let allVoices = AVSpeechSynthesisVoice.speechVoices()
-    let voice = allVoices.first(where: {
+    let matched = allVoices.first(where: {
       $0.identifier == rawId || $0.name == rawId ||
       "personal:\($0.identifier)" == requestedVoiceId ||
       "apple-personal:\($0.identifier)" == requestedVoiceId
-    }) ?? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
+    })
+    // Guess only when the caller named no voice at all. A named-but-absent
+    // voice — one not synced to this Mac — must fail loudly rather than be
+    // replaced by a different Personal Voice speaking the user's words.
+    let voice = matched ?? (rawId.isEmpty
+      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
+      : nil)
 
     guard let selectedVoice = voice else {
       fail("voice-not-found")

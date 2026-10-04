@@ -4,8 +4,23 @@
 
 const DESKTOP_PLATFORMS = new Set(["darwin", "linux", "win32"]);
 
+// Apple Personal Voice synthesis (AVSpeechSynthesizer.personalVoiceAuthorizationStatus)
+// arrived in macOS 14, whose Darwin kernel major is 23.  Advertising the capability
+// on an older host only offers a call button whose sole outcome is the speech
+// helper's own `unsupported-platform` failure.
+const PERSONAL_VOICE_MIN_MACOS = 14;
+const DARWIN_TO_MACOS_OFFSET = 9;
+
 function normalizedPlatform(platform) {
   return DESKTOP_PLATFORMS.has(platform) ? platform : "other";
+}
+
+/** macOS major version for a Darwin kernel release string ("23.6.0" -> 14).
+ * Returns 0 when the release cannot be read, which fails the gate closed. */
+function macOSMajorVersion(osRelease) {
+  const darwinMajor = Number.parseInt(String(osRelease ?? "").split(".")[0] ?? "", 10);
+  if (!Number.isInteger(darwinMajor) || darwinMajor <= 0) return 0;
+  return darwinMajor - DARWIN_TO_MACOS_OFFSET;
 }
 
 function nativeDesktopActions(platform) {
@@ -81,6 +96,7 @@ function desktopCapabilities({
   packaged = false,
   localConnection = null,
   homeDir = require("node:os").homedir(),
+  osRelease = require("node:os").release(),
 } = {}) {
   const hostPlatform = normalizedPlatform(platform);
   const isMac = hostPlatform === "darwin";
@@ -104,9 +120,10 @@ function desktopCapabilities({
     available: isMac,
     engine: isMac ? "apple-speech" : "none",
     onDevice: isMac,
-    personalVoice: isMac,
+    personalVoice: isMac && macOSMajorVersion(osRelease) >= PERSONAL_VOICE_MIN_MACOS,
   };
   if (!isMac) dictation.reasonCode = "unsupported-platform";
+  else if (!dictation.personalVoice) dictation.reasonCode = "requires-macos-14";
   const localComputer = {
     available: localAvailable,
     support:
@@ -177,5 +194,6 @@ module.exports = {
   linuxLocalControlSupport,
   linuxSession,
   localComputerReady,
+  macOSMajorVersion,
   nativeDesktopActions,
 };

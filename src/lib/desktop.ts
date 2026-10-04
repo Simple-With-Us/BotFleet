@@ -41,7 +41,10 @@ export function initialDesktopCapabilities(): DesktopCapabilities {
     available: isMac,
     engine: isMac ? "apple-speech" : "none",
     onDevice: isMac,
-    personalVoice: isMac,
+    // Optimistic first paint, not an answer: only the main process knows the
+    // host's macOS version, and Personal Voice needs 14+. `ready` stays false
+    // until the real capabilities land, so nothing is offered on this value.
+    personalVoice: false,
   };
   if (!isMac) dictation.reasonCode = "unsupported-platform";
   return {

@@ -56,9 +56,11 @@ describe("Personal Voice desktop call support", () => {
     expect(SRC).toMatch(/voice\.startsWith\("apple-personal:"\)/);
   });
 
-  it("enables personal voice on macOS while gating non-Apple platforms", () => {
-    expect(SRC).toMatch(/const isMac = capabilities\.host\.platform === "darwin" \|\| window\.ogb\?\.platform === "darwin";/);
-    expect(SRC).toMatch(/const isPersonalSpeakable = isMac;/);
+  it("enables personal voice only when the host advertises the capability", () => {
+    // The version gate lives in electron/capabilities.cjs (macOS 14+), so the
+    // renderer reads the flag rather than re-deriving it from the platform.
+    expect(SRC).toMatch(/const isPersonalSpeakable = capabilities\.dictation\.personalVoice === true;/);
+    expect(SRC).not.toMatch(/const isPersonalSpeakable = isMac;/);
     expect(SRC).toMatch(/configured && \(isPersonalSpeakable \|\| !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)\)/);
   });
 
