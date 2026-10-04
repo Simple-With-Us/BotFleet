@@ -7,6 +7,7 @@ import {
   IDLE_POLL_MS,
   captureFailureIsActionable,
   decideCloudPreview,
+  newestPreview,
   streamIsDelivering,
   type CloudPreviewGate,
 } from "./computer-preview";
@@ -49,7 +50,6 @@ describe("decideCloudPreview", () => {
       gate({ botBusy: true, lastFrameAt: T0 - 1_000, nowMs: T0 }),
     );
     expect(decision.poll).toBe(false);
-    expect(decision.preferPolled).toBe(false);
   });
 
   it("resumes polling when a stream that painted once goes quiet", () => {
@@ -67,7 +67,6 @@ describe("decideCloudPreview", () => {
     expect(decideCloudPreview(gate({ botBusy: true, streamState: "failed" }))).toEqual({
       poll: true,
       intervalMs: BUSY_POLL_MS,
-      preferPolled: true,
     });
   });
 
@@ -91,17 +90,13 @@ describe("decideCloudPreview", () => {
     expect(decideCloudPreview(gate({ botBusy: false, lastFrameAt: T0 - 1_000 })).poll).toBe(true);
   });
 
-  // The store never clears `state.screens[botId]`, so a turn-1 frame outlives
-  // its turn.  If the polled capture cannot outrank it, the fallback succeeds
-  // at fetching a picture and the panel still shows the old one.
-  it("lets the polled capture outrank a stale live frame whenever it is polling", () => {
-    const stale = decideCloudPreview(
-      gate({ botBusy: true, lastFrameAt: T0 - FRAME_STALE_MS - 1, nowMs: T0 }),
-    );
-    expect(stale.preferPolled).toBe(true);
-    // ...and the opposite while the stream is genuinely delivering.
-    const live = decideCloudPreview(gate({ botBusy: true, lastFrameAt: T0 - 1_000, nowMs: T0 }));
-    expect(live.preferPolled).toBe(false);
+  it("does not claim a source preference in states where it never polls", () => {
+    // Nothing polls in these states, so no capture is made fresher by them,
+    // and the store's live frame must keep the pre-existing precedence.
+    for (const patch of [{ viewerOpen: true }, { pageVisible: false }, { phase: "starting" }]) {
+      expect(Object.keys(decideCloudPreview(gate(patch)))).toEqual(["poll", "intervalMs"]);
+      expect(decideCloudPreview(gate(patch)).poll, JSON.stringify(patch)).toBe(false);
+    }
   });
 });
 
@@ -112,11 +107,12 @@ describe("streamIsDelivering", () => {
     expect(streamIsDelivering(T0 - FRAME_STALE_MS, T0)).toBe(false);
   });
 
-  it("sits above the server's real publish cadence for a remote capture", () => {
+  it("sits well clear of the server's real publish cadence for a remote capture", () => {
     // ScreenPollers fires every 6s with a 3s min gap, but a VPS capture is a
-    // ~17s round trip, so a healthy stream publishes every ~20-25s.  A window
-    // under that would flap the fallback on every turn.
-    expect(FRAME_STALE_MS).toBeGreaterThan(25_000);
+    // ~17s round trip, so a healthy stream publishes every ~20-25s.  Every
+    // breach queues another full SSH capture onto an already-slow box, so the
+    // window is sized to the worst plausible cadence, not the median.
+    expect(FRAME_STALE_MS).toBeGreaterThanOrEqual(45_000);
   });
 });
 
@@ -125,5 +121,40 @@ describe("captureFailureIsActionable", () => {
     expect(captureFailureIsActionable(0)).toBe(false);
     expect(captureFailureIsActionable(CAPTURE_FAILURE_LIMIT - 1)).toBe(false);
     expect(captureFailureIsActionable(CAPTURE_FAILURE_LIMIT)).toBe(true);
+  });
+});
+
+describe("newestPreview", () => {
+  const live = { png: "live", mime: "image/png" };
+  const polled = { png: "polled", mime: "image/png" };
+
+  // Both sources persist — the store never clears `live`, and `polledFrame`
+  // survives until a capture replaces it — so preferring by which one exists
+  // makes the preview jump backwards in time.
+  it("paints the newer capture, not merely the one that exists", () => {
+    // Stream delivered at t=5000; capture landed at t=1000.  The capture is
+    // older, so the streamed frame wins.
+    expect(newestPreview(live, polled, 1_000, 5_000)).toBe(live);
+    // Capture landed at t=9000, after the stream's t=5000 frame.
+    expect(newestPreview(live, polled, 9_000, 5_000)).toBe(polled);
+  });
+
+  it("keeps the turn's final streamed frame after the turn ends", () => {
+    // Turn ends with live at t=35s; the last mid-turn capture is older.  The
+    // idle poll takes ~17s to land, and until it does the streamed frame is
+    // the newer picture.
+    expect(newestPreview(live, polled, 17_000, 35_000)).toBe(live);
+  });
+
+  it("lets any capture outrank a prior turn when nothing streamed this turn", () => {
+    // lastFrameAt resets to 0 on a new turn, so a mid-turn capture cannot be
+    // beaten by the previous turn's final frame.
+    expect(newestPreview(live, polled, 500, 0)).toBe(polled);
+  });
+
+  it("falls back to whichever single source exists", () => {
+    expect(newestPreview(live, null, 0, 5_000)).toBe(live);
+    expect(newestPreview(undefined, polled, 5_000, 0)).toBe(polled);
+    expect(newestPreview(undefined, null, 0, 0)).toBeNull();
   });
 });

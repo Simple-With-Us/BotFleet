@@ -30,6 +30,7 @@ import { usePageVisible } from "@/lib/page-visible";
 import {
   captureFailureIsActionable,
   decideCloudPreview,
+  newestPreview,
   FRAME_STALE_MS,
   type ScreenStreamState,
 } from "@/lib/computer-preview";
@@ -495,6 +496,8 @@ export function ComputerPanel({
   const inFlight = useRef(false);
   const captureFailures = useRef(0);
   const [captureProblem, setCaptureProblem] = useState<string | null>(null);
+  // When the polled capture landed, so `newestPreview` can compare ages.
+  const [polledAt, setPolledAt] = useState(0);
   useEffect(() => {
     if (!preview.poll) return;
     let alive = true;
@@ -503,7 +506,10 @@ export function ComputerPanel({
       inFlight.current = true;
       try {
         const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
-        if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
+        if (alive) {
+          setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
+          setPolledAt(Date.now());
+        }
         if (captureFailures.current > 0) {
           captureFailures.current = 0;
           setCaptureProblem(null);
@@ -600,11 +606,11 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
-  // The store's `live` frame is never cleared, so whenever the gate is
-  // polling because the stream has not proven itself, `live` is a stale image
-  // from an earlier turn and must not shadow the capture that is actually
-  // keeping the preview alive.
-  const latestPreview = preview.preferPolled ? polledFrame ?? live : live ?? polledFrame;
+  // The store's `live` frame is never cleared and `polledFrame` is only
+  // replaced when a capture lands, so both persist.  Deciding by age rather
+  // than by which one happens to exist is what keeps the preview from
+  // jumping backwards in time at a turn boundary or a staleness transition.
+  const latestPreview = newestPreview(live, polledFrame, polledAt, lastFrameAt);
   const cloudFrame =
     latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);

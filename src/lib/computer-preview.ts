@@ -25,15 +25,19 @@ export const FALLBACK_POLL_MS = 10_000;
  *
  * The server's poller fires every 6s with a 3s minimum gap, but a remote
  * capture is a real round trip — roughly 17s on the VPS backend — so a healthy
- * stream publishes every ~20-25s.  30s sits just above that.
+ * stream publishes every ~20-25s, and a box under load can take appreciably
+ * longer.
  *
- * The window is deliberately biased short.  Treating a quiet stream as live
- * freezes the preview on a stale image, which is the bug being fixed; treating
- * a working stream as quiet only costs one extra screenshot, because the
- * fallback's own capture then repaints the panel.  Flapping is cheap,
- * freezing is not.
+ * The window is sized to the WORST plausible cadence rather than the median.
+ * Every breach restarts the poll effect, which fires an immediate full remote
+ * screenshot; a box that is already missing its cadence would then absorb
+ * another ~17s SSH capture, and if a frame lands first that capture is thrown
+ * away.  Tightening the window does not fix a slow stream, it piles load onto
+ * the most contended box and amplifies the problem.  The cost of erring long
+ * is a dead stream freezing the preview for up to 45s instead of 30s, which
+ * is a delay, not a wrong picture.
  */
-export const FRAME_STALE_MS = 30_000;
+export const FRAME_STALE_MS = 45_000;
 
 export interface CloudPreviewGate {
   /** Panel phase; only a ready cloud computer has a preview to fetch. */
@@ -64,14 +68,6 @@ export interface CloudPreviewDecision {
    * cannot possibly land in time.
    */
   intervalMs: number;
-  /**
-   * True when a polled screenshot is the fresher picture and must win the
-   * render.  The store's `live` frame is never cleared, so whenever the gate
-   * is polling because the stream has not proven itself, `live` is a stale
-   * image from an earlier turn and must not shadow the capture that is
-   * actually keeping the preview alive.
-   */
-  preferPolled: boolean;
 }
 
 /** Is the stream demonstrably still delivering as of `nowMs`? */
@@ -80,15 +76,14 @@ export function streamIsDelivering(lastFrameAt: number, nowMs: number): boolean 
 }
 
 /**
- * Should the panel fetch a screenshot on its own, and which source should
- * paint while it does?
+ * Should the panel fetch a screenshot on its own?
  *
  * The only case that suppresses the poll is a busy bot whose stream delivered
  * a frame recently.  A busy bot with a quiet stream falls back to polling,
  * because nothing else is going to paint the preview.
  */
 export function decideCloudPreview(gate: CloudPreviewGate): CloudPreviewDecision {
-  const idle: CloudPreviewDecision = { poll: false, intervalMs: IDLE_POLL_MS, preferPolled: true };
+  const idle: CloudPreviewDecision = { poll: false, intervalMs: IDLE_POLL_MS };
   if (gate.phase !== "ready") return idle;
   if (gate.panelView !== "computer") return idle;
   if (gate.viewerOpen) return idle;
@@ -96,18 +91,46 @@ export function decideCloudPreview(gate: CloudPreviewGate): CloudPreviewDecision
 
   // A broken stream stops being the preferred source immediately.
   if (gate.streamState === "failed") {
-    return { poll: true, intervalMs: gate.botBusy ? BUSY_POLL_MS : IDLE_POLL_MS, preferPolled: true };
+    return { poll: true, intervalMs: gate.botBusy ? BUSY_POLL_MS : IDLE_POLL_MS };
   }
 
   if (gate.botBusy && streamIsDelivering(gate.lastFrameAt, gate.nowMs)) {
-    return { poll: false, intervalMs: BUSY_POLL_MS, preferPolled: false };
+    return { poll: false, intervalMs: BUSY_POLL_MS };
   }
   if (gate.botBusy) {
     // Busy, and the stream is not currently delivering.  Poll — slowly —
     // because this is the only thing that will ever fill the preview.
-    return { poll: true, intervalMs: FALLBACK_POLL_MS, preferPolled: true };
+    return { poll: true, intervalMs: FALLBACK_POLL_MS };
   }
-  return { poll: true, intervalMs: IDLE_POLL_MS, preferPolled: true };
+  return { poll: true, intervalMs: IDLE_POLL_MS };
+}
+
+/** A preview picture, from either source. */
+export interface PreviewFrame {
+  png: string;
+  mime: string;
+}
+
+/**
+ * Which picture to paint, decided by AGE and never by nullability.
+ *
+ * Both sources persist: the store's `live` frame is written but never
+ * cleared, and `polledFrame` is replaced only when a capture lands.  So
+ * "one exists" says nothing about which is newer, and preferring by
+ * nullability makes the preview jump backwards in time — a mid-turn capture
+ * left over from before a turn ends would outrank the turn's final streamed
+ * frame.  Timestamps are the only honest comparison, and `lastFrameAt === 0`
+ * (nothing streamed this turn) correctly lets any capture outrank a prior
+ * turn's frame.
+ */
+export function newestPreview(
+  live: PreviewFrame | undefined,
+  polled: PreviewFrame | null,
+  polledAt: number,
+  lastFrameAt: number,
+): PreviewFrame | null {
+  if (polled && polledAt > lastFrameAt) return polled;
+  return live ?? polled ?? null;
 }
 
 /**
