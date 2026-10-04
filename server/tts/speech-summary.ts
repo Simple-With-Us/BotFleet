@@ -204,7 +204,8 @@ export async function summarizeForVoice(
       if (parsed.success) {
         const summary = parsed.data.choices?.[0]?.message?.content?.trim();
         if (summary) {
-          return cleanSummaryForTTS(summary);
+          const cleaned = cleanSummaryForTTS(summary);
+          if (cleaned) return cleaned;
         }
       }
     }
@@ -234,7 +235,8 @@ export async function summarizeForVoice(
       if (fbParsed.success) {
         const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
         if (fbSummary) {
-          return cleanSummaryForTTS(fbSummary);
+          const cleaned = cleanSummaryForTTS(fbSummary);
+          if (cleaned) return cleaned;
         }
       }
     }

@@ -251,6 +251,23 @@ describe("summarizeForVoice", () => {
     const res = await summarizeForVoice(LONG, "test-key");
     expect(res).toContain("deployment of multiple services");
   });
+
+  it("falls back to deterministic speech when model returns an unclosed fence at position 0 resulting in empty cleaned text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
 });
 
 
