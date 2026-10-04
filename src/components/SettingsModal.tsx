@@ -44,6 +44,7 @@ import { EnginesSettings } from "./EnginesSettings";
 import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
+import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
 import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
@@ -1492,6 +1493,9 @@ export function SettingsModal() {
                 <>
                   <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
                     <LocalComputerSection />
+                  </div>
+                  <div className={highlightClass("setting-computers-cli-credentials")}>
+                    <HostCliIntegrationCard />
                   </div>
                   <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
                     <LocalVmRuntimeCard />

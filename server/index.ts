@@ -3084,31 +3084,40 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   setLocalVmLaneActive(target, threadId, botId, true);
   localVmIdleFor(target).touch();
-  let localVm = await containerComputerStatus(undefined, undefined, target);
   try {
-    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
-  } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
-  }
-  if (!localVm.ready || !localVm.runtime) {
-    throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
-  }
-  // The container is up but this bot's desktop may not be: in shared mode each
-  // bot owns its own display + socket, and the first turn for a bot is the one
-  // that has to start it.  Idempotent, so every later turn is a no-op.  The
-  // shared `:1` supervisor desktop is never touched.
-  if (target.session) {
+    let localVm = await containerComputerStatus(undefined, undefined, target);
     try {
-      await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+      localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
     } catch (error) {
-      throw new Error(
-        `could not start this bot's shared VM desktop on ${target.session.display}: ${
-          error instanceof Error ? error.message : String(error)
-        } (App Settings → Local VM)`,
-      );
+      throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
     }
+    if (!localVm.ready || !localVm.runtime) {
+      throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
+    }
+    // The container is up but this bot's desktop may not be: in shared mode each
+    // bot owns its own display + socket, and the first turn for a bot is the one
+    // that has to start it.  Idempotent, so every later turn is a no-op.  The
+    // shared `:1` supervisor desktop is never touched.
+    if (target.session) {
+      try {
+        await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+      } catch (error) {
+        throw new Error(
+          `could not start this bot's shared VM desktop on ${target.session.display}: ${
+            error instanceof Error ? error.message : String(error)
+          } (App Settings → Local VM)`,
+        );
+      }
+    }
+    return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
+  } catch (error) {
+    // The turn may carry on with another granted computer, so the claim must
+    // not outlive the failure: a lingering lease would hold the container
+    // against idle teardown and block Local VM lifecycle actions.  Release is
+    // idempotent, so the dispatcher's own unwind is still safe.
+    releaseLocalVmThread(threadId, botId);
+    throw error;
   }
-  return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
 }
 
 /** The harness state `resolveTurnComputerMounts` borrows, gathered in one

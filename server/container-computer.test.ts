@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createServer } from "node:net";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
@@ -25,7 +26,15 @@ import {
   VM_WORKSPACE_GUEST,
   VM_WORKSPACE_ROOT,
   WORKSPACE_LABEL,
+  DEFAULT_CONTAINER_LIMITS,
+  LIMITS_LABEL,
+  adaptContainerLimits,
   authorizeBoxGateway,
+  defaultCommandRunner,
+  healCuaShimsScript,
+  limitsFromLabels,
+  redactSecrets,
+  resolveContainerLimits,
   boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
@@ -1213,5 +1222,170 @@ describe("Box gateway", () => {
     expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(true);
     revokeBoxGatewayGrant(grant.token);
     expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(false);
+  });
+});
+
+describe("adaptive container limits", () => {
+  it("keeps the historical 4 CPU / 8 GiB cap on a roomy runtime", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 })).toEqual({ cpus: 4, memoryGib: 8 });
+    expect(adaptContainerLimits(null)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("shrinks to an OrbStack-sized runtime (3 CPUs, 4 GiB) instead of failing to start", () => {
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 2 });
+  });
+
+  it("honours a configured ceiling and never exceeds 4 / 8", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 }, { cpus: 2, memoryGib: 3 })).toEqual({
+      cpus: 2,
+      memoryGib: 3,
+    });
+    expect(adaptContainerLimits(null, { cpus: 99, memoryGib: 99 })).toEqual({ cpus: 4, memoryGib: 8 });
+  });
+
+  it("asks the runtime what it has, and falls back to the ceiling when it will not say", async () => {
+    const answering = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3 4294967296\n" });
+    expect(await resolveContainerLimits("docker", answering.run)).toEqual({ cpus: 3, memoryGib: 3 });
+    const podman = runner({ "podman info --format {{.Host.CPUs}} {{.Host.MemTotal}}": "2 8589934592\n" });
+    expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 6 });
+    const silent = runner({});
+    expect(await resolveContainerLimits("docker", silent.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("reads declared limits from the label and treats anything odd as the historical cap", () => {
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "3x3" })).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(limitsFromLabels({})).toEqual(DEFAULT_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(DEFAULT_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(DEFAULT_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("creates the container with the adapted caps and records them in a label", () => {
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux", { limits: { cpus: 3, memoryGib: 3 } });
+    expect(args[args.indexOf("--memory") + 1]).toBe("3g");
+    expect(args[args.indexOf("--memory-swap") + 1]).toBe("3g");
+    expect(args[args.indexOf("--cpus") + 1]).toBe("3");
+    expect(args).toContain(`${LIMITS_LABEL}=3x3`);
+    const defaults = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux");
+    expect(defaults[defaults.indexOf("--memory") + 1]).toBe("8g");
+    expect(defaults[defaults.indexOf("--cpus") + 1]).toBe("4");
+  });
+
+  it("reports a container built with adapted limits as hardened, and a mismatch as unsafe", async () => {
+    const adapted = JSON.parse(readyInspect())[0];
+    adapted.Config.Labels[LIMITS_LABEL] = "3x3";
+    adapted.HostConfig.Memory = 3 * 1024 ** 3;
+    adapted.HostConfig.MemorySwap = 3 * 1024 ** 3;
+    adapted.HostConfig.NanoCpus = 3_000_000_000;
+    const status = (inspect: string) =>
+      runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: inspect,
+      });
+    expect((await containerComputerStatus(status(JSON.stringify([adapted])).run, "linux")).security).toBe("hardened");
+    // declared 3x3 but actually running with the old 8 GiB / 4 CPU limits
+    const drifted = JSON.parse(JSON.stringify(adapted));
+    drifted.HostConfig.Memory = 8 * 1024 ** 3;
+    drifted.HostConfig.MemorySwap = 8 * 1024 ** 3;
+    expect((await containerComputerStatus(status(JSON.stringify([drifted])).run, "linux")).security).toBe("unsafe");
+    // an unlabeled container is judged against the historical cap, as before
+    expect((await containerComputerStatus(status(readyInspect()).run, "linux")).security).toBe("hardened");
+  });
+});
+
+describe("secret redaction", () => {
+  it("scrubs the viewer password out of a failed docker run command line", () => {
+    const message =
+      "Command failed: docker run -d --name x -e VNC_PW=hunter2 -p 127.0.0.1:6080:6901 image\n" +
+      "docker: Error response from daemon: ports are not available";
+    const redacted = redactSecrets(message);
+    expect(redacted).not.toContain("hunter2");
+    expect(redacted).toContain("VNC_PW=<redacted>");
+    expect(redacted).toContain("ports are not available");
+  });
+
+  it("scrubs the password from the error the real command runner throws", async () => {
+    const failure = await defaultCommandRunner("/bin/sh", ["-c", "exit 3", "x", "-e", "VNC_PW=hunter2"]).catch(
+      (error: Error & { cmd?: string }) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain("hunter2");
+    expect((failure as Error & { cmd?: string }).cmd ?? "").not.toContain("hunter2");
+  });
+
+  it("scrubs other credential-shaped variables and leaves ordinary text alone", () => {
+    expect(redactSecrets("-e API_TOKEN=abc -e DB_PASSWORD='p w' --cpus 4")).toBe(
+      "-e API_TOKEN=<redacted> -e DB_PASSWORD=<redacted> --cpus 4",
+    );
+  });
+});
+
+describe("Local VM creation on a busy host", () => {
+  const dockerHost = (runCalls: string[][]) => {
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "3 4294967296\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (command === "docker" && args[0] === "run") {
+        runCalls.push(args);
+        return { stdout: "id\n" };
+      }
+      throw new Error(`no such object: ${key}`);
+    };
+    return run;
+  };
+  const tempTarget = (viewerPort: number | null): LocalVmTarget => {
+    const base = perBotLocalVmTarget("busy-port-test");
+    return { ...base, viewerPort, workspaceDir: join(mkdtempSync(join(tmpdir(), "vm-port-")), "homes", "abcd") };
+  };
+
+  it("adapts the container limits to the runtime when it is created", async () => {
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(null));
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]![runCalls[0]!.indexOf("--cpus") + 1]).toBe("3");
+    expect(runCalls[0]![runCalls[0]!.indexOf("--memory") + 1]).toBe("3g");
+  });
+
+  it("falls back to an ephemeral loopback viewer port when the fixed one is taken", async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const busy = (blocker.address() as { port: number }).port;
+    try {
+      const runCalls: string[][] = [];
+      await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(busy));
+      const published = runCalls[0]![runCalls[0]!.indexOf("-p") + 1];
+      expect(published).toBe("127.0.0.1::6901");
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it("keeps the fixed viewer port when it is free", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const free = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(free));
+    expect(runCalls[0]![runCalls[0]!.indexOf("-p") + 1]).toBe(`127.0.0.1:${free}:6901`);
+  });
+});
+
+describe("PATH driver symlink repair", () => {
+  it("links both PATH entries to the root-owned binary, only when it exists and a link is missing", () => {
+    const script = healCuaShimsScript();
+    expect(script).toContain(`[ -x ${CUA_EXECUTABLE} ] || exit 0`);
+    for (const shim of ["/usr/local/bin/cua-driver", "/opt/venv/bin/cua-driver"]) {
+      expect(script).toContain(`ln -sf ${CUA_EXECUTABLE} ${shim}`);
+      expect(script).toContain(`readlink ${shim}`);
+    }
   });
 });

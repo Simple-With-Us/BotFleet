@@ -6,6 +6,7 @@
 // `cua-driver mcp` inside the container; this module never reimplements clicks,
 // typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
+import { createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -102,6 +103,80 @@ const MEMORY_BYTES = CONTAINER_MEMORY_GIB * 1024 * 1024 * 1024;
 const NANO_CPUS = CONTAINER_CPUS * 1_000_000_000;
 const PIDS_LIMIT = 512;
 const SHM_BYTES = 512 * 1024 * 1024;
+
+/** What one Local VM container is capped at.  The maximum (4 CPUs, 8 GiB) is
+ * only a ceiling: a runtime with less (OrbStack's default VM is 3 CPUs and
+ * 4 GiB) cannot start a container asking for more, so the limits adapt. */
+export interface ContainerLimits {
+  cpus: number;
+  memoryGib: number;
+}
+export const DEFAULT_CONTAINER_LIMITS: ContainerLimits = { cpus: CONTAINER_CPUS, memoryGib: CONTAINER_MEMORY_GIB };
+export const LIMITS_LABEL = "com.botfleet.limits";
+const MIN_CONTAINER_MEMORY_GIB = 2;
+
+export function clampContainerLimits(limits: Partial<ContainerLimits>): ContainerLimits {
+  const whole = (value: number | undefined, fallback: number, min: number, max: number) =>
+    Number.isFinite(value) ? Math.min(max, Math.max(min, Math.floor(value as number))) : fallback;
+  return {
+    cpus: whole(limits.cpus, CONTAINER_CPUS, 1, CONTAINER_CPUS),
+    memoryGib: whole(limits.memoryGib, CONTAINER_MEMORY_GIB, 1, CONTAINER_MEMORY_GIB),
+  };
+}
+
+export function limitsLabelValue(limits: ContainerLimits): string {
+  return `${limits.cpus}x${limits.memoryGib}`;
+}
+
+/** The limits a container declares it was created with.  An absent or
+ * malformed label is a container from before limits adapted, so the historical
+ * 4 CPU / 8 GiB cap applies.  The declared numbers are only ever compared with
+ * what the runtime reports — never trusted past the 4 / 8 ceiling. */
+export function limitsFromLabels(labels: Record<string, string> | undefined | null): ContainerLimits {
+  const match = /^(\d{1,2})x(\d{1,2})$/.exec(labels?.[LIMITS_LABEL] ?? "");
+  if (!match) return DEFAULT_CONTAINER_LIMITS;
+  const limits = { cpus: Number(match[1]), memoryGib: Number(match[2]) };
+  const clamped = clampContainerLimits(limits);
+  return clamped.cpus === limits.cpus && clamped.memoryGib === limits.memoryGib && limits.cpus >= 1 && limits.memoryGib >= 1
+    ? limits
+    : DEFAULT_CONTAINER_LIMITS;
+}
+
+/** Pick limits for a new container: the configured ceiling (or 4 / 8), cut to
+ * what the runtime has.  Memory keeps a quarter of the runtime's RAM free for
+ * the runtime itself and its other containers. */
+export function adaptContainerLimits(
+  host: { cpus?: number; memoryBytes?: number } | null,
+  configured: Partial<ContainerLimits> = {},
+): ContainerLimits {
+  const ceiling = clampContainerLimits(configured);
+  if (!host) return ceiling;
+  const cpus = host.cpus && host.cpus > 0 ? Math.min(ceiling.cpus, Math.floor(host.cpus)) : ceiling.cpus;
+  const hostGib = host.memoryBytes && host.memoryBytes > 0 ? Math.floor((host.memoryBytes / 1024 ** 3) * 0.75) : null;
+  const memoryGib = hostGib === null ? ceiling.memoryGib : Math.min(ceiling.memoryGib, Math.max(MIN_CONTAINER_MEMORY_GIB, hostGib));
+  return { cpus: Math.max(1, cpus), memoryGib };
+}
+
+/** Ask the runtime how much it has.  Best effort: a runtime that will not say
+ * leaves the configured ceiling in place. */
+export async function resolveContainerLimits(
+  runtime: Runtime,
+  runner: CommandRunner,
+  configured: Partial<ContainerLimits> = {},
+): Promise<ContainerLimits> {
+  if (runtime === "container") return clampContainerLimits(configured);
+  const format = runtime === "podman" ? "{{.Host.CPUs}} {{.Host.MemTotal}}" : "{{.NCPU}} {{.MemTotal}}";
+  try {
+    const { stdout } = await runner(runtime, ["info", "--format", format], 8000);
+    const [cpus, memoryBytes] = stdout.trim().split(/\s+/).map(Number);
+    return adaptContainerLimits(
+      { cpus: Number.isFinite(cpus) ? cpus : undefined, memoryBytes: Number.isFinite(memoryBytes) ? memoryBytes : undefined },
+      configured,
+    );
+  } catch {
+    return clampContainerLimits(configured);
+  }
+}
 
 export interface LocalVmTarget {
   /** Stable, non-secret identity used for leases and caches. */
@@ -291,14 +366,39 @@ LABEL ${MANAGED_LABEL}="1" \\
 `;
 }
 
+/** Scrub `NAME=value` secrets from command output and error text.  `docker
+ * run … -e VNC_PW=<password>` failures embed the whole command line in the
+ * error message, and that message is returned to the UI. */
+export function redactSecrets(text: string): string {
+  return text.replace(
+    /\b([A-Z][A-Z0-9_]*(?:PW|PASSWORD|PASSWD|SECRET|TOKEN|KEY))=("[^"]*"|'[^']*'|[^\s]+)/g,
+    "$1=<redacted>",
+  );
+}
+
+function redactCommandError(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  const scrubbed = error as Error & { cmd?: string; stdout?: unknown; stderr?: unknown };
+  scrubbed.message = redactSecrets(scrubbed.message);
+  if (typeof scrubbed.cmd === "string") scrubbed.cmd = redactSecrets(scrubbed.cmd);
+  if (typeof scrubbed.stdout === "string") scrubbed.stdout = redactSecrets(scrubbed.stdout);
+  if (typeof scrubbed.stderr === "string") scrubbed.stderr = redactSecrets(scrubbed.stderr);
+  if (typeof scrubbed.stack === "string") scrubbed.stack = redactSecrets(scrubbed.stack);
+  return scrubbed;
+}
+
 async function sh(cmd: string, args: string[], timeout = 8000): Promise<{ stdout: string }> {
-  const { stdout } = await run(cmd, args, {
-    timeout,
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    env: { ...process.env, PATH: augmentedPath() },
-  });
-  return { stdout };
+  try {
+    const { stdout } = await run(cmd, args, {
+      timeout,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      env: { ...process.env, PATH: augmentedPath() },
+    });
+    return { stdout };
+  } catch (error) {
+    throw redactCommandError(error);
+  }
 }
 
 async function installed(
@@ -533,6 +633,43 @@ export function cuaExecArgs(
   ];
 }
 
+/** PATH entries that must resolve to the root-owned driver binary.  Fresh
+ * images get them from the Dockerfile; containers built before that change
+ * never will, and bumping IMAGE_LAYER_VERSION to force it would replace
+ * every running container under the bots using it. */
+export const CUA_PATH_SHIMS = ["/usr/local/bin/cua-driver", "/opt/venv/bin/cua-driver"] as const;
+
+/** Idempotent shell that (re)creates the PATH shims.  A no-op when the driver
+ * binary is absent or a shim already points at it. */
+export function healCuaShimsScript(): string {
+  const links = CUA_PATH_SHIMS.map(
+    (shim) =>
+      `[ -d "$(dirname ${shim})" ] && [ "$(readlink ${shim} 2>/dev/null)" != "${CUA_EXECUTABLE}" ] && ln -sf ${CUA_EXECUTABLE} ${shim}`,
+  );
+  return [`[ -x ${CUA_EXECUTABLE} ] || exit 0`, ...links.map((link) => `${link} || true`), "exit 0"].join("; ");
+}
+
+/** `exec` argv (as root) that heals the shims inside one container. */
+export function healCuaShimsExecArgs(container: string): string[] {
+  return ["exec", "-u", "root", container, "sh", "-c", healCuaShimsScript()];
+}
+
+const shimHealedAt = new Map<string, number>();
+const SHIM_HEAL_TTL_MS = 10 * 60_000;
+
+/** True at most once per `ttlMs` for a key.  Healing is best-effort and must
+ * not add a root exec (an SSH round trip on a VPS) to every bot turn. */
+export function shouldHealCuaShims(key: string, now = Date.now(), ttlMs = SHIM_HEAL_TTL_MS): boolean {
+  const last = shimHealedAt.get(key);
+  if (last !== undefined && now - last < ttlMs) return false;
+  shimHealedAt.set(key, now);
+  return true;
+}
+
+export function resetCuaShimHealGate(): void {
+  shimHealedAt.clear();
+}
+
 export async function containerComputerStatus(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
@@ -610,8 +747,11 @@ export async function containerComputerStatus(
         ? "durable"
         : "unsafe";
       const resources = detail?.configuration?.resources;
+      const declared = limitsFromLabels(detail?.configuration?.labels);
       status.security =
-        (resources?.memoryInBytes ?? 0) >= MEMORY_BYTES && resources?.cpus === CONTAINER_CPUS ? "hardened" : "unsafe";
+        (resources?.memoryInBytes ?? 0) >= declared.memoryGib * 1024 ** 3 && resources?.cpus === declared.cpus
+          ? "hardened"
+          : "unsafe";
       status.viewer_url = viewerUrl(viewerPassword(detail?.configuration?.environment), status.viewer_port);
     } else {
       const inspected = JSON.parse(stdout) as Array<{
@@ -651,8 +791,13 @@ export async function containerComputerStatus(
       ) ? "durable" : "unsafe";
       status.security = (
         status.runtime === "podman"
-          ? podmanSecurityIsHardened(detail?.HostConfig, detail?.EffectiveCaps, detail?.BoundingCaps)
-          : dockerSecurityIsHardened(detail?.HostConfig)
+          ? podmanSecurityIsHardened(
+              detail?.HostConfig,
+              detail?.EffectiveCaps,
+              detail?.BoundingCaps,
+              declaredHardening(detail?.Config?.Labels),
+            )
+          : dockerSecurityIsHardened(detail?.HostConfig, declaredHardening(detail?.Config?.Labels))
       ) ? "hardened" : "unsafe";
       status.viewer_url = viewerUrl(viewerPassword(detail?.Config?.Env), status.viewer_port);
     }
@@ -994,6 +1139,7 @@ export function podmanSecurityIsHardened(
   config: DockerHardeningConfig | undefined,
   effectiveCaps: string[] | undefined,
   boundingCaps: string[] | undefined,
+  options: { memoryBytes?: number; nanoCpus?: number } = {},
 ): boolean {
   if (!config) return false;
   const normalizeCaps = (caps: string[] | undefined) => (caps ?? [])
@@ -1009,7 +1155,17 @@ export function podmanSecurityIsHardened(
     PidMode: config.PidMode === "private" ? "" : config.PidMode,
     UTSMode: config.UTSMode === "private" ? "" : config.UTSMode,
     CgroupnsMode: config.CgroupnsMode || "private",
-  });
+  }, options);
+}
+
+/** The exact caps a container declared at creation (see `limitsFromLabels`),
+ * as the byte and nano-CPU figures the runtime reports back. */
+function declaredHardening(labels: Record<string, string> | undefined | null): {
+  memoryBytes: number;
+  nanoCpus: number;
+} {
+  const declared = limitsFromLabels(labels);
+  return { memoryBytes: declared.memoryGib * 1024 ** 3, nanoCpus: declared.cpus * 1_000_000_000 };
 }
 
 /** Where the well-known host names point inside a managed container.
@@ -1085,8 +1241,11 @@ export function containerRunArgs(
   password = "CHANGE_ME",
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
   platform: NodeJS.Platform = process.platform,
-  options?: { shareCliCredentials?: boolean; homeDir?: string },
+  options?: { shareCliCredentials?: boolean; homeDir?: string; limits?: ContainerLimits },
 ): string[] {
+  const limits = clampContainerLimits(options?.limits ?? DEFAULT_CONTAINER_LIMITS);
+  const memoryArg = `${limits.memoryGib}g`;
+  const cpusArg = String(limits.cpus);
   if (runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key) {
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
   }
@@ -1104,14 +1263,16 @@ export function containerRunArgs(
     `${WORKSPACE_LABEL}=1`,
     "--label",
     `${TARGET_LABEL}=${target.label}`,
+    "--label",
+    `${LIMITS_LABEL}=${limitsLabelValue(limits)}`,
   );
   if (runtime === "container") {
     // Apple container already places each Linux container in a lightweight VM.
     common.push(
       "--memory",
-      CONTAINER_MEMORY_ARG,
+      memoryArg,
       "--cpus",
-      CONTAINER_CPUS_ARG,
+      cpusArg,
       "--cap-drop",
       "ALL",
       "--cap-add",
@@ -1126,11 +1287,11 @@ export function containerRunArgs(
       "--hostname",
       target.containerName,
       "--memory",
-      CONTAINER_MEMORY_ARG,
+      memoryArg,
       "--memory-swap",
-      CONTAINER_MEMORY_ARG,
+      memoryArg,
       "--cpus",
-      CONTAINER_CPUS_ARG,
+      cpusArg,
       "--pids-limit",
       String(PIDS_LIMIT),
       // Pinned explicitly rather than trusting daemon defaults: the shared
@@ -1223,6 +1384,36 @@ async function prepareManagedImage(runtime: Runtime, runner: CommandRunner): Pro
   }
 }
 
+/** True when nothing is listening on this loopback port right now. */
+export function loopbackPortFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.once("error", () => resolve(false));
+    server.listen({ port, host: "127.0.0.1", exclusive: true }, () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+function configuredContainerLimits(): Partial<ContainerLimits> {
+  try {
+    const localVm = loadConfig()?.localVm;
+    return { cpus: localVm?.cpus, memoryGib: localVm?.memoryGib };
+  } catch {
+    return {};
+  }
+}
+
+/** Whether the workspace opted into mounting the host's CLI credentials
+ * read-only.  Best-effort: an unreadable config means "no". */
+function shareCliCredentialsConfigured(): boolean {
+  try {
+    return Boolean(loadConfig()?.localVm?.shareCliCredentials);
+  } catch {
+    return false;
+  }
+}
+
 export async function containerComputerAction(
   action: LifecycleAction,
   runner: CommandRunner = sh,
@@ -1258,15 +1449,20 @@ export async function containerComputerAction(
     await prepareManagedImage(runtime, runner);
   } else {
     if (action === "run") await ensureVmWorkspace(platform, target);
-    let shareCliCredentials = false;
-    try {
-      shareCliCredentials = Boolean(loadConfig()?.localVm?.shareCliCredentials);
-    } catch {
-      // Best-effort config read
-    }
+    const shareCliCredentials = shareCliCredentialsConfigured();
+    const limits = action === "run" ? await resolveContainerLimits(runtime, runner, configuredContainerLimits()) : undefined;
+    // The historical shared target asks for host port 6080.  A second OS user
+    // on the same Mac (or anything else already on 6080) must not make the
+    // Local VM fail to start, so a busy port falls back to an ephemeral
+    // loopback one — status reads the port the runtime really bound.  Apple
+    // `container` cannot publish an ephemeral port, so it keeps the fixed one.
+    const runTarget =
+      action === "run" && runtime !== "container" && target.viewerPort && !(await loopbackPortFree(target.viewerPort))
+        ? { ...target, viewerPort: null }
+        : target;
     const args =
       action === "run"
-        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target, platform, { shareCliCredentials })
+        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), runTarget, platform, { shareCliCredentials, limits })
         : action === "remove"
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
@@ -1491,7 +1687,7 @@ export function setupCommands(
     run:
       runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key
         ? null
-        : command(containerRunArgs(runtime, "CHANGE_ME", target, platform)),
+        : command(containerRunArgs(runtime, "CHANGE_ME", target, platform, { shareCliCredentials: shareCliCredentialsConfigured() })),
     start: null,
     stop: command(["stop", target.containerName]),
     remove: command(["rm", runtime === "container" ? "--force" : "-f", target.containerName]),

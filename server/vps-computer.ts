@@ -17,6 +17,9 @@ import {
   IMAGE as CUA_IMAGE,
   cuaExecArgs,
   dockerSecurityIsHardened,
+  healCuaShimsExecArgs,
+  redactSecrets,
+  shouldHealCuaShims,
   imageLabelsMatch,
   managedImageDockerfile,
   wholeScreenshot,
@@ -157,6 +160,51 @@ const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
 /** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
 const botSessionLocks = new Map<string, Promise<void>>();
+/** Concurrent shared-mode provisions of the one container coalesce into a
+ * single flight.  Provision is the idempotent turn-start path: when N bots
+ * start turns together, serialising N inspections behind a 5 s acquire timeout
+ * made the later bots fail with a spurious "VPS is being prepared" 409. */
+const provisionFlights = new Map<string, Promise<VpsComputerStatus>>();
+/** Automatic CLI credential sync is rate-limited: it runs at most once per
+ * container id per TTL, concurrent callers share one in-flight sync, and a
+ * failure backs off briefly rather than retrying on every bot turn.  The
+ * manual Sync button calls vpsSyncCliCredentials directly and is never gated. */
+const CLI_SYNC_TTL_MS = 10 * 60_000;
+const CLI_SYNC_FAILURE_BACKOFF_MS = 60_000;
+const cliSyncState = new Map<string, { containerId: string; until: number }>();
+const cliSyncFlights = new Map<string, Promise<void>>();
+
+export function resetVpsCliSyncThrottle(): void {
+  cliSyncState.clear();
+  cliSyncFlights.clear();
+  provisionFlights.clear();
+}
+
+async function autoSyncCliCredentials(
+  cfg: AppConfig,
+  target: VpsTarget,
+  containerId: string,
+  runner: VpsCommandRunner,
+): Promise<void> {
+  const key = `${vpsSshAlias(cfg) ?? ""}:${target.containerName}`;
+  const known = cliSyncState.get(key);
+  if (known && known.containerId === containerId && Date.now() < known.until) return;
+  const flight = cliSyncFlights.get(key);
+  if (flight) return flight;
+  const started = vpsSyncCliCredentials(cfg, target, runner).then(
+    () => {
+      cliSyncState.set(key, { containerId, until: Date.now() + CLI_SYNC_TTL_MS });
+    },
+    (err) => {
+      cliSyncState.set(key, { containerId, until: Date.now() + CLI_SYNC_FAILURE_BACKOFF_MS });
+      console.warn(`[vps] automatic CLI credentials sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    },
+  ).finally(() => {
+    cliSyncFlights.delete(key);
+  });
+  cliSyncFlights.set(key, started);
+  return started;
+}
 // A held lock means a lifecycle mutation (worst case: a 10-minute image
 // build) is running. Waiting it out would wedge Sleep and the screenshot
 // poll behind it, so acquisition fails fast instead.
@@ -409,7 +457,7 @@ export function defaultRunner(args: string[], options: VpsCommandOptions = {}): 
       }
       settle(() => {
         if (code === 0) return resolve({ stdout: stdout.text(), stderr: stderr.text() });
-        const detail = stderr.text().trim().slice(-1000);
+        const detail = redactSecrets(stderr.text().trim().slice(-1000));
         reject(new Error(detail || `Docker-over-SSH exited ${code ?? signal ?? "without a status"}`));
       });
     });
@@ -546,6 +594,13 @@ async function ensureSharedVpsBotSession(
   const session = vpsSharedBotSession(botId);
   const sessionKey = vpsBotSessionLockKey(cfg, botId);
   const runEnsure = async () => {
+    // Best effort and throttled: containers built before the image gained the
+    // PATH symlinks are repaired in place rather than replaced under the bots.
+    if (shouldHealCuaShims(`${alias}:${containerRef}`)) {
+      await runner(vpsDockerArgs(alias, healCuaShimsExecArgs(containerRef)), { timeoutMs: 20_000 }).catch(
+        () => undefined,
+      );
+    }
     await runner(vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)), {
       timeoutMs: 90_000,
     });
@@ -1021,16 +1076,29 @@ export async function vpsComputerAction(
       statusCache.delete(key);
     }
   };
-  const after = await withVpsLifecycleLock(key, operation);
+  let after: VpsComputerStatus;
+  if (action === "provision" && isSharedVpsMode(cfg)) {
+    // Every bot's turn-start provision targets the same container and is
+    // idempotent, so concurrent ones share one flight instead of queueing.
+    let flight = provisionFlights.get(key);
+    if (!flight) {
+      flight = withVpsLifecycleLock(key, operation).finally(() => {
+        provisionFlights.delete(key);
+      });
+      provisionFlights.set(key, flight);
+    }
+    after = await flight;
+  } else {
+    after = await withVpsLifecycleLock(key, operation);
+  }
   if (isSharedVpsMode(cfg) && after.ready && (after.container_id ?? after.container_name)) {
     await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
   }
   if (cfg.localVm?.shareCliCredentials && after.ready && (action === "provision" || action === "start")) {
-    await vpsSyncCliCredentials(cfg, target, runner).catch((err) => {
-      console.warn(`[vps] automatic CLI credentials sync failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    await autoSyncCliCredentials(cfg, target, after.container_id ?? after.container_name, runner);
   }
   return after;
+
 }
 
 export interface VpsSyncCredentialsResult {

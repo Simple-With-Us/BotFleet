@@ -1,5 +1,12 @@
 import { botDesktopSession } from "./bot-desktop-session.ts";
-import { CUA_EXECUTABLE, cuaExecArgs, defaultCommandRunner, type CommandRunner } from "./container-computer.ts";
+import {
+  CUA_EXECUTABLE,
+  cuaExecArgs,
+  defaultCommandRunner,
+  healCuaShimsExecArgs,
+  shouldHealCuaShims,
+  type CommandRunner,
+} from "./container-computer.ts";
 import type { BotDesktopSession } from "./bot-desktop-session.ts";
 import type { AppConfig } from "./config.ts";
 
@@ -101,5 +108,11 @@ export async function ensureContainerComputerSession(
   botId: string,
   runner: CommandRunner = defaultCommandRunner,
 ): Promise<void> {
+  // Best effort: a container built before the image gained the PATH symlinks
+  // is repaired here instead of by replacing it under the bots that use it.
+  if (shouldHealCuaShims(`${runtime}:${containerName}`)) {
+    await runner(runtime, healCuaShimsExecArgs(containerName), 15_000).catch(() => undefined);
+  }
   await runner(runtime, ensureLocalVmSessionExecArgs(containerName, localVmSharedBotSession(botId)), 60_000);
 }
+
