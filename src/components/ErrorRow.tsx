@@ -8,6 +8,15 @@ import { openSentryFeedback } from "@/lib/sentry";
 
 export const ERROR_RECOVERY_EVENT = "omb-error-recovery";
 
+/**
+ * Ensures two visible spaces between sentences in rendered HTML/JSX copy.
+ * Replaces sentence-ending punctuation followed by whitespace with \u00A0 .
+ */
+export function formatSentenceGap(text: string): string {
+  if (!text) return "";
+  return text.replace(/([.!?])\s+(?=[A-Z0-9"'])/g, "$1\u00A0 ");
+}
+
 export type ErrorRecoveryAction =
   | "switch-model"
   | "add-key"
@@ -217,7 +226,7 @@ function ErrorRow({
       <div className="w-fit max-w-[min(42rem,78%)] rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-2.5 text-[13.5px] text-danger">
         <div className="flex items-start gap-2">
           <AlertTriangle size={15} className="mt-0.5 shrink-0" />
-          <span className="min-w-0 break-words">{message}</span>
+          <span className="min-w-0 break-words">{formatSentenceGap(message)}</span>
         </div>
         {setupInstance && !(setupInstance.snapshot.state === "available" && setupInstance.snapshot.authenticated !== false) ? (
           <div className="mt-2 flex flex-col gap-2">

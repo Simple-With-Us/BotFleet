@@ -72,6 +72,15 @@ export interface MinimalBot {
   activity?: "working" | "waiting-on-you" | "idle" | "no-signal" | "dead";
   unread?: boolean;
   hidden?: boolean;
+  hasError?: boolean;
+  errorReason?: string;
+  messages?: readonly { kind: string; tool?: { name: string } }[];
+}
+
+export function isBotTurnError(bot: { messages?: readonly { kind: string; tool?: { name: string } }[] }): boolean {
+  if (!bot.messages || bot.messages.length === 0) return false;
+  const last = bot.messages[bot.messages.length - 1];
+  return last?.kind === "activity" && Boolean(last.tool?.name.startsWith("error:"));
 }
 
 export interface MinimalGroup {
@@ -108,13 +117,25 @@ export function computeRoomAttentionIndex(
 
       // 1. Errors: dead activity or terminal unresolved failures
       const errorBots: AttentionParticipant[] = assignedBots
-        .filter((b) => b.activity === "dead")
-        .map((b) => ({
-          botId: b.id,
-          botName: b.name,
-          avatarUrl: b.avatarUrl,
-          reason: "Process terminated or dead harness",
-        }));
+        .filter((b) => b.activity === "dead" || b.hasError || isBotTurnError(b))
+        .map((b) => {
+          const turnError = isBotTurnError(b);
+          const errorDetail = turnError && b.messages
+            ? b.messages[b.messages.length - 1].tool?.name.slice(6).trim()
+            : undefined;
+          return {
+            botId: b.id,
+            botName: b.name,
+            avatarUrl: b.avatarUrl,
+            reason:
+              b.errorReason ||
+              (b.activity === "dead"
+                ? "Process terminated or dead harness"
+                : errorDetail
+                  ? `Turn error: ${errorDetail}`
+                  : "Active error"),
+          };
+        });
 
       // 2. Needs Action: waiting-on-you (prompts, permissions, confirmation)
       const needsActionBots: AttentionParticipant[] = assignedBots

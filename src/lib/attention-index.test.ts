@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   computeRoomAttentionIndex,
+  isBotTurnError,
   summarizeFleetAttention,
   type MinimalBot,
   type MinimalGroup,
@@ -183,5 +184,34 @@ describe("computeRoomAttentionIndex", () => {
     expect(summary.totalWorking).toBe(1);
     expect(summary.roomsWithUnread).toBe(1);
     expect(summary.totalUnread).toBe(2);
+  });
+
+  it("includes bots with active turn errors in room errors and reasons", () => {
+    const groups: MinimalGroup[] = [
+      {
+        id: "group-bf",
+        name: "BotFleet",
+        memberIds: ["bot-err"],
+        unread: false,
+      },
+    ];
+
+    const bots: MinimalBot[] = [
+      {
+        id: "bot-err",
+        name: "Builder",
+        activity: "idle",
+        messages: [
+          { kind: "text" },
+          { kind: "activity", tool: { name: "error: rate limit from provider" } },
+        ],
+      },
+    ];
+
+    expect(isBotTurnError(bots[0])).toBe(true);
+    const result = computeRoomAttentionIndex(groups, bots);
+    expect(result[0].errors.count).toBe(1);
+    expect(result[0].errors.bots[0].botName).toBe("Builder");
+    expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
   });
 });

@@ -595,7 +595,7 @@ function ThreadListItem({
             });
           }
         }}
-        title={`${label}\u00a0 — double-click to rename, drag onto a bot to move, onto a thread to merge`}
+        title={`${label}\u00a0 — Double-click to rename, drag onto a bot to move, onto a thread to merge`}
         className={cn(
           "flex w-full min-w-0 items-center gap-2 rounded-lg py-1 pr-2 text-left transition-colors",
           density === "compact" ? "pl-8" : "pl-9",
@@ -1812,10 +1812,25 @@ export function BotListItem({
   const activityAt = latestChatActivity(bot.tasks, last?.at, bot.createdAt ?? 0);
   const waitReason = botWaitReason(bot, last, state.bots);
   const previewText = preview(bot, last, state.bots, state.groups);
-  // Icon shape ported from upstream's SidebarBotActivity: CircleAlert for
-  // anything needing a person or naming a teammate, a spinning Loader2 as
-  // the fallback for plain busy work, nothing for idle.
-  const StatusIcon = waitReason ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert) : bot.busy ? Loader2 : null;
+  const hasTurnError = last?.kind === "activity" && Boolean(last.tool?.name.startsWith("error:"));
+  const isDead = bot.activity === "dead";
+  const hasError = hasTurnError || isDead;
+  const needsAction = waitReason?.kind === "approval" || bot.activity === "waiting-on-you";
+  // Icon shape ported from upstream's SidebarBotActivity: CircleAlert in red
+  // for turn errors or dead bot, CircleAlert/Clock3 in warning for approvals/questions,
+  // spinning Loader2 as the fallback for plain busy work, nothing for idle.
+  const StatusIcon = hasError
+    ? CircleAlert
+    : waitReason
+      ? (waitReason.kind === "teammate" ? Clock3 : CircleAlert)
+      : bot.busy
+        ? Loader2
+        : null;
+  const displayPreviewText = hasTurnError
+    ? `Error: ${last!.tool!.name.slice(6).trim()}`
+    : isDead
+      ? "Process terminated"
+      : previewText;
   const rowClass = cn(
     "flex w-full items-center rounded-xl border text-left select-none cursor-pointer",
     iconOnly
@@ -1833,7 +1848,7 @@ export function BotListItem({
   );
   const body = (
     <>
-      <div className="shrink-0 pointer-events-none">
+      <div className="shrink-0 pointer-events-none relative">
         <BotAvatar
           bot={bot}
           state={stateForBot({ ...bot, messages: visible })}
@@ -1846,6 +1861,24 @@ export function BotListItem({
           // decorative; busy/unread/motion are the real signals).
           animated={Boolean(bot.busy) || Boolean(bot.unread) || (mascotMotion?.kind ?? "none") !== "none"}
         />
+        {iconOnly && (
+          hasError ? (
+            <span
+              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated"}
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-danger ring-2 ring-card"
+            />
+          ) : needsAction ? (
+            <span
+              title={waitReason?.kind === "approval" ? "Waiting for your approval" : "Waiting for your response"}
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-warning ring-2 ring-card"
+            />
+          ) : bot.unread ? (
+            <span
+              title="Unread messages"
+              className="absolute -top-0.5 -right-0.5 size-2.5 rounded-full bg-accent ring-2 ring-card"
+            />
+          ) : null
+        )}
       </div>
       <div className={cn("min-w-0 flex-1", iconOnly && "hidden")}>
         <div className="flex items-baseline justify-between gap-2">
@@ -1883,13 +1916,13 @@ export function BotListItem({
         </div>
         <div className="flex items-center justify-between gap-2 select-none">
           <span className="flex min-w-0 items-center gap-1.5 truncate text-[13px] text-ink-secondary select-none">
-            {bot.chiefOfStaff && !bot.busy && !waitReason && (
+            {bot.chiefOfStaff && !bot.busy && !waitReason && !hasError && (
               <span className="flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-accent">
                 <Crown size={11} /> Chief of Staff
               </span>
             )}
-            {bot.chiefOfStaff && !bot.busy && !waitReason && previewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
-            {bot.chiefOfStaff && (bot.busy || waitReason) && (
+            {bot.chiefOfStaff && !bot.busy && !waitReason && !hasError && displayPreviewText && <span className="shrink-0 text-ink-secondary/60">·</span>}
+            {bot.chiefOfStaff && (bot.busy || waitReason || hasError) && (
               <span title="Chief of Staff" className="flex shrink-0 items-center">
                 <Crown size={11} className="text-accent" />
               </span>
@@ -1898,16 +1931,35 @@ export function BotListItem({
               <StatusIcon
                 size={11}
                 aria-hidden="true"
-                className={cn("shrink-0", waitReason ? "text-warning" : "animate-spin text-success")}
+                className={cn(
+                  "shrink-0",
+                  hasError ? "text-danger" : waitReason ? "text-warning" : "animate-spin text-success",
+                )}
               />
             )}
-            <span className={cn("truncate select-none", (bot.busy || waitReason) && "font-medium text-ink")} title={previewText}>
-              {previewText}
+            <span className={cn("truncate select-none", (bot.busy || waitReason || hasError) && "font-medium text-ink")} title={displayPreviewText}>
+              {displayPreviewText}
             </span>
           </span>
-          {bot.unread && (
-            <span className="size-2 shrink-0 rounded-full bg-accent" />
-          )}
+          {hasError ? (
+            <span
+              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated or dead harness"}
+              className="size-2 shrink-0 rounded-full bg-danger ring-2 ring-danger/30"
+              aria-label="Error"
+            />
+          ) : needsAction ? (
+            <span
+              title={waitReason?.kind === "approval" ? "Waiting for your approval" : "Waiting for your response"}
+              className="size-2 shrink-0 rounded-full bg-warning ring-2 ring-warning/30"
+              aria-label="Needs Action"
+            />
+          ) : bot.unread ? (
+            <span
+              title="Unread messages"
+              className="size-2 shrink-0 rounded-full bg-accent"
+              aria-label="Unread"
+            />
+          ) : null}
         </div>
       </div>
     </>

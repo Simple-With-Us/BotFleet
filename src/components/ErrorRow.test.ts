@@ -6,6 +6,7 @@ import {
   ErrorRow,
   TurnErrorAnnouncement,
   advanceTurnErrorLiveState,
+  formatSentenceGap,
   isComputerDispatchError,
   isProviderError,
   latestTurnErrorMessage,
@@ -164,5 +165,16 @@ describe("ErrorRow recovery", () => {
     );
     expect(html).toContain("Report Problem");
     expect(html).toContain("Install Kimi");
+  });
+
+  it("formats sentences with two visible spaces in rendered copy", () => {
+    expect(formatSentenceGap("Error occurred. Please try again.")).toBe("Error occurred.\u00A0 Please try again.");
+    expect(formatSentenceGap("Single sentence.")).toBe("Single sentence.");
+    const html = renderToStaticMarkup(
+      createElement(ErrorRow, {
+        message: "The task failed. Please retry.",
+      }),
+    );
+    expect(html).toContain("The task failed.\u00A0 Please retry.");
   });
 });
