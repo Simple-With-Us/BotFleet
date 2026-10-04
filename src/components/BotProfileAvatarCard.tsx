@@ -97,7 +97,7 @@ export function BotProfileAvatarCard({
         <div
           role="button"
           tabIndex={0}
-          aria-label="Bot avatar.\u00a0 Drop an image here to change it."
+          aria-label={"Bot avatar.\u00a0 Drop an image here to change it."}
           className={cn(
             "flex justify-center rounded-xl py-3 transition-colors",
             dragOver ? "bg-accent/10 ring-2 ring-accent-border" : "bg-transparent",
