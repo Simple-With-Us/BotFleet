@@ -55,11 +55,9 @@ describe("parsePersonalVoiceList", () => {
     ]);
   });
 
-  it("treats a malformed list as empty rather than throwing", () => {
-    // `[]` is the normal answer from a Mac that cannot build the helper, so a
-    // shape change must read the same as "no personal voices", not crash.
+  it("rejects a malformed list by throwing a validation error", () => {
     for (const bad of [null, undefined, {}, "personal:x", [{ id: "personal:x" }], 42]) {
-      expect(parsePersonalVoiceList(bad)).toEqual([]);
+      expect(() => parsePersonalVoiceList(bad)).toThrow();
     }
   });
 });
@@ -75,8 +73,8 @@ describe("parseTtsVoicesResponse", () => {
     });
   });
 
-  it("treats a malformed response as empty", () => {
-    expect(parseTtsVoicesResponse({ voices: "nope" })).toEqual({});
-    expect(parseTtsVoicesResponse(null)).toEqual({});
+  it("rejects a malformed response by throwing a validation error", () => {
+    expect(() => parseTtsVoicesResponse({ voices: "nope" })).toThrow();
+    expect(() => parseTtsVoicesResponse(null)).toThrow();
   });
 });

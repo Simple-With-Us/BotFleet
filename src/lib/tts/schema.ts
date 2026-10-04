@@ -53,11 +53,13 @@ export type TtsVoicesResponse = z.infer<typeof TtsVoicesResponseSchema>;
  */
 export function parsePersonalVoiceList(value: unknown): PersonalVoiceInfo[] {
   const parsed = PersonalVoiceListSchema.safeParse(value);
-  return parsed.success ? parsed.data : [];
+  if (!parsed.success) throw parsed.error;
+  return parsed.data;
 }
 
 /** Same contract for the harness voice list. */
 export function parseTtsVoicesResponse(value: unknown): TtsVoicesResponse {
   const parsed = TtsVoicesResponseSchema.safeParse(value);
-  return parsed.success ? parsed.data : {};
+  if (!parsed.success) throw parsed.error;
+  return parsed.data;
 }

@@ -34,7 +34,7 @@ export function browserDesktopCapabilities(): DesktopCapabilities {
 }
 
 export function initialDesktopCapabilities(): DesktopCapabilities {
-  const platform = window.ogb?.platform;
+  const platform = typeof window !== "undefined" ? window.ogb?.platform : undefined;
   if (!platform) return browserCapabilities;
   const isMac = platform === "darwin";
   const dictation: DesktopCapabilities["dictation"] = {
@@ -61,7 +61,7 @@ export function initialDesktopCapabilities(): DesktopCapabilities {
 
 export async function loadDesktopCapabilities(): Promise<DesktopCapabilities> {
   if (cached) return cached;
-  if (!window.ogb?.getCapabilities) return browserCapabilities;
+  if (typeof window === "undefined" || !window.ogb?.getCapabilities) return browserCapabilities;
   const revisionAtStart = cacheRevision;
   let loaded: DesktopCapabilities;
   try {

@@ -14657,14 +14657,15 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         textToSpeak = await voiceSummaryFor(threadId, messageId, message.text, cfg);
       }
       const utterances = toUtterances(textToSpeak);
-      if (utterances.length > 64 || utterances.join("").length > 12000) return json(res, 413, { error: "reply exceeds voice clip limit" });
+      if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000) {
+        return json(res, 413, { error: "reply exceeds voice clip limit" });
+      }
       if (tts.isPersonalVoice(owner.voice)) {
         return json(res, 200, { audio: [], voiceText: textToSpeak, utterances, onDevice: true, personalVoice: true });
       }
       if (audioIntact() && message.audio!.length === utterances.length) {
         return json(res, 200, { audio: message.audio, voiceText: textToSpeak, utterances });
       }
-      if (!utterances.length) return json(res, 413, { error: "reply exceeds voice clip limit" });
       const key = `${threadId}:${messageId}`;
       let job = voiceJobs.get(key);
       if (!job) {

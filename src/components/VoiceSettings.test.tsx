@@ -30,6 +30,25 @@ vi.mock("@/state/store", async (importOriginal) => {
   };
 });
 
+let mockPersonalVoice = false;
+vi.mock("./DesktopCapabilities", () => ({
+  useDesktopCapabilities: () => ({
+    capabilities: {
+      host: { platform: "darwin", label: "macOS", session: "desktop", packaged: true },
+      windowChrome: "mac-inset",
+      screenPreview: { available: false, interaction: "none" },
+      dictation: {
+        available: true,
+        engine: "apple-speech",
+        onDevice: true,
+        personalVoice: mockPersonalVoice,
+      },
+      localComputer: { available: false, support: "unsupported", enabled: false, status: "unavailable" },
+    },
+    ready: true,
+  }),
+}));
+
 import { VoiceSettings } from "./VoiceSettings";
 import type { Bot, ConfigStatus } from "@/state/store";
 
@@ -57,6 +76,7 @@ describe("VoiceSettings", () => {
   });
 
   it("enables Try button when desktop personalVoice speak bridge is available", () => {
+    mockPersonalVoice = true;
     const origWindow = globalThis.window;
     try {
       globalThis.window = {
@@ -75,6 +95,7 @@ describe("VoiceSettings", () => {
       expect(html).toContain("title=\"Hear this Apple Personal Voice\"");
       expect(html).toContain("aria-label=\"Hear this Apple Personal Voice\"");
     } finally {
+      mockPersonalVoice = false;
       globalThis.window = origWindow;
     }
   });

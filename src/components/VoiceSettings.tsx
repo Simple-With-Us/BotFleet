@@ -9,6 +9,7 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
 import { parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 
@@ -23,6 +24,7 @@ export function VoiceSettings({
   onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">>) => void;
 }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
   const tts = state.config?.tts;
 
   const [key, setKey] = useState("");
@@ -203,7 +205,9 @@ export function VoiceSettings({
   const selectedVoice = bot.voice ?? "";
   const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   const isSelectedPersonal = isPersonalVoice(selectedVoice);
-  const canSpeakPersonal = Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
+  const canSpeakPersonal =
+    capabilities.dictation.personalVoice === true &&
+    Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
   const ready = configured && Boolean(selectedVoice || tts.voice);
   const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
   const previewTitle = isSelectedPersonal
