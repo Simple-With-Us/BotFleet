@@ -1194,7 +1194,16 @@ function formatHoverTime(at: number) {
 }
 
 export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
-  const bot = explicitThreadId && explicitThreadId !== originalBot.threadId ? { ...originalBot, threadId: explicitThreadId } : originalBot;
+  // A pin onto a different thread for App views.  Memoized so the derived
+  // object keeps a stable identity across renders and effects don't churn
+  // when the pin isn't shadowing anything.
+  const bot = useMemo(
+    () =>
+      explicitThreadId && explicitThreadId !== originalBot.threadId
+        ? { ...originalBot, threadId: explicitThreadId }
+        : originalBot,
+    [originalBot, explicitThreadId],
+  );
   const { state, dispatch } = useStore();
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips

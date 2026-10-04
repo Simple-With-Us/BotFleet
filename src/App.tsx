@@ -386,7 +386,7 @@ function Shell() {
               setSelectedAppId(appId);
               const b = state.bots.find(x => x.id === botId);
               const tasks = b?.tasks ?? [];
-              const explicitTask = tasks.find(t => t.workspaceContext?.appRef === appId);
+              const explicitTask = tasks.find(t => t.workspaceContext?.appRef.id === appId);
               const threadId = explicitTask?.threadId ?? b?.threadId;
               dispatch({ type: "select", id: botId, viewedThreadId: threadId });
             }}
@@ -418,7 +418,7 @@ function Shell() {
                   // Find the bot's thread for this app
                   const bot = state.bots.find(b => b.id === botId);
                   const tasks = bot?.tasks ?? [];
-                  const explicitTask = tasks.find(t => t.workspaceContext?.appRef === appId);
+                  const explicitTask = tasks.find(t => t.workspaceContext?.appRef.id === appId);
                   // If no specific thread exists yet, we just fall back to bot's active thread or a new selection state.
                   // But `viewedThreadId` will hold the explicitly chosen thread.
                   const threadId = explicitTask?.threadId ?? bot?.threadId;

@@ -1460,7 +1460,10 @@ export function reducer(state: AppState, action: Action): AppState {
       const bots = state.bots.filter((b) => b.id !== action.botId);
       const selectedId =
         state.selectedId === action.botId ? (bots.find((b) => !b.hidden)?.id ?? bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, bots, selectedId };
+      // A thread pin onto the deleted bot's thread would dangle — and even
+      // without a deletion, the pin belongs to the old selection.
+      const viewedThreadId = state.selectedId === action.botId ? null : state.viewedThreadId;
+      return { ...state, bots, selectedId, viewedThreadId };
     }
     case "markUnread": {
       const next = updateBot(withMascotMotion(state, action.botId, "surprise"), action.botId, (b) => ({ ...b, unread: true }));
@@ -1994,8 +1997,12 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
     }
-    case "taskSwitched":
-      return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+    case "taskSwitched": {
+      const next = updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+      // The pin points at a thread; the active thread just changed, so the
+      // pin is stale.  Clearing it is a no-op when it already agreed.
+      return state.selectedId === action.bot.id ? { ...next, viewedThreadId: null } : next;
+    }
     case "newBot":
     case "duplicateBot":
     case "interrupt":
