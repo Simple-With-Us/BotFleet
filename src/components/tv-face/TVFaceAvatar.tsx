@@ -132,6 +132,65 @@ export function planFrame(
   return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
 }
 
+function tvFaceAssetPath(
+  skinDir: string,
+  expr: TVFaceExpression,
+  type: "enter" | "hold" | "return",
+  animated: boolean,
+  isStill = false,
+): string {
+  const base = `/tv-face/skins/${skinDir}`;
+  if (isStill || !animated) {
+    return `${base}/stills/${expr}.png`;
+  }
+  return `${base}/gifs/${expr}_${type}.gif`;
+}
+
+function imgKeyForStep(skinDir: string, step: FrameStep, holdEpoch: number): string {
+  if (step.kind === "hold") {
+    return `${skinDir}:${step.expression}:hold:${holdEpoch}`;
+  }
+  return `${skinDir}:${step.expression}:${step.kind}`;
+}
+
+function pathForStepMedia(skinDir: string, step: FrameStep, animated: boolean): string {
+  if (step.kind === "still") return tvFaceAssetPath(skinDir, step.expression, "hold", animated, true);
+  return tvFaceAssetPath(skinDir, step.expression, step.kind, animated);
+}
+
+/** First paint must match the mount effect's first frame so `key` does not flip. */
+function initialFrameMedia(
+  expression: TVFaceExpression,
+  skinDir: string,
+  animated: boolean,
+): { src: string; imgKey: string; holdEpoch: number } {
+  if (!animated) {
+    return {
+      src: tvFaceAssetPath(skinDir, expression, "hold", false, true),
+      imgKey: `${skinDir}:${expression}:still`,
+      holdEpoch: 0,
+    };
+  }
+
+  const prevFrame: TVFaceFrame = { expression: RESTING, skin: skinDir };
+  const nextFrame: TVFaceFrame = { expression, skin: skinDir };
+
+  if (tvFaceFrameChanged(prevFrame, nextFrame)) {
+    const step = planFrame(prevFrame.expression, expression)[0];
+    return {
+      src: pathForStepMedia(skinDir, step, true),
+      imgKey: imgKeyForStep(skinDir, step, step.kind === "hold" ? 1 : 0),
+      holdEpoch: step.kind === "hold" ? 0 : 0,
+    };
+  }
+
+  return {
+    src: tvFaceAssetPath(skinDir, expression, "hold", true),
+    imgKey: `${skinDir}:${expression}:hold:1`,
+    holdEpoch: 1,
+  };
+}
+
 export function TVFaceAvatar({
   state = "idle",
   color = "orange",
@@ -142,24 +201,17 @@ export function TVFaceAvatar({
   const expression = TVFACE_MANIFEST[state] || RESTING;
   const skinDir = tvFaceSkinDir(color);
 
-  const [currentGif, setCurrentGif] = useState<string>("");
-  const [imgKey, setImgKey] = useState<string>(() => `${skinDir}:${expression}:still`);
-  const holdEpochRef = useRef(0);
+  const initialFrame = useRef(initialFrameMedia(expression, skinDir, animated));
+  const [currentGif, setCurrentGif] = useState(initialFrame.current.src);
+  const [imgKey, setImgKey] = useState(initialFrame.current.imgKey);
+  const holdEpochRef = useRef(initialFrame.current.holdEpoch);
   const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) => {
-    const base = `/tv-face/skins/${skinDir}`;
-    if (isStill || !animated) {
-      return `${base}/stills/${expr}.png`;
-    }
-    return `${base}/gifs/${expr}_${type}.gif`;
-  };
+  const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) =>
+    tvFaceAssetPath(skinDir, expr, type, animated, isStill);
 
-  const pathForStep = (step: FrameStep): string => {
-    if (step.kind === "still") return getAssetPath(step.expression, "hold", true);
-    return getAssetPath(step.expression, step.kind);
-  };
+  const pathForStep = (step: FrameStep): string => pathForStepMedia(skinDir, step, animated);
 
   useEffect(() => {
     if (!animated) {
@@ -181,9 +233,9 @@ export function TVFaceAvatar({
         const src = pathForStep(step);
         if (step.kind === "hold") {
           holdEpochRef.current += 1;
-          setImgKey(`${skinDir}:${step.expression}:hold:${holdEpochRef.current}`);
+          setImgKey(imgKeyForStep(skinDir, step, holdEpochRef.current));
         } else {
-          setImgKey(`${skinDir}:${step.expression}:${step.kind}`);
+          setImgKey(imgKeyForStep(skinDir, step, 0));
         }
         setCurrentGif(src);
         i += 1;
