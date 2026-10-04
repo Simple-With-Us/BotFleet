@@ -13,7 +13,7 @@ rule: >-
   and a raw U+00A0 character typed directly is normalized away in the transcript
   view — neither works in chat. In a file (read as source, never through that
   renderer), keep literal two ASCII spaces and do not switch file content to
-  NBSP or `&nbsp;`. Theme default is light.
+  NBSP or `&nbsp;`. Default UI theme is system.
 severity: medium
 scope: pull-request
 path: '**/*'
