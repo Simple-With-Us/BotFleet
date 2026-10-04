@@ -28,6 +28,10 @@ import {
   type UpdateControl,
   type UpdateStatus,
 } from "./update-control.ts";
+// Test-only import of the updater's own step list.  It keeps the two files
+// honest about each other without the production bundle depending on a script.
+import { APPLY_STEPS, PREPARE_STEPS } from "../scripts/mac-update-transaction.mjs";
+import { UPDATE_STEP_LABELS } from "./update-control.ts";
 
 const INSTALLED_COMMIT = "a".repeat(40);
 const NEW_COMMIT = "b".repeat(40);
@@ -913,6 +917,9 @@ describe("reading what another process wrote", () => {
 
   it("names a step in words, and falls back to the raw name", () => {
     expect(stepLabel("installDependencies")).toBe("Installing dependencies");
+    // Every step the updater can report needs a sentence, or the Mac and the
+    // phone show the raw camelCase op name to the person waiting.
+    expect(stepLabel("smokeTestBundle")).toBe("Verifying the new build actually starts");
     expect(stepLabel("somethingNew")).toBe("somethingNew");
     expect(stepLabel(null)).toBe("Working");
   });
@@ -1293,5 +1300,22 @@ describe("paths named by current-run.json", () => {
     // real progress file rather than the planted one.
     expect(running?.logTail).toEqual([]);
     expect(running?.step).toBe(stepLabel("buildBundle"));
+  });
+});
+
+describe("update step labels", () => {
+  it("covers every step the updater can report, so no raw op name reaches a person", () => {
+    const uncovered = [...PREPARE_STEPS, ...APPLY_STEPS]
+      .filter((step) => !UPDATE_STEP_LABELS[step]);
+    expect(uncovered).toEqual([]);
+  });
+
+  it("uses Title Case sentences rather than op names", () => {
+    // A label that is just the step name is the bug this whole table exists to
+    // prevent, so assert on the shape rather than trusting a reviewer's eye.
+    for (const [step, label] of Object.entries(UPDATE_STEP_LABELS)) {
+      expect(label, `${step} label is the raw step name`).not.toBe(step);
+      expect(label.length).toBeGreaterThan(0);
+    }
   });
 });
