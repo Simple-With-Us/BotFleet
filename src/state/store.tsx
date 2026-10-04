@@ -1046,7 +1046,9 @@ export type Action =
   | { type: "cancelNewTask" }
   | { type: "newTask"; botId: string; appRef?: TaskAppRef }
   | { type: "switchTask"; botId: string; threadId: string }
-  | { type: "taskSwitched"; bot: Bot }
+  // `messages` is optional: the pre-send switch asks for `?messages=0`
+  // and must not be typed as a full transcript replace.
+  | { type: "taskSwitched"; bot: Pick<Bot, "id" | "threadId"> & Partial<Omit<Bot, "id" | "threadId">> }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
   /** Put one thread to sleep, or wake it.  `null` is the wake — an omitted
    * field means "leave it alone" on the harness route, and `0` is the real
@@ -1223,6 +1225,22 @@ export function prependEarlier(current: Message[], earlier: Message[]): Message[
   const known = new Set(current.map((message) => message.id));
   const fresh = earlier.filter((message) => !known.has(message.id));
   return fresh.length ? [...fresh, ...current] : current;
+}
+
+/** Transcript to apply from a bot frame, or undefined to keep the current one.
+ * A switch frame with messages always wins. A later snapshot for the same
+ * thread replaces only when it shares no ids with the transcript on screen
+ * (the second half of a task-switch broadcast). */
+function transcriptFromBotFrame(
+  beforeMessages: Message[],
+  incoming: Message[] | undefined,
+  switchedThread: boolean,
+): Message[] | undefined {
+  if (!incoming) return undefined;
+  if (switchedThread) return incoming;
+  if (incoming.length === 0 || beforeMessages.length === 0) return undefined;
+  const currentIds = new Set(beforeMessages.map((message) => message.id));
+  return incoming.every((message) => !currentIds.has(message.id)) ? incoming : undefined;
 }
 
 export function reducer(state: AppState, action: Action): AppState {
@@ -1456,17 +1474,20 @@ export function reducer(state: AppState, action: Action): AppState {
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
       return state; // the server's request.resolved patch settles the card
-    case "botAdded":
+    case "botAdded": {
+      // An HTTP create/import response and a second fold of the same bot can
+      // both dispatch. Selecting a *different* bot must not inherit the
+      // previous chat's pin; re-folding the bot already on screen is not a
+      // selection change and must leave that pin alone.
+      const viewedThreadId = action.bot.id === state.selectedId ? state.viewedThreadId : null;
       return withMascotMotion({
         ...state,
-        // An HTTP create/import response and its SSE broadcast can race. Fold
-        // both paths without ever showing the same bot twice.
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
-        // Selecting the new bot must not inherit the previous chat's pin.
-        viewedThreadId: null,
+        viewedThreadId,
       }, action.bot.id, "arrive");
+    }
     case "deleteBot": {
       const bots = state.bots.filter((b) => b.id !== action.botId);
       const selectedId =
@@ -1513,17 +1534,18 @@ export function reducer(state: AppState, action: Action): AppState {
         : animated;
       const switchedThread =
         typeof action.bot.threadId === "string" && action.bot.threadId !== before.threadId;
+      const incomingMessages = Array.isArray(action.bot.messages) ? action.bot.messages : undefined;
+      // Ordinary bot patches omit messages and must preserve the current
+      // transcript. A task switch's full bot event carries the new transcript.
+      // The server emits that as two frames: wireBot (new threadId, no
+      // messages) then the transcript snapshot (same threadId). The second
+      // frame shares no message ids with the previous task, so it still
+      // replaces. A same-thread snapshot that overlaps current ids does not.
+      const replacement = transcriptFromBotFrame(before.messages, incomingMessages, switchedThread);
       return updateBot(next, action.bot.id, (b) => ({
         ...b,
         ...action.bot,
-        // Ordinary bot patches omit messages and must preserve the current
-        // transcript. A task switch is different: its full bot event carries
-        // the new transcript, which must replace the previous task before the
-        // webhook's streamed messages begin arriving.
-        messages:
-          switchedThread && Array.isArray(action.bot.messages)
-            ? action.bot.messages
-            : b.messages,
+        messages: replacement ?? b.messages,
       }));
     }
     case "messageAdded": {
@@ -2009,7 +2031,14 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "taskSwitched": {
-      const next = updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+      const next = updateBot(state, action.bot.id, (bot) => ({
+        ...bot,
+        ...action.bot,
+        // Omitted messages mean "this ack did not carry a transcript"
+        // (`?messages=0` on the pre-send switch). Wiping here would show
+        // an empty thread until a later frame; keep what we have.
+        messages: action.bot.messages ?? bot.messages,
+      }));
       // The pin points at a thread; the active thread just changed, so the
       // pin is stale.  Clearing it is a no-op when it already agreed.
       return state.selectedId === action.bot.id ? { ...next, viewedThreadId: null } : next;
@@ -2081,44 +2110,51 @@ export const initialState: AppState = {
 // ── API response contracts ─────────────────────────────────────────────
 // These responses cross the HTTP boundary through the deliberately generic
 // API helper, so each write path narrows its raw body before using it.
-const taskSwitchModelSelectionSchema = z.object({
-  instanceId: z.string(),
-  model: z.string(),
-}).passthrough();
-
-const taskSwitchMessageSchema = z.object({
-  id: z.string(),
-  role: z.enum(["bot", "user", "system"]),
-  kind: z.enum(["text", "options", "activity", "screen", "connector", "secret"]),
-  at: z.number(),
-}).passthrough();
-
-const taskSwitchBotSchema = z.object({
+//
+// The pre-send task switch only needs proof of which thread is now active.
+// The wire bot is much larger (profile, tasks, `lastMessage`, and — unless
+// `?messages=0` — the whole transcript). Parsing that with `.passthrough()`
+// kept unknown keys and then spread them into application state. This schema
+// keeps `id` and `threadId` only; every other property is dropped before
+// dispatch. `.strict()` on the envelope still rejects a body that is not
+// `{ bot }`. A full `.strict()` bot would reject the real `wireBot` payload
+// (or force this path to model and store fields it does not use).
+const taskSwitchAckBotSchema = z.object({
   id: z.string(),
   threadId: z.string(),
-  name: z.string(),
-  title: z.string(),
-  description: z.string(),
-  notifications: z.boolean(),
-  color: z.enum(["green", "blue", "red", "orange", "purple", "cyan", "pink", "yellow", "teal", "coral"]),
-  unread: z.boolean(),
-  modelSelection: taskSwitchModelSelectionSchema,
-  messages: z.array(taskSwitchMessageSchema),
-}).passthrough();
+});
 
 export const TaskSwitchResponseSchema = z.object({
-  bot: taskSwitchBotSchema,
+  bot: taskSwitchAckBotSchema,
 }).strict();
 
+// Idempotent replay is `{ ...firstBody, replayed: true }` (server `replyOnce`),
+// not a body of only `{ ok, replayed }`. Each success arm therefore allows
+// that flag. `ignored: "self_echo"` is a 200 from the loop breaker and is
+// still a successful post.
+const replayedFlag = z.literal(true).optional();
 export const MessagePostResponseSchema = z.union([
   z.object({
     ok: z.literal(true),
     queued: z.literal(true),
     queueId: z.string(),
     threadId: z.string(),
+    replayed: replayedFlag,
   }).strict(),
-  z.object({ ok: z.literal(true), steered: z.literal(true) }).strict(),
-  z.object({ ok: z.literal(true) }).strict(),
+  z.object({
+    ok: z.literal(true),
+    steered: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    ignored: z.literal("self_echo"),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
 ]);
 
 // ── API client ─────────────────────────────────────────────────────────
@@ -2471,8 +2507,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             current.selectedId === action.botId && current.viewedThreadId
               ? current.viewedThreadId
               : null;
-          const targetThreadId = pinnedThreadId || liveBot?.threadId;
-          const postMessage = (threadId: string | undefined) => {
+          // `threadId` is sent only after this client has just switched the
+          // server task, when the id is known to be current. On the ordinary
+          // path the snapshot in `liveBot.threadId` can already be stale — a
+          // routine, another client, or an automation may have switched — and
+          // the server then 409s instead of delivering. Omitting it lets the
+          // server use the active thread.
+          const postMessage = (threadId?: string) => {
             void api(`/api/bots/${action.botId}/messages`, {
               method: "POST",
               body: JSON.stringify({
@@ -2502,13 +2543,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               });
           };
           if (liveBot && pinnedThreadId && pinnedThreadId !== liveBot.threadId) {
-            void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}`, { method: "POST" })
+            // `messages=0` skips the transcript. This path only checks the
+            // active thread id; the bot frame carries the new messages.
+            void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}?messages=0`, { method: "POST" })
               .then((body: unknown) => {
                 const parsed = TaskSwitchResponseSchema.safeParse(body);
-                if (!parsed.success || parsed.data.bot.threadId !== pinnedThreadId) {
+                if (
+                  !parsed.success
+                  || parsed.data.bot.id !== action.botId
+                  || parsed.data.bot.threadId !== pinnedThreadId
+                ) {
                   throw new Error("Could not open the thread on screen before sending.");
                 }
-                rawDispatch({ type: "taskSwitched", bot: parsed.data.bot });
+                rawDispatch({
+                  type: "taskSwitched",
+                  bot: { id: parsed.data.bot.id, threadId: parsed.data.bot.threadId },
+                });
                 postMessage(pinnedThreadId);
               })
               .catch((error) => {
@@ -2517,7 +2567,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               });
             break;
           }
-          postMessage(targetThreadId);
+          postMessage();
           break;
         }
         case "editMessage":

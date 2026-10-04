@@ -35,25 +35,48 @@ describe("API response contracts", () => {
     messages: [],
   };
 
-  it("accepts a task switch bot and rejects malformed envelopes", () => {
-    expect(TaskSwitchResponseSchema.safeParse({ bot }).success).toBe(true);
+  it("keeps only the task-switch thread identity and rejects a bad envelope", () => {
+    const parsed = TaskSwitchResponseSchema.safeParse({
+      bot: {
+        ...bot,
+        messages: [{ id: "m1", role: "user", kind: "text", at: 1, injected: true }],
+        unexpected: true,
+      },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.bot).toEqual({ id: "bot-1", threadId: "thread-1" });
     expect(TaskSwitchResponseSchema.safeParse({ bot, extra: true }).success).toBe(false);
     expect(TaskSwitchResponseSchema.safeParse({ bot: { ...bot, threadId: 42 } }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { id: "bot-1" } }).success).toBe(false);
   });
 
   it("accepts each message post outcome and rejects unvalidated fields", () => {
     expect(MessagePostResponseSchema.safeParse({ ok: true }).success).toBe(true);
     expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "self_echo" }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true, replayed: true }).success).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        ignored: "self_echo",
+        replayed: true,
+      }).success,
+    ).toBe(true);
     expect(
       MessagePostResponseSchema.safeParse({
         ok: true,
         queued: true,
         queueId: "queue-1",
         threadId: "thread-1",
+        replayed: true,
       }).success,
     ).toBe(true);
     expect(MessagePostResponseSchema.safeParse({ ok: true, queued: true, queueId: 7, threadId: "thread-1" }).success).toBe(false);
     expect(MessagePostResponseSchema.safeParse({ ok: true, extra: "unexpected" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "other" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: false }).success).toBe(false);
   });
 });
 
@@ -1108,6 +1131,12 @@ describe("viewed thread pin stays with its selection", () => {
     expect(next.viewedThreadId).toBeNull();
   });
 
+  it("keeps the pin when botAdded folds the bot that is already selected", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("a", "thread-a") });
+    expect(next.selectedId).toBe("a");
+    expect(next.viewedThreadId).toBe("app-thread");
+  });
+
   it("drops the pin when the selected bot is deleted and keeps it otherwise", () => {
     const deleted = reducer(pinned, { type: "deleteBot", botId: "a" });
     expect(deleted.selectedId).not.toBe("a");
@@ -1134,5 +1163,60 @@ describe("viewed thread pin stays with its selection", () => {
     });
     expect(kept.selectedId).toBe("a");
     expect(kept.viewedThreadId).toBe("app-thread");
+  });
+});
+
+describe("task switch transcript", () => {
+  const message = (id: string): Message => ({ id, role: "user", kind: "text", text: id, at: 1 });
+  const bot = (threadId: string, messages: Message[]): Bot => ({
+    id: "a",
+    threadId,
+    name: "a",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages,
+  });
+
+  it("keeps the transcript when a task switch ack omits messages", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("old-thread", [message("old")])],
+      selectedId: "a",
+      viewedThreadId: "new-thread",
+    };
+    const next = reducer(state, { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("replaces the transcript when a later bot frame is a different thread's snapshot", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("new-thread", [message("old")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+
+  it("does not replace a same-thread snapshot that overlaps the current transcript", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("same", [message("keep"), message("local")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("same", [message("keep")]), messages: [message("keep")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["keep", "local"]);
   });
 });
