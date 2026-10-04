@@ -321,17 +321,18 @@ interface T2AResponse {
 
 /**
  * MiniMax TTS acoustic model (t2a_v2) drops pauses on em-dashes, en-dashes,
- * and isolated hyphens, slurring words together without breaths.
- * Deterministically normalize dashes to natural pauses (comma/space)
- * and clean up ellipses.
+ * and isolated hyphens, slurring words together without breaths.  Deterministically
+ * normalize dashes to natural pauses (comma/space) and clean up ellipses.
  */
 export function sanitizeForTTS(text: string): string {
   if (!text) return "";
   return text
+    // Collapse whitespace runs first to prevent regex backtracking on long runs
+    .replace(/\s+/g, " ")
     // Replace em-dashes (—) and en-dashes (–) with a comma and space for natural breathing pause
-    .replace(/\s*[—–]\s*/g, ", ")
+    .replace(/ ?[—–] ?/g, ", ")
     // Replace floating/isolated hyphens (" - ") with a comma and space
-    .replace(/\s+-\s+/g, ", ")
+    .replace(/ - /g, ", ")
     // Replace ellipses with a single period
     .replace(/\.{2,}/g, ".")
     // Clean up multiple consecutive commas or comma-periods
@@ -343,7 +344,7 @@ export function sanitizeForTTS(text: string): string {
     .trim();
 }
 
-/** Synthesize one utterance to mp3 bytes. Throws if MiniMax returns a
+/** Synthesize one utterance to mp3 bytes.  Throws if MiniMax returns a
  * non-zero status_code or the audio payload is empty. */
 export async function synthesize(
   text: string,
@@ -352,7 +353,7 @@ export async function synthesize(
   options: SynthesizeOptions = { voiceId: "" },
 ): Promise<Audio> {
   const trimmed = sanitizeForTTS(text);
-  if (!trimmed) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
+  if (!trimmed || !/[\p{L}\p{N}]/u.test(trimmed)) return { bytes: new Uint8Array(), mime: "audio/mpeg" };
   if (trimmed.length > MAX_CHARS) {
     throw new Error(`utterance is ${trimmed.length} chars; MiniMax accepts at most ${MAX_CHARS} per request`);
   }

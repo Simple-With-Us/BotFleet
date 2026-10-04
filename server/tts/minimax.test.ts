@@ -252,6 +252,28 @@ describe("synthesize", () => {
       const body = JSON.parse(post!.body);
       expect(body.text).toBe("Step one, do this, next. finish");
     });
+
+    it("returns empty audio for punctuation-only input without calling network", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      const res1 = await synthesize(" — ", "English_Graceful_Lady", "sk");
+      expect(res1.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+
+      const res2 = await synthesize("...", "English_Graceful_Lady", "sk");
+      expect(res2.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+    });
+
+    it("collapses large whitespace runs efficiently without backtracking", async () => {
+      const { sanitizeForTTS } = await driver();
+      const padded = "Start" + " ".repeat(10_000) + "—" + " ".repeat(10_000) + "End";
+      const t0 = performance.now();
+      const sanitized = sanitizeForTTS(padded);
+      const elapsed = performance.now() - t0;
+      expect(sanitized).toBe("Start, End");
+      expect(elapsed).toBeLessThan(100);
+    });
   });
 });
 

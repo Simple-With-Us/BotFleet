@@ -610,12 +610,16 @@ const REPLAY_MAX_BYTES = 4 * 1024 * 1024; // 4 MB — see ReplayBuffer.push
 let lastSeq = 0;
 const replayBuffer = new ReplayBuffer(REPLAY_MAX, REPLAY_MAX_BYTES);
 
+export const SseCursorSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-zA-Z0-9_-]+:\d+$/, "Cursor must be in <streamId>:<seq> format");
+
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
  * remember to resume.  Returns null when it belongs to another run. */
-function cursorSeq(raw: string | string[] | undefined): number | null {
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (!value) return null;
-  const [stream, seq] = value.split(":");
+export function cursorSeq(validCursor: string | null | undefined): number | null {
+  if (!validCursor) return null;
+  const [stream, seq] = validCursor.split(":");
   if (stream !== STREAM_ID) return null;
   const parsed = Number(seq);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
@@ -10092,6 +10096,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
     // ── events stream ──
     if (method === "GET" && path === "/api/events") {
+      const rawCursor = url.searchParams.get("since") ?? req.headers["last-event-id"];
+      let validatedCursor: string | undefined;
+      if (rawCursor !== null && rawCursor !== undefined && rawCursor !== "") {
+        const candidate = Array.isArray(rawCursor) ? rawCursor[0] : rawCursor;
+        const parsed = SseCursorSchema.safeParse(candidate);
+        if (!parsed.success) {
+          return json(res, 400, {
+            ok: false,
+            error: "invalid_cursor",
+            message: parsed.error.issues[0]?.message ?? "Invalid SSE cursor format",
+          });
+        }
+        validatedCursor = parsed.data;
+      }
+
       const client: SseClient = {
         res,
         screens: url.searchParams.get("screens") === "on",
@@ -10110,10 +10129,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         client.slow = false;
       });
 
-      // Resume, if the client offered a cursor we can honour. `?since=` is
+      // Resume, if the client offered a cursor we can honour.  `?since=` is
       // for clients that read the stream by hand; Last-Event-ID is what a
       // browser EventSource sends by itself.
-      const since = cursorSeq(url.searchParams.get("since") ?? req.headers["last-event-id"]);
+      const since = cursorSeq(validatedCursor);
       // The buffer only reaches so far back. If the client's cursor fell off
       // the end, saying so is the only honest answer — a partial replay
       // would leave a permanent hole in its state.

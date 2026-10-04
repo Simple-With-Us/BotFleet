@@ -201,6 +201,15 @@ describe("summarizeForVoice", () => {
     const res = await summarizeForVoice(LONG, "test-key");
     expect(res).toBe("Here is your update, first step completed, and waiting. for you");
   });
+
+  it("handles malformed model responses by falling back to deterministic speech", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ invalid_payload: 123 }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
 });
 
 

@@ -1,5 +1,28 @@
+import { z } from "zod";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
+
+export const DeepSeekChatMessageSchema = z.object({
+  role: z.string().optional(),
+  content: z.string().optional(),
+});
+
+export const DeepSeekChatChoiceSchema = z.object({
+  index: z.number().optional(),
+  message: DeepSeekChatMessageSchema.optional(),
+  finish_reason: z.string().nullable().optional(),
+});
+
+export const DeepSeekChatResponseSchema = z.object({
+  id: z.string().optional(),
+  object: z.string().optional(),
+  created: z.number().optional(),
+  model: z.string().optional(),
+  choices: z.array(DeepSeekChatChoiceSchema).optional(),
+  usage: z.record(z.string(), z.unknown()).optional(),
+});
+
+export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
 
 const DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -155,13 +178,14 @@ export async function summarizeForVoice(
     });
 
     if (response.ok) {
-      const data = (await response.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const summary = data?.choices?.[0]?.message?.content?.trim();
-      if (summary) {
-        // Strip any accidental brackets or tags
-        return sanitizeForTTS(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+      const rawData: unknown = await response.json();
+      const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
+      if (parsed.success) {
+        const summary = parsed.data.choices?.[0]?.message?.content?.trim();
+        if (summary) {
+          // Strip any accidental brackets or tags
+          return sanitizeForTTS(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+        }
       }
     }
 
@@ -185,12 +209,13 @@ export async function summarizeForVoice(
     });
 
     if (fallbackResponse.ok) {
-      const fbData = (await fallbackResponse.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const fbSummary = fbData?.choices?.[0]?.message?.content?.trim();
-      if (fbSummary) {
-        return sanitizeForTTS(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+      const fbRawData: unknown = await fallbackResponse.json();
+      const fbParsed = DeepSeekChatResponseSchema.safeParse(fbRawData);
+      if (fbParsed.success) {
+        const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
+        if (fbSummary) {
+          return sanitizeForTTS(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
+        }
       }
     }
   } catch {
