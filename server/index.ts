@@ -203,6 +203,7 @@ import {
   EVENTS_DIR,
   ITEM_IO_DIR,
   NATIVE_DIR,
+  type AppConfig,
 } from "./config.ts";
 import {
   appendBounded,
@@ -859,7 +860,7 @@ pluginsModule.initPluginRuntime({
   listConfigKeys: () => Object.keys(cfg).filter((key) => !/key|token|secret|credential/i.test(key)),
   // SAFETY: `cfg` is the resolved AppConfig snapshot (string-keyed), so a
   // string-keyed read is sound; the caller names `T` and accepts the cast.
-  readConfig: <T = unknown>(key: string): T | undefined => (cfg as Record<string, unknown>)[key] as T | undefined,
+  readConfig: <T = unknown>(key: string): T | undefined => (cfg as Record<string, AppConfig[keyof AppConfig]>)[key] as T | undefined,
   logger: (level, name, message) => {
     const tag = `[plugin:${name}]`;
     if (level === "error") console.error(tag, message);
