@@ -18,6 +18,7 @@ import {
   summarizeFleetAttention,
   type RoomAttention,
 } from "@/lib/attention-index";
+import { explicitMemberIdSet } from "@/lib/room-members";
 
 interface AppDeckProps {
   activeAppId: string | null;
@@ -72,16 +73,7 @@ export function AppDeck({
   // Bots assigned to the currently selected App
   const assignedBots = useMemo(() => {
     if (!activeGroup) return [];
-    const memberSet = new Set(activeGroup.memberIds || []);
-    for (const b of state.bots) {
-      if (
-        !b.hidden &&
-        b.section &&
-        (b.section === activeGroup.name || b.section === activeGroup.section)
-      ) {
-        memberSet.add(b.id);
-      }
-    }
+    const memberSet = explicitMemberIdSet(activeGroup.memberIds);
     return state.bots.filter((b) => !b.hidden && memberSet.has(b.id));
   }, [activeGroup, state.bots]);
 

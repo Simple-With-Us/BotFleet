@@ -18,6 +18,7 @@ import {
   summarizeFleetAttention,
   type RoomAttention,
 } from "@/lib/attention-index";
+import { explicitMemberIdSet } from "@/lib/room-members";
 
 interface FleetMatrixViewProps {
   onSelectApp: (appId: string) => void;
@@ -169,12 +170,7 @@ export function FleetMatrixView({
               const attention = attentionMap.get(group.id);
               const folderName = cwdBasename(group.cwd);
 
-              const memberSet = new Set(group.memberIds || []);
-              for (const b of activeBots) {
-                if (b.section && (b.section === group.name || b.section === group.section)) {
-                  memberSet.add(b.id);
-                }
-              }
+              const memberSet = explicitMemberIdSet(group.memberIds);
 
               return (
                 <tr key={group.id} className="hover:bg-raised/20 transition-colors">
