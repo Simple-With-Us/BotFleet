@@ -312,7 +312,8 @@ export function TVFaceAvatar({
     return () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
     };
-    // transitionSpeed intentionally included: changing it re-plans the wait.
+    // transitionSpeed intentionally included: changing it re-plans the wait
+    // with the new delay (see speedChanged above).
   }, [expression, animated, color, skinDir, transitionSpeed]);
 
   return (
