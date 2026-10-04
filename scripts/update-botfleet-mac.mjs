@@ -309,7 +309,7 @@ export const FAILED_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.failed-";
 // gets to decide when it goes.
 const KNOWN_STAGE_ENTRIES = new Set([
   "BotFleet.app", "node_modules", "prepared.json", "rollback", "source",
-  "pending-recovery.json", "credential-migration.json",
+  "pending-recovery.json", "credential-migration.json", "hosted",
 ]);
 export const ABANDONED_STAGE_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -965,6 +965,7 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
 const SMOKE_BOOT_TIMEOUT_MS = 180_000;
 const SMOKE_BOOT_ATTEMPTS = 2;
 const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
+const SMOKE_HEALTH_REQUEST_TIMEOUT_MS = 3_000;
 const SMOKE_OUTPUT_EXCERPT = 2_000;
 
 export function smokeTestEnabled(env = process.env) {
@@ -1196,7 +1197,13 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
     while (Date.now() < deadline) {
       if (spawnError || child.exitCode !== null) break;
       try {
-        const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+        // Bound each request, not just the loop: the deadline is only checked
+        // between iterations, so a candidate that accepts the connection and
+        // never answers would otherwise hold the updater lock for undici's
+        // default 300s headers timeout instead of returning at 180s.
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(SMOKE_HEALTH_REQUEST_TIMEOUT_MS),
+        });
         if (response.ok && (await response.json().catch(() => null))?.ready !== false) {
           ready = true;
           break;

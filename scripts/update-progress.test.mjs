@@ -201,7 +201,41 @@ describe("the reporting channel itself", () => {
   });
 });
 
+describe("the step list that drives the fraction", () => {
+  it("covers every step a successful run performs, and names nothing else", () => {
+    // `UPDATE_STEPS` is what the progress fraction is computed from, so a step
+    // missing from it freezes the Mac/phone fraction for the whole of that
+    // step and leaves every later fraction understated.  `rollback`,
+    // `cleanupCandidate` and `releaseSource` are deliberately absent: they run
+    // on the failure and teardown paths, which finish the record rather than
+    // advance it.
+    const teardownOnly = new Set(["rollback", "cleanupCandidate", "releaseSource"]);
+    const required = [...PREPARE_STEPS, ...APPLY_STEPS].filter((step) => !teardownOnly.has(step));
+    expect(required.filter((step) => !UPDATE_STEPS.includes(step))).toEqual([]);
+    const known = new Set([...PREPARE_STEPS, ...APPLY_STEPS, "acquireLock"]);
+    expect(UPDATE_STEPS.filter((step) => !known.has(step))).toEqual([]);
+  });
+
+  it("advances the fraction through the smoke test, which is the longest step", async () => {
+    const path = progressFile();
+    const progress = createUpdateProgress({ path, runId: "run_one" });
+    const seen = [];
+    const { operations } = fakeOperations({
+      smokeTestBundle: async () => {
+        seen.push(read(path));
+      },
+    });
+    await prepareUpdate({ target: "origin/main" }, instrumentOperations(operations, progress));
+    // The label alone used to keep rendering while `record.progress` stood
+    // still, because the recorder had no position for this step at all.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].step).toBe("smokeTestBundle");
+    expect(seen[0].progress).toBeGreaterThan(0);
+  });
+});
+
 describe("which outcome a failure is", () => {
+
   it("calls a completed rollback rolled-back, whatever threw", () => {
     expect(outcomeForError(new Error("codesign failed"), { rolledBack: true })).toBe("rolled-back");
   });

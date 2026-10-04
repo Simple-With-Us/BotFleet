@@ -548,6 +548,27 @@ test("leftover stages are pruned only when empty or entirely this updater's own 
   }
 });
 
+test("a stage the ci policy built is sweepable, because the hosted tree is ours", () => {
+  const now = 1789300000000;
+  const day = 24 * 60 * 60 * 1000;
+  // The default `ci` policy unpacks the hosted build into `<stage>/hosted`
+  // before `persistPrepared` copies the bundle to `<stage>/BotFleet.app`.  If
+  // `hosted` were not on the allowlist, every stage the new default produces
+  // would read as "holds files this updater did not write" and leak a full
+  // extra copy of the app plus node_modules in the updates cache forever.
+  const entry = {
+    name: `hosted-${now - 2 * day}`,
+    path: `/updates/hosted-${now - 2 * day}`,
+    names: ["hosted", "BotFleet.app", "node_modules"],
+    mtimeMs: now,
+    hasPrepared: false,
+    hasGeneration: false,
+  };
+  const { prune, report } = abandonedStages([entry], { now });
+  assert.deepEqual(prune, [`/updates/hosted-${now - 2 * day}`]);
+  assert.deepEqual(report, []);
+});
+
 test("stage age comes from the name the updater gave it", () => {
   assert.equal(stageStamp("4e3459758b67-1789257579801"), 1789257579801);
   // A hand-made directory ending in a date parses as a number too, and
