@@ -129,7 +129,7 @@ export function SharedVpsRuntimeCard() {
     <Card
       id="setting-computers-shared-vps"
       title="Shared VPS VM"
-      subtitle="The shared Cua Linux sandbox running on your VPS, with a separate desktop for each bot.\u00a0 Bots share cookies, sign-ins, files, and installed apps/CLI tools."
+      subtitle="The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\u00a0 Bots share cookies, sign-ins, files, and installed apps/CLI tools."
     >
       <div className="flex flex-col gap-4">
         {unavailable ? (

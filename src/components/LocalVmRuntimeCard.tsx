@@ -3,7 +3,7 @@
 // for provider toggles + matrix without silently dropping the one-click
 // container install that operators rely on.  Behavior is unchanged from
 // the prior file: a status poll against `/api/local-computer`, four
-// numbered setup steps (install runtime / open runtime / prepare Cua
+// numbered setup steps (install runtime / open runtime / prepare BotFleet
 // desktop / create VM), a per-bot-vs-shared switch that hits
 // `/api/local-computer/mode`, and a Safety / Storage card with stop /
 // delete controls.
@@ -265,8 +265,8 @@ export function LocalVmRuntimeCard() {
         id="setting-computers-local-vm"
         title="Local VM"
         subtitle={perBot
-          ? `Private Cua Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
-          : `A shared Cua Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
+          ? `Private Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
+          : `A shared Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
       >
         <div className="flex flex-wrap items-center gap-2">
           <span
@@ -390,7 +390,7 @@ export function LocalVmRuntimeCard() {
         </div>
       </Card>
 
-      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares Cua and the VM for you.">
+      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares BotFleet and the VM for you.">
         <div className="flex flex-col gap-4">
           <Step n={1} title="Install a Container Runtime" done={Boolean(status?.runtime)}>
             <div className="text-[13px] leading-relaxed text-ink-secondary">
@@ -417,9 +417,9 @@ export function LocalVmRuntimeCard() {
             )}
           </Step>
 
-          <Step n={3} title="Prepare the Cua Desktop (one-time download and build)" done={Boolean(status?.image)}>
+          <Step n={3} title="Prepare the Linux Desktop (one-time download and build)" done={Boolean(status?.image)}>
             {status?.daemonUp && (
-              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Cua Desktop</ActionButton>
+              <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Linux Desktop</ActionButton>
             )}
             {c?.pull && <details className="text-[12px] text-ink-secondary"><summary className="cursor-pointer">Show Base-Image Download</summary><div className="mt-2"><CommandLine command={c.pull} /></div></details>}
           </Step>
@@ -448,7 +448,7 @@ export function LocalVmRuntimeCard() {
                     <RotateCcw size={13} /> Delete and recreate
                   </ActionButton>
                 ) : (
-                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Cua desktop above before replacing this VM.</div>
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before replacing this VM.</div>
                 )}
               </>
             ) : status?.container === "stopped" ? (
@@ -478,8 +478,8 @@ export function LocalVmRuntimeCard() {
       <Card
         title="Safety and Storage"
         subtitle={perBot
-          ? `Cua Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 Each VM keeps the existing 8 GB, 4 CPU, 512-process and dropped-capability limits.\u00a0 VMs can still reach the internet.`
-          : `Cua Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are limited to 8 GB memory, 4 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
+          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 Each VM keeps the existing 8 GB, 4 CPU, 512-process and dropped-capability limits.\u00a0 VMs can still reach the internet.`
+          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are limited to 8 GB memory, 4 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
       >
         {existing && (
           <div className="flex flex-wrap gap-2">
@@ -495,7 +495,7 @@ export function LocalVmRuntimeCard() {
         )}
         <div className="mt-3 break-all text-[11px] text-ink-secondary">
           Durable workspace: {status?.workspace_path ?? "not created"} ·{" "}
-          Cua Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
+          Computer Driver: {status?.driver_version ?? "0.20.0"} · Local image: {status?.image_ref ?? "not prepared"}
           {status?.base_image_ref ? <> · Base: {status.base_image_ref}</> : null}
         </div>
       </Card>
