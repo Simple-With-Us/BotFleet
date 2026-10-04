@@ -1,0 +1,37 @@
+title: >-
+  Never edit in the owner's integration tree — work only in your agent lane
+  worktree
+rule: >-
+  Do NOT work in `/Users/jay/Code/Personal-Site`. That folder is the human
+  owner's integration tree and the shared fleet review base; checking out a
+  feature branch there corrupts the review base for every other agent. Before
+  editing anything, `cd` into your designated agent lane worktree and create the
+  lane if it does not exist. Lane/prefix map: Grok `~/apps/personal-grok`
+  (`grok/`), Claude `~/apps/personal-claude` (`claude/` or `agent/claude`),
+  Codex `~/apps/personal-codex` (`codex/`), Antigravity
+  `~/apps/personal-antigravity` (`ag/` or `agent/antigravity`), Cursor
+  `~/apps/personal-cursor` (`cursor/`), Monet `~/apps/personal-monet`
+  (`monet/`), Grok Build `~/apps/personal-grok-build` (`grok-build/`). Create a
+  missing lane with: `git -C /Users/jay/Code/Personal-Site worktree add -b
+  <prefix>/<slug> ~/apps/personal-<seat>`. Always run `git status` and `git log
+  -3` first, then read `STATUS.md`, the latest `docs/rollouts/` note, this file,
+  and `docs/EFFORT-LOG.md` before non-trivial work. Also keep the public site
+  source free of private infrastructure links
+  (hosting/routing/apexes/hostnames/deploy paths live in the owner's private
+  operations records), and never publish production from the xAI Grok builder.
+severity: critical
+scope: file
+path: '**/*'
+examples:
+  - snippet: cd /Users/jay/Code/Personal-Site && git checkout -b claude/fix-nav
+    isCorrect: false
+  - snippet: >-
+      git -C /Users/jay/Code/Personal-Site worktree add -b claude/fix-nav
+      ~/apps/personal-claude
+
+      cd ~/apps/personal-claude && git status && git log -3
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []
