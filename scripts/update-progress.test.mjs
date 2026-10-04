@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { applyPreparedUpdate, prepareUpdate, UpdateRefusedError } from "./mac-update-transaction.mjs";
+import { APPLY_STEPS, applyPreparedUpdate, PREPARE_STEPS, prepareUpdate, UpdateRefusedError } from "./mac-update-transaction.mjs";
 import {
   createUpdateProgress,
   instrumentOperations,
@@ -62,7 +62,17 @@ function fakeOperations(overrides = {}) {
     finish: async () => {},
     rollback: async () => {},
     cleanupCandidate: async () => {},
+    smokeTestBundle: async () => {},
   };
+  // A fixture that quietly omits a step fails at runtime as
+  // "ops.<name> is not a function", which reads like a bug in the coordinator
+  // rather than an out-of-date fake.  Check it here instead, naming the step.
+  for (const step of [...PREPARE_STEPS, ...APPLY_STEPS]) {
+    if (step === "acquireLock") continue;
+    if (typeof base[step] !== "function") {
+      throw new Error(`fakeOperations is missing ${step}; add it so this fixture keeps matching the transaction`);
+    }
+  }
   return { prepared, operations: { ...base, ...overrides } };
 }
 
@@ -92,6 +102,7 @@ describe("the progress file", () => {
       "installDependencies",
       "buildBundle",
       "validateBundle",
+      "smokeTestBundle",
       "persistPrepared",
       "releaseSource",
     ]);
