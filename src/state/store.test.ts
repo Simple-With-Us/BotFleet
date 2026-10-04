@@ -1219,4 +1219,37 @@ describe("task switch transcript", () => {
     });
     expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["keep", "local"]);
   });
+
+  it("replaces the retained transcript when the new thread snapshot is empty", () => {
+    const held = reducer(
+      {
+        ...initialState,
+        bots: [bot("old-thread", [message("old")])],
+        selectedId: "a",
+      },
+      { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } },
+    );
+    expect(held.bots[0]?.threadId).toBe("new-thread");
+    expect(held.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    const next = reducer(held, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", []), messages: [] },
+    });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages).toEqual([]);
+  });
+
+  it("applies a non-empty snapshot when the client transcript is empty", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("thread", [])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.threadId).toBe("thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
 });

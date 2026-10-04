@@ -1229,8 +1229,11 @@ export function prependEarlier(current: Message[], earlier: Message[]): Message[
 
 /** Transcript to apply from a bot frame, or undefined to keep the current one.
  * A switch frame with messages always wins. A later snapshot for the same
- * thread replaces only when it shares no ids with the transcript on screen
- * (the second half of a task-switch broadcast). */
+ * thread replaces only when it shares no ids with the transcript on screen.
+ * An empty snapshot is authoritative (the thread really is empty), and a
+ * non-empty snapshot replaces an empty client transcript. Either length used
+ * to return undefined, which left the previous conversation under the new
+ * header after a `?messages=0` ack, or left the chat blank. */
 function transcriptFromBotFrame(
   beforeMessages: Message[],
   incoming: Message[] | undefined,
@@ -1238,7 +1241,6 @@ function transcriptFromBotFrame(
 ): Message[] | undefined {
   if (!incoming) return undefined;
   if (switchedThread) return incoming;
-  if (incoming.length === 0 || beforeMessages.length === 0) return undefined;
   const currentIds = new Set(beforeMessages.map((message) => message.id));
   return incoming.every((message) => !currentIds.has(message.id)) ? incoming : undefined;
 }
@@ -1537,10 +1539,11 @@ export function reducer(state: AppState, action: Action): AppState {
       const incomingMessages = Array.isArray(action.bot.messages) ? action.bot.messages : undefined;
       // Ordinary bot patches omit messages and must preserve the current
       // transcript. A task switch's full bot event carries the new transcript.
-      // The server emits that as two frames: wireBot (new threadId, no
-      // messages) then the transcript snapshot (same threadId). The second
-      // frame shares no message ids with the previous task, so it still
-      // replaces. A same-thread snapshot that overlaps current ids does not.
+      // The pre-send ack (`?messages=0`) advances threadId and keeps the
+      // previous transcript until that snapshot arrives on the same thread id,
+      // including when the snapshot is empty. It replaces when it shares no
+      // ids with what is on screen. A same-thread snapshot that overlaps
+      // current ids does not.
       const replacement = transcriptFromBotFrame(before.messages, incomingMessages, switchedThread);
       return updateBot(next, action.bot.id, (b) => ({
         ...b,
