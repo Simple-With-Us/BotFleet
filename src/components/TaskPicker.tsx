@@ -321,7 +321,7 @@ export function TaskPicker({ bot }: { bot: Bot }) {
       threadId={bot.threadId}
       tasks={bot.tasks ?? []}
       busy={Boolean(bot.busy)}
-      onNew={() => dispatch({ type: "newTask", botId: bot.id })}
+      onNew={() => dispatch({ type: "requestNewTask", botId: bot.id })}
       onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
       onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
       onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}

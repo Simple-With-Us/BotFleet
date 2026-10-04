@@ -5,7 +5,8 @@
 // double-click or right-click to rename, plus to start a fresh one.
 import { useEffect, useRef, useState } from "react";
 import { GitMerge, Plus, X } from "lucide-react";
-import { useStore, formatTime, type Bot, type Group, type Task } from "@/state/store";
+import { useStore, formatTime, getRoomTerminology, type Bot, type Group, type Task } from "@/state/store";
+import { TaskWorkspaceLabel } from "./TaskWorkspaceLabel";
 import { cn } from "@/lib/cn";
 import { nextRename } from "@/lib/rename";
 import { TASK_RENAME_HINT, taskPickerPointerIntent } from "./TaskPicker";
@@ -244,36 +245,56 @@ function ConversationThreadTabs({
 }
 
 export function ThreadTabs({ bot }: { bot: Bot }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const tasks = bot.tasks ?? [];
+  const context = tasks.find((task) => task.threadId === bot.threadId)?.workspaceContext;
   if (tasks.length === 0) return null;
   return (
-    <ConversationThreadTabs
-      threadId={bot.threadId}
-      tasks={tasks}
-      busy={Boolean(bot.busy)}
-      onNew={() => dispatch({ type: "newTask", botId: bot.id })}
-      onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
-      onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
-      onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}
-      onMerge={(threadId, intoThreadId) => dispatch({ type: "mergeTasks", botId: bot.id, threadId, intoThreadId })}
-    />
+    <>
+      <ConversationThreadTabs
+        threadId={bot.threadId}
+        tasks={tasks}
+        busy={Boolean(bot.busy)}
+        onNew={() => dispatch({ type: "requestNewTask", botId: bot.id })}
+        onSwitch={(threadId) => dispatch({ type: "switchTask", botId: bot.id, threadId })}
+        onRename={(threadId, title) => dispatch({ type: "renameTask", botId: bot.id, threadId, title })}
+        onDelete={(threadId) => dispatch({ type: "deleteTask", botId: bot.id, threadId })}
+        onMerge={(threadId, intoThreadId) => dispatch({ type: "mergeTasks", botId: bot.id, threadId, intoThreadId })}
+      />
+      {context && (
+        <TaskWorkspaceLabel
+          context={context}
+          appName={state.groups.find((group) => group.id === context.appRef.id)?.name}
+          groupNoun={getRoomTerminology(state.config).singular}
+        />
+      )}
+    </>
   );
 }
 
 export function GroupThreadTabs({ group }: { group: Group }) {
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const tasks = group.tasks ?? [];
+  const context = tasks.find((task) => task.threadId === group.threadId)?.workspaceContext;
   if (group.dm || tasks.length === 0) return null;
   return (
-    <ConversationThreadTabs
-      threadId={group.threadId}
-      tasks={tasks}
-      busy={Boolean(group.busyBotId)}
-      onNew={() => dispatch({ type: "newGroupTask", groupId: group.id })}
-      onSwitch={(threadId) => dispatch({ type: "switchGroupTask", groupId: group.id, threadId })}
-      onRename={(threadId, title) => dispatch({ type: "renameGroupTask", groupId: group.id, threadId, title })}
-      onDelete={(threadId) => dispatch({ type: "deleteGroupTask", groupId: group.id, threadId })}
-    />
+    <>
+      <ConversationThreadTabs
+        threadId={group.threadId}
+        tasks={tasks}
+        busy={Boolean(group.busyBotId)}
+        onNew={() => dispatch({ type: "newGroupTask", groupId: group.id })}
+        onSwitch={(threadId) => dispatch({ type: "switchGroupTask", groupId: group.id, threadId })}
+        onRename={(threadId, title) => dispatch({ type: "renameGroupTask", groupId: group.id, threadId, title })}
+        onDelete={(threadId) => dispatch({ type: "deleteGroupTask", groupId: group.id, threadId })}
+      />
+      {context && (
+        <TaskWorkspaceLabel
+          context={context}
+          appName={state.groups.find((app) => app.id === context.appRef.id)?.name}
+          groupNoun={getRoomTerminology(state.config).singular}
+        />
+      )}
+    </>
   );
 }
