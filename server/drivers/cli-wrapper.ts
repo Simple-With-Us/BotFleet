@@ -34,7 +34,7 @@ export const CliWrapperConfigSchema = z.object({
   command: z.string().min(1).default("echo"),
   args: z.array(z.string()).default([]),
   passPromptAs: z.enum(["stdin", "arg"]).default("arg"),
-});
+}).strict();
 
 export type CliWrapperConfig = z.infer<typeof CliWrapperConfigSchema>;
 
@@ -61,6 +61,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
     // a teardown can reach the process instead of leaking it for the life of
     // the server.
     const children = new Map<string, ChildProcess>();
+    const cancelledThreads = new Set<string>();
 
     const emit = (event: RuntimeEvent) => {
       for (const listener of listeners) {
@@ -75,7 +76,12 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
     // binary every provider key and webhook secret the server holds.
     const childEnv = (): Record<string, string | undefined> => {
       const env: Record<string, string | undefined> = {
-        ...process.env,
+        HOME: process.env.HOME,
+        USER: process.env.USER,
+        LOGNAME: process.env.LOGNAME,
+        SHELL: process.env.SHELL,
+        TERM: process.env.TERM,
+        TMPDIR: process.env.TMPDIR,
         ...input.environment,
         PATH: augmentedPath(),
       };
@@ -84,6 +90,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
     };
 
     const killThread = (threadId: string): void => {
+      cancelledThreads.add(threadId);
       const child = children.get(threadId);
       if (!child) return;
       children.delete(threadId);
@@ -149,12 +156,14 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           if (settled) return;
           settled = true;
           children.delete(threadId);
+          const wasCancelled = cancelledThreads.delete(threadId);
+          const resolvedStopReason = wasCancelled ? "interrupted" : stopReason;
           emit({
             ...base(),
             type: "turn.completed",
-            ok,
+            ok: wasCancelled ? false : ok,
             usage: { input: 0 },
-            ...(stopReason ? { stopReason } : {}),
+            ...(resolvedStopReason ? { stopReason: resolvedStopReason } : {}),
           });
         };
 
@@ -162,10 +171,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         if (config.passPromptAs === "arg") {
           const bytes = Buffer.byteLength(turnInput.text, "utf8");
           if (bytes > MAX_PROMPT_ARG_BYTES) {
-            settle(
-              false,
-              `prompt is ${bytes} bytes, over the ${MAX_PROMPT_ARG_BYTES}-byte argument limit — set passPromptAs to "stdin"`,
-            );
+            settle(false, "prompt_too_large");
             return { turnId, dispatched: false };
           }
           args.push(turnInput.text);
@@ -185,7 +191,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         } catch (err) {
           const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
           emit({ ...base(), type: "runtime.error", ...failure });
-          settle(false, "spawn_error");
+          settle(false, failure.message);
           return { turnId, dispatched: false };
         }
         children.set(threadId, child);
@@ -218,7 +224,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         child.on("error", (err) => {
           const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
           emit({ ...base(), type: "runtime.error", ...failure });
-          settle(false, "spawn_error");
+          settle(false, failure.message);
         });
 
         return { turnId };

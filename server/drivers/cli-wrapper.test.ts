@@ -169,7 +169,7 @@ describe("CliWrapperDriver turns (real child process)", () => {
     const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
 
     expect((done as { ok: boolean }).ok).toBe(false);
-    expect((done as { stopReason?: string }).stopReason).toContain("stdin");
+    expect((done as { stopReason?: string }).stopReason).toBe("prompt_too_large");
     // The command never ran: no output, so no spawn happened.
     expect(recorder.events.filter((e) => e.type === "content.delta")).toHaveLength(0);
   });
