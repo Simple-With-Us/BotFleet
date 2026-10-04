@@ -625,7 +625,7 @@ function UpdateNotificationsRow() {
   );
 }
 
-function ConversationModeRow() {
+export function ConversationModeRow() {
   const { state, dispatch } = useStore();
   const current = parseConversationMode(state.config?.conversationMode);
   const labels = state.config?.roomLabels ?? { singular: "Channel", plural: "Channels" };

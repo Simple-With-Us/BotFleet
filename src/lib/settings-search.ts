@@ -38,10 +38,10 @@ export const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
     sectionId: "general",
     sectionLabel: "General",
     title: "Workspace Arrangement",
-    subtitle: "Simple is Grok-style: named bots with one conversation each, plus group threads.  Projects hide named bots and treat the room word as a category that any number of threads can sit under.",
+    subtitle: "Simple is Grok-style: named bots with one conversation each, plus group threads.\u00a0 Projects hide named bots and treat the room word as a category that any number of threads can sit under.",
     keywords: ["workspace arrangement", "arrangement", "workspace layout", "conversation mode", "simple", "projects", "threads", "categories", "merge extra threads", "layout", "mode"],
     domId: "setting-general-conversation-mode",
-    badge: "Layout",
+    badge: "Arrangement",
   },
   {
     id: "general:terminology",

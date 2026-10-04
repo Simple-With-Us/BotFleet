@@ -38,6 +38,10 @@ describe("Settings Search Engine", () => {
     expect(label("computers:defaults")).toBe("Default Bot Settings");
     expect(label("secrets:infisical")).toBe("Secret Store");
     expect(label("general:conversationMode")).toBe("Workspace Arrangement");
+
+    const modeItem = SETTINGS_SEARCH_ITEMS.find((i) => i.id === "general:conversationMode");
+    expect(modeItem?.badge).toBe("Arrangement");
+    expect(modeItem?.subtitle).toContain("\u00a0");
   });
 
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
