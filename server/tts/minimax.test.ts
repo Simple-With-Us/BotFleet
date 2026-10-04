@@ -53,6 +53,7 @@ beforeAll(async () => {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as { port: number }).port;
   process.env.MINIMAX_API_URL = `http://127.0.0.1:${port}`;
+  process.env.MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || "test-stub-credential";
 });
 
 afterAll(() => new Promise<void>((r) => server.close(() => r())));
@@ -265,8 +266,12 @@ describe("synthesize", () => {
 
     it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
       const { synthesize } = await driver();
+      const apiKeyForSanitizedPost = process.env.MINIMAX_API_KEY;
+      if (!apiKeyForSanitizedPost) {
+        throw new Error("MINIMAX_API_KEY is required to run the TTS tests");
+      }
       seen.length = 0;
-      await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", "sk");
+      await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", apiKeyForSanitizedPost);
       const post = seen.find((s) => s.method === "POST" && s.url.includes("/v1/t2a_v2"));
       expect(post).toBeDefined();
       const body = JSON.parse(post!.body);
@@ -275,12 +280,16 @@ describe("synthesize", () => {
 
     it("returns empty audio for punctuation-only input without calling network", async () => {
       const { synthesize } = await driver();
+      const apiKeyForSanitizedPost = process.env.MINIMAX_API_KEY;
+      if (!apiKeyForSanitizedPost) {
+        throw new Error("MINIMAX_API_KEY is required to run the TTS tests");
+      }
       seen.length = 0;
-      const res1 = await synthesize(" — ", "English_Graceful_Lady", "sk");
+      const res1 = await synthesize(" — ", "English_Graceful_Lady", apiKeyForSanitizedPost);
       expect(res1.bytes.length).toBe(0);
       expect(seen.length).toBe(0);
 
-      const res2 = await synthesize("...", "English_Graceful_Lady", "sk");
+      const res2 = await synthesize("...", "English_Graceful_Lady", apiKeyForSanitizedPost);
       expect(res2.bytes.length).toBe(0);
       expect(seen.length).toBe(0);
     });
