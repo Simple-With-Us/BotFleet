@@ -595,13 +595,13 @@ const sseClients = new Set<SseClient>();
 
 /** Every frame is numbered, and the last few hundred (or 4 MB, whichever
  * is smaller) are kept, so a client whose connection dropped can ask for
- * what it missed instead of re-downloading every transcript. The desktop
+ * what it missed instead of re-downloading every transcript.  The desktop
  * reconnects in milliseconds and barely needs this; a phone reconnects
  * every time it unlocks.
  *
  * The stream id makes the cursor safe across restarts: sequence numbers
  * begin again at 1 on boot, so a cursor from a previous run must be
- * rejected rather than used to replay a different run's frames. It rides
+ * rejected rather than used to replay a different run's frames.  It rides
  * inside the SSE `id:` field, which means a browser EventSource resumes
  * correctly through its own Last-Event-ID with no client code at all. */
 const STREAM_ID = randomUUID().slice(0, 8);
@@ -611,7 +611,7 @@ let lastSeq = 0;
 const replayBuffer = new ReplayBuffer(REPLAY_MAX, REPLAY_MAX_BYTES);
 
 /** `<streamId>:<seq>` — opaque to clients, and the only thing they need to
- * remember to resume. Returns null when it belongs to another run. */
+ * remember to resume.  Returns null when it belongs to another run. */
 function cursorSeq(raw: string | string[] | undefined): number | null {
   const value = Array.isArray(raw) ? raw[0] : raw;
   if (!value) return null;
