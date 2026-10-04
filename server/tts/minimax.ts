@@ -331,10 +331,16 @@ export function sanitizeForTTS(text: string): string {
     .replace(/\s+/g, " ")
     // Replace em-dashes (—) and en-dashes (–) with a comma and space for natural breathing pause
     .replace(/ ?[—–] ?/g, ", ")
-    // Replace floating/isolated hyphens (" - ") with a comma and space
-    .replace(/ - /g, ", ")
-    // Replace ellipses with a single period
-    .replace(/\.{2,}/g, ".")
+    // Replace floating/isolated hyphens (" - ") with a comma and space, but
+    // keep the operator in "5 - 3 = 2" — a minus sign between two numbers is
+    // arithmetic, not a clause dash, and reads as "five, three" otherwise
+    .replace(
+      /(\S) - (\S)/g,
+      (_m, before: string, after: string) =>
+        (/\d/.test(before) && /\d/.test(after)) ? `${before} - ${after}` : `${before}, ${after}`,
+    )
+    // Replace ellipses (ASCII "..." and the Unicode "…") with a single period
+    .replace(/(?:\.{2,}|…+)/g, ".")
     // Clean up multiple consecutive commas or comma-periods
     .replace(/,\s*,+/g, ",")
     .replace(/,\s*\./g, ".")

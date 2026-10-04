@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
 import { sanitizeForTTS } from "./minimax.ts";
+import { speakable } from "./speech-text.ts";
 
 export const DeepSeekChatMessageSchema = z.object({
   role: z.string().optional(),
@@ -124,7 +125,11 @@ export async function summarizeForVoice(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    return sanitizeForTTS(cleanInput);
+    // Normalize the markdown and paragraph structure *before* the acoustic
+    // pass: sanitizeForTTS collapses newlines, and the line anchors that
+    // strip list markers and add audible paragraph pauses only match on the
+    // original text.
+    return sanitizeForTTS(speakable(cleanInput));
   }
 
   const options: SummarizeVoiceOptions =
@@ -134,7 +139,7 @@ export async function summarizeForVoice(
 
   const key = resolveDeepSeekKey(options.key);
   if (!key) {
-    return sanitizeForTTS(spokenReply(rawText));
+    return sanitizeForTTS(speakable(spokenReply(rawText)));
   }
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
@@ -227,5 +232,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return sanitizeForTTS(spokenReply(rawText));
+  return sanitizeForTTS(speakable(spokenReply(rawText)));
 }

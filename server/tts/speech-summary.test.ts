@@ -202,6 +202,13 @@ describe("summarizeForVoice", () => {
     expect(res).toBe("Here is your update, first step completed, and waiting. for you");
   });
 
+  it("strips list markers and keeps paragraph pauses on short replies", async () => {
+    // The acoustic pass collapses newlines, so the structure has to be
+    // normalized first or "2. Deploy queued" survives as a run-on.
+    const res = await summarizeForVoice("1. Build passed\n2. Deploy queued");
+    expect(res).toBe("Build passed. Deploy queued");
+  });
+
   it("handles malformed model responses by falling back to deterministic speech", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,

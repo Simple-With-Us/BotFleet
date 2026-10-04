@@ -243,6 +243,26 @@ describe("synthesize", () => {
       expect(sanitizeForTTS("Hello — , world...  ")).toBe("Hello, world.");
     });
 
+    it("keeps a minus sign between numbers and still pauses on a clause dash", async () => {
+      const { sanitizeForTTS } = await driver();
+      // arithmetic: the operator has to survive or it reads as "five, three"
+      expect(sanitizeForTTS("5 - 3 = 2")).toBe("5 - 3 = 2");
+      // a digit on one side only is still a clause dash
+      expect(sanitizeForTTS("Step 1 - then deploy")).toBe("Step 1, then deploy");
+      expect(sanitizeForTTS("Start - middle end")).toBe("Start, middle end");
+    });
+
+    it("collapses a Unicode ellipsis to a single period", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Wait… then… go")).toBe("Wait. then. go");
+      expect(sanitizeForTTS("Wait… then... go")).toBe("Wait. then. go");
+    });
+
+    it("leaves a hyphenated word intact", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("A well-known fix")).toBe("A well-known fix");
+    });
+
     it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
       const { synthesize } = await driver();
       seen.length = 0;

@@ -5297,9 +5297,7 @@ describe("resumable event stream", () => {
   it("rejects a malformed cursor with HTTP 400", async () => {
     const res = await fetch(`${BASE}/api/events?since=not-a-cursor`);
     expect(res.status).toBe(400);
-    const body = (await res.json()) as any;
-    expect(body.ok).toBe(false);
-    expect(body.error).toBe("invalid_cursor");
+    expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 });
 
