@@ -33,7 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -120,7 +120,9 @@ export async function currentCommit(env = process.env) {
   }
   // A pointer aimed at something that is not a release (a legacy checkout, or a
   // half-built directory) still tells the caller which commit is live, by name.
-  const name = physical.split("/").pop();
+  // Split on the platform's separator: a hard-coded "/" would make every path
+  // look like one segment on Windows and silently answer null there.
+  const name = physical.split(sep).pop();
   return FULL_COMMIT.test(name) ? name : null;
 }
 
