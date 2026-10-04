@@ -212,6 +212,11 @@ export interface RoutineManagerOptions {
   botState: (botId: string) => "ready" | "busy" | "missing";
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
+  /** True when the host is too hot for a new unattended webhook wake.
+   *  Absent never sheds, so tests and older wiring keep dispatching.
+   *  Does not apply to resource, schedule, or manual runs, and never
+   *  touches a run that is already going. */
+  hostHot?: () => boolean;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -1109,6 +1114,12 @@ export class RoutineManager {
           this.failRun(run, "The assigned Bot no longer exists");
           continue;
         }
+        // Defer, don't drop.  A hot host (swap at the jobs admission
+        // ceiling, or load per core at the ACP init ceiling) skips a new
+        // webhook wake and leaves the receipt queued.  The 10s scheduler
+        // tick tries again.  In-flight runs are not in this loop's queued
+        // set, and resource wakes still start so Housekeeper can run.
+        if (run.triggerSource === "webhook" && this.options.hostHot?.()) continue;
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
         // and the whole batch goes into one turn when the gap closes, which

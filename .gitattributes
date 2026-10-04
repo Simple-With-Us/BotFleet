@@ -1,0 +1,8 @@
+# docs/EFFORT-LOG.md is an append-only ledger that every seat writes to, so it conflicts on
+# almost every PR.  Resolving those by hand is how a seat silently drops another seat's
+# rows, which is exactly what happened on 2026-10-04 when the file went from 716 rows to 9.
+#
+# merge=union takes both sides and concatenates them, so the union a careful agent would
+# have written by hand is what git does automatically.  A duplicate row is harmless and visible;
+# a missing row is not.
+docs/EFFORT-LOG.md merge=union

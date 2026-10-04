@@ -7,6 +7,8 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import { writeFileAtomic } from "./atomic.ts";
+import { loadPerCore, MAX_INIT_LOAD_FACTOR, type HostLoad } from "./drivers/acp/init-deadline.ts";
+import { DEFAULT_ADMISSION } from "./jobs/admission.ts";
 import { DATA_DIR } from "./config.ts";
 import { parseJson, schemaIssue, type JsonValue } from "./schema.ts";
 
@@ -205,6 +207,27 @@ function darwinRamUsedPct(): number | null {
   } catch {
     return null;
   }
+}
+
+/** Whether a new unattended webhook wake should wait.
+ *
+ *  Reuses two signals that already exist.  No new sampler:
+ *  - swap at or above the jobs admission ceiling (`DEFAULT_ADMISSION`,
+ *    98%).  macOS swap percent sits near 90% in ordinary use, so the
+ *    Housekeeper UI example of 80% is not this gate.
+ *  - 1-minute load per core at or above the ACP init saturation ceiling
+ *    (`MAX_INIT_LOAD_FACTOR`, 3).  That is the same "saturated host" the
+ *    init deadline already treats as maxed out.
+ *  A missing reading admits.  A broken probe must not stop webhooks.
+ */
+export function webhookDispatchHot(input: {
+  swapUsedPercent: number | null;
+  load: HostLoad | null;
+}): boolean {
+  const swap = input.swapUsedPercent;
+  if (swap !== null && Number.isFinite(swap) && swap >= DEFAULT_ADMISSION.maxSwapPercent) return true;
+  const perCore = loadPerCore(input.load);
+  return perCore !== null && perCore >= MAX_INIT_LOAD_FACTOR;
 }
 
 export function sampleHost(now = Date.now()): HostSample {

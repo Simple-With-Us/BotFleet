@@ -227,6 +227,59 @@ describe("nextOccurrence", () => {
 });
 
 describe("RoutineManager", () => {
+  it("defers a queued webhook while the host is hot and still starts a resource wake", async () => {
+    const h = harness();
+    let hot = true;
+    h.options.hostHot = () => hot;
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-1",
+      receivedAt: 1,
+    });
+    h.manager.enqueueResource({
+      triggerId: "disk",
+      triggerName: "Housekeeper",
+      prompt: "disk",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "rs-1",
+      receivedAt: 2,
+    });
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["resource"]);
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    hot = false;
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["resource", "webhook"]);
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("running");
+  });
+
+  it("does not cancel an in-flight webhook when the host turns hot", async () => {
+    const h = harness();
+    let hot = false;
+    h.options.hostHot = () => hot;
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-1",
+      receivedAt: 1,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0]?.status).toBe("running");
+    hot = true;
+    h.setBot("busy");
+    await h.manager.tick();
+    expect(h.manager.listRuns()[0]?.status).toBe("running");
+    expect(h.started).toHaveLength(1);
+  });
+
   it("enriches legacy client schedules with the host zone without rewriting their stored semantics", () => {
     const h = harness(Date.parse("2026-09-14T12:00:00.000Z"));
     h.options.timeZone = () => "Europe/Athens";

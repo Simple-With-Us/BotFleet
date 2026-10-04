@@ -105,6 +105,10 @@ export function unattendedModelDowngrade(
     /** Quota cooldowns vetted the pre-downgrade model; the rewrite must not
      *  route onto a cheaper model that is itself cooling down. */
     isCooling?: (instanceId: string, model: string) => boolean;
+    /** Webhook classify/gate may leave mcode's thinking Flash for this row.
+     *  The caller passes it only when an enabled engine's catalog actually
+     *  offers the id.  Absent means stay on the thinking id. */
+    nonThinkingFlash?: { instanceId: string; model: string };
   },
 ): ModelSelection {
   if (opts.hasExplicitSelection) return selection;
@@ -118,6 +122,27 @@ export function unattendedModelDowngrade(
     opts.automationSource === "webhook" ||
     opts.automationSource === "resource";
   if (!automated) return selection;
+  // Webhook classify/gate seats ship on mcode's thinking Flash, the catalog
+  // default, because that CLI fails the no-variant turn.  The non-thinking
+  // id is live on other engines (DSH, the MiniMax HTTP catalog).  Only a
+  // webhook takes the move: a job keeps the model it was chosen with, a
+  // resource wake is Housekeeper, and a person typing stays on thinking.
+  // Crossing engines drops effort.  The source engine's "low" is not the
+  // target's, and DSH refuses a level its settings do not declare.
+  if (
+    opts.automationSource === "webhook" &&
+    selection.model === "MiniMax-M3.1-Flash-Preview-thinking" &&
+    opts.nonThinkingFlash?.instanceId &&
+    opts.nonThinkingFlash.model &&
+    !opts.isCooling?.(opts.nonThinkingFlash.instanceId, opts.nonThinkingFlash.model)
+  ) {
+    const target = opts.nonThinkingFlash;
+    if (target.instanceId !== selection.instanceId) {
+      const { effort: _dropped, ...rest } = selection;
+      return { ...rest, instanceId: target.instanceId, model: target.model };
+    }
+    selection = { ...selection, model: target.model };
+  }
   // Resolve the downgrade family from the driver kind so operator-added
   // instances ("claude2", "gravity") get the same cheaper-model treatment
   // as the reserved ids.  Fall back to the instance id only when no kind
