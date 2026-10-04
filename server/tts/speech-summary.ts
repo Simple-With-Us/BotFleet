@@ -1,4 +1,5 @@
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
+import { sanitizeForTTS } from "./minimax.ts";
 
 const DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -100,7 +101,7 @@ export async function summarizeForVoice(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    return cleanInput;
+    return sanitizeForTTS(cleanInput);
   }
 
   const options: SummarizeVoiceOptions =
@@ -110,7 +111,7 @@ export async function summarizeForVoice(
 
   const key = resolveDeepSeekKey(options.key);
   if (!key) {
-    return spokenReply(rawText);
+    return sanitizeForTTS(spokenReply(rawText));
   }
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
@@ -160,7 +161,7 @@ export async function summarizeForVoice(
       const summary = data?.choices?.[0]?.message?.content?.trim();
       if (summary) {
         // Strip any accidental brackets or tags
-        return summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();
+        return sanitizeForTTS(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
       }
     }
 
@@ -189,7 +190,7 @@ export async function summarizeForVoice(
       };
       const fbSummary = fbData?.choices?.[0]?.message?.content?.trim();
       if (fbSummary) {
-        return fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();
+        return sanitizeForTTS(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, ""));
       }
     }
   } catch {
@@ -201,5 +202,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return spokenReply(rawText);
+  return sanitizeForTTS(spokenReply(rawText));
 }
