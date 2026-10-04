@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   applicationAttachmentError,
   applicationIdentitiesCanTransition,
+  classifySmokeFailure,
   SAFE_STORAGE_EXPORT_FLAG,
   shouldExportSafeStorageBeforeRename,
   authenticatedRuntimeError,
@@ -32,9 +33,12 @@ import {
   rollbackHarnessBootstrapPlists,
   rollbackReadinessError,
   run,
+  runStagedSmokeTest,
   runtimePreflight,
   settledRunOutcome,
   signalProcess,
+  smokeFailureMessage,
+  smokeTestEnabled,
   stableApplicationProcessError,
   startedHarnessLabel,
   swapPreparedFiles,
@@ -1788,4 +1792,169 @@ test("another script with the same entry guard runs through a symlinked director
   // a network request without a token.
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /GH_TOKEN is required to verify the release tag/);
+});
+
+// --- Pre-activation smoke test ------------------------------------------------
+//
+// The Sep 17 and Oct 1 outages were both a healthy binary plus a starved CPU,
+// and the first version of this gate would have called both of them a corrupt
+// build.  These cases exist to keep that mistake from returning: a timeout and
+// a real failure must stay distinguishable, and only a timeout may be retried.
+test("the smoke test is on unless it is explicitly switched off", () => {
+  assert.equal(smokeTestEnabled({}), true);
+  assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: "1" }), true);
+  for (const value of ["0", "off", "FALSE", "no", " off "]) {
+    assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: value }), false, `${value} should disable the probe`);
+  }
+});
+
+test("a boot that never became ready is a busy host, not a corrupt candidate", () => {
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: null }), "server-never-ready");
+  assert.equal(classifySmokeFailure({ spawnTimedOut: true }), "sqlite-probe-timed-out");
+  const timeoutMessage = smokeFailureMessage({
+    cause: "server-never-ready",
+    exitCode: null,
+    signal: null,
+    targetCommit: "b".repeat(40),
+  });
+  assert.match(timeoutMessage, /too busy/);
+  assert.match(timeoutMessage, /commit=b{12}\b/);
+  // The whole point: a starved host must not be reported as a broken build.
+  assert.doesNotMatch(timeoutMessage, /corrupt|invalid|bad build/i);
+});
+
+test("a candidate that exits or cannot spawn is named as a real failure", () => {
+  assert.equal(classifySmokeFailure({ exitCode: 1, signal: null }), "server-exited");
+  assert.equal(classifySmokeFailure({ exitCode: null, signal: "SIGSEGV" }), "server-killed-SIGSEGV");
+  assert.equal(classifySmokeFailure({ spawnError: new Error("ENOENT") }), "spawn-failed");
+  const exited = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    signal: null,
+    targetCommit: "b".repeat(40),
+    output: "Error: Cannot find package 'zod'",
+  });
+  assert.match(exited, /exited during boot/);
+  assert.match(exited, /exit=1/);
+  assert.match(exited, /Cannot find package/);
+  assert.match(smokeFailureMessage({ cause: "spawn-failed", spawnError: "EACCES", targetCommit: "b".repeat(40) }), /spawn=EACCES/);
+});
+
+test("candidate output is capped in the failure message", () => {
+  const message = smokeFailureMessage({
+    cause: "server-exited",
+    exitCode: 1,
+    targetCommit: "b".repeat(40),
+    output: "x".repeat(50_000),
+  });
+  assert.ok(message.length < 4_000, `message should stay small, got ${message.length}`);
+});
+
+const smokeOk = { ready: true, output: "", sqlite: { ok: true, timedOut: false, detail: null } };
+const smokeNeverReady = { ready: false, output: "", exitCode: null, signal: null };
+const smokeExited = { ready: false, output: "boom", exitCode: 1, signal: null };
+
+test("a candidate that starts and initializes SQLite passes without a retry", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 1 });
+  assert.equal(calls, 1);
+});
+
+test("a readiness timeout is retried once, and a second timeout is reported as a busy host", async () => {
+  let calls = 0;
+  const retries = [];
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeNeverReady;
+      },
+      onRetry: (event) => retries.push(event),
+    }),
+    /too busy/,
+  );
+  assert.equal(calls, 2, "exactly one retry, never a loop");
+  assert.deepEqual(retries, [{ attempt: 1, attempts: 2 }]);
+});
+
+test("a busy first attempt followed by a healthy candidate succeeds", async () => {
+  let calls = 0;
+  const result = await runStagedSmokeTest({
+    builtBundle: "/stage/BotFleet.app",
+    targetCommit: "b".repeat(40),
+    smokeImpl: async () => {
+      calls += 1;
+      return calls === 1 ? smokeNeverReady : smokeOk;
+    },
+  });
+  assert.deepEqual(result, { ok: true, attempts: 2 });
+  assert.equal(calls, 2);
+});
+
+test("a candidate that exits is never retried, because waiting cannot change the answer", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return smokeExited;
+      },
+    }),
+    /exited during boot/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a missing node:sqlite binding is a real failure, not a slow host", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return { ready: true, output: "", sqlite: { ok: false, timedOut: false, detail: "node:sqlite did not initialize (exit=1)" } };
+      },
+    }),
+    /node:sqlite did not initialize/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a probe-reported cause wins over the busy-host default", async () => {
+  // A live child that never reported readiness would normally classify as
+  // "too busy" and be retried.  When the probe knows better — the owner record
+  // named a different pid — that is a real defect, and saying "too busy" would
+  // send the operator after the wrong problem entirely.
+  let calls = 0;
+  await assert.rejects(
+    runStagedSmokeTest({
+      builtBundle: "/stage/BotFleet.app",
+      targetCommit: "b".repeat(40),
+      smokeImpl: async () => {
+        calls += 1;
+        return {
+          ready: false,
+          cause: "owner-mismatch",
+          output: "owner record pid 1 does not match the staged server pid 2",
+          exitCode: null,
+          signal: null,
+        };
+      },
+    }),
+    /owner record naming a different process/,
+  );
+  assert.equal(calls, 1, "a real defect must not be retried as a slow host");
 });

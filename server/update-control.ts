@@ -332,6 +332,7 @@ export const UPDATE_STEP_LABELS: Record<string, string> = {
   installDependencies: "Installing dependencies",
   buildBundle: "Building and signing the app",
   validateBundle: "Verifying the signature and identity",
+  smokeTestBundle: "Verifying the new build actually starts",
   persistPrepared: "Recording the prepared build",
   validatePrepared: "Re-checking the prepared build",
   preflight: "Checking for work in flight",

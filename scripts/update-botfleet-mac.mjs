@@ -16,7 +16,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyPreparedUpdate, prepareUpdate, runUpdate } from "./mac-update-transaction.mjs";
@@ -929,6 +929,306 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
   return { ...(await signatureIdentity(bundlePath, { allowLegacyBundleId: true })), version: build.version, apiVersion: build.apiVersion, uiHash: build.uiHash };
 }
 
+// ---------------------------------------------------------------------------
+// Pre-activation smoke test.
+//
+// validateBuiltBundle above reads files: it proves the bytes are signed, from
+// the expected team, and stamped with the expected commit.  None of that proves
+// the artifact runs.  0.1.24 shipped a server that passed every one of those
+// checks and died on every launch with ERR_MODULE_NOT_FOUND, because tsc
+// leaves bare imports verbatim and the packaged tree carries no node_modules.
+// The hosted release pipeline has caught that class of bug since
+// (scripts/smoke-packaged-server.mjs), but only for artifacts GitHub built.
+// A candidate downloaded from a CI build, imported from a stage, or produced
+// by a local fallback has had no equivalent gate on this Mac.
+//
+// So mirror MCode's validatePrefixPackage here: before the stage is published
+// or anything live is touched, actually run the candidate — boot the packaged
+// server with no node_modules in reach, wait for real readiness, and prove the
+// native SQLite binding initializes.  Three properties, deliberately, because
+// a busy Mac produces timeouts and a timeout must never be reported as a
+// corrupt artifact.  That mistake shipped twice on this machine already (see
+// scripts/native-version-probe.mjs); the classifier below exists so the same
+// mistake cannot ship a third time here.
+// ---------------------------------------------------------------------------
+
+// Generous on purpose.  prepare runs on the owner's Mac, often while five to
+// ten agent seats are compiling; the Sep 17 and Oct 1 outages were both a
+// healthy binary plus a starved CPU.  One retry on timeout only — a genuinely
+// bad artifact fails identically a second later, so retrying it would only
+// delay the real error, and a missing file cannot become present by waiting.
+const SMOKE_BOOT_TIMEOUT_MS = 180_000;
+const SMOKE_BOOT_ATTEMPTS = 2;
+const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
+const SMOKE_OUTPUT_EXCERPT = 2_000;
+
+export function smokeTestEnabled(env = process.env) {
+  const value = (env.BOTFLEET_UPDATE_SMOKE ?? "").trim().toLowerCase();
+  return !(value === "0" || value === "off" || value === "false" || value === "no");
+}
+
+/**
+ * Turn a failed boot into a cause a human can act on.  The distinction that
+ * matters most is "this artifact is broken" versus "this Mac was too busy to
+ * finish the probe" — the two look identical to a naive boolean and call for
+ * opposite responses, so they must never collapse into one value.  A child
+ * still alive with no readiness and no exit is the busy case by elimination,
+ * so the default has to be the busy case rather than an unlabelled unknown.
+ */
+export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
+  if (spawnError) return "spawn-failed";
+  if (spawnTimedOut) return "sqlite-probe-timed-out";
+  if (exitCode !== null && exitCode !== undefined) return "server-exited";
+  if (signal) return `server-killed-${signal}`;
+  return "server-never-ready";
+}
+
+const SMOKE_CAUSES = {
+  "spawn-failed": "could not be started",
+  "server-exited": "exited during boot",
+  "server-never-ready": "never reported ready",
+  "sqlite-probe-timed-out": "timed out initializing its native SQLite binding",
+  "sqlite-unavailable": "could not initialize its native SQLite binding",
+  "owner-mismatch": "wrote an owner record naming a different process",
+};
+
+export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath }) {
+  const summary = SMOKE_CAUSES[cause] || cause;
+  const detail = [];
+  if (exitCode !== null && exitCode !== undefined) detail.push(`exit=${exitCode}`);
+  if (signal) detail.push(`signal=${signal}`);
+  if (spawnError) detail.push(`spawn=${spawnError}`);
+  detail.push(`commit=${targetCommit?.slice(0, 12) || "unknown"}`);
+  const excerpt = (output || "").trim().slice(-SMOKE_OUTPUT_EXCERPT);
+  const headline = `Staged BotFleet candidate ${summary} (${detail.join(", ")}); nothing was installed.`;
+  if (cause === "server-never-ready" || cause === "sqlite-probe-timed-out") {
+    return `${headline}  This Mac may simply have been too busy to finish the probe — re-run when it is quieter before treating the build as bad.${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+  }
+  return `${headline}${excerpt ? `\n--- candidate output ---\n${excerpt}` : ""}`;
+}
+
+/**
+ * `run` has no timeout, and a probe that can hang forever is worse than no
+ * probe at all — it would strand the updater lock.  Bound it explicitly and
+ * report a timeout as its own outcome rather than as a non-zero exit, for the
+ * same reason the boot classifier has a distinct "too busy" cause.
+ */
+function runBounded(command, args, { cwd, env, timeoutMs }) {
+  return new Promise((resolveRun) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: env ? { ...process.env, ...env } : process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolveRun({ code: null, signal: "SIGKILL", stdout, stderr, timedOut: true });
+    }, timeoutMs);
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveRun(result);
+    };
+    child.once("error", (error) => settle({ code: null, signal: null, stdout, stderr, spawnError: error, timedOut: false }));
+    child.once("close", (code, signal) => settle({ code, signal, stdout, stderr, timedOut: false }));
+  });
+}
+
+/**
+ * Prove `node:sqlite` initializes in the runtime that will actually serve the
+ * candidate.  The store opens its database through DatabaseSync from node:sqlite
+ * (server/message-db.ts), a native binding that has to load before the harness
+ * can run at all — the same reason MCode initializes better-sqlite3 in memory
+ * before it trusts a downloaded release.  In-memory keeps the probe from
+ * depending on the store's own file lifecycle: a lazy database is not a broken
+ * one, and this gate must never fail a healthy build for being lazy.
+ */
+async function smokeNativeSqlite({ serverDirectory, nodeBin, runImpl = runBounded }) {
+  const script = [
+    'import { DatabaseSync } from "node:sqlite";',
+    'const db = new DatabaseSync(":memory:");',
+    'db.exec("CREATE TABLE smoke (id INTEGER PRIMARY KEY, value TEXT)");',
+    'db.prepare("INSERT INTO smoke (value) VALUES (?)").run("botfleet");',
+    'const row = db.prepare("SELECT value FROM smoke WHERE id = 1").get();',
+    'if (row?.value !== "botfleet") throw new Error(`unexpected row: ${JSON.stringify(row)}`);',
+    'db.close();',
+    'console.log("sqlite-ok");',
+  ].join("\n");
+  const probePath = join(serverDirectory, `smoke-sqlite-${process.pid}-${randomUUID()}.mjs`);
+  await writeFile(probePath, `${script}\n`, { mode: 0o600 });
+  try {
+    const result = await runImpl(nodeBin, [probePath], { cwd: serverDirectory, timeoutMs: SMOKE_SQLITE_TIMEOUT_MS });
+    if (result.timedOut) return { ok: false, timedOut: true, detail: "probe exceeded its time budget" };
+    if (result.spawnError) return { ok: false, timedOut: false, detail: `probe could not start: ${result.spawnError.message}` };
+    if (result.stdout.includes("sqlite-ok")) return { ok: true, timedOut: false, detail: null };
+    return {
+      ok: false,
+      timedOut: false,
+      detail: `node:sqlite did not initialize (exit=${result.code}, signal=${result.signal}): ${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+    };
+  } finally {
+    await rm(probePath, { force: true });
+  }
+}
+
+async function freeLoopbackPort() {
+  const { createServer } = await import("node:net");
+  return new Promise((resolvePort, rejectPort) => {
+    const probe = createServer();
+    probe.unref();
+    probe.on("error", rejectPort);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const chosen = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => resolvePort(chosen));
+    });
+  });
+}
+
+/**
+ * The attempt policy, separated from the probe so it can be tested without a
+ * real candidate.  Retry exactly one readiness timeout and nothing else: a
+ * candidate that exited, or whose native SQLite binding will not load, fails
+ * identically a second later, so waiting again would only delay the real
+ * diagnosis.  A busy Mac and a broken build must not produce the same verdict.
+ */
+export async function runStagedSmokeTest({ builtBundle, targetCommit, smokeImpl, attempts = SMOKE_BOOT_ATTEMPTS, onRetry } = {}) {
+  const scratchRoot = join(tmpdir(), "botfleet-update-smoke");
+  await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // A structural problem (no entry point, ditto failed, no free port) is not
+    // a busy-host symptom, so it propagates without earning a retry.
+    const result = await smokeImpl({ bundlePath: builtBundle, targetCommit, attempt, scratchRoot });
+    if (result.ready && result.sqlite?.ok) return { ok: true, attempts: attempt };
+    if (result.ready && result.sqlite?.timedOut) {
+      lastFailure = { cause: "sqlite-probe-timed-out", output: result.output };
+    } else if (result.ready) {
+      // Booted, but the native binding would not initialize.  That is a real
+      // defect in the artifact, and the probe's own detail is the diagnosis.
+      lastFailure = { cause: "sqlite-unavailable", output: `${result.output}\n${result.sqlite?.detail || ""}` };
+    } else {
+      // The probe may know more than the process state does (an owner record
+      // that names the wrong pid looks exactly like a live, unready child).
+      // Its explicit cause wins; otherwise classify from what the process did.
+      lastFailure = {
+        cause: result.cause || classifySmokeFailure({
+          exitCode: result.exitCode,
+          signal: result.signal,
+          spawnError: result.spawnError,
+        }),
+        exitCode: result.exitCode,
+        signal: result.signal,
+        spawnError: result.spawnError,
+        output: result.output,
+      };
+    }
+    if (lastFailure.cause !== "server-never-ready" || attempt === attempts) break;
+    onRetry?.({ attempt, attempts });
+  }
+  throw new Error(smokeFailureMessage({ ...lastFailure, targetCommit, bundlePath: builtBundle }));
+}
+
+/**
+ * Boot the candidate's packaged server with no node_modules in reach and wait
+ * for genuine readiness.  Health answers as soon as the port binds, which is
+ * before boot work finishes, so `ready` — not the first 200 — is the signal.
+ * Readiness plus the owner record together are the same contract
+ * scripts/smoke-packaged-server.mjs asserts in CI; proving it locally is what
+ * makes a CI-built or imported candidate as trustworthy as a locally built one.
+ */
+export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scratchRoot }) {
+  const serverDirectory = join(bundlePath, "Contents/Resources/server");
+  if (!(await exists(join(serverDirectory, "index.js")))) {
+    throw new Error(`Staged BotFleet candidate has no packaged server entry point: ${serverDirectory}/index.js`);
+  }
+  const scratch = join(scratchRoot, `smoke-${targetCommit.slice(0, 12)}-${attempt}-${randomUUID()}`);
+  const staging = join(scratch, "server");
+  const home = join(scratch, "home");
+  await mkdir(home, { recursive: true, mode: 0o700 });
+  // Copy out of the bundle before running, exactly as the CI smoke test does.
+  // A bare import resolves differently depending on what sits above the tree,
+  // and the point of the probe is the layout the candidate will really ship.
+  await run("ditto", [serverDirectory, staging]);
+  const port = await freeLoopbackPort();
+  if (!port || DEFAULT_PORTS.includes(port)) {
+    throw new Error(`Could not reserve a loopback port for the staged smoke test (got ${port})`);
+  }
+
+  const child = spawn(process.execPath, [join(staging, "index.js")], {
+    cwd: staging,
+    env: {
+      PATH: process.env.PATH,
+      HOME: home,
+      OMB_PORT: String(port),
+      // A loopback DSN exercises SDK loading without contacting the owner's
+      // Sentry project; the probe must never emit a test event.
+      SENTRY_DSN: "https://0123456789abcdef0123456789abcdef@127.0.0.1:1/1",
+      SENTRY_TRACES_SAMPLE_RATE: "0",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+
+  try {
+    const deadline = Date.now() + SMOKE_BOOT_TIMEOUT_MS;
+    let ready = false;
+    let spawnError = null;
+    child.on("error", (error) => { spawnError = error; });
+    while (Date.now() < deadline) {
+      if (spawnError || child.exitCode !== null) break;
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+        if (response.ok && (await response.json().catch(() => null))?.ready !== false) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* not up yet */
+      }
+      await sleep(300);
+    }
+    if (!ready) {
+      return { ready: false, output, spawnError, exitCode: child.exitCode, signal: child.signalCode };
+    }
+    // The owner record is written at the end of a successful boot, so its
+    // presence and matching pid prove the candidate finished starting rather
+    // than merely binding a port.
+    const owner = await parseJsonFile(join(home, ".botfleet", "harness-owner.json"), "Staged runtime owner record");
+    if (owner?.pid !== child.pid) {
+      // A wrong owner record is a real defect, not a slow host, so it carries
+      // its own cause: without this it would classify as a readiness timeout,
+      // earn a retry, and be reported as "too busy".
+      return {
+        ready: false,
+        cause: "owner-mismatch",
+        output: `${output}\nowner record pid ${owner?.pid} does not match the staged server pid ${child.pid}`,
+        exitCode: child.exitCode,
+        signal: child.signalCode,
+      };
+    }
+    const sqlite = await smokeNativeSqlite({ serverDirectory: staging, nodeBin: process.execPath });
+    return { ready: true, output, sqlite };
+  } finally {
+    child.kill("SIGKILL");
+    await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
+  }
+}
+
+
 async function exactAppPids(appPath) {
   const result = await run("ps", ["-axo", "pid=,command="], { allowFailure: true });
   const executable = join(appPath, "Contents/MacOS/BotFleet");
@@ -1704,6 +2004,21 @@ function createOperations(config) {
     },
 
     validateBundle: validateBuiltBundle,
+
+    smokeTestBundle: async (builtBundle, targetCommit) => {
+      if (!smokeTestEnabled()) {
+        console.log("Skipping the staged smoke test (BOTFLEET_UPDATE_SMOKE=0); the candidate is unproven.");
+        return;
+      }
+      const result = await runStagedSmokeTest({
+        builtBundle,
+        targetCommit,
+        smokeImpl: smokeStagedServer,
+        onRetry: ({ attempt, attempts }) =>
+          console.log(`Staged candidate did not report ready (attempt ${attempt}/${attempts}); retrying once for a busy host.`),
+      });
+      console.log(`Staged candidate ${targetCommit.slice(0, 12)} booted, reported ready, and initialized node:sqlite ✓ (attempt ${result.attempts})`);
+    },
 
     persistPrepared: async ({ source, targetCommit, builtBundle, identity }) => {
       const bundlePath = join(source.stageDirectory, "BotFleet.app");
