@@ -116,28 +116,23 @@ function isAuthorized(req: IncomingMessage): boolean {
 }
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const DRAIN_BUDGET_BYTES = 64 * 1024;
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
     let tooLarge = false;
-    let drained = 0;
+    let received = 0;
     req.on("data", (chunk: Buffer) => {
-      if (tooLarge) {
-        drained += chunk.length;
-        if (drained > DRAIN_BUDGET_BYTES) req.destroy();
+      if (tooLarge) return;
+      received += chunk.length;
+      if (received > MAX_BODY_BYTES) {
+        tooLarge = true;
+        body = "";
+        req.resume();
+        reject(new Error("Payload too large"));
         return;
       }
       body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
-        tooLarge = true;
-        body = "";
-        drained += chunk.length;
-        req.resume();
-        if (drained > DRAIN_BUDGET_BYTES) req.destroy();
-        reject(new Error("Payload too large"));
-      }
     });
     req.on("end", () => {
       if (!tooLarge) resolve(body);
@@ -265,10 +260,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     try {
       rawBody = await readBody(req);
     } catch (err) {
+      res.once("finish", () => req.destroy());
       sendJson(res, 400, {
         jsonrpc: "2.0",
         id: null,
-        error: { code: -32700, message: (err as Error).message || "Parse error" },
+        error: { code: -32700, message: (err instanceof Error ? err.message : String(err)) || "Parse error" },
       });
       return;
     }

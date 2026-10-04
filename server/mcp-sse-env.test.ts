@@ -15,10 +15,11 @@ describe("MCP HTTP/SSE adapter harness URL default", () => {
     delete process.env.BOTFLEET_URL;
     delete process.env.OPENMAUSBOT_URL;
     delete process.env.OMB_PORT;
-    // A token is what makes the un-configured case throw the config error
-    // rather than silently probing: it is the guard against leaking the harness
-    // bearer to whatever answers on a discovered port.
-    const canary = `test-token-${Date.now()}`;
+    process.env.BOTFLEET_MCP_TEST_TOKEN = process.env.BOTFLEET_MCP_TEST_TOKEN || "test-token-env-ordering";
+    const canary = process.env.BOTFLEET_MCP_TEST_TOKEN;
+    if (!canary) {
+      throw new Error("BOTFLEET_MCP_TEST_TOKEN is required to run the MCP adapter env-ordering test");
+    }
     process.env.BOTFLEET_TOKEN = canary;
     process.env.BOTFLEET_MCP_TOKEN = canary;
     process.env.BOTFLEET_MCP_HOST = "127.0.0.1";
