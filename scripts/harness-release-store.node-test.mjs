@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
@@ -320,12 +320,25 @@ test("the swap reports whether it was atomic, and is atomic where the platform a
 
   const first = await swapCurrent({ commit: A, env });
   assert.equal(typeof first.atomic, "boolean", "every swap must report its atomicity");
+  // A SECOND swap is what exercises the non-atomic path: the first one has no
+  // existing pointer to collide with, so it never reaches the fallback.
+  const second = await swapCurrent({ commit: B, env });
+  assert.equal(typeof second.atomic, "boolean", "every swap must report its atomicity");
+
   if (process.platform !== "win32") {
     assert.equal(first.atomic, true, "the atomic path is the one macOS and Linux take");
-    const second = await swapCurrent({ commit: B, env });
     assert.equal(second.atomic, true, "and it must stay atomic on every swap, not just the first");
+  } else {
+    // Windows cannot rename over the pointer, so it takes the documented
+    // fallback.  The contract is that it still WORKS, and that the caller is
+    // told — not that it is fast.
+    assert.equal(second.atomic, false, "the Windows fallback must report that it was not atomic");
   }
-  // Whatever the platform did, the pointer ends up on the requested release.
+
+  // Whatever the platform did, the pointer ends up on the last release asked
+  // for.  Asserted against what was actually swapped, because a test that
+  // hardcodes an expectation the platform-specific branch skipped just fails
+  // there for a reason that has nothing to do with the code.
   assert.equal(await currentCommit(env), B);
   assert.equal(await realpath(currentLink(env)), await realpath(releasePath(B, env)));
 });
@@ -384,4 +397,75 @@ test("the commit is read from a path with the platform's own separator", () => {
   const windowsPointer = "C:\\Users\\jay\\.botfleet\\releases\\" + A;
   assert.equal(windowsPointer.split(win32.sep).pop(), A, "the last segment must be recoverable on Windows");
   assert.equal(windowsPointer.split("/").pop(), windowsPointer, "which is exactly what the hard-coded split returned");
+});
+
+test("where rename-over is refused, the swap still works and says it was not atomic", async (t) => {
+  // The Windows fallback was otherwise only exercised on Windows, which is the one
+  // place this cannot be reasoned about from a Mac.  Injecting the EPERM makes
+  // the branch run on every platform, so the fallback's contract — it WORKS, and
+  // the caller is TOLD it was not atomic — is pinned here rather than discovered
+  // in CI on a machine nobody can reproduce on.
+  const { env } = await store(t);
+  for (const commit of [A, B]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env });
+  }
+  await swapCurrent({ commit: A, env });
+
+  let calls = 0;
+  // The stub must still PERFORM the real rename on its second call — a stub that
+  // merely stopped throwing would leave the pointer deleted and the test would
+  // be asserting a broken fallback rather than a working one.
+  const refusing = async (...args) => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error("EPERM: operation not permitted, rename");
+      error.code = "EPERM";
+      throw error;
+    }
+    return rename(...args);
+  };
+
+  const result = await swapCurrent({ commit: B, env, renameImpl: refusing });
+  assert.equal(result.atomic, false, "the caller must be told the swap was not atomic");
+  assert.equal(calls, 2, "the fallback retries the rename once after clearing the pointer");
+  // And the point of the fallback: the pointer still ends up where it was asked
+  // to be, because a non-atomic swap is only acceptable if it still works.
+  assert.equal(await currentCommit(env), B);
+  assert.equal(await realpath(currentLink(env)), await realpath(releasePath(B, env)));
+
+  await t.test("an unrecognised failure is not swallowed", async () => {
+    await assert.rejects(
+      swapCurrent({
+        commit: A,
+        env,
+        renameImpl: async () => {
+          const error = new Error("EIO: i/o error");
+          error.code = "EIO";
+          throw error;
+        },
+      }),
+      (error) => error.code === "EIO",
+    );
+  });
+});
+
+test("a manifest whose commit is not a full SHA is not a release", async (t) => {
+  // The commit check is one expression rather than a typeof plus a format
+  // check, so these pin that a non-string is rejected by the SAME test that
+  // validates the format — a manifest claiming commit: 42, or commit: "main",
+  // or no commit at all, must not be mistaken for a release.
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-"));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const write = async (body) => {
+    await writeFile(join(dir, ".botfleet-release.json"), typeof body === "string" ? body : JSON.stringify(body));
+    return isReleaseDirectory(dir);
+  };
+  assert.equal(await write({ schemaVersion: 1, commit: A, promotedAt: "2026-10-01T00:00:00.000Z" }), true);
+  assert.equal(await write({ schemaVersion: 1, commit: 42 }), false, "a number is not a commit");
+  assert.equal(await write({ schemaVersion: 1, commit: "main" }), false, "a branch name is not a commit");
+  assert.equal(await write({ schemaVersion: 1, commit: "abc" }), false, "a short sha is not a commit");
+  assert.equal(await write({ schemaVersion: 1, commit: `${A}Z` }), false, "a non-hex character is not a commit");
+  assert.equal(await write({ schemaVersion: 1 }), false, "no commit is not a release");
+  assert.equal(await write("not json at all"), false, "unparseable is not a release");
 });

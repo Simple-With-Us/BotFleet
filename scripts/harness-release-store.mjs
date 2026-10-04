@@ -87,7 +87,7 @@ export function currentLink(env = process.env) {
 /** Is this path a release directory we promoted, as opposed to a live checkout? */
 export async function isReleaseDirectory(path) {
   const manifest = await readReleaseManifest(path);
-  return typeof manifest?.commit === "string" && FULL_COMMIT.test(manifest.commit);
+  return FULL_COMMIT.test(manifest?.commit ?? "");
 }
 
 /**
@@ -115,7 +115,7 @@ export async function currentCommit(env = process.env) {
   // function documented to return null — so a caller doing the documented null
   // check still crashed, on the exact path where a release is being deleted.
   const manifest = await readReleaseManifest(physical);
-  if (manifest && typeof manifest.commit === "string" && FULL_COMMIT.test(manifest.commit)) {
+  if (manifest && FULL_COMMIT.test(manifest.commit ?? "")) {
     return manifest.commit;
   }
   // A pointer aimed at something that is not a release (a legacy checkout, or a
@@ -185,7 +185,7 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
  * and therefore atomic.  A reader following `current` at any instant sees either
  * the previous release or the new one.
  */
-export async function swapCurrent({ commit, env = process.env } = {}) {
+export async function swapCurrent({ commit, env = process.env, renameImpl = rename } = {}) {
   const target = releasePath(commit, env);
   const link = currentLink(env);
   const previous = await resolveCurrent(env);
@@ -201,7 +201,7 @@ export async function swapCurrent({ commit, env = process.env } = {}) {
   try {
     await symlink(target, staged, linkType);
     try {
-      await rename(staged, link);
+      await renameImpl(staged, link);
     } catch (error) {
       // rename-over-an-existing-link is POSIX.  Where it is not available,
       // remove the pointer first and say so, rather than crashing: a
@@ -212,7 +212,7 @@ export async function swapCurrent({ commit, env = process.env } = {}) {
       if (!["EPERM", "EACCES", "ENOTEMPTY", "EEXIST"].includes(error?.code)) throw error;
       atomic = false;
       await rm(link, { recursive: true, force: true });
-      await rename(staged, link);
+      await renameImpl(staged, link);
     }
   } finally {
     await rm(scratch, { recursive: true, force: true }).catch(() => {});
