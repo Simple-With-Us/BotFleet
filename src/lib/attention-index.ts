@@ -106,28 +106,17 @@ function indexAttentionMessages<T extends AttentionMessage>(
   return byId;
 }
 
-/** Same parent walk as `visibleMessages` in the store.  Without a leaf, or
- * when that leaf is not in the payload, the flat list is the visible thread. */
-function visibleAttentionMessages<T extends AttentionMessage>(
+/** Visible tail for turn-error checks.  When the leaf id is in the index,
+ * that message is the tail: the old parent walk pushed it first and then
+ * reversed, so `.at(-1)` was always the leaf.  A cycle break cannot change
+ * that, and a missing leaf still falls back to the flat last message. */
+function visibleAttentionTail<T extends AttentionMessage>(
   messages: readonly T[] | undefined,
   activeLeafId: string | null | undefined,
-): readonly T[] {
-  if (!messages || messages.length === 0) return [];
-  if (!activeLeafId) return messages;
-  const byId = indexAttentionMessages(messages);
-  if (!byId.has(activeLeafId)) return messages;
-  const path: T[] = [];
-  const seen = new Set<string>();
-  let cur = byId.get(activeLeafId);
-  while (cur) {
-    if (cur.id) {
-      if (seen.has(cur.id)) break;
-      seen.add(cur.id);
-    }
-    path.push(cur);
-    cur = cur.parentId ? byId.get(cur.parentId) : undefined;
-  }
-  return path.reverse();
+): T | undefined {
+  if (!messages || messages.length === 0) return undefined;
+  if (!activeLeafId) return messages.at(-1);
+  return indexAttentionMessages(messages).get(activeLeafId) ?? messages.at(-1);
 }
 
 function messageIsTurnError(message: AttentionMessage | undefined): boolean {
@@ -138,8 +127,7 @@ export function isBotTurnError(bot: {
   activeLeafId?: string | null;
   messages?: readonly AttentionMessage[];
 }): boolean {
-  const visible = visibleAttentionMessages(bot.messages, bot.activeLeafId);
-  return messageIsTurnError(visible.at(-1));
+  return messageIsTurnError(visibleAttentionTail(bot.messages, bot.activeLeafId));
 }
 
 export interface MinimalGroup {
@@ -175,10 +163,10 @@ export function computeRoomAttentionIndex(
         .filter((b): b is MinimalBot => Boolean(b));
 
       // 1. Errors: dead activity or terminal unresolved failures.
-      // The visible tail is resolved once and reused for the filter and the reason.
+      // The visible tail is one leaf lookup, reused for the check and the reason.
       const errorBots: AttentionParticipant[] = [];
       for (const b of assignedBots) {
-        const visibleTail = visibleAttentionMessages(b.messages, b.activeLeafId).at(-1);
+        const visibleTail = visibleAttentionTail(b.messages, b.activeLeafId);
         const turnError = messageIsTurnError(visibleTail);
         if (b.activity !== "dead" && !b.hasError && !turnError) continue;
         const errorDetail = turnError

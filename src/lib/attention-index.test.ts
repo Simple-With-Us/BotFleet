@@ -292,4 +292,89 @@ describe("computeRoomAttentionIndex", () => {
       "Turn error: rate limit from provider",
     ]);
   });
+
+  it("uses the leaf as the visible tail, including a deep chain and a cycle", () => {
+    const deep = [
+      { id: "m0", kind: "text", parentId: null },
+      ...Array.from({ length: 40 }, (_, i) => ({
+        id: `m${i + 1}`,
+        kind: "text",
+        parentId: `m${i}`,
+      })),
+      {
+        id: "leaf",
+        kind: "activity",
+        parentId: "m40",
+        tool: { name: "error: leaf on the visible branch" },
+      },
+      {
+        id: "flat-tail",
+        kind: "activity",
+        parentId: "m0",
+        tool: { name: "error: abandoned flat tail" },
+      },
+    ];
+    const deepBot: MinimalBot = {
+      id: "bot-deep",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "leaf",
+      messages: deep,
+    };
+
+    const cycle: MinimalBot = {
+      id: "bot-cycle",
+      name: "Scout",
+      activity: "idle",
+      activeLeafId: "loop-leaf",
+      messages: [
+        { id: "loop-leaf", kind: "activity", parentId: "loop-mid", tool: { name: "error: cycle leaf" } },
+        { id: "loop-mid", kind: "activity", parentId: "loop-leaf", tool: { name: "error: cycle parent" } },
+        { id: "flat-tail", kind: "activity", parentId: null, tool: { name: "error: cycle flat tail" } },
+      ],
+    };
+
+    const missingLeaf: MinimalBot = {
+      id: "bot-missing",
+      name: "Fixer",
+      activity: "idle",
+      activeLeafId: "not-in-transcript",
+      messages: [
+        { id: "root", kind: "text", parentId: null },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: flat fallback" } },
+      ],
+    };
+
+    const ancestorOnly: MinimalBot = {
+      id: "bot-ancestor",
+      name: "Archivist",
+      activity: "idle",
+      activeLeafId: "clean-leaf",
+      messages: [
+        { id: "root", kind: "activity", parentId: null, tool: { name: "error: ancestor only" } },
+        { id: "clean-leaf", kind: "text", parentId: "root" },
+        { id: "flat-tail", kind: "activity", parentId: "root", tool: { name: "error: not the leaf" } },
+      ],
+    };
+
+    expect(isBotTurnError(deepBot)).toBe(true);
+    expect(isBotTurnError(cycle)).toBe(true);
+    expect(isBotTurnError(missingLeaf)).toBe(true);
+    expect(isBotTurnError(ancestorOnly)).toBe(false);
+
+    const groups: MinimalGroup[] = [
+      {
+        id: "room",
+        name: "BotFleet",
+        memberIds: ["bot-deep", "bot-cycle", "bot-missing", "bot-ancestor"],
+        unread: false,
+      },
+    ];
+    const result = computeRoomAttentionIndex(groups, [deepBot, cycle, missingLeaf, ancestorOnly]);
+    expect(result[0].errors.bots.map((bot) => [bot.botName, bot.reason])).toEqual([
+      ["Builder", "Turn error: leaf on the visible branch"],
+      ["Scout", "Turn error: cycle leaf"],
+      ["Fixer", "Turn error: flat fallback"],
+    ]);
+  });
 });
