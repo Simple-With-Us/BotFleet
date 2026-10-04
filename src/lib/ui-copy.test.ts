@@ -161,3 +161,57 @@ describe("Bot Chats sidebar section appears once", () => {
     expect(matches).toHaveLength(1);
   });
 });
+
+describe("sentence gap outside chat", () => {
+  // Chat bubbles and <pre> panes use whitespace-pre-wrap, so two ASCII
+  // spaces survive there.  Everywhere else the default white-space:normal
+  // collapses them, and styles.css sets no white-space of its own.  A CSS
+  // change cannot turn the single ASCII space these strings ship with into
+  // the sentence gap.  The gap that still renders is NBSP + space, written
+  // {"\u00a0 "} in JSX children.  A quoted attribute does not decode \u,
+  // so attribute copy uses the same marker inside a JS expression: ={"...\u00a0 ..."}.
+  // Assert that marker is present.  A negative-only rule
+  // (not.toMatch(/[a-z0-9)]\. {1,2}[A-Z]/)) stays green when the gap is
+  // deleted outright, which is how #810 shipped a removed gap.
+  const GAPS: Array<[file: string, gap: string]> = [
+    ["components/AndroidDevicePanel.tsx", "USB.{\"\\u00a0 \"}The screen"],
+    ["components/BotProfileAvatarCard.tsx", "aria-label={\"Bot avatar.\\u00a0 Drop"],
+    ["components/CompanionSection.tsx", "read.{\"\\u00a0 \"}Check MagicDNS"],
+    ["components/ComputerPanel.tsx", "Connections.{\"\\u00a0 \"}Auto only"],
+    ["components/ComputerPanel.tsx", "default.{\"\\u00a0 \"}When enabled"],
+    ["components/ComputerPanel.tsx", "Off.{\"\\u00a0 \"}Choose ASCII"],
+    ["components/EngineSetup.tsx", "platform.{\"\\u00a0 \"}Use the setup"],
+    ["components/GroupSettingsPanel.tsx", "history.{\"\\u00a0 \"}Bot definitions"],
+    ["components/GroupView.tsx", "attached.{\"\\u00a0 \"}Add more"],
+    ["components/RoutinesPage.tsx", "answer.{\"\\u00a0 \"}Open its"],
+    ["components/RoutinesPage.tsx", "work.{\"\\u00a0 \"}Every run"],
+    ["components/SettingsModal.tsx", "subtitle={\"Anonymous product events — app opened, which features get used.\\u00a0 Never"],
+    ["components/SettingsModal.tsx", "output.\\u00a0 Your email is only attached if you shared it during setup.\"}"],
+    ["components/SettingsModal.tsx", "tools.{\"\\u00a0 \"}Errors"],
+    ["components/SettingsModal.tsx", "subtitle={\"Early features may change while we test them.\\u00a0 They stay"],
+    ["components/SettingsModal.tsx", "subtitle={\"Versions, configuration on/off state and a redacted server log tail.\\u00a0 Review"],
+    ["components/SettingsModal.tsx", "subtitle={\"Shown in the sidebar.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsModal.tsx", "subtitle={\"Which binary each engine runs.\\u00a0 Saved as you go.\"}"],
+    ["components/SettingsPanel.tsx", "placeholder={\"Nothing remembered yet.\\u00a0 The bot"],
+    ["components/SkillRecorderPage.tsx", "once.{\"\\u00a0 \"}Let every"],
+    ["components/SkillRecorderPage.tsx", "remain.{\"\\u00a0 \"}The narration"],
+    ["components/TeamMapPage.tsx", "turn.{\"\\u00a0 \"}Only you"],
+    ["components/TeamMapPage.tsx", "yet.{\"\\u00a0 \"}Ask a"],
+    ["components/WebhooksPanel.tsx", "once.{\"\\u00a0 \"}Generate"],
+    ["components/WebhooksPanel.tsx", "now.{\"\\u00a0 \"}Keep BotFleet"],
+    ["components/WebhooksPanel.tsx", "yet.{\"\\u00a0 \"}Use the"],
+    // Search results render the same sentences from this table, not from the modal.
+    ["lib/settings-search.ts", "used.\\u00a0 Never"],
+    ["lib/settings-search.ts", "them.\\u00a0 They stay"],
+    ["lib/settings-search.ts", "tail.\\u00a0 Review"],
+    ["lib/settings-search.ts", "sidebar.\\u00a0 Saved"],
+  ];
+
+  for (const [file, gap] of GAPS) {
+    it(`${file} keeps ${gap.replaceAll("\\u00a0", "NBSP")}`, () => {
+      const source = FILES.find((entry) => entry.rel === file);
+      expect(source, `${file} is missing`).toBeDefined();
+      expect(source!.text).toContain(gap);
+    });
+  }
+});

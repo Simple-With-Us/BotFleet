@@ -229,7 +229,7 @@ function SectionContextDialog({ section, label, onClose }: { section: string; la
               </h2>
             </div>
             <p className="mt-1.5 max-w-[520px] text-[12.5px] leading-relaxed text-ink-secondary">
-              A team brief shown to every bot in this section at the start of each turn. Only you can edit it.
+              A team brief shown to every bot in this section at the start of each turn.{"\u00a0 "}Only you can edit it.
             </p>
           </div>
           <button
@@ -420,7 +420,7 @@ export function TeamMapPage() {
             ))}
             {edges.length === 0 && (
               <div className="rounded-xl border border-dashed border-hairline bg-panel px-4 py-6 text-center text-[12.5px] text-ink-secondary">
-                No bot-to-bot handoffs yet. Ask a Chief of Staff to delegate a task and it will appear here live.
+                No bot-to-bot handoffs yet.{"\u00a0 "}Ask a Chief of Staff to delegate a task and it will appear here live.
               </div>
             )}
           </div>
@@ -434,5 +434,17 @@ export function TeamMapPage() {
         />
       )}
     </main>
+  );
+}
+
+/** Visual-spec harness for tests/e2e/team-map-context.visual.spec.ts.
+ *  Mounts the real shared-context dialog.  The spec fulfills
+ *  GET /api/section-context with a fixed payload so the dialog can leave
+ *  its loading state.  That route is served by the bot server, which this
+ *  lane does not run.  The sentence in the dialog header is this component's
+ *  own JSX. */
+export function TeamMapSharedContextVisualFixture() {
+  return (
+    <SectionContextDialog section="ops" label="Operations" onClose={() => {}} />
   );
 }

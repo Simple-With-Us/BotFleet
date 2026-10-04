@@ -277,7 +277,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
           <textarea
             className={cn(inputCls, "min-h-[160px] resize-y font-mono text-[12.5px] leading-relaxed")}
             value={text}
-            placeholder="Nothing remembered yet. The bot writes durable notes here — or add your own."
+            placeholder={"Nothing remembered yet.\u00a0 The bot writes durable notes here — or add your own."}
             aria-label="Bot memory"
             onChange={(e) => {
               setText(e.target.value);
