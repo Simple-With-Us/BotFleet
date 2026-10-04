@@ -3,6 +3,7 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ResolutionError } from "./ci-build-resolver.mjs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
@@ -17,6 +18,7 @@ import {
   credentialPreparationReceiptPath,
   DEFAULT_PORTS,
   dependencyFingerprint,
+  isRecoverableResolutionFailure,
   designatedRequirementFromOutput,
   fenceRuntimeAdmission,
   healthTopologyResult,
@@ -272,6 +274,7 @@ test("the stable wrapper bootstraps updater policy from the fetched target", asy
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -341,6 +344,7 @@ test("the stable wrapper rejects an unmerged --target before running any of its 
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -394,6 +398,7 @@ test("the stable wrapper resolves a revision-expression --target instead of fetc
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -446,6 +451,7 @@ test("unquiesce ignores update targets and bootstraps the recovery from origin/m
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -503,6 +509,7 @@ test("the stable wrapper resolves env and equals-form targets to the pinned vali
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -555,6 +562,7 @@ test("the stable wrapper builds the commit it validated, even when main moves mi
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -629,6 +637,7 @@ test("the stable wrapper runs with no arguments and no update target", { skip: p
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -671,6 +680,7 @@ test("the stable wrapper detects a linked worktree checkout, where .git is a fil
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]) {
@@ -720,6 +730,7 @@ test("the up-to-date shortcut only swallows a plain update to origin/main", { sk
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -809,6 +820,7 @@ test("apply bootstraps the updater recorded in the stage manifest, not a newer o
       "scripts/update-botfleet-mac.mjs",
       "scripts/mac-update-transaction.mjs",
       "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
       "scripts/update-progress.mjs",
       "electron/update-credential-preparation.mjs",
     ]) {
@@ -1770,6 +1782,7 @@ test("the updater runs its entry point when invoked through a symlinked director
     "scripts/update-botfleet-mac.mjs",
     "scripts/mac-update-transaction.mjs",
     "scripts/ci-build-resolver.mjs",
+    "scripts/stage-entries.mjs",
     "scripts/update-progress.mjs",
     "electron/update-credential-preparation.mjs",
   ]);
@@ -1980,5 +1993,29 @@ test("only a well-formed health body establishes readiness", () => {
   for (const body of [null, undefined, "ready", 42, [], {}, { ready: true }, { app: "botfleet" },
     { app: "botfleet", ready: "true" }, { app: "botfleet", ready: 1 }]) {
     assert.equal(parseHealthBody(body), false, `${JSON.stringify(body)} must not establish readiness`);
+  }
+});
+
+test("only an expected cancellation justifies packaging on this Mac", () => {
+  // The real class: the check is an instanceof, so a stand-in would make the
+  // test pass for the wrong reason.
+
+  // The `auto` policy exists for "this commit was not built".  A build that
+  // actually FAILED is a signal — its signature gate, tests, or packaging step
+  // rejected the commit — and quietly building it locally for 15 minutes would
+  // turn a broken pipeline into a deceptively successful install.
+  const outcome = (cause, conclusion) => {
+    const error = new ResolutionError("x");
+    error.cause = cause;
+    error.conclusion = conclusion;
+    return isRecoverableResolutionFailure(error);
+  };
+  assert.equal(outcome("no-build", undefined), true, "the commit predates the workflow");
+  assert.equal(outcome("build-failed", "cancelled"), true, "a newer commit landed on main");
+  assert.equal(outcome("build-failed", "in_progress"), true, "worth a moment");
+  assert.equal(outcome("build-failed", "failure"), false, "the build rejected the commit");
+  assert.equal(outcome("build-failed", "timed_out"), false);
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "unauthorized"]) {
+    assert.equal(outcome(cause, undefined), false, `${cause} must surface, not fall back`);
   }
 });

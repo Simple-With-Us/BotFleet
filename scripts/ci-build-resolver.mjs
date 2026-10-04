@@ -118,6 +118,8 @@ export class ResolutionError extends Error {
     super(message);
     this.name = "ResolutionError";
     this.cause = cause;
+    /** For cause "build-failed": "cancelled", "failure", "still running", ... */
+    this.conclusion = undefined;
   }
 }
 
@@ -393,10 +395,16 @@ export async function downloadBuiltBundle({
       const conclusion = attempted.status === "in_progress"
         ? "still running"
         : attempted.conclusion || "unknown";
-      throw new ResolutionError(
+      const failure = new ResolutionError(
         resolutionMessage({ cause: "build-failed", commit, conclusion, repository }),
         "build-failed",
       );
+      // Carried on the error so the caller can tell an expected cancellation
+      // from a build that actually rejected the commit.  Only the first is a
+      // legitimate reason to package on this Mac; the second is a signal, and
+      // silently building it locally would be a deceptively successful install.
+      failure.conclusion = conclusion;
+      throw failure;
     }
     throw new ResolutionError(
       resolutionMessage({ cause: "no-build", commit, status: 404, repository }),

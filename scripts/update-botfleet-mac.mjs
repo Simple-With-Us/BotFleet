@@ -27,6 +27,7 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import { KNOWN_STAGE_ENTRIES, stageIsPrunable } from "./stage-entries.mjs";
 import {
   downloadBuiltBundle,
   ResolutionError,
@@ -304,13 +305,10 @@ export const CANDIDATE_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.update
 // every later update forever.  It carries the updater's pid so the ordinary
 // candidate rule sweeps it once that process is gone.
 export const FAILED_DEPENDENCY_PREFIX = ".botfleet-server.node_modules.failed-";
-// Entries a stage directory is allowed to contain and still be swept
-// unattended.  Anything else in there was put there by a person, and a person
-// gets to decide when it goes.
-const KNOWN_STAGE_ENTRIES = new Set([
-  "BotFleet.app", "node_modules", "prepared.json", "rollback", "source",
-  "pending-recovery.json", "credential-migration.json", "hosted",
-]);
+// The allowlist lives in scripts/stage-entries.mjs because
+// server/update-control.ts sweeps with the same rules, and two copies of it
+// already drifted once — which leaked a full copy of the app and a
+// multi-gigabyte dependency tree on every update.
 export const ABANDONED_STAGE_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -380,7 +378,7 @@ export function abandonedStages(entries, { now = Date.now(), referenced = [], ag
     }
     const stamp = stageStamp(entry.name) ?? entry.mtimeMs;
     const stale = Number.isFinite(stamp) && now - stamp > ageMs;
-    if (stale && entry.names.every((name) => KNOWN_STAGE_ENTRIES.has(name))) prune.push(entry.path);
+    if (stale && stageIsPrunable(entry.names)) prune.push(entry.path);
     else report.push(entry.path);
   }
   return { prune, report };
@@ -1183,6 +1181,16 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
   if (!(await exists(join(serverDirectory, "index.js")))) {
     throw new Error(`Staged BotFleet candidate has no packaged server entry point: ${serverDirectory}/index.js`);
   }
+  // Checked BEFORE any scratch directory exists.  This used to sit after the
+  // ditto below, so a candidate with no packaged executable threw with a full
+  // copy of Contents/Resources/server already on disk, and the cleanup
+  // finally-block had not been entered yet — a structural throw is not retried,
+  // so every imported --bundle candidate without that binary leaked a /tmp
+  // directory for the life of the machine.
+  const packagedBinary = join(bundlePath, "Contents/MacOS/BotFleet");
+  if (!(await exists(packagedBinary))) {
+    throw new Error(`Staged BotFleet candidate has no packaged executable: ${packagedBinary}`);
+  }
   const scratch = join(scratchRoot, `smoke-${targetCommit.slice(0, 12)}-${attempt}-${randomUUID()}`);
   const staging = join(scratch, "server");
   const home = join(scratch, "home");
@@ -1204,10 +1212,6 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
   // Homebrew/nvm Node could have node:sqlite while Electron's bundled Node does
   // not, or the reverse, and the probe would be answering a question nobody
   // asked.  Dropping the flag would launch GUI Electron instead of the server.
-  const packagedBinary = join(bundlePath, "Contents/MacOS/BotFleet");
-  if (!(await exists(packagedBinary))) {
-    throw new Error(`Staged BotFleet candidate has no packaged executable: ${packagedBinary}`);
-  }
   const child = spawn(packagedBinary, [join(staging, "index.js")], {
     cwd: staging,
     env: {
@@ -1358,15 +1362,22 @@ async function processTxtPaths(pid) {
  * 15-minute local build would turn a broken pipeline or a tampered artifact
  * into "it worked, just slowly".
  */
-function isRecoverableResolutionFailure(error) {
-  // "no-build" is the case `auto` exists for: the commit predates the workflow,
-  // or its build never ran.  "build-failed" belongs with it — a run that
-  // exists but did not succeed is equally not something a retry can fix, and
-  // it is the expected outcome whenever this workflow cancels a superseded
-  // build.  Everything else (network, rate limit, checksum, bad manifest) must
-  // still surface, because a silent local package would turn a broken pipeline
-  // or a tampered artifact into "it worked, just slowly".
-  return error instanceof ResolutionError && ["no-build", "build-failed"].includes(error.cause);
+export function isRecoverableResolutionFailure(error) {
+  if (!(error instanceof ResolutionError)) return false;
+  if (error.cause === "no-build") return true;
+  // Only a run the workflow was *expected* to cancel justifies a local
+  // fallback.  A genuinely failed build is a signal: its signature gate, its
+  // tests, or its packaging step rejected the commit, and quietly building the
+  // same commit locally for 15 minutes would turn a broken pipeline into a
+  // deceptively successful install.  `cancelled` is the expected outcome
+  // whenever a newer commit lands on main; `in_progress` is worth a moment.
+  if (error.cause === "build-failed") {
+    return ["cancelled", "in_progress"].includes(error.conclusion);
+  }
+  // Network, rate limit, checksum, and bad manifest must all surface: a silent
+  // local package would turn a broken pipeline or a tampered artifact into "it
+  // worked, just slowly".
+  return false;
 }
 
 export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
