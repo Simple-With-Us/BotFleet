@@ -907,6 +907,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           if (pid && child.exitCode === null && child.signalCode === null) {
             const forceTimer = setTimeout(() => {
               try {
+                // The child may have exited since the timer was armed and its
+                // pid recycled: killing the group then could hit an unrelated
+                // process.  Re-check liveness before sending SIGKILL.
+                if (child.exitCode !== null || child.signalCode !== null) return;
                 if (process.platform !== "win32") process.kill(-pid, "SIGKILL");
                 else child.kill("SIGKILL");
               } catch {
@@ -914,6 +918,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               }
             }, FORCE_EXIT_AFTER_MS);
             forceTimer.unref?.();
+          } else if (pid) {
+            // The leader already exited, but an MCP descendant can ignore
+            // SIGTERM and outlive its parent while still holding the session
+            // lock (see stopAndWaitForExit).  One group kill reaps the
+            // lingerer instead of leaving the wedged process behind.
+            try {
+              if (process.platform !== "win32") process.kill(-pid, "SIGKILL");
+            } catch {
+              // the whole group is already gone
+            }
           }
         };
         const stopAndWaitForExit = async () => {
