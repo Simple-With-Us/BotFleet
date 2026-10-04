@@ -298,7 +298,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       res.end(JSON.stringify({ ok: true, status: "accepted" }) + "\n");
 
       try {
-        const responseJson = await processMcpMessage(rawBody);
+        const responseJson = await processMcpMessage(rawBody, undefined, sessionId);
         if (responseJson && !session.res.writableEnded) {
           session.res.write(`event: message\ndata: ${responseJson}\n\n`);
         }
