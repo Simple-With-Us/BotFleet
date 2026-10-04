@@ -37,6 +37,11 @@ describe("Settings Search Engine", () => {
     expect(label("models:fleet")).toBe("Models");
     expect(label("computers:defaults")).toBe("Default Bot Settings");
     expect(label("secrets:infisical")).toBe("Secret Store");
+    expect(label("general:conversationMode")).toBe("Workspace Arrangement");
+
+    const modeItem = SETTINGS_SEARCH_ITEMS.find((i) => i.id === "general:conversationMode");
+    expect(modeItem?.badge).toBe("Arrangement");
+    expect(modeItem?.subtitle).toContain("\u00a0");
   });
 
   it("keeps the Usage body visible when a query matches only a sub-item", () => {
@@ -87,6 +92,16 @@ describe("Settings Search Engine", () => {
     const result = searchSettings("dark mode");
     expect(result.matchingSectionIds.has("general")).toBe(true);
     expect(result.matchingItemIds.has("general:skin")).toBe(true);
+  });
+
+  it("finds workspace arrangement by title or keywords", () => {
+    const byArrangement = searchSettings("arrangement");
+    expect(byArrangement.matchingSectionIds.has("general")).toBe(true);
+    expect(byArrangement.matchingItemIds.has("general:conversationMode")).toBe(true);
+
+    const byTitle = searchSettings("Workspace Arrangement");
+    expect(byTitle.matchingSectionIds.has("general")).toBe(true);
+    expect(byTitle.matchingItemIds.has("general:conversationMode")).toBe(true);
   });
 
   it("finds both Shared VPS VM and Local VM by sandbox or vm", () => {

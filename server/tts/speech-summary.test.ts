@@ -187,5 +187,87 @@ describe("summarizeForVoice", () => {
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT read out raw git commit hashes");
     expect(DEEPSEEK_FLASH_TTS_PROMPT).toContain("DO NOT use em-dashes");
   });
+
+  it("sanitizes em-dashes, en-dashes, and floating hyphens on short replies", async () => {
+    const res = await summarizeForVoice("Quick check—looks good - done... ready");
+    expect(res).toBe("Quick check, looks good, done. ready");
+  });
+
+  it("sanitizes em-dashes and ellipses returned by model", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "Here is your update—first step completed - and waiting... for you" } }] }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is your update, first step completed, and waiting. for you");
+  });
+
+  it("strips list markers and keeps paragraph pauses on short replies", async () => {
+    // The acoustic pass collapses newlines, so the structure has to be
+    // normalized first or "2. Deploy queued" survives as a run-on.
+    const res = await summarizeForVoice("1. Build passed\n2. Deploy queued");
+    expect(res).toBe("Build passed. Deploy queued");
+  });
+
+  it("strips trailing unclosed code fences without wiping the preceding text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Here is the summary of what changed. ```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is the summary of what changed.");
+  });
+
+  it("preserves closed code fences while handling speech normalization", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Done. ```typescript\nconsole.log(1);\n``` All clear.",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Done. (a code block) All clear.");
+  });
+
+  it("handles malformed model responses by falling back to deterministic speech", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ invalid_payload: 123 }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
+
+  it("falls back to deterministic speech when model returns an unclosed fence at position 0 resulting in empty cleaned text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toContain("deployment of multiple services");
+  });
 });
+
 
