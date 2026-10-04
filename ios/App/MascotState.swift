@@ -53,7 +53,7 @@ extension BotState {
         if matches(["security", "secure", "compliance", "risk", "privacy", "finance", "financial"]) { return .scared }
         if matches(["design", "creative", "brainstorm", "art", "illustration", "music", "story"]) { return .playful }
         if matches(["support", "help", "success", "onboarding", "coach", "teacher", "guide", "welcome"]) { return .happy }
-        if matches(["sneak", "stealth", "quiet", "background agent"]) { return .sneaking }
+        if matches(["sneak", "stealth", "quiet"]) { return .sneaking }
         return .idle
     }
 

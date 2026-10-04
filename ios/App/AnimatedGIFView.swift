@@ -24,16 +24,32 @@ struct AnimatedGIFView: UIViewRepresentable {
     func updateUIView(_ view: UIImageView, context: Context) {
         view.contentMode = contentMode
         guard let data else {
+            view.stopAnimating()
             view.image = nil
             view.animationImages = nil
+            context.coordinator.lastData = nil
             return
         }
+        // TVFaceAvatar reads player.imageData in body, so this fires on every
+        // parent re-render: re-decoding the full frame set and restarting the
+        // animation at frame 0 each time would stutter a scrolling bot list.
+        guard context.coordinator.lastData != data else { return }
+        context.coordinator.lastData = data
         if let animated = UIImage.animatedImage(withAnimatedGIFData: data) {
             view.image = animated
             view.startAnimating()
         } else {
             view.image = UIImage(data: data)
         }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator { var lastData: Data? }
+
+    static func dismantleUIView(_ view: UIImageView, coordinator: Coordinator) {
+        view.stopAnimating()
+        coordinator.lastData = nil
     }
 }
 

@@ -343,9 +343,15 @@ async function apply(card, step) {
   for (const candidate of tryUrls) {
     try {
       if (candidate.kind !== "still") {
-        const head = await fetch(candidate.url, { method: "GET", mode: "cors" });
-        if (!head.ok) continue;
+        // Probe by decoding: loadGif throws on 404 and caches the frames,
+        // so the later show() reuses them instead of downloading the GIF a
+        // second time for the existence check.
+        await loadGif(candidate.url);
       }
+      // A newer step may have claimed the card while this chain was in
+      // flight (tick() fires apply() every frame, unawaited).  Painting now
+      // would tear down the newer loop and freeze on a stale frame.
+      if (card.cur !== key) return;
       await card.player.show(candidate.url, candidate.kind);
       return;
     } catch (_) {}

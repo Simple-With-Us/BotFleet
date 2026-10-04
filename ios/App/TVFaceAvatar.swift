@@ -20,9 +20,14 @@ public enum TVFaceAssetSource: Sendable {
         }
     }
 
+    /// Non-default packs live under the skins CDN; the pack root above is
+    /// the orange/default pack (and the legacy fallback some clients use).
+    private static let skinsBase = URL(string: "https://fleetlink.online/TV-Face/botfleet-skins")!
+
     func url(color: String, expression: TVFaceExpression, kind: TVFaceFrameKind) -> URL {
         let skin = TVFaceManifest.skinDir(color)
-        // FleetLink layout: orange at pack root; other colors under /{color}/.
+        // FleetLink layout: orange at pack root; other colors under
+        // /TV-Face/botfleet-skins/{color} (mirrors the demo pages' packBase).
         // Local/app layout would use /skins/{skin}/ — we support both:
         // FleetLink uses color name (or root for orange/default).
         let root: URL
@@ -30,7 +35,7 @@ public enum TVFaceAssetSource: Sendable {
             if skin == "default" {
                 root = baseURL
             } else {
-                root = baseURL.appendingPathComponent(skin)
+                root = Self.skinsBase.appendingPathComponent(skin)
             }
         } else {
             root = baseURL.appendingPathComponent(skin)
@@ -53,20 +58,26 @@ final class TVFacePlayer: ObservableObject {
     private var color: String
     private var source: TVFaceAssetSource
     private var task: Task<Void, Never>?
-    private var cache: [URL: Data] = [:]
+    /// One cache for every player: each row used to hold its own copy of the
+    /// same packs (N× the bytes, N× the fetches in a fleet list).  The URL
+    /// space is finite (skins × expressions × kinds), so sharing bounds it by
+    /// content rather than by row count.  @MainActor-isolated like the rest.
+    private static var sharedCache: [URL: Data] = [:]
 
     init(color: String, source: TVFaceAssetSource = .fleetLink) {
         self.color = color
         self.source = source
     }
 
-    func setColor(_ color: String) {
+    func setColor(_ color: String, animated: Bool) {
         guard color != self.color else { return }
         self.color = color
-        // Force replay of current expression under the new skin.
+        // Force replay of current expression under the new skin.  This is the
+        // only replay: the view must not call play again after this, or the
+        // second call cancels the enter step just scheduled.
         let expr = previous
         previous = .resting
-        play(expression: expr, animated: true)
+        play(expression: expr, animated: animated)
     }
 
     func play(state: BotState, animated: Bool) {
@@ -98,25 +109,29 @@ final class TVFacePlayer: ObservableObject {
 
     private func show(expression: TVFaceExpression, kind: TVFaceFrameKind) async {
         let url = source.url(color: color, expression: expression, kind: kind == .still ? .still : kind)
-        if let cached = cache[url] {
+        if let cached = Self.sharedCache[url] {
             imageData = cached
             return
         }
         // Fallback chain: requested → still of same expression → resting still.
         if let data = await fetch(url) {
-            cache[url] = data
+            Self.sharedCache[url] = data
             imageData = data
             return
         }
         let still = source.url(color: color, expression: expression, kind: .still)
         if let data = await fetch(still) {
-            cache[still] = data
+            Self.sharedCache[still] = data
+            // Resolve the missing GIF to its still so the guaranteed 404 is
+            // not re-fetched on every subsequent state change.
+            Self.sharedCache[url] = data
             imageData = data
             return
         }
         let rest = source.url(color: color, expression: .resting, kind: .still)
         if let data = await fetch(rest) {
-            cache[rest] = data
+            Self.sharedCache[rest] = data
+            Self.sharedCache[url] = data
             imageData = data
         }
     }
@@ -181,7 +196,7 @@ struct TVFaceAvatar: View {
         .accessibilityHidden(true)
         .onAppear { player.play(state: state, animated: animated) }
         .onChange(of: state) { _, new in player.play(state: new, animated: animated) }
-        .onChange(of: color) { _, new in player.setColor(new); player.play(state: state, animated: animated) }
+        .onChange(of: color) { _, new in player.setColor(new, animated: animated) }
         .onChange(of: animated) { _, new in player.play(state: state, animated: new) }
     }
 }
