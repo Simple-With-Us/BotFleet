@@ -1417,6 +1417,9 @@ export function reducer(state: AppState, action: Action): AppState {
           ...state,
           activeView: "chat",
           selectedId: action.id,
+          // A group is not the bot the pin belongs to.  Leaving it set would
+          // show the next bot the previous thread.
+          viewedThreadId: null,
           groups: state.groups.map((g) => (g.id === action.id ? { ...g, unread: false } : g)),
           groupEpoch: wasUnread ? bumpEpoch(state.groupEpoch, action.id) : state.groupEpoch,
         };
@@ -1455,6 +1458,8 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
+        // Selecting the new bot must not inherit the previous chat's pin.
+        viewedThreadId: null,
       }, action.bot.id, "arrive");
     case "deleteBot": {
       const bots = state.bots.filter((b) => b.id !== action.botId);
@@ -2408,29 +2413,61 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // Stamp before the POST so a slow 202 still shows send-time, not
           // response-receipt time (Codex P2 on #587).
           const sentAt = Date.now();
-          void api(`/api/bots/${action.botId}/messages`, {
-            method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          })
-            .then((body) => {
-              if (
-                body?.queued &&
-                typeof body.threadId === "string" &&
-                typeof body.queueId === "string"
-              ) {
-                rawDispatch({
-                  type: "pendingQueued",
-                  threadId: body.threadId,
-                  queueId: body.queueId,
-                  text: action.text,
-                  at: sentAt,
-                });
-              }
+          const current = stateRef.current;
+          const liveBot = current.bots.find((b) => b.id === action.botId);
+          // The pin is the thread on screen.  The message route accepts only
+          // the bot's active task, so a disagreeing pin has to become active
+          // before the POST.  Otherwise the text lands on the other thread.
+          const pinnedThreadId =
+            current.selectedId === action.botId && current.viewedThreadId
+              ? current.viewedThreadId
+              : null;
+          const targetThreadId = pinnedThreadId || liveBot?.threadId;
+          const postMessage = (threadId: string | undefined) => {
+            void api(`/api/bots/${action.botId}/messages`, {
+              method: "POST",
+              body: JSON.stringify({
+                text: action.text,
+                replyToId: action.replyToId,
+                ...(threadId ? { threadId } : {}),
+              }),
             })
-            .catch((error) => {
-              showError(error);
-              action.onError?.(error instanceof Error ? error.message : String(error));
-            });
+              .then((body) => {
+                if (
+                  body?.queued &&
+                  typeof body.threadId === "string" &&
+                  typeof body.queueId === "string"
+                ) {
+                  rawDispatch({
+                    type: "pendingQueued",
+                    threadId: body.threadId,
+                    queueId: body.queueId,
+                    text: action.text,
+                    at: sentAt,
+                  });
+                }
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+          };
+          if (liveBot && pinnedThreadId && pinnedThreadId !== liveBot.threadId) {
+            void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}`, { method: "POST" })
+              .then((switched: any) => {
+                if (!switched?.bot || switched.bot.threadId !== pinnedThreadId) {
+                  throw new Error("Could not open the thread on screen before sending.");
+                }
+                rawDispatch({ type: "taskSwitched", bot: switched.bot });
+                postMessage(pinnedThreadId);
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+            break;
+          }
+          postMessage(targetThreadId);
           break;
         }
         case "editMessage":
