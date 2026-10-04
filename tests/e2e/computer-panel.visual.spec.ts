@@ -4,11 +4,12 @@ import { test, expect, type Page, type Locator } from '@playwright/test';
 // /?fixture=computer-panel (see src/main.tsx). There is no visual-tests/
 // directory; this follows tests/e2e/visual.spec.ts.
 //
-// threshold 0.2 is Playwright's default per-pixel color distance, the same
-// value visual.spec.ts already compares with by leaving the option unset.
-// maxDiffPixelRatio 0.02 matches that file. No mask: these cards have no
-// animated mascot or live frame.
-const stableShot = { animations: 'disabled' as const, caret: 'hide' as const, maxDiffPixelRatio: 0.02, threshold: 0.2 };
+// Screenshot tolerance is expect.toHaveScreenshot in playwright.config.ts:
+// maxDiffPixelRatio 0.02 and threshold 0.2.  Those match visual.spec.ts
+// (0.02 explicit, 0.2 by Playwright's default).  Only animation and caret
+// handling stay on the call.  No mask: these cards have no animated mascot
+// or live frame.
+const stableShot = { animations: 'disabled' as const, caret: 'hide' as const };
 
 // The Runs On row labels "This Mac" when the user agent contains "Mac".
 // Pin a Linux Chrome UA so that label cannot drift between hosts. Desktop
