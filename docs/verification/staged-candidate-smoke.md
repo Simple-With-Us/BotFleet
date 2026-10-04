@@ -25,7 +25,7 @@ false verdict:
 
 | Property | How | Failure cause |
 |---|---|---|
-| It boots with no `node_modules` in reach | Copies `Contents/Resources/server` out of the bundle and runs it on a reserved loopback port with a throwaway `HOME` | `server-exited`, `server-never-ready` |
+| It boots with no `node_modules` in reach | Copies `Contents/Resources/server` out of the bundle and runs it on the packaged Electron binary with a reserved loopback port and a throwaway `HOME` | `server-exited`, `server-never-ready` |
 | It finishes booting, not just binds a port | Waits for `/api/health` with `ready !== false`, then requires `~/.botfleet/harness-owner.json` to name the probe's own pid | `server-never-ready` |
 | Its native SQLite binding loads | Opens and round-trips a row through `DatabaseSync` from `node:sqlite` on `:memory:` | `sqlite-unavailable`, `sqlite-probe-timed-out` |
 
@@ -59,10 +59,15 @@ The probe never touches live state:
 
 - a fresh `HOME` under the system temp dir, so no real config, credential, or
   `harness-owner.json` is read or overwritten;
+- each health request bounded at 3s, not just the boot loop, because the boot
+  handler exists from the moment the port binds — a candidate that accepts the
+  connection and never answers would otherwise sit on undici's 300s default and
+  strand the updater lock far past the boot deadline;
 - a port reserved by the OS on `127.0.0.1:0`, asserted not to be one of
   `DEFAULT_PORTS`, so it can never collide with the running harness;
-- a loopback `SENTRY_DSN`, so SDK loading is exercised without emitting an event
-  to the owner's Sentry project;
+- no Sentry configuration at all: the child environment is built from scratch
+  rather than inherited, so omitting the variable is what guarantees the probe
+  cannot reach a real project;
 - scratch under the system temp dir, deliberately **not** under
   `BOTFLEET_UPDATE_ROOT`, whose entries are scanned for abandoned stages and
   rollback generations.
@@ -96,7 +101,7 @@ if (!result.ready || !result.sqlite?.ok) process.exit(1);
 ```
 
 Observed on this Mac, 2026-10-04, against the installed `d9e646ffc292` bundle:
-`ready: true`, `sqliteOk: true`, 17.2s wall clock, with the live harness on
+`ready: true`, `sqliteOk: true`, 17.6s wall clock, with the live harness on
 `:8799` still answering `ready: true` and no scratch left behind.
 
 ## Bypass
