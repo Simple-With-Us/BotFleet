@@ -14,10 +14,10 @@ rule: >-
   (`monet/`), Grok Build `~/apps/personal-grok-build` (`grok-build/`). Create a
   missing lane with: `git -C /Users/jay/Code/Personal-Site worktree add -b
   <prefix>/<slug> ~/apps/personal-<seat>`. Always run `git status` and `git log
-  -3` first, then read `AGENTS.md`, `STATUS.md`, the latest `docs/rollouts/`
-  note, and `docs/EFFORT-LOG.md` before non-trivial work, and repeat `git log
-  -3` plus the current diff as the last step of the handoff. Also keep the public site
-  source free of private infrastructure links
+  -3` first, then read `AGENTS.md`, `STATUS.md`, `PLAN.md`, the relevant
+  `docs/phase-*.md`, the latest `docs/rollouts/` note, and `docs/EFFORT-LOG.md`
+  before non-trivial work, and repeat `git log -3` plus the current diff as the
+  last step of the handoff.  Also keep the public site source free of private infrastructure links
   (hosting/routing/apexes/hostnames/deploy paths live in the owner's private
   operations records), and never publish production from the xAI Grok builder.
 severity: critical
