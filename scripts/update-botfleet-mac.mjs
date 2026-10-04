@@ -27,6 +27,11 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
+import {
+  downloadBuiltBundle,
+  ResolutionError,
+  updateSourcePolicy,
+} from "./ci-build-resolver.mjs";
 
 const EXPECTED_TEAM_ID = "CC8UTF7ATG";
 // Transition release: main still BUILDS com.botfleet.app (LEGACY_BUNDLE_ID).
@@ -1294,6 +1299,19 @@ async function processTxtPaths(pid) {
   return result.code === 0 ? result.stdout.split("\n").filter((line) => line.startsWith("n")).map(line => line.slice(1)) : [];
 }
 
+/**
+ * Which resolution failures justify quietly packaging on this Mac instead.
+ *
+ * Only "this commit was never built on CI" is a legitimate reason: the point of
+ * `auto` is to install a commit that predates the workflow.  A network failure,
+ * a rate limit, or a checksum mismatch must NOT fall back, because a silent
+ * 15-minute local build would turn a broken pipeline or a tampered artifact
+ * into "it worked, just slowly".
+ */
+function isRecoverableResolutionFailure(error) {
+  return error instanceof ResolutionError && error.cause === "no-build";
+}
+
 export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
@@ -1975,6 +1993,26 @@ function createOperations(config) {
 
     buildBundle: async (source, targetCommit) => {
       if (source.providedBundle) return source.providedBundle;
+      // Owner ruling 2026-10-01: GitHub's Mac runners do the building, always.
+      // `pnpm package:mac:local` below is the 10-15 minute electron-builder run
+      // that every recorded update failure was inside, so it is now the
+      // explicit bypass rather than the default.
+      const policy = updateSourcePolicy();
+      if (policy !== "local") {
+        try {
+          const hosted = await downloadBuiltBundle({
+            commit: targetCommit,
+            destination: join(source.stageDirectory, "hosted"),
+          });
+          console.log(`Using the hosted build of ${targetCommit.slice(0, 12)} instead of packaging on this Mac`);
+          return hosted.appPath;
+        } catch (error) {
+          // `ci` must fail loudly: silently falling back to a 15-minute local
+          // build would make the ruling a suggestion and hide a broken pipeline.
+          if (policy === "ci" || !isRecoverableResolutionFailure(error)) throw error;
+          console.error(`Hosted build unavailable, packaging on this Mac instead: ${error.message}`);
+        }
+      }
       const identities = await output("security", ["find-identity", "-v", "-p", "codesigning"]);
       if (!identities.includes(EXPECTED_SIGN_IDENTITY)) {
         throw new Error(`Required stable signing identity is unavailable: ${EXPECTED_SIGN_IDENTITY}`);
