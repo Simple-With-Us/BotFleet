@@ -101,6 +101,22 @@ export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
   return `${base}/chat/completions`;
 }
 
+function stripUnclosedFences(text: string): string {
+  const fenceRegex = /(?:```|~~~)/g;
+  const matches = [...text.matchAll(fenceRegex)];
+  if (matches.length % 2 !== 0) {
+    const lastMatch = matches[matches.length - 1];
+    return text.slice(0, lastMatch.index).trimEnd();
+  }
+  return text;
+}
+
+function cleanSummaryForTTS(summary: string): string {
+  const withoutTags = summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "");
+  const stripped = stripUnclosedFences(withoutTags);
+  return sanitizeForTTS(speakable(stripped));
+}
+
 /**
  * Summarize raw bot output into speech-optimized natural text using DeepSeek V4.1 Flash (deepseek-flash).
  * If the model call fails, times out, or no key is configured, falls back gracefully to deepseek-chat or spokenReply().
@@ -188,8 +204,7 @@ export async function summarizeForVoice(
       if (parsed.success) {
         const summary = parsed.data.choices?.[0]?.message?.content?.trim();
         if (summary) {
-          // Strip any accidental brackets or tags
-          return sanitizeForTTS(speakable(summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "")));
+          return cleanSummaryForTTS(summary);
         }
       }
     }
@@ -219,7 +234,7 @@ export async function summarizeForVoice(
       if (fbParsed.success) {
         const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
         if (fbSummary) {
-          return sanitizeForTTS(speakable(fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "")));
+          return cleanSummaryForTTS(fbSummary);
         }
       }
     }

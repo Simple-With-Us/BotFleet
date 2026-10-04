@@ -209,6 +209,40 @@ describe("summarizeForVoice", () => {
     expect(res).toBe("Build passed. Deploy queued");
   });
 
+  it("strips trailing unclosed code fences without wiping the preceding text", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Here is the summary of what changed. ```typescript\nconst x = 1;",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Here is the summary of what changed.");
+  });
+
+  it("preserves closed code fences while handling speech normalization", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "Done. ```typescript\nconsole.log(1);\n``` All clear.",
+            },
+          },
+        ],
+      }),
+    });
+    const res = await summarizeForVoice(LONG, "test-key");
+    expect(res).toBe("Done. (a code block) All clear.");
+  });
+
   it("handles malformed model responses by falling back to deterministic speech", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,
