@@ -24,6 +24,7 @@ Verification uses these isolated fixtures:
 - [Packaged server smoke test](packaged-server.md) — server start-up and module resolution
 - [Model fallback on quota chips](quota-fallback.md) — provider failover when quota is exhausted
 - [Mac updater transaction](mac-updater.md) — signed update delivery and application
+- [Staged candidate smoke test](staged-candidate-smoke.md) — the pre-activation probe that runs a candidate before anything live is touched
 - [Connector grants](connector-grants.md) — per-bot third-party tool authorization
 
 ### Test Fixtures
@@ -37,6 +38,7 @@ Many recipes are codified as unit tests or integration tests:
 - **Packaged server:** `scripts/smoke-packaged-server.mjs` proves the built server starts without repo node_modules.
 - **Quota fallback:** `server/turn-tools.test.ts` exercises provider failover.
 - **Mac updater:** `scripts/mac-update-transaction.node-test.mjs` simulates signed update delivery.
+- **Staged candidate smoke:** `smokeStagedServer` boots a real signed bundle; see [staged-candidate-smoke.md](staged-candidate-smoke.md) for the recipe that runs it against the installed app.
 - **Connector grants:** `server/mcp-server.test.ts` and integration fixtures verify tool authorization per bot.
 
 ## Evidence
