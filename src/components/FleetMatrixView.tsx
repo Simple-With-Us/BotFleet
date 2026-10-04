@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertCircle,
   Clock,
@@ -6,6 +6,7 @@ import {
   LayoutGrid,
   Loader2,
   MessageSquare,
+  ArrowRightLeft,
   Bot as BotIcon,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -18,6 +19,7 @@ import {
   summarizeFleetAttention,
   type RoomAttention,
 } from "@/lib/attention-index";
+import { NeedsYouList } from "@/components/NeedsYouList";
 
 interface FleetMatrixViewProps {
   onSelectApp: (appId: string) => void;
@@ -33,6 +35,7 @@ export function FleetMatrixView({
   onSelectBotInApp,
 }: FleetMatrixViewProps) {
   const { state } = useStore();
+  const [swapAxes, setSwapAxes] = useState(false);
   const terminology = getRoomTerminology(state.config);
 
   const nonDmGroups = useMemo(
@@ -123,13 +126,158 @@ export function FleetMatrixView({
               </div>
             )}
           </div>
+          
+          <button
+            type="button"
+            onClick={() => setSwapAxes(!swapAxes)}
+            className="flex items-center gap-1.5 rounded-lg border border-hairline/50 bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-secondary hover:bg-raised hover:text-ink transition-colors"
+            title="Swap Matrix Axes"
+          >
+            <ArrowRightLeft size={14} />
+            <span>Swap Axes</span>
+          </button>
         </div>
       </div>
+
+      <NeedsYouList />
 
       {/* 2D Matrix Grid */}
       <div className="min-w-0 flex-1 overflow-x-auto rounded-xl border border-hairline/50 bg-panel shadow-xs">
         <table className="w-full border-collapse text-left text-[12px]">
-          <thead>
+          
+          {swapAxes ? (
+            <>
+              <thead>
+                <tr className="border-b border-hairline/50 bg-raised/60">
+                  <th className="sticky left-0 z-10 bg-raised/95 px-4 py-3 font-semibold text-ink backdrop-blur-xs min-w-[200px]">
+                    Bot / Assistant
+                  </th>
+                  {nonDmGroups.map((group) => {
+                    const folderName = cwdBasename(group.cwd);
+                    return (
+                      <th
+                        key={group.id}
+                        className="px-3 py-3 font-medium text-ink min-w-[140px] text-center"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => onSelectApp(group.id)}
+                          className="group inline-flex flex-col items-center gap-1 hover:text-primary transition-colors"
+                        >
+                          <div className="flex items-center gap-2">
+                            {group.avatarUrl ? (
+                              <img src={group.avatarUrl} alt="" className="h-4 w-4 rounded-xs object-cover" />
+                            ) : (
+                              <FolderGit2 size={15} className="text-ink-tertiary" />
+                            )}
+                          </div>
+                          <span className="font-semibold truncate max-w-[120px] group-hover:text-primary">
+                            {group.name}
+                          </span>
+                          {folderName && (
+                            <span className="text-[10.5px] font-normal text-ink-tertiary truncate max-w-[120px]">
+                              {folderName}
+                            </span>
+                          )}
+                        </button>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-hairline/30">
+                {activeBots.map((bot) => (
+                  <tr key={bot.id} className="hover:bg-raised/20 transition-colors">
+                    {/* Row Header: Bot info */}
+                    <td className="sticky left-0 z-10 bg-panel/95 px-4 py-3 font-medium text-ink backdrop-blur-xs border-r border-hairline/25">
+                      <button
+                        type="button"
+                        onClick={() => onSelectBot(bot.id)}
+                        className="group flex flex-col text-left hover:text-primary transition-colors"
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className="flex h-5 w-5 items-center justify-center rounded-md bg-panel border border-hairline/40 group-hover:border-primary/40">
+                            {bot.avatarUrl ? (
+                              <img src={bot.avatarUrl} alt="" className="h-4 w-4 rounded-xs object-cover" />
+                            ) : (
+                              <BotIcon size={12} className="text-ink-secondary" />
+                            )}
+                          </div>
+                          <span className="font-semibold text-ink group-hover:text-primary">
+                            {bot.name}
+                          </span>
+                        </div>
+                      </button>
+                    </td>
+
+                    {/* Columns: Apps */}
+                    {nonDmGroups.map((group) => {
+                      const memberSet = new Set(group.memberIds || []);
+                      const isAssigned = memberSet.has(bot.id);
+                      const isDead = bot.activity === "dead";
+                      const isWaiting = bot.activity === "waiting-on-you";
+                      const isWorking = bot.activity === "working" || group.busyBotId === bot.id;
+                      const hasUnread = bot.unread;
+
+                      if (!isAssigned) {
+                        return (
+                          <td key={group.id} className="px-3 py-3 text-center border-r border-hairline/10 last:border-r-0">
+                            <span className="text-ink-tertiary/40">—</span>
+                          </td>
+                        );
+                      }
+
+                      return (
+                        <td key={group.id} className="px-3 py-3 text-center border-r border-hairline/10 last:border-r-0">
+                          <button
+                            type="button"
+                            onClick={() => onSelectBotInApp(bot.id, group.id)}
+                            className={cn(
+                              "inline-flex w-[110px] items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] font-medium transition-colors cursor-pointer",
+                              isDead
+                                ? "bg-error/10 border-error/30 text-error hover:bg-error/20"
+                                : isWaiting
+                                  ? "bg-warning/10 border-warning/30 text-warning hover:bg-warning/20"
+                                  : isWorking
+                                    ? "bg-info/10 border-info/30 text-info hover:bg-info/20"
+                                    : hasUnread
+                                      ? "bg-accent/10 border-accent/30 text-accent hover:bg-accent/20"
+                                      : "bg-surface border-hairline hover:bg-raised text-ink-secondary"
+                            )}
+                          >
+                            <div className={cn(
+                              "flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-panel border border-hairline/40",
+                              isWorking && "animate-pulse",
+                              hasUnread && "ring-1 ring-accent ring-offset-1 ring-offset-panel"
+                            )}>
+                              {bot.avatarUrl ? (
+                                <img src={bot.avatarUrl} alt="" className="h-full w-full rounded-sm object-cover" />
+                              ) : (
+                                <BotIcon size={10} className="text-ink-secondary" />
+                              )}
+                            </div>
+                            <span className="truncate">
+                              {isDead
+                                ? "Dead"
+                                : isWaiting
+                                  ? "Needs Action"
+                                  : isWorking
+                                    ? "Working"
+                                    : hasUnread
+                                      ? "Unread"
+                                      : "Assigned"}
+                            </span>
+                          </button>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </>
+          ) : (
+            <>
+<thead>
             <tr className="border-b border-hairline/50 bg-raised/60">
               <th className="sticky left-0 z-10 bg-raised/95 px-4 py-3 font-semibold text-ink backdrop-blur-xs min-w-[200px]">
                 {terminology.singular} / Repository
@@ -323,6 +471,8 @@ export function FleetMatrixView({
               );
             })}
           </tbody>
+                    </>
+          )}
         </table>
       </div>
     </div>
