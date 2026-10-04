@@ -1,0 +1,205 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import test from "node:test";
+
+import {
+  artifactNameFor,
+  classifyResolutionFailure,
+  downloadBuiltBundle,
+  findCommitArtifact,
+  materializeBuild,
+  ResolutionError,
+  selectCommitRun,
+  updateSourcePolicy,
+  verifyManifest,
+} from "./ci-build-resolver.mjs";
+
+const run = promisify(execFile);
+const COMMIT = "a".repeat(40);
+const OTHER = "b".repeat(40);
+const REPO = "jaywedgeworth22/BotFleet";
+
+function json(body, status = 200) {
+  return async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+}
+
+const successfulRuns = {
+  workflow_runs: [
+    { id: 1, head_sha: COMMIT, conclusion: "success", event: "push" },
+  ],
+};
+
+async function fixture(t) {
+  const dir = await mkdtemp(join(tmpdir(), "ci-resolver-"));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }));
+  return dir;
+}
+
+test("the hosted build is the default, and the bypass is explicit", () => {
+  // The owner's 2026-10-01 ruling is that CI builds, always.  A default of
+  // "local" would make the ruling opt-in and quietly restore the 15-minute
+  // packaging that caused the outages.
+  assert.equal(updateSourcePolicy({}), "ci");
+  assert.equal(updateSourcePolicy({ BOTFLEET_UPDATE_SOURCE: "CI" }), "ci");
+  assert.equal(updateSourcePolicy({ BOTFLEET_UPDATE_SOURCE: " auto " }), "auto");
+  assert.equal(updateSourcePolicy({ BOTFLEET_UPDATE_SOURCE: "local" }), "local");
+  assert.throws(() => updateSourcePolicy({ BOTFLEET_UPDATE_SOURCE: "github" }), /must be ci, auto, or local/);
+});
+
+test("a missing build, a throttled API, and a flaky network are three different problems", () => {
+  // Collapsing these is the failure mode this resolver exists to avoid: the
+  // operator's response to "CI never built this" and "GitHub was briefly
+  // unreachable" are completely different, and only the first is safe to fall
+  // back from.
+  assert.equal(classifyResolutionFailure({ status: 404 }), "no-build");
+  assert.equal(classifyResolutionFailure({ status: 429 }), "rate-limited");
+  assert.equal(classifyResolutionFailure({ status: 403 }), "rate-limited");
+  assert.equal(classifyResolutionFailure({ status: 401 }), "unauthorized");
+  assert.equal(classifyResolutionFailure({ status: 503 }), "github-unavailable");
+  assert.equal(classifyResolutionFailure({ timedOut: true }), "network-timed-out");
+  assert.equal(classifyResolutionFailure({ spawnError: new Error("ENOTFOUND") }), "network-failed");
+});
+
+test("only a successful run for this exact commit is usable", () => {
+  // A run for a different commit, a failed run, or a run from another event is
+  // not a build of what we are about to install.
+  assert.equal(selectCommitRun(successfulRuns.workflow_runs, COMMIT)?.id, 1);
+  assert.equal(selectCommitRun(successfulRuns.workflow_runs, OTHER), null);
+  assert.equal(selectCommitRun([{ id: 2, head_sha: COMMIT, conclusion: "failure", event: "push" }], COMMIT), null);
+  assert.equal(selectCommitRun([{ id: 3, head_sha: COMMIT, conclusion: "success", event: "schedule" }], COMMIT), null);
+  assert.equal(selectCommitRun([], COMMIT), null);
+  assert.equal(selectCommitRun(undefined, COMMIT), null);
+});
+
+test("an expired artifact is not an artifact", () => {
+  assert.equal(findCommitArtifact([{ name: artifactNameFor(COMMIT), expired: false }], COMMIT)?.name, artifactNameFor(COMMIT));
+  // 30-day retention means this is a real, reachable state for a Mac that was
+  // off for a month, and it must read as "no build", never as a valid one.
+  assert.equal(findCommitArtifact([{ name: artifactNameFor(COMMIT), expired: true }], COMMIT), null);
+  assert.equal(findCommitArtifact([{ name: "botfleet-mac-somethingelse" }], COMMIT), null);
+});
+
+test("a manifest is only accepted for the commit that was asked for, with matching bytes", () => {
+  const bytes = Buffer.from("pretend this is a zip");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const manifest = { schemaVersion: 1, commit: COMMIT, artifact: "BotFleet-mac-arm64.zip", sha256: digest };
+  const verified = verifyManifest(manifest, { commit: COMMIT, bytes });
+  assert.equal(verified.verifiedBytes, bytes.length);
+
+  // The case that matters most: a perfectly signed build of the WRONG commit
+  // would pass the caller's signature check, because the signature is valid —
+  // it is just for another build.
+  assert.throws(
+    () => verifyManifest(manifest, { commit: OTHER, bytes }),
+    (error) => error instanceof ResolutionError && /names commit/.test(error.message),
+  );
+  assert.throws(
+    () => verifyManifest({ ...manifest, sha256: "0".repeat(64) }, { commit: COMMIT, bytes }),
+    (error) => error.cause === "checksum-mismatch",
+  );
+  assert.throws(
+    () => verifyManifest({ ...manifest, schemaVersion: 99 }, { commit: COMMIT, bytes }),
+    (error) => error.cause === "bad-manifest",
+  );
+  assert.throws(
+    () => verifyManifest({ ...manifest, artifact: "BotFleet.app" }, { commit: COMMIT, bytes }),
+    (error) => error.cause === "bad-manifest",
+  );
+});
+
+test("a commit with no hosted build says so, and says how to make one", async (t) => {
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: json({ workflow_runs: [] }) }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "no-build");
+      // An operator must be able to act on this without reading the source.
+      assert.match(error.message, /gh workflow run mac-commit-build\.yml/);
+      assert.match(error.message, /BOTFLEET_UPDATE_SOURCE=local/);
+      assert.match(error.message, new RegExp(COMMIT));
+      return true;
+    },
+  );
+});
+
+test("a target that is not a full commit is refused before any request", async (t) => {
+  let called = false;
+  await assert.rejects(
+    downloadBuiltBundle({
+      commit: "abc1234",
+      destination: await fixture(t),
+      fetchImpl: async () => { called = true; return json({}); },
+    }),
+    (error) => error.cause === "bad-target",
+  );
+  assert.equal(called, false, "must not hit the network with an ambiguous target");
+});
+
+test("a throttled API is reported as a budget, not as a missing build", async (t) => {
+  // Falling back to a local package here would turn a 60-request/hour limit
+  // into a silent 15-minute build and hide the real cause.
+  await assert.rejects(
+    downloadBuiltBundle({
+      commit: COMMIT,
+      destination: await fixture(t),
+      fetchImpl: async () => ({ ok: false, status: 403, json: async () => ({}) }),
+    }),
+    (error) => {
+      assert.equal(error.cause, "rate-limited");
+      assert.match(error.message, /NOT a missing build|budget/i);
+      return true;
+    },
+  );
+});
+
+test("materialising a verified build produces a real app directory", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("needs ditto with --sequesterRsrc, which is macOS only");
+    return;
+  }
+  const scratch = await fixture(t);
+  const staging = join(scratch, "staging");
+  await run("mkdir", ["-p", join(scratch, "inner", "BotFleet.app", "Contents", "Resources")]);
+  await run("sh", ["-c", 'echo staged > "$1/Contents/Resources/marker.txt"', "_", join(scratch, "inner", "BotFleet.app")]);
+
+  // Build the two-level shape GitHub actually produces: the artifact wrapper
+  // holds the manifest and the bundle zip, and the bundle zip holds the app.
+  const innerZip = join(scratch, "BotFleet-mac-arm64.zip");
+  await run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", join(scratch, "inner", "BotFleet.app"), innerZip]);
+  const innerBytes = await readFile(innerZip);
+  const manifest = {
+    schemaVersion: 1,
+    commit: COMMIT,
+    artifact: "BotFleet-mac-arm64.zip",
+    sha256: createHash("sha256").update(innerBytes).digest("hex"),
+  };
+
+  // GitHub nests every entry under a directory named for the artifact, which is
+  // why the resolver extracts with -j.  Reproduce that here or the test proves
+  // nothing about the real artifact layout.
+  const wrapperRoot = join(scratch, "wrapper");
+  const wrapperDir = join(wrapperRoot, artifactNameFor(COMMIT));
+  await run("mkdir", ["-p", wrapperDir]);
+  await writeFile(join(wrapperDir, "BotFleet-mac-arm64.zip"), innerBytes);
+  await writeFile(join(wrapperDir, "build-manifest.json"), JSON.stringify(manifest));
+  await run("zip", ["-q", "-r", join(scratch, "artifact.zip"), artifactNameFor(COMMIT)], { cwd: wrapperRoot });
+  const artifactBytes = await readFile(join(scratch, "artifact.zip"));
+
+  const destination = join(staging, "hosted");
+  const built = await materializeBuild({ artifactBytes, commit: COMMIT, destination, manifest });
+  assert.equal(built.appPath, join(destination, "BotFleet.app"));
+  assert.ok((await stat(built.appPath)).isDirectory());
+  // The resource fork is why `ditto` is used instead of a plain unzip: a build
+  // that lost it would differ from a locally built one invisibly.
+  assert.equal((await readFile(join(built.appPath, "Contents/Resources/marker.txt"), "utf8")).trim(), "staged");
+
+  // A second attempt must replace rather than merge into the previous unpack.
+  await writeFile(join(built.appPath, "Contents/Resources/marker.txt"), "second\n");
+  await materializeBuild({ artifactBytes, commit: COMMIT, destination, manifest });
+  assert.equal((await readFile(join(built.appPath, "Contents/Resources/marker.txt"), "utf8")).trim(), "staged");
+});
