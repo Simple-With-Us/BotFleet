@@ -62,4 +62,11 @@ export const JOB_ENGINE_FIXTURES: readonly JobEngineFixture[] = [
     lane: "none",
     because: "remote and opaque: no MCP, no host shell",
   },
+  {
+    displayName: "CLI wrapper",
+    driverKind: "cli-wrapper",
+    capabilities: { backgroundJobs: "none" },
+    lane: "none",
+    because: "generic CLI wrapper: unmounted tool loop, no MCP server",
+  },
 ];
