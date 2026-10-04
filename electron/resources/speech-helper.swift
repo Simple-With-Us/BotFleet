@@ -193,26 +193,151 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
 
   final class PersonalVoiceSpeaker: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
     let synth = AVSpeechSynthesizer()
+    var chunks: [String] = []
+    var currentChunkIndex = 0
+    var attempts = 0
+    var voice: AVSpeechSynthesisVoice?
+    var isStopped = false
+
+    static func chunkText(_ text: String, maxCharacters: Int = 750) -> [String] {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else { return [] }
+      guard trimmed.count > maxCharacters else { return [trimmed] }
+
+      var rawSentences: [String] = []
+      trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex, options: [.bySentences, .localized]) { substring, _, _, _ in
+        if let s = substring?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+          rawSentences.append(s)
+        }
+      }
+      if rawSentences.isEmpty { rawSentences = [trimmed] }
+
+      let delimiters: [Character] = [";", ":", "\n", "—", "–", ","]
+      var atoms: [String] = []
+      for sentence in rawSentences {
+        if sentence.count <= maxCharacters {
+          atoms.append(sentence)
+        } else {
+          var clauseParts: [String] = []
+          var cur = ""
+          for char in sentence {
+            cur.append(char)
+            if delimiters.contains(char) && cur.count >= min(200, maxCharacters / 3) {
+              let cl = cur.trimmingCharacters(in: .whitespacesAndNewlines)
+              if !cl.isEmpty { clauseParts.append(cl) }
+              cur = ""
+            }
+          }
+          let rem = cur.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !rem.isEmpty { clauseParts.append(rem) }
+
+          for part in clauseParts {
+            if part.count <= maxCharacters {
+              atoms.append(part)
+            } else {
+              let words = part.split(separator: " ").map(String.init)
+              var wChunk = ""
+              for word in words {
+                if word.count > maxCharacters {
+                  if !wChunk.isEmpty { atoms.append(wChunk); wChunk = "" }
+                  var sub = word
+                  while sub.count > maxCharacters {
+                    let idx = sub.index(sub.startIndex, offsetBy: maxCharacters)
+                    atoms.append(String(sub[..<idx]))
+                    sub = String(sub[idx...])
+                  }
+                  if !sub.isEmpty { wChunk = sub }
+                } else if wChunk.isEmpty {
+                  wChunk = word
+                } else if wChunk.count + 1 + word.count <= maxCharacters {
+                  wChunk += " " + word
+                } else {
+                  atoms.append(wChunk)
+                  wChunk = word
+                }
+              }
+              if !wChunk.isEmpty { atoms.append(wChunk) }
+            }
+          }
+        }
+      }
+
+      var result: [String] = []
+      var current = ""
+      for atom in atoms {
+        if current.isEmpty {
+          current = atom
+        } else if current.count + 1 + atom.count <= maxCharacters {
+          current += " " + atom
+        } else {
+          result.append(current)
+          current = atom
+        }
+      }
+      if !current.isEmpty { result.append(current) }
+      return result
+    }
 
     func speak(voice: AVSpeechSynthesisVoice, text: String) {
       synth.delegate = self
-      let utterance = AVSpeechUtterance(string: text)
+      self.voice = voice
+      self.chunks = Self.chunkText(text)
+      guard !chunks.isEmpty else {
+        emit(["finished": true])
+        exit(0)
+      }
+      self.currentChunkIndex = 0
+      self.attempts = 0
+      self.isStopped = false
+      speakCurrentChunk()
+    }
+
+    func speakCurrentChunk() {
+      guard !isStopped, let voice = self.voice, currentChunkIndex < chunks.count else {
+        emit(["finished": true])
+        exit(0)
+      }
+      let utterance = AVSpeechUtterance(string: chunks[currentChunkIndex])
       utterance.voice = voice
       utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+      utterance.postUtteranceDelay = 0.05
       synth.speak(utterance)
     }
 
     func stop() {
+      isStopped = true
       synth.stopSpeaking(at: .immediate)
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-      emit(["finished": true])
-      exit(0)
+      currentChunkIndex += 1
+      attempts = 0
+      if currentChunkIndex >= chunks.count {
+        emit(["finished": true])
+        exit(0)
+      } else {
+        speakCurrentChunk()
+      }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-      exit(0)
+      if isStopped {
+        exit(0)
+      }
+      // Internal synthesis drop/error: retry chunk once before skipping.
+      attempts += 1
+      if attempts < 2 {
+        speakCurrentChunk()
+      } else {
+        currentChunkIndex += 1
+        attempts = 0
+        if currentChunkIndex >= chunks.count {
+          emit(["finished": true])
+          exit(0)
+        } else {
+          speakCurrentChunk()
+        }
+      }
     }
   }
 
