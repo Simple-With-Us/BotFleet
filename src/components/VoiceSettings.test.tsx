@@ -222,3 +222,41 @@ describe("VoiceSettings voice loading", () => {
   });
 });
 
+
+/**
+ * A typed custom id and a clone result used to call onPatch directly.
+ * Either id can start with personal: or apple-personal:, which the server
+ * treats as Personal Voice and then refuses to synthesize. Those saves have
+ * to take the same refusal as the picker.
+ */
+describe("VoiceSettings personal voice selection guard", () => {
+  const SRC = readFileSync(join(__dirname, "VoiceSettings.tsx"), "utf8");
+  const between = (start: string, end: string) => {
+    const from = SRC.indexOf(start);
+    const to = SRC.indexOf(end, from + start.length);
+    if (from < 0 || to < 0) throw new Error(`missing slice ${start} -> ${end}`);
+    return SRC.slice(from, to);
+  };
+
+  it("routes add and clone through the select guard", () => {
+    const guard = between("const commitVoice", "const loadVoices");
+    const add = between("const handleAddCustomVoice", "const handleDeleteVoice");
+    const clone = between("const handleClone =", "if (!tts) return null");
+
+    expect(guard).toContain("if (isPersonalVoice(next) && !personalVoiceAllowed)");
+    expect(guard).toContain("if (capabilitiesReady) setError(personalVoiceDisabledReason);");
+    expect(guard).toContain("onPatch({ voice: next })");
+
+    expect(add).toContain("commitVoice(res.voice.id)");
+    expect(add).not.toContain("onPatch(");
+    expect(clone).toContain("commitVoice(result.voiceId)");
+    expect(clone).not.toContain("onPatch(");
+    expect(SRC).toContain("commitVoice(e.target.value)");
+
+    // Clearing a deleted voice is not a Personal Voice selection.
+    expect(SRC.match(/onPatch\(\{ voice: [^}]+\}\)/g)).toEqual([
+      "onPatch({ voice: next })",
+      'onPatch({ voice: "" })',
+    ]);
+  });
+});

@@ -56,6 +56,31 @@ export function VoiceSettings({
   // that cannot speak here.
   const personalVoiceAllowed = capabilities.dictation.personalVoice === true;
 
+  const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
+  // `requires-macos-14` means this computer is a Mac, just not new enough.
+  // Naming only "Mac or iPhone" is false there, and naming any platform
+  // before capabilities arrive is a guess.
+  const personalVoiceDisabledReason = !capabilitiesReady
+    ? "Checking Personal Voice availability"
+    : capabilities.dictation.reasonCode === "requires-macos-14"
+      ? "Personal Voices need macOS 14 or later, or an iPhone"
+      : capabilities.dictation.reasonCode === "unsupported-platform"
+        ? "Personal Voices play on-device on a Mac or iPhone"
+        : "Personal Voice is not available on this computer";
+
+  // One gate for every way a voice id becomes this bot's voice: the picker,
+  // a typed custom id, and a clone result. Free text can start with
+  // personal: or apple-personal:, and saving that on a computer that cannot
+  // speak it is the same refusal as picking it.
+  const commitVoice = (next: string) => {
+    if (isPersonalVoice(next) && !personalVoiceAllowed) {
+      if (capabilitiesReady) setError(personalVoiceDisabledReason);
+      return;
+    }
+    setError((current) => (current === personalVoiceDisabledReason ? null : current));
+    onPatch({ voice: next });
+  };
+
   // The single loader. Every refresh path (mount, key save, add, clone,
   // delete) goes through here, so the Personal Voice merge can never be
   // dropped by a refresh that only reloads the harness list.
@@ -156,9 +181,7 @@ export function VoiceSettings({
         setCustomVoiceLabel("");
         setCustomOpen(false);
         await loadVoices();
-        if (res.voice?.id) {
-          onPatch({ voice: res.voice.id });
-        }
+        if (res.voice?.id) commitVoice(res.voice.id);
       }
     } catch (e) {
       setCustomError(e instanceof Error ? e.message : "Failed to add voice identifier.");
@@ -223,9 +246,7 @@ export function VoiceSettings({
         setCloneFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
         await loadVoices();
-        if (result.voiceId) {
-          onPatch({ voice: result.voiceId });
-        }
+        if (result.voiceId) commitVoice(result.voiceId);
       }
     } catch (e) {
       setCloneError(e instanceof Error ? e.message : "Clone failed.");
@@ -237,23 +258,12 @@ export function VoiceSettings({
   if (!tts) return null;
 
   const selectedVoice = bot.voice ?? "";
-  const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   const isSelectedPersonal = isPersonalVoice(selectedVoice);
   const canSpeakPersonal =
     capabilities.dictation.personalVoice === true &&
     Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
   const ready = configured && Boolean(selectedVoice || tts.voice);
   const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
-  // `requires-macos-14` means this computer is a Mac, just not new enough.
-  // Naming only "Mac or iPhone" is false there, and naming any platform
-  // before capabilities arrive is a guess.
-  const personalVoiceDisabledReason = !capabilitiesReady
-    ? "Checking Personal Voice availability"
-    : capabilities.dictation.reasonCode === "requires-macos-14"
-      ? "Personal Voices need macOS 14 or later, or an iPhone"
-      : capabilities.dictation.reasonCode === "unsupported-platform"
-        ? "Personal Voices play on-device on a Mac or iPhone"
-        : "Personal Voice is not available on this computer";
   const previewTitle = isSelectedPersonal
     ? canSpeakPersonal
       ? "Hear this Apple Personal Voice"
@@ -453,17 +463,7 @@ export function VoiceSettings({
           <select
             value={selectedVoice}
             onChange={(e) => {
-              const next = e.target.value;
-              // Refuse to save a Personal Voice when this computer cannot
-              // speak one. Say why once capabilities confirm the denial.
-              // The optimistic personalVoice:false before they arrive is
-              // not a denial, so do not explain a refusal we do not have yet.
-              if (isPersonalVoice(next) && !personalVoiceAllowed) {
-                if (capabilitiesReady) setError(personalVoiceDisabledReason);
-                return;
-              }
-              setError((current) => (current === personalVoiceDisabledReason ? null : current));
-              onPatch({ voice: next });
+              commitVoice(e.target.value);
             }}
             aria-label={`${bot.name}'s voice`}
             className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[13px] text-ink focus:border-hairline focus:outline-none"
