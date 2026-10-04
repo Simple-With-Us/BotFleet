@@ -5,19 +5,29 @@ import { initialState, StoreContext, StoreProvider, type AppState } from "@/stat
 
 describe("SettingsModal", () => {
   beforeAll(() => {
-    const existing = (globalThis as any).window ?? {};
-    (globalThis as any).window = Object.assign(existing, {
+    interface TestWindow {
+      ogb?: { updater?: { setEnabled: (val: boolean) => void } };
+      addEventListener?: unknown;
+      removeEventListener?: unknown;
+      dispatchEvent?: unknown;
+      matchMedia?: unknown;
+      setTimeout?: unknown;
+      clearTimeout?: unknown;
+    }
+    const globalObj = globalThis as typeof globalThis & { window?: TestWindow };
+    const existing = globalObj.window ?? {};
+    globalObj.window = Object.assign(existing, {
       ogb: {
         updater: {
           setEnabled: () => {},
         },
       },
-      addEventListener: existing.addEventListener ?? (() => {}),
-      removeEventListener: existing.removeEventListener ?? (() => {}),
-      dispatchEvent: existing.dispatchEvent ?? (() => true),
-      matchMedia: existing.matchMedia ?? (() => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} })),
-      setTimeout: existing.setTimeout ?? globalThis.setTimeout.bind(globalThis),
-      clearTimeout: existing.clearTimeout ?? globalThis.clearTimeout.bind(globalThis),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+      matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
     });
   });
 
