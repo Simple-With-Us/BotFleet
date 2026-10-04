@@ -130,7 +130,7 @@ export function computeRoomAttentionIndex(
             reason:
               b.errorReason ||
               (b.activity === "dead"
-                ? "Process terminated or dead harness"
+                ? "Process terminated"
                 : errorDetail
                   ? `Turn error: ${errorDetail}`
                   : "Active error"),

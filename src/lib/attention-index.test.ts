@@ -83,6 +83,7 @@ describe("computeRoomAttentionIndex", () => {
     const st = result.find((r) => r.roomId === "group-st")!;
     expect(st.errors.count).toBe(1);
     expect(st.errors.bots[0].botName).toBe("Scout");
+    expect(st.errors.bots[0].reason).toBe("Process terminated");
     expect(st.working.count).toBe(0);
     expect(st.needsAction.count).toBe(0);
     expect(st.unread.count).toBe(1); // group unread is true

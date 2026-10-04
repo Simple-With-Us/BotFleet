@@ -1943,7 +1943,7 @@ export function BotListItem({
           </span>
           {hasError ? (
             <span
-              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated or dead harness"}
+              title={hasTurnError ? `Turn error: ${last?.tool?.name.slice(6).trim()}` : "Process terminated"}
               className="size-2 shrink-0 rounded-full bg-danger ring-2 ring-danger/30"
               aria-label="Error"
             />
