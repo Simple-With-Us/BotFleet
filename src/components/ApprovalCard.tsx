@@ -109,7 +109,7 @@ export function ApprovalCard({
         ) : (
           <>
             <ShieldCheck size={14} className="text-accent" />
-            {isRoutineRequest ? "Waiting for Your Confirmation Below" : "Waiting for Your Answer Below"}
+            {isRoutineRequest ? "Waiting for your confirmation below" : "Waiting for your answer below"}
           </>
         )}
       </div>
