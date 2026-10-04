@@ -198,3 +198,146 @@ export function finishSpeech() {
     writeFileSync(child.finishPath, "finish");
   } catch {}
 }
+
+let personalVoiceChild = null;
+
+export function listPersonalVoices() {
+  if (process.platform !== "darwin") return Promise.resolve([]);
+  try {
+    ensureBuilt();
+  } catch {
+    return Promise.resolve([]);
+  }
+  return new Promise((resolve) => {
+    const sessionDir = mkdtempSync(path.join(app.getPath("temp"), "botfleet-pv-list-"));
+    const outputPath = path.join(sessionDir, "stdout.ndjson");
+    const errorPath = path.join(sessionDir, "stderr.log");
+    writeFileSync(outputPath, "");
+    writeFileSync(errorPath, "");
+
+    const proc = spawn(
+      "/usr/bin/open",
+      [
+        "-n",
+        "-g",
+        "-W",
+        "-o",
+        outputPath,
+        "--stderr",
+        errorPath,
+        BUNDLE,
+        "--args",
+        "--list-personal-voices",
+      ],
+      { stdio: "ignore" },
+    );
+
+    proc.on("close", () => {
+      try {
+        const out = readFileSync(outputPath, "utf8").trim();
+        for (const line of out.split("\n")) {
+          if (!line.trim()) continue;
+          const parsed = JSON.parse(line);
+          if (Array.isArray(parsed.voices)) {
+            resolve(parsed.voices);
+            rmSync(sessionDir, { recursive: true, force: true });
+            return;
+          }
+        }
+      } catch {}
+      rmSync(sessionDir, { recursive: true, force: true });
+      resolve([]);
+    });
+
+    proc.on("error", () => {
+      rmSync(sessionDir, { recursive: true, force: true });
+      resolve([]);
+    });
+  });
+}
+
+export function speakPersonalVoice(text, voiceId) {
+  stopPersonalVoice();
+  if (process.platform !== "darwin") {
+    return Promise.reject(new Error("Personal Voice requires macOS."));
+  }
+  try {
+    ensureBuilt();
+  } catch {
+    return Promise.reject(new Error("The speech helper couldn't be built."));
+  }
+
+  return new Promise((resolve, reject) => {
+    const sessionDir = mkdtempSync(path.join(app.getPath("temp"), "botfleet-pv-speak-"));
+    const outputPath = path.join(sessionDir, "stdout.ndjson");
+    const errorPath = path.join(sessionDir, "stderr.log");
+    const stopPath = path.join(sessionDir, "stop");
+    writeFileSync(outputPath, "");
+    writeFileSync(errorPath, "");
+
+    const proc = spawn(
+      "/usr/bin/open",
+      [
+        "-n",
+        "-g",
+        "-W",
+        "-o",
+        outputPath,
+        "--stderr",
+        errorPath,
+        BUNDLE,
+        "--args",
+        "--speak-personal-voice",
+        "--voice-id",
+        String(voiceId ?? ""),
+        "--text",
+        String(text ?? ""),
+        "--stop-file",
+        stopPath,
+      ],
+      { stdio: "ignore" },
+    );
+
+    const session = { proc, stopPath, sessionDir };
+    personalVoiceChild = session;
+
+    proc.on("close", () => {
+      if (personalVoiceChild === session) personalVoiceChild = null;
+      try {
+        const out = readFileSync(outputPath, "utf8").trim();
+        for (const line of out.split("\n")) {
+          if (!line.trim()) continue;
+          const parsed = JSON.parse(line);
+          if (parsed.error) {
+            rmSync(sessionDir, { recursive: true, force: true });
+            reject(new Error(parsed.error));
+            return;
+          }
+          if (parsed.finished) {
+            rmSync(sessionDir, { recursive: true, force: true });
+            resolve();
+            return;
+          }
+        }
+      } catch {}
+      rmSync(sessionDir, { recursive: true, force: true });
+      resolve();
+    });
+
+    proc.on("error", (err) => {
+      if (personalVoiceChild === session) personalVoiceChild = null;
+      rmSync(sessionDir, { recursive: true, force: true });
+      reject(err);
+    });
+  });
+}
+
+export function stopPersonalVoice() {
+  if (personalVoiceChild) {
+    try {
+      writeFileSync(personalVoiceChild.stopPath, "stop");
+    } catch {}
+    personalVoiceChild = null;
+  }
+}
+

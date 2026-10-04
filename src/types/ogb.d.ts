@@ -77,6 +77,7 @@ type SkillRecordingPayload = {
       available: boolean;
       engine: "apple-speech" | "none";
       onDevice: boolean;
+      personalVoice?: boolean;
       reasonCode?: string;
     };
     localComputer: {
@@ -145,6 +146,12 @@ type SkillRecordingPayload = {
         cb: (line: { partial?: boolean; text?: string; error?: string }) => void,
       ): () => void;
       onSpeechEnd(cb: (info: { code: number | null; reason?: string }) => void): () => void;
+      personalVoice?: {
+        isAvailable(): Promise<boolean>;
+        list(): Promise<Array<{ id: string; name: string; locale?: string }>>;
+        speak(text: string, voiceId?: string): Promise<void>;
+        stop(): Promise<void>;
+      };
       skillRecorder?: {
         permissions(): Promise<{ supported: boolean; reason?: string }>;
         start(): Promise<{ recording: boolean }>;

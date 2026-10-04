@@ -137,6 +137,7 @@ mac:
   extendInfo:
     NSMicrophoneUsageDescription: BotFleet uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: BotFleet transcribes your voice on-device to type messages for you.
+    NSSpeechSynthesisUsageDescription: BotFleet uses your Apple Personal Voice to speak aloud during calls and voice replies.
     NSAccessibilityUsageDescription: BotFleet uses Accessibility when you let a bot control this Mac.
     NSScreenCaptureUsageDescription: BotFleet uses Screen Recording so bots can see this Mac before acting.
   # Notarization runs manually after the build (notarytool + staple),

@@ -78,6 +78,9 @@ export class Speaker {
     this.token += 1;
     this.request?.abort();
     this.request = null;
+    if (typeof window !== "undefined") {
+      void window.ogb?.personalVoice?.stop?.();
+    }
     // Pausing/removing an <audio> source does not reliably fire `ended` or
     // `error`. Resolve the play promise ourselves so every interrupted
     // speak() settles and call mode cannot leak a forever-pending task.
@@ -111,6 +114,32 @@ export class Speaker {
     this.request = controller;
     const live = () => this.token === mine && !controller.signal.aborted;
 
+    const isPersonal =
+      typeof opts.voiceId === "string" &&
+      (opts.voiceId.startsWith("personal:") || opts.voiceId.startsWith("apple-personal:"));
+
+    if (isPersonal) {
+      this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId, caption: text, voiceText: text, wordIndex: 0 });
+      if (typeof window !== "undefined" && window.ogb?.personalVoice?.speak) {
+        try {
+          this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: text, voiceText: text, wordIndex: 0 });
+          await window.ogb.personalVoice.speak(text, opts.voiceId);
+          if (live()) this.set(IDLE);
+        } catch (error) {
+          if (live()) this.set({ ...IDLE, error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          if (this.request === controller) this.request = null;
+        }
+        return;
+      }
+      this.set({
+        ...IDLE,
+        error: "Apple Personal Voice speaks on authorized Apple devices (macOS / iOS).",
+      });
+      if (this.request === controller) this.request = null;
+      return;
+    }
+
     if (opts.messageId && opts.botId) {
       this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId });
       try {
@@ -121,11 +150,23 @@ export class Speaker {
         const endpoint = `/api/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(opts.messageId)}/audio`;
         const response = await fetch(endpoint, { method: "POST", signal: controller.signal });
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `Voice service returned ${response.status}`);
-        const { audio, voiceText, utterances } = (await response.json()) as {
+        const { audio, voiceText, utterances, onDevice } = (await response.json()) as {
           audio: Array<{ path: string; mime: string }>;
           voiceText?: string;
           utterances?: string[];
+          onDevice?: boolean;
         };
+        if (onDevice || (!audio?.length && voiceText)) {
+          if (typeof window !== "undefined" && window.ogb?.personalVoice?.speak) {
+            const speechText = voiceText ?? text;
+            this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: speechText, voiceText: speechText, wordIndex: 0 });
+            await window.ogb.personalVoice.speak(speechText, opts.voiceId);
+            if (live()) this.set(IDLE);
+          } else {
+            throw new Error("Apple Personal Voice speaks on authorized Apple devices (macOS / iOS).");
+          }
+          return;
+        }
         for (let i = 0; i < audio.length && live(); i++) {
           const clip = await fetch(`${endpoint}/${i}`, { signal: controller.signal });
           if (!clip.ok) throw new Error(`Voice clip could not be loaded (${clip.status}).`);

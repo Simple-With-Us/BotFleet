@@ -50,20 +50,20 @@ describe("CallTargetButton visibility", () => {
   });
 });
 
-describe("Personal Voice cannot start a desktop call", () => {
-  it("treats a personal voice id as unspeakable on the desktop call path", () => {
-    // Server-side voiceReady refuses personal voices; passing entry on a
-    // non-empty-but-unspeakable id connected the call and stayed silent.
+describe("Personal Voice desktop call support", () => {
+  it("recognizes personal voice identifiers", () => {
     expect(SRC).toMatch(/voice\.startsWith\("personal:"\)/);
     expect(SRC).toMatch(/voice\.startsWith\("apple-personal:"\)/);
-    expect(SRC).toMatch(/voices\.every\(\(voice\) => !isPersonalVoiceId\(voice\)\)/);
-    expect(SRC).toMatch(/!isPersonalVoiceId\(state\.config\?\.tts\?\.voice\)/);
-    // An explicit Personal Voice must not pass via an otherwise ready workspace fallback.
-    expect(SRC).toMatch(/configured && !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)/);
   });
 
-  it("says Personal Voice is iPhone-only instead of a generic pick-a-voice", () => {
-    expect(SRC).toMatch(/Personal Voice is iPhone-only/);
-    expect(SRC).toMatch(/Apple Personal Voice speaks on iPhone only/);
+  it("enables personal voice on macOS while gating non-Apple platforms", () => {
+    expect(SRC).toMatch(/const isMac = capabilities\.host\.platform === "darwin" \|\| window\.ogb\?\.platform === "darwin";/);
+    expect(SRC).toMatch(/const isPersonalSpeakable = isMac;/);
+    expect(SRC).toMatch(/configured && \(isPersonalSpeakable \|\| !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)\)/);
+  });
+
+  it("explains Personal Voice needs Apple devices on unsupported platforms", () => {
+    expect(SRC).toMatch(/Personal Voice needs a Mac or iPhone/);
+    expect(SRC).toMatch(/Apple Personal Voice speaks on Apple devices \(Mac and iPhone\)/);
   });
 });

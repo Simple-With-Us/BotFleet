@@ -39,7 +39,7 @@ describe("VoiceSettings", () => {
     voice,
   } as unknown as Bot);
 
-  it("renders Apple Personal Voice label and iOS helper note when configured on bot", () => {
+  it("renders Apple Personal Voice label and Mac / iOS helper note when configured on bot", () => {
     const html = renderToStaticMarkup(
       createElement(VoiceSettings, {
         bot: sampleBot("personal:com.apple.speech.voice.Jay"),
@@ -47,9 +47,9 @@ describe("VoiceSettings", () => {
       })
     );
 
-    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device iOS)");
-    expect(html).toContain("This bot uses an Apple Personal Voice on iOS.  Synthesis runs on-device on your authorized iPhone.");
-    expect(html).toContain("title=\"Personal Voices play on-device on iOS\"");
+    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
+    expect(html).toContain("This bot uses an Apple Personal Voice.  Synthesis runs on-device on your authorized Mac or iPhone.");
+    expect(html).toContain("title=\"Hear this Apple Personal Voice\"");
   });
 
   it("renders standard current voice for non-personal custom voice", () => {

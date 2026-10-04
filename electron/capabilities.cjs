@@ -104,6 +104,7 @@ function desktopCapabilities({
     available: isMac,
     engine: isMac ? "apple-speech" : "none",
     onDevice: isMac,
+    personalVoice: isMac,
   };
   if (!isMac) dictation.reasonCode = "unsupported-platform";
   const localComputer = {

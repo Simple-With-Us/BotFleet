@@ -62,14 +62,32 @@ export function VoiceSettings({
   useEffect(() => {
     let alive = true;
     setLoadingVoices(true);
-    api("/api/tts/voices")
-      .then((r: { voices?: typeof voices; error?: string }) => {
-        if (!alive) return;
-        setVoices(r.voices ?? []);
-        if (r.error) setError(r.error);
-      })
-      .catch(() => alive && setVoices([]))
-      .finally(() => alive && setLoadingVoices(false));
+    const loadPvs = window.ogb?.personalVoice?.list
+      ? window.ogb.personalVoice.list().catch(() => [])
+      : Promise.resolve([]);
+
+    Promise.all([
+      api("/api/tts/voices").catch(() => ({ voices: [] })),
+      loadPvs,
+    ]).then(([r, pvs]: [
+      { voices?: typeof voices; error?: string },
+      Array<{ id: string; name: string; locale?: string }>,
+    ]) => {
+      if (!alive) return;
+      const apiVoices = r.voices ?? [];
+      const personalEntries = Array.isArray(pvs)
+        ? pvs.map((pv) => ({
+            id: pv.id,
+            label: pv.name,
+            description: `Apple Personal Voice (${pv.locale ?? "en-US"})`,
+          }))
+        : [];
+      const existing = new Set(apiVoices.map((v) => v.id));
+      const merged = [...personalEntries.filter((pv) => !existing.has(pv.id)), ...apiVoices];
+      setVoices(merged);
+      if (r.error) setError(r.error);
+    }).finally(() => alive && setLoadingVoices(false));
+
     return () => {
       alive = false;
     };
@@ -401,7 +419,7 @@ export function VoiceSettings({
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
               <option value={selectedVoice}>
                 {isSelectedPersonal
-                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device iOS)`
+                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
                   : `${selectedVoice} (Current)`}
               </option>
             )}
@@ -413,9 +431,9 @@ export function VoiceSettings({
             ))}
           </select>
           <button
-            onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts.voice, botId: bot.id })}
-            disabled={!ready || isSelectedPersonal}
-            title={isSelectedPersonal ? "Personal Voices play on-device on iOS" : ready ? "Hear this voice" : "Pick a voice first"}
+            onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts?.voice, botId: bot.id })}
+            disabled={!ready && !isSelectedPersonal}
+            title={isSelectedPersonal ? "Hear this Apple Personal Voice" : ready ? "Hear this voice" : "Pick a voice first"}
             aria-label="Hear this voice"
             className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -424,7 +442,7 @@ export function VoiceSettings({
         </div>
         {isSelectedPersonal && (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            This bot uses an Apple Personal Voice on iOS.  Synthesis runs on-device on your authorized iPhone.
+            This bot uses an Apple Personal Voice.  Synthesis runs on-device on your authorized Mac or iPhone.
           </div>
         )}
       </div>

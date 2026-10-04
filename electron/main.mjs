@@ -8,7 +8,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
-import { finishSpeech, startSpeech, stopSpeech } from "./speech.mjs";
+import {
+  finishSpeech,
+  listPersonalVoices,
+  speakPersonalVoice,
+  startSpeech,
+  stopPersonalVoice,
+  stopSpeech,
+} from "./speech.mjs";
 import {
   recorderPermissionStatus,
   saveSkillRecording,
@@ -1795,6 +1802,19 @@ ipcMain.handle("speech:stop", () => {
 });
 ipcMain.handle("speech:finish", () => {
   if (nativeActions.appleSpeech) finishSpeech();
+});
+
+ipcMain.handle("personal-voice:available", () => nativeActions.appleSpeech);
+ipcMain.handle("personal-voice:list", async () => {
+  if (!nativeActions.appleSpeech) return [];
+  return listPersonalVoices();
+});
+ipcMain.handle("personal-voice:speak", async (_event, text, voiceId) => {
+  if (!nativeActions.appleSpeech) throw new Error("Personal Voice requires macOS.");
+  return speakPersonalVoice(text, voiceId);
+});
+ipcMain.handle("personal-voice:stop", () => {
+  if (nativeActions.appleSpeech) stopPersonalVoice();
 });
 
 ipcMain.handle("skill-recorder:permissions", () => recorderPermissionStatus());
