@@ -127,6 +127,137 @@ final class SilenceEndpointer {
   }
 }
 
+// ── Personal Voice listing and synthesis (macOS 14+) ──────────────────────
+if CommandLine.arguments.contains("--list-personal-voices") {
+  if #available(macOS 14.0, *) {
+    let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+    if status == .authorized {
+      let voices = AVSpeechSynthesisVoice.speechVoices()
+        .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+        .map { [
+          "id": "personal:\($0.identifier)",
+          "name": $0.name,
+          "locale": $0.language
+        ] }
+      emit(["status": "authorized", "voices": voices])
+      exit(0)
+    } else if status == .notDetermined {
+      AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+        if newStatus == .authorized {
+          let voices = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+            .map { [
+              "id": "personal:\($0.identifier)",
+              "name": $0.name,
+              "locale": $0.language
+            ] }
+          emit(["status": "authorized", "voices": voices])
+        } else {
+          emit(["status": "denied", "voices": []])
+        }
+        exit(0)
+      }
+      RunLoop.main.run()
+    } else {
+      emit(["status": "denied", "voices": []])
+      exit(0)
+    }
+  } else {
+    emit(["status": "unsupported", "voices": []])
+    exit(0)
+  }
+}
+
+if CommandLine.arguments.contains("--speak-personal-voice") {
+  guard #available(macOS 14.0, *) else {
+    fail("unsupported-platform")
+  }
+  let args = CommandLine.arguments
+  guard let voiceIdx = args.firstIndex(of: "--voice-id"), voiceIdx + 1 < args.count else {
+    fail("missing-voice-id")
+  }
+  // The reply text arrives in a 0600 file rather than on argv: argv is
+  // world-readable through `ps`, and this text is a voice summary of the
+  // user's own messages.
+  guard let textIdx = args.firstIndex(of: "--text-file"), textIdx + 1 < args.count else {
+    fail("missing-text")
+  }
+  let requestedVoiceId = args[voiceIdx + 1]
+  let textPath = args[textIdx + 1]
+  guard let text = try? String(contentsOfFile: textPath, encoding: .utf8) else {
+    fail("missing-text")
+  }
+  let rawId = requestedVoiceId
+    .replacingOccurrences(of: "apple-personal:", with: "")
+    .replacingOccurrences(of: "personal:", with: "")
+
+  final class PersonalVoiceSpeaker: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
+    let synth = AVSpeechSynthesizer()
+
+    func speak(voice: AVSpeechSynthesisVoice, text: String) {
+      synth.delegate = self
+      let utterance = AVSpeechUtterance(string: text)
+      utterance.voice = voice
+      utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+      synth.speak(utterance)
+    }
+
+    func stop() {
+      synth.stopSpeaking(at: .immediate)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+      emit(["finished": true])
+      exit(0)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+      exit(0)
+    }
+  }
+
+  let speaker = PersonalVoiceSpeaker()
+
+  let doSpeak = {
+    let allVoices = AVSpeechSynthesisVoice.speechVoices()
+    let matched = allVoices.first(where: {
+      $0.identifier == rawId || $0.name == rawId ||
+      "personal:\($0.identifier)" == requestedVoiceId ||
+      "apple-personal:\($0.identifier)" == requestedVoiceId
+    })
+    // Guess only when the caller named no voice at all. A named-but-absent
+    // voice — one not synced to this Mac — must fail loudly rather than be
+    // replaced by a different Personal Voice speaking the user's words.
+    let voice = matched ?? (rawId.isEmpty
+      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
+      : nil)
+
+    guard let selectedVoice = voice else {
+      fail("voice-not-found")
+    }
+
+    speaker.speak(voice: selectedVoice, text: text)
+  }
+
+  let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+  if status == .authorized {
+    doSpeak()
+  } else if status == .notDetermined {
+    AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+      if newStatus == .authorized {
+        DispatchQueue.main.async { doSpeak() }
+      } else {
+        fail("personal-voice-not-authorized")
+      }
+    }
+  } else {
+    fail("personal-voice-not-authorized")
+  }
+
+  RunLoop.main.run()
+}
+
+// ── Speech-to-text dictation (Speech framework) ──────────────────────────
 SFSpeechRecognizer.requestAuthorization { status in
   guard status == .authorized else { fail("speech-not-authorized") }
   // Recognize in the user's language: a hardcoded en-US recognizer
