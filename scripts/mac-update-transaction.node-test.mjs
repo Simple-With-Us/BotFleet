@@ -172,6 +172,7 @@ test("prepare validates completely before publishing a reusable stage", async ()
       installDependencies: () => step("installDependencies"),
       buildBundle: () => step("buildBundle", "/stage/source/release/mac-arm64/BotFleet.app"),
       validateBundle: () => step("validateBundle", { teamIdentifier: "CC8UTF7ATG" }),
+      smokeTestBundle: () => step("smokeTestBundle"),
       persistPrepared: () => step("persistPrepared", prepared),
       releaseSource: () => step("releaseSource"),
     },
@@ -185,6 +186,7 @@ test("prepare validates completely before publishing a reusable stage", async ()
     "installDependencies",
     "buildBundle",
     "validateBundle",
+    "smokeTestBundle",
     "persistPrepared",
     "releaseSource",
     "unlock",
@@ -207,6 +209,7 @@ test("a staging build failure cannot reach any live operation", async () => {
           throw new Error("package failed");
         },
         validateBundle: async () => calls.push("validateBundle"),
+        smokeTestBundle: async () => calls.push("smokeTestBundle"),
         persistPrepared: async () => calls.push("persistPrepared"),
         releaseSource: async () => calls.push("releaseSource"),
       },
@@ -229,6 +232,7 @@ test("a staging-source cleanup failure still releases the updater lock", async (
         installDependencies: async () => {},
         buildBundle: async () => "/stage/source/release/mac-arm64/BotFleet.app",
         validateBundle: async () => ({ teamIdentifier: "CC8UTF7ATG" }),
+        smokeTestBundle: async () => {},
         persistPrepared: async () => prepared,
         releaseSource: async () => {
           calls.push("releaseSource");
@@ -239,4 +243,61 @@ test("a staging-source cleanup failure still releases the updater lock", async (
     /source cleanup failed/,
   );
   assert.deepEqual(calls, ["releaseSource", "unlock"]);
+});
+
+// The staged candidate is proved by RUNNING it, in the one phase that still
+// touches nothing live.  These two cases pin that placement: the probe runs
+// after signature validation and before the stage is published, and a failing
+// probe never reaches persistPrepared.
+test("the candidate is proved to start after validation and before the stage is published", async () => {
+  const calls = [];
+  const step = async (name, value) => {
+    calls.push(name);
+    return value;
+  };
+  await prepareUpdate(
+    { target: "origin/main" },
+    {
+      acquireLock: () => step("lock", { release: () => step("unlock") }),
+      resolveTarget: () => step("resolveTarget", prepared.targetCommit),
+      prepareSource: () => step("prepareSource", { path: "/stage/source", temporary: true }),
+      assertStagingSource: () => step("assertStagingSource"),
+      installDependencies: () => step("installDependencies"),
+      buildBundle: () => step("buildBundle", "/stage/source/release/mac-arm64/BotFleet.app"),
+      validateBundle: () => step("validateBundle", { teamIdentifier: "CC8UTF7ATG" }),
+      smokeTestBundle: () => step("smokeTestBundle"),
+      persistPrepared: () => step("persistPrepared", prepared),
+      releaseSource: () => step("releaseSource"),
+    },
+  );
+  assert.ok(calls.indexOf("validateBundle") < calls.indexOf("smokeTestBundle"));
+  assert.ok(calls.indexOf("smokeTestBundle") < calls.indexOf("persistPrepared"));
+});
+
+test("a candidate that will not start is never published as a reusable stage", async () => {
+  const calls = [];
+  await assert.rejects(
+    prepareUpdate(
+      { target: "origin/main" },
+      {
+        acquireLock: async () => ({ release: async () => calls.push("unlock") }),
+        resolveTarget: async () => "b".repeat(40),
+        prepareSource: async () => ({ path: "/stage/source", temporary: true }),
+        assertStagingSource: async () => calls.push("assertStagingSource"),
+        installDependencies: async () => calls.push("installDependencies"),
+        buildBundle: async () => "/stage/source/release/mac-arm64/BotFleet.app",
+        validateBundle: async () => ({ teamIdentifier: "CC8UTF7ATG" }),
+        smokeTestBundle: async () => {
+          calls.push("smokeTestBundle");
+          throw new Error("Staged BotFleet candidate never reported ready");
+        },
+        persistPrepared: async () => calls.push("persistPrepared"),
+        releaseSource: async () => calls.push("releaseSource"),
+      },
+    ),
+    /never reported ready/,
+  );
+  // No stage is published, and the staging source is still released.  Nothing
+  // live was touched at any point, so there is nothing to roll back.
+  assert.deepEqual(calls, ["assertStagingSource", "installDependencies", "smokeTestBundle", "releaseSource", "unlock"]);
 });
