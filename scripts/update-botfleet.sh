@@ -154,9 +154,47 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
     LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)
     REMOTE_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse origin/main)
     if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
-      CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
-      echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
-      exit 0
+      IS_UP_TO_DATE=1
+
+      # 1. Compare against the installed Mac app's build identity
+      APP_MANIFEST="${BOTFLEET_APP_PATH:-/Applications/BotFleet.app}/Contents/Resources/server/build-identity.json"
+      if [[ -f "$APP_MANIFEST" ]]; then
+        INSTALLED_COMMIT=$("$NODE_BIN" -e "try { console.log(JSON.parse(require('fs').readFileSync('$APP_MANIFEST', 'utf8')).sourceCommit) } catch { console.log('') }" 2>/dev/null)
+        if [[ "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
+          IS_UP_TO_DATE=0
+        fi
+      else
+        IS_UP_TO_DATE=0
+      fi
+
+      # 2. Compare against the running server's runtime commit
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/owner.json"
+        if [[ -f "$OWNER_FILE" ]]; then
+          OWNER_PORT=$("$NODE_BIN" -e "try { console.log(JSON.parse(require('fs').readFileSync('$OWNER_FILE', 'utf8')).port) } catch { console.log('') }" 2>/dev/null || true)
+          OWNER_NONCE=$("$NODE_BIN" -e "try { console.log(JSON.parse(require('fs').readFileSync('$OWNER_FILE', 'utf8')).nonce) } catch { console.log('') }" 2>/dev/null || true)
+          if [[ -n "$OWNER_PORT" && -n "$OWNER_NONCE" ]]; then
+             RUNTIME_COMMIT=$(curl -s -f -m 1 -H "Authorization: Bearer $OWNER_NONCE" "http://127.0.0.1:$OWNER_PORT/api/runtime" 2>/dev/null | "$NODE_BIN" -e "
+               let d=''; process.stdin.on('data', c=>d+=c).on('end', () => {
+                 try { console.log(JSON.parse(d).build.sourceCommit || '') } catch { console.log('') }
+               });
+             " 2>/dev/null || true)
+             if [[ "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
+               IS_UP_TO_DATE=0
+             fi
+          else
+             IS_UP_TO_DATE=0
+          fi
+        else
+          IS_UP_TO_DATE=0
+        fi
+      fi
+
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
+        echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
+        exit 0
+      fi
     fi
   else
     echo "WARNING:  Could not fetch origin/main from $BOTFLEET_CHECKOUT; running updater anyway."
