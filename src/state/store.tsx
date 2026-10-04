@@ -341,6 +341,7 @@ export interface Bot {
   unread: boolean;
   busy?: boolean;
   activityStartedAt?: number;
+  inflightThreadId?: string;
   /** what the bot is doing, as the harness sees it; busy is derived from it */
   activity?: "working" | "waiting-on-you" | "idle" | "no-signal" | "dead";
   modelSelection: ModelSelection;
