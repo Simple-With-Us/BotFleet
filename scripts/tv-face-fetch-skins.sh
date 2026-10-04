@@ -5,16 +5,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE="${TVFACE_SKINS_BASE:-https://fleetlink.online/TV-Face/botfleet-skins}"
 DEST="${ROOT}/public/tv-face/skins"
-COLORS=("${@:-blue green purple pink red cyan yellow teal coral}")
+if [ "$#" -eq 0 ]; then
+  set -- blue green purple pink red cyan yellow teal coral
+fi
+COLORS=("$@")
 
-# Manifest lists files per color
+# Pull the file list from the local default pack: every color pack is built
+# from the same inventory, so the default directory is the source of truth
+# for which files a pack should contain.
 for color in "${COLORS[@]}"; do
   echo "=== $color ==="
   mkdir -p "$DEST/$color/stills" "$DEST/$color/gifs"
-  # Prefer manifest.json if present
-  if curl -fsSL "$BASE/$color/manifest.json" -o "/tmp/tvface-man-$color.json" 2>/dev/null; then
-    echo "got manifest"
-  fi
   # Pull default file list from local default pack
   for f in "$DEST/default/stills"/*.png; do
     name=$(basename "$f")
