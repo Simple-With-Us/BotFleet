@@ -63,6 +63,20 @@ test("the effort ledger is a growing record, not a file to be rewritten", async 
   );
 });
 
+test("the ledger contains no unresolved merge markers", () => {
+  // A marker survived a full PR, a passing test run, and a force-push onto a
+  // branch, because the checks in this file count ROWS and a conflict marker is
+  // not a row.  An unmerged ledger mirrors nothing, and `=======` reads as a
+  // heading to a human skimming the file.
+  const text = readFileSync(join(root, LEDGER), "utf8");
+  const markers = text.split("\n").filter((line) => /^(<{7}|={7}|>{7})/.test(line));
+  assert.deepEqual(
+    markers,
+    [],
+    `docs/EFFORT-LOG.md has ${markers.length} merge-conflict marker(s); resolve it as a union, never by picking a side`,
+  );
+});
+
 test("the ledger still holds the fleet's history", () => {
   // A floor, not an exact count: seats keep adding rows, and this only has to
   // notice a collapse.  Every seat listed here had dozens of rows before the
