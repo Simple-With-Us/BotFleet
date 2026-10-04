@@ -1,9 +1,11 @@
 // Test harness for tests/e2e/engine-setup.visual.spec.ts.
 //
-// Mounts the real EngineSetup card in the no-command installer state:
-// the install descriptor exists, but this platform has no one-line command.
-// The card is a pure render of that instance.  It does not talk to a bot
-// server.
+// Mounts the real EngineSetup card in the no-command installer state.
+// The install descriptor is present, but `command` is omitted so
+// installCommandFor returns null on every host: darwin, win32, and linux,
+// whether the platform comes from window.ogb or the user agent. A
+// darwin-only command rendered CommandRow on macOS and skipped the sentence
+// this spec exists to capture. The card does not talk to a bot server.
 import { EngineSetup } from "./EngineSetup";
 import type { InstanceInfo } from "@/state/store";
 
@@ -15,10 +17,6 @@ const noCommandInstaller: InstanceInfo = {
   snapshot: { state: "unavailable", reason: "kimi CLI not found" },
   install: {
     docsUrl: "https://example.com/kimi-setup",
-    // darwin only: hostPlatform() on the Playwright chromium lane is linux,
-    // so installCommandFor returns null and the card shows the no-command
-    // sentence instead of a command row.
-    command: { darwin: "echo kimi-setup" },
   },
 };
 

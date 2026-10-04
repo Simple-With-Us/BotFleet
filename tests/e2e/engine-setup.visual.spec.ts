@@ -3,7 +3,7 @@ import { test, expect, type Page } from '@playwright/test';
 // No-command installer sentence in EngineSetup.  The fixture mounts the real
 // card via /?fixture=engine-setup (see src/main.tsx).  There is no
 // visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
-const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02 } as const;
+const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02, threshold: 0.2 } as const;
 
 async function pinFonts(page: Page): Promise<void> {
   await page.addStyleTag({
