@@ -1,0 +1,56 @@
+title: >-
+  iOS: generate Xcode files from ios/project.yml and never compile locally —
+  wait for hosted ios-build
+rule: >-
+  For ios/**, treat `ios/project.yml` (XcodeGen) as the source of truth: edit it
+  and let the GitHub-hosted `ios-build` job run `xcodegen generate` (which
+  invokes `ios/xcodegen-post.py` via `postGenCommand` to rewrite objectVersion
+  77 → 100). Never hand-edit generated or binary project artifacts — `.pbxproj`
+  (`ios/Socratic Trade.xcodeproj/project.pbxproj`), `.entitlements`, `.xib`,
+  `.storyboard` — and never add a file under `ios/SocraticTrade/` that
+  `project.yml` `sources:` does not list (it will not compile). Do NOT run
+  `xcodebuild` or `xcrun simctl` locally, do not stand up/debug/narrate Xcode
+  MCP (`build_sim`, `mcpbridge`), and do not restart or re-register the retired
+  Mac runner (`mac-xcode26-socratic`, `trading-live-mac`, `ship-now-gui`): Swift
+  compile + XCTest is `.github/workflows/ios-build.yml` on GitHub-hosted
+  `macos-latest`, and TestFlight archive/upload is
+  `.github/workflows/ios-ship.yml` (`scripts/ios-ship-testflight.sh` → in-repo
+  `scripts/ios-fleet/`), dispatched with `gh workflow run ios-ship.yml` (signing
+  check only: `-f export_only=true`). A green local gate (lint/tsc/vitest/next
+  build) proves nothing about `ios/**` — wait for `ios-build` on the PR,
+  especially after merges, which can silently duplicate declarations. Ship
+  constraints: bundle ID `com.socratictrade.ios`, test bundle
+  `com.socratictrade.ios.tests`, team `CC8UTF7ATG`, keep both AASA appIDs and
+  dual SIWA/APNs audiences until the old TestFlight build is retired; do not
+  mint a new App Store Connect key; Release signs MANUALLY via the App Store
+  profile in `ios/appstore-profiles.json` installed by
+  `scripts/ios-install-appstore-profiles.sh` — do not restore
+  `-allowProvisioningUpdates` or `CODE_SIGN_STYLE=Automatic`; do not re-add the
+  `group.com.socratictrade` App Group entitlement until it is assigned in the
+  Developer Portal. SwiftUI rules: `@Observable` + `@MainActor` on stores (never
+  `ObservableObject`), `NavigationStack` + value-based `NavigationLink` (never
+  `NavigationView`), light theme default, two spaces between sentences in
+  user-visible copy, and secrets stay in `~/.secrets/`/Infisical and are never
+  printed.
+severity: high
+scope: file
+path: ios/**/*
+examples:
+  - snippet: >-
+      Edit `ios/project.yml` to add the new view to `sources:`, commit, then let
+      the hosted `ios-build` workflow run `xcodegen generate`.
+    isCorrect: true
+  - snippet: >-
+      Hand-edit `ios/Socratic Trade.xcodeproj/project.pbxproj` to add the file
+      to the target, then run `xcodebuild -scheme SocraticTrade build` locally
+      to check it compiles.
+    isCorrect: false
+  - snippet: >-
+      Dispatch `gh workflow run ios-ship.yml` for TestFlight; use `gh workflow
+      run ios-ship.yml --ref <branch> -f export_only=true` to verify signing
+      without uploading.
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []
