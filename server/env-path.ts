@@ -124,8 +124,47 @@ export function augmentedPath(): string {
   return cached;
 }
 
+/** Installer dirs that must stay ahead of the `~/.local/bin` symlink farm.
+ * The MiniMax Code installer drops a `~/.local/bin/mcode` symlink at a
+ * launcher that is not symlink-safe (it resolves its data dir from the
+ * parent of its own path, so through the symlink it reads
+ * `~/.local/current` and exits non-zero), and kimi-code symlinks the same
+ * way.  Whichever copy comes first in PATH is the one that runs, so the
+ * canonical dir has to win. */
+const CANONICAL_INSTALLER_DIRS = [".minimax-code", ".kimi-code"];
+
+/** Move the canonical installer dirs ahead of `~/.local/bin` in a finished
+ * PATH.  Ordering knownDirs() alone does not hold that precedence:
+ * `augmentedPath()` merges OMB_EXTRA_PATH, the inherited PATH and the
+ * login-shell probe AHEAD of knownDirs(), and any of those can carry
+ * `~/.local/bin`.  A GUI launch hits exactly that case, and every
+ * `resetPathCache()` (a rescan, `/api/cli-candidates`) rebuilds the merge
+ * with those sources first — so the symlink farm won again on the very next
+ * rebuild.  This runs on every merge, so the invariant holds whichever
+ * source supplied each dir.
+ *
+ * Only dirs already present are moved, and only ahead of the symlink farm,
+ * so no other CLI's resolution changes. */
+function promoteCanonicalDirs(parts: string[]): string[] {
+  const symlinkFarm = join(homedir(), ".local", "bin");
+  if (!parts.includes(symlinkFarm)) return parts;
+  const out: string[] = [];
+  for (const part of parts) {
+    if (part !== symlinkFarm) {
+      out.push(part);
+      continue;
+    }
+    for (const name of CANONICAL_INSTALLER_DIRS) {
+      const dir = join(homedir(), name, "bin");
+      if (parts.includes(dir) && !out.includes(dir)) out.push(dir);
+    }
+    out.push(part);
+  }
+  return out;
+}
+
 function mergePaths(parts: string[]): string {
-  return [...new Set(parts.filter(Boolean))].join(delimiter);
+  return promoteCanonicalDirs([...new Set(parts.filter(Boolean))]).join(delimiter);
 }
 
 function probeLoginShellPath(): void {

@@ -126,15 +126,51 @@ describe("augmentedPath", () => {
   posixIt2("puts a canonical installer dir ahead of the ~/.local/bin symlink farm", () => {
     // The MiniMax Code installer drops a ~/.local/bin/mcode symlink to a
     // launcher that is not symlink-safe: it resolves its data dir from the
-    // parent of its own path, so through the symlink it exits non-zero.  A GUI
-    // launch inherits a PATH with no mcode in it, so this ordering is the only
-    // thing that decides whether the engine can start.
+    // parent of its own path, so through the symlink it exits non-zero.  This
+    // ordering is what decides whether the engine can start.
+    //
+    // The dirs are created rather than probed for: setup.ts points homedir()
+    // at a throwaway home, so without them knownDirs()'s existsSync filter
+    // drops both and this test would assert nothing at all.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
     resetPathCacheForTests();
     const parts = augmentedPath().split(delimiter);
-    const installer = parts.findIndex((p) => p === join(homedir(), ".minimax-code", "bin"));
-    const symlinks = parts.findIndex((p) => p === join(homedir(), ".local", "bin"));
-    if (installer === -1) return; // not installed here; nothing to order
-    expect(symlinks === -1 || installer < symlinks).toBe(true);
+    const installer = parts.indexOf(installerDir);
+    const symlinks = parts.indexOf(symlinkFarm);
+    expect(installer).toBeGreaterThanOrEqual(0);
+    expect(symlinks).toBeGreaterThanOrEqual(0);
+    expect(installer).toBeLessThan(symlinks);
+  });
+
+  posixIt2("keeps the canonical installer dir first when the inherited PATH carries the symlink farm", () => {
+    // knownDirs() order is not enough on its own: augmentedPath() merges
+    // OMB_EXTRA_PATH, the inherited PATH and the login-shell probe AHEAD of
+    // knownDirs(), and any of those can carry ~/.local/bin.  A GUI launch hits
+    // exactly that case, and every resetPathCache() rebuilds the merge with
+    // those sources first — so the symlink farm reclaimed first position on
+    // the next rescan even with knownDirs() ordered correctly.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      const installer = parts.indexOf(installerDir);
+      const symlinks = parts.indexOf(symlinkFarm);
+      expect(installer).toBeGreaterThanOrEqual(0);
+      expect(symlinks).toBeGreaterThanOrEqual(0);
+      expect(installer).toBeLessThan(symlinks);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
   });
 
   it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {
