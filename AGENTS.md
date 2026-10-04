@@ -85,6 +85,10 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 
 When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.
 
+## Infisical Sole Source Of Truth (owner directive, 2026-10-03)
+
+Infisical is the sole source of truth for this app's secrets, env config, and tunable settings knobs — see [INFISICAL.md](INFISICAL.md) for the policy, the key inventory, and the runtime contract.  Credentials live in the table in `server/secret-map.ts`; tunable knobs (job limits, admission thresholds, Sentry sample rates, the spend ceiling, the Infisical refresh cadence) live in the table in `server/knob-map.ts`.  One table row each — the snapshot filter, `loadConfig()` resolution, provenance, `PUT /api/config` write-through, and the status views all follow the tables.  Never add a direct `process.env` read for a setting that belongs in either table; never fetch Infisical per-request (all runtime reads come from the resolved in-memory `cfg`).  The store's own machine identity and timeouts are deliberately NOT in the vault — a lock cannot hold its own key.  Admin saves write through to Infisical first; a failed write fails the save.
+
 ## Observability
 
 Sentry org `simple-with-us`, project `botfleet` (web client, harness spans, iOS Cocoa).  Do not stand up a second project.  CI reports deploys through the fleet Sentry reporter workflows.  Canonical: `AGENT-SYNC.md` § Observability.

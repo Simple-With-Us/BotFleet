@@ -337,6 +337,8 @@ import { getSentry, isSentryActive } from "./sentry.ts";
 import { infisical, type RefreshReason } from "./infisical.ts";
 import { InfisicalError } from "./infisical-client.ts";
 import { credentialFingerprint, SECRET_FIELDS, secretProvenance, secretSource, vaultNames, type SecretFieldSpec } from "./secret-map.ts";
+import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
+import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
@@ -14255,6 +14257,21 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           error: "Updating Infisical settings and credentials in the same request is not supported.\u00A0 Save Infisical settings first.",
         });
       }
+      // The knob twin of the check above, narrower: a knob save rides the
+      // write-through path in `knob-write-through.ts`, but a patch that ALSO
+      // moves the store's own connection (project, site, environment, path,
+      // identity) would land the knob write in the OLD project before the
+      // connection moves.  Refuse the combination outright.  A patch that
+      // carries only `infisical.refreshMinutes` is a knob write like any
+      // other and is handled below.
+      if (
+        patchChangesInfisicalConnection(patch) &&
+        KNOB_FIELDS.some((spec) => readKnobField(patch, spec) !== undefined)
+      ) {
+        return json(res, 400, {
+          error: "Updating the Infisical connection and managed settings in the same request is not supported.\u00A0 Save the Infisical connection first.",
+        });
+      }
 
       const vaultForSave = infisical.getStatus();
       const vaultKnownNames = new Set(vaultNames());
@@ -14344,6 +14361,39 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
       }
       for (const { spec } of managedInPatch) blankSecretField(patch, spec);
+      // The tunable-knob twin of the credential write-through above, via
+      // `server/knob-write-through.ts`: a knob the store manages goes to the
+      // store first and only then is dropped from the patch bound for disk,
+      // so a failed write leaves both sides exactly as they were.  On a
+      // partial failure the writes that already landed are in the vault while
+      // this process still holds the old values, so the store and this
+      // process are reconciled before answering — the same reconciliation the
+      // credential path runs two blocks up.
+      const knobWrite = await writeThroughKnobs(patch, {
+        enabled: vaultForSave.enabled,
+        writeThrough: vaultForSave.writeThrough,
+        environment: vaultForSave.environment,
+        unreachable: vaultUnreachable,
+        knownNames: vaultKnownNames,
+        sourceOf: (id) => knobSource(id),
+        writeSecret: (name, value) => infisical.writeSecret(name, value),
+      });
+      if (!knobWrite.ok) {
+        if (knobWrite.written.length > 0) {
+          await applyResolvedSecrets("settings").catch((applyError) => {
+            console.error(
+              `[infisical] apply after a partial knob write-through failed: ${applyError instanceof Error ? applyError.message : String(applyError)}`,
+            );
+          });
+        }
+        return json(res, knobWrite.status, {
+          error: knobWrite.error,
+          field: knobWrite.field,
+          infisicalName: knobWrite.infisicalName,
+          written: knobWrite.written,
+          failed: knobWrite.failed,
+        });
+      }
       // Bot identities and permission fields can change while the provider
       // and secret-store checks above await.  Bind the save to the exact
       // fleet that was displayed before persisting a host-capable default.
