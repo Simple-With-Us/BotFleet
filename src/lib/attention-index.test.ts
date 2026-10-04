@@ -258,4 +258,38 @@ describe("computeRoomAttentionIndex", () => {
     expect(result[0].errors.bots.map((bot) => bot.botName)).toEqual(["Builder"]);
     expect(result[0].errors.bots[0].reason).toBe("Turn error: rate limit from provider");
   });
+
+  it("reuses one transcript for a bot shared by two rooms", () => {
+    const messages = [
+      { id: "root", kind: "text", parentId: null },
+      { id: "err", kind: "activity", parentId: "root", tool: { name: "error: rate limit from provider" } },
+      { id: "abandoned", kind: "text", parentId: "root" },
+    ];
+    const bot: MinimalBot = {
+      id: "bot-shared",
+      name: "Builder",
+      activity: "idle",
+      activeLeafId: "err",
+      messages,
+    };
+    const groups: MinimalGroup[] = [
+      { id: "room-a", name: "A", memberIds: ["bot-shared"], unread: false },
+      { id: "room-b", name: "B", memberIds: ["bot-shared"], unread: false },
+    ];
+
+    const result = computeRoomAttentionIndex(groups, [bot]);
+    expect(result.map((room) => room.errors.bots[0]?.reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+    expect(isBotTurnError(bot)).toBe(true);
+
+    const again = computeRoomAttentionIndex(groups, [bot]);
+    expect(again.map((room) => room.roomId)).toEqual(["room-a", "room-b"]);
+    expect(again.map((room) => room.errors.count)).toEqual([1, 1]);
+    expect(again.map((room) => room.errors.bots[0].reason)).toEqual([
+      "Turn error: rate limit from provider",
+      "Turn error: rate limit from provider",
+    ]);
+  });
 });

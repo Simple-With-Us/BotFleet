@@ -86,6 +86,26 @@ export interface MinimalBot {
   messages?: readonly AttentionMessage[];
 }
 
+/** One id index per messages-array identity.  Rooms that share a bot, and
+ * the error check plus its reason, must not scan that transcript again. */
+const attentionMessageIndex = new WeakMap<
+  readonly AttentionMessage[],
+  Map<string, AttentionMessage>
+>();
+
+function indexAttentionMessages<T extends AttentionMessage>(
+  messages: readonly T[],
+): Map<string, T> {
+  const cached = attentionMessageIndex.get(messages);
+  if (cached) return cached as Map<string, T>;
+  const byId = new Map<string, T>();
+  for (const message of messages) {
+    if (message.id) byId.set(message.id, message);
+  }
+  attentionMessageIndex.set(messages, byId);
+  return byId;
+}
+
 /** Same parent walk as `visibleMessages` in the store.  Without a leaf, or
  * when that leaf is not in the payload, the flat list is the visible thread. */
 function visibleAttentionMessages<T extends AttentionMessage>(
@@ -94,10 +114,7 @@ function visibleAttentionMessages<T extends AttentionMessage>(
 ): readonly T[] {
   if (!messages || messages.length === 0) return [];
   if (!activeLeafId) return messages;
-  const byId = new Map<string, T>();
-  for (const message of messages) {
-    if (message.id) byId.set(message.id, message);
-  }
+  const byId = indexAttentionMessages(messages);
   if (!byId.has(activeLeafId)) return messages;
   const path: T[] = [];
   const seen = new Set<string>();
@@ -157,28 +174,29 @@ export function computeRoomAttentionIndex(
         .map((id) => botMap.get(id))
         .filter((b): b is MinimalBot => Boolean(b));
 
-      // 1. Errors: dead activity or terminal unresolved failures
-      const errorBots: AttentionParticipant[] = assignedBots
-        .filter((b) => b.activity === "dead" || b.hasError || isBotTurnError(b))
-        .map((b) => {
-          const visibleTail = visibleAttentionMessages(b.messages, b.activeLeafId).at(-1);
-          const turnError = messageIsTurnError(visibleTail);
-          const errorDetail = turnError
-            ? visibleTail?.tool?.name.slice(6).trim()
-            : undefined;
-          return {
-            botId: b.id,
-            botName: b.name,
-            avatarUrl: b.avatarUrl,
-            reason:
-              b.errorReason ||
-              (b.activity === "dead"
-                ? "Process terminated"
-                : errorDetail
-                  ? `Turn error: ${errorDetail}`
-                  : "Active error"),
-          };
+      // 1. Errors: dead activity or terminal unresolved failures.
+      // The visible tail is resolved once and reused for the filter and the reason.
+      const errorBots: AttentionParticipant[] = [];
+      for (const b of assignedBots) {
+        const visibleTail = visibleAttentionMessages(b.messages, b.activeLeafId).at(-1);
+        const turnError = messageIsTurnError(visibleTail);
+        if (b.activity !== "dead" && !b.hasError && !turnError) continue;
+        const errorDetail = turnError
+          ? visibleTail?.tool?.name.slice(6).trim()
+          : undefined;
+        errorBots.push({
+          botId: b.id,
+          botName: b.name,
+          avatarUrl: b.avatarUrl,
+          reason:
+            b.errorReason ||
+            (b.activity === "dead"
+              ? "Process terminated"
+              : errorDetail
+                ? `Turn error: ${errorDetail}`
+                : "Active error"),
         });
+      }
 
       // 2. Needs Action: waiting-on-you (prompts, permissions, confirmation)
       const needsActionBots: AttentionParticipant[] = assignedBots
