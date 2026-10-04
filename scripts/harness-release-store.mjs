@@ -258,7 +258,13 @@ async function promotedAtOf(path) {
     // fall through to the filesystem
   }
   try {
-    return (await import("node:fs/promises")).stat(path).then((s) => s.mtimeMs);
+    // Awaited inside the try, never returned from it.  A promise RETURNED from
+    // a try block is not covered by that block's catch, so a stat() failure would
+    // escape as an unhandled rejection instead of falling back to 0 — and this
+    // runs once per release inside a retention pass that is about to delete
+    // things, which is the worst possible place for an unhandled rejection.
+    const { stat } = await import("node:fs/promises");
+    return (await stat(path)).mtimeMs;
   } catch {
     return 0;
   }
