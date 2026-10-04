@@ -17,7 +17,7 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
 
 /** The longest prompt that may ride in argv.  ARG_MAX is megabytes on Linux
  * but the whole Windows command line is one 32KB buffer, and a prompt that
@@ -108,15 +108,33 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
     const probeCommand = (): Promise<ProviderSnapshot> => {
       if (!probePromise) {
         probePromise = new Promise<ProviderSnapshot>((resolve) => {
-          execCli(config.command, ["--version"], { env: childEnv(), timeout: 10_000 }, (err, stdout) => {
-            if (!err) {
-              const version = stdout.trim().split("\n")[0] || null;
-              resolve({ state: "available", authenticated: true, version });
-              return;
-            }
-            const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
-            resolve({ state: "unavailable", reason: failure.message });
-          });
+          execCli(
+            config.command,
+            [...config.args, "--version"],
+            {
+              env: childEnv(),
+              timeout: 10_000,
+              killSignal: "SIGKILL",
+              maxBuffer: 1024 * 64,
+            },
+            (err, stdout) => {
+              if (!err) {
+                const version = stdout.trim().split("\n")[0] || null;
+                resolve({ state: "available", authenticated: true, version });
+                return;
+              }
+              if (isProbeTimeout(err)) {
+                resolve({
+                  state: "unavailable",
+                  transient: true,
+                  reason: `\`${config.command}\` did not answer in time`,
+                });
+                return;
+              }
+              const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
+              resolve({ state: "unavailable", reason: failure.message });
+            },
+          );
         });
       }
       return probePromise;
@@ -194,11 +212,16 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           settle(false, failure.message);
           return { turnId, dispatched: false };
         }
-        children.set(threadId, child);
+        try {
+          children.set(threadId, child);
 
-        if (config.passPromptAs === "stdin") {
-          child.stdin?.write(turnInput.text);
-          child.stdin?.end();
+          if (config.passPromptAs === "stdin") {
+            child.stdin?.write(turnInput.text);
+            child.stdin?.end();
+          }
+        } catch (err) {
+          killThread(threadId);
+          throw err;
         }
 
         child.stdout?.on("data", (chunk: Buffer) => {

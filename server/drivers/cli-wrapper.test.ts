@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
 import { ensureDirs } from "../config.ts";
 import type { ProviderInstance, SendTurnInput } from "../contracts.ts";
@@ -93,14 +94,15 @@ describe("CliWrapperDriver turns (real child process)", () => {
   });
 
   it("keeps the harness's workspace credentials out of the child, and passes the approved ones", async () => {
-    process.env.LINQ_WEBHOOK_SECRET = "whsec-must-not-leak";
+    const canary = process.env.CLI_WRAPPER_TEST_CANARY ?? `canary-${Date.now()}`;
+    process.env.LINQ_WEBHOOK_SECRET = canary;
     try {
       await create(
         {
           command: NODE,
           args: [
             "-e",
-            "process.stdout.write(JSON.stringify({leak: process.env.LINQ_WEBHOOK_SECRET ?? null, ok: process.env.CLI_WRAPPER_OK ?? null}))",
+            "process.stdout.write(JSON.stringify({leak: process.env.LINQ_WEBHOOK_SECRET ? 'present' : null, ok: process.env.CLI_WRAPPER_OK ?? null}))",
           ],
           passPromptAs: "arg",
         },
@@ -113,10 +115,13 @@ describe("CliWrapperDriver turns (real child process)", () => {
         .filter((e) => e.type === "content.delta")
         .map((e) => (e as { delta: string }).delta)
         .join("");
-      const seen = JSON.parse(out) as { leak: string | null; ok: string | null };
+      const seen = z
+        .object({ leak: z.string().nullable(), ok: z.string().nullable() })
+        .strict()
+        .parse(JSON.parse(out));
       expect(seen.leak).toBeNull();
       expect(seen.ok).toBe("approved");
-      expect(out).not.toContain("whsec-must-not-leak");
+      expect(out).not.toContain(canary);
     } finally {
       delete process.env.LINQ_WEBHOOK_SECRET;
     }
@@ -194,5 +199,17 @@ describe("CliWrapperDriver turns (real child process)", () => {
     await instance.adapter.stopAll();
     const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId, 15_000);
     expect(done.turnId).toBe(turnId);
+  });
+
+  it("probes availability using the command with configured args and --version", async () => {
+    await create({
+      command: NODE,
+      args: ["-e", "process.stdout.write('v99.0.0\\n')"],
+      passPromptAs: "arg",
+    });
+    const snapshot = await instance.snapshot();
+    expect(snapshot.state).toBe("available");
+    expect(snapshot.authenticated).toBe(true);
+    expect(snapshot.version).toBe(process.version);
   });
 });
