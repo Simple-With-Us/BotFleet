@@ -15,6 +15,7 @@ import type { InfisicalSettings } from "./config.ts";
 import { InfisicalError, login, listSecrets, upsertSecret } from "./infisical-client.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { SECRET_FIELDS, infisicalSnapshot, setInfisicalSnapshot, vaultNames as snapshotVaultNames } from "./secret-map.ts";
+import { KNOB_FIELDS, KNOB_INFISICAL_NAMES, knobSource } from "./knob-map.ts";
 
 export type RefreshReason = "boot" | "timer" | "settings" | "manual";
 
@@ -45,13 +46,22 @@ export interface InfisicalStatusView {
   vaultNames: string[];
   appliedCount: number;
   appliedFields: string[];
+  /** Tunable knobs the vault holds (`server/knob-map.ts`): how many, and
+   * which mapped knob ids the last resolution applied.  Values never ride
+   * here for credentials; knob values are already visible in Settings, so
+   * only ids and counts leave this module either way. */
+  knobCount: number;
+  appliedKnobs: string[];
   unusedVaultNames: string[];
 }
 
 /** Every Infisical name this process will ever apply, built once from the
- * same table `secret-map.ts` uses — so the two modules can never disagree
- * about what "mapped" means. */
-const MAPPED_INFISICAL_NAMES: ReadonlySet<string> = new Set(SECRET_FIELDS.map((spec) => spec.infisicalName));
+ * same tables `secret-map.ts` and `knob-map.ts` use — so the three modules
+ * can never disagree about what "mapped" means. */
+const MAPPED_INFISICAL_NAMES: ReadonlySet<string> = new Set([
+  ...SECRET_FIELDS.map((spec) => spec.infisicalName),
+  ...KNOB_INFISICAL_NAMES,
+]);
 
 const DEFAULT_CALL_TIMEOUT_MS = 30_000;
 const DEFAULT_BOOT_CAP_MS = 25_000;
@@ -345,6 +355,7 @@ class InfisicalManager {
     const appliedFields = snap
       ? SECRET_FIELDS.filter((spec) => (snap.get(spec.infisicalName) ?? "").length > 0).map((spec) => spec.id)
       : [];
+    const appliedKnobs = KNOB_FIELDS.filter((spec) => knobSource(spec.id) === "infisical").map((spec) => spec.id);
     const unusedVaultNames = names.filter((name) => !MAPPED_INFISICAL_NAMES.has(name));
 
     return {
@@ -369,6 +380,8 @@ class InfisicalManager {
       vaultNames: [...names],
       appliedCount: appliedFields.length,
       appliedFields,
+      knobCount: names.filter((name) => KNOB_INFISICAL_NAMES.has(name)).length,
+      appliedKnobs,
       unusedVaultNames,
     };
   }

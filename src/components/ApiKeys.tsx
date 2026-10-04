@@ -39,7 +39,7 @@ const SECTIONS: Record<
   opencodeGo: { body: (v) => ({ opencodeGo: { apiKey: v } }), flag: (c) => c.opencodeGo?.configured ?? false },
   // The deepseek key lives at the user level and is used only to fetch the
   // account balance for the engine row chip — never injected into any
-  // engine's process environment, so a bot can run on the DeepSeek harness
+  // engine's process environment, so a bot can run on Clutch
   // without this key set.
   deepseek: { body: (v) => ({ deepseek: { key: v } }), flag: (c) => c.deepseek?.configured ?? false },
 };

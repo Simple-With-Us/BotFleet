@@ -24,6 +24,8 @@ import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
 import type { ContextInjectionRef } from "../../shared/context-injection";
+import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
+import { eligibleTaskApps } from "@/lib/task-app-context";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -31,6 +33,7 @@ import {
   type RoomTerminology,
 } from "../../shared/terminology";
 import {
+  allowsMultipleBotThreads,
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
@@ -235,6 +238,7 @@ export interface GroupTask {
   lastActivity?: number;
   pinnedCwd?: string | null;
   pinnedMessageId?: string;
+  workspaceContext?: TaskWorkspaceContext;
 }
 
 export interface ModelSelection {
@@ -268,9 +272,10 @@ export interface Task {
    *  connection;  `byModel` splits the bucket per model that ran.
    *  Absent on older records. */
   usageByInstance?: Record<string, TaskUsage & { engineId?: string; byModel?: Record<string, TaskUsage> }>;
-  /** folder this task's turns run in, pinned on its first turn; null =
+  /** Folder selected at creation or pinned on the first turn; null =
    * legacy home-folder session; absent = not pinned yet */
   cwd?: string | null;
+  workspaceContext?: TaskWorkspaceContext;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
   modelSelection?: ModelSelection;
@@ -829,6 +834,8 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Local task-creation dialog; never changes the bot's running thread. */
+  taskCreationBotId: string | null;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   selectedRoutineId?: string | null;
   routines: Routine[];
@@ -1032,7 +1039,9 @@ export type Action =
       /** Local UI recovery hook for voice flows. Never sent to the server. */
       onError?: (message: string) => void;
     }
-  | { type: "newTask"; botId: string }
+  | { type: "requestNewTask"; botId: string }
+  | { type: "cancelNewTask" }
+  | { type: "newTask"; botId: string; appRef?: TaskAppRef }
   | { type: "switchTask"; botId: string; threadId: string }
   | { type: "taskSwitched"; bot: Bot }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
@@ -1392,6 +1401,8 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         config: action.config,
+        taskCreationBotId: allowsMultipleBotThreads(getConversationMode(action.config))
+          ? state.taskCreationBotId : null,
         activeView:
           state.activeView === "skill-recorder" && !skillRecorderEnabled(action.config)
             ? "chat"
@@ -1804,7 +1815,15 @@ export function reducer(state: AppState, action: Action): AppState {
       return withMascotMotion(dismissOnboardingCard(state, action.botId), action.botId, "working");
     case "editMessage":
       return withMascotMotion(state, action.botId, "working");
+    case "requestNewTask": {
+      if (!allowsMultipleBotThreads(getConversationMode(state.config))) return state;
+      const bot = state.bots.find((entry) => entry.id === action.botId);
+      if (!bot || bot.busy || eligibleTaskApps(bot.id, state.groups).length === 0) return state;
+      return { ...state, taskCreationBotId: bot.id };
+    }
+    case "cancelNewTask":
     case "newTask":
+      return { ...state, taskCreationBotId: null };
     case "switchTask":
     case "deleteTask":
     case "newGroupTask":
@@ -1852,6 +1871,7 @@ export function reducer(state: AppState, action: Action): AppState {
       // too; refusing here keeps the sidebar honest if the drop is illegal.
       const source = state.groups.find((group) => group.id === action.groupId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         groups: state.groups.map((group) => {
@@ -1893,7 +1913,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...bot,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, cwd: moving.pinnedCwd, workspaceContext: moving.workspaceContext },
                   ...(bot.tasks ?? []),
                 ],
               }
@@ -1904,6 +1924,9 @@ export function reducer(state: AppState, action: Action): AppState {
     case "mergeTasks": {
       const source = state.bots.find((bot) => bot.id === action.botId);
       if (!source || action.threadId === action.intoThreadId || (source.tasks ?? []).length < 2) return state;
+      const from = source.tasks?.find((task) => task.threadId === action.threadId);
+      const into = source.tasks?.find((task) => task.threadId === action.intoThreadId);
+      if (!taskWorkspaceContextsMatch(from?.workspaceContext, into?.workspaceContext)) return state;
       const remaining = (source.tasks ?? []).filter((task) => task.threadId !== action.threadId);
       if (remaining.length === (source.tasks ?? []).length) return state;
       if (!remaining.some((task) => task.threadId === action.intoThreadId)) return state;
@@ -1944,6 +1967,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const source = state.bots.find((bot) => bot.id === action.botId);
       const moving = (source?.tasks ?? []).find((task) => task.threadId === action.threadId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         bots: state.bots.map((bot) => {
@@ -1960,7 +1984,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...group,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, pinnedCwd: moving.cwd, workspaceContext: moving.workspaceContext },
                   ...(group.tasks ?? []),
                 ],
               }
@@ -2002,6 +2026,7 @@ export const initialState: AppState = {
   instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  taskCreationBotId: null,
   activeView: "chat",
   selectedRoutineId: null,
   routines: [],
@@ -2313,9 +2338,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return bot ? openOnboardingCard(bot) : undefined;
       })();
       if (action.type === "deleteBot") botPatchQueue.cancel(action.botId);
-      // A queued message is still real until the server confirms deletion.
-      // All other actions keep their existing optimistic behavior.
-      if (action.type !== "cancelQueued") rawDispatch(action);
+      // Rejected task moves and merges must not hide the original conversation.
+      // Apply their local projection only after the server accepts the change.
+      const confirmTaskMutation = action.type === "moveGroupTask"
+        || action.type === "moveGroupTaskToBot" || action.type === "mergeTasks"
+        || action.type === "moveTaskToBot" || action.type === "moveTaskToGroup";
+      if (action.type !== "cancelQueued" && !confirmTaskMutation) rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
           api("/api/routines", { method: "POST", body: JSON.stringify(action.input) }).catch(showError);
@@ -2602,8 +2630,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         // tasks: the server answers with the bot AND the live transcript,
         // because switching changes which conversation is on screen
+        case "requestNewTask": {
+          const current = stateRef.current;
+          if (!allowsMultipleBotThreads(getConversationMode(current.config))) break;
+          const bot = current.bots.find((entry) => entry.id === action.botId);
+          if (bot && !bot.busy && eligibleTaskApps(bot.id, current.groups).length === 0) {
+            wrapped({ type: "newTask", botId: bot.id });
+          }
+          break;
+        }
         case "newTask":
-          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: "{}" })
+          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: JSON.stringify({ appRef: action.appRef }) })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
@@ -2654,31 +2691,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveGroupTaskToBot":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.botId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "mergeTasks":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ mergeInto: action.intoThreadId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveTaskToBot":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.toBotId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveTaskToGroup":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "deleteGroupTask":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "DELETE" })

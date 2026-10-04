@@ -156,6 +156,19 @@ if (argv[0] === "auth" && argv[1] === "status") {
   );
 }
 
+// One-shot /usage renewal command used by claudeSignedIn
+if (argv.includes("-p") && argv.includes("/usage")) {
+  const auth = process.env.FAKE_CLAUDE_AUTH ?? "in";
+  if (auth === "out" || auth === "unsupported") {
+    process.stderr.write("Failed to authenticate: OAuth session expired and could not be refreshed\n");
+    process.exit(1);
+  }
+  process.stdout.write(
+    JSON.stringify({ is_error: false, subtype: "success", result: "Total cost: $0.00" }) + "\n",
+  );
+  process.exit(0);
+}
+
 // One-shot helper mode used by generateText/reviewPermission. The prompt is
 // deliberately read from stdin so sensitive review text never appears in
 // argv or process listings.

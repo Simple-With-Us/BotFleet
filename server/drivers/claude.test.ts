@@ -1837,9 +1837,12 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       );
     });
 
-    it("reports background jobs off and typed helpers", async () => {
+    it("reports emulated background jobs and typed helpers", async () => {
       await create();
-      expect(instance.adapter.capabilities.backgroundJobs).toBe("none");
+      // jobs P2: BotFleet's own job tools reach Claude over the `agents` MCP
+      // server, so the capability is `emulated` — not Claude's own background
+      // work, which stays contained off (`--disallowedTools` above).
+      expect(instance.adapter.capabilities.backgroundJobs).toBe("emulated");
       expect(instance.adapter.capabilities.helpers).toBe("typed");
     });
 

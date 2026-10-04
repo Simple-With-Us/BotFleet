@@ -1050,9 +1050,12 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // xhigh/max only land on models that expose them; pi rejects an
           // unsupported level and the turn keeps the engine default.
           effortLevels: EFFORT_LEVELS,
-          // Jobs matrix: BotFleet jobs arrive through pi-mcp-extension in P2,
-          // once it is shown to proxy them; helpers are unverified.
-          backgroundJobs: "none",
+          // Jobs matrix: BotFleet's own job tools arrive through the same
+          // pi-mcp-extension that already carries ask_bot, and the chain is
+          // proven end to end in server/drivers/pi-jobs.test.ts — the real
+          // extension, the real agents-proxy, jobs mounted, reaching the
+          // harness.  Helpers are still unverified and stay `none`.
+          backgroundJobs: "emulated",
           helpers: "none",
         },
         sendTurn,

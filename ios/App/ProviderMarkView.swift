@@ -105,7 +105,7 @@ struct ProviderMarkView: View {
         case "grok", "grokAgent": return "Grok"
         case "grok-bot": return "Grok Bot"
         case "deepseek", "deepseekAgent": return "DeepSeek"
-        case "dsh", "dshAgent": return "DeepSeek Harness"
+        case "dsh", "dshAgent": return "Clutch"
         case "codex": return "Codex"
         case "openai-compat", "openai": return "OpenAI"
         case "gemini", "geminiAgent": return "Gemini"

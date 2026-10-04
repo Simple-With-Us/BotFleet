@@ -108,6 +108,24 @@ export interface LocalVmTarget {
    * targets let the runtime allocate a distinct ephemeral loopback port. */
   viewerPort: number | null;
   label: string;
+  /** Per-bot desktop inside a shared container.
+   *
+   * Absent means the single `:1` desktop the container's supervisor started —
+   * the historical behaviour, and what per-bot mode and the human noVNC
+   * preview still use.  Present means this bot owns its own X display, Cua
+   * socket and screenshot path inside the same container, which is what lets N
+   * bots share one container.  Deliberately separate from `key`: `key`
+   * identifies the CONTAINER (lifecycle and idle teardown must keep seeing one
+   * desktop), while the session identifies the bot's desktop within it. */
+  session?: {
+    display: string;
+    socket: string;
+    session: string;
+    screenshotPath: string;
+  };
+  /** Lease lane key, when the target's desktop belongs to one bot inside a
+   * shared container.  Absent means the lane IS `key`. */
+  laneKey?: string;
 }
 
 export const SHARED_LOCAL_VM_TARGET: LocalVmTarget = {
@@ -485,7 +503,7 @@ function viewerUrl(password: string | null, port: number | null): string {
  * telemetry knobs can never drift between the Local VM and a VPS container. */
 export function cuaExecArgs(
   args: string[],
-  options: { container?: string; interactive?: boolean; display?: string } = {},
+  options: { container?: string; interactive?: boolean; display?: string; command?: string } = {},
 ): string[] {
   return [
     "exec",
@@ -501,7 +519,10 @@ export function cuaExecArgs(
     "-e",
     "CUA_DRIVER_RS_TELEMETRY_ENABLED=0",
     options.container ?? CONTAINER,
-    CUA_EXECUTABLE,
+    // Defaults to the driver binary; a caller that needs to run something else
+    // inside the same exec (the per-bot session ensure runs a shell script)
+    // passes it here rather than rebuilding the argv.
+    options.command ?? CUA_EXECUTABLE,
     ...args,
   ];
 }
@@ -1258,6 +1279,14 @@ export async function containerComputerAction(
  * the freshest status, so the caller's readiness check never judges a
  * stale snapshot. A non-stopped or unsupported status passes through
  * untouched. */
+/** The default Local VM command runner.
+ *
+ * Exported so a caller that already depends on this module (and only this
+ * module) can run an argv without `index.ts` having to reach for
+ * `node:child_process` itself, and without `local-vm-shared-session.ts`
+ * having to import back into here. */
+export const defaultCommandRunner: CommandRunner = sh;
+
 export async function wakeContainerComputer(
   status: ContainerComputerStatus,
   runner: CommandRunner = sh,
@@ -1343,7 +1372,7 @@ export async function containerComputerScreenshot(
   }
   if (cacheable) screenshotStatusCache.set(target.key, { status, expiresAt: now + SCREENSHOT_STATUS_TTL_MS });
   try {
-    const screenshot = "/tmp/botfleet-preview.png";
+    const screenshot = target.session?.screenshotPath ?? "/tmp/botfleet-preview.png";
     await runner(
       status.runtime,
       cuaExecArgs([
@@ -1351,10 +1380,10 @@ export async function containerComputerScreenshot(
         "get_desktop_state",
         "{}",
         "--socket",
-        CUA_SOCKET,
+        target.session?.socket ?? CUA_SOCKET,
         "--screenshot-out-file",
         screenshot,
-      ], { container: target.containerName }),
+      ], { container: target.containerName, display: target.session?.display }),
       30_000,
     );
     const { stdout } = await runner(
@@ -1397,7 +1426,10 @@ export function containerComputerMcp(
 ): ContainerMcpLaunch {
   return {
     command: process.execPath,
-    args: [containerMcpPath, runtime, target.containerName, CUA_SOCKET],
+    // The socket is per-bot in shared mode: two bots sharing one container must
+    // not end up driving the same desktop, so the bridge is told which socket
+    // belongs to the bot that owns this turn.
+    args: [containerMcpPath, runtime, target.containerName, target.session?.socket ?? CUA_SOCKET],
     // The control pair rides in env, not argv — argv is world-readable
     // through `ps` for the life of the bridge.
     env: {

@@ -680,7 +680,7 @@ public struct Instance: Codable, Hashable, Identifiable, Sendable {
             return name
         }
         switch driverKind {
-        case "dsh", "dshAgent": return "DeepSeek Harness"
+        case "dsh", "dshAgent": return "Clutch"
         case "mcode", "mcodeAgent": return "MiniMax Code"
         case "deepseek", "deepseekAgent": return "DeepSeek"
         case "claude", "claudeAgent": return "Claude"
