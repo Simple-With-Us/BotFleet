@@ -5,7 +5,15 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
 import { redactSecretsInText } from "../shared/redact.ts";
+
+export const McpRequestSchema = z.object({
+  jsonrpc: z.string().optional(),
+  id: z.union([z.string(), z.number(), z.null()]).optional(),
+  method: z.string(),
+  params: z.unknown().optional(),
+}).passthrough();
 
 const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
@@ -119,23 +127,37 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
-    let body = "";
-    let tooLarge = false;
+    // Buffer chunks and decode once: concatenating per-chunk strings
+    // corrupts multi-byte UTF-8 sequences that split across TCP chunks.
+    const chunks: Buffer[] = [];
     let received = 0;
+    let tooLarge = false;
     req.on("data", (chunk: Buffer) => {
       if (tooLarge) return;
       received += chunk.length;
       if (received > MAX_BODY_BYTES) {
         tooLarge = true;
-        body = "";
+        chunks.length = 0;
         req.resume();
         reject(new Error("Payload too large"));
         return;
       }
-      body += chunk;
+      chunks.push(chunk);
     });
     req.on("end", () => {
-      if (!tooLarge) resolve(body);
+      if (!tooLarge) {
+        try {
+          const raw = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const parsed = McpRequestSchema.safeParse(raw);
+          if (!parsed.success) {
+            reject(parsed.error);
+            return;
+          }
+          resolve(JSON.stringify(parsed.data));
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      }
     });
     req.on("error", reject);
   });
@@ -260,6 +282,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     try {
       rawBody = await readBody(req);
     } catch (err) {
+      res.setHeader("Connection", "close");
       res.once("finish", () => req.destroy());
       sendJson(res, 400, {
         jsonrpc: "2.0",

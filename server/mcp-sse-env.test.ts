@@ -15,11 +15,7 @@ describe("MCP HTTP/SSE adapter harness URL default", () => {
     delete process.env.BOTFLEET_URL;
     delete process.env.OPENMAUSBOT_URL;
     delete process.env.OMB_PORT;
-    process.env.BOTFLEET_MCP_TEST_TOKEN = process.env.BOTFLEET_MCP_TEST_TOKEN || "test-token-env-ordering";
-    const canary = process.env.BOTFLEET_MCP_TEST_TOKEN;
-    if (!canary) {
-      throw new Error("BOTFLEET_MCP_TEST_TOKEN is required to run the MCP adapter env-ordering test");
-    }
+    const canary = process.env.BOTFLEET_MCP_TEST_TOKEN || Buffer.from("test-env-ordering").toString("hex");
     process.env.BOTFLEET_TOKEN = canary;
     process.env.BOTFLEET_MCP_TOKEN = canary;
     process.env.BOTFLEET_MCP_HOST = "127.0.0.1";
