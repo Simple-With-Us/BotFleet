@@ -2,7 +2,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const OPEN = new Set(["open", "in_progress"]);
-const REPO = "jaywedgeworth22/BotFleet";
+const REPO = "Simple-With-Us/BotFleet";
 const plain = (value) => String(value ?? "").replace(/\b[a-z][a-z0-9+.-]*:\S+/gi, "[link]").replace(/[\r\n]+/g, " ");
 const normalized = (value) => plain(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const summary = (row) => ({ id: row.id, title: plain(row.title), status: row.status, sourceKind: row.source_kind, owner: row.addressed_by || row.reported_by || null });
@@ -39,7 +39,7 @@ export function auditEffortBoard({ board, issues, mergedPullRequests, deployment
     if (row.source_kind !== "effort-row" && !issueLinks.length && !String(row.external_uid ?? "").startsWith(`issue-${REPO}-`)) {
       findings.push({ kind: "missing-canonical-issue-link", ...summary(row) });
     }
-    const prNumbers = [...text.matchAll(/https?:\/\/github\.com\/jaywedgeworth22\/BotFleet\/pull\/(\d+)/gi)].map((match) => Number(match[1]));
+    const prNumbers = [...text.matchAll(/https?:\/\/github\.com\/(?:jaywedgeworth22|Simple-With-Us)\/BotFleet\/pull\/(\d+)/gi)].map((match) => Number(match[1]));
     for (const list of text.matchAll(/\bPRs?\s*(#\d+(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*[&/]\s*)#\d+|\s*[-–—]\s*#?\d+)*)/gi)) {
       for (const reference of list[1].matchAll(/#(\d+)(?:\s*[-–—]\s*#?(\d+))?/g)) {
         const first = Number(reference[1]);

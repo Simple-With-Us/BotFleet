@@ -1,11 +1,11 @@
 {
   "site": {
     "testflightUrl": "https://testflight.apple.com/join/ER6sPNMh",
-    "repo": "https://github.com/jaywedgeworth22/BotFleet",
+    "repo": "https://github.com/Simple-With-Us/BotFleet",
     "upstream": "https://github.com/milind-soni/OpenMausBot",
-    "releases": "https://github.com/jaywedgeworth22/BotFleet/releases",
-    "macDownload": "https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet.dmg",
-    "macDownloadIntel": "https://github.com/jaywedgeworth22/BotFleet/releases/latest/download/BotFleet-intel.dmg"
+    "releases": "https://github.com/Simple-With-Us/BotFleet/releases",
+    "macDownload": "https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet.dmg",
+    "macDownloadIntel": "https://github.com/Simple-With-Us/BotFleet/releases/latest/download/BotFleet-intel.dmg"
   },
   "exampleFleet": ["Builder", "Reviewer", "Scout"],
   "sections": [

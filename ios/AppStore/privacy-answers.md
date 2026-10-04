@@ -51,7 +51,7 @@ production hosted service still match this repository.
   for the submitted build, and treat the replay as collected screen content
   rather than as diagnostics.
 - Privacy policy URL:
-  `https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/ios-privacy.md`
+  `https://github.com/Simple-With-Us/BotFleet/blob/main/docs/ios-privacy.md`
 
 The iOS app does not receive the hosted account's user ID or the computer's
 hosted installation ID. Email sign-in for optional hosted access happens on the

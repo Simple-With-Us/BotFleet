@@ -193,7 +193,7 @@ test("release tags must resolve to the pinned build, including nested annotated 
   const sha = "a".repeat(40);
   const annotation = "b".repeat(40);
   const nested = "c".repeat(40);
-  const identity = { repo: "jaywedgeworth22/BotFleet", tag: `v${VERSION}`, sha };
+  const identity = { repo: "Simple-With-Us/BotFleet", tag: `v${VERSION}`, sha };
   const commit = (value) => ({ status: 200, body: { object: { type: "commit", sha: value } } });
   assert.deepEqual(await verifyReleaseTag({ ...identity, request: async () => commit(sha) }), { exists: true });
   await assert.rejects(verifyReleaseTag({ ...identity, request: async () => commit("d".repeat(40)) }), /different commit/);
@@ -212,7 +212,7 @@ test("release tags must resolve to the pinned build, including nested annotated 
 });
 
 test("only a missing ref permits tag creation; failed queries and broken chains fail closed", async () => {
-  const identity = { repo: "jaywedgeworth22/BotFleet", tag: `v${VERSION}`, sha: "a".repeat(40) };
+  const identity = { repo: "Simple-With-Us/BotFleet", tag: `v${VERSION}`, sha: "a".repeat(40) };
   assert.deepEqual(await verifyReleaseTag({ ...identity, request: async () => ({ status: 404 }) }), { exists: false });
   for (const status of [401, 403, 429, 500]) {
     await assert.rejects(verifyReleaseTag({ ...identity, request: async () => ({ status }) }), /Cannot verify release tag/);

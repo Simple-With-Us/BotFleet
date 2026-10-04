@@ -49,7 +49,7 @@ permissions:
 env:
   # The one and only publish target. Must match electron-builder.yml
   # `publish`, or installed apps check a feed no release ever lands on.
-  RELEASES_REPO: jaywedgeworth22/BotFleet
+  RELEASES_REPO: Simple-With-Us/BotFleet
 
 jobs:
   prepare:

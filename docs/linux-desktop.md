@@ -31,7 +31,7 @@ CUA supply-chain work is tracked in [issue #113](https://github.com/milind-soni/
 ## Download packages
 
 No Ubuntu package has been published yet: the current release on the
-[releases page](https://github.com/jaywedgeworth22/BotFleet/releases) carries macOS builds only.  Once the release
+[releases page](https://github.com/Simple-With-Us/BotFleet/releases) carries macOS builds only.  Once the release
 workflow ships an Ubuntu build, each release will carry:
 
 - a Debian package (`BotFleet-amd64.deb`) — recommended; APT installs its desktop dependencies;
@@ -49,7 +49,7 @@ Requirements for building from source:
 - pnpm 10.33.0 (Corepack can install the version declared by the project)
 
 ```sh
-git clone https://github.com/jaywedgeworth22/BotFleet.git
+git clone https://github.com/Simple-With-Us/BotFleet.git
 cd BotFleet
 corepack enable
 pnpm install --frozen-lockfile
