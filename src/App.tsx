@@ -1,7 +1,8 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
-import { StoreProvider, useStore, type AppSettingsSection } from "@/state/store";
+import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
+import { eligibleTaskApps } from "@/lib/task-app-context";
 import { ERROR_RECOVERY_EVENT, type ErrorRecoveryDetail } from "@/components/ErrorRow";
 import { Onboarding } from "@/components/Onboarding";
 import { emailGateDone, initAnalytics } from "@/lib/analytics";
@@ -40,6 +41,9 @@ const InspectorPanel = lazy(() =>
 );
 const SettingsModal = lazy(() =>
   import("@/components/SettingsModal").then((m) => ({ default: m.SettingsModal })),
+);
+const NewTaskAppDialog = lazy(() =>
+  import("@/components/NewTaskAppDialog").then((m) => ({ default: m.NewTaskAppDialog })),
 );
 const RoutinesPage = lazy(() =>
   import("@/components/RoutinesPage").then((m) => ({ default: m.RoutinesPage })),
@@ -84,6 +88,7 @@ function Shell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
+  const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -173,10 +178,9 @@ function Shell() {
         if (state.selectedId) {
           const targetBot = state.bots.find((b) => b.id === state.selectedId);
           if (targetBot) {
-            dispatch({ type: "newTask", botId: targetBot.id });
+            dispatch({ type: "requestNewTask", botId: targetBot.id });
           }
         }
-        window.dispatchEvent(new CustomEvent("focus-composer"));
       } else if (action === "export-bots") {
         void downloadAllBots().catch(() => {});
       } else if (action === "import-bots") {
@@ -410,6 +414,18 @@ function Shell() {
       {state.appSettingsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <SettingsModal />
+        </Suspense>
+      )}
+      {taskCreationBot && (
+        <Suspense fallback={<PanelFallback />}>
+          <NewTaskAppDialog
+            botName={taskCreationBot.name}
+            apps={eligibleTaskApps(taskCreationBot.id, state.groups)}
+            groupNoun={getRoomTerminology(state.config).singular}
+            busy={Boolean(taskCreationBot.busy)}
+            onChoose={(appRef) => dispatch({ type: "newTask", botId: taskCreationBot.id, appRef })}
+            onCancel={() => dispatch({ type: "cancelNewTask" })}
+          />
         </Suspense>
       )}
       {state.pluginsOpen && (
