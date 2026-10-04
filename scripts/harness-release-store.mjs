@@ -86,12 +86,8 @@ export function currentLink(env = process.env) {
 
 /** Is this path a release directory we promoted, as opposed to a live checkout? */
 export async function isReleaseDirectory(path) {
-  try {
-    const manifest = JSON.parse(await readFile(join(path, MANIFEST), "utf8"));
-    return typeof manifest?.commit === "string" && FULL_COMMIT.test(manifest.commit);
-  } catch {
-    return false;
-  }
+  const manifest = await readReleaseManifest(path);
+  return typeof manifest?.commit === "string" && FULL_COMMIT.test(manifest.commit);
 }
 
 /**
@@ -114,13 +110,27 @@ export async function resolveCurrent(env = process.env) {
 export async function currentCommit(env = process.env) {
   const physical = await resolveCurrent(env);
   if (!physical) return null;
-  if (await isReleaseDirectory(physical)) {
-    return JSON.parse(await readFile(join(physical, MANIFEST), "utf8")).commit;
+  // ONE read, guarded.  This used to check the manifest and then read it again,
+  // and a prune landing between the two made the second read throw out of a
+  // function documented to return null — so a caller doing the documented null
+  // check still crashed, on the exact path where a release is being deleted.
+  const manifest = await readReleaseManifest(physical);
+  if (manifest && typeof manifest.commit === "string" && FULL_COMMIT.test(manifest.commit)) {
+    return manifest.commit;
   }
   // A pointer aimed at something that is not a release (a legacy checkout, or a
   // half-built directory) still tells the caller which commit is live, by name.
   const name = physical.split("/").pop();
   return FULL_COMMIT.test(name) ? name : null;
+}
+
+/** Read a release manifest, returning null rather than throwing on anything. */
+async function readReleaseManifest(directory) {
+  try {
+    return JSON.parse(await readFile(join(directory, MANIFEST), "utf8"));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -144,7 +154,14 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
     node: process.version,
     platform: process.platform,
   };
-  await writeFile(join(from, MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o444 });
+  const manifestPath = join(from, MANIFEST);
+  // Remove any leftover first.  A previous attempt may have written the manifest
+  // read-only, and fs.writeFile applies `mode` only when it CREATES a file — so
+  // rewriting one that already exists throws EACCES against our own 0o444, and
+  // a retried promotion would fail with "run chmod manually" on a file this
+  // function wrote seconds earlier.
+  await rm(manifestPath, { force: true });
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o444 });
   await mkdir(releasesRoot(env), { recursive: true, mode: 0o755 });
   try {
     await renameImpl(from, to);
@@ -201,16 +218,49 @@ export async function swapCurrent({ commit, env = process.env } = {}) {
   return { activated: target, previous, atomic };
 }
 
-/** Every promoted release, oldest first by name (commit SHAs sort by time). */
+/**
+ * Every promoted release, OLDEST FIRST BY WHEN IT WAS PROMOTED.
+ *
+ * Not by commit SHA.  A SHA contains no time information, and lexicographic
+ * order is only chronological when commits happen to be created in ascending
+ * order — which is not a property, it is a coincidence.  Promote `bbbb…` and
+ * then `aaaa…` and a name-sorted list puts `aaaa…` FIRST, so a retention policy
+ * keeping the most recent N would delete the NEWER release and retain the stale
+ * one.  That is a rollback target that is not a rollback target.
+ *
+ * `promotedAt` in the manifest is the real ordering key.  A directory whose
+ * manifest cannot be read falls back to its mtime, and then to the name, so an
+ * unreadable release sorts predictably instead of vanishing from the list.
+ */
 export async function listReleases(env = process.env) {
+  let entries;
   try {
-    const names = await readdir(releasesRoot(env), { withFileTypes: true });
-    return names
-      .filter((entry) => entry.isDirectory() && FULL_COMMIT.test(entry.name))
-      .map((entry) => entry.name)
-      .sort();
+    entries = await readdir(releasesRoot(env), { withFileTypes: true });
   } catch {
     return [];
+  }
+  const releases = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !FULL_COMMIT.test(entry.name)) continue;
+    const path = join(releasesRoot(env), entry.name);
+    const promotedAt = await promotedAtOf(path);
+    releases.push({ commit: entry.name, promotedAt });
+  }
+  return releases.sort((a, b) => a.promotedAt - b.promotedAt || a.commit.localeCompare(b.commit)).map((r) => r.commit);
+}
+
+async function promotedAtOf(path) {
+  try {
+    const manifest = JSON.parse(await readFile(join(path, MANIFEST), "utf8"));
+    const when = Date.parse(manifest?.promotedAt ?? "");
+    if (Number.isFinite(when)) return when;
+  } catch {
+    // fall through to the filesystem
+  }
+  try {
+    return (await import("node:fs/promises")).stat(path).then((s) => s.mtimeMs);
+  } catch {
+    return 0;
   }
 }
 
@@ -245,7 +295,7 @@ export async function isHeld(directory, { timeoutMs = 25_000 } = {}) {
     // as a numeric code and a failure to execute as a string like ENOENT, or as
     // killed/signal on a timeout.
     stdout = String(error?.stdout || "");
-    ranToCompletion = typeof error?.code === "number";
+    ranToCompletion = Number.isInteger(error?.code);
   }
   if (/(^|\n)p\d+/.test(stdout)) return true; // something is holding files here
   // lsof on an empty or untouched directory exits 1 with no output at all, so
@@ -264,7 +314,7 @@ export async function isHeld(directory, { timeoutMs = 25_000 } = {}) {
  * wasted disk at worst — but the same mistake aimed the other way is an outage,
  * and that is not a trade this makes.
  */
-export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = isHeld } = {}) {
+export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = isHeld, onRemove } = {}) {
   const live = await currentCommit(env);
   const releases = await listReleases(env);
   const candidates = releases.filter((commit) => commit !== live);
@@ -289,6 +339,7 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
     }
     await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     removed.push(commit);
+    onRemove?.(commit);
   }
   return { removed, kept, live };
 }
