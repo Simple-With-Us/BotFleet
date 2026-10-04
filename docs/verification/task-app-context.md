@@ -48,6 +48,14 @@ pnpm exec playwright test tests/e2e/task-app-context.spec.ts
 
 The browser fixture intercepts every `/api/**` request, including a catch-all, and supplies temporary in-memory App/task records.  It covers App eligibility, canonical server snapshots, changed defaults, removed Apps, unassigned creation, busy and Simple modes, and repeated native-menu focus.  Screenshots are written to Playwright test output and retained by the hosted E2E workflow for desktop, narrow-screen, and chooser inspection.  The fixture never contacts the running harness.  Narrow checks retain a strict document-width assertion and verify header-control bounds at 320px and 390px with a busy bot and long name; header actions wrap instead of escaping the screen.  Failure artifacts retain the narrow screenshot and element geometry for diagnosis.
 
-## Remaining Milestone Work
+## Delivery Evidence
+
+The binding milestone is complete.  PR #820 (task-folder snapshot), PR #822 (backend App context), and PR #824 (client App choice and saved-folder display) are merged; PR #824 squash commit is `041dcaae0b2a0ad51fa473c8b6ec0152e8b17610`.
+
+Final full hosted CI passed on macOS, Windows, and Ubuntu, along with the other protected jobs, at tested head `45ff47b66cc46ebeb3a82c02e8138522dc383da3`: [run 37172121805](https://github.com/Simple-With-Us/BotFleet/actions/runs/37172121805).  The hosted E2E run passed all 30 cases: [run 37172121816](https://github.com/Simple-With-Us/BotFleet/actions/runs/37172121816).  Five screenshots were reviewed: chooser, desktop, exact-folder at 390px, and busy views at 390px and 320px.
+
+The matrix/thread-attention work and checkout write admission remain separate.  This milestone does not claim deployment.
+
+## Follow-On Work
 
 Future task creation from the matrix must explicitly pass `appRef`; browsing remains a read-only selection.  The creation/display slice alone does not expose a new workspace mode.  Thread attention remains keyed by `threadId`, with unread acknowledgment separate from approvals and errors.  Checkout write admission, resource isolation, and safe parallel work remain separate work before expanded fan-out.  This change creates no worktrees and enables no additional concurrency.
