@@ -81,7 +81,9 @@ async function mockServer(page: Page, options: { eligible?: boolean; busy?: bool
       return route.fulfill({
         status: 200,
         contentType: 'text/event-stream',
-        body: 'retry: 30000\n\ndata: {"kind":"hello","resumed":true}\n\n',
+        // A new browser fixture has no resumable event cursor.  The app must
+        // load its REST snapshot before the bot row can be selected.
+        body: 'retry: 30000\n\ndata: {"kind":"hello","resumed":false}\n\n',
       });
     }
     if (pathname === '/api/bots' && method === 'GET') {
@@ -138,7 +140,9 @@ async function mockServer(page: Page, options: { eligible?: boolean; busy?: bool
 async function openBot(page: Page, expectNewButton = true) {
   await page.addInitScript(() => localStorage.setItem('omb-email-gate', 'skipped'));
   await page.goto('/');
-  await page.getByRole('complementary', { name: 'Bots and Navigation' }).getByText('Atlas', { exact: true }).first().click();
+  const botRow = page.getByRole('complementary', { name: 'Bots and Navigation' }).getByText('Atlas', { exact: true }).first();
+  await expect(botRow).toBeVisible();
+  await botRow.click();
   if (expectNewButton) await expect(page.getByRole('button', { name: 'New Thread' })).toBeVisible();
 }
 
