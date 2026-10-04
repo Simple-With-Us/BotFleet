@@ -425,7 +425,7 @@ async function listArchiveEntries(archivePath) {
  * `unzip` of a sequestered bundle loses the resource fork, and the app would
  * differ from a locally built one in a way no signature check notices.
  */
-export async function materializeBuild({ artifactBytes, commit, destination, manifest, fetchImpl = fetch, env = process.env }) {
+export async function materializeBuild({ artifactBytes, commit, destination, manifest }) {
   const scratch = await mkdtemp(join(tmpdir(), "botfleet-ci-build-"));
   try {
     const wrapper = join(scratch, "artifact.zip");
@@ -545,7 +545,5 @@ export async function downloadBuiltBundle({
     commit,
     destination,
     manifest,
-    fetchImpl,
-    env,
   });
 }
