@@ -15,7 +15,7 @@ import type {
   TurnStartResult,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
-import { stripWorkspaceCredentialEnv } from "../config.ts";
+import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
 import { describeSpawnFailure, execCli, isProbeTimeout, killCliTree, spawnCli } from "../procs.ts";
 
@@ -76,23 +76,19 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
     // binary every provider key and webhook secret the server holds.
     const childEnv = (): Record<string, string | undefined> => {
       const env: Record<string, string | undefined> = {
-        HOME: process.env.HOME,
-        USER: process.env.USER,
-        LOGNAME: process.env.LOGNAME,
-        SHELL: process.env.SHELL,
-        TERM: process.env.TERM,
-        TMPDIR: process.env.TMPDIR,
+        ...process.env,
         ...input.environment,
         PATH: augmentedPath(),
       };
       stripWorkspaceCredentialEnv(env);
+      for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
       return env;
     };
 
     const killThread = (threadId: string): void => {
-      cancelledThreads.add(threadId);
       const child = children.get(threadId);
       if (!child) return;
+      cancelledThreads.add(threadId);
       children.delete(threadId);
       try {
         killCliTree(child);
@@ -209,7 +205,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         } catch (err) {
           const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
           emit({ ...base(), type: "runtime.error", ...failure });
-          settle(false, failure.message);
+          settle(false, "spawn_error");
           return { turnId, dispatched: false };
         }
         try {
@@ -247,7 +243,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         child.on("error", (err) => {
           const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
           emit({ ...base(), type: "runtime.error", ...failure });
-          settle(false, failure.message);
+          settle(false, "spawn_error");
         });
 
         return { turnId };

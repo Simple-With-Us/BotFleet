@@ -89,20 +89,22 @@ describe("CliWrapperDriver turns (real child process)", () => {
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(1);
     expect((done as { ok: boolean }).ok).toBe(false);
-    // ENOENT is a setup problem, and the product already has words for it.
-    expect((done as { stopReason?: string }).stopReason).toContain("PATH");
+    expect((done as { stopReason?: string }).stopReason).toBe("spawn_error");
+    const runtimeError = recorder.events.find((e) => e.type === "runtime.error");
+    expect((runtimeError as { message: string }).message).toContain("PATH");
   });
 
-  it("keeps the harness's workspace credentials out of the child, and passes the approved ones", async () => {
+  it("keeps the harness's workspace and provider credentials out of the child, and passes approved ones", async () => {
     const canary = process.env.CLI_WRAPPER_TEST_CANARY ?? `canary-${Date.now()}`;
     process.env.LINQ_WEBHOOK_SECRET = canary;
+    process.env.ANTHROPIC_API_KEY = canary;
     try {
       await create(
         {
           command: NODE,
           args: [
             "-e",
-            "process.stdout.write(JSON.stringify({leak: process.env.LINQ_WEBHOOK_SECRET ? 'present' : null, ok: process.env.CLI_WRAPPER_OK ?? null}))",
+            "process.stdout.write(JSON.stringify({leak: (process.env.LINQ_WEBHOOK_SECRET || process.env.ANTHROPIC_API_KEY) ? 'present' : null, ok: process.env.CLI_WRAPPER_OK ?? null}))",
           ],
           passPromptAs: "arg",
         },
@@ -124,7 +126,18 @@ describe("CliWrapperDriver turns (real child process)", () => {
       expect(out).not.toContain(canary);
     } finally {
       delete process.env.LINQ_WEBHOOK_SECRET;
+      delete process.env.ANTHROPIC_API_KEY;
     }
+  });
+
+  it("does not mark subsequent turns as interrupted when an idle thread is interrupted", async () => {
+    await create({ command: NODE, args: ["-e", "process.stdout.write('success')"], passPromptAs: "arg" });
+    await instance.adapter.interruptTurn("t1");
+
+    const { turnId } = await instance.adapter.sendTurn(turn("hi"));
+    const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    expect((done as { ok: boolean }).ok).toBe(true);
+    expect((done as { stopReason?: string }).stopReason).toBeUndefined();
   });
 
   it("runs the child in the turn's cwd, not the server's", async () => {
