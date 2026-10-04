@@ -200,10 +200,54 @@ test('choosing an App saves its server snapshot and retains the folder after def
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(unavailable).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
-  const narrowScreenshot = testInfo.outputPath('task-app-context-narrow.png');
-  await page.screenshot({ path: narrowScreenshot, fullPage: true });
-  await testInfo.attach('task-app-context-narrow', { path: narrowScreenshot, contentType: 'image/png' });
+  try {
+    await expect.poll(
+      () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),
+      { timeout: 5_000, message: 'The document should not overflow the narrow viewport.' },
+    ).toBe(true);
+  } finally {
+    const narrowScreenshot = testInfo.outputPath('task-app-context-narrow.png');
+    await page.screenshot({ path: narrowScreenshot, fullPage: true });
+    await testInfo.attach('task-app-context-narrow', { path: narrowScreenshot, contentType: 'image/png' });
+    const geometry = await page.evaluate(() => {
+      const viewportWidth = window.innerWidth;
+      const overflowing = Array.from(document.querySelectorAll('*'))
+        .flatMap((element) => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          if (
+            style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 ||
+            rect.width === 0 || rect.height === 0 || rect.right <= viewportWidth + 1
+          ) return [];
+          return [{
+            tag: element.tagName.toLowerCase(),
+            classes: element.getAttribute('class') ?? '',
+            boundingRect: {
+              left: rect.left,
+              right: rect.right,
+              top: rect.top,
+              bottom: rect.bottom,
+              width: rect.width,
+              height: rect.height,
+            },
+          }];
+        })
+        .sort((left, right) => right.boundingRect.right - left.boundingRect.right)
+        .slice(0, 15);
+      return {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        document: {
+          width: document.documentElement.scrollWidth,
+          height: document.documentElement.scrollHeight,
+        },
+        overflowingVisibleElements: overflowing,
+      };
+    });
+    await testInfo.attach('task-app-context-overflow-geometry', {
+      body: JSON.stringify(geometry, null, 2),
+      contentType: 'application/json',
+    });
+  }
   await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
@@ -264,7 +308,10 @@ test('repeated native New Thread actions keep the chooser focused and protect th
   await triggerNativeNewThread(page);
   await expect(dialog).toHaveCount(1);
   await expect(dialog.getByRole('button', { name: 'Unassigned' })).toBeFocused();
-  await page.keyboard.type('should not reach composer');
+  // Space and Enter should activate a focused choice, so keep this probe to letters.
+  await page.keyboard.type('shouldnotreachcomposer');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Unassigned' })).toBeFocused();
   await expect(composer).toHaveValue('draft stays in the old conversation');
   expect(fixture.posts).toHaveLength(0);
 });
