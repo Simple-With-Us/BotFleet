@@ -27,7 +27,7 @@ import {
   outcomeMessage,
 } from "./update-progress.mjs";
 import { validUpdateCredentialReceipt } from "../electron/update-credential-preparation.mjs";
-import { KNOWN_STAGE_ENTRIES, stageIsPrunable } from "./stage-entries.mjs";
+import { stageIsPrunable } from "./stage-entries.mjs";
 import {
   downloadBuiltBundle,
   ResolutionError,
@@ -965,6 +965,9 @@ const SMOKE_BOOT_ATTEMPTS = 2;
 const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
 const SMOKE_HEALTH_REQUEST_TIMEOUT_MS = 3_000;
 const SMOKE_OUTPUT_EXCERPT = 2_000;
+// What we hold, versus what we show.  Generous enough to keep a full stack trace
+// and a boot log, small enough that two failed attempts cannot exhaust memory.
+const SMOKE_OUTPUT_CAPTURE = 256 * 1024;
 
 export function smokeTestEnabled(env = process.env) {
   const value = (env.BOTFLEET_UPDATE_SMOKE ?? "").trim().toLowerCase();
@@ -1228,9 +1231,17 @@ export async function smokeStagedServer({ bundlePath, targetCommit, attempt, scr
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  // Bounded, because only the tail is ever rendered (SMOKE_OUTPUT_EXCERPT) and a
+  // candidate stuck in a crash loop — precisely the case this gate exists to
+  // diagnose — would otherwise append to this for two full boot windows and get
+  // the updater OOM-killed by the thing it was diagnosing.  Keep the tail: that
+  // is the part that names the failure.
   let output = "";
-  child.stdout.on("data", (chunk) => (output += chunk));
-  child.stderr.on("data", (chunk) => (output += chunk));
+  const capture = (chunk) => {
+    output = (output + chunk).slice(-SMOKE_OUTPUT_CAPTURE);
+  };
+  child.stdout.on("data", capture);
+  child.stderr.on("data", capture);
 
   try {
     const deadline = Date.now() + SMOKE_BOOT_TIMEOUT_MS;
@@ -2135,6 +2146,17 @@ function createOperations(config) {
       const copiedIdentity = await validateBuiltBundle(bundlePath, targetCommit);
       if (copiedIdentity.designatedRequirement !== identity.designatedRequirement) {
         throw new Error("Staged copy changed the BotFleet signing requirement");
+      }
+      // The download unpacked into <stage>/hosted and the app was just copied out
+      // of it, so that directory is now a second full copy of the bundle sitting
+      // in the stage.  A stage holding prepared.json is never prunable — it is a
+      // build a later `apply` can still install — so leaving it there means every
+      // prepared stage, which is the normal state between two updates, holds a
+      // duplicate of the app for as long as it exists.  Removed only after the
+      // copy has been validated, so a failure still leaves it for diagnosis.
+      const hostedScratch = join(source.stageDirectory, "hosted");
+      if (resolve(hostedScratch) !== resolve(bundlePath) && await exists(hostedScratch)) {
+        await rm(hostedScratch, { recursive: true, force: true });
       }
       const dependenciesPath = join(source.stageDirectory, "node_modules");
       const sourceDependencies = source.providedDependencies || join(source.path, "node_modules");

@@ -102,7 +102,7 @@ function resolutionMessage({ cause, commit, status, repository, detail, conclusi
       );
     case "build-failed":
       return (
-        `A hosted build exists for ${sha} but it did not succeed${conclusion ? ` (${conclusion})` : ""}.  ` +
+        `A hosted build exists for ${sha} but it did not succeed${conclusion ? ` (${conclusion === "in_progress" ? "still running" : conclusion})` : ""}.  ` +
         `Re-run it, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.  Note that this ` +
         `workflow cancels superseded builds, so a build cancelled because a newer commit landed on main is expected.`
       );
@@ -147,7 +147,21 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
     error.status = response.status;
     throw error;
   }
-  return response.json();
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    // A 200 with an HTML or truncated body is a real possibility behind a proxy
+    // or during an incident, and a raw SyntaxError would escape classification
+    // entirely: isRecoverableResolutionFailure sees a non-ResolutionError, the
+    // operator is shown "SyntaxError: Unexpected token '<'", and the actual
+    // cause is lost.  Say what happened instead.
+    throw new ResolutionError(
+      `GitHub returned HTTP ${response.status} for ${url} with a body that is not JSON (${error?.message || error})`,
+      "bad-response",
+    );
+  }
+  return body;
 }
 
 async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = DOWNLOAD_TIMEOUT_MS, totalTimeoutMs = DOWNLOAD_TOTAL_TIMEOUT_MS, label }) {
@@ -326,6 +340,84 @@ export function manifestArtifactName(manifest) {
 }
 
 /**
+ * Refuse an archive whose entries would escape the destination.
+ *
+ * The manifest's `artifact` field is a network-supplied FILENAME and is checked
+ * to be a plain basename.  The archive's ENTRY NAMES are the other, larger
+ * untrusted input and were not checked at all: an entry named
+ * `../../../../.ssh/authorized_keys` is the actual Zip Slip vector, and the
+ * basename check says nothing about it.
+ *
+ * `ditto` refuses some of these, but relying on the extractor's behaviour is not
+ * a check — it varies by version, and the failure would be whatever it happens to
+ * do rather than a refusal we chose.  Every entry is therefore resolved against
+ * the destination and rejected if it lands outside, before a single byte is
+ * written.  Absolute paths, `..` segments, and symlink entries are all refused:
+ * a symlink entry is a Zip Slip that survives extraction, because the link is
+ * created in the tree and a LATER entry can then be written through it.
+ */
+export function assertSafeArchiveEntries(entries, { label = "artifact" } = {}) {
+  const unsafe = [];
+  for (const { name, mode } of entries) {
+    const clean = String(name).replace(/\\/g, "/");
+    if (!clean || clean.endsWith("/")) continue; // directory entries carry no payload
+    if (clean.startsWith("/") || /^[A-Za-z]:/.test(clean)) {
+      unsafe.push(`${name} (absolute path)`);
+      continue;
+    }
+    const segments = clean.split("/").filter((part) => part && part !== ".");
+    if (segments.includes("..")) {
+      unsafe.push(`${name} (traverses out of the destination)`);
+      continue;
+    }
+    // A symlink entry is a Zip Slip that survives extraction: the link is created
+    // inside the tree and a LATER entry is then written THROUGH it, so the entry
+    // name can look perfectly innocent.  Type comes from the archive, not from the
+    // name — `__MACOSX/._*` sidecars are legitimate (they carry the resource fork
+    // that --sequesterRsrc exists to preserve) and are ordinary files, so
+    // guessing from the name would refuse every real build.
+    if (String(mode || "").startsWith("l")) {
+      unsafe.push(`${name} (symlink entry)`);
+    }
+  }
+  if (unsafe.length) {
+    throw new ResolutionError(
+      `Hosted ${label} has ${unsafe.length} unsafe archive entr${unsafe.length === 1 ? "y" : "ies"}, refusing to extract: ${unsafe.slice(0, 5).join(", ")}`,
+      "unsafe-archive",
+    );
+  }
+  return entries;
+}
+
+async function listArchiveEntries(archivePath) {
+  // `zipinfo -l` lists names AND modes without extracting anything, so a hostile
+  // archive is inspected before it can touch the filesystem.  A machine without
+  // zipinfo cannot answer, which is treated as unsafe rather than as fine.
+  let stdout;
+  try {
+    stdout = await run("zipinfo", ["-l", archivePath], { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+  } catch (error) {
+    throw new ResolutionError(
+      `Could not list the hosted artifact's entries before extracting it (${error?.message || error}); refusing to extract an archive that cannot be inspected`,
+      "unsafe-archive",
+    );
+  }
+  const entries = [];
+  for (const line of String(stdout).split("\n")) {
+    // Mode string, size, version, os, flags, date, time, then the name.
+    const match = line.match(/^([-dlbcps][-rwxSsTt]{9})\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$/);
+    if (match) entries.push({ name: match[2].trim(), mode: match[1] });
+  }
+  if (entries.length === 0) {
+    throw new ResolutionError(
+      `Could not parse the hosted artifact's entry list, so its names cannot be checked; refusing to extract it`,
+      "unsafe-archive",
+    );
+  }
+  return entries;
+}
+
+/**
  * Unpack the artifact zip, verify it, and leave a real `.app` directory.
  *
  * The outer zip is GitHub's artifact wrapper; the inner one is the bundle the
@@ -343,11 +435,18 @@ export async function materializeBuild({ artifactBytes, commit, destination, man
     const appPath = join(destination, "BotFleet.app");
     await writeFile(wrapper, artifactBytes, { mode: 0o600 });
     await mkdir(destination, { recursive: true, mode: 0o700 });
+    // Inspect the archive's own entry names before extracting either of them.
+    // `manifestArtifactName` checks the network-supplied FILENAME, which is one
+    // untrusted input; the entry names are the other and larger one, and an
+    // entry called ../../.ssh/authorized_keys is the actual Zip Slip vector.
+    assertSafeArchiveEntries(await listArchiveEntries(wrapper), { label: "artifact" });
     // -j matters: GitHub nests every artifact entry inside a directory named
     // after the artifact, so without it the bundle lands one level down and
     // this lookup silently misses.
     await run("unzip", ["-q", "-j", "-o", wrapper, "-d", scratch]);
     const verified = verifyManifest(manifest, { commit, bytes: await readFile(inner) });
+    // And again for the bundle, which is the archive that becomes an app here.
+    assertSafeArchiveEntries(await listArchiveEntries(inner), { label: "app bundle" });
     // Unpack fresh: a leftover directory from a previous attempt would let
     // `ditto` merge into stale files instead of replacing them.
     await rm(appPath, { recursive: true, force: true });
@@ -392,8 +491,13 @@ export async function downloadBuiltBundle({
     // here, not a failure.
     const attempted = anyRunForCommit(runs, commit);
     if (attempted) {
+      // The raw workflow status, NOT a prettified label: isRecoverableResolutionFailure
+      // compares this against ["cancelled", "in_progress"], and it previously
+      // received "still running" instead, so the still-running branch was dead
+      // code and a hosted build that had not finished yet blocked the update
+      // outright under `auto` — the one transient case that most needs patience.
       const conclusion = attempted.status === "in_progress"
-        ? "still running"
+        ? "in_progress"
         : attempted.conclusion || "unknown";
       const failure = new ResolutionError(
         resolutionMessage({ cause: "build-failed", commit, conclusion, repository }),
@@ -428,6 +532,7 @@ export async function downloadBuiltBundle({
   try {
     const wrapper = join(scratch, "artifact.zip");
     await writeFile(wrapper, bytes, { mode: 0o600 });
+    assertSafeArchiveEntries(await listArchiveEntries(wrapper), { label: "artifact" });
     await run("unzip", ["-q", "-j", "-o", wrapper, "build-manifest.json", "-d", scratch]);
     manifest = JSON.parse(await readFile(join(scratch, "build-manifest.json"), "utf8"));
   } catch (error) {

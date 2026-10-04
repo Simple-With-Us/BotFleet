@@ -9,6 +9,7 @@ import test from "node:test";
 
 import {
   artifactNameFor,
+  assertSafeArchiveEntries,
   classifyResolutionFailure,
   downloadBuiltBundle,
   findCommitArtifact,
@@ -264,6 +265,43 @@ test("a manifest artifact name is reduced to a basename before it becomes a path
     );
   }
   assert.ok(verifyManifest(manifest, { commit: COMMIT, bytes }).artifact === "BotFleet-mac-arm64.zip");
+});
+
+test("an archive whose entries would escape the destination is refused", () => {
+  // The manifest's `artifact` FILENAME is checked to be a basename, but that
+  // says nothing about the archive's own entry names — and an entry called
+  // ../../.ssh/authorized_keys is the actual Zip Slip vector.  Judging type
+  // from the archive rather than the name matters too: `__MACOSX/._*` sidecars
+  // are legitimate (they carry the resource fork --sequesterRsrc exists to
+  // preserve) and are ordinary files, so a name-based rule would refuse every
+  // real build.
+  const entry = (name, mode = "-rw-r--r--") => ({ name, mode });
+  const directory = (name) => entry(name, "drwxr-xr-x");
+
+  // A genuine app bundle, sidecars and all, is fine.
+  assert.doesNotThrow(() => assertSafeArchiveEntries([
+    directory("BotFleet.app/"),
+    directory("__MACOSX/"),
+    entry("BotFleet.app/Contents/MacOS/BotFleet"),
+    entry("__MACOSX/BotFleet.app/._BotFleet"),
+  ], { label: "app bundle" }));
+
+  for (const [name, why] of [
+    ["../../../../.ssh/authorized_keys", "traverses out of the destination"],
+    ["BotFleet.app/../../escape", "traverses out of the destination"],
+    ["/etc/authorized_keys", "absolute path"],
+    ["BotFleet.app/Contents/link", "symlink entry"],
+  ]) {
+    const mode = why === "symlink entry" ? "lrwxrwxrwx" : "-rw-r--r--";
+    assert.throws(
+      () => assertSafeArchiveEntries([entry(name, mode)], { label: "app bundle" }),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive");
+        assert.match(error.message, new RegExp(why), `"${name}" must be refused as ${why}`);
+        return true;
+      },
+    );
+  }
 });
 
 test("materialising a verified build produces a real app directory", async (t) => {
