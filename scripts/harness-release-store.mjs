@@ -172,13 +172,33 @@ export async function swapCurrent({ commit, env = process.env } = {}) {
   const previous = await resolveCurrent(env);
   const scratch = await mkdtemp(join(storeRoot(env), ".current-"));
   const staged = join(scratch, CURRENT);
+  // "dir" matters on Windows: without a type, Node infers one from the target,
+  // and since the target is a directory it creates a JUNCTION — which Windows
+  // then refuses to rename over, because a junction is a directory for
+  // MoveFileEx purposes.  That is the whole reason the atomic form appeared to
+  // be broken there rather than merely unsupported.
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  let atomic = true;
   try {
-    await symlink(target, staged);
-    await rename(staged, link);
+    await symlink(target, staged, linkType);
+    try {
+      await rename(staged, link);
+    } catch (error) {
+      // rename-over-an-existing-link is POSIX.  Where it is not available,
+      // remove the pointer first and say so, rather than crashing: a
+      // non-atomic swap can leave `current` missing for an instant, which is
+      // why the caller is told and the previous release is returned so it can be
+      // restored.  On macOS — the only platform that runs this — the primary
+      // path is the atomic one and this is never reached.
+      if (!["EPERM", "EACCES", "ENOTEMPTY", "EEXIST"].includes(error?.code)) throw error;
+      atomic = false;
+      await rm(link, { recursive: true, force: true });
+      await rename(staged, link);
+    }
   } finally {
     await rm(scratch, { recursive: true, force: true }).catch(() => {});
   }
-  return { activated: target, previous };
+  return { activated: target, previous, atomic };
 }
 
 /** Every promoted release, oldest first by name (commit SHAs sort by time). */

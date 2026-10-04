@@ -267,3 +267,28 @@ test("pruning leaves a young release alone", async (t) => {
   assert.deepEqual(result.kept.map((k) => k.reason), ["too-young"]);
   assert.deepEqual(await listReleases(env), [A, B]);
 });
+
+test("the swap reports whether it was atomic, and is atomic where the platform allows", async (t) => {
+  // Windows creates a JUNCTION for a directory symlink when no type is given,
+  // and a junction cannot be renamed over — which made the atomic form look
+  // broken there rather than unsupported.  CI caught it as an EPERM.  So the
+  // type is now explicit and, where rename-over is unavailable, the pointer is
+  // removed first and the caller is told the swap was not atomic.  A caller
+  // that needs to know can act on it; one that does not still works.
+  const { env } = await store(t);
+  for (const commit of [A, B]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env });
+  }
+
+  const first = await swapCurrent({ commit: A, env });
+  assert.equal(typeof first.atomic, "boolean", "every swap must report its atomicity");
+  if (process.platform !== "win32") {
+    assert.equal(first.atomic, true, "the atomic path is the one macOS and Linux take");
+    const second = await swapCurrent({ commit: B, env });
+    assert.equal(second.atomic, true, "and it must stay atomic on every swap, not just the first");
+  }
+  // Whatever the platform did, the pointer ends up on the requested release.
+  assert.equal(await currentCommit(env), B);
+  assert.equal(await realpath(currentLink(env)), await realpath(releasePath(B, env)));
+});
