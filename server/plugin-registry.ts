@@ -141,7 +141,6 @@ export function listingFor(name: string, baseDir: string = PLUGINS_DIR): PluginL
 
   let manifestValue: unknown;
   try {
-    // SAFETY: JSON.parse returns a JSON-compatible value; parsePluginManifest accepts unknown at its boundary, so the cast downcasts to the parser's documented input type.
     manifestValue = JSON.parse(readFileSync(manifestPath, "utf8"));
   } catch (error) {
     // SAFETY: JSON.parse only throws SyntaxError with a `message` property; every catch on readFileSync catches an Error or SystemError with `message`.
@@ -149,6 +148,7 @@ export function listingFor(name: string, baseDir: string = PLUGINS_DIR): PluginL
     return { error: `plugin "${name}" manifest is unreadable: ${detail}` };
   }
 
+  // SAFETY: JSON.parse returns a JSON-compatible value (string, number, boolean, null, array, or plain object); JsonValue is the closed union of those shapes, so the cast downcasts to the parser's documented input type.
   const parsed = parsePluginManifest(manifestValue as JsonValue);
   if (!parsed.ok) {
     return {

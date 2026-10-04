@@ -264,6 +264,7 @@ export function parsePluginManifestJson(text: string): PluginManifestParseResult
       ],
     };
   }
+  // SAFETY: JSON.parse returns a JSON-compatible value (string, number, boolean, null, array, or plain object); JsonValue is the closed union of those shapes, so the cast downcasts to the parser's documented input type.
   return parsePluginManifest(value as JsonValue);
 }
 

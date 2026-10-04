@@ -128,9 +128,10 @@ function isRecordLikeObject(value: unknown): value is PluginHostRecordLike {
  *  against tampering). */
 // oxlint-disable-next-line anti-slop/no-unknown-parameters
 export function isPluginHost(value: unknown): value is PluginHost {
+  // SAFETY: isPlainObject accepts a PluginHostRecordLike and returns true only when the input is a plain record; the cast gives TypeScript that input shape so the predicate can compile.
   if (!isPlainObject(value as PluginHostRecordLike)) return false;
-  // SAFETY: isPlainObject narrowed value to PluginHostRecordLike; index access on a Record<PropertyKey, unknown> is allowed by the index signature.
-  return (value as Record<PropertyKey, unknown>)[NONCE] === true;
+  // SAFETY: isPlainObject narrowed value to PluginHostRecordLike; NONCE is a known symbol key on that Record<PropertyKey, PluginHostJsonValue>, so the index access is well-typed.
+  return (value as PluginHostRecordLike)[NONCE] === true;
 }
 
 /** Load one plugin module.  Returns the imported module + the listing

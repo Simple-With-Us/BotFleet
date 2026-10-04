@@ -22,7 +22,7 @@ import {
   _resetForTests,
 } from "./plugins.ts";
 import { clearPluginsDir, readRegistry, setPluginEntry } from "./plugin-registry.ts";
-import { satisfiesBotfleetVersion, HOST_API_VERSION } from "../shared/plugin-manifest.ts";
+import { satisfiesBotfleetVersion, HOST_API_VERSION, type PluginManifest } from "../shared/plugin-manifest.ts";
 
 const FIXTURE = join(process.cwd(), "tests", "fixtures", "example-plugin");
 
@@ -210,10 +210,13 @@ describe("host API version gate", () => {
     // SAFETY: this test mutates the on-disk registry entry it just wrote;
     // the next line restores it so the test never leaves stale state on disk.
     setPluginEntry({ ...entry, enabled: false }, baseDir);
+    const manifestPath = join(baseDir, "fleet-overview", "botfleet-plugin.json");
+    // SAFETY: this test mutates the on-disk manifest it just wrote; the fixture is the canonical example-plugin and ParsePluginManifest validates every field against the PluginManifest schema, so the cast to PluginManifest downcasts to the schema's documented shape.
+    const manifestRaw = JSON.parse(readFileSync(manifestPath, "utf8")) as PluginManifest;
     writeFileSync(
-      join(baseDir, "fleet-overview", "botfleet-plugin.json"),
+      manifestPath,
       JSON.stringify({
-        ...JSON.parse(readFileSync(join(baseDir, "fleet-overview", "botfleet-plugin.json"), "utf8")) as Record<string, unknown>,
+        ...manifestRaw,
         botfleet: ">=2",
       }),
     );

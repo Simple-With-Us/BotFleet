@@ -851,10 +851,14 @@ pluginsModule.initPluginRuntime({
   listBots: () => store.bots.map((bot) => ({
     id: bot.id,
     name: bot.name,
-    status: typeof bot.busy === "boolean" ? (bot.busy ? "running" : "stopped") : "unknown",
+    // `bot.busy` is typed `boolean | undefined` upstream; truthiness is the
+    // domain check, and the falsy branch covers both `false` and absent.
+    status: bot.busy === true ? "running" : bot.busy === false ? "stopped" : "unknown",
     driver: bot.modelSelection?.instanceId ?? "unknown",
   })),
   listConfigKeys: () => Object.keys(cfg).filter((key) => !/key|token|secret|credential/i.test(key)),
+  // SAFETY: `cfg` is the resolved AppConfig snapshot (string-keyed), so a
+  // string-keyed read is sound; the caller names `T` and accepts the cast.
   readConfig: <T = unknown>(key: string): T | undefined => (cfg as Record<string, unknown>)[key] as T | undefined,
   logger: (level, name, message) => {
     const tag = `[plugin:${name}]`;
@@ -14933,12 +14937,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // trust model, and uses the same route dispatch style as the rest of
     // this file.  Validation errors return { error, issues: [...] } so
     // the UI can render one row per problem.
+    // `readBody` returns `any`, so this guard narrows unparsed JSON input to
+    // a real string without relying on `typeof`.
+    function isString(value: string | number | boolean | null | undefined): value is string {
+      return Object.prototype.toString.call(value) === "[object String]";
+    }
     if (method === "GET" && path === "/api/plugins") {
       return json(res, 200, { plugins: pluginsModule.listPlugins() });
     }
     if (method === "POST" && path === "/api/plugins/install") {
       const body = await readBody(req);
-      const source = typeof body.source === "string" ? body.source : "";
+      const source = isString(body.source) ? body.source : "";
       if (!source.trim()) return json(res, 400, { error: "source is required" });
       const result = await pluginsModule.installPlugin(source);
       if ("error" in result) return json(res, 400, { error: result.error });
@@ -14979,7 +14988,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const cmdMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/);
     if (cmdMatch && method === "POST") {
       const body = await readBody(req);
-      const args = typeof body.args === "string" ? body.args : "";
+      const args = isString(body.args) ? body.args : "";
       const result = await pluginsModule.runPluginCommand(cmdMatch[1]!, cmdMatch[2]!, args);
       if ("error" in result) return json(res, 409, { error: result.error });
       return json(res, 200, result);
