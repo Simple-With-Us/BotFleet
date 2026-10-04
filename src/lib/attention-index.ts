@@ -1,8 +1,18 @@
 /**
- * Per-Room Attention Index
+ * Room Attention Index (Aggregation of Bot-Global Activity)
  *
  * Implements the typed attention index specified in
  * docs/architecture/per-room-attention-index.md.
+ *
+ * Note on Scope:
+ * Each bot currently has a single global activity state (server/store.ts).
+ * This module computes a per-room AGGREGATION of bot-global states for
+ * bots explicitly assigned to each room via `group.memberIds`.
+ * Per-(bot, room) activity tracking remains a planned future enhancement (#815).
+ *
+ * Invariants:
+ * - Room membership is strictly determined by explicit `group.memberIds`.
+ * - Do not infer membership from mutable section labels, names, or cwd similarity.
  *
  * Four distinct, un-summed badges per room:
  * - Errors:       durable failures and dead bots.
@@ -88,13 +98,9 @@ export function computeRoomAttentionIndex(
   return groups
     .filter((g) => !g.dm)
     .map((group) => {
-      // Find bots assigned explicitly by memberIds or implicitly by matching section
+      // Membership invariant: Strictly use explicit memberIds.
+      // Mutable section labels and cwd similarity must never infer membership.
       const memberSet = new Set<string>(group.memberIds || []);
-      for (const bot of activeBots) {
-        if (bot.section && (bot.section === group.name || bot.section === group.section)) {
-          memberSet.add(bot.id);
-        }
-      }
 
       const assignedBots = Array.from(memberSet)
         .map((id) => botMap.get(id))

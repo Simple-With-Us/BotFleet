@@ -381,6 +381,15 @@ function Shell() {
               setMatrixOverviewActive(false);
               dispatch({ type: "select", id: botId });
             }}
+            onSelectBotInApp={(botId, appId) => {
+              setMatrixOverviewActive(false);
+              setSelectedAppId(appId);
+              const b = state.bots.find(x => x.id === botId);
+              const tasks = b?.tasks ?? [];
+              const explicitTask = tasks.find(t => t.workspaceContext?.appRef === appId);
+              const threadId = explicitTask?.threadId ?? b?.threadId;
+              dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+            }}
             onSelectGroupChat={(groupId) => {
               setMatrixOverviewActive(false);
               dispatch({ type: "select", id: groupId });
@@ -400,6 +409,25 @@ function Shell() {
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
                   dispatch({ type: "select", id: botId });
+                }}
+                onSelectBotInApp={(botId, appId) => {
+                  setMatrixOverviewActive(false);
+                  // Remember the app we were viewing, so AppDeck shows it
+                  setSelectedAppId(appId);
+                  
+                  // Find the bot's thread for this app
+                  const bot = state.bots.find(b => b.id === botId);
+                  const tasks = bot?.tasks ?? [];
+                  const explicitTask = tasks.find(t => t.workspaceContext?.appRef === appId);
+                  // If no specific thread exists yet, we just fall back to bot's active thread or a new selection state.
+                  // But `viewedThreadId` will hold the explicitly chosen thread.
+                  const threadId = explicitTask?.threadId ?? bot?.threadId;
+
+                  dispatch({
+                    type: "select",
+                    id: botId,
+                    viewedThreadId: threadId
+                  });
                 }}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
@@ -434,7 +462,7 @@ function Shell() {
           ) : group ? (
             <GroupView key={group.id} group={group} />
           ) : bot ? (
-            <ChatView key={bot.id} bot={bot} />
+            <ChatView key={bot.id} bot={bot} explicitThreadId={state.viewedThreadId || undefined} />
           ) : (
             <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
               <Loader2 size={20} className="animate-spin" />

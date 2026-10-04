@@ -1193,7 +1193,8 @@ function formatHoverTime(at: number) {
   return `${date.getMonth() + 1}/${date.getDate()} ${timeStr}`;
 }
 
-export function ChatView({ bot }: { bot: Bot }) {
+export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
+  const bot = explicitThreadId && explicitThreadId !== originalBot.threadId ? { ...originalBot, threadId: explicitThreadId } : originalBot;
   const { state, dispatch } = useStore();
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
