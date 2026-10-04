@@ -39,10 +39,13 @@ import {
   signalProcess,
   smokeFailureMessage,
   smokeTestEnabled,
+  swapDependencyTree,
   stableApplicationProcessError,
   startedHarnessLabel,
   swapPreparedFiles,
   terminateVerified,
+  updatesApp,
+  updatesServer,
   validateBuiltBundle,
   waitForLaunchdBootout,
 } from "./update-botfleet-mac.mjs";
@@ -76,6 +79,7 @@ test("prepare and apply expose an explicit reusable stage", () => {
       bundle: undefined,
       dependencies: undefined,
       openApplication: true,
+      components: "both",
       progress: undefined,
       runId: undefined,
     },
@@ -88,6 +92,7 @@ test("prepare and apply expose an explicit reusable stage", () => {
     bundle: undefined,
     dependencies: undefined,
     openApplication: false,
+    components: "both",
     progress: undefined,
     runId: undefined,
   });
@@ -1966,4 +1971,59 @@ test("a probe-reported cause wins over the busy-host default", async () => {
     /owner record naming a different process/,
   );
   assert.equal(calls, 1, "a real defect must not be retried as a slow host");
+});
+
+// --- Component selection (Recommendation 3) -----------------------------------
+//
+// The whole point of --components server is that a harness update leaves the
+// desktop app alone.  These cases pin which halves each step owns, because the
+// coupling was spread across five separate operations and none of them was
+// individually obviously wrong.
+test("a run owns the app or the server, and both is the historical default", () => {
+  assert.equal(updatesApp({}), true, "an empty parse means the default, which installs both");
+  assert.equal(updatesServer({}), true);
+  assert.equal(updatesApp({ components: "both" }), true);
+  assert.equal(updatesApp({ components: "server" }), false);
+  assert.equal(updatesServer({ components: "server" }), true);
+  assert.equal(updatesApp({ components: "app" }), true);
+  assert.equal(updatesServer({ components: "app" }), false);
+});
+
+test("--components is validated, and app-only is refused without a staged import", () => {
+  assert.equal(parseArguments(["update"]).components, "both");
+  assert.equal(parseArguments(["update", "--components", "server"]).components, "server");
+  assert.equal(parseArguments(["update", "--components=server"]).components, "server");
+  assert.equal(parseArguments(["update", "--server-only"]).components, "server");
+  // A typo must not silently install everything.
+  assert.throws(() => parseArguments(["update", "--components", "srv"]), /--components must be one of/);
+  // The app bundles its own server, so an app-only update without an import
+  // would leave the UI and the harness on different builds with nothing
+  // saying so.
+  assert.throws(() => parseArguments(["update", "--components", "app"]), /only supported for a staged import/);
+  assert.doesNotThrow(() => parseArguments(["update", "--components", "app", "--source", "/stage/source"]));
+  // unquiesce takes no options at all, and that must not change.
+  assert.throws(() => parseArguments(["unquiesce", "--components", "server"]), /unquiesce accepts no options/);
+});
+
+test("a server-only swap moves the dependency tree and never renames the bundle", async (t) => {
+  const paths = await swapFixture(t);
+  const progress = {};
+  await swapDependencyTree({ ...paths, progress });
+  assert.equal(progress.rollbackDependenciesHold, true, "the prior tree must stay recoverable");
+  assert.equal(await readFile(join(paths.liveDependencies, "marker"), "utf8"), "new-deps");
+  assert.equal(await readFile(join(paths.rollbackDependencies, "marker"), "utf8"), "old-deps");
+  // The bundle is not an input to this function, so a server-only update has
+  // no code path that could rename the app out from under a running UI.
+  assert.equal(await readFile(join(paths.appPath, "marker"), "utf8"), "old-app");
+  assert.equal(await readFile(join(paths.candidateApp, "marker"), "utf8"), "new-app");
+
+  await t.test("a failure restores the prior tree rather than leaving none", async () => {
+    const retry = await swapFixture(t);
+    const failed = {};
+    await assert.rejects(
+      swapDependencyTree({ ...retry, candidateDependencies: join(retry.appPath, "does-not-exist"), progress: failed }),
+    );
+    assert.equal(failed.rollbackDependenciesHold, false, "a false flag would restore the wrong generation");
+    assert.equal(await readFile(join(retry.liveDependencies, "marker"), "utf8"), "old-deps");
+  });
 });

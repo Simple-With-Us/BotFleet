@@ -49,6 +49,11 @@ const EXPECTED_SIGN_IDENTITY = "Developer ID Application: Jay Wedgeworth, LLC (C
 const BUILDER_SIGN_SELECTOR = "Jay Wedgeworth, LLC (CC8UTF7ATG)";
 export const DEFAULT_PORTS = [8799, 18799, 28799];
 const BUILD_MANIFEST_RELATIVE = "Contents/Resources/server/build-identity.json";
+// Which halves of the install a run is allowed to touch.  `both` is the
+// historical behaviour.  `server` updates the harness and its checkout and
+// leaves the desktop app running, so an idle UI is not interrupted by a server
+// concern and a bot turn is not interrupted by a UI relaunch.
+const UPDATE_COMPONENTS = ["both", "server", "app"];
 const GENERATED_PATHS = [
   "electron/resources/BotFleet Recorder.app/Contents/MacOS/recorder-helper",
   "electron/resources/BotFleet Speech.app/Contents/MacOS/speech-helper",
@@ -79,6 +84,7 @@ export function parseArguments(argv) {
     bundle: undefined,
     dependencies: undefined,
     openApplication: true,
+    components: "both",
     progress: undefined,
     runId: undefined,
   };
@@ -92,6 +98,9 @@ export function parseArguments(argv) {
     else if (arg === "--dependencies") parsed.dependencies = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--progress") parsed.progress = resolve(requiredValue(arg, args.shift()));
     else if (arg === "--run-id") parsed.runId = requiredValue(arg, args.shift());
+    else if (arg === "--components") parsed.components = requiredValue(arg, args.shift());
+    else if (arg.startsWith("--components=")) parsed.components = requiredValue("--components", arg.slice("--components=".length));
+    else if (arg === "--server-only") parsed.components = "server";
     else if (arg === "--no-open") parsed.openApplication = false;
     else if (arg === "--force" || arg === "-f") parsed.force = true;
     else if (arg === "--help" || arg === "-h") parsed.help = true;
@@ -99,7 +108,8 @@ export function parseArguments(argv) {
   }
   if (command === "apply" && !parsed.stage) throw new Error("apply requires --stage <directory>");
   if (command === "unquiesce" && (parsed.target !== "origin/main" || parsed.source || parsed.stage || parsed.bundle ||
-      parsed.dependencies || parsed.openApplication === false || parsed.progress || parsed.runId)) {
+      parsed.dependencies || parsed.openApplication === false || parsed.components !== "both" ||
+      parsed.progress || parsed.runId)) {
     throw new Error("unquiesce accepts no options");
   }
   if (command === "apply" && (parsed.bundle || parsed.dependencies || parsed.source)) {
@@ -114,6 +124,17 @@ export function parseArguments(argv) {
   if (parsed.runId !== undefined) {
     if (!parsed.progress) throw new Error("--run-id requires --progress <path>");
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(parsed.runId)) throw new Error("--run-id must be a short identifier");
+  }
+  if (!UPDATE_COMPONENTS.includes(parsed.components)) {
+    throw new Error(`--components must be one of ${UPDATE_COMPONENTS.join(", ")} (got "${parsed.components}")`);
+  }
+  // The transaction's safety proof is about the harness: it is what owns the
+  // database, and verifying an exact authenticated single owner is what makes
+  // an install safe.  An app-only run has no harness step to prove, so it is
+  // not offered as a general flag and is reachable only through the explicit
+  // staged import an operator asked for by name.
+  if (parsed.components === "app" && command !== "unquiesce" && !parsed.source) {
+    throw new Error("--components app is only supported for a staged import (--source with --bundle and --dependencies)");
   }
   return parsed;
 }
@@ -139,6 +160,16 @@ An existing exact-source build can be imported with --bundle and --dependencies.
 apply performs a fresh active-work check, installs one prepared stage, verifies exact runtime identity,
 and rolls the prior bundle and checkout back if any install or startup step fails.
 unquiesce is the authenticated recovery action if the updater exits after fencing admission but before shutdown.
+
+--components both|server|app (or --server-only) chooses which halves to install.  Default both.
+  "server" updates the harness and its checkout and leaves the running desktop app alone, so an
+  idle window is not closed for a server change and a bot turn is not interrupted by a UI relaunch.
+  The app is a client of the harness (electron/main.mjs attach-or-spawn): against the always-on
+  app.botfleet.server it is attached, so it simply reconnects to the harness that just restarted.
+  On a desktop with no always-on harness, where the app spawned its own, the app keeps that child
+  until it is next restarted, so the window and the harness can differ until then.
+  "app" updates only the desktop app and requires a staged import, because the transaction's safety
+  proof is the harness verifying itself as the single authenticated data owner.
 
 --force (-f, or BOTFLEET_FORCE=1) does more than reinstall when the checkout is already current.
 It drops the requirement that the harness be idle and asks it to quiesce with force=true, which
@@ -1617,6 +1648,57 @@ export async function terminateVerified(pids, previous, config, {
   }
 }
 
+/**
+ * The dependency-tree half of swapPreparedFiles, for a server-only run.
+ *
+ * Same contract and the same `progress` flags, so rollback and the receipt
+ * handling work unchanged — but it never touches the installed bundle.  A
+ * server-only update exists so a running desktop app keeps running, and a
+ * routine that renames the app out from under it would defeat the point while
+ * also invalidating the app's own signature state.
+ */
+export async function swapDependencyTree({
+  liveDependencies,
+  candidateDependencies,
+  rollbackDependencies,
+  progress = {},
+}, renamePath = rename) {
+  // Recovery must restore from the rollback path only when THIS run put the
+  // prior tree there; one left by an earlier run belongs to an older generation.
+  progress.rollbackDependenciesHold = false;
+  let newDependenciesMoved = false;
+  try {
+    await renamePath(liveDependencies, rollbackDependencies);
+    progress.rollbackDependenciesHold = true;
+    await renamePath(candidateDependencies, liveDependencies);
+    newDependenciesMoved = true;
+  } catch (error) {
+    if (newDependenciesMoved) await renamePath(liveDependencies, candidateDependencies);
+    if (progress.rollbackDependenciesHold) {
+      await renamePath(rollbackDependencies, liveDependencies);
+      progress.rollbackDependenciesHold = false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Does this run own the installed desktop app, or only the harness?
+ *
+ * Reads the parsed CLI rather than a threaded argument, so every operation
+ * answers from the one thing the operator actually asked for.  A second source
+ * of truth threaded alongside it would be a way for the app swap and the app
+ * relaunch to disagree.
+ */
+export function updatesApp(parsed = {}) {
+  return (parsed.components ?? "both") !== "server";
+}
+
+/** Does this run own the harness, its checkout, and its dependency tree? */
+export function updatesServer(parsed = {}) {
+  return (parsed.components ?? "both") !== "app";
+}
+
 export async function swapPreparedFiles({
   appPath,
   candidateApp,
@@ -2217,7 +2299,12 @@ function createOperations(config) {
 
     quiesce: async (previous) => {
       await bootOutHarnessForQuiesce(config, previous);
-      await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      // Quitting the desktop app is a UI concern, and doing it during a
+      // server-only update interrupts work the user is looking at for no
+      // reason.  The app is left running; only the harness is stopped.
+      if (updatesApp(config.parsed)) {
+        await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true });
+      }
       // Re-resolve what holds BotFleet state now rather than trusting the
       // capture.  The embedded driver and the helper apps start on demand, so
       // one can appear between the capture and the shutdown; and the harness
@@ -2227,12 +2314,12 @@ function createOperations(config) {
       // terminateVerified drops once their identity no longer matches.
       const [currentHolders, currentBundlePids, health] = await Promise.all([
         sqliteHolders(config.dataDirectory),
-        bundleProcessPids(config.appPath),
+        updatesApp(config.parsed) ? bundleProcessPids(config.appPath) : Promise.resolve([]),
         Promise.all(config.ports.map(probeHealth)),
       ]);
       const current = ownedRuntimePids({ holders: currentHolders, bundlePids: currentBundlePids, health });
       await terminateVerified(
-        [...previous.runtimePids, ...previous.appPids, ...current],
+        [...previous.runtimePids, ...(updatesApp(config.parsed) ? previous.appPids : []), ...current],
         previous,
         config,
         { current },
@@ -2258,6 +2345,7 @@ function createOperations(config) {
     },
 
     advanceCheckout: async (targetCommit) => {
+      if (!updatesServer(config.parsed)) return;
       await git(config.checkout, ["checkout", "--detach", targetCommit]);
       const head = await gitOutput(config.checkout, ["rev-parse", "HEAD"]);
       if (head !== targetCommit) throw new Error("Live checkout did not advance to the prepared commit");
@@ -2267,7 +2355,7 @@ function createOperations(config) {
       // The renamed executable cannot decrypt the Keychain item Electron
       // safeStorage created under com.botfleet.app.  The still-authorized
       // predecessor writes credentials.migration.json before the swap.
-      if (shouldExportSafeStorageBeforeRename(
+      if (updatesApp(config.parsed) && shouldExportSafeStorageBeforeRename(
         previous.installedIdentity.bundleIdentifier,
         prepared.bundleIdentifier,
       )) {
@@ -2286,6 +2374,20 @@ function createOperations(config) {
       previous.installedAt = new Date().toISOString();
       const receiptPath = `${previous.rollbackPath}.json`;
       await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
+      // A server-only run swaps the dependency tree and leaves the running app
+      // exactly where it is.  swapPreparedFiles renames the bundle and the tree
+      // in one non-atomic sequence, so it is the wrong tool here rather than a
+      // partially-invoked one.
+      if (!updatesApp(config.parsed)) {
+        await swapDependencyTree({
+          liveDependencies: join(config.checkout, "node_modules"),
+          candidateDependencies: previous.candidateDependencies,
+          rollbackDependencies: previous.rollbackDependencies,
+          progress: previous.swap,
+        });
+        await atomicJson(receiptPath, rollbackReceipt(prepared, previous, config, { status: "installing" }));
+        return;
+      }
       const liveDependencies = join(config.checkout, "node_modules");
       await swapPreparedFiles({
         appPath: config.appPath,
@@ -2351,25 +2453,25 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
+      // A server-only run must still prove the harness is the single data
+      // owner — that is the whole safety property — but it has no business
+      // sampling desktop app processes, which are expected to be mid-turn.
+      const expectApp = updatesApp(config.parsed) && config.parsed.openApplication !== false;
       let firstAppPids = [];
       let secondAppPids = [];
-      if (config.parsed.openApplication !== false) {
+      if (expectApp) {
         await sleep(2_000);
         firstAppPids = await exactAppPids(config.appPath);
         await sleep(1_000);
         secondAppPids = await exactAppPids(config.appPath);
       }
-      const appError = stableApplicationProcessError(
-        firstAppPids,
-        secondAppPids,
-        config.parsed.openApplication !== false,
-      );
+      const appError = stableApplicationProcessError(firstAppPids, secondAppPids, expectApp);
       if (appError) throw new Error(appError);
       const snapshot = await runtimeIdentityPreflight(config, prepared);
       if (!snapshot.safe || snapshot.mode !== "authenticated") {
         throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
       }
-      const attachmentError = applicationAttachmentError(snapshot, config.parsed.openApplication !== false);
+      const attachmentError = applicationAttachmentError(snapshot, expectApp);
       if (attachmentError) throw new Error(attachmentError);
       const survivors = await bundleProcessPids(previous.rollbackPath);
       const survivingError = survivingRollbackProcessError(survivors, previous.rollbackPath);
@@ -2464,7 +2566,9 @@ function createOperations(config) {
           }
         });
       }
-      await recordStop(async () => { await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true }); });
+      if (updatesApp(config.parsed)) {
+        await recordStop(async () => { await run("osascript", ["-e", 'if application "BotFleet" is running then tell application "BotFleet" to quit'], { allowFailure: true }); });
+      }
       await recordStop(async () => {
         const holders = await sqliteHolders(config.dataDirectory);
         const appPids = await bundleProcessPids(config.appPath);
@@ -2559,7 +2663,9 @@ function createOperations(config) {
       for (const plist of rollbackHarnessPlists) {
         await record(async () => { await run("launchctl", ["bootstrap", config.domain, plist]); });
       }
-      if (previous.appWasRunning) await record(async () => { await run("open", [config.appPath]); });
+      if (updatesApp(config.parsed) && previous.appWasRunning) {
+        await record(async () => { await run("open", [config.appPath]); });
+      }
       if (previous.launchdLoaded || previous.legacyLaunchdLoaded || previous.appWasRunning) await record(async () => {
         const deadline = Date.now() + config.startupTimeoutMs;
         let snapshot;
