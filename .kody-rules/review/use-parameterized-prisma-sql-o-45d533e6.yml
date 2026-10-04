@@ -1,0 +1,31 @@
+title: Use parameterized Prisma SQL only — no interpolated raw queries
+rule: >-
+  Never build SQL by string concatenation or template interpolation. Use the
+  Prisma query builder, or parameterized `prisma.$queryRaw` /
+  `prisma.$executeRaw` tagged templates with `Prisma.sql` fragments;
+  `$queryRawUnsafe` / `$executeRawUnsafe` are forbidden outside audited
+  migration/repair scripts and must never receive user- or collector-supplied
+  values. Also ensure `@prisma/client` is only instantiated in server-only
+  modules (no imports from client components).
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: |-
+      const provider = req.nextUrl.searchParams.get('provider');
+      const rows = await prisma.$queryRawUnsafe(
+        `SELECT * FROM UsageSnapshot WHERE provider = '${provider}'`
+      );
+    isCorrect: false
+  - snippet: >-
+      const provider =
+      ProviderSchema.parse(req.nextUrl.searchParams.get('provider'));
+
+      const rows = await prisma.$queryRaw`
+        SELECT * FROM UsageSnapshot WHERE provider = ${provider}
+      `;
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

@@ -1,0 +1,59 @@
+title: >-
+  Mandatory pre-commit handoff protocol and verification trio before claiming
+  work done
+rule: >-
+  Before ANY commit or push, complete the handoff protocol: read `AGENTS.md`
+  (canonical; `CLAUDE.md` is a symlink to it) → `STATUS.md` → `PLAN.md` →
+  relevant `docs/phase-*.md` → latest `docs/rollouts/*` → `git log -3` and the
+  current diff; then (1) update `STATUS.md` (current state, blockers, next
+  action), (2) add/update a chronological note
+  `docs/rollouts/YYYY-MM-DD-short-slug.md` — never a single `HANDOFF.md` —
+  covering Context & Objective, Changes Made (with exact file paths), Decisions
+  & Trade-offs, Verification State (exact commands run and build status), Next
+  Steps & Blockers, and Zero-Code Findings, (3) update `PLAN.md` for
+  scope/timeline/approach changes, (4) update the relevant
+  phase/architecture/README docs, and (5) reference the updated docs in the
+  commit message. Also keep the effort ledger current (branch-neutral
+  `/Users/jay/apps/TRADING-EFFORT-LOG.md` plus the repo-tracked
+  `docs/EFFORT-LOG.md` mirror) moving rows Planned → In Progress → Completed
+  (merged to `main`) → Deployed, never deleting another agent's row. Then
+  verify, in this order, before saying a change is complete: `npm run lint`
+  (eslint flat config; REQUIRED `verify` CI step, fails on errors only), `npx
+  tsc --noEmit`, `npm test` (vitest), `npm run build` (full Next.js build;
+  wipes/regenerates `.next/`, so restart any running dev server). A required
+  `verify` ruleset gates every merge to `main` — `gh api
+  .../branches/main/protection` returns 404 and does not mean unprotected, `gh
+  pr merge --admin` does NOT bypass it, so merge with `gh pr merge <n> --squash
+  --auto` and re-run flakes with `gh run rerun <run-id> --failed`. Hard
+  guardrails: no destructive git (`reset --hard`, force-push, branch deletion)
+  without explicit confirmation in the current conversation; edit only your own
+  worktree/branch; never label real data "mock" or "fallback" in anything
+  user-facing; keep `scripts/*.sh` ASCII-only (Apple bash 3.2.57 mis-parses a
+  non-ASCII byte adjacent to a `$VAR`); commit with the owner's noreply email
+  `12656028+jaywedgeworth22@users.noreply.github.com` so the real email is never
+  published; open PRs READY for review by default (drafts only for genuine WIP).
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: >-
+      Update `STATUS.md`, add `docs/rollouts/2026-10-01-console-filter-fix.md`,
+      note the scope change in `PLAN.md`, then run `npx tsc --noEmit` → `npm
+      test` → `npm run build` and commit with a message referencing the docs.
+    isCorrect: true
+  - snippet: >-
+      Push the fix straight to my agent branch with a one-line commit and no
+      `docs/rollouts/` note because the change is small.
+    isCorrect: false
+  - snippet: >-
+      `gh pr merge 3451 --squash --admin` to get past the failing `verify`
+      check.
+    isCorrect: false
+  - snippet: >-
+      `gh pr merge 3451 --squash --auto` so the PR lands the instant the
+      required `verify` check goes green.
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

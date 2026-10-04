@@ -2236,7 +2236,7 @@ export function useStreaming() {
   return useContext(StreamContext);
 }
 
-const StoreContext = createContext<{
+export const StoreContext = createContext<{
   state: AppState;
   dispatch: React.Dispatch<Action>;
   /** Commit any debounced profile edits before an operation reads the bot. */

@@ -1,0 +1,39 @@
+title: Validate every inbound payload with Zod before it reaches Prisma
+rule: >-
+  All externally supplied data (Next.js route handlers, server actions,
+  Cloudflare Worker handlers, OTLP/pushed telemetry bodies, parsed receipt
+  emails, collector CLI input) must be parsed with a Zod schema before use, and
+  the parsed result — not the raw `await req.json()` / `formData()` value — is
+  what gets passed to Prisma or any downstream service. Reject unknown fields
+  (`.strict()` or explicit stripping), return HTTP 400 on `safeParse` failure,
+  and never spread an unvalidated object into `prisma.*.create/update` data.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: |-
+      export async function POST(req: Request) {
+        const body = await req.json();
+        await prisma.usageSnapshot.create({ data: body });
+        return Response.json({ ok: true });
+      }
+    isCorrect: false
+  - snippet: |-
+      const UsageSchema = z.object({
+        provider: z.enum(['anthropic', 'openai', 'cursor']),
+        tokens: z.number().int().nonnegative(),
+      }).strict();
+
+      export async function POST(req: Request) {
+        const parsed = UsageSchema.safeParse(await req.json());
+        if (!parsed.success) {
+          return Response.json({ error: 'invalid payload' }, { status: 400 });
+        }
+        await prisma.usageSnapshot.create({ data: parsed.data });
+        return Response.json({ ok: true });
+      }
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

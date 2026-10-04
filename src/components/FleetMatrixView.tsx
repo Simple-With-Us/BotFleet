@@ -171,12 +171,8 @@ export function FleetMatrixView({
               const attention = attentionMap.get(group.id);
               const folderName = cwdBasename(group.cwd);
 
+              // Membership invariant: Strictly use explicit memberIds.
               const memberSet = new Set(group.memberIds || []);
-              for (const b of activeBots) {
-                if (b.section && (b.section === group.name || b.section === group.section)) {
-                  memberSet.add(b.id);
-                }
-              }
 
               return (
                 <tr key={group.id} className="hover:bg-raised/20 transition-colors">

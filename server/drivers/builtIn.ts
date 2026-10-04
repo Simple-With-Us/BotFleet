@@ -17,6 +17,7 @@ import { HermesAgentDriver } from "./acp/hermes.ts";
 import { OpenAICompatDriver } from "./openai-compat.ts";
 import { PiDriver } from "./pi.ts";
 import { MinimaxDriver } from "./minimax.ts";
+import { CliWrapperDriver } from "./cli-wrapper.ts";
 
 import { DeepSeekAgentDriver } from "./acp/deepseek.ts";
 import { DshAgentDriver } from "./acp/dsh.ts";
@@ -40,4 +41,5 @@ export const BUILT_IN_DRIVERS: readonly AnyProviderDriver[] = [
   AntigravityDriver,
   BoxAgentDriver,
   MinimaxDriver,
+  CliWrapperDriver,
 ];

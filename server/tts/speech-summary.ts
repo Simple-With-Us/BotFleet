@@ -1,4 +1,29 @@
+import { z } from "zod";
 import { spokenReply, stripVoiceSummaryTags } from "../../shared/voice-summary.ts";
+import { sanitizeForTTS } from "./minimax.ts";
+import { speakable } from "./speech-text.ts";
+
+export const DeepSeekChatMessageSchema = z.object({
+  role: z.string().optional(),
+  content: z.string().optional(),
+});
+
+export const DeepSeekChatChoiceSchema = z.object({
+  index: z.number().optional(),
+  message: DeepSeekChatMessageSchema.optional(),
+  finish_reason: z.string().nullable().optional(),
+});
+
+export const DeepSeekChatResponseSchema = z.object({
+  id: z.string().optional(),
+  object: z.string().optional(),
+  created: z.number().optional(),
+  model: z.string().optional(),
+  choices: z.array(DeepSeekChatChoiceSchema).optional(),
+  usage: z.record(z.string(), z.unknown()).optional(),
+});
+
+export type DeepSeekChatResponse = z.infer<typeof DeepSeekChatResponseSchema>;
 
 const DEFAULT_DEEPSEEK_BASE = "https://api.deepseek.com";
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -76,6 +101,22 @@ export function normalizeDeepSeekChatUrl(baseUrl?: string): string {
   return `${base}/chat/completions`;
 }
 
+function stripUnclosedFences(text: string): string {
+  const fenceRegex = /(?:```|~~~)/g;
+  const matches = [...text.matchAll(fenceRegex)];
+  if (matches.length % 2 !== 0) {
+    const lastMatch = matches[matches.length - 1];
+    return text.slice(0, lastMatch.index).trimEnd();
+  }
+  return text;
+}
+
+function cleanSummaryForTTS(summary: string): string {
+  const withoutTags = summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "");
+  const stripped = stripUnclosedFences(withoutTags);
+  return sanitizeForTTS(speakable(stripped));
+}
+
 /**
  * Summarize raw bot output into speech-optimized natural text using DeepSeek V4.1 Flash (deepseek-flash).
  * If the model call fails, times out, or no key is configured, falls back gracefully to deepseek-chat or spokenReply().
@@ -100,7 +141,11 @@ export async function summarizeForVoice(
     /[*#_\[\]]/.test(cleanInput);
 
   if (cleanInput.length <= 120 && !hasTechnicalContent) {
-    return cleanInput;
+    // Normalize the markdown and paragraph structure *before* the acoustic
+    // pass: sanitizeForTTS collapses newlines, and the line anchors that
+    // strip list markers and add audible paragraph pauses only match on the
+    // original text.
+    return sanitizeForTTS(speakable(cleanInput));
   }
 
   const options: SummarizeVoiceOptions =
@@ -110,7 +155,7 @@ export async function summarizeForVoice(
 
   const key = resolveDeepSeekKey(options.key);
   if (!key) {
-    return spokenReply(rawText);
+    return sanitizeForTTS(speakable(spokenReply(rawText)));
   }
 
   const endpoint = completionsUrl(options.baseUrl || options.url || extraOptions.url);
@@ -154,13 +199,14 @@ export async function summarizeForVoice(
     });
 
     if (response.ok) {
-      const data = (await response.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const summary = data?.choices?.[0]?.message?.content?.trim();
-      if (summary) {
-        // Strip any accidental brackets or tags
-        return summary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();
+      const rawData: unknown = await response.json();
+      const parsed = DeepSeekChatResponseSchema.safeParse(rawData);
+      if (parsed.success) {
+        const summary = parsed.data.choices?.[0]?.message?.content?.trim();
+        if (summary) {
+          const cleaned = cleanSummaryForTTS(summary);
+          if (cleaned) return cleaned;
+        }
       }
     }
 
@@ -184,12 +230,14 @@ export async function summarizeForVoice(
     });
 
     if (fallbackResponse.ok) {
-      const fbData = (await fallbackResponse.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const fbSummary = fbData?.choices?.[0]?.message?.content?.trim();
-      if (fbSummary) {
-        return fbSummary.replace(/\[\/?(?:voice_summary|written_answer)\]/gi, "").trim();
+      const fbRawData: unknown = await fallbackResponse.json();
+      const fbParsed = DeepSeekChatResponseSchema.safeParse(fbRawData);
+      if (fbParsed.success) {
+        const fbSummary = fbParsed.data.choices?.[0]?.message?.content?.trim();
+        if (fbSummary) {
+          const cleaned = cleanSummaryForTTS(fbSummary);
+          if (cleaned) return cleaned;
+        }
       }
     }
   } catch {
@@ -201,5 +249,5 @@ export async function summarizeForVoice(
     }
   }
 
-  return spokenReply(rawText);
+  return sanitizeForTTS(speakable(spokenReply(rawText)));
 }

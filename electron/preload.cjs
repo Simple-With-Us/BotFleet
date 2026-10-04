@@ -72,6 +72,12 @@ contextBridge.exposeInMainWorld("ogb", {
     ipcRenderer.on("speech:end", handler);
     return () => ipcRenderer.removeListener("speech:end", handler);
   },
+  personalVoice: {
+    isAvailable: () => ipcRenderer.invoke("personal-voice:available"),
+    list: () => ipcRenderer.invoke("personal-voice:list"),
+    speak: (text, voiceId) => ipcRenderer.invoke("personal-voice:speak", text, voiceId),
+    stop: () => ipcRenderer.invoke("personal-voice:stop"),
+  },
   /** A local-first demonstration recorder. Global events stay in main; the
    * renderer receives only the privacy-filtered event stream. */
   skillRecorder: {

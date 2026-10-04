@@ -1,0 +1,71 @@
+title: >-
+  Follow the canonical companion build/sign/launchd sequence and never hand-edit
+  project files
+rule: >-
+  After a repo rename or any companion change, the rebuild must hit all three
+  on-disk landmines in order: (1) run `swift package clean` in BOTH `companion/`
+  and `CompanionCore/` (companion imports CompanionCore, so a stale `.build/`
+  module cache in either breaks the other with `precompiled file ... was
+  compiled with module cache path ...` / `missing required module
+  'SwiftShims'`); (2) codesign the freshly built binary — either `codesign
+  --force --sign "Developer ID Application: Jay Wedgeworth, LLC (CC8UTF7ATG)"
+  --options runtime` (preferred) or `codesign --force --sign - -o linker-signed`
+  — and NEVER bare `codesign -s -`, which yields `flags=0x2(adhoc)` without the
+  linker-signed bit and is still SIGKILLed by launchd with
+  `OS_REASON_CODESIGNING`; (3) clear the stale LWCR with `launchctl bootout
+  gui/501/com.jay.MiniMax-Companion` followed by `launchctl bootstrap gui/501
+  ~/Library/LaunchAgents/com.jay.MiniMax-Companion.plist`, because `launchctl
+  kickstart -k` does NOT clear it (`Unable to get updated LWCR ... error 0x3 -
+  No such process`). Do not `sleep 2 && curl` as a health check: the port does
+  not bind for ~14 s after restart because `main.swift` renders the QR with
+  CoreImage before `server.start()` and that render takes 10–15 s when stdout is
+  a log file (process shows state `R`, `lsof -i :7842` shows nothing — this
+  reads like a crash but is not); poll up to ~15 × 2 s for HTTP 200 on
+  `http://127.0.0.1:7842/v1/info`, or pass `--no-qr` to skip the render and bind
+  immediately (what CI should use). Also: don't hand-edit `.pbxproj` — edit
+  `project.yml` and run `xcodegen`; don't bypass `ship-testflight.sh` from
+  `~/apps/ios-fleet/`; bump both `MARKETING_VERSION` and
+  `CURRENT_PROJECT_VERSION` in `project.yml`; and don't ship without verifying
+  the build on a simulator first, with automated visual verification where
+  feasible (`xcrun simctl io booted screenshot` for iOS simulator, Playwright
+  screenshot assertions for web surfaces) since the owner never takes manual
+  screenshots or runs local UI preview sessions. Keep BotFleet conventions
+  (bundle ID prefix `com.simplewithus.*`, Bonjour `_MiniMax._tcp`,
+  `PairingScanner`, `PairingView`) and leave a `// differs from BotFleet: …`
+  comment at any divergence.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: >-
+      swift package clean --package-path companion
+
+      swift package clean --package-path CompanionCore
+
+      swift build -c release
+
+      codesign --force --sign "Developer ID Application: Jay Wedgeworth, LLC
+      (CC8UTF7ATG)" \
+        --options runtime companion/.build/release/MiniMax-Companion
+      cp companion/.build/release/MiniMax-Companion ~/bin/MiniMax-Companion
+
+      launchctl bootout gui/501/com.jay.MiniMax-Companion 2>/dev/null
+
+      launchctl bootstrap gui/501
+      ~/Library/LaunchAgents/com.jay.MiniMax-Companion.plist
+
+      for i in $(seq 1 15); do
+        sleep 2
+        [ "$(curl -sS -m 2 -o /dev/null -w '%{http_code}' \
+             http://127.0.0.1:7842/v1/info)" = "200" ] && break
+      done
+    isCorrect: true
+  - snippet: |-
+      codesign --force --sign - ~/bin/MiniMax-Companion
+      launchctl kickstart -k gui/501/com.jay.MiniMax-Companion
+      sleep 2 && curl -sS http://127.0.0.1:7842/v1/info | jq .
+    isCorrect: false
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

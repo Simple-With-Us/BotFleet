@@ -1,0 +1,52 @@
+title: Keep canonical bundle IDs and do not rename internal namespaces
+rule: >-
+  Treat the `## Bundle identifiers` table in AGENTS.md as canonical: macOS app =
+  `com.simplewithus.hoghunter.macos`, macOS unit tests =
+  `com.simplewithus.hoghunter.macos.tests`, iOS companion =
+  `com.simplewithus.hoghunter.ios`, App Group =
+  `group.com.simplewithus.hoghunter`, Associated Domain = `simplewithus.com`
+  (applinks + webcredentials). Pre-rename IDs (`com.jayservices.HogHunter`,
+  `com.jayservices.HogHunterTests`) must stay absent from the project.
+  Conversely, internal namespaces are NOT bundle IDs and must never be renamed:
+  the history path `~/Library/Application Support/HogHunter/`
+  (`Sources/History/HistoryStore.swift:83`), the `"HogHunter"` denylist entry
+  that matches the executable via `pgrep -x`/`pkill -x`
+  (`Sources/Store/ProcessControl.swift:22`), and the log path
+  `~/Library/Logs/HogHunter/` (`Sources/UI/RowView.swift:256`). Likewise,
+  `PRODUCT_NAME` must stay `HogHunter` (the executable name); only the
+  human-visible name changes to `Hog Hunter` via `INFOPLIST_KEY_CFBundleName` /
+  `INFOPLIST_KEY_CFBundleDisplayName`, and `scripts/install.sh` installs `Hog
+  Hunter.app` while retiring a pre-rename `HogHunter.app` only after confirming
+  the same `CFBundleIdentifier` and quitting by both names. Renaming these
+  paths/process names would orphan user state or break the running-app quit path
+  on every installed copy.
+severity: critical
+scope: file
+path: '**/*'
+examples:
+  - snippet: >-
+      | macOS app (`HogHunter`) | `com.simplewithus.hoghunter.macos` |
+      `project.yml` `targets.HogHunter.settings.base.PRODUCT_BUNDLE_IDENTIFIER`
+      |
+
+      | iOS companion (`HogHunterIOS`) | `com.simplewithus.hoghunter.ios` |
+      `project.yml`
+      `targets.HogHunterIOS.settings.base.PRODUCT_BUNDLE_IDENTIFIER` |
+    isCorrect: true
+  - snippet: >-
+      Rename `com.simplewithus.hoghunter.macos` back to
+      `com.jayservices.HogHunter` in project.yml
+    isCorrect: false
+  - snippet: >-
+      Change `PRODUCT_NAME` to "Hog Hunter" so the binary matches the display
+      name
+    isCorrect: false
+  - snippet: >-
+      `Sources/Store/ProcessControl.swift:22` — `"HogHunter"` in the denylist;
+      the executable name must stay one word because `pgrep -x` / `pkill -x`
+      match it
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

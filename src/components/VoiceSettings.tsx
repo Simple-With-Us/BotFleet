@@ -8,6 +8,8 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
+import { parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 
@@ -22,6 +24,7 @@ export function VoiceSettings({
   onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">>) => void;
 }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
   const tts = state.config?.tts;
 
   const [key, setKey] = useState("");
@@ -48,31 +51,48 @@ export function VoiceSettings({
 
   const configured = Boolean(tts?.configured);
 
+  // The single loader. Every refresh path (mount, key save, add, clone,
+  // delete) goes through here, so the Personal Voice merge can never be
+  // dropped by a refresh that only reloads the harness list.
   const loadVoices = () => {
     setLoadingVoices(true);
-    return api("/api/tts/voices")
-      .then((r: { voices?: typeof voices; error?: string }) => {
-        setVoices(r.voices ?? []);
-        if (r.error) setError(r.error);
-      })
-      .catch(() => setVoices([]))
-      .finally(() => setLoadingVoices(false));
+    const personalVoices = window.ogb?.personalVoice?.list
+      ? window.ogb.personalVoice.list().catch(() => [])
+      : Promise.resolve([]);
+    return Promise.all([
+      api("/api/tts/voices").catch(() => ({})),
+      personalVoices,
+    ]).then(([raw, personal]) => {
+      let r: { voices?: Array<{ id: string; label: string; description?: string }>; error?: string };
+      try {
+        r = parseTtsVoicesResponse(raw);
+      } catch {
+        r = { voices: [] };
+      }
+      const apiVoices = r.voices ?? [];
+      // Entries the harness already knows about win, so a Personal Voice that
+      // the server also lists is never shown twice under two labels.
+      const existing = new Set(apiVoices.map((voice) => voice.id));
+      let parsedPersonal: ReturnType<typeof parsePersonalVoiceList> = [];
+      try {
+        parsedPersonal = parsePersonalVoiceList(personal);
+      } catch {
+        parsedPersonal = [];
+      }
+      const personalEntries = parsedPersonal
+        .filter((voice) => !existing.has(voice.id))
+        .map((voice) => ({
+          id: voice.id,
+          label: voice.name,
+          description: `Apple Personal Voice (${voice.locale ?? "en-US"})`,
+        }));
+      setVoices([...personalEntries, ...apiVoices]);
+      if (r.error) setError(r.error);
+    }).catch(() => setVoices([])).finally(() => setLoadingVoices(false));
   };
 
   useEffect(() => {
-    let alive = true;
-    setLoadingVoices(true);
-    api("/api/tts/voices")
-      .then((r: { voices?: typeof voices; error?: string }) => {
-        if (!alive) return;
-        setVoices(r.voices ?? []);
-        if (r.error) setError(r.error);
-      })
-      .catch(() => alive && setVoices([]))
-      .finally(() => alive && setLoadingVoices(false));
-    return () => {
-      alive = false;
-    };
+    void loadVoices();
   }, [configured]);
 
   const saveKey = () => {
@@ -175,7 +195,7 @@ export function VoiceSettings({
       if (result.error) {
         setCloneError(result.error);
       } else {
-        setCloneSuccess(`Voice "${label}" cloned and ready.  Pick it from the list below.`);
+        setCloneSuccess(`Voice "${label}" cloned and ready.\u00A0 Pick it from the list below.`);
         setCloneLabel("");
         setCloneFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
@@ -196,7 +216,18 @@ export function VoiceSettings({
   const selectedVoice = bot.voice ?? "";
   const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   const isSelectedPersonal = isPersonalVoice(selectedVoice);
+  const canSpeakPersonal =
+    capabilities.dictation.personalVoice === true &&
+    Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
   const ready = configured && Boolean(selectedVoice || tts.voice);
+  const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
+  const previewTitle = isSelectedPersonal
+    ? canSpeakPersonal
+      ? "Hear this Apple Personal Voice"
+      : "Personal Voices play on-device on a Mac or iPhone"
+    : ready
+      ? "Hear this voice"
+      : "Pick a voice first";
 
   const defaultVoiceRecord = tts.voice ? voices.find((v) => v.id === tts.voice) : null;
   const defaultVoiceDisplay = defaultVoiceRecord
@@ -211,7 +242,7 @@ export function VoiceSettings({
     <div className="rounded-xl bg-card p-4">
       <div className="text-[15px] font-medium text-ink">Voice</div>
       <div className="mt-0.5 text-[13px] text-ink-secondary">
-        Give this bot a voice for calls and spoken replies using MiniMax.  The voice choice belongs to this bot; the MiniMax key is shared by the workspace.
+        Give this bot a voice for calls and spoken replies using MiniMax.{"\u00A0 "}The voice choice belongs to this bot; the MiniMax key is shared by the workspace.
       </div>
 
       {/* ── MiniMax Key Input ── */}
@@ -335,8 +366,7 @@ export function VoiceSettings({
           <div className="mb-3 rounded-lg border border-hairline/40 bg-inset p-3">
             <div className="text-[12.5px] font-medium text-ink">Clone Voice From Audio</div>
             <p className="mt-0.5 mb-2 text-[12px] text-ink-secondary">
-              Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice
-              clone.  The clone appears in the voice list below.
+              Upload a short audio clip (10 seconds to 5 minutes, MP3/M4A/WAV, under 20 MB) to create a voice clone.{"\u00A0 "}The clone appears in the voice list below.
             </p>
             <div className="mb-2 flex gap-2">
               <input
@@ -401,7 +431,7 @@ export function VoiceSettings({
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
               <option value={selectedVoice}>
                 {isSelectedPersonal
-                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device iOS)`
+                  ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
                   : `${selectedVoice} (Current)`}
               </option>
             )}
@@ -413,10 +443,10 @@ export function VoiceSettings({
             ))}
           </select>
           <button
-            onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts.voice, botId: bot.id })}
-            disabled={!ready || isSelectedPersonal}
-            title={isSelectedPersonal ? "Personal Voices play on-device on iOS" : ready ? "Hear this voice" : "Pick a voice first"}
-            aria-label="Hear this voice"
+            onClick={() => void speaker.speak(SAMPLE, { voiceId: selectedVoice || tts?.voice, botId: bot.id })}
+            disabled={previewDisabled}
+            title={previewTitle}
+            aria-label={previewTitle}
             className="flex w-[72px] shrink-0 items-center justify-center gap-1.5 rounded-lg bg-control py-2 text-[13px] text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Volume2 size={14} /> Try
@@ -424,7 +454,7 @@ export function VoiceSettings({
         </div>
         {isSelectedPersonal && (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            This bot uses an Apple Personal Voice on iOS.  Synthesis runs on-device on your authorized iPhone.
+            This bot uses an Apple Personal Voice.{"\u00A0 "}Synthesis runs on-device on your authorized Mac or iPhone.
           </div>
         )}
       </div>
@@ -467,14 +497,14 @@ export function VoiceSettings({
       {/* ── Speech to Text ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Speech to Text</div>
-        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.  Recordings sent from iPhone keep the original audio and transcript on their message.</p>
+        <p className="mt-1 text-[12px] text-ink-secondary">iPhone microphone dictation uses Apple on-device recognition when this language and device support it.{"\u00A0 "}Recordings sent from iPhone keep the original audio and transcript on their message.</p>
         <p className="mt-1 text-[12px] text-ink-secondary">Cloud fallback and translation are not configured.</p>
       </div>
 
       {/* ── Play Replies On ── */}
       <div className="mt-4 border-t border-hairline/40 pt-4">
         <div className="text-[13px] font-medium text-ink">Play Replies On</div>
-        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.  Voice clips stay on their messages for replay.</p>
+        <p className="mt-0.5 text-[11.5px] text-ink-secondary">Choose where this bot speaks as answers arrive.{"\u00A0 "}Voice clips stay on their messages for replay.</p>
         <div className="mt-3 flex gap-4">
           {([['mac', 'Mac'], ['iphone', 'Play on iPhone (while app is open)']] as const).map(([device, label]) => {
             const selected = bot.speechDevices ? bot.speechDevices.includes(device) : device === 'mac' && Boolean(bot.speakReplies);

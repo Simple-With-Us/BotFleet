@@ -1,0 +1,41 @@
+title: Define explicit tolerance and masking for visual snapshot comparisons
+rule: >-
+  Visual regression checks must be configured with an explicit tolerance in
+  playwright.config.* (expect.toHaveScreenshot.maxDiffPixels or
+  maxDiffPixelRatio, plus a threshold) instead of relying on the default
+  pixel-perfect comparison, and any region that changes for legitimate reasons
+  (clocks, timestamps, live counters, charts) must be masked via the mask option
+  so only meaningful UI changes fail the build. Baseline images must be
+  committed to the repository and only regenerated through the existing
+  e2e:update script, never hand-edited or deleted to make a failing comparison
+  pass.
+severity: medium
+scope: file
+path: '**/*'
+examples:
+  - snippet: |-
+      export default defineConfig({
+        expect: { toHaveScreenshot: {} },
+        testDir: './tests',
+      });
+
+      // in a spec:
+      await expect(page).toHaveScreenshot('dashboard.png');
+    isCorrect: false
+  - snippet: |-
+      export default defineConfig({
+        expect: {
+          toHaveScreenshot: { maxDiffPixelRatio: 0.02, threshold: 0.2, animations: 'disabled' },
+        },
+        testDir: './tests',
+      });
+
+      // in a spec:
+      await expect(page).toHaveScreenshot('dashboard.png', {
+        mask: [page.locator('.last-updated'), page.locator('.live-counter')],
+      });
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

@@ -65,6 +65,9 @@ export const ENGINE_FIXTURES: readonly EngineFixture[] = [
   // The remote agent.  Its driver declares no computer flag at all: the turn
   // runs on the box, so there is nothing to mount.
   { displayName: "ASCII.dev Box", driverKind: "boxAgent", capabilities: {} },
+
+  // Generic CLI wrapper: spawns local processes without mounting a computer.
+  { displayName: "Generic CLI Wrapper", driverKind: "cli-wrapper", capabilities: {} },
 ];
 
 /** Cells that no shipped engine occupies but the derivation still has to
