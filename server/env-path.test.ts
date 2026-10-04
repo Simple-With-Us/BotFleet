@@ -173,6 +173,40 @@ describe("augmentedPath", () => {
     }
   });
 
+  posixIt2("emits every PATH entry exactly once, including a hoisted dir", () => {
+    // The hoisting fix hoists the canonical dir ahead of the symlink farm, but
+    // mergePaths dedupes BEFORE promoteCanonicalDirs runs — so without dropping
+    // the original slot the dir appears twice, once hoisted and once in place.
+    // An index comparison cannot see that (the two tests above both passed with
+    // the duplicate present), so uniqueness is asserted directly here.
+    //
+    // The symlink farm is put into the inherited PATH explicitly: hoisting only
+    // happens when the farm is present in the merged list, so without this the
+    // assertion would pass on an unhoisted PATH and test nothing.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      // the hoisting path must actually have run, or this is vacuous again
+      expect(parts.indexOf(installerDir)).toBeGreaterThanOrEqual(0);
+      expect(parts.indexOf(symlinkFarm)).toBeGreaterThanOrEqual(0);
+      expect(parts.length).toBeGreaterThan(0);
+      expect(new Set(parts).size).toBe(parts.length);
+      // and the hoisted dir specifically appears once, in its promoted slot
+      expect(parts.filter((p) => p === installerDir)).toHaveLength(1);
+      expect(parts.indexOf(installerDir)).toBeLessThan(parts.indexOf(symlinkFarm));
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("finds Antigravity installed after launch", () => {
     const previous = process.env.LOCALAPPDATA;
     const localAppData = mkdtempSync(join(tmpdir(), "omb-localappdata-"));

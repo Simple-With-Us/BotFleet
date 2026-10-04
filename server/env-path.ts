@@ -144,21 +144,32 @@ const CANONICAL_INSTALLER_DIRS = [".minimax-code", ".kimi-code"];
  * source supplied each dir.
  *
  * Only dirs already present are moved, and only ahead of the symlink farm,
- * so no other CLI's resolution changes. */
+ * so no other CLI's resolution changes.
+ *
+ * The hoisted dir is dropped from its ORIGINAL position rather than left to
+ * appear twice: `mergePaths` dedupes before calling this, so a dir inserted
+ * ahead of the farm would otherwise also still be emitted when the walk
+ * reaches its old slot, and PATH would carry it twice.  `seen` is what makes
+ * each dir appear exactly once, hoisted position winning. */
 function promoteCanonicalDirs(parts: string[]): string[] {
   const symlinkFarm = join(homedir(), ".local", "bin");
   if (!parts.includes(symlinkFarm)) return parts;
   const out: string[] = [];
-  for (const part of parts) {
-    if (part !== symlinkFarm) {
-      out.push(part);
-      continue;
-    }
+  const seen = new Set<string>();
+  const hoist = (): void => {
     for (const name of CANONICAL_INSTALLER_DIRS) {
       const dir = join(homedir(), name, "bin");
-      if (parts.includes(dir) && !out.includes(dir)) out.push(dir);
+      if (parts.includes(dir) && !seen.has(dir)) {
+        out.push(dir);
+        seen.add(dir);
+      }
     }
+  };
+  for (const part of parts) {
+    if (part === symlinkFarm) hoist();
+    if (seen.has(part)) continue;
     out.push(part);
+    seen.add(part);
   }
   return out;
 }
