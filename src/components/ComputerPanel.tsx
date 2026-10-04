@@ -1097,13 +1097,13 @@ export function ComputerPanel({
               {!bot.computers &&
                 (isLinux || !localSelectable
                   ? cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
-                    : `${linuxAutoDescription()} `
+                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off.\u00a0 "
+                    : `${linuxAutoDescription()}\u00a0 `
                   : cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one exists, otherwise this computer. "
-                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer. ")}
-              Pick where this bot's computer lives. <b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop. Set it up in App
+                    ? "Auto reuses a ready VPS when one exists, otherwise this computer.\u00a0 "
+                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer.\u00a0 ")}
+              Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
+              in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
           </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">

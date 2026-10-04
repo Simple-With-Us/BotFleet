@@ -45,7 +45,11 @@ export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
 export const IMAGE_LAYER_VERSION = "5";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
-export const CONTAINER = `botfleet-computer-${userInfo().username}`;
+export function sanitizeContainerSuffix(name: string): string {
+  const cleaned = name.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned.length > 0 ? cleaned : "user";
+}
+export const CONTAINER = `botfleet-computer-${sanitizeContainerSuffix(userInfo().username)}`;
 const LEGACY_CONTAINER_PREFIXES = ["botfleet-computer", "openmausbot-computer", "opengrokbot-computer"] as const;
 export const MANAGED_LABEL = "com.botfleet.local-vm";
 export const DRIVER_LABEL = "com.botfleet.cua-driver";
@@ -226,6 +230,8 @@ RUN set -eux; \\
     driver_bin="$(find /opt/venv/lib -path '*/cua_driver/bin/cua-driver' -type f -print -quit)"; \\
     test -n "$driver_bin"; \\
     install -D -m 0755 "$driver_bin" ${CUA_EXECUTABLE}; \\
+    ln -sf ${CUA_EXECUTABLE} /usr/local/bin/cua-driver; \\
+    ln -sf ${CUA_EXECUTABLE} /opt/venv/bin/cua-driver; \\
     install -d -o cua -g cua -m 0700 ${VM_WORKSPACE_GUEST}; \\
     test "$(${CUA_EXECUTABLE} --version)" = "cua-driver ${CUA_DRIVER_VERSION}"
 RUN printf '%s\\n' \\

@@ -10,6 +10,7 @@ import {
   hostToolPrefix,
   nameMounts,
   turnComputerMounts,
+  hostShellGranted,
   type ComputerMount,
   type TurnComputerDeps,
 } from "./computer-grants.ts";
@@ -883,5 +884,57 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+  });
+
+  it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {
+    const deps = makeBaseDeps();
+    deps.vps.vpsComputerAction = async () => ({
+      container_name: "botfleet-vps-shared",
+      container_id: "c1",
+      container: "running",
+      image: true,
+      ready: true,
+      problem: null,
+      daemonUp: true,
+      managed: true,
+      network: "host",
+      security: "confined",
+      persistence: "disposable",
+      sshAlias: "coolify",
+    });
+    deps.vps.vpsComputerMcp = () => ({ command: "vps-cua", args: [], env: {} });
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Worker", computers: ["cloud"], cloudBackend: "vps" },
+      cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.hasHostComputer).toBe(true);
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+  });
+
+  describe("hostShellGranted", () => {
+    it("grants host shell when local computer is granted", () => {
+      const cfg: AppConfig = {};
+      expect(hostShellGranted({ computers: ["local"] }, cfg, null)).toBe(true);
+    });
+
+    it("grants host shell in hybrid mode for Local VM", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["vm"] }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["vm"] }, {}, null)).toBe(false);
+    });
+
+    it("grants host shell in hybrid mode for Cloud VPS", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "box" }, cfg, null)).toBe(false);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, {}, null)).toBe(false);
+    });
   });
 });

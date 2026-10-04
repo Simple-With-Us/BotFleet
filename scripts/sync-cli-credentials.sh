@@ -274,7 +274,24 @@ if [ "$TARGET" = "vps" ] || [ "$TARGET" = "all" ]; then
 fi
 
 if [ "$TARGET" = "local" ] || [ "$TARGET" = "all" ]; then
-  LOCAL_CONTAINER="${CONTAINER:-botfleet-computer}"
+  if [ -n "$CONTAINER" ]; then
+    LOCAL_CONTAINER="$CONTAINER"
+  else
+    USER_CLEAN="$(echo "${USER:-$(whoami)}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9_.-' '-' | sed 's/^-//;s/-$//')"
+    DEFAULT_LOCAL_CONTAINER="botfleet-computer-${USER_CLEAN:-user}"
+    LOCAL_CONTAINER="$DEFAULT_LOCAL_CONTAINER"
+    for check_cmd in "docker" "podman"; do
+      if command -v "$check_cmd" >/dev/null 2>&1; then
+        if "$check_cmd" inspect --format '{{.State.Running}}' "$DEFAULT_LOCAL_CONTAINER" 2>/dev/null | grep -q "true"; then
+          LOCAL_CONTAINER="$DEFAULT_LOCAL_CONTAINER"
+          break
+        elif "$check_cmd" inspect --format '{{.State.Running}}' "botfleet-computer" 2>/dev/null | grep -q "true"; then
+          LOCAL_CONTAINER="botfleet-computer"
+          break
+        fi
+      fi
+    done
+  fi
   if sync_to_container "local" "$LOCAL_CONTAINER"; then
     SYNCED_TARGETS+=("local:$LOCAL_CONTAINER")
   fi

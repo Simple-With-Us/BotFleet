@@ -355,7 +355,7 @@ export function LocalVmRuntimeCard() {
       <Card
         id="setting-computers-cli-credentials"
         title="Host & CLI Integration"
-        subtitle="Manage CLI authentication and terminal access for bots using the Local VM."
+        subtitle="Manage CLI authentication and terminal access for bots using Local and Cloud VMs."
       >
         <div className="flex flex-col gap-3">
           <label className="flex cursor-pointer items-start gap-3">
@@ -366,9 +366,9 @@ export function LocalVmRuntimeCard() {
               className="mt-0.5 rounded border-hairline/40 accent-accent"
             />
             <div className="text-[13px]">
-              <div className="font-medium text-ink">Share Host CLI Credentials with Local VM</div>
+              <div className="font-medium text-ink">Share Host CLI Credentials with Local &amp; Cloud VMs</div>
               <div className="text-[12px] text-ink-secondary">
-                Mounts read-only host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the container so tools run inside the VM are signed into your accounts.
+                Mounts or synchronizes read-only host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) so tools run inside the VM are signed into your accounts.
               </div>
             </div>
           </label>
@@ -383,14 +383,14 @@ export function LocalVmRuntimeCard() {
             <div className="text-[13px]">
               <div className="font-medium text-ink">Host Shell Execution with VM Screen (Hybrid Mode)</div>
               <div className="text-[12px] text-ink-secondary">
-                Enables bots using the Local VM to execute shell commands and tests in your host Mac terminal environment, while keeping all mouse clicks, typing, and desktop viewing strictly inside the VM.
+                Enables bots using a Local VM or Shared VPS VM to execute shell commands and tests in your host Mac terminal environment, while keeping all mouse clicks, typing, and desktop viewing strictly inside the VM.
               </div>
             </div>
           </label>
         </div>
       </Card>
 
-      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares BotFleet and the VM for you.">
+      <Card title="Setup" subtitle="Once a container runtime is open, BotFleet prepares the Linux desktop and the VM for you.">
         <div className="flex flex-col gap-4">
           <Step n={1} title="Install a Container Runtime" done={Boolean(status?.runtime)}>
             <div className="text-[13px] leading-relaxed text-ink-secondary">

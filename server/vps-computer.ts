@@ -1025,6 +1025,11 @@ export async function vpsComputerAction(
   if (isSharedVpsMode(cfg) && after.ready && (after.container_id ?? after.container_name)) {
     await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
   }
+  if (cfg.localVm?.shareCliCredentials && after.ready && (action === "provision" || action === "start")) {
+    await vpsSyncCliCredentials(cfg, target, runner).catch((err) => {
+      console.warn(`[vps] automatic CLI credentials sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
   return after;
 }
 

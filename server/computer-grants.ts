@@ -566,8 +566,10 @@ export function hostShellGranted(
   allowed: ComputerDestination[] | null,
 ): boolean {
   const { granted } = resolveGrants(bot.computers, undefined, cfg.botDefaults?.computers, allowed);
-  const filtered = filterGrantedByProviders(granted, cfg, resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend));
-  return filtered.includes("local") || (filtered.includes("vm") && cfg.localVm?.allowHostTerminal === true);
+  const cloudBackend = resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend);
+  const filtered = filterGrantedByProviders(granted, cfg, cloudBackend);
+  const hasVmOrVps = filtered.includes("vm") || (filtered.includes("cloud") && cloudBackend === "vps");
+  return filtered.includes("local") || (hasVmOrVps && cfg.localVm?.allowHostTerminal === true);
 }
 
 export async function resolveTurnComputerMounts<Lease>(
@@ -676,7 +678,10 @@ async function resolveMounts<Lease>(
   });
   const mountsCloudComputer = reach.box;
   const mountsLocalComputer = reach.local && !unattendedAgy;
-  const allowHostTerminalWithVm = Boolean(wantsVm && cfg.localVm?.allowHostTerminal === true);
+  const allowHostTerminalWithVm = Boolean(
+    (wantsVm || (wantsCloudFiltered && cloudBackend === "vps")) &&
+    cfg.localVm?.allowHostTerminal === true,
+  );
   const hasHostComputer = Boolean((wantsLocal || allowHostTerminalWithVm) && mountsLocalComputer);
 
   // Explicit destinations are strict.  In particular, Local VM must never

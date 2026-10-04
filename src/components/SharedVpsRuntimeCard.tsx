@@ -168,7 +168,7 @@ export function SharedVpsRuntimeCard() {
                   <div>
                     <div className="text-[13px] font-medium text-ink">Host CLI Credentials</div>
                     <div className="text-[12px] text-ink-secondary">
-                      Copy local developer logins (~/.infisical, ~/.ssh, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the shared VPS container.
+                      Copy local developer logins (~/.infisical, ~/.ssh, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the shared VPS container.{state.config?.localVm?.shareCliCredentials ? "\u00a0 Automatic sync is enabled in Host & CLI Integration." : ""}
                     </div>
                   </div>
                   <button

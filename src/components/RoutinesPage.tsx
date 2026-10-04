@@ -836,7 +836,7 @@ export function RoutinesPage() {
             {section === "calendar" && <button onClick={() => setEditor("new")} disabled={visibleBots.length === 0} className="flex items-center gap-2 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-medium text-white shadow-lg shadow-accent/10 hover:brightness-110 disabled:opacity-40"><Plus size={15} />New Routine</button>}
           </div>
         </div>
-        <div className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
+        <div style={noDragStyle} className="mt-4 flex items-center gap-1 rounded-xl bg-panel p-1 sm:w-fit">
           <button onClick={() => setSection("calendar")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "calendar" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><CalendarDays size={13} />Routines</button>
           <button onClick={() => setSection("webhooks")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "webhooks" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Webhook size={13} />Webhooks{state.webhooks.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.webhooks.length}</span>}</button>
           <button onClick={() => setSection("resources")} className={cn("flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-medium", section === "resources" ? "bg-raised text-ink shadow" : "text-ink-secondary hover:text-ink")}><Gauge size={13} />Resources{state.resourceTriggers.length > 0 && <span className="rounded-full bg-accent/15 px-1.5 text-[10px] text-accent">{state.resourceTriggers.length}</span>}</button>

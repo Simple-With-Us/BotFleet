@@ -8214,6 +8214,8 @@ function configStatus() {
     localVm: {
       mode: cfg.localVm?.mode ?? "shared",
       maxInstances: localVmMaxInstances(cfg),
+      shareCliCredentials: Boolean(cfg.localVm?.shareCliCredentials),
+      allowHostTerminal: Boolean(cfg.localVm?.allowHostTerminal),
     },
     // No invented endpoint or collection: the operator's own values or
     // nothing at all, so an unconfigured install reads as unconfigured.
