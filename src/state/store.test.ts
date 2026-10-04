@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  MessagePostResponseSchema,
+  TaskSwitchResponseSchema,
   getRoomTerminology,
   initialState,
   isHarnessUnreachableError,
@@ -18,6 +20,42 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("API response contracts", () => {
+  const bot = {
+    id: "bot-1",
+    threadId: "thread-1",
+    name: "Bot",
+    title: "Bot",
+    description: "A test bot",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    modelSelection: { instanceId: "engine-1", model: "model-1" },
+    messages: [],
+  };
+
+  it("accepts a task switch bot and rejects malformed envelopes", () => {
+    expect(TaskSwitchResponseSchema.safeParse({ bot }).success).toBe(true);
+    expect(TaskSwitchResponseSchema.safeParse({ bot, extra: true }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { ...bot, threadId: 42 } }).success).toBe(false);
+  });
+
+  it("accepts each message post outcome and rejects unvalidated fields", () => {
+    expect(MessagePostResponseSchema.safeParse({ ok: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true }).success).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        queued: true,
+        queueId: "queue-1",
+        threadId: "thread-1",
+      }).success,
+    ).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, queued: true, queueId: 7, threadId: "thread-1" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, extra: "unexpected" }).success).toBe(false);
+  });
+});
 
 describe("renderer hydration recovery", () => {
   const retainedBot = {

@@ -14,6 +14,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { z } from "zod";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
@@ -2077,6 +2078,49 @@ export const initialState: AppState = {
   loadingEarlier: {},
 };
 
+// ── API response contracts ─────────────────────────────────────────────
+// These responses cross the HTTP boundary through the deliberately generic
+// API helper, so each write path narrows its raw body before using it.
+const taskSwitchModelSelectionSchema = z.object({
+  instanceId: z.string(),
+  model: z.string(),
+}).passthrough();
+
+const taskSwitchMessageSchema = z.object({
+  id: z.string(),
+  role: z.enum(["bot", "user", "system"]),
+  kind: z.enum(["text", "options", "activity", "screen", "connector", "secret"]),
+  at: z.number(),
+}).passthrough();
+
+const taskSwitchBotSchema = z.object({
+  id: z.string(),
+  threadId: z.string(),
+  name: z.string(),
+  title: z.string(),
+  description: z.string(),
+  notifications: z.boolean(),
+  color: z.enum(["green", "blue", "red", "orange", "purple", "cyan", "pink", "yellow", "teal", "coral"]),
+  unread: z.boolean(),
+  modelSelection: taskSwitchModelSelectionSchema,
+  messages: z.array(taskSwitchMessageSchema),
+}).passthrough();
+
+export const TaskSwitchResponseSchema = z.object({
+  bot: taskSwitchBotSchema,
+}).strict();
+
+export const MessagePostResponseSchema = z.union([
+  z.object({
+    ok: z.literal(true),
+    queued: z.literal(true),
+    queueId: z.string(),
+    threadId: z.string(),
+  }).strict(),
+  z.object({ ok: z.literal(true), steered: z.literal(true) }).strict(),
+  z.object({ ok: z.literal(true) }).strict(),
+]);
+
 // ── API client ─────────────────────────────────────────────────────────
 /** Thrown by `api()` on a non-2xx response.  Carries the parsed JSON body
  * alongside `.message`, so a caller that needs more than the error string —
@@ -2437,16 +2481,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 ...(threadId ? { threadId } : {}),
               }),
             })
-              .then((body) => {
-                if (
-                  body?.queued &&
-                  typeof body.threadId === "string" &&
-                  typeof body.queueId === "string"
-                ) {
+              .then((body: unknown) => {
+                const parsed = MessagePostResponseSchema.safeParse(body);
+                if (!parsed.success) {
+                  throw new Error("Invalid message post response.");
+                }
+                if ("queued" in parsed.data && parsed.data.queued) {
                   rawDispatch({
                     type: "pendingQueued",
-                    threadId: body.threadId,
-                    queueId: body.queueId,
+                    threadId: parsed.data.threadId,
+                    queueId: parsed.data.queueId,
                     text: action.text,
                     at: sentAt,
                   });
@@ -2459,11 +2503,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           };
           if (liveBot && pinnedThreadId && pinnedThreadId !== liveBot.threadId) {
             void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}`, { method: "POST" })
-              .then((switched: any) => {
-                if (!switched?.bot || switched.bot.threadId !== pinnedThreadId) {
+              .then((body: unknown) => {
+                const parsed = TaskSwitchResponseSchema.safeParse(body);
+                if (!parsed.success || parsed.data.bot.threadId !== pinnedThreadId) {
                   throw new Error("Could not open the thread on screen before sending.");
                 }
-                rawDispatch({ type: "taskSwitched", bot: switched.bot });
+                rawDispatch({ type: "taskSwitched", bot: parsed.data.bot });
                 postMessage(pinnedThreadId);
               })
               .catch((error) => {
