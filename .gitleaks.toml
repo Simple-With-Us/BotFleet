@@ -1,0 +1,10 @@
+# Extend the default ruleset; do not replace it.
+[extend]
+useDefault = true
+
+# .kody-rules/review/*.yml are code-review rule files.  Each one deliberately
+# shows a bad (hardcoded secret) example next to a good one, using made-up
+# values.  Skip only this directory; every other path is still scanned.
+[[allowlists]]
+description = "Kody review rules contain intentional fake-secret examples"
+paths = ['''^\.kody-rules/''']
