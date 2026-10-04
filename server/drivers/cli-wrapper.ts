@@ -133,6 +133,8 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
           threadId,
         });
 
+        if (children.has(threadId)) throw new Error("a turn is already running on this thread");
+
         // Every driver opens its turn here, and sentry-ai.ts opens the
         // gen_ai.invoke_agent span on this event, so without it the driver
         // is untraced and index.ts's turnStats.started is skipped.
@@ -164,7 +166,7 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
               false,
               `prompt is ${bytes} bytes, over the ${MAX_PROMPT_ARG_BYTES}-byte argument limit — set passPromptAs to "stdin"`,
             );
-            return { turnId };
+            return { turnId, dispatched: false };
           }
           args.push(turnInput.text);
         }
@@ -181,8 +183,10 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
             stdio: ["pipe", "pipe", "pipe"],
           });
         } catch (err) {
-          settle(false, err instanceof Error ? err.message : String(err));
-          return { turnId };
+          const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
+          emit({ ...base(), type: "runtime.error", ...failure });
+          settle(false, "spawn_error");
+          return { turnId, dispatched: false };
         }
         children.set(threadId, child);
 
@@ -212,9 +216,9 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
         child.on("close", (code) => settle(code === 0));
 
         child.on("error", (err) => {
-          // ENOENT on a CLI the user typed is a setup problem, not a crash,
-          // and this is the wording the rest of the product uses for it.
-          settle(false, describeSpawnFailure(err as NodeJS.ErrnoException, config.command).message);
+          const failure = describeSpawnFailure(err as NodeJS.ErrnoException, config.command);
+          emit({ ...base(), type: "runtime.error", ...failure });
+          settle(false, "spawn_error");
         });
 
         return { turnId };
