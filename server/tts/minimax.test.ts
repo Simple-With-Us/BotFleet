@@ -226,4 +226,81 @@ describe("synthesize", () => {
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message.toLowerCase()).toContain("couldn't reach");
   });
+
+  describe("sanitizeForTTS", () => {
+    it("converts em-dashes and en-dashes into pauses with comma-space", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Option A—fastest option–available now")).toBe("Option A, fastest option, available now");
+    });
+
+    it("converts floating hyphens into pauses and cleans ellipses", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Start - middle... end")).toBe("Start, middle. end");
+    });
+
+    it("normalizes consecutive commas and trailing spaces", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Hello — , world...  ")).toBe("Hello, world.");
+    });
+
+    it("keeps a minus sign between numbers and still pauses on a clause dash", async () => {
+      const { sanitizeForTTS } = await driver();
+      // arithmetic: the operator has to survive or it reads as "five, three"
+      expect(sanitizeForTTS("5 - 3 = 2")).toBe("5 - 3 = 2");
+      expect(sanitizeForTTS("5 - 3 - 1 = 1")).toBe("5 - 3 - 1 = 1");
+      // a digit on one side only is still a clause dash
+      expect(sanitizeForTTS("Step 1 - then deploy")).toBe("Step 1, then deploy");
+      expect(sanitizeForTTS("Start - middle end")).toBe("Start, middle end");
+      // consecutive clause dashes with single non-space characters
+      expect(sanitizeForTTS("a - b - c")).toBe("a, b, c");
+      expect(sanitizeForTTS("I - a - programmer")).toBe("I, a, programmer");
+      expect(sanitizeForTTS("a - b - c - d")).toBe("a, b, c, d");
+    });
+
+    it("collapses a Unicode ellipsis to a single period", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("Wait… then… go")).toBe("Wait. then. go");
+      expect(sanitizeForTTS("Wait… then... go")).toBe("Wait. then. go");
+    });
+
+    it("leaves a hyphenated word intact", async () => {
+      const { sanitizeForTTS } = await driver();
+      expect(sanitizeForTTS("A well-known fix")).toBe("A well-known fix");
+    });
+
+    it("sanitizes text before passing to POST /v1/t2a_v2", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      const testKey = process.env.MINIMAX_API_KEY || "test-dummy-key";
+      await synthesize("Step one—do this - next... finish", "English_Graceful_Lady", testKey);
+      const post = seen.find((s) => s.method === "POST" && s.url.includes("/v1/t2a_v2"));
+      expect(post).toBeDefined();
+      const body = JSON.parse(post!.body);
+      expect(body.text).toBe("Step one, do this, next. finish");
+    });
+
+    it("returns empty audio for punctuation-only input without calling network", async () => {
+      const { synthesize } = await driver();
+      seen.length = 0;
+      const testKey = process.env.MINIMAX_API_KEY || "test-dummy-key";
+      const res1 = await synthesize(" — ", "English_Graceful_Lady", testKey);
+      expect(res1.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+
+      const res2 = await synthesize("...", "English_Graceful_Lady", testKey);
+      expect(res2.bytes.length).toBe(0);
+      expect(seen.length).toBe(0);
+    });
+
+    it("collapses large whitespace runs efficiently without backtracking", async () => {
+      const { sanitizeForTTS } = await driver();
+      const padded = "Start" + " ".repeat(10_000) + "—" + " ".repeat(10_000) + "End";
+      const t0 = performance.now();
+      const sanitized = sanitizeForTTS(padded);
+      const elapsed = performance.now() - t0;
+      expect(sanitized).toBe("Start, End");
+      expect(elapsed).toBeLessThan(100);
+    });
+  });
 });
+
