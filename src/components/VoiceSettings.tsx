@@ -63,12 +63,23 @@ export function VoiceSettings({
       api("/api/tts/voices").catch(() => ({})),
       personalVoices,
     ]).then(([raw, personal]) => {
-      const r = parseTtsVoicesResponse(raw);
+      let r: { voices?: Array<{ id: string; label: string; description?: string }>; error?: string };
+      try {
+        r = parseTtsVoicesResponse(raw);
+      } catch {
+        r = { voices: [] };
+      }
       const apiVoices = r.voices ?? [];
       // Entries the harness already knows about win, so a Personal Voice that
       // the server also lists is never shown twice under two labels.
       const existing = new Set(apiVoices.map((voice) => voice.id));
-      const personalEntries = parsePersonalVoiceList(personal)
+      let parsedPersonal: ReturnType<typeof parsePersonalVoiceList> = [];
+      try {
+        parsedPersonal = parsePersonalVoiceList(personal);
+      } catch {
+        parsedPersonal = [];
+      }
+      const personalEntries = parsedPersonal
         .filter((voice) => !existing.has(voice.id))
         .map((voice) => ({
           id: voice.id,

@@ -42,7 +42,7 @@ describe("Personal Voice reply bounds", () => {
     expect(bound).toBeLessThan(personalVoice);
   });
 
-  it("evaluates the empty-utterances bound before the early return", () => {
+  it("keeps the empty-reply rejection in force for every voice owner", () => {
     const source = routeSource();
     const emptyBound = source.indexOf("!utterances.length");
     const personalVoice = source.indexOf("tts.isPersonalVoice(owner.voice)");
@@ -50,7 +50,11 @@ describe("Personal Voice reply bounds", () => {
     expect(emptyBound).toBeGreaterThan(-1);
     expect(personalVoice).toBeGreaterThan(-1);
     expect(emptyBound).toBeLessThan(personalVoice);
+    // The empty check must still reject, not soft-return: a 200 sends
+    // `voiceText` to the desktop helper (src/lib/tts/index.ts:157-161).
+    expect(source.slice(emptyBound, personalVoice)).toMatch(/return json\(res, 413/);
     expect(source.match(/reply exceeds voice clip limit/g)).toHaveLength(1);
+    expect(source).toMatch(/if \(!utterances\.length \|\|/);
   });
 
   it("bounds the reply text a Personal Voice owner can reach the helper with", () => {
