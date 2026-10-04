@@ -4,3 +4,16 @@
 export function nextMemberIds(current: string[], picked: Set<string>, order: string[]): string[] {
   return [...current.filter((id) => picked.has(id)), ...order.filter((id) => picked.has(id) && !current.includes(id))];
 }
+
+/**
+ * Ids that belong to a room.
+ *
+ * Section labels and room names are editable dividers.  Matching them would
+ * move matrix cells and badge counts when a person renames a section.
+ * A matching cwd is not membership either.
+ */
+export function explicitMemberIdSet(
+  memberIds: readonly string[] | null | undefined,
+): ReadonlySet<string> {
+  return new Set(memberIds ?? []);
+}
