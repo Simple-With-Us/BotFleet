@@ -38,15 +38,53 @@ const deniedCapabilities: DesktopCapabilities = {
   },
 };
 
+const unavailableLocalControl = {
+  enabled: false,
+  status: "unavailable" as const,
+};
+
+// A complete desktop bridge, not a cast. The visual lane and the unit tests
+// both need personalVoice.speak (and getCapabilities) to type-check as the
+// real preload contract. Missing a required method is a type error.
+export function personalVoiceDesktopBridge(over: {
+  capabilities?: DesktopCapabilities;
+  speak?: (text: string, voiceId?: string) => Promise<void>;
+} = {}): NonNullable<Window["ogb"]> {
+  const capabilities = over.capabilities ?? deniedCapabilities;
+  const unsubscribe = () => {};
+  return {
+    platform: "darwin",
+    getCapabilities: () => Promise.resolve(capabilities),
+    onCapabilitiesChanged: () => unsubscribe,
+    localControl: {
+      status: () => Promise.resolve(unavailableLocalControl),
+      enable: () => Promise.resolve(unavailableLocalControl),
+      disable: () => Promise.resolve(unavailableLocalControl),
+      retry: () => Promise.resolve(unavailableLocalControl),
+    },
+    beginScreenPreviewIntent: () => false,
+    screenFrame: () => Promise.resolve(null),
+    speechStart: () => Promise.resolve(),
+    speechStop: () => Promise.resolve(),
+    onSpeechTranscript: () => unsubscribe,
+    onSpeechEnd: () => unsubscribe,
+    personalVoice: {
+      isAvailable: () => Promise.resolve(capabilities.dictation.personalVoice === true),
+      list: () => Promise.resolve([]),
+      speak: over.speak ?? (() => Promise.resolve()),
+      stop: () => Promise.resolve(),
+    },
+    permStatus: () => Promise.resolve({ mic: "unknown" }),
+    permRequestMic: () => Promise.resolve(false),
+    permOpenSettings: () => Promise.resolve(),
+  };
+}
+
 // Installed before DesktopCapabilitiesProvider mounts. Playwright's chromium
 // lane has no Electron bridge, so without this stub the card would deny with
 // the browser reason instead of the macOS 14 sentence this path exists for.
 if (typeof window !== "undefined" && !window.ogb) {
-  window.ogb = {
-    platform: "darwin",
-    getCapabilities: () => Promise.resolve(deniedCapabilities),
-    onCapabilitiesChanged: () => () => {},
-  } as unknown as Window["ogb"];
+  window.ogb = personalVoiceDesktopBridge();
 }
 
 const configuredTts: ConfigStatus = {

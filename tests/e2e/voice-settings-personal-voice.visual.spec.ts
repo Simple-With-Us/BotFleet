@@ -107,8 +107,10 @@ test('visual: Personal Voice denial after a personal: voice id is submitted', as
   const denial = 'Personal Voices need macOS 14 or later, or an iPhone';
   await expect(board.getByRole('alert').filter({ hasText: denial })).toBeVisible();
   // The id is refused, not written onto the bot. The picker stays on the
-  // workspace default instead of selecting the personal: row.
+  // workspace default instead of selecting the personal: row, and the typed
+  // id stays in the still-open form.
   await expect(board.getByRole('combobox', { name: "Assistant's voice" })).toHaveValue('');
+  await expect(board.getByRole('textbox', { name: 'Custom Voice ID' })).toHaveValue('personal:fixture-voice');
   await expect(board.getByText('Apple Personal Voice: fixture-voice')).toHaveCount(0);
 
   await expect(board).toHaveScreenshot('personal-voice-denied.png', stableShot);

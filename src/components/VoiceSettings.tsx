@@ -14,6 +14,14 @@ import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
 
 const SAMPLE = "Morning.  Overnight the tests went green, and I left two notes for you in the thread.";
+
+function personalVoiceDisabledReasonFor(ready: boolean, reasonCode: string | undefined): string {
+  if (!ready) return "Checking Personal Voice availability";
+  if (reasonCode === "requires-macos-14") return "Personal Voices need macOS 14 or later, or an iPhone";
+  if (reasonCode === "unsupported-platform") return "Personal Voices play on-device on a Mac or iPhone";
+  return "Personal Voice is not available on this computer";
+}
+
 const MINIMAX_KEY_URL = "https://platform.minimax.io/user/basic-information/interface-key";
 
 export function VoiceSettings({
@@ -30,6 +38,12 @@ export function VoiceSettings({
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A Personal Voice refusal is a condition, not a stored sentence. The
+  // visible copy is whatever the current reason code says, so a refresh
+  // from "not available" to "not available on this computer" cannot leave
+  // the previous sentence stuck, and a later accepted voice clears it
+  // without comparing those strings.
+  const [personalVoiceDenied, setPersonalVoiceDenied] = useState(false);
   const [voices, setVoices] = useState<Array<{ id: string; label: string; description?: string }>>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
 
@@ -59,40 +73,54 @@ export function VoiceSettings({
   const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   // `requires-macos-14` means this computer is a Mac, just not new enough.
   // Naming only "Mac or iPhone" is false there, and naming any platform
-  // before capabilities arrive is a guess.
-  const personalVoiceDisabledReason = !capabilitiesReady
-    ? "Checking Personal Voice availability"
-    : capabilities.dictation.reasonCode === "requires-macos-14"
-      ? "Personal Voices need macOS 14 or later, or an iPhone"
-      : capabilities.dictation.reasonCode === "unsupported-platform"
-        ? "Personal Voices play on-device on a Mac or iPhone"
-        : "Personal Voice is not available on this computer";
+  // before capabilities arrive is a guess. The code, not a previously
+  // rendered sentence, decides the copy.
+  const personalVoiceDisabledReason = personalVoiceDisabledReasonFor(
+    capabilitiesReady,
+    capabilities.dictation.reasonCode,
+  );
+
+  // initialDesktopCapabilities() hardcodes personalVoice false, then the
+  // effect runs again when the real flag arrives. Add and clone await the
+  // network and loadVoices before they commit, and that await is long
+  // enough for capabilities to resolve. Read the gate at call time so the
+  // commit function from the render that started the request cannot drop a
+  // Personal Voice that is allowed now, or hide the denial because ready
+  // was still false then.
+  const personalVoiceAllowedRef = useRef(personalVoiceAllowed);
+  personalVoiceAllowedRef.current = personalVoiceAllowed;
+  const capabilitiesReadyRef = useRef(capabilitiesReady);
+  capabilitiesReadyRef.current = capabilitiesReady;
+  const capabilitiesRef = useRef(capabilities);
+  capabilitiesRef.current = capabilities;
+  const loadRequestRef = useRef(0);
 
   // One gate for every way a voice id becomes this bot's voice: the picker,
   // a typed custom id, and a clone result. Free text can start with
   // personal: or apple-personal:, and saving that on a computer that cannot
-  // speak it is the same refusal as picking it.
-  const commitVoice = (next: string) => {
-    if (isPersonalVoice(next) && !personalVoiceAllowed) {
-      if (capabilitiesReady) setError(personalVoiceDisabledReason);
-      return;
+  // speak it is the same refusal as picking it. False means the id was
+  // refused. The picker reports that on the shared banner. Add Voice ID
+  // passes reportDenial false and keeps the message in the still-open form.
+  const commitVoice = (next: string, reportDenial = true): boolean => {
+    const allowed = personalVoiceAllowedRef.current;
+    const ready = capabilitiesReadyRef.current;
+    if (isPersonalVoice(next) && !allowed) {
+      if (ready && reportDenial) setPersonalVoiceDenied(true);
+      return false;
     }
-    setError((current) => (current === personalVoiceDisabledReason ? null : current));
+    setPersonalVoiceDenied(false);
     onPatch({ voice: next });
+    return true;
   };
 
   // The single loader. Every refresh path (mount, key save, add, clone,
   // delete) goes through here, so the Personal Voice merge can never be
   // dropped by a refresh that only reloads the harness list.
   //
-  // initialDesktopCapabilities() hardcodes personalVoice false, then the
-  // effect runs again when the real flag arrives. Read the gate at call
-  // time so a clone or add that started on the optimistic false still
-  // merges, and ignore every result but the latest so a slow first
-  // response cannot overwrite that merge or wipe the list from its catch.
-  const personalVoiceAllowedRef = useRef(personalVoiceAllowed);
-  personalVoiceAllowedRef.current = personalVoiceAllowed;
-  const loadRequestRef = useRef(0);
+  // Read the gate at call time so a clone or add that started on the
+  // optimistic false still merges, and ignore every result but the latest
+  // so a slow first response cannot overwrite that merge or wipe the list
+  // from its catch.
 
   const loadVoices = () => {
     const requestId = ++loadRequestRef.current;
@@ -177,11 +205,22 @@ export function VoiceSettings({
       if (res.error) {
         setCustomError(res.error);
       } else {
+        await loadVoices();
+        const addedId = res.voice?.id;
+        // Refuse before clearing. A personal: id on a computer that cannot
+        // speak it must leave the typed id and label in the open form.
+        if (addedId && !commitVoice(addedId, false)) {
+          if (capabilitiesReadyRef.current) {
+            setCustomError(personalVoiceDisabledReasonFor(
+              true,
+              capabilitiesRef.current.dictation.reasonCode,
+            ));
+          }
+          return;
+        }
         setCustomVoiceId("");
         setCustomVoiceLabel("");
         setCustomOpen(false);
-        await loadVoices();
-        if (res.voice?.id) commitVoice(res.voice.id);
       }
     } catch (e) {
       setCustomError(e instanceof Error ? e.message : "Failed to add voice identifier.");
@@ -193,6 +232,9 @@ export function VoiceSettings({
   const handleDeleteVoice = async (voiceId: string) => {
     try {
       await api(`/api/tts/custom-voice/${encodeURIComponent(voiceId)}`, { method: "DELETE" });
+      // Deleting is not a voice save, but it does leave the previous
+      // Personal Voice refusal behind if nothing clears that condition.
+      setPersonalVoiceDenied(false);
       if (bot.voice === voiceId) {
         onPatch({ voice: "" });
       }
@@ -648,6 +690,9 @@ export function VoiceSettings({
           })}
         </div>
       </div>
+      {personalVoiceDenied && (
+        <div role="alert" className="mt-2 text-[12px] text-danger">{personalVoiceDisabledReason}</div>
+      )}
       {error && <div role="alert" className="mt-2 text-[12px] text-danger">{error}</div>}
     </div>
   );
