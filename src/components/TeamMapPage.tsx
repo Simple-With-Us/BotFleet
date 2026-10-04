@@ -436,3 +436,15 @@ export function TeamMapPage() {
     </main>
   );
 }
+
+/** Visual-spec harness for tests/e2e/team-map-context.visual.spec.ts.
+ *  Mounts the real shared-context dialog.  The spec fulfills
+ *  GET /api/section-context with a fixed payload so the dialog can leave
+ *  its loading state.  That route is served by the bot server, which this
+ *  lane does not run.  The sentence in the dialog header is this component's
+ *  own JSX. */
+export function TeamMapSharedContextVisualFixture() {
+  return (
+    <SectionContextDialog section="ops" label="Operations" onClose={() => {}} />
+  );
+}
