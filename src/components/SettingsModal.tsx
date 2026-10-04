@@ -669,9 +669,7 @@ export function ConversationModeRow() {
           const copy = CONVERSATION_MODE_COPY[mode];
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
-          const displaySubtitle = mode === "projects"
-            ? `Categories with any number of threads under them.${"\u00A0 "}Each thread picks a model.${"\u00A0 "}Named bots stay hidden.`
-            : copy.subtitle;
+          const displaySubtitle = copy.subtitle;
           return (
             <button
               key={mode}

@@ -5,19 +5,20 @@ import { initialState, StoreContext, StoreProvider, type AppState } from "@/stat
 
 describe("SettingsModal", () => {
   beforeAll(() => {
-    if (typeof window === "undefined" || !window.ogb?.updater) {
-      (globalThis as unknown as { window: unknown }).window = {
-        ogb: {
-          updater: {
-            setEnabled: () => {},
-          },
+    const existing = (globalThis as any).window ?? {};
+    (globalThis as any).window = Object.assign(existing, {
+      ogb: {
+        updater: {
+          setEnabled: () => {},
         },
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => true,
-        matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
-      };
-    }
+      },
+      addEventListener: existing.addEventListener ?? (() => {}),
+      removeEventListener: existing.removeEventListener ?? (() => {}),
+      dispatchEvent: existing.dispatchEvent ?? (() => true),
+      matchMedia: existing.matchMedia ?? (() => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} })),
+      setTimeout: existing.setTimeout ?? globalThis.setTimeout.bind(globalThis),
+      clearTimeout: existing.clearTimeout ?? globalThis.clearTimeout.bind(globalThis),
+    });
   });
 
   it("renders Workspace Arrangement and update settings with proper copy and spacing", async () => {
