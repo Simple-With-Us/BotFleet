@@ -437,6 +437,14 @@ export function ComputerPanel({
     const timer = window.setTimeout(() => setNowMs(Date.now()), remaining + 10);
     return () => window.clearTimeout(timer);
   }, [lastFrameAt, nowMs]);
+  // The age of the picture the store is holding.  Tracked apart from
+  // `lastFrameAt` on purpose: that one is zeroed whenever a new stream is
+  // subscribed or a turn begins, because the gate is asking "has this turn
+  // proven it streams?" — but the store's frame is never cleared, so zero
+  // there means "unproven", not "infinitely old".  Using it as the live
+  // frame's age let a leftover polled capture outrank a live frame that was
+  // genuinely on screen.  The `key={bot.id}` remount is what scopes this.
+  const [liveFrameAt, setLiveFrameAt] = useState(0);
   const wasBusy = useRef(bot.busy);
   useEffect(() => {
     if (wasBusy.current === bot.busy) return;
@@ -471,6 +479,7 @@ export function ComputerPanel({
           const frame = parsed.data;
           const at = Date.now();
           setLastFrameAt(at);
+          setLiveFrameAt(at);
           setNowMs(at);
           dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
         }
@@ -504,11 +513,17 @@ export function ComputerPanel({
     const shoot = async () => {
       if (inFlight.current) return;
       inFlight.current = true;
+      const takenAt = Date.now();
       try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+        const { png, format, capturedAt } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
         if (alive) {
           setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-          setPolledAt(Date.now());
+          // Compare PICTURE age, not arrival age.  This capture waited out a
+          // full remote round trip, so stamping it on receipt would let a
+          // slow capture outrank a newer streamed frame — the exact backward
+          // jump the comparison exists to prevent.  Prefer the server's stamp,
+          // taken between the pixels landing and the response leaving.
+          setPolledAt(typeof capturedAt === "number" ? capturedAt : takenAt);
         }
         if (captureFailures.current > 0) {
           captureFailures.current = 0;
@@ -606,11 +621,12 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
-  // The store's `live` frame is never cleared and `polledFrame` is only
-  // replaced when a capture lands, so both persist.  Deciding by age rather
-  // than by which one happens to exist is what keeps the preview from
-  // jumping backwards in time at a turn boundary or a staleness transition.
-  const latestPreview = newestPreview(live, polledFrame, polledAt, lastFrameAt);
+  // Both sources persist: the store's `live` frame is written but never
+  // cleared, and `polledFrame` is replaced only when a capture lands.  Each
+  // carries its own capture time, because "one exists" says nothing about
+  // which is newer — preferring by nullability makes the preview jump
+  // backwards in time at a turn boundary or a staleness transition.
+  const latestPreview = newestPreview(live, polledFrame, polledAt, liveFrameAt);
   const cloudFrame =
     latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
