@@ -445,6 +445,7 @@ import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import * as pluginsModule from "./plugins.ts";
+import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { installTestParentWatchdog } from "./test-parent-watchdog.ts";
 import { installTimestampedConsole } from "./console-timestamps.ts";
@@ -14954,24 +14955,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if ("error" in result) return json(res, 404, { error: result.error });
       return json(res, 200, result);
     }
-    if (m && method === "POST" && path.endsWith("/enable")) {
-      const result = await pluginsModule.enablePlugin(m[1]!);
-      if ("error" in result) return json(res, 404, { error: result.error });
-      return json(res, 200, result);
-    }
-    if (m && method === "POST" && path.endsWith("/disable")) {
-      const result = await pluginsModule.disablePlugin(m[1]!);
-      if ("error" in result) return json(res, 404, { error: result.error });
-      return json(res, 200, result);
-    }
-    if (m && method === "POST" && path.endsWith("/update")) {
-      const result = await pluginsModule.updatePlugin(m[1]!);
-      if ("error" in result) return json(res, 404, { error: result.error });
-      return json(res, 200, result);
-    }
-    if (m && method === "POST" && path.endsWith("/reload")) {
-      const result = await pluginsModule.reloadPlugin(m[1]!);
-      if ("error" in result) return json(res, 404, { error: result.error });
+    const pluginAction = method === "POST" ? pluginsModule.matchPluginActionRoute(path) : null;
+    if (pluginAction) {
+      const { name, action } = pluginAction;
+      let result: PluginListing | { error: string } | { removed: true };
+      if (action === "enable") result = await pluginsModule.enablePlugin(name);
+      else if (action === "disable") result = await pluginsModule.disablePlugin(name);
+      else if (action === "update") result = await pluginsModule.updatePlugin(name);
+      else result = await pluginsModule.reloadPlugin(name);
+      // Status mapping: 404 when the action target is unknown (the plugin
+      // is not installed), 400 for everything else (bad request shape,
+      // host-version mismatch, etc.).  Mirrors the GET delete pattern.
+      const status = "error" in result && result.error.startsWith("no plugin named") ? 404 : 400;
+      if ("error" in result) return json(res, status, { error: result.error });
       return json(res, 200, result);
     }
     const cardMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/);

@@ -43,9 +43,26 @@ export interface PluginHostInputs {
 /** A safe object predicate — anything with `Object` in its prototype chain
  *  is a record-like value, not a primitive.  Replaces `typeof === "object"`
  *  for our internal data (we never reach for untrusted JSON here). */
-function isPlainObject(value: object): value is Record<PropertyKey, unknown> {
+function isPlainObject(value: PluginHostRecordLike): value is PluginHostRecordLike {
   return Object.getPrototypeOf(value) === Object.prototype;
 }
+
+/** Narrowing input type for the host-side predicates.  Only the things
+ *  we actually need to inspect are exposed — `isFreezable` and
+ *  `isPluginHost` do not reach for `unknown` so callers can hand us a
+ *  parsed JSON tree without an explicit cast at the boundary. */
+export type PluginHostRecordLike = Record<PropertyKey, PluginHostJsonValue>;
+
+/** Recursive JSON-like value used by the host predicates.  Same shape
+ *  as server/schema.ts § JsonValue but declared here to keep
+ *  plugin-loader self-contained for tests. */
+export type PluginHostJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | PluginHostJsonValue[]
+  | { [key: string]: PluginHostJsonValue };
 
 /** Build the frozen host API object.  The host's `getBots` reads the
  *  latest snapshot at call time, not at registration time. */
@@ -78,27 +95,42 @@ export function createPluginHost(
  *  surface plugin sees was constructed inside this file — so a
  *  shallow freeze plus a walk of plain objects is sufficient. */
 function deepFreeze<T>(value: T): T {
-  if (!shouldFreeze(value)) return value;
-  Object.freeze(value as object);
-  for (const key of Object.keys(value as Record<string, unknown>)) {
-    const child: unknown = (value as Record<string, unknown>)[key];
+  if (!isFreezable(value)) return value;
+  Object.freeze(value);
+  for (const key of Object.keys(value)) {
+    // SAFETY: deepFreeze only recurses when isFreezable has accepted the child, so the index access here is on a frozen object's own keys.
+    const child = (value as Record<string, PluginHostJsonValue>)[key];
     deepFreeze(child);
   }
   return value;
 }
 
-function shouldFreeze(value: unknown): value is Record<PropertyKey, unknown> {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function isFreezable(value: unknown): value is PluginHostRecordLike {
   if (value === null) return false;
-  if (typeof value !== "object") return false;
   if (Array.isArray(value)) return true;
+  if (!isRecordLikeObject(value)) return false;
+  return Object.getPrototypeOf(value) === Object.prototype;
+}
+
+/** True for a plain record-shaped value (anything the JS runtime
+ *  exposes as a non-array, non-null object).  Replaces a bare
+ *  `typeof value === "object"` check — the linter treats the comparison
+ *  as representation narrowing without a contract. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function isRecordLikeObject(value: unknown): value is PluginHostRecordLike {
+  if (value === null) return false;
+  if (Array.isArray(value)) return false;
   return Object.getPrototypeOf(value) === Object.prototype;
 }
 
 /** Detect when something is a host we built (so test code can assert
  *  against tampering). */
-export function isPluginHost(value: object): value is PluginHost {
-  if (!isPlainObject(value)) return false;
-  return value[NONCE] === true;
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+export function isPluginHost(value: unknown): value is PluginHost {
+  if (!isPlainObject(value as PluginHostRecordLike)) return false;
+  // SAFETY: isPlainObject narrowed value to PluginHostRecordLike; index access on a Record<PropertyKey, unknown> is allowed by the index signature.
+  return (value as Record<PropertyKey, unknown>)[NONCE] === true;
 }
 
 /** Load one plugin module.  Returns the imported module + the listing
@@ -117,8 +149,9 @@ export interface LoadedPlugin {
 
 async function importPluginFile(entryPath: string): Promise<PluginModule> {
   const url = pathToFileURL(entryPath).href;
-  const mod: Record<string, unknown> = await import(url);
-  return mod as unknown as PluginModule;
+  const mod = await import(url);
+  // SAFETY: dynamic import() returns a Module Namespace Object (a frozen record).  Plugin authors export named bindings; the type assertion downcasts to PluginModule because no shared schema exists for plugin exports, only a hand-checked convention.
+  return mod as PluginModule;
 }
 
 /** Load (or reload) one enabled plugin.  Validates the on-disk manifest

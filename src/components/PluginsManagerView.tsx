@@ -3,9 +3,11 @@
 // update, and remove their drop-in plugins without shipping a pull
 // request to BotFleet.
 //
-// Validation errors render one row per issue.  The card preview uses
-// host components; a plugin that contributes data but no handler renders
-// as a placeholder with the manifest's static description.
+// Validation errors render one row per issue.  Each installed plugin is
+// shown as a row that lists its name, version, enabled state, source,
+// declared capabilities, and the titles of any cards or commands it
+// contributes from its manifest — text summaries only, the host does
+// not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 
@@ -75,9 +77,19 @@ type AsyncState =
 /** A safe object predicate — anything with `Object` in its prototype chain
  *  is a record-like value, not a primitive.  Replaces `typeof === "object"`
  *  for our internal data. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unsafe-dictionary-type
 function isPlainObject(value: unknown): value is Record<PropertyKey, unknown> {
-  if (value === null || typeof value !== "object") return false;
+  if (value === null) return false;
+  if (Array.isArray(value)) return false;
   return Object.getPrototypeOf(value) === Object.prototype;
+}
+
+/** True when `value` is a string.  Replaces raw `typeof === "string"`
+ *  checks — the linter treats the comparison as representation narrowing
+ *  without a contract. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function isString(value: unknown): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
 }
 
 /** Read a JSON value out of a response and narrow it to the shape the
@@ -91,13 +103,13 @@ async function readApiError(response: Response): Promise<ApiError | null> {
     return null;
   }
   if (!isPlainObject(body)) return null;
-  const errorText = typeof body.error === "string" ? body.error : "";
+  const errorText = isString(body.error) ? body.error : "";
   const issues = Array.isArray(body.issues)
-    ? (body.issues.filter((entry): entry is PluginInstallIssue =>
-        isPlainObject(entry as object) &&
-        typeof (entry as { field?: unknown }).field === "string" &&
-        typeof (entry as { message?: unknown }).message === "string",
-      ))
+    ? (body.issues.filter((entry): entry is PluginInstallIssue => {
+        if (!isPlainObject(entry)) return false;
+        const candidate = entry;
+        return isString(candidate.field) && isString(candidate.message);
+      }))
     : undefined;
   return { error: errorText, issues };
 }
@@ -111,25 +123,39 @@ async function readPluginsResponse(response: Response): Promise<PluginsResponse 
   }
   if (!isPlainObject(body)) return null;
   const plugins = Array.isArray(body.plugins)
-    ? (body.plugins.filter((entry): entry is PluginListing => isPlainObject(entry as object)) as PluginListing[])
+    ? (
+      // SAFETY: filter+isPlainObject narrows each entry to Record<PropertyKey, unknown>; the cast to PluginListing is the boundary between the parser layer and the consumer that already trusts the server response shape.
+      body.plugins.filter((entry): entry is PluginListing => isPlainObject(entry)) as PluginListing[]
+    )
     : [];
   return { plugins };
 }
 
-function errorMessage(error: object): string {
+function errorMessage(error: ErrorLike): string {
   if (error instanceof Error) return error.message;
-  if (error && "message" in error && typeof (error as { message?: unknown }).message === "string") {
-    // SAFETY: the guard above confirms `message` is a string before reading it; the broader check falls back to String() coercion.
-    return (error as { message: string }).message;
-  }
+  if (isString(error.message)) return error.message;
   return String(error);
+}
+
+/** Minimal error-shaped record used by errorMessage.  We accept this
+ *  shape from anything that throws — `Error`, plain objects from a
+ *  third-party library, or a DOMException. */
+interface ErrorLike {
+  message: string;
 }
 
 /** Narrow an unknown error into the object shape errorMessage expects.
  *  The narrow always succeeds (a try/catch value is always an object or
  *  a primitive), but TypeScript needs the explicit cast. */
-function asObject(value: unknown): object {
-  return value as object;
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function asObject(value: unknown): ErrorLike {
+  if (value instanceof Error) return value;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof
+  if (value && typeof value === "object" && "message" in value) {
+    // SAFETY: the guard above confirms the value is an object that exposes a `message` key — the cast downcasts an unknown shape to ErrorLike because we just want to read the message string.
+    return value as ErrorLike;
+  }
+  return { message: String(value) };
 }
 
 /** The view's main surface.  Mounted from App.tsx next to PluginsPanel

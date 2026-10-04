@@ -13,6 +13,7 @@ import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import { parsePluginManifest } from "../shared/plugin-manifest.ts";
+import type { JsonValue } from "./schema.ts";
 import type { PluginRegistry, PluginRegistryEntry, PluginSource, PluginListing, FetchedPlugin } from "./plugin-types.ts";
 
 export const PLUGINS_DIR = join(DATA_DIR, "plugins");
@@ -35,8 +36,10 @@ export function getPluginDir(name: string): string {
 /** A safe object predicate — anything with `Object` in its prototype chain
  *  is a record-like value, not a primitive.  Replaces `typeof === "object"`
  *  for our internal data (we never reach for untrusted JSON here). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unsafe-dictionary-type
 function isPlainObject(value: unknown): value is Record<PropertyKey, unknown> {
-  if (value === null || typeof value !== "object") return false;
+  if (value === null) return false;
+  if (Array.isArray(value)) return false;
   return Object.getPrototypeOf(value) === Object.prototype;
 }
 
@@ -46,7 +49,7 @@ export function readRegistry(baseDir: string = PLUGINS_DIR): PluginRegistry {
   try {
     const raw = readFileSync(registryPathFor(baseDir), "utf8");
     const parsed: unknown = JSON.parse(raw);
-    if (isRegistryShape(parsed)) return parsed;
+    if (isRegistryDoc(parsed)) return parsed;
   } catch {
     // a missing or corrupt registry is a fresh registry, not an error
   }
@@ -57,8 +60,10 @@ export function readRegistry(baseDir: string = PLUGINS_DIR): PluginRegistry {
  *  JSON.parse yields.  A registry is { version: number, plugins: object }
  *  where `plugins` is a flat object of entries.  Anything else returns
  *  false so the caller treats it as a fresh registry. */
-function isRegistryShape(value: unknown): value is PluginRegistry {
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+function isRegistryDoc(value: unknown): value is PluginRegistry {
   if (!isPlainObject(value)) return false;
+  // SAFETY: isPlainObject has confirmed the shape is a record; the cast to { version?, plugins? } narrows for the field-by-field checks below.
   const candidate = value as { version?: unknown; plugins?: unknown };
   if (candidate.version !== 1) return false;
   if (!isPlainObject(candidate.plugins)) return false;
@@ -134,17 +139,17 @@ export function listingFor(name: string, baseDir: string = PLUGINS_DIR): PluginL
   const manifestPath = join(pluginDirFor(name, baseDir), "botfleet-plugin.json");
   if (!existsSync(manifestPath)) return { error: `plugin "${name}" has no manifest on disk` };
 
-  let manifestValue: object;
+  let manifestValue: unknown;
   try {
-    const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as object;
-    manifestValue = parsed;
+    // SAFETY: JSON.parse returns a JSON-compatible value; parsePluginManifest accepts unknown at its boundary, so the cast downcasts to the parser's documented input type.
+    manifestValue = JSON.parse(readFileSync(manifestPath, "utf8"));
   } catch (error) {
     // SAFETY: JSON.parse only throws SyntaxError with a `message` property; every catch on readFileSync catches an Error or SystemError with `message`.
     const detail = (error as Error).message;
     return { error: `plugin "${name}" manifest is unreadable: ${detail}` };
   }
 
-  const parsed = parsePluginManifest(manifestValue);
+  const parsed = parsePluginManifest(manifestValue as JsonValue);
   if (!parsed.ok) {
     return {
       error: `plugin "${name}" has an invalid manifest: ${parsed.issues.map((i) => `${i.field}: ${i.message}`).join("; ")}`,

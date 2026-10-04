@@ -90,7 +90,9 @@ describe("fetchPluginFromGit", () => {
 });
 
 function makeFakeFetcher(responses: FakeResponseMap): typeof fetch {
+  // SAFETY: the cast downcasts the inner async closure to `typeof fetch` because the wrapper has the same call signature, but the inner function takes only the inputs the global fetch accepts.  Plugin authors do not see this type — it lives behind this single test helper.
   return (async (input: string | URL) => {
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof
     const url = typeof input === "string" ? input : input.toString();
     const response = responses[url];
     if (!response) {
@@ -100,5 +102,5 @@ function makeFakeFetcher(responses: FakeResponseMap): typeof fetch {
       return new Response(response.value, { status: 200, headers: { "content-type": "text/plain" } });
     }
     return new Response(JSON.stringify(response.value), { status: 200, headers: { "content-type": "application/json" } });
-  }) as unknown as typeof fetch;
+  }) as typeof fetch;
 }

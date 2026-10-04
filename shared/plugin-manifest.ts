@@ -14,6 +14,15 @@ import { z } from "zod";
 
 export const HOST_API_VERSION = 1;
 
+/** Recursive JSON value type.  Mirrors server/schema.ts § JsonValue.
+ *  Declared here so a caller at the shared/plugin-manifest.ts boundary
+ *  can hand a parsed JSON tree in without re-defining the same union. */
+export type JsonPrimitive = null | boolean | number | string;
+export interface JsonObject {
+  [key: string]: JsonValue;
+}
+export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+
 /** Plugin name gate.  Same shape as skill names so the on-disk layout
  *  stays predictable and `..` is structurally impossible. */
 export const PLUGIN_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -210,7 +219,7 @@ export type PluginManifestParseResult =
  *  manifest.  Returns the typed issues so the UI can render them
  *  one row at a time.  Accepts `unknown` because callers reach this
  *  function with a `JSON.parse` result that has no narrower type. */
-export function parsePluginManifest(value: object): PluginManifestParseResult {
+export function parsePluginManifest(value: JsonValue | unknown): PluginManifestParseResult {
   const result = pluginManifestSchema.safeParse(value);
   if (result.success) {
     return {
@@ -239,9 +248,10 @@ export function parsePluginManifest(value: object): PluginManifestParseResult {
 /** Parse a JSON string.  Same shape as parsePluginManifest, with a
  *  synthesized "invalid JSON" issue when the string does not parse. */
 export function parsePluginManifestJson(text: string): PluginManifestParseResult {
-  let value: object;
+  let value: unknown;
   try {
-    value = JSON.parse(text) as object;
+    // SAFETY: JSON.parse returns `any`; we pass it straight to zod's safeParse which accepts unknown, so the cast does not narrow in any meaningful way and the unknown alias below is the type the caller will see.
+    value = JSON.parse(text);
   } catch (error) {
     return {
       ok: false,
@@ -254,7 +264,7 @@ export function parsePluginManifestJson(text: string): PluginManifestParseResult
       ],
     };
   }
-  return parsePluginManifest(value);
+  return parsePluginManifest(value as JsonValue);
 }
 
 /** A conservative semver comparison that handles the four operators

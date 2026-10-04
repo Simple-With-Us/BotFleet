@@ -49,7 +49,6 @@ const {
   reloadPlugin,
   removePlugin,
   runPluginCommand,
-  updatePlugin,
   _loadedNames,
   _resetForTests,
   initPluginRuntime,

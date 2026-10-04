@@ -21,7 +21,7 @@ export function getCardData({ cardId, host }) {
   return { result: { a: bots.length, b: bots.length * 2 } };
 }
 
-export function runCommand({ command, args, host }) {
+export function runCommand({ command: _command, args, host }) {
   const who = args?.trim() || "world";
   host.log("info", `/hello ${who}`);
   return `Hello, ${who}, from your plugin.`;

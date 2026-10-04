@@ -64,6 +64,21 @@ export interface PluginRuntimeInputs {
 let runtimeInputs: PluginRuntimeInputs | null = null;
 const loaded = new Map<string, LoadedPlugin>();
 
+export type PluginAction = "enable" | "disable" | "update" | "reload";
+
+/** Pure route matcher for plugin action endpoints.  Lives in server/
+ *  plugins.ts so server/index.ts can dispatch through it without taking
+ *  on the path-parsing responsibility itself.  Returns the plugin name
+ *  and the action when the path matches `/api/plugins/<name>/<action>`
+ *  exactly; every other shape returns null.  Anchored with `$` so a
+ *  path like `/api/plugins/foo/enable/extra` does not match. */
+export function matchPluginActionRoute(path: string): { name: string; action: PluginAction } | null {
+  const m = path.match(/^\/api\/plugins\/([\w][\w-]*)\/(enable|disable|update|reload)$/);
+  if (!m) return null;
+  // SAFETY: the regex group's capture set is the literal `enable|disable|update|reload`, so any match group [2] is one of those strings.  The cast to PluginAction narrows the union.
+  return { name: m[1]!, action: m[2]! as PluginAction };
+}
+
 /** Bootstrap the plugin runtime with host-side inputs.  Called once at
  *  server boot from server/index.ts. */
 export function initPluginRuntime(inputs: PluginRuntimeInputs): void {
@@ -100,6 +115,19 @@ async function installFromFetched(
   }
 
   const manifest = parsed.manifest;
+  // The manifest's `entry` is regex-legal as long as it points at any
+  // relative .mjs/.js path, but the path has to actually exist among the
+  // fetched files — a manifest claiming entry: "sub/dir/plugin.mjs" with
+  // only top-level files in the tree would install cleanly and then fail
+  // at enable with "failed to load".  v1 keeps installs top-level-only,
+  // so verify the entry is one of the files we are about to write.
+  const entryFiles = fetched.files.filter((file) => file.path === manifest.entry);
+  if (entryFiles.length === 0) {
+    return {
+      error: `entry: "${manifest.entry}" is not one of the installed plugin files`,
+    };
+  }
+
   const registry = readRegistry(baseDir);
   if (registry.plugins[manifest.name]) {
     return { error: `a plugin named "${manifest.name}" is already installed — remove it first` };
@@ -175,13 +203,24 @@ async function installFromFolder(
   return listingOrError(result.entry.name, baseDir);
 }
 
-/** Enable a plugin: validate, import its module, hand it the host. */
+/** Enable a plugin: validate, import its module, hand it the host.
+ *  Refuses to enable plugins whose host API version is incompatible —
+ *  that is the design promise in docs/plugins/DESIGN.md § Version gate,
+ *  and enablePlugin must honour it the same way bootPluginRuntime does. */
 export async function enablePlugin(
   name: string,
   baseDir: string = PLUGINS_DIR,
 ): Promise<PluginListing | { error: string }> {
   const listing = listingOrError(name, baseDir);
   if ("error" in listing) return listing;
+
+  // Gate on the host API version.  Refuse before loading the module so a
+  // mismatch never reaches the loaded cache.
+  if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
+    return {
+      error: `plugin "${name}" requires botfleet "${listing.botfleet}" but the host API is ${HOST_API_VERSION}`,
+    };
+  }
 
   if (!loaded.has(name)) {
     const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);

@@ -25,7 +25,7 @@ export function getCardData({ cardId, host }) {
   return { result: counts };
 }
 
-export function runCommand({ command, args, host }) {
+export function runCommand({ command: _command, args, host }) {
   const bots = host.getBots();
   const counts = bots.reduce(
     (acc, bot) => {

@@ -13,6 +13,7 @@ import {
   initPluginRuntime,
   installPlugin,
   listPlugins,
+  matchPluginActionRoute,
   reloadPlugin,
   removePlugin,
   runPluginCommand,
@@ -20,7 +21,7 @@ import {
   _loadedNames,
   _resetForTests,
 } from "./plugins.ts";
-import { clearPluginsDir, readRegistry } from "./plugin-registry.ts";
+import { clearPluginsDir, readRegistry, setPluginEntry } from "./plugin-registry.ts";
 import { satisfiesBotfleetVersion, HOST_API_VERSION } from "../shared/plugin-manifest.ts";
 
 const FIXTURE = join(process.cwd(), "tests", "fixtures", "example-plugin");
@@ -137,6 +138,7 @@ describe("plugin lifecycle", () => {
       await installPlugin(sourceDir, baseDir);
       await enablePlugin("fleet-overview", baseDir);
       const manifestPath = join(sourceDir, "botfleet-plugin.json");
+      // SAFETY: this test owns the manifest it just wrote, so the JSON.parse result has exactly the shape we wrote — a one-key object — and we only read `version`.
       const original = JSON.parse(readFileSync(manifestPath, "utf8")) as { version: string };
       original.version = "1.1.0";
       writeFileSync(manifestPath, JSON.stringify(original, null, 2));
@@ -199,5 +201,125 @@ describe("host API version gate", () => {
   it("satisfiesBotfleetVersion recognizes >=1 against the host version", () => {
     assert.equal(satisfiesBotfleetVersion(">=1", HOST_API_VERSION), true);
     assert.equal(satisfiesBotfleetVersion(">=2", HOST_API_VERSION), false);
+  });
+
+  it("enablePlugin refuses when the listing declares a higher host version", async () => {
+    await installPlugin(FIXTURE, baseDir);
+    const entry = readRegistry(baseDir).plugins["fleet-overview"];
+    if (!entry) throw new Error("fixture install did not record an entry");
+    // SAFETY: this test mutates the on-disk registry entry it just wrote;
+    // the next line restores it so the test never leaves stale state on disk.
+    setPluginEntry({ ...entry, enabled: false }, baseDir);
+    writeFileSync(
+      join(baseDir, "fleet-overview", "botfleet-plugin.json"),
+      JSON.stringify({
+        ...JSON.parse(readFileSync(join(baseDir, "fleet-overview", "botfleet-plugin.json"), "utf8")) as Record<string, unknown>,
+        botfleet: ">=2",
+      }),
+    );
+    const result = await enablePlugin("fleet-overview", baseDir);
+    assert.ok("error" in result, "enablePlugin should refuse on a host-version mismatch");
+    assert.match(
+      result.error,
+      /requires botfleet ">=2" but the host API is \d/,
+    );
+    // The plugin must remain disabled after the refused enable.
+    const after = readRegistry(baseDir).plugins["fleet-overview"];
+    assert.equal(after?.enabled, false, "refused enable must not flip the flag");
+    // The module must NOT have been loaded.
+    assert.ok(
+      !_loadedNames().includes("fleet-overview"),
+      "refused enable must not import the module",
+    );
+  });
+});
+
+describe("matchPluginActionRoute", () => {
+  it("matches the four action paths with the right name and action", () => {
+    for (const action of ["enable", "disable", "update", "reload"] as const) {
+      const result = matchPluginActionRoute(`/api/plugins/fleet-overview/${action}`);
+      assert.deepEqual(result, { name: "fleet-overview", action });
+    }
+  });
+
+  it("returns null for /api/plugins/foo (no action segment)", () => {
+    assert.equal(matchPluginActionRoute("/api/plugins/foo"), null);
+  });
+
+  it("returns null for /api/plugins/foo/cards/x (card path, not an action)", () => {
+    assert.equal(matchPluginActionRoute("/api/plugins/foo/cards/x"), null);
+  });
+
+  it("returns null for /api/plugins/foo/enable/extra (trailing segment)", () => {
+    assert.equal(matchPluginActionRoute("/api/plugins/foo/enable/extra"), null);
+  });
+
+  it("returns null for malformed names", () => {
+    assert.equal(matchPluginActionRoute("/api/plugins/-bad/enable"), null);
+    assert.equal(matchPluginActionRoute("/api/plugins/.bad/enable"), null);
+    assert.equal(matchPluginActionRoute("/api/plugins//enable"), null);
+  });
+
+  it("returns null for an unknown action verb", () => {
+    assert.equal(matchPluginActionRoute("/api/plugins/foo/install"), null);
+  });
+});
+
+describe("installFromFetched entry validation", () => {
+  it("rejects when the manifest entry is not among the fetched files", async () => {
+    // A folder that contains a manifest pointing at an entry file that does
+    // NOT exist alongside the manifest.  buildPluginTree would write only
+    // the listed files; without the entry, enable would fail later.
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-missing-entry-"));
+    try {
+      writeFileSync(
+        join(sourceDir, "botfleet-plugin.json"),
+        JSON.stringify({
+          name: "missing-entry",
+          version: "1.0.0",
+          description: "fixture with a phantom entry",
+          botfleet: ">=1",
+          // SAFETY: this test deliberately writes a manifest whose entry
+          // is NOT among the files the folder carries, so we can prove
+          // installFromFetched refuses before touching the registry.
+          entry: "phantom.mjs",
+          capabilities: [],
+          contributes: {},
+        }),
+      );
+      const result = await installPlugin(sourceDir, baseDir);
+      assert.ok("error" in result, "install should refuse when entry is missing");
+      assert.match(result.error, /^entry: "phantom\.mjs" is not one of the installed plugin files$/);
+      // The registry must not have been mutated.
+      assert.equal(readRegistry(baseDir).plugins["missing-entry"], undefined);
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("installs when the manifest entry IS among the fetched files", async () => {
+    // Same shape as the first test, but the entry file IS present.
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-present-entry-"));
+    try {
+      writeFileSync(
+        join(sourceDir, "botfleet-plugin.json"),
+        JSON.stringify({
+          name: "present-entry",
+          version: "1.0.0",
+          description: "fixture whose entry file is present",
+          botfleet: ">=1",
+          entry: "plugin.mjs",
+          capabilities: [],
+          contributes: {},
+        }),
+      );
+      writeFileSync(join(sourceDir, "plugin.mjs"), "export default {};\n");
+      const result = await installPlugin(sourceDir, baseDir);
+      assert.ok(!("error" in result), `install should succeed, got: ${"error" in result ? result.error : ""}`);
+      assert.equal(result.name, "present-entry");
+      assert.equal(result.entry, "plugin.mjs");
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
   });
 });

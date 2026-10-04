@@ -98,6 +98,7 @@ describe("plugin registry", () => {
     setPluginEntry(entry, baseDir);
     const listing = listingFor("bad-json", baseDir);
     assert.ok("error" in listing);
+    // SAFETY: the previous line narrowed `listing` to an error variant; the cast is for the reader's benefit so they don't have to inspect the conditional above.
     assert.match((listing as { error: string }).error, /unreadable|invalid/i);
   });
 
