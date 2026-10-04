@@ -23,6 +23,7 @@
 import { createHash } from "node:crypto";
 
 import type { AppConfig } from "./config.ts";
+import { KNOB_INFISICAL_NAMES } from "./knob-map.ts";
 
 /** One credential BotFleet knows how to consume.
  *
@@ -164,6 +165,16 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
     reloadProviders: false,
   },
   {
+    id: "deepseek.url",
+    label: "DeepSeek base URL",
+    section: "deepseek",
+    path: ["url"],
+    env: ["DEEPSEEK_URL"],
+    infisicalName: "DEEPSEEK_URL",
+    secret: false,
+    reloadProviders: true,
+  },
+  {
     id: "usage.ingestUrl",
     label: "Usage Monitor ingest URL",
     section: "usage",
@@ -275,8 +286,13 @@ export const SECRET_FIELDS: readonly SecretFieldSpec[] = [
   },
 ] as const;
 
-/** Every Infisical name this process will accept, built once from the table. */
-const MAPPED_NAMES: ReadonlySet<string> = new Set(SECRET_FIELDS.map((spec) => spec.infisicalName));
+/** Every Infisical name this process will accept, built once from the table.
+ * Knob names ride along: the snapshot is the one listing for both layers,
+ * and `knob-map.ts` resolves its own rows off it. */
+const MAPPED_NAMES: ReadonlySet<string> = new Set([
+  ...SECRET_FIELDS.map((spec) => spec.infisicalName),
+  ...KNOB_INFISICAL_NAMES,
+]);
 
 export type SecretSource = "infisical" | "env" | "file" | "none";
 

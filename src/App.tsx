@@ -1,7 +1,8 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
-import { StoreProvider, useStore, type AppSettingsSection } from "@/state/store";
+import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
+import { eligibleTaskApps } from "@/lib/task-app-context";
 import { ERROR_RECOVERY_EVENT, type ErrorRecoveryDetail } from "@/components/ErrorRow";
 import { Onboarding } from "@/components/Onboarding";
 import { emailGateDone, initAnalytics } from "@/lib/analytics";
@@ -41,6 +42,9 @@ const InspectorPanel = lazy(() =>
 const SettingsModal = lazy(() =>
   import("@/components/SettingsModal").then((m) => ({ default: m.SettingsModal })),
 );
+const NewTaskAppDialog = lazy(() =>
+  import("@/components/NewTaskAppDialog").then((m) => ({ default: m.NewTaskAppDialog })),
+);
 const RoutinesPage = lazy(() =>
   import("@/components/RoutinesPage").then((m) => ({ default: m.RoutinesPage })),
 );
@@ -52,6 +56,11 @@ const LocalVmWorkspace = lazy(() =>
 );
 const SkillRecorderPage = lazy(() =>
   import("@/components/SkillRecorderPage").then((m) => ({ default: m.SkillRecorderPage })),
+);
+import { AppDeck } from "@/components/AppDeck";
+
+const FleetMatrixView = lazy(() =>
+  import("@/components/FleetMatrixView").then((m) => ({ default: m.FleetMatrixView })),
 );
 const TeamMapPage = lazy(() =>
   import("@/components/TeamMapPage").then((m) => ({ default: m.TeamMapPage })),
@@ -84,6 +93,24 @@ function Shell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const group = state.groups.find((g) => g.id === state.selectedId);
   const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
+  const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
+  const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
+  const hasApps = state.groups.some((g) => !g.dm);
+
+  // If a group was chosen in the sidebar or store, keep selectedAppId aligned
+  useEffect(() => {
+    if (group && !group.dm) {
+      setSelectedAppId(group.id);
+    }
+  }, [group?.id]);
+
+  // When selection changes via sidebar or store, yield matrix overview to the selected chat
+  useEffect(() => {
+    if (state.selectedId) {
+      setMatrixOverviewActive(false);
+    }
+  }, [state.selectedId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -173,10 +200,9 @@ function Shell() {
         if (state.selectedId) {
           const targetBot = state.bots.find((b) => b.id === state.selectedId);
           if (targetBot) {
-            dispatch({ type: "newTask", botId: targetBot.id });
+            dispatch({ type: "requestNewTask", botId: targetBot.id });
           }
         }
-        window.dispatchEvent(new CustomEvent("focus-composer"));
       } else if (action === "export-bots") {
         void downloadAllBots().catch(() => {});
       } else if (action === "import-bots") {
@@ -335,46 +361,95 @@ function Shell() {
           menuButtonRef.current?.focus();
         }}
       />
-      {state.activeView === "team-map" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <TeamMapPage />
-        </Suspense>
-      ) : state.activeView === "routines" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <RoutinesPage />
-        </Suspense>
-      ) : state.activeView === "skill-recorder" ? (
-        <Suspense fallback={<PanelFallback />}>
-          <SkillRecorderPage />
-        </Suspense>
-      ) : localVmWorkspaceBotId ? (
-        <Suspense fallback={<PanelFallback />}>
-          <LocalVmWorkspace
-            primaryBotId={localVmWorkspaceBotId}
-            overlayOpen={nativeViewOverlayOpen}
-            onClose={() => setLocalVmWorkspaceBotId(null)}
-            onOpenComputer={openComputerFromWorkspace}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {hasApps && (
+          <AppDeck
+            activeAppId={selectedAppId}
+            isMatrixOverviewActive={matrixOverviewActive}
+            onSelectApp={(appId) => {
+              if (appId === null) {
+                setMatrixOverviewActive(true);
+                setSelectedAppId(null);
+              } else {
+                setMatrixOverviewActive(false);
+                setSelectedAppId(appId);
+                dispatch({ type: "select", id: appId });
+              }
+            }}
+            activeBotId={bot?.id}
+            onSelectBot={(botId) => {
+              setMatrixOverviewActive(false);
+              dispatch({ type: "select", id: botId });
+            }}
+            onSelectGroupChat={(groupId) => {
+              setMatrixOverviewActive(false);
+              dispatch({ type: "select", id: groupId });
+            }}
+            isGroupChatActive={Boolean(!matrixOverviewActive && group && group.id === selectedAppId)}
           />
-        </Suspense>
-      ) : noEngines ? (
-        <NoEngines />
-      ) : group ? (
-        <GroupView key={group.id} group={group} />
-      ) : bot ? (
-        <ChatView key={bot.id} bot={bot} />
-      ) : (
-        <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
-          <Loader2 size={20} className="animate-spin" />
-          <div className="text-[14px]">
-            {state.connected ? "No bots yet" : "Connecting to the bot server…"}
-          </div>
-          {!state.connected && !window.ogb && (
-            <div className="text-[12px]">
-              Start it with <code className="rounded bg-raised px-1.5 py-0.5">pnpm dev:server</code>
-            </div>
+        )}
+        <div className="relative min-h-0 flex-1">
+          {matrixOverviewActive && hasApps && state.activeView === "chat" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <FleetMatrixView
+                onSelectApp={(appId) => {
+                  setMatrixOverviewActive(false);
+                  setSelectedAppId(appId);
+                  dispatch({ type: "select", id: appId });
+                }}
+                onSelectBot={(botId) => {
+                  setMatrixOverviewActive(false);
+                  dispatch({ type: "select", id: botId });
+                }}
+                onOpenAppRoom={(appId) => {
+                  setMatrixOverviewActive(false);
+                  setSelectedAppId(appId);
+                  dispatch({ type: "select", id: appId });
+                }}
+              />
+            </Suspense>
+          ) : state.activeView === "team-map" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <TeamMapPage />
+            </Suspense>
+          ) : state.activeView === "routines" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <RoutinesPage />
+            </Suspense>
+          ) : state.activeView === "skill-recorder" ? (
+            <Suspense fallback={<PanelFallback />}>
+              <SkillRecorderPage />
+            </Suspense>
+          ) : localVmWorkspaceBotId ? (
+            <Suspense fallback={<PanelFallback />}>
+              <LocalVmWorkspace
+                primaryBotId={localVmWorkspaceBotId}
+                overlayOpen={nativeViewOverlayOpen}
+                onClose={() => setLocalVmWorkspaceBotId(null)}
+                onOpenComputer={openComputerFromWorkspace}
+              />
+            </Suspense>
+          ) : noEngines ? (
+            <NoEngines />
+          ) : group ? (
+            <GroupView key={group.id} group={group} />
+          ) : bot ? (
+            <ChatView key={bot.id} bot={bot} />
+          ) : (
+            <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
+              <Loader2 size={20} className="animate-spin" />
+              <div className="text-[14px]">
+                {state.connected ? "No bots yet" : "Connecting to the bot server…"}
+              </div>
+              {!state.connected && !window.ogb && (
+                <div className="text-[12px]">
+                  Start it with <code className="rounded bg-raised px-1.5 py-0.5">pnpm dev:server</code>
+                </div>
+              )}
+            </main>
           )}
-        </main>
-      )}
+        </div>
+      </div>
       {(state.settingsOpen || state.computerOpen || state.inspectorOpen) && (
         <div
           aria-hidden
@@ -410,6 +485,18 @@ function Shell() {
       {state.appSettingsOpen && (
         <Suspense fallback={<PanelFallback />}>
           <SettingsModal />
+        </Suspense>
+      )}
+      {taskCreationBot && (
+        <Suspense fallback={<PanelFallback />}>
+          <NewTaskAppDialog
+            botName={taskCreationBot.name}
+            apps={eligibleTaskApps(taskCreationBot.id, state.groups)}
+            groupNoun={getRoomTerminology(state.config).singular}
+            busy={Boolean(taskCreationBot.busy)}
+            onChoose={(appRef) => dispatch({ type: "newTask", botId: taskCreationBot.id, appRef })}
+            onCancel={() => dispatch({ type: "cancelNewTask" })}
+          />
         </Suspense>
       )}
       {state.pluginsOpen && (
