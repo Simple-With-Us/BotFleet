@@ -106,11 +106,17 @@ export function cleanupHoldReason(dataDir: string): string | null {
 }
 
 /** At startup, add a "left-over" notice for each store that has a set-aside file from an earlier
- * run and no fresher notice of its own.  This is what keeps the banner up after a restart. */
+ * run and no fresher notice of its own.  This is what keeps the banner up after a restart.
+ *
+ * config.json is included.  A set-aside of it is the one that holds the owner's API keys in
+ * plaintext, and the file that replaced it is healthy, so `readStoredConfig` reports no problem and
+ * nothing else would ever name the old copy — the notice would be the only thing that says it is
+ * still there.  When the file is missing as well, this branch's notice is replaced by the more
+ * precise "config-ignored" one that `readStoredConfig` records, because notices are keyed by file,
+ * so the two cannot double up. */
 export function registerLeftOverSetAsideFiles(dataDir: string, now: number = Date.now()): void {
   const newestByFile = new Map<string, SetAsideFile>();
   for (const entry of findSetAsideFiles(dataDir)) {
-    if (entry.file === "config.json") continue;
     newestByFile.set(entry.file, entry);
   }
   for (const [file, entry] of newestByFile) {

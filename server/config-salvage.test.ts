@@ -45,8 +45,7 @@ describe("loadConfig with a config.json it cannot fully use", () => {
   // The config lock renames the old file aside and then renames the staged one
   // over it, so a process that dies between those two syscalls leaves no
   // config.json with its contents in the set-aside.  Reading that as a first
-  // run would put BotFleet on defaults silently — and config.json is the one
-  // file registerLeftOverSetAsideFiles does not raise a notice for.
+  // run would put BotFleet on defaults silently.
   it("does not read a missing config.json as a first run when one was set aside", () => {
     const setAside = join(DATA_DIR, "config.json.corrupt-1790000000000");
     writeFileSync(setAside, JSON.stringify({ profile: { name: "Ada" } }));
@@ -58,6 +57,24 @@ describe("loadConfig with a config.json it cannot fully use", () => {
       expect(listDataFaults().map((fault) => fault.file)).toContain("config.json");
     } finally {
       rmSync(setAside, { force: true });
+    }
+  });
+
+  // The left-over lookup reads the data directory, which grows one message file
+  // per thread, so it is answered from a listing cached against the directory's
+  // own mtime/ctime/size.  A set-aside that appears after an earlier read has
+  // already answered "nothing there" must still be seen, or a first run would be
+  // reported over a quarantined file for the life of the process.
+  it("still sees a set-aside file that appears after an earlier first-run read", () => {
+    loadConfig();
+    expect(warn).not.toHaveBeenCalled();
+
+    writeFileSync(join(DATA_DIR, "config.json.corrupt-1790000000500"), JSON.stringify({ profile: { name: "Ada" } }));
+    try {
+      expect(loadConfig().profile).toBeUndefined();
+      expect(warned()[0]).toContain("config.json.corrupt-1790000000500");
+    } finally {
+      rmSync(join(DATA_DIR, "config.json.corrupt-1790000000500"), { force: true });
     }
   });
 
@@ -151,33 +168,33 @@ describe("loadConfig with a config.json it cannot fully use", () => {
   });
 
   it("treats truncated JSON as unusable, falls back to defaults, and warns once", () => {
-    writeFileSync(path, '{"profile":{"name":"Ada"},"xai":{"key":"sk-fixture-secret-value');
+    writeFileSync(path, '{"profile":{"name":"Ada"},"xai":{"key":"REDACTED_TEST_MARKER');
     const cfg = loadConfig();
     loadConfig();
     expect(cfg.profile).toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warned()[0]).toContain(path);
     expect(warned()[0]).toContain("cut short");
-    expect(warned()[0]).not.toContain("sk-fixture-secret-value");
+    expect(warned()[0]).not.toContain("REDACTED_TEST_MARKER");
     expect(listDataFaults()).toEqual([expect.objectContaining({ file: "config.json", kind: "config-ignored" })]);
   });
 
   it("never logs a fragment of the file from a JSON parser error", () => {
-    writeFileSync(path, "sk-fixture-secret-value");
+    writeFileSync(path, "REDACTED_TEST_MARKER");
     loadConfig();
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warned()[0]).toContain("not valid JSON");
-    expect(warned()[0]).not.toContain("sk-fixture");
-    expect(JSON.stringify(listDataFaults())).not.toContain("sk-fixture");
+    expect(warned()[0]).not.toContain("REDACTED_TEST_MARKER");
+    expect(JSON.stringify(listDataFaults())).not.toContain("REDACTED_TEST_MARKER");
   });
 
   it("never logs a value from a failing field", () => {
-    writeFileSync(path, JSON.stringify({ xai: { key: ["sk-fixture-secret-value"] }, profile: { name: "Ada" } }));
+    writeFileSync(path, JSON.stringify({ xai: { key: ["REDACTED_TEST_MARKER"] }, profile: { name: "Ada" } }));
     const cfg = loadConfig();
     expect(cfg.profile?.name).toBe("Ada");
     expect(warned()[0]).toContain("xai.key");
-    expect(warned()[0]).not.toContain("sk-fixture");
-    expect(JSON.stringify(listDataFaults())).not.toContain("sk-fixture");
+    expect(warned()[0]).not.toContain("REDACTED_TEST_MARKER");
+    expect(JSON.stringify(listDataFaults())).not.toContain("REDACTED_TEST_MARKER");
   });
 
   it("treats an empty file as unusable rather than as a first run", () => {

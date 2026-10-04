@@ -59,6 +59,14 @@ async function open(
 
 const banner = (page: Page) => page.getByTestId('data-fault-banner');
 
+/** A bounding box that is null means the element is not laid out, which is the failure under
+ * test — saying so beats a "cannot read properties of null" from three lines further down. */
+async function boxOf(target: ReturnType<Page['getByTestId']>, name: string) {
+  const box = await target.boundingBox();
+  if (!box) throw new Error(`${name} is not rendered, so it has no box to measure`);
+  return box;
+}
+
 for (const skin of ['studio', 'midnight'] as const) {
   test.describe(`saved-data notice (${skin})`, () => {
     test('says what was set aside, that nothing was deleted, and how to restore it', async ({ page }, testInfo) => {
@@ -78,10 +86,10 @@ for (const skin of ['studio', 'midnight'] as const) {
 
     test('is a full-width bar at the very top, above the app, with nothing overflowing', async ({ page }) => {
       await open(page, { skin });
-      const box = (await banner(page).boundingBox())!;
+      const box = await boxOf(banner(page), 'the saved-data notice');
       expect(box.y).toBeLessThan(2);
       expect(box.width).toBeGreaterThan(1270);
-      const below = (await page.getByTitle('App Settings').boundingBox())!;
+      const below = await boxOf(page.getByTitle('App Settings'), 'App Settings');
       expect(below.y).toBeGreaterThanOrEqual(box.y + box.height - 1);
       const overflow = await page.evaluate(() => ({
         page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -184,8 +192,8 @@ test.describe('saved-data notice behaviour', () => {
   test('wraps on a phone-width window with the dismiss control still in view', async ({ page }, testInfo) => {
     await open(page, { width: 375, height: 800 });
     await expect(banner(page)).toBeVisible();
-    const bar = (await banner(page).boundingBox())!;
-    const close = (await page.getByRole('button', { name: 'Dismiss Saved Data Notice' }).boundingBox())!;
+    const bar = await boxOf(banner(page), 'the saved-data notice');
+    const close = await boxOf(page.getByRole('button', { name: 'Dismiss Saved Data Notice' }), 'Dismiss Saved Data Notice');
     expect(bar.width).toBeLessThanOrEqual(375);
     expect(close.x + close.width).toBeLessThanOrEqual(375);
     expect(bar.height).toBeGreaterThan(80); // several lines, not one clipped line

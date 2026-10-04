@@ -609,9 +609,16 @@ test("updateConfigFile refuses to overwrite an unusable file it cannot set aside
       assert.match(String(error), /config\.json/);
     }
     if (!refused) {
-      // The platform allowed the oversized name, so the case was never set
-      // up.  Assert nothing rather than pass a claim this run did not test;
-      // POSIX takes the branch below on every run.
+      // The platform allowed the oversized name, so the refusal was never set up.  Assert the
+      // outcome it did produce rather than returning silently: a lock that was not released, or a
+      // staged file left behind, would otherwise pass here.  POSIX takes the branch below on
+      // every run.
+      const moved = join(dir, `config.json.corrupt-${"9".repeat(400)}`);
+      assert.ok(existsSync(moved), "the unusable file was moved aside under the long name");
+      assert.equal(readFileSync(moved, "utf8"), "{ not json", "the moved file is byte for byte");
+      assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { fresh: true });
+      assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
+      assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
       return;
     }
     assert.equal(readFileSync(path, "utf8"), "{ not json", "the unusable file is untouched");

@@ -136,7 +136,7 @@ describe("data faults", () => {
     registerLeftOverSetAsideFiles(dir, 1790000001000);
 
     const byFile = new Map(listDataFaults().map((entry) => [entry.file, entry]));
-    expect([...byFile.keys()]).toEqual(["bots.json", "groups.json", "routines.json"]);
+    expect([...byFile.keys()].sort()).toEqual(["bots.json", "config.json", "groups.json", "routines.json"]);
     expect(byFile.get("bots.json")).toMatchObject({
       kind: "left-over",
       setAsideAs: "bots.json.corrupt-1790000000900",
@@ -144,6 +144,16 @@ describe("data faults", () => {
       writesRefused: false,
     });
     expect(byFile.get("routines.json")).toMatchObject({ kind: "left-over", holdsCleanup: false });
+    // config.json is quarantined by the config lock, in another process, and the copy left behind
+    // is the one holding the owner's API keys.  The file that replaced it is healthy, so no other
+    // notice would ever name it, and it must not hold the cleanup sweeps either: it decides
+    // nothing about which bots or rooms still exist.
+    expect(byFile.get("config.json")).toMatchObject({
+      kind: "left-over",
+      setAsideAs: "config.json.corrupt-1790000000400",
+      holdsCleanup: false,
+      writesRefused: false,
+    });
     expect(byFile.get("groups.json")?.kind).toBe("partial");
   });
 });

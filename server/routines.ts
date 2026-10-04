@@ -1619,7 +1619,10 @@ export class RoutineManager {
     }
     if (!this.dirty) return;
     if (this.writesRefused) {
-      this.dirty = false;
+      // `dirty` stays set on purpose.  It is cleared only after a write lands, so a refused write
+      // leaves the pending state marked exactly as a failed write would — a later flush, once the
+      // owner has fixed the file, still tries to persist it.  Clearing it here would report a save
+      // that never happened as done, and the refusal is logged once per file either way.
       logRefusedSave(this.file);
       return;
     }

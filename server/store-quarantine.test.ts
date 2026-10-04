@@ -7,7 +7,7 @@
 // unusable file is moved aside (never deleted), the store starts without it,
 // the state is logged and recorded for the app's banner, and the set-aside file
 // keeps the roster protected across restarts.
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 
@@ -326,12 +326,23 @@ describe("Store with an unusable bots.json or groups.json", () => {
     writeFileSync(BOTS, "{ not json");
     chmodSync(DATA_DIR, 0o555);
     try {
+      let writable = false;
       try {
         writeFileSync(join(DATA_DIR, "probe"), "x");
         rmSync(join(DATA_DIR, "probe"));
-        return; // running as root: the mode proves nothing here
+        writable = true;
       } catch {
         /* read-only, as intended */
+      }
+      if (writable) {
+        // The mode is not enforced for uid 0, so the refusal was never set up.  Assert the
+        // outcome that did happen instead of passing a claim this run cannot test: a writable
+        // folder still quarantines the corrupt bytes rather than dropping them.
+        const store = new Store(selection);
+        expect(store.bots).toEqual([]);
+        const [name] = setAside("bots.json");
+        expect(readFileSync(join(DATA_DIR, name!), "utf8")).toBe("{ not json");
+        return;
       }
       const store = new Store(selection);
       expect(store.bots).toEqual([]);
@@ -340,5 +351,57 @@ describe("Store with an unusable bots.json or groups.json", () => {
     } finally {
       chmodSync(DATA_DIR, 0o755);
     }
+  });
+
+  // A delete removes data that cannot be un-deleted, and the roster edit that records it is the
+  // only thing that stops the bot or room coming back on the next boot.  When the roster cannot be
+  // written, the delete has to stop with it.  An unreadable store is set up here by making its own
+  // path a directory, which fails the same way on every platform and whoever runs it, and the bot
+  // or room is then created in memory — the only state a refused-write store can be holding.
+  describe("a delete the roster cannot record", () => {
+    it("keeps a room's messages when groups.json cannot be written", () => {
+      const { lead, helper } = seedRoster();
+      rmSync(GROUPS);
+      mkdirSync(GROUPS);
+      const store = new Store(selection);
+      expect(listDataFaults()[0]).toMatchObject({ file: "groups.json", writesRefused: true });
+      const room = store.createGroup("Ops", [lead.id, helper.id]);
+      const messages = join(DATA_DIR, `messages-${room.threadId}.json`);
+      writeFileSync(messages, "[]");
+
+      expect(store.deleteGroup(room.id)).toBe(false);
+      expect(store.group(room.id)?.id).toBe(room.id);
+      expect(readFileSync(messages, "utf8")).toBe("[]");
+    });
+
+    it("keeps a bot's workspace when bots.json cannot be written", () => {
+      seedRoster();
+      rmSync(BOTS);
+      mkdirSync(BOTS);
+      const store = new Store(selection);
+      expect(listDataFaults().find((fault) => fault.file === "bots.json")).toMatchObject({ writesRefused: true });
+      const bot = store.createBot({ name: "Late" });
+      const workspace = join(DATA_DIR, "workspaces", bot.id);
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "MEMORY.md"), "knows things");
+
+      expect(store.deleteBot(bot.id)).toBe(false);
+      expect(store.bot(bot.id)?.id).toBe(bot.id);
+      expect(readFileSync(join(workspace, "MEMORY.md"), "utf8")).toBe("knows things");
+    });
+
+    it("still deletes both when the roster can be written", () => {
+      const { lead, helper } = seedRoster();
+      const store = new Store(selection);
+      const room = store.createGroup("Ops", [lead.id, helper.id]);
+      const messages = join(DATA_DIR, `messages-${room.threadId}.json`);
+      writeFileSync(messages, "[]");
+
+      expect(store.deleteGroup(room.id)).toBe(true);
+      expect(store.group(room.id)).toBeUndefined();
+      expect(existsSync(messages)).toBe(false);
+      expect(store.deleteBot(lead.id)).toBe(true);
+      expect(store.bot(lead.id)).toBeNull();
+    });
   });
 });

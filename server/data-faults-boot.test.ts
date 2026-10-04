@@ -98,7 +98,7 @@ describe("a server booted over damaged saved data", () => {
         instances: { ghost: { driver: "not-a-real-driver", displayName: "Ghost" } },
         profile: { name: "Ada" },
         autoUpdate: { enabled: "yes" },
-        tts: { key: ["sk-fixture-secret-value"] },
+        tts: { key: ["REDACTED_TEST_MARKER"] },
       }),
     );
 
@@ -160,7 +160,7 @@ describe("a server booted over damaged saved data", () => {
     // Nothing the app is told gives away a path or a fragment of a file.
     const wire = JSON.stringify(body);
     expect(wire).not.toContain(home);
-    expect(wire).not.toContain("sk-fixture");
+    expect(wire).not.toContain("REDACTED_TEST_MARKER");
     expect(wire).not.toContain("Lead");
   }, 30_000);
 
@@ -179,7 +179,7 @@ describe("a server booted over damaged saved data", () => {
     expect(stderr).toContain("routines.json could not be used because");
     expect(stderr).toContain("Nothing was deleted");
     expect(stderr).toContain("config.json has settings BotFleet could not use");
-    expect(stderr).not.toContain("sk-fixture");
-    expect(stdout).not.toContain("sk-fixture");
+    expect(stderr).not.toContain("REDACTED_TEST_MARKER");
+    expect(stdout).not.toContain("REDACTED_TEST_MARKER");
   });
 });

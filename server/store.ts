@@ -1173,7 +1173,8 @@ export class Store {
     }
     if (!this.botsDirty) return;
     if (this.botsWritesRefused) {
-      this.botsDirty = false;
+      // `botsDirty` stays set on purpose: it is cleared only after a write lands, so a refused
+      // write leaves the pending change marked and a later flush still tries to persist it.
       logRefusedSave(BOTS_FILE);
       return;
     }
@@ -1303,6 +1304,14 @@ export class Store {
   deleteGroup(id: string): boolean {
     const group = this.group(id);
     if (!group) return false;
+    // Deleting a room also deletes its threads' message rows, and that is not undoable.  A save
+    // that was refused leaves this removal only in memory, so the room would come back on the next
+    // boot pointing at transcripts that are already gone.  Nothing is deleted until the roster is
+    // known to be writable.
+    if (this.groupsWritesRefused) {
+      logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.groups = this.groups.filter((g) => g.id !== id);
     this.saveGroups();
     for (const threadId of new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)])) {
@@ -1908,6 +1917,16 @@ export class Store {
   deleteBot(id: string): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
+    // A bot's threads, transcripts and workspace all go with it, and none of that comes back.  The
+    // roster edit is debounced, so a delete cannot be made durable first without reordering the
+    // write path; what it can do is stop while the roster is known to be unwritable, so a refused
+    // save never ends in a workspace that is gone for good and a bot that returns on the next boot
+    // still pointing at it.
+    if (this.botsWritesRefused || this.groupsWritesRefused) {
+      if (this.botsWritesRefused) logRefusedSave(BOTS_FILE);
+      if (this.groupsWritesRefused) logRefusedSave(GROUPS_FILE);
+      return false;
+    }
     this.bots = this.bots.filter((b) => b.id !== id);
     // Rooms keep their own roster.  Strip the deleted id so memberIds and
     // defaultResponder never point at a ghost.  A remaining member becomes

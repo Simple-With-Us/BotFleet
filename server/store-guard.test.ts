@@ -92,7 +92,10 @@ describe("store-guard", () => {
     });
 
     it("describes a JSON failure by position only, never by quoting the text", () => {
-      const bad = ['{"key":"sk-fixture-secret-value", oops}', "sk-fixture-secret-value", '{"key":"sk-fixture-secret-value'];
+      // The marker stands in for a credential so nothing here is shaped like a real key, and so a
+      // scanner cannot read the fixture as one.  It still has to be absent from the reason, which
+      // is the whole point of the test.
+      const bad = ['{"key":"REDACTED_TEST_MARKER", oops}', "REDACTED_TEST_MARKER", '{"key":"REDACTED_TEST_MARKER'];
       for (const text of bad) {
         let reason = "";
         try {
@@ -101,7 +104,7 @@ describe("store-guard", () => {
           reason = jsonFailureReason(failure instanceof Error ? failure : new Error("?"));
         }
         expect(reason).toMatch(/^it (ends early|is not valid JSON)/);
-        expect(reason).not.toContain("sk-fixture");
+        expect(reason).not.toContain("REDACTED_TEST_MARKER");
       }
     });
   });
@@ -210,10 +213,14 @@ describe("store-guard", () => {
       try {
         const probe = setFileAside(file, "move", 1790000000000);
         if (probe.ok) {
-          // Nothing was proven here.  Undo the probe's move so the directory
-          // is left as found, and do not assert a property this platform would
-          // not let us set up.  POSIX takes the branch below on every run.
+          // The mode was not enforced (root, or a filesystem without permission bits), so the
+          // refusal was never set up.  Undo the probe's move so the directory is left as found,
+          // then assert the outcome that did happen rather than returning silently: the bytes
+          // must still be in the original file, byte for byte.  POSIX takes the branch below on
+          // every run.
           if (probe.path) renameSync(probe.path, file);
+          expect(readFileSync(file, "utf8")).toBe("{ not json");
+          expect(readdirSync(dir)).toEqual(["bots.json"]);
           return;
         }
         const loaded = loadGuarded(file, list, 1790000000000);

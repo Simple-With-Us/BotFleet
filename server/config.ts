@@ -1,14 +1,14 @@
 // Config + data dirs. One file, ~/.botfleet/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"apiKey":"ak_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 
 import { updateConfigFile, type ConfigFileSetAside } from "../electron/config-file-lock.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
-import { clearDataFault, findSetAsideFiles, recordDataFault } from "./data-faults.ts";
+import { clearDataFault, findSetAsideFiles, recordDataFault, type SetAsideFile } from "./data-faults.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
 import { describeDsn } from "./sentry.ts";
@@ -1164,6 +1164,35 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
   };
 }
 
+/** The set-aside files in `dir`, re-read only when the directory itself says it changed.
+ *
+ * `findSetAsideFiles` is a synchronous read of the whole data directory, and that directory grows
+ * one message file per thread, so asking on every `loadConfig()` would put an O(files in the data
+ * directory) read on a request path — `loadConfig()` is called per turn from the Linq webhook, the
+ * tool lane and the index, and a fresh install has no config.json at all, which is the very branch
+ * that asks.  One `statSync` of the directory is enough to tell whether the listing can have
+ * changed: a set-aside file appears, or the owner removes one, and either way the directory's
+ * mtime, ctime and size all move.  The answer therefore goes stale only if an entry is added or
+ * removed within the clock's resolution, and a re-read is cheap enough that nothing depends on it
+ * never happening twice. */
+let setAsideListing: { dir: string; stamp: string; files: SetAsideFile[] } | null = null;
+
+function setAsideFilesIn(dir: string): SetAsideFile[] {
+  let stamp: string;
+  try {
+    const info = statSync(dir);
+    stamp = `${info.mtimeMs}:${info.ctimeMs}:${info.size}`;
+  } catch {
+    // No directory to stat: fall back to the uncached read, which already answers an unreadable
+    // one with an empty list.
+    return findSetAsideFiles(dir);
+  }
+  if (setAsideListing && setAsideListing.dir === dir && setAsideListing.stamp === stamp) return setAsideListing.files;
+  const files = findSetAsideFiles(dir);
+  setAsideListing = { dir, stamp, files };
+  return files;
+}
+
 /** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
  * is a first run; every other way of not getting a full config out of it is a problem the caller
  * reports. */
@@ -1180,9 +1209,10 @@ function readStoredConfig(path: string): StoredConfigRead {
     // syscalls leaves the file absent with its contents sitting in the
     // set-aside.  Reading that as a first run would put BotFleet on defaults
     // with no fault, no log and no banner — the exact silent loss this branch
-    // exists to prevent — and registerLeftOverSetAsideFiles deliberately does
-    // not raise config.json, so nothing else would surface it either.
-    const leftOver = findSetAsideFiles(dirname(path)).find((entry) => entry.file === basename(path));
+    // exists to prevent.  registerLeftOverSetAsideFiles would also raise it,
+    // but only once it runs, and only as history; this branch runs on the read
+    // itself and says which file is waiting, so the two cannot both be quiet.
+    const leftOver = setAsideFilesIn(dirname(path)).find((entry) => entry.file === basename(path));
     return leftOver
       ? ignoredConfig(`it is missing, but an earlier copy of it was set aside as ${leftOver.name}, so these are not first-run settings`)
       : { config: {}, problem: null };

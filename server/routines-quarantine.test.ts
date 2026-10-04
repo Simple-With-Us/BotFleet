@@ -179,4 +179,22 @@ describe("RoutineManager with an unusable routines.json", () => {
     expect(error.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("not saving"))).toHaveLength(1);
     expect(manager.listRoutines().map((routine) => routine.name)).toEqual(["In Memory"]);
   });
+
+  it("still marks the routines as pending after a refused save", () => {
+    // The refusal never lifts inside one manager, so the pending flag is the only place its
+    // contract is visible: a refused flush has to leave it set, exactly as a write that throws
+    // does.  Clearing it would report a save that never happened as done, and a caller that
+    // treats a returned flush as durable — the boot-recovery path fires onRunFailed straight
+    // after one — would act on state that is not on disk.
+    const file = tempFile();
+    mkdirSync(file);
+    writeFileSync(join(file, "keep.txt"), "x");
+    const manager = build(file);
+    manager.create({ name: "In Memory", prompt: "x", botId: "bot-1", schedule: { type: "daily", time: "09:00", weekdays: [1] } });
+    const pending = (): boolean => (manager as unknown as { dirty: boolean }).dirty;
+    expect(pending()).toBe(true);
+
+    manager.flushNow();
+    expect(pending()).toBe(true);
+  });
 });
