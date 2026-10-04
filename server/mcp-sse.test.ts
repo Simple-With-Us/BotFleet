@@ -5,6 +5,7 @@ const TEST_PORT = 38794 + Math.floor(Math.random() * 1000);
 process.env.BOTFLEET_MCP_PORT = String(TEST_PORT);
 process.env.BOTFLEET_MCP_HOST = "127.0.0.1";
 process.env.BOTFLEET_URL = "http://127.0.0.1:8799";
+process.env.BOTFLEET_MCP_TOKEN = "test-token";
 
 describe("BotFleet MCP HTTP & SSE server", () => {
   let serverModule: typeof import("../scripts/mcp-sse.ts");
@@ -38,7 +39,7 @@ describe("BotFleet MCP HTTP & SSE server", () => {
   it("handles direct streamable HTTP POST for JSON-RPC initialize and tools/list", async () => {
     const initRes = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer test-token" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -56,7 +57,7 @@ describe("BotFleet MCP HTTP & SSE server", () => {
 
     const toolsRes = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer test-token" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 2,
@@ -73,7 +74,7 @@ describe("BotFleet MCP HTTP & SSE server", () => {
   it("establishes SSE connection, parses endpoint, and receives tool response over SSE stream", async () => {
     const controller = new AbortController();
     const sseRes = await fetch(`http://127.0.0.1:${TEST_PORT}/mcp/sse/`, {
-      headers: { Accept: "text/event-stream" },
+      headers: { Accept: "text/event-stream", "Authorization": "Bearer test-token" },
       signal: controller.signal,
     });
     expect(sseRes.status).toBe(200);
@@ -104,7 +105,7 @@ describe("BotFleet MCP HTTP & SSE server", () => {
     // Post a message to that endpoint
     const postRes = await fetch(`http://127.0.0.1:${TEST_PORT}${endpointUri}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer test-token" },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 100,

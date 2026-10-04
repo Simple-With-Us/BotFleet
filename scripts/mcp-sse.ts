@@ -6,11 +6,30 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { processMcpMessage, TOOLS } from "./mcp-server.ts";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
 const HARNESS_URL = process.env.BOTFLEET_URL || "http://127.0.0.1:8799";
-const AUTH_TOKEN = (process.env.BOTFLEET_MCP_TOKEN || process.env.BOTFLEET_TOKEN || "").trim();
+function resolveAuthToken(): string | null {
+  try {
+    const envFile = fs.readFileSync(path.join(process.env.HOME || "/Users/jay", ".secrets", "seat-mcp.env"), "utf8");
+    const match = envFile.match(/^SEAT_MCP_TOKEN=(\S+)/m);
+    if (match && match[1]) return match[1];
+  } catch (e) {}
+  const fromEnv =
+    process.env.SEAT_MCP_TOKEN?.trim() || process.env.BOTFLEET_MCP_TOKEN?.trim() || process.env.BOTFLEET_TOKEN?.trim();
+  return fromEnv || null;
+}
+
+const AUTH_TOKEN = resolveAuthToken();
+if (!AUTH_TOKEN) {
+  console.error(
+    "[FATAL] MCP Token is not configured (checked ~/.secrets/seat-mcp.env and the environment); refusing to start unauthenticated."
+  );
+  process.exit(1);
+}
 
 // Ensure the underlying mcp-server.ts knows where to find the harness
 if (!process.env.BOTFLEET_URL) {
@@ -57,13 +76,20 @@ function sendJson(res: ServerResponse, status: number, data: unknown, isHead = f
   }
 }
 
+/** Bearer auth with the iOS app's double-"Bearer" workaround. Never logs
+ *  the Authorization header: it carries the token. */
 function isAuthorized(req: IncomingMessage): boolean {
-  if (!AUTH_TOKEN) return true;
-  const auth = req.headers.authorization;
-  if (!auth) return false;
-  const parts = auth.split(" ");
-  if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") return false;
-  return parts[1] === AUTH_TOKEN;
+  let authHeader = req.headers.authorization || "";
+  authHeader = authHeader.replace(/^Bearer\s+Bearer\s+/i, "Bearer ");
+  
+  const parts = authHeader.split(" ");
+  const providedToken = parts[1];
+
+  if (!authHeader.toLowerCase().startsWith("bearer ") || providedToken !== AUTH_TOKEN) {
+    logError(`Missing or invalid token for ${req.method} ${req.url}`);
+    return false;
+  }
+  return true;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
