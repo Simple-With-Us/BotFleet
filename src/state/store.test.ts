@@ -1042,3 +1042,59 @@ describe("instances ordering guard", () => {
     expect(late.instances[0].snapshot.version).toBe("restarted");
   });
 });
+
+describe("viewed thread pin stays with its selection", () => {
+  const bot = (id: string, threadId: string): Bot => ({
+    id,
+    threadId,
+    name: id,
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages: [],
+  });
+
+  const pinned = {
+    ...initialState,
+    bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+    selectedId: "a",
+    viewedThreadId: "app-thread",
+  };
+
+  it("drops the pin when botAdded selects the new bot", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("c", "thread-c") });
+    expect(next.selectedId).toBe("c");
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("drops the pin when the selected bot is deleted and keeps it otherwise", () => {
+    const deleted = reducer(pinned, { type: "deleteBot", botId: "a" });
+    expect(deleted.selectedId).not.toBe("a");
+    expect(deleted.viewedThreadId).toBeNull();
+    const other = reducer(pinned, { type: "deleteBot", botId: "b" });
+    expect(other.selectedId).toBe("a");
+    expect(other.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when hydrate has to move the selection, and keeps it when the bot remains", () => {
+    const moved = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(moved.selectedId).toBe("b");
+    expect(moved.viewedThreadId).toBeNull();
+    const kept = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(kept.selectedId).toBe("a");
+    expect(kept.viewedThreadId).toBe("app-thread");
+  });
+});

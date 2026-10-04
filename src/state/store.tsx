@@ -1230,6 +1230,9 @@ export function reducer(state: AppState, action: Action): AppState {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
       const selectedId =
         state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
+      // A pin belongs to the selection.  Falling through to another bot must
+      // not keep showing the previous thread.
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
       return {
         ...state,
         bots: mergeHydrateBots(
@@ -1247,6 +1250,7 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
         computerControl: action.computerControl,
         selectedId,
+        viewedThreadId,
         error: isHarnessUnreachableError(state.error) ? null : state.error,
         // a fresh hydrate replaces the whole picture, scrollback included:
         // carrying the old flags over would leave a pill promising a page
@@ -1387,7 +1391,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case "groupDeleted": {
       const groups = state.groups.filter((g) => g.id !== action.groupId);
       const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, groups, selectedId };
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
+      return { ...state, groups, selectedId, viewedThreadId };
     }
     case "instances": {
       // Every response carries the server's describedAt; drop one older than
