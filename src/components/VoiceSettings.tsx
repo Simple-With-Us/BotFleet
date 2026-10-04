@@ -59,15 +59,28 @@ export function VoiceSettings({
   // The single loader. Every refresh path (mount, key save, add, clone,
   // delete) goes through here, so the Personal Voice merge can never be
   // dropped by a refresh that only reloads the harness list.
+  //
+  // initialDesktopCapabilities() hardcodes personalVoice false, then the
+  // effect runs again when the real flag arrives. Read the gate at call
+  // time so a clone or add that started on the optimistic false still
+  // merges, and ignore every result but the latest so a slow first
+  // response cannot overwrite that merge or wipe the list from its catch.
+  const personalVoiceAllowedRef = useRef(personalVoiceAllowed);
+  personalVoiceAllowedRef.current = personalVoiceAllowed;
+  const loadRequestRef = useRef(0);
+
   const loadVoices = () => {
+    const requestId = ++loadRequestRef.current;
+    const allowPersonal = personalVoiceAllowedRef.current;
     setLoadingVoices(true);
-    const personalVoices = personalVoiceAllowed && window.ogb?.personalVoice?.list
+    const personalVoices = allowPersonal && window.ogb?.personalVoice?.list
       ? window.ogb.personalVoice.list().catch(() => [])
       : Promise.resolve([]);
     return Promise.all([
       api("/api/tts/voices").catch(() => ({})),
       personalVoices,
     ]).then(([raw, personal]) => {
+      if (requestId !== loadRequestRef.current) return;
       let r: { voices?: Array<{ id: string; label: string; description?: string }>; error?: string };
       try {
         r = parseTtsVoicesResponse(raw);
@@ -93,7 +106,12 @@ export function VoiceSettings({
         }));
       setVoices([...personalEntries, ...apiVoices]);
       if (r.error) setError(r.error);
-    }).catch(() => setVoices([])).finally(() => setLoadingVoices(false));
+    }).catch(() => {
+      if (requestId !== loadRequestRef.current) return;
+      setVoices([]);
+    }).finally(() => {
+      if (requestId === loadRequestRef.current) setLoadingVoices(false);
+    });
   };
 
   useEffect(() => {
@@ -437,9 +455,14 @@ export function VoiceSettings({
             onChange={(e) => {
               const next = e.target.value;
               // Refuse to save a Personal Voice when this computer cannot
-              // speak one. The list itself is already gated; this is the
-              // belt for a stale option or a race before capabilities arrive.
-              if (isPersonalVoice(next) && !personalVoiceAllowed) return;
+              // speak one. Say why once capabilities confirm the denial.
+              // The optimistic personalVoice:false before they arrive is
+              // not a denial, so do not explain a refusal we do not have yet.
+              if (isPersonalVoice(next) && !personalVoiceAllowed) {
+                if (capabilitiesReady) setError(personalVoiceDisabledReason);
+                return;
+              }
+              setError((current) => (current === personalVoiceDisabledReason ? null : current));
               onPatch({ voice: next });
             }}
             aria-label={`${bot.name}'s voice`}
@@ -453,9 +476,9 @@ export function VoiceSettings({
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
               <option value={selectedVoice}>
                 {isSelectedPersonal
-                  ? personalVoiceAllowed
-                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
-                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
+                  ? capabilitiesReady && !personalVoiceAllowed
+                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
+                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
                   : `${selectedVoice} (Current)`}
               </option>
             )}

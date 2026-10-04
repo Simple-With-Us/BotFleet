@@ -31,6 +31,7 @@ vi.mock("@/state/store", async (importOriginal) => {
 });
 
 let mockPersonalVoice = false;
+let mockCapabilitiesReady = true;
 vi.mock("./DesktopCapabilities", () => ({
   useDesktopCapabilities: () => ({
     capabilities: {
@@ -48,7 +49,7 @@ vi.mock("./DesktopCapabilities", () => ({
       },
       localComputer: { available: false, support: "unsupported", enabled: false, status: "unavailable" },
     },
-    ready: true,
+    ready: mockCapabilitiesReady,
   }),
 }));
 
@@ -133,6 +134,27 @@ describe("VoiceSettings", () => {
     }
   });
 
+  it("keeps the on-device option label while capabilities are still unknown", () => {
+    mockPersonalVoice = false;
+    mockCapabilitiesReady = false;
+    try {
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: sampleBot("personal:com.apple.speech.voice.Jay"),
+          onPatch: () => {},
+        })
+      );
+      // Optimistic personalVoice:false is not a denial. The suffix stays
+      // until capabilities confirm this computer cannot speak one.
+      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
+      expect(html).toContain("Checking Personal Voice availability");
+      expect(html).not.toContain("Personal Voices need macOS 14 or later, or an iPhone");
+    } finally {
+      mockPersonalVoice = false;
+      mockCapabilitiesReady = true;
+    }
+  });
+
   it("renders standard current voice for non-personal custom voice", () => {
     const html = renderToStaticMarkup(
       createElement(VoiceSettings, {
@@ -181,9 +203,16 @@ describe("VoiceSettings voice loading", () => {
     expect(loader).toContain("parseTtsVoicesResponse(raw)");
     expect(loader).toContain("setVoices([...personalEntries, ...apiVoices])");
     // Listing must wait on the macOS 14 Personal Voice gate, not appleSpeech alone.
-    expect(loader).toContain("personalVoiceAllowed && window.ogb?.personalVoice?.list");
+    expect(loader).toContain("personalVoiceAllowedRef.current");
+    expect(loader).toContain("allowPersonal && window.ogb?.personalVoice?.list");
+    expect(loader.match(/if \(requestId !== loadRequestRef\.current\) return;/g)).toHaveLength(2);
+    expect(loader).toContain("if (requestId === loadRequestRef.current) setLoadingVoices(false);");
     expect(SRC).toContain("capabilities.dictation.personalVoice === true");
-    expect(SRC).toContain("if (isPersonalVoice(next) && !personalVoiceAllowed) return;");
+    expect(SRC).toContain("if (isPersonalVoice(next) && !personalVoiceAllowed)");
+    expect(SRC).toContain("if (capabilitiesReady) setError(personalVoiceDisabledReason);");
+    // On-device suffix is omitted only after a confirmed denial, not while
+    // capabilities are still the optimistic personalVoice:false.
+    expect(SRC).toContain("capabilitiesReady && !personalVoiceAllowed");
   });
 
   it("has the mount effect call that loader instead of fetching on its own", () => {
