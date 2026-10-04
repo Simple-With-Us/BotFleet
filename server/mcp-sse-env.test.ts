@@ -18,8 +18,9 @@ describe("MCP HTTP/SSE adapter harness URL default", () => {
     // A token is what makes the un-configured case throw the config error
     // rather than silently probing: it is the guard against leaking the harness
     // bearer to whatever answers on a discovered port.
-    process.env.BOTFLEET_TOKEN = "harness-token-for-env-ordering-test";
-    process.env.BOTFLEET_MCP_TOKEN = "adapter-token-for-env-ordering-test";
+    const canary = `test-token-${Date.now()}`;
+    process.env.BOTFLEET_TOKEN = canary;
+    process.env.BOTFLEET_MCP_TOKEN = canary;
     process.env.BOTFLEET_MCP_HOST = "127.0.0.1";
     process.env.BOTFLEET_MCP_PORT = "39794";
   });
@@ -38,7 +39,7 @@ describe("MCP HTTP/SSE adapter harness URL default", () => {
       // No harness listening in this environment: the failure must be the
       // connection failure, never the "you did not configure a URL" refusal
       // that the dead assignment produced.
-      expect(String((err as Error).message)).not.toMatch(/OMB_PORT/);
+      expect(err instanceof Error ? err.message : String(err)).not.toMatch(/OMB_PORT/);
     }
   });
 });

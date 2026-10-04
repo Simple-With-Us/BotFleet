@@ -79,7 +79,7 @@ describe("BotFleet MCP HTTP & SSE server", () => {
     const missingBody = await readJson(missing, "401 response");
     expect(asRecord(missingBody.error, "error")).toHaveProperty("code", -32001);
 
-    const wrong = await call({ "Content-Type": "application/json", Authorization: "Bearer not-the-token" });
+    const wrong = await call({ "Content-Type": "application/json", Authorization: `Bearer wrong-${randomUUID()}` });
     expect(wrong.status).toBe(401);
 
     const correct = await call(AUTH_HEADERS);

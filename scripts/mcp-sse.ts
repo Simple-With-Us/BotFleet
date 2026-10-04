@@ -5,39 +5,25 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { homedir } from "node:os";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { redactSecretsInText } from "../shared/redact.ts";
 
 const PORT = Number(process.env.BOTFLEET_MCP_PORT || process.env.PORT || 8794);
 const HOST = process.env.BOTFLEET_MCP_HOST || "127.0.0.1";
 const HARNESS_URL = process.env.BOTFLEET_URL || "http://127.0.0.1:8799";
 function resolveAuthToken(): string | null {
-  // 1. Environment first, so an operator rotating the token -- or Infisical
-  //    injecting it in CI -- always wins over the local handoff file.
-  const fromEnv =
-    process.env.SEAT_MCP_TOKEN?.trim() || process.env.BOTFLEET_MCP_TOKEN?.trim() || process.env.BOTFLEET_TOKEN?.trim();
-  if (fromEnv) return fromEnv;
-
-  // 2. Local-Mac handoff file, as a fallback only.  Surrounding quotes are
-  //    stripped because clients send the bare token, so a quoted file value
-  //    would never match and every request would 401.
-  try {
-    const envFile = fs.readFileSync(path.join(homedir(), ".secrets", "seat-mcp.env"), "utf8");
-    const match = envFile.match(/^SEAT_MCP_TOKEN=(.*)$/m);
-    const value = match?.[1]?.trim().replace(/^["']|["']$/g, "");
-    if (value) return value;
-  } catch {
-    // No local handoff file: the environment is the only source.
-  }
-  return null;
+  // Runtime credentials must be injected through process.env; ~/.secrets is handoff-only.
+  return (
+    process.env.SEAT_MCP_TOKEN?.trim() ||
+    process.env.BOTFLEET_MCP_TOKEN?.trim() ||
+    process.env.BOTFLEET_TOKEN?.trim() ||
+    null
+  );
 }
 
 const AUTH_TOKEN = resolveAuthToken();
 if (!AUTH_TOKEN) {
   console.error(
-    "[FATAL] MCP Token is not configured (checked ~/.secrets/seat-mcp.env and the environment); refusing to start unauthenticated."
+    "[FATAL] MCP Token is not configured in environment (BOTFLEET_MCP_TOKEN or SEAT_MCP_TOKEN); refusing to start unauthenticated."
   );
   process.exit(1);
 }
@@ -129,26 +115,33 @@ function isAuthorized(req: IncomingMessage): boolean {
   return true;
 }
 
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+const DRAIN_BUDGET_BYTES = 64 * 1024;
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
     let tooLarge = false;
-    req.on("data", (chunk) => {
-      if (tooLarge) return;
+    let drained = 0;
+    req.on("data", (chunk: Buffer) => {
+      if (tooLarge) {
+        drained += chunk.length;
+        if (drained > DRAIN_BUDGET_BYTES) req.destroy();
+        return;
+      }
       body += chunk;
-      // 10 MB payload limit for tool calls/messages
-      if (body.length > 10 * 1024 * 1024) {
-        // Drain the rest of the request instead of destroying the socket:
-        // destroying it would reset the connection, so the JSON-RPC error the
-        // caller sends could never be written and an oversized body would look
-        // like a crash.
+      if (body.length > MAX_BODY_BYTES) {
         tooLarge = true;
         body = "";
+        drained += chunk.length;
         req.resume();
+        if (drained > DRAIN_BUDGET_BYTES) req.destroy();
         reject(new Error("Payload too large"));
       }
     });
-    req.on("end", () => resolve(body));
+    req.on("end", () => {
+      if (!tooLarge) resolve(body);
+    });
     req.on("error", reject);
   });
 }
@@ -157,8 +150,8 @@ const server = createServer((req, res) => {
   // createServer does not observe the promise a listener returns, so an
   // unhandled rejection here would take the process down.  Every throw is
   // caught and answered on the response instead.
-  void handleRequest(req, res).catch((err) => {
-    logError(`Unhandled request error: ${safeErrorText(err)}`);
+  void handleRequest(req, res).catch(() => {
+    logError("Unhandled request error");
     if (!res.headersSent) {
       sendJson(res, 500, { jsonrpc: "2.0", id: null, error: { code: -32603, message: "Internal error" } });
     } else {
@@ -284,8 +277,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     // rather than cast: an assertion would hide a repeated header behind a
     // lookup that could never match.
     const headerSession = req.headers["mcp-session-id"];
-    const sessionId =
+    const rawSession =
       url.searchParams.get("sessionId") || (Array.isArray(headerSession) ? headerSession[0] : headerSession);
+    let sessionId: string | undefined;
+    if (rawSession) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawSession)) {
+        sendJson(res, 400, {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32602, message: "Invalid session ID" },
+        });
+        return;
+      }
+      sessionId = rawSession;
+    }
 
     if (sessionId && activeSessions.has(sessionId)) {
       // SSE Session route:
@@ -303,7 +308,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           session.res.write(`event: message\ndata: ${responseJson}\n\n`);
         }
       } catch (err) {
-        logError(`Error processing message for session ${sessionId}: ${safeErrorText(err)}`);
+        logError(`Error processing message for session ${sessionId}`);
         if (!session.res.writableEnded) {
           const errReply = JSON.stringify({
             jsonrpc: "2.0",
@@ -347,7 +352,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       });
       res.end(responseJson);
     } catch (err) {
-      logError(`Error processing direct POST message: ${safeErrorText(err)}`);
+      logError("Error processing direct POST message");
       sendJson(res, 500, {
         jsonrpc: "2.0",
         id: null,
@@ -380,14 +385,21 @@ const pingInterval = setInterval(() => {
 }, PING_INTERVAL_MS);
 pingInterval.unref();
 
+server.on("error", (err) => {
+  logError(`MCP SSE server error: ${safeErrorText(err)}`);
+});
+
 export function startServer(): Promise<void> {
   return new Promise((resolve, reject) => {
-    const onError = (err: Error) => reject(err);
+    let listening = false;
+    const onError = (err: Error) => {
+      if (!listening) reject(err);
+    };
     server.once("error", onError);
     server.listen(PORT, HOST, () => {
+      listening = true;
       server.removeListener("error", onError);
       log(`BotFleet MCP HTTP/SSE server listening on http://${HOST}:${PORT}`);
-      log(`Harness target: ${HARNESS_URL}`);
       log(`Ready to accept connections from botfleetadmin.jays.services`);
       resolve();
     });
