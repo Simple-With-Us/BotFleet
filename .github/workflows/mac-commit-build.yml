@@ -1,0 +1,190 @@
+# A signed arm64 BotFleet.app for every commit on main, keyed by commit.
+#
+# Why this exists separately from release.yml: the Mac that installs updates
+# used to build them.  `pnpm package:mac:local` is a 10-15 minute
+# electron-builder run on the same Mac running five to ten agent seats, and
+# every update failure traced back to it — a probe timing out under load and a
+# perfectly good binary being reported as corrupt.  The owner ruled on
+# 2026-10-01 that Mac runners do the building, always, with a local bypass.
+#
+# This is the narrow version of that: arm64 only, signed, smoke-tested, and
+# published under the commit it was built from.  It deliberately does NOT
+# notarize, staple, or build x64 — this artifact is installed by the owner's own
+# updater on his own machine, not distributed, and the full public pipeline
+# already covers distribution through release.yml.  Notarization is the slowest
+# part of that pipeline and the local updater never verified a stapled ticket.
+#
+# What the local updater does with it: download by commit, check the manifest's
+# sha256, then run the same signature and identity gate it has always applied
+# (`validateBuiltBundle`, which demands the exact Developer ID team and
+# designated requirement).  The signature check is the real security boundary;
+# the manifest guards the transfer.
+#
+# Concurrency cancels superseded builds, so a burst of merges spends one
+# runner rather than ten.  That is what "always" costs without wasting minutes
+# on commits nobody will ever install.
+name: Mac Commit Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit/branch to build (defaults to the branch this runs from)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-commit-build-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pin:
+    name: Pin the build commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - id: pin
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  mac:
+    name: Signed arm64 bundle (${{ needs.pin.outputs.sha }})
+    needs: pin
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.pin.outputs.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Stale output is how 0.1.15 shipped as "the app is damaged".
+      - name: Clean generated output
+        run: rm -rf dist dist-server dist-native release
+
+      - name: Load the Developer ID certificate
+        uses: ./.github/actions/infisical-secrets
+        with:
+          names: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          required: MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          client-id: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_ID || secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET || secrets.INFISICAL_CLIENT_SECRET }}
+        env:
+          GH_FALLBACK_MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          GH_FALLBACK_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+
+      - name: Import the Developer ID certificate into a throwaway keychain
+        env:
+          MAC_CERT_P12_BASE64: ${{ env.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ env.MAC_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MAC_CERT_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm "$RUNNER_TEMP/cert.p12"
+
+      # --arm64 --dir, and nothing else: this is the exact shape the Mac
+      # updater consumes, and the exact shape it used to build for itself.
+      - name: Package the signed arm64 app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          OMB_CLOUDFLARED_CURRENT: "1"
+        run: |
+          pnpm package:mac:local \
+            -c.mac.identity="Jay Wedgeworth, LLC (CC8UTF7ATG)" \
+            -c.mac.timestamp=none
+
+      - name: "Gate: signature, team, and a packaged server that starts"
+        run: |
+          app=release/mac-arm64/BotFleet.app
+          codesign --verify --deep --strict "$app"
+          team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          if [ "$team" != "CC8UTF7ATG" ]; then
+            echo "::error::expected team CC8UTF7ATG, got '${team:-none}'"
+            exit 1
+          fi
+          identity=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^Authority=//p' | head -1)
+          echo "::notice::signed by ${identity} (team ${team})"
+          # The same gate release.yml applies, and the same bug it exists for:
+          # 0.1.24 passed every signature check and died on launch.
+          OMB_SMOKE_DIST="$app/Contents/Resources/server" node scripts/smoke-packaged-server.mjs
+
+      - name: Record the build manifest
+        id: manifest
+        env:
+          BUILD_SHA: ${{ needs.pin.outputs.sha }}
+        run: |
+          app=release/mac-arm64/BotFleet.app
+          identity="$app/Contents/Resources/server/build-identity.json"
+          test -f "$identity" || { echo "::error::no build-identity.json in the packaged server"; exit 1; }
+          # A dirty build is not reproducible and the Mac updater refuses it
+          # (validateBuiltBundle requires sourceDirty === false), so fail here
+          # rather than publishing something the installer will reject.
+          dirty=$(node -p "require('./$identity').sourceDirty")
+          if [ "$dirty" != "false" ]; then
+            echo "::error::packaged build reports sourceDirty=${dirty}; the updater would refuse it"
+            exit 1
+          fi
+          packaged=$(node -p "require('./$identity').sourceCommit")
+          if [ "$packaged" != "$BUILD_SHA" ]; then
+            echo "::error::packaged commit ${packaged} does not match the built commit ${BUILD_SHA}"
+            exit 1
+          fi
+          version=$(node -p "require('./$identity').version")
+          api=$(node -p "require('./$identity').apiVersion")
+          # --sequesterRsrc and --keepParent are what `ditto` produces for a
+          # distributable app bundle; a plain zip loses the resource fork and
+          # the updater's copy would come out subtly different from a local build.
+          ditto -c -k --sequesterRsrc --keepParent "$app" BotFleet-mac-arm64.zip
+          sha256=$(shasum -a 256 BotFleet-mac-arm64.zip | cut -d' ' -f1)
+          cat > build-manifest.json <<EOF
+          {
+            "schemaVersion": 1,
+            "commit": "$BUILD_SHA",
+            "version": "$version",
+            "apiVersion": $api,
+            "teamIdentifier": "CC8UTF7ATG",
+            "artifact": "BotFleet-mac-arm64.zip",
+            "sha256": "$sha256",
+            "bytes": $(wc -c < BotFleet-mac-arm64.zip | tr -d ' '),
+            "nodeVersion": "$(node -v)"
+          }
+          EOF
+          cat build-manifest.json
+          echo "artifact=BotFleet-mac-arm64.zip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Commit-keyed so the Mac updater can resolve an exact build rather
+          # than "whatever is newest", and 30 days so a Mac that has been off
+          # for a month can still install from CI.
+          name: botfleet-mac-${{ needs.pin.outputs.sha }}
+          path: |
+            BotFleet-mac-arm64.zip
+            build-manifest.json
+          retention-days: 30
+          if-no-files-found: error
