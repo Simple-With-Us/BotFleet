@@ -768,6 +768,7 @@ export interface InstanceInfo {
       supportsEffort?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
@@ -775,6 +776,7 @@ export interface InstanceInfo {
     agentsMcp?: boolean;
     composioMcp?: boolean;
     images?: boolean;
+    contextWindow?: number;
     effortLevels?: readonly EffortLevel[];
     /** the engine keeps a live session and takes a message mid-turn */
     queueing?: boolean;

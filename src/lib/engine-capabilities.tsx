@@ -543,11 +543,11 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       terminal: "yes",
       thisComputer: "yes",
       webAccess: "yes",
-      // DSH driver's adapter contract (`server/drivers/acp/dsh.test.ts`)
-      // pins `instance.adapter.capabilities.images` to `false`, so the
-      // composer rejects image input.  Render "no" rather than "yes" so
-      // the matrix doesn't overclaim — Codex caught this in the review.
-      imageAttachments: "no",
+      // The DSH ACP adapter declares images support (`server/drivers/acp/dsh.ts`
+      // sets `images: true`, and `dsh.test.ts` pins the adapter capability),
+      // so the composer accepts image input on this engine.  Whether a given
+      // model takes the image is per model — see the prose below.
+      imageAttachments: "yes",
       // The DSH ACP adapter declares composioMcp
       // (server/drivers/acp/dsh.test.ts) — the matrix used to render
       // "-" here because the registry omitted it.
@@ -564,17 +564,14 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       liveResearch: "unknown",
     },
     capabilityNotes: {
-      imageAttachments:
-        "The bridge pins image input to false, so the composer rejects an image on this engine.  That is a limit on the bridge BotFleet ships, not on what the model can read.",
       crossBotCoordination:
         "Team tools ride the same generic ACP mount, so a DeepSeek bot can hand work to a peer and take it back.",
     },
     whyThisEngine: {
       headline: "DeepSeek models over the Clutch ACP bridge, billed pay-as-you-go.",
       prose: [
-        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, connected apps, and cross-bot coordination are available.",
+        "Clutch runs DeepSeek models through BotFleet's Clutch ACP bridge.  Files, terminal, this computer, web access, image attachments, connected apps, and cross-bot coordination are available.  Image attachments are per model:  DeepSeek-V4.1-Flash accepts images, while DeepSeek-V4.1-Pro carries a No Vision badge.",
         "Billing is DeepSeek pay-as-you-go.  The rates in Pricing Mode are the public API catalog, not a subscription invoice.",
-        "Image attachments are not available on the Clutch engine yet.",
       ],
     },
     defaultModels: [
