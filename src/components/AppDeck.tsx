@@ -75,15 +75,6 @@ export function AppDeck({
   const assignedBots = useMemo(() => {
     if (!activeGroup) return [];
     const memberSet = new Set(activeGroup.memberIds || []);
-    for (const b of state.bots) {
-      if (
-        !b.hidden &&
-        b.section &&
-        (b.section === activeGroup.name || b.section === activeGroup.section)
-      ) {
-        memberSet.add(b.id);
-      }
-    }
     return state.bots.filter((b) => !b.hidden && memberSet.has(b.id));
   }, [activeGroup, state.bots]);
 
