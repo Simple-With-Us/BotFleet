@@ -42,6 +42,9 @@ vi.mock("./DesktopCapabilities", () => ({
         engine: "apple-speech",
         onDevice: true,
         personalVoice: mockPersonalVoice,
+        // A Mac that cannot speak Personal Voice is the version gate, not
+        // "not a Mac".  The disabled control has to read that code.
+        reasonCode: mockPersonalVoice ? undefined : "requires-macos-14",
       },
       localComputer: { available: false, support: "unsupported", enabled: false, status: "unavailable" },
     },
@@ -71,8 +74,9 @@ describe("VoiceSettings", () => {
     expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
     expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
     // In plain environment without window.ogb.personalVoice.speak, the button explains device requirement
-    expect(html).toContain("title=\"Personal Voices play on-device on a Mac or iPhone\"");
-    expect(html).toContain("aria-label=\"Personal Voices play on-device on a Mac or iPhone\"");
+    expect(html).toContain("title=\"Personal Voices need macOS 14 or later, or an iPhone\"");
+    expect(html).toContain("aria-label=\"Personal Voices need macOS 14 or later, or an iPhone\"");
+    expect(html).not.toContain("Personal Voices play on-device on a Mac or iPhone");
   });
 
   it("enables Try button when desktop personalVoice speak bridge is available", () => {

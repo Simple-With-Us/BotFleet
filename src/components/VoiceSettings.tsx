@@ -24,7 +24,7 @@ export function VoiceSettings({
   onPatch: (patch: Partial<Pick<Bot, "voice" | "speakReplies" | "speechDevices" | "voiceSummaryMode">>) => void;
 }) {
   const { state, dispatch } = useStore();
-  const { capabilities } = useDesktopCapabilities();
+  const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const tts = state.config?.tts;
 
   const [key, setKey] = useState("");
@@ -221,10 +221,20 @@ export function VoiceSettings({
     Boolean(typeof window !== "undefined" && window.ogb?.personalVoice?.speak);
   const ready = configured && Boolean(selectedVoice || tts.voice);
   const previewDisabled = isSelectedPersonal ? !canSpeakPersonal : !ready;
+  // `requires-macos-14` means this computer is a Mac, just not new enough.
+  // Naming only "Mac or iPhone" is false there, and naming any platform
+  // before capabilities arrive is a guess.
+  const personalVoiceDisabledReason = !capabilitiesReady
+    ? "Checking Personal Voice availability"
+    : capabilities.dictation.reasonCode === "requires-macos-14"
+      ? "Personal Voices need macOS 14 or later, or an iPhone"
+      : capabilities.dictation.reasonCode === "unsupported-platform"
+        ? "Personal Voices play on-device on a Mac or iPhone"
+        : "Personal Voice is not available on this computer";
   const previewTitle = isSelectedPersonal
     ? canSpeakPersonal
       ? "Hear this Apple Personal Voice"
-      : "Personal Voices play on-device on a Mac or iPhone"
+      : personalVoiceDisabledReason
     : ready
       ? "Hear this voice"
       : "Pick a voice first";
