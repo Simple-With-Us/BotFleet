@@ -12,6 +12,7 @@ import {
   classifyResolutionFailure,
   downloadBuiltBundle,
   findCommitArtifact,
+  manifestArtifactName,
   materializeBuild,
   ResolutionError,
   selectCommitRun,
@@ -155,6 +156,74 @@ test("a throttled API is reported as a budget, not as a missing build", async (t
       return true;
     },
   );
+});
+
+test("the artifact name is a name, never a path out of the scratch directory", () => {
+  // The manifest arrives over the network and its `artifact` field is the one
+  // value that becomes a filesystem path, so it is refused unless it is a plain
+  // basename.  The sha256 check still guards the bytes.
+  assert.equal(manifestArtifactName({ artifact: "BotFleet-mac-arm64.zip" }), "BotFleet-mac-arm64.zip");
+  for (const name of [
+    "../../../../somewhere/evil.zip",
+    "/etc/evil.zip",
+    "nested/dir/evil.zip",
+    "..",
+    "BotFleet.app",
+    "",
+    null,
+  ]) {
+    assert.throws(
+      () => manifestArtifactName({ artifact: name }),
+      (error) => error instanceof ResolutionError && error.cause === "bad-manifest",
+      `${JSON.stringify(name)} must not become a path`,
+    );
+  }
+
+  // Verification applies the same rule, so a manifest cannot pass here and only
+  // be refused later at the path `materializeBuild` builds from it.
+  const bytes = Buffer.from("pretend this is a zip");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  assert.throws(
+    () => verifyManifest({ schemaVersion: 1, commit: COMMIT, artifact: "../../evil.zip", sha256: digest }, { commit: COMMIT, bytes }),
+    (error) => error.cause === "bad-manifest",
+  );
+});
+
+test("a client error the server will keep returning is not retried", async (t) => {
+  // A 410 cannot become a 200 by waiting, so all three attempts would only
+  // delay the real reason by 15 seconds and the backoff sleeps between them.
+  let calls = 0;
+  const responses = [
+    async () => {
+      calls += 1;
+      return { ok: true, status: 200, json: async () => successfulRuns };
+    },
+    async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          artifacts: [{ id: 9, name: artifactNameFor(COMMIT), expired: false, archive_download_url: "https://example.test/a.zip" }],
+        }),
+      };
+    },
+    async () => {
+      calls += 1;
+      return { ok: false, status: 410, arrayBuffer: async () => new ArrayBuffer(0) };
+    },
+  ];
+  await assert.rejects(
+    downloadBuiltBundle({ commit: COMMIT, destination: await fixture(t), fetchImpl: () => responses.shift()() }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.match(error.message, /HTTP 410/);
+      return true;
+    },
+  );
+  // Two lookups plus exactly one download attempt: the third attempt, and both
+  // backoff sleeps, are the part the fatal flag removes.
+  assert.equal(calls, 3);
 });
 
 test("materialising a verified build produces a real app directory", async (t) => {

@@ -154,12 +154,22 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
         const retryable = response.status === 429 || response.status >= 500;
         lastError = new ResolutionError(`Downloading ${label} failed with HTTP ${response.status}`, cause);
         lastError.status = response.status;
-        if (!retryable) throw lastError;
+        if (!retryable) {
+          // Mark it before throwing: this throw happens inside the try, so the
+          // catch below would otherwise treat a 400 or a 410 as an unknown
+          // network error and spend all three attempts on a status that cannot
+          // change, delaying the real reason by 15 seconds.
+          lastError.fatal = true;
+          throw lastError;
+        }
       } else {
         return Buffer.from(await response.arrayBuffer());
       }
     } catch (error) {
       if (error instanceof ResolutionError) {
+        // A client error that is not one of the three causes worth naming is
+        // still fatal once `requestBytes` has decided it cannot be retried.
+        if (error.fatal) throw error;
         if (error.cause === "no-build" || error.cause === "rate-limited" || error.cause === "unauthorized") throw error;
         lastError = error;
       } else {
@@ -222,6 +232,9 @@ export function verifyManifest(manifest, { commit, bytes }) {
   if (typeof manifest.artifact !== "string" || !manifest.artifact.endsWith(".zip")) {
     throw new ResolutionError(`Hosted build manifest names no zip artifact: ${manifest.artifact}`, "bad-manifest");
   }
+  // The same name check `materializeBuild` applies to the path, so a manifest
+  // cannot pass verification here and be refused later at the path it builds.
+  manifestArtifactName(manifest);
   return { ...manifest, verifiedBytes: bytes.length };
 }
 
@@ -238,6 +251,22 @@ function run(command, args, options) {
 }
 
 /**
+ * The artifact name is the one field of a network-fetched manifest that becomes
+ * a filesystem path, so it is reduced to a plain basename here rather than at
+ * the point of use.  The workflow names the bundle `BotFleet-mac-arm64.zip`,
+ * so a strict pattern costs nothing and keeps a manifest from naming something
+ * outside the scratch directory it was unpacked into.  The sha256 check still
+ * guards the bytes themselves; this only keeps the name a name.
+ */
+export function manifestArtifactName(manifest) {
+  const name = manifest?.artifact;
+  if (typeof name !== "string" || !/^[\w.-]+\.zip$/.test(name)) {
+    throw new ResolutionError(`Hosted build manifest names no zip artifact: ${name}`, "bad-manifest");
+  }
+  return name;
+}
+
+/**
  * Unpack the artifact zip, verify it, and leave a real `.app` directory.
  *
  * The outer zip is GitHub's artifact wrapper; the inner one is the bundle the
@@ -249,7 +278,9 @@ export async function materializeBuild({ artifactBytes, commit, destination, man
   const scratch = await mkdtemp(join(tmpdir(), "botfleet-ci-build-"));
   try {
     const wrapper = join(scratch, "artifact.zip");
-    const inner = join(scratch, manifest.artifact);
+    // Validate before the name reaches a path: `join` collapses `..`, so a
+    // traversing name would otherwise read and extract outside `scratch`.
+    const inner = join(scratch, manifestArtifactName(manifest));
     const appPath = join(destination, "BotFleet.app");
     await writeFile(wrapper, artifactBytes, { mode: 0o600 });
     await mkdir(destination, { recursive: true, mode: 0o700 });
