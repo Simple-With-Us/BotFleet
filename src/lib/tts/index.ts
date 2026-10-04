@@ -126,12 +126,41 @@ export class Speaker {
           voiceText?: string;
           utterances?: string[];
         };
-        for (let i = 0; i < audio.length && live(); i++) {
-          const clip = await fetch(`${endpoint}/${i}`, { signal: controller.signal });
-          if (!clip.ok) throw new Error(`Voice clip could not be loaded (${clip.status}).`);
+        const numClips = utterances?.length ?? audio.length;
+        if (numClips === 0) return;
+
+        type Rendered = { blob: Blob; error?: never } | { blob?: never; error: unknown };
+        const render = async (i: number): Promise<Rendered> => {
+          try {
+            const method = i < audio.length ? "GET" : "POST";
+            const clip = await fetch(`${endpoint}/${i}`, { method, signal: controller.signal });
+            if (!clip.ok) {
+              const body = await clip.json().catch(() => ({}));
+              throw new Error(body.error ?? `Voice clip could not be loaded (${clip.status}).`);
+            }
+            return { blob: await clip.blob() };
+          } catch (error) {
+            return { error };
+          }
+        };
+
+        let next: Promise<Rendered> | null = render(0);
+        for (let i = 0; i < numClips; i++) {
+          const current = next;
+          next = i + 1 < numClips ? render(i + 1) : null;
+          if (!current) break;
+          const rendered = await current;
+          if ("error" in rendered) {
+            if (live()) this.set({ ...IDLE, error: rendered.error instanceof Error ? rendered.error.message : String(rendered.error) });
+            break;
+          }
+          if (!live()) return;
           const caption = utterances?.[i] ?? voiceText;
           this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText, wordIndex: 0 });
-          if (!(await this.play(await clip.blob(), live, caption))) throw new Error("The voice clip could not be played.");
+          if (!(await this.play(rendered.blob, live, caption))) {
+            if (live()) this.set({ ...IDLE, error: "The voice clip could not be played." });
+            break;
+          }
         }
         if (live()) this.set(IDLE);
       } catch (error) {

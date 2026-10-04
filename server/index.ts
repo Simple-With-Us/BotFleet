@@ -14645,10 +14645,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (cfg.tts?.provider !== "system" && workspaceCredentialPending(cfg, "ttsKey")) return json(res, 409, { error: "Voice synthesis is waiting for its encrypted credential" });
       const summaryMode = resolveVoiceSummaryMode(owner);
       let textToSpeak = spokenReply(message.text);
-      const audioIntact = () => !!message.audio?.length && message.audio.every((clip) => {
-        const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-        return name && attachmentExists(name);
-      });
       if (summaryMode === "off") {
         textToSpeak = writtenReply(message.text);
       } else if (message.voiceText) {
@@ -14657,35 +14653,39 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         textToSpeak = await voiceSummaryFor(threadId, messageId, message.text, cfg);
       }
       const utterances = toUtterances(textToSpeak);
-      if (audioIntact() && message.audio!.length === utterances.length) {
-        return json(res, 200, { audio: message.audio, voiceText: textToSpeak, utterances });
+      if (clipIndex === undefined) {
+        if (method !== "POST") return json(res, 405, { error: "GET requires clip index" });
+        return json(res, 200, { audio: message.audio ?? [], voiceText: textToSpeak, utterances });
       }
-      if (!utterances.length || utterances.length > 64 || utterances.join("").length > 12000) return json(res, 413, { error: "reply exceeds voice clip limit" });
-      const key = `${threadId}:${messageId}`;
+
+      if (method !== "POST") return json(res, 405, { error: "must POST to generate clip" });
+      const index = Number(clipIndex);
+      if (!utterances[index]) return json(res, 404, { error: "no such utterance index" });
+
+      const key = `${threadId}:${messageId}:${index}`;
       let job = voiceJobs.get(key);
       if (!job) {
         job = (async () => {
-          const clips: Array<{ path: string; mime: string }> = [];
-          for (const clip of message.audio ?? []) {
-            const name = clip.path.match(/^\/api\/attachments\/([\w.-]+)$/)?.[1];
-            if (!name || !attachmentExists(name)) break;
-            clips.push(clip);
-          }
-          if (clips.length !== (message.audio?.length ?? 0)) store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
-          for (const utterance of utterances.slice(clips.length)) {
-            const audio = await tts.speak(cfg, utterance, owner.voice);
-            if (!["audio/mpeg", "audio/wav"].includes(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
-            const saved = saveAttachment(Buffer.from(audio.bytes), audio.mime);
-            clips.push({ path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime });
-            store.patchMessage(threadId, messageId, { audio: [...clips], voiceText: textToSpeak });
-          }
-          return clips;
+          const audio = await tts.speak(cfg, utterances[index], owner.voice);
+          if (!["audio/mpeg", "audio/wav"].includes(audio.mime)) throw new Error("The voice engine returned an unsupported audio format.");
+          const saved = saveAttachment(Buffer.from(audio.bytes), audio.mime);
+          const currentMessage = store.messagesFor(threadId).find((row) => row.id === messageId);
+          const clips = currentMessage?.audio ? [...currentMessage.audio] : [];
+          clips[index] = { path: `/api/attachments/${saved.path.split(/[\/]/).pop()}`, mime: saved.mime };
+          store.patchMessage(threadId, messageId, { audio: clips, voiceText: textToSpeak });
+          return [clips[index]];
         })();
         voiceJobs.set(key, job);
         void job.finally(() => voiceJobs.delete(key)).catch(() => {});
       }
-      try { return json(res, 200, { audio: await job, voiceText: textToSpeak, utterances }); }
-      catch (error) {
+      try {
+        const generated = await job;
+        const stored = generated?.[0]?.path.match(/^\/api\/attachments\/([\w.-]+)$/);
+        const audio = stored ? readAttachment(stored[1]!) : null;
+        if (!audio) throw new Error("Voice clip missing after generation.");
+        res.writeHead(200, { "content-type": audio.mime, "content-length": String(audio.bytes.byteLength), "cache-control": "private, max-age=31536000, immutable", "x-content-type-options": "nosniff" });
+        return res.end(audio.bytes);
+      } catch (error) {
         if (error instanceof tts.NoVoiceConfigured) return json(res, 409, { error: error.message });
         return json(res, 502, { error: error instanceof Error ? error.message : String(error) });
       }
