@@ -27,6 +27,11 @@ import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
+import {
+  captureFailureIsActionable,
+  decideCloudPreview,
+  type ScreenStreamState,
+} from "@/lib/computer-preview";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
@@ -214,6 +219,7 @@ export function ComputerPanel({
     setVpsStatus(null);
     setLocalFrame(null);
     setError(null);
+    setCaptureProblem(null);
     if ((bot.computers ?? []).length === 0) {
       setPhase("off");
       return;
@@ -409,10 +415,26 @@ export function ComputerPanel({
   // idle bot — a drawer left open overnight must not keep shooting.
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
-  const [screenStreamState, setScreenStreamState] = useState<"connecting" | "connected" | "failed">("connecting");
+  const [screenStreamState, setScreenStreamState] = useState<ScreenStreamState>("connecting");
+  // Has THIS turn's stream actually delivered a frame?  The socket being open
+  // proves nothing: the server registers a screen poller inside `startTurn` and
+  // tears it down when the turn settles, so a stream can sit connected for a
+  // whole turn and never paint.  Gating the poll on the socket instead of on
+  // this is what left the panel on "Waiting for the first frame…" until the
+  // turn ended.  See src/lib/computer-preview.ts.
+  const [sawFrame, setSawFrame] = useState(false);
+  const wasBusy = useRef(bot.busy);
+  useEffect(() => {
+    if (wasBusy.current === bot.busy) return;
+    wasBusy.current = bot.busy;
+    // A new turn brings its own turn-scoped poller, which has to prove itself.
+    if (bot.busy) setSawFrame(false);
+  }, [bot.busy]);
   useEffect(() => {
     if (phase !== "ready" || panelView !== "computer" || viewerOpen || !pageVisible) return;
     setScreenStreamState("connecting");
+    // A brand new stream has not demonstrated anything yet.
+    setSawFrame(false);
     const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
     let active = true;
     let failed = false;
@@ -433,6 +455,7 @@ export function ComputerPanel({
         const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
         if (parsed.success && parsed.data.botId === bot.id) {
           const frame = parsed.data;
+          setSawFrame(true);
           dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
         }
       } catch {
@@ -444,9 +467,20 @@ export function ComputerPanel({
       stream.close();
     };
   }, [phase, panelView, viewerOpen, pageVisible, bot.id, dispatch]);
+  const preview = decideCloudPreview({
+    phase,
+    panelView,
+    botBusy: bot.busy === true,
+    sawFrame,
+    streamState: screenStreamState,
+    viewerOpen,
+    pageVisible,
+  });
   const inFlight = useRef(false);
+  const captureFailures = useRef(0);
+  const [captureProblem, setCaptureProblem] = useState<string | null>(null);
   useEffect(() => {
-    if (phase !== "ready" || panelView !== "computer" || (bot.busy && screenStreamState !== "failed") || viewerOpen || !pageVisible) return;
+    if (!preview.poll) return;
     let alive = true;
     const shoot = async () => {
       if (inFlight.current) return;
@@ -454,23 +488,37 @@ export function ComputerPanel({
       try {
         const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
         if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-      } catch {
-        /* box mid-command or asleep — next tick */
+        if (captureFailures.current > 0) {
+          captureFailures.current = 0;
+          setCaptureProblem(null);
+        }
+      } catch (e) {
+        /* A box mid-command or asleep fails transiently and retries next tick.
+         * One that fails every tick is not slow, it is broken, and saying so
+         * beats an eternal "Waiting for the first frame…". */
+        if (!alive) return;
+        captureFailures.current += 1;
+        if (captureFailureIsActionable(captureFailures.current)) {
+          setCaptureProblem(
+            `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       } finally {
         inFlight.current = false;
       }
     };
     void shoot();
-    const timer = setInterval(shoot, bot.busy ? 4000 : 30_000);
+    const timer = setInterval(shoot, preview.intervalMs);
     return () => {
       alive = false;
       clearInterval(timer);
     };
-  }, [phase, panelView, screenStreamState, bot.id, viewerOpen, pageVisible, bot.busy]);
+  }, [preview.poll, preview.intervalMs, bot.id]);
 
   // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
   const vmInFlight = useRef(false);
+  const vmFailures = useRef(0);
   useEffect(() => {
     if (phase !== "vm" || viewerOpen || !pageVisible) return;
     let alive = true;
@@ -480,8 +528,21 @@ export function ComputerPanel({
       try {
         const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
         if (alive && typeof image === "string") setVmFrame(image);
+        if (vmFailures.current > 0) {
+          vmFailures.current = 0;
+          setCaptureProblem(null);
+        }
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        /* The desktop restarting mid-capture fails once and recovers.  Raise it
+         * only when it keeps failing, and let a good frame take the message
+         * back down — an error that outlives its cause is its own bug. */
+        if (!alive) return;
+        vmFailures.current += 1;
+        if (captureFailureIsActionable(vmFailures.current)) {
+          setCaptureProblem(
+            `Couldn't capture the Local VM's screen: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       } finally {
         vmInFlight.current = false;
       }
@@ -923,6 +984,11 @@ export function ComputerPanel({
         {error && (
           <div className="mt-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
             {error}
+          </div>
+        )}
+        {captureProblem && (
+          <div className="mt-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+            {captureProblem}
           </div>
         )}
         {phase === "unconfigured" && (
