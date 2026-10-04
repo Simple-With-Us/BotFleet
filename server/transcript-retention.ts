@@ -659,14 +659,20 @@ export function startOrphanTranscriptSweeps(
   opts: { dryRun?: boolean; initialDelayMs?: number; hold?: () => string | null } = {},
 ): () => void {
   const dryRun = opts.dryRun ?? false;
+  // The sweep is asked to run daily, but the hold reason only changes when a
+  // set-aside file appears or is cleared — logging it on every run would spam
+  // the log for as long as the reason stays truthy, so it is logged on change.
+  let lastHold: string | null = null;
   const run = () => {
     // `hold` is asked on every run.  A reason means the roster cannot be trusted to say which threads
     // still exist (a set-aside bots.json is waiting), so nothing is treated as an orphan.
     const held = opts.hold?.();
     if (held) {
-      log(`[retention] orphan transcript sweep skipped: ${held}.`);
+      if (held !== lastHold) log(`[retention] orphan transcript sweep skipped: ${held}.`);
+      lastHold = held;
       return;
     }
+    lastHold = null;
     const result = sweepOrphanedTranscripts(dirs, new Set(getLiveThreadIds()), { dryRun });
     const line = describeOrphanSweep(result);
     if (line) log(line);

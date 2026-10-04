@@ -490,7 +490,7 @@ const setAsideNames = (dir) => readdirSync(dir).filter((name) => name.startsWith
 test("updateConfigFile sets an unparseable file aside, byte for byte, before writing a new one", () => {
   const { dir, path } = tempConfig();
   try {
-    const broken = '{"xai":{"key":"fixture-key"},"profile":{"name":"Ada"';
+    const broken = '{"xai":{"key":"REDACTED_TEST_MARKER"},"profile":{"name":"Ada"';
     writeFileSync(path, broken, { mode: 0o600 });
     const notices = [];
     let seen;
@@ -518,7 +518,7 @@ test("updateConfigFile sets an unparseable file aside, byte for byte, before wri
     assert.equal(notices.length, 1);
     assert.equal(notices[0].setAsidePath, aside);
     assert.match(notices[0].reason, /ends early|not valid JSON/);
-    assert.ok(!notices[0].reason.includes("fixture-key"), "the reason never quotes the file");
+    assert.ok(!notices[0].reason.includes("REDACTED_TEST_MARKER"), "the reason never quotes the file");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
