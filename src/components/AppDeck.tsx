@@ -19,12 +19,24 @@ import {
   type RoomAttention,
 } from "@/lib/attention-index";
 
+/** Bots the deck may treat as belonging to an app.
+ *  Membership is `memberIds` only.  Section labels are mutable and must
+ *  not invent an assignment (see computeRoomAttentionIndex). */
+export function memberAssignedBots<T extends { id: string; hidden?: boolean }>(
+  memberIds: readonly string[] | null | undefined,
+  bots: readonly T[],
+): T[] {
+  const memberSet = new Set(memberIds ?? []);
+  return bots.filter((b) => !b.hidden && memberSet.has(b.id));
+}
+
 interface AppDeckProps {
   activeAppId: string | null;
   onSelectApp: (appId: string | null) => void;
   isMatrixOverviewActive?: boolean;
   activeBotId?: string | null;
   onSelectBot?: (botId: string) => void;
+  onSelectBotInApp?: (botId: string, appId: string) => void;
   onSelectGroupChat?: (groupId: string) => void;
   isGroupChatActive?: boolean;
 }
@@ -35,6 +47,7 @@ export function AppDeck({
   isMatrixOverviewActive,
   activeBotId,
   onSelectBot,
+  onSelectBotInApp,
   onSelectGroupChat,
   isGroupChatActive,
 }: AppDeckProps) {
@@ -69,11 +82,12 @@ export function AppDeck({
     [activeAppId, state.groups],
   );
 
-  // Bots assigned to the currently selected App (strictly explicit memberIds)
+  // Bots assigned to the currently selected App.  Membership is memberIds
+  // only, the same invariant as computeRoomAttentionIndex.  A matching
+  // section name is not an assignment.
   const assignedBots = useMemo(() => {
     if (!activeGroup) return [];
-    const memberSet = new Set(activeGroup.memberIds || []);
-    return state.bots.filter((b) => !b.hidden && memberSet.has(b.id));
+    return memberAssignedBots(activeGroup.memberIds, state.bots);
   }, [activeGroup, state.bots]);
 
   const cwdBasename = (cwd?: string | null) => {
@@ -310,7 +324,19 @@ export function AppDeck({
                 <button
                   key={b.id}
                   type="button"
-                  onClick={() => onSelectBot?.(b.id)}
+                  onClick={() => {
+                    // Only a real member opens the app thread.  A chip that
+                    // is not in memberIds falls back to ordinary bot select.
+                    if (
+                      onSelectBotInApp &&
+                      activeAppId &&
+                      (activeGroup.memberIds || []).includes(b.id)
+                    ) {
+                      onSelectBotInApp(b.id, activeAppId);
+                    } else {
+                      onSelectBot?.(b.id);
+                    }
+                  }}
                   aria-label={`${b.name} thread in ${activeGroup.name}`}
                   className={cn(
                     "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 font-medium transition-colors",
