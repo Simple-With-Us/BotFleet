@@ -56,7 +56,11 @@ interface SseSession {
   res: ServerResponse;
   createdAt: number;
   lastPing: number;
+  lastActive: number;
 }
+
+const MAX_SESSIONS = 64;
+const IDLE_MS = 30 * 60_000;
 
 const activeSessions = new Map<string, SseSession>();
 
@@ -216,6 +220,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // Supports /mcp/sse, /mcp/sse/, /sse, /mcp
   const isSsePath = pathname === "/mcp/sse" || pathname === "/sse" || pathname === "/mcp";
   if (req.method === "GET" && isSsePath) {
+    if (activeSessions.size >= MAX_SESSIONS) {
+      sendJson(res, 503, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32000, message: "Too many MCP sessions" },
+      });
+      return;
+    }
+
     const sessionId = randomUUID();
     // No peer address: an IP is personal data and the session id is already an
     // opaque client identifier.
@@ -229,11 +242,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       "Mcp-Session-Id": sessionId,
     });
 
+    const now = Date.now();
     const session: SseSession = {
       id: sessionId,
       res,
-      createdAt: Date.now(),
-      lastPing: Date.now(),
+      createdAt: now,
+      lastPing: now,
+      lastActive: now,
     };
     activeSessions.set(sessionId, session);
 
@@ -277,6 +292,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       // Acknowledge the POST request immediately with 202 Accepted,
       // and transmit the JSON-RPC reply over the active SSE stream.
       const session = activeSessions.get(sessionId)!;
+      session.lastActive = Date.now();
       res.statusCode = 202;
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.end(JSON.stringify({ ok: true, status: "accepted" }) + "\n");
@@ -346,11 +362,15 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 }
 
 // Periodic keepalive ping to prevent intermediary proxies (like Cloudflare) from terminating idle SSE connections
+// and idle session sweep
 const PING_INTERVAL_MS = 15_000;
 const pingInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, session] of activeSessions.entries()) {
-    if (session.res.writableEnded) {
+    if (session.res.writableEnded || now - session.lastActive > IDLE_MS) {
+      try {
+        session.res.end();
+      } catch {}
       activeSessions.delete(id);
       continue;
     }
@@ -358,11 +378,14 @@ const pingInterval = setInterval(() => {
     session.lastPing = now;
   }
 }, PING_INTERVAL_MS);
+pingInterval.unref();
 
 export function startServer(): Promise<void> {
   return new Promise((resolve, reject) => {
-    server.on("error", reject);
+    const onError = (err: Error) => reject(err);
+    server.once("error", onError);
     server.listen(PORT, HOST, () => {
+      server.removeListener("error", onError);
       log(`BotFleet MCP HTTP/SSE server listening on http://${HOST}:${PORT}`);
       log(`Harness target: ${HARNESS_URL}`);
       log(`Ready to accept connections from botfleetadmin.jays.services`);
@@ -371,18 +394,22 @@ export function startServer(): Promise<void> {
   });
 }
 
+export function stopServer(): Promise<void> {
+  return new Promise((resolve) => {
+    clearInterval(pingInterval);
+    for (const session of activeSessions.values()) {
+      try {
+        session.res.end();
+      } catch {}
+    }
+    activeSessions.clear();
+    server.close(() => resolve());
+  });
+}
+
 function handleShutdown(signal: string): void {
   log(`Received ${signal}, shutting down gracefully...`);
-  clearInterval(pingInterval);
-
-  for (const session of activeSessions.values()) {
-    try {
-      session.res.end();
-    } catch {}
-  }
-  activeSessions.clear();
-
-  server.close(() => {
+  void stopServer().then(() => {
     log("Server closed");
     process.exit(0);
   });

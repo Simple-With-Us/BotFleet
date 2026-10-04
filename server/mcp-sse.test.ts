@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { request } from "node:http";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // Point BOTFLEET_MCP_PORT to a dynamic port for testing
 const TEST_PORT = 38794 + Math.floor(Math.random() * 1000);
@@ -40,6 +40,12 @@ describe("BotFleet MCP HTTP & SSE server", () => {
   beforeAll(async () => {
     serverModule = await import("../scripts/mcp-sse.ts");
     await serverModule.startServer();
+  });
+
+  afterAll(async () => {
+    if (serverModule?.stopServer) {
+      await serverModule.stopServer();
+    }
   });
 
   it("serves health check on /health and /api/health", async () => {
