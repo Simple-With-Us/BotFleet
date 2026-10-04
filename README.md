@@ -80,7 +80,7 @@ Two things worth knowing before you read a model picker:
 - **Gemini is a model, not an engine here.**  The Gemini 3.7/3.8 Flash entries come from the Antigravity driver's catalog (`server/antigravity-models.ts`) and appear under Antigravity.  There is no separate Gemini engine in the registry.
 - **Adding one is deliberately cheap.**  The driver SPI in `server/contracts.ts` is small on purpose: write `server/drivers/<name>.ts` and append one line to `BUILT_IN_DRIVERS`.
 
-Some engines need a key (xAI, OpenAI-compatible, MiniMax, DeepSeek, Box, Composio, OpenCode) and the rest run against a CLI you have already logged into.  Unconfigured models stay out of the picker.
+Some engines need a key (xAI, OpenAI-compatible, MiniMax, DeepSeek, Box, OpenCode) and the rest run against a CLI you have already logged into.  Composio is a separate tool integration, not an engine.  Unconfigured models stay out of the picker.
 
 ## From OpenMausBot
 
@@ -124,7 +124,7 @@ In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
 | | Value |
 |---|---|
 | Published release / tag | **v0.1.38** (the only tag) |
-| Update feed | shipped with that release — `latest-mac.yml` plus both DMGs |
+| Update feed | **not shipped** — `latest-mac.yml` is missing from the v0.1.38 release, so in-app Check for updates 404s; the DMGs are the only shipped artifacts and `~/apps/update-botfleet.sh` is the only update route until the feed ships |
 | `package.json` version on `main` | `1.0.31` |
 | iOS companion `MARKETING_VERSION` | `1.0.30` |
 
