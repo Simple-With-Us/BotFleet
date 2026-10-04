@@ -635,13 +635,20 @@ function broadcast(payload: Record<string, unknown>) {
     if (result === "slow-end") {
       console.warn(`[sse] client exceeded ${SLOW_CLIENT_BYTE_LIMIT} buffered bytes; disconnecting so it reconnects and resumes from its cursor`);
       sseClients.delete(client);
-      screenPollers?.viewerChanged();
+      screenPollers.viewerChanged();
     } else if (result === "error") {
       sseClients.delete(client);
-      screenPollers?.viewerChanged();
+      screenPollers.viewerChanged();
     }
   }
 }
+
+// ── live screen: capture only while a viewer watches ───────────────────
+const screenPollers = new ScreenPollers(
+  (botId) => [...sseClients].some((client) =>
+    !client.res.destroyed && client.screens && (!client.screenBotIds || client.screenBotIds.has(botId))),
+  (botId, frame) => broadcast({ kind: "screen", botId, ...frame }),
+);
 
 // BOTFLEET-2M / Sentry 7768010831: createUpdateControl wires readiness into a
 // 2s status timer. Mid-update harness restart can fire that timer across the
@@ -4471,13 +4478,6 @@ function drainQueuedSends() {
     });
   });
 }
-
-// ── live screen: capture only while a viewer watches ───────────────────
-const screenPollers = new ScreenPollers(
-  (botId) => [...sseClients].some((client) =>
-    !client.res.destroyed && client.screens && (!client.screenBotIds || client.screenBotIds.has(botId))),
-  (botId, frame) => broadcast({ kind: "screen", botId, ...frame }),
-);
 
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
 /** What started a turn nobody typed: a routine's trigger, or `job` — a
