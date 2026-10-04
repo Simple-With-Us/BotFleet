@@ -43,7 +43,7 @@
     "test:infisical-fetch": "node --test scripts/infisical-fetch.node-test.mjs",
     "test:release-workflow": "node --test scripts/release-workflow.node-test.mjs",
     "test:updater": "node --test electron/updater-coordinator.node-test.mjs electron/updater-throttle.node-test.mjs",
-    "test:mac-updater": "node --test scripts/effort-log-integrity.node-test.mjs scripts/mac-update-transaction.node-test.mjs scripts/update-botfleet-mac.node-test.mjs scripts/mac-update-rollback-placement.node-test.mjs scripts/mac-update-rollback-hardening.node-test.mjs scripts/update-botfleet-arch.node-test.mjs scripts/ci-build-resolver.node-test.mjs",
+    "test:mac-updater": "node --test scripts/harness-release-store.node-test.mjs scripts/effort-log-integrity.node-test.mjs scripts/mac-update-transaction.node-test.mjs scripts/update-botfleet-mac.node-test.mjs scripts/mac-update-rollback-placement.node-test.mjs scripts/mac-update-rollback-hardening.node-test.mjs scripts/update-botfleet-arch.node-test.mjs scripts/ci-build-resolver.node-test.mjs",
     "test:config-lock": "node --test electron/config-file-lock.node-test.mjs",
     "test:credential-patch": "node --test electron/credential-patch.node-test.mjs",
     "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs electron/desktop-workspace.node-test.mjs",
