@@ -662,7 +662,7 @@ function ConversationModeRow() {
   return (
     <Card
       title="Workspace Arrangement"
-      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.  Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
+      subtitle={`Choose how your bots and ${labels.plural.toLowerCase()} are structured.${"\u00A0 "}Simple is Grok-style with named bots, while ${labels.plural.toLowerCase()} mode treats each ${labels.singular.toLowerCase()} as a category for threads.`}
     >
       <div className="flex flex-col gap-2">
         {CONVERSATION_MODES.map((mode) => {
@@ -670,7 +670,7 @@ function ConversationModeRow() {
           const selected = current === mode;
           const displayTitle = mode === "projects" ? labels.plural : copy.title;
           const displaySubtitle = mode === "projects"
-            ? "Categories with any number of threads under them.  Each thread picks a model.  Named bots stay hidden."
+            ? `Categories with any number of threads under them.${"\u00A0 "}Each thread picks a model.${"\u00A0 "}Named bots stay hidden.`
             : copy.subtitle;
           return (
             <button

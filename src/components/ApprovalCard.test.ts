@@ -149,3 +149,40 @@ describe("a background job's approval", () => {
     expect(pendingApprovalLabel({ message, requestId: "req-job", tool: "job_start", detail: "job: pnpm test" })).toBe("Background job approval requested");
   });
 });
+
+describe("ApprovalCard waiting status", () => {
+  it("renders sentence-case waiting status when waiting for confirmation or answer", () => {
+    const routineMessage: Message = {
+      id: "routine-unanswered",
+      role: "bot",
+      kind: "options",
+      at: 1,
+      card: {
+        title: "Confirm routine",
+        subtitle: "Weekdays at 09:00",
+        options: ["Confirm", "Cancel"],
+        requestId: "routine-request",
+        tool: "schedule_routine",
+        routineRequest: { ...routineRequest, operation: createRoutineOperation },
+      },
+    };
+    const routineMarkup = renderToStaticMarkup(createElement(ApprovalCard, { message: routineMessage }));
+    expect(routineMarkup).toContain("Waiting for your confirmation below");
+
+    const generalMessage: Message = {
+      id: "general-unanswered",
+      role: "bot",
+      kind: "options",
+      at: 1,
+      card: {
+        title: "Approve action",
+        subtitle: "Run bash command",
+        options: ["Allow", "Deny"],
+        requestId: "general-request",
+        tool: "bash",
+      },
+    };
+    const generalMarkup = renderToStaticMarkup(createElement(ApprovalCard, { message: generalMessage }));
+    expect(generalMarkup).toContain("Waiting for your answer below");
+  });
+});
