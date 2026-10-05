@@ -98,33 +98,44 @@ export const STATIC_MUSE_MODELS: ModelCatalog = {
   ],
 };
 
-/** Is Muse Code signed in?
+/** Is Muse Code signed in *for this driver*?
  *
- *  **Only an API key counts as proof.**  A live run on 2026-10-05 showed why:
- *  `~/.config/muse/auth.json` exists for a Keychain-backed OAuth session, and
- *  this function used to read that file's existence as proof — but the file
- *  holds NO credential.  It is an index:  `providers.meta` carries
+ *  **Only an API key counts.**  A live run on 2026-10-05 showed why the file
+ *  cannot be the answer:  `~/.config/muse/auth.json` exists for a signed-in
+ *  account and holds NO credential.  It is an index — `providers.meta` carries
  *  `mechanism: "oauth"`, `storage: "keychain"`, `obtained_via: "device_code"`,
- *  `api_base_url`, and the user's name and avatar URL, while the token itself
- *  lives in the macOS Keychain under a service name the CLI chooses.  So
- *  "the index exists" said yes for an engine that could not complete a turn.
+ *  the api base url, and the user's name and avatar URL — while the token lives
+ *  in the macOS Keychain under a service name the CLI picks.
  *
- *  There is no honest fallback.  `muse` has `login`, `logout`, and `auth set`,
- *  but no `auth status` or `whoami`, so there is nothing cheap to shell out to
- *  and ask.  A Keychain-backed session is therefore reported as *not* proven,
- *  which sends the user to the setup card instead of promising a working
- *  engine.  That is the right way round to be wrong:  a false negative costs
- *  one setup click, and a false positive costs a bot that fails every turn.
+ *  And "the account is signed in" is not the question that matters, because
+ *  **this driver cannot use a keychain OAuth session.**  Muse Code resolves
+ *  credentials as `META_API_KEY`, then a stored key, then a stored browser
+ *  session — and the community adapter we spawn bundles
+ *  `@muse-code/sdk@1.3.0`, which predates the Keychain move and answers "not
+ *  logged in" on exactly that account.  So the third tier is real for the CLI
+ *  and unusable here, and reporting it as signed in is what produced the
+ *  original bug:  a setup-complete badge over an engine that failed every turn.
  *
- *  Note this is also a real limitation of the community adapter we drive,
- *  which bundles `@muse-code/sdk@1.3.0` — that SDK does not read the Keychain
- *  token Muse Code 1.4.2 writes, so it answers "not logged in" on exactly this
- *  account.  A first-party MSP bridge spawns `muse serve` and inherits the
- *  CLI's own credential handling, which is the strongest argument for
- *  building one. */
+ *  Why this returns false rather than trying harder:  the live consumers of
+ *  this answer are the setup card and the failover chain at
+ *  `server/safety/turn-safety.ts`, which skips an instance whose
+ *  `authenticated` is `false`.  `muse` does not set
+ *  `requireAuthenticationBeforeSpawn` and uses `authFailure: "continue"`, so
+ *  nothing blocks a turn on this value — which means a wrong `false` is not
+ *  cosmetic.  It strands the setup card and the failover chain for a user who
+ *  did everything right.  Hence `loginNote` and `signInCommand` name the API
+ *  key as the sign-in path, so following the card actually produces a
+ *  credential this function can see.
+ */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
   return Boolean(env.META_API_KEY?.trim());
 }
+
+/** The sign-in sentence the harness shows when this engine is not authenticated.
+ *  Exported so a test can hold it to `museAuthenticated` — the bug this encodes
+ *  was the two drifting apart. */
+export const MUSE_LOGIN_NOTE =
+  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it";
 
 const support: AcpSupport = {
   driverKind: "museAgent",
@@ -153,7 +164,14 @@ const support: AcpSupport = {
   mcpServers: true,
   defaultCli: "muse-code-acp",
   nativeSource: "muse.acp",
-  loginNote: "Muse Code is not signed in — run `muse-code-acp --cli login` in a terminal, or set META_API_KEY",
+  // Must name the ONLY sign-in path that produces a credential this driver can
+  // see.  It previously said `muse-code-acp --cli login`, which completes a
+  // device-code OAuth session into the Keychain — a credential the adapter's
+  // SDK cannot read — so a user who followed the card exactly stayed
+  // `authenticated: false` forever, with the setup card never clearing and the
+  // instance permanently outside the failover chain.  This has to match
+  // `museAuthenticated` exactly; the two drifting apart is what that bug was.
+  loginNote: MUSE_LOGIN_NOTE,
   install: {
     command: {
       // Two steps: the `muse` binary, then the adapter that fronts it.  The
@@ -166,10 +184,13 @@ const support: AcpSupport = {
       win32: "irm https://dev.meta.ai/install.ps1 | iex; npm install -g @bex-co/muse-code-acp",
     },
     docsUrl: "https://dev.meta.ai/docs/muse-code",
-    // The adapter owns the login surface, not `muse login`: it wraps both
-    // behind `--cli`, so `muse login` alone would leave the engine unsigned
-    // as far as this driver is concerned.
-    signInCommand: "muse-code-acp --cli login",
+    // The API key path, matching `museAuthenticated` and `loginNote`.  Not
+    // `muse-code-acp --cli login`:  that completes a device-code OAuth session
+    // into the Keychain, which this engine's adapter cannot read, so it would
+    // walk a user through setup and leave them signed out from BotFleet's
+    // point of view.  `auth set` reads the key from stdin, so it never lands in
+    // a shell history either.  The env-var alternative is `META_API_KEY`.
+    signInCommand: "muse auth set --provider meta --api-key-stdin",
     // `npm install -g` needs Node; the setup UI surfaces that instead of
     // offering a command that cannot run.
     needsNode: true,
