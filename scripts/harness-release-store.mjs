@@ -241,7 +241,15 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
   // nothing actually stopped anything from writing into a promoted release —
   // and the whole design rests on a release being byte-identical to the commit
   // it names.  The release is read-only, not merely documented read-only.
-  await makeReadOnly(to);
+  try {
+    await makeReadOnly(to);
+  } catch (error) {
+    throw new ResolutionError(
+      `${error.message}  The tree is already promoted at ${to}; it cannot be re-promoted, so it must be removed with discardRelease() before retrying.`,
+      "release-not-read-only",
+      { releasePath: to },
+    );
+  }
   return to;
 }
 
@@ -281,23 +289,34 @@ export async function discardRelease(commit, env = process.env) {
  * permissions, so the "immutable" release was fully writable file by file and
  * nothing stopped anyone from editing a release in place.
  */
-async function setTreePermission(path, { writable, readOnly }) {
-  const { chmod, readdir, stat } = await import("node:fs/promises");
-  await chmod(path, writable ? 0o755 : 0o555).catch(() => {});
+async function setTreePermission(path, { writable, readOnly, errors = [] }) {
+  const { chmod, readdir } = await import("node:fs/promises");
+  try {
+    await chmod(path, writable ? 0o755 : 0o555);
+  } catch (err) {
+    errors.push({ path, error: err });
+  }
   let entries = [];
   try {
     entries = await readdir(path, { withFileTypes: true });
-  } catch {
-    return;
+  } catch (err) {
+    errors.push({ path, error: err });
+    return errors;
   }
   for (const entry of entries) {
     const child = join(path, entry.name);
     if (entry.isDirectory()) {
-      await setTreePermission(child, { writable, readOnly });
-    } else {
-      await chmod(child, writable ? 0o644 : readOnly).catch(() => {});
+      await setTreePermission(child, { writable, readOnly, errors });
+    } else if (!entry.isSymbolicLink()) {
+      // chmod follows symlinks; a link in the tree would chmod its target outside the release
+      try {
+        await chmod(child, writable ? 0o644 : readOnly);
+      } catch (err) {
+        errors.push({ path: child, error: err });
+      }
     }
   }
+  return errors;
 }
 
 async function makeWritable(path) {
@@ -305,7 +324,16 @@ async function makeWritable(path) {
 }
 
 async function makeReadOnly(path) {
-  await setTreePermission(path, { writable: false, readOnly: 0o444 });
+  const errors = await setTreePermission(path, { writable: false, readOnly: 0o444 });
+  if (errors.length > 0) {
+    const failedPaths = errors.slice(0, 3).map((e) => e.path).join(", ");
+    throw new ResolutionError(
+      `Promoted ${path} but ${errors.length} file(s) failed permission updates: ${failedPaths}; ` +
+        `a release must be immutable, so this is not being treated as a success`,
+      "release-not-read-only",
+      { releasePath: path, errors },
+    );
+  }
   const { stat } = await import("node:fs/promises");
   const mode = (await stat(path)).mode & 0o222;
   if (mode !== 0) {
@@ -313,6 +341,7 @@ async function makeReadOnly(path) {
       `Promoted ${path} but it is still writable (mode ${(mode & 0o777).toString(8)}); ` +
         `a release must be immutable, so this is not being treated as a success`,
       "release-not-read-only",
+      { releasePath: path },
     );
   }
 }

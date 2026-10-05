@@ -3,7 +3,7 @@
 Board `f1482275` (Recommendation 2, harness half).  Branch
 `minimax/harness-release-store`, PR #858.  Author: MINIMAX.
 
-## Why
+## Context & Objective
 
 `app.botfleet.server` runs from `~/apps/botfleet-server`, a mutable linked git
 worktree.  Every update `git checkout --detach`s that worktree and renames a
