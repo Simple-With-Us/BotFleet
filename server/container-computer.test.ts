@@ -68,6 +68,18 @@ import {
   type LocalVmTarget,
 } from "./container-computer.ts";
 
+function bindMountSpecs(args: string[]): string[] {
+  return args.filter((entry) => entry.startsWith("type=bind,"));
+}
+
+function expectBindMount(args: string[], guestTarget: string, sourcePath: string): void {
+  const mount = bindMountSpecs(args).find((entry) => entry.includes(`target=${guestTarget},readonly`));
+  expect(mount).toBeDefined();
+  const normalizedSource = sourcePath.replaceAll("\\", "/");
+  const normalizedMount = mount!.replaceAll("\\", "/");
+  expect(normalizedMount.includes(normalizedSource)).toBe(true);
+}
+
 function runner(responses: Record<string, string | Error>) {
   const calls: string[] = [];
   const run: CommandRunner = async (command, args) => {
@@ -707,25 +719,26 @@ describe("Cua integration", () => {
     const stagedDockerConfig = join(stagingRoot, ".docker", "config.json");
 
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${stagedDockerConfig},target=/home/cua/.docker/config.json,readonly`);
+    expectBindMount(mounts, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(mounts, "/home/cua/.config/gh", join(fakeHome, ".config", "gh"));
+    expectBindMount(mounts, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(mounts, "/home/cua/.config/infisical", join(fakeHome, ".config", "infisical"));
+    expectBindMount(mounts, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(mounts, "/home/cua/.docker/config.json", stagedDockerConfig);
     expect(readFileSync(stagedDockerConfig, "utf8")).not.toContain("osxkeychain");
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
       homeDir: fakeHome,
     });
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(args).toContain(`type=bind,source=${stagedDockerConfig},target=/home/cua/.docker/config.json,readonly`);
+    expectBindMount(args, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(args, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(args, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(args, "/home/cua/.docker/config.json", stagedDockerConfig);
   });
 
   it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const credentialHome = mkdtempSync(join(tmpdir(), "bf-cli-inspect-home-"));
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -734,9 +747,9 @@ describe("Cua integration", () => {
       [`docker inspect ${CONTAINER}`]: readyInspect({
         Mounts: [
           { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
-          { Type: "bind", Source: "/Users/test/.infisical", Destination: "/home/cua/.infisical", RW: false },
-          { Type: "bind", Source: "/Users/test/.ssh", Destination: "/home/cua/.ssh", RW: false },
-          { Type: "bind", Source: "/Users/test/.gitconfig", Destination: "/home/cua/.gitconfig", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".infisical"), Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".ssh"), Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".gitconfig"), Destination: "/home/cua/.gitconfig", RW: false },
         ],
       }),
       [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
