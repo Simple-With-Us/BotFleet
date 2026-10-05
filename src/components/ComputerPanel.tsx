@@ -29,6 +29,7 @@ import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
 import {
   captureFailureIsActionable,
+  cloudCaptureErrorIsStale,
   decideCloudPreview,
   newestPreview,
   FRAME_STALE_MS,
@@ -510,6 +511,20 @@ export function ComputerPanel({
   });
   const captureFailures = useRef(0);
   const [captureProblem, setCaptureProblem] = useState<string | null>(null);
+  // A cloud capture error that outlives the capture that raised it is its own
+  // bug.  The banner is only ever cleared by the next GOOD capture, and the
+  // poll effect below is torn down the moment the gate stops asking — so a
+  // stream that resumes mid-turn leaves a red "Couldn't capture this computer's
+  // screen" banner over a preview that is streaming fine.  Resetting the
+  // counter as well as the message is what stops the next blip from re-raising
+  // an error that had already been proven untrue by the frames on screen.
+  // Scoped to the cloud path: the Local VM writes the same state and is also
+  // `poll: false`, so this must not take down a live VM error.
+  useEffect(() => {
+    if (!cloudCaptureErrorIsStale(phase, preview.poll)) return;
+    captureFailures.current = 0;
+    setCaptureProblem(null);
+  }, [phase, preview.poll]);
   // When the polled capture landed, so `newestPreview` can compare ages.
   const [polledAt, setPolledAt] = useState(0);
   // One capture at a time, SHARED across poll-effect generations.

@@ -6,6 +6,7 @@ import {
   FRAME_STALE_MS,
   IDLE_POLL_MS,
   captureFailureIsActionable,
+  cloudCaptureErrorIsStale,
   decideCloudPreview,
   newestPreview,
   streamIsDelivering,
@@ -156,5 +157,37 @@ describe("newestPreview", () => {
     expect(newestPreview(live, null, 0, 5_000)).toBe(live);
     expect(newestPreview(undefined, polled, 5_000, 0)).toBe(polled);
     expect(newestPreview(undefined, null, 0, 0)).toBeNull();
+  });
+});
+
+describe("cloudCaptureErrorIsStale", () => {
+  // The regression: the banner is cleared only by the next GOOD capture, so a
+  // torn-down poll effect strands it.  A busy bot whose stream resumed is
+  // exactly that case — the gate stops asking for screenshots, nothing ever
+  // succeeds, and the red "Couldn't capture this computer's screen" banner
+  // stays up over a preview that is streaming normally.
+  it("takes the banner down once a cloud capture stops being attempted", () => {
+    // Still polling, so the next success can clear it honestly.
+    expect(cloudCaptureErrorIsStale("ready", true)).toBe(false);
+    // A resumed stream on a ready cloud panel: no capture in flight, no
+    // success coming, so the message is describing a capture that stopped
+    // happening.
+    expect(cloudCaptureErrorIsStale("ready", false)).toBe(true);
+  });
+
+  it("leaves the Local VM's own capture error alone", () => {
+    // The VM writes the same `captureProblem` string and is never `poll: true`,
+    // so a blanket `!poll` reset would erase a live, accurate VM error and
+    // zero `vmFailures` so one transient hiccup re-raised the banner.
+    expect(cloudCaptureErrorIsStale("vm", false)).toBe(false);
+    expect(cloudCaptureErrorIsStale("vm", true)).toBe(false);
+  });
+
+  it("does not claim another phase's message", () => {
+    // Every non-cloud phase reports `poll: false`; none of them owns a cloud
+    // capture failure.
+    for (const phase of ["checking", "local", "starting", "error", "off", "vps-stopped", "vps-unconfigured"]) {
+      expect(cloudCaptureErrorIsStale(phase, false), phase).toBe(false);
+    }
   });
 });

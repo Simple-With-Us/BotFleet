@@ -144,3 +144,26 @@ export const CAPTURE_FAILURE_LIMIT = 3;
 export function captureFailureIsActionable(failures: number): boolean {
   return failures >= CAPTURE_FAILURE_LIMIT;
 }
+
+/**
+ * Should a cloud capture error be taken down because the cloud capture stopped?
+ *
+ * The banner is cleared by the next GOOD capture, so it is only ever as stale as
+ * the gap between the last failure and the next success.  The poll effect is
+ * torn down the moment the gate stops asking for captures — a turn's stream
+ * resumes and delivers, the viewer opens, the tab is hidden — and a torn-down
+ * effect never comes back with a success, so the red "Couldn't capture this
+ * computer's screen" banner sits over a preview that is updating perfectly
+ * well.  An error that outlives its cause is its own bug.
+ *
+ * The cloud path ONLY, deliberately.  `phase === "vm"` also reports
+ * `poll: false`, and the Local VM's own capture failure writes the same
+ * `captureProblem` string with its own `vmFailures` counter; resetting on a
+ * blanket `!poll` would erase a live, accurate VM error and, worse, zero the
+ * counter so the next transient desktop hiccup re-raised the banner after a
+ * single failure.  Anything that is not a cloud phase is somebody else's
+ * message.
+ */
+export function cloudCaptureErrorIsStale(phase: string, poll: boolean): boolean {
+  return phase === "ready" && !poll;
+}
