@@ -1,13 +1,11 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Unique substrings in `bots/_shared.md` — tests assert each appears exactly
- *  once in a composed seat prompt.  Keep them stable; they are the contract.
- *  The agent-sync marker is split so this module does not embed the Slack
- *  channel token as a contiguous literal (see server/prompt-privacy.test.ts). */
+ *  once in a composed seat prompt.  Keep them stable; they are the contract. */
 export const FLEET_SHARED_RULE_MARKERS = [
-  ["#", "agent-sync"].join(""),
+  "fleet Slack coordination channel",
   "Recall CLI fallback",
   "[to iMessage]",
   "Never post unprompted status spam or routine commentary to Slack",
@@ -31,14 +29,47 @@ export const FLEET_SEAT_IDS = [
 
 export type FleetSeatId = (typeof FLEET_SEAT_IDS)[number];
 
-const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-
+let cachedBotsRoot: string | undefined;
 let cachedShared: string | undefined;
 const cachedSeat = new Map<string, string>();
 
-function readBotsFile(name: string): string {
-  const path = join(repoRoot, "bots", name);
-  return readFileSync(path, "utf8").trim();
+/** Directory containing `_shared.md` and seat files — packaged, dev, and test. */
+export function fleetBotsDirectory(): string {
+  if (cachedBotsRoot !== undefined) return cachedBotsRoot;
+  const fromEnv = process.env.OMB_BOTS_DIR?.trim();
+  if (fromEnv) {
+    cachedBotsRoot = fromEnv;
+    return fromEnv;
+  }
+  const resources = process.env.OMB_RESOURCES_PATH?.trim();
+  if (resources) {
+    const underResources = join(resources, "bots");
+    if (existsSync(join(underResources, "_shared.md"))) {
+      cachedBotsRoot = underResources;
+      return underResources;
+    }
+  }
+  const moduleDir = fileURLToPath(new URL(".", import.meta.url));
+  const candidates = [
+    join(moduleDir, "..", "bots"),
+    join(process.cwd(), "bots"),
+  ];
+  for (const dir of candidates) {
+    if (existsSync(join(dir, "_shared.md"))) {
+      cachedBotsRoot = dir;
+      return dir;
+    }
+  }
+  cachedBotsRoot = candidates[0]!;
+  return cachedBotsRoot;
+}
+
+function readBotsFile(name: string): string | null {
+  try {
+    return readFileSync(join(fleetBotsDirectory(), name), "utf8").trim();
+  } catch {
+    return null;
+  }
 }
 
 /** UTF-8 bytes of the shared preamble block (cached). */
@@ -48,7 +79,11 @@ export function fleetSharedPreambleBytes(): number {
 
 export function fleetSharedPreambleText(): string {
   if (cachedShared === undefined) {
-    cachedShared = readBotsFile("_shared.md");
+    const text = readBotsFile("_shared.md");
+    if (!text) {
+      throw new Error(`Fleet seat shared preamble missing under ${fleetBotsDirectory()}`);
+    }
+    cachedShared = text;
   }
   return cachedShared;
 }
@@ -57,6 +92,9 @@ function fleetSeatSpecificText(seatId: FleetSeatId): string {
   const hit = cachedSeat.get(seatId);
   if (hit !== undefined) return hit;
   const text = readBotsFile(`${seatId}.md`);
+  if (!text) {
+    throw new Error(`Fleet seat file missing: ${seatId}.md under ${fleetBotsDirectory()}`);
+  }
   cachedSeat.set(seatId, text);
   return text;
 }
@@ -98,6 +136,14 @@ export function composeFleetSeatPrompt(seatId: FleetSeatId): string {
   return `${shared}\n\n${specific}`;
 }
 
+/** Like `composeFleetSeatPrompt`, but returns null when assets are missing (no throw). */
+export function tryComposeFleetSeatPrompt(seatId: FleetSeatId): string | null {
+  const shared = readBotsFile("_shared.md");
+  const specific = readBotsFile(`${seatId}.md`);
+  if (!shared || !specific) return null;
+  return `${shared}\n\n${specific}`;
+}
+
 export function fleetComposedPromptBytes(seatId: FleetSeatId): number {
   return Buffer.byteLength(composeFleetSeatPrompt(seatId), "utf8");
 }
@@ -105,7 +151,6 @@ export function fleetComposedPromptBytes(seatId: FleetSeatId): number {
 /** Bytes wasted when the shared block was pasted at each assembly site (1:1 + room). */
 export function legacyDuplicatedSharedBytesPerTurn(assemblySites = 2): number {
   const shared = fleetSharedPreambleBytes();
-  // One injection carries the block; legacy pasted it at every site.
   return shared * Math.max(0, assemblySites - 1);
 }
 
@@ -122,8 +167,9 @@ export function fleetSeatPromptPart(bot: {
   if (!fleetSeatPromptsEnabled()) return null;
   const seatId = resolveFleetSeatId(bot);
   if (!seatId) return null;
-  const text = composeFleetSeatPrompt(seatId);
-  return text ? { seatId, text: `\n${text}` } : null;
+  const text = tryComposeFleetSeatPrompt(seatId);
+  if (!text) return null;
+  return { seatId, text: `\n${text}` };
 }
 
 export function countMarker(haystack: string, marker: string): number {
@@ -136,4 +182,11 @@ export function countMarker(haystack: string, marker: string): number {
     idx = at + marker.length;
   }
   return count;
+}
+
+/** Test-only: drop cached roots so env overrides take effect. */
+export function resetFleetSeatPromptCacheForTests(): void {
+  cachedBotsRoot = undefined;
+  cachedShared = undefined;
+  cachedSeat.clear();
 }

@@ -94,6 +94,8 @@ extraResources:
     to: companion
   - from: skills
     to: skills
+  - from: bots
+    to: bots
   - from: dist-native/android-platform-tools
     to: android-platform-tools
 

@@ -11,6 +11,7 @@ import {
   fleetSeatPromptsEnabled,
   fleetSharedPreambleBytes,
   legacyDuplicatedSharedBytesPerTurn,
+  resetFleetSeatPromptCacheForTests,
   resolveFleetSeatId,
   type FleetSeatId,
 } from "./seat-prompt.ts";
@@ -51,13 +52,31 @@ describe("fleet seat prompt composition", () => {
       expect(fleetSeatPromptsEnabled()).toBe(true);
       const part = fleetSeatPromptPart({ name: "BF-Grok" });
       expect(part?.seatId).toBe("grok");
-      expect(part?.text).toContain(["#", "agent-sync"].join(""));
+      expect(part?.text).toContain("fleet Slack coordination channel");
       for (const marker of FLEET_SHARED_RULE_MARKERS) {
         expect(countMarker(part!.text, marker)).toBe(1);
       }
     } finally {
       if (prev === undefined) delete process.env.BOTFLEET_FLEET_SEAT_PROMPTS;
       else process.env.BOTFLEET_FLEET_SEAT_PROMPTS = prev;
+      resetFleetSeatPromptCacheForTests();
+    }
+  });
+
+  it("returns null when seat assets are missing instead of crashing the turn", () => {
+    const prevFlag = process.env.BOTFLEET_FLEET_SEAT_PROMPTS;
+    const prevDir = process.env.OMB_BOTS_DIR;
+    try {
+      process.env.BOTFLEET_FLEET_SEAT_PROMPTS = "1";
+      process.env.OMB_BOTS_DIR = "/nonexistent/bots-root";
+      resetFleetSeatPromptCacheForTests();
+      expect(fleetSeatPromptPart({ name: "BF-Grok" })).toBeNull();
+    } finally {
+      if (prevFlag === undefined) delete process.env.BOTFLEET_FLEET_SEAT_PROMPTS;
+      else process.env.BOTFLEET_FLEET_SEAT_PROMPTS = prevFlag;
+      if (prevDir === undefined) delete process.env.OMB_BOTS_DIR;
+      else process.env.OMB_BOTS_DIR = prevDir;
+      resetFleetSeatPromptCacheForTests();
     }
   });
 });
