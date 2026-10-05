@@ -15,7 +15,7 @@
 // <userData>/cua-connection.json for the harness server to hand to drivers.
 
 import { app, ipcMain } from "electron";
-import { nativeProbeFailureMessage, probeNativeSync } from "../scripts/native-version-probe.mjs";
+import { nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
