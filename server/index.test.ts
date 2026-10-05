@@ -65,11 +65,17 @@ let fakeSlowProbeStarted: string;
 let fakeRecallCli: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  init?: { signal?: AbortSignal },
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: init?.signal,
   });
   return { status: res.status, body: await res.json() };
 };
@@ -82,6 +88,55 @@ const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutM
     const value = read();
     if (ok(value) || Date.now() > deadline) return value;
     await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
+/** Abort in-flight `api()` fetches slightly before `expect.poll`'s deadline so
+ *  a slow tick surfaces as the configured settle message instead of AbortError. */
+const SETTLE_ABORT_SKEW_MS = 75;
+
+/** Polls `read` until it satisfies, using vitest's own primitive.
+ *
+ *  The Windows runner is roughly a third slower than the others and its test
+ *  files overlap more, so anything that asserts a settled instance state or a
+ *  write landing *immediately* is a coin flip there and a certainty here.
+ *
+ *  `expect.poll`'s `interval` is a minimum gap between attempts, not an
+ *  observation count: the runner keeps trying until `timeoutMs` elapses, and
+ *  each `read()` can take arbitrarily long (a `GET /api/instances?fresh=1` on a
+ *  busy fleet can consume the whole window on one tick).  Do not pass `fresh=1`
+ *  on every tick — request it once before polling if a single re-probe is
+ *  needed, then read the memoized snapshot.
+ *
+ *  `signal` is aborted `SETTLE_ABORT_SKEW_MS` before the poll deadline so a
+ *  hung fetch is abandoned without racing Vitest's failure message.
+ */
+const settlesWithin = async (
+  read: (opts: { signal: AbortSignal }) => Promise<boolean>,
+  timeoutMs: number,
+  intervalMs: number,
+  what: string,
+): Promise<void> => {
+  const abort = new AbortController();
+  const abortAtMs = Math.max(0, timeoutMs - SETTLE_ABORT_SKEW_MS);
+  const timer = setTimeout(() => abort.abort(), abortAtMs);
+  const message = `${what} did not settle within ${timeoutMs}ms`;
+  try {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return await read({ signal: abort.signal });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return false;
+            throw error;
+          }
+        },
+        { timeout: timeoutMs, interval: intervalMs, message },
+      )
+      .toBe(true);
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -3066,11 +3121,23 @@ describe("harness HTTP API", () => {
         await api("POST", `/api/bots/${bot.id}/interrupt`, {});
         await api("DELETE", `/api/bots/${bot.id}`);
       }
-      for (const instanceId of otherInstances) {
-        expect((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status).toBe(200);
-      }
-      expect((await api("PATCH", "/api/instances/gatedQuota", { enabled: false, fullAuto: false })).status).toBe(200);
-      expect((await api("PATCH", "/api/instances/slowProbe", { enabled: false, fullAuto: false })).status).toBe(200);
+      let next = 0;
+      await settlesWithin(
+        async ({ signal }) => {
+          for (; next < otherInstances.length; next++) {
+            if ((await api("PATCH", `/api/instances/${otherInstances[next]}`, { enabled: true }, { signal })).status !== 200) {
+              return false;
+            }
+          }
+          for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
+            if ((await api("PATCH", path, { enabled: false, fullAuto: false }, { signal })).status !== 200) return false;
+          }
+          return true;
+        },
+        6_000,
+        200,
+        "instance cleanup writes",
+      );
     }
   }, 40_000);
 
@@ -5504,28 +5571,50 @@ describe("instance CLI override API", () => {
       boxTurnGate = null;
       releaseBoxTurnGate = null;
 
-      const persistedTask = () => {
-        const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
+      const botsJsonPath = join(home, ".botfleet", "bots.json");
+      const readSuccessorPersistence = () => {
+        const bots = JSON.parse(readFileSync(botsJsonPath, "utf8")) as Array<{
           id: string;
           tasks: Array<{ threadId: string; lastInstanceId?: string; resumeCursors: Record<string, unknown> }>;
         }>;
-        return bots.find((candidate) => candidate.id === bot.id)?.tasks.find((task) => task.threadId === bot.threadId);
-      };
-      await expect.poll(() => ({
-        launches: existsSync(launchLog)
+        const task = bots
+          .find((candidate) => candidate.id === bot.id)
+          ?.tasks.find((candidate) => candidate.threadId === bot.threadId);
+        const launches = existsSync(launchLog)
           ? readFileSync(launchLog, "utf8").split("\n").filter(Boolean).length
-          : 0,
-        lastInstanceId: persistedTask()?.lastInstanceId,
-        cursor: persistedTask()?.resumeCursors.claude,
-      }), { timeout: 5_000 }).toEqual({
+          : 0;
+        return { launches, task };
+      };
+      // Gate release unblocks the box and the hanging CLI; on Windows the
+      // successor dispatch, markTaskDispatched, and debounced bots.json flush
+      // can land several seconds later.  Read the files fresh each tick — do
+      // not memoize a task snapshot — and abort in-flight bot polls before the
+      // settle deadline so a hung tick cannot eat the whole window.
+      await settlesWithin(
+        async ({ signal }) => {
+          const { launches, task } = readSuccessorPersistence();
+          const cursor = task?.resumeCursors?.claude;
+          if (launches !== 1) return false;
+          if (task?.lastInstanceId !== "claude" || typeof cursor !== "string" || cursor.length === 0) return false;
+          const live = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return live?.busy === true;
+        },
+        10_000,
+        200,
+        "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
+      );
+      const settled = readSuccessorPersistence();
+      expect({
+        launches: settled.launches,
+        lastInstanceId: settled.task?.lastInstanceId,
+        cursor: settled.task?.resumeCursors.claude,
+      }).toEqual({
         launches: 1,
         lastInstanceId: "claude",
         cursor: expect.any(String),
       });
-      const live = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-        (candidate: { id: string }) => candidate.id === bot.id,
-      );
-      expect(live?.busy).toBe(true);
     } finally {
       releaseBoxTurnGate?.();
       boxTurnGate = null;
@@ -5537,7 +5626,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -5553,8 +5642,26 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
-      const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+      // An engine a neighbouring test left reloading is still settling;
+      // `unavailable` here means "asked too early", not "broken".  Poll at the
+      // fleet re-probe cadence with `fresh=1` each tick so a 15s describe memo
+      // cannot freeze an early `unavailable` for the whole wait (~4 probes in 8s).
+      await settlesWithin(
+        async ({ signal }) => {
+          const instances = (
+            await api("GET", "/api/instances?fresh=1", undefined, { signal })
+          ).body.instances;
+          return instances.find(
+            (instance: { instanceId: string }) => instance.instanceId === "claude",
+          )?.snapshot?.state === "available";
+        },
+        8_000,
+        2_000,
+        "the claude engine reaching available",
+      );
+      const claude = (await api("GET", "/api/instances")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "claude",
+      );
       expect(claude?.snapshot.state).toBe("available");
 
       const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
@@ -5598,7 +5705,7 @@ describe("instance CLI override API", () => {
       if (botId) await api("DELETE", `/api/bots/${botId}`);
       expect((await api("PATCH", "/api/instances/claude", { fullAuto: false })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);

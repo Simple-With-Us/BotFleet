@@ -560,7 +560,7 @@ describe("containerComputerStatus", () => {
 
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
     expect(fake.calls).not.toContain(versionProbe);
   });
 
@@ -578,7 +578,7 @@ describe("containerComputerStatus", () => {
     expect(status.image_id).toBe("managed-image-id");
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
   });
 
   it("does not treat an unlabelled image under the local tag as prepared", async () => {
@@ -593,7 +593,7 @@ describe("containerComputerStatus", () => {
     const status = await containerComputerStatus(fake.run, "linux");
 
     expect(status.image).toBe(false);
-    expect(status.problem).toContain("Prepare the Cua desktop image");
+    expect(status.problem).toContain("Prepare the CUA desktop image");
   });
 });
 
@@ -848,7 +848,7 @@ describe("containerComputerAction", () => {
     });
 
     await expect(containerComputerAction("run", fake.run, "linux")).rejects.toThrow(
-      "Prepare the Cua desktop image",
+      "Prepare the CUA desktop image",
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });

@@ -82,7 +82,7 @@ export function ensureLocalVmSessionExecArgs(
     `  ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1 && exit 0`,
     `  sleep 0.25`,
     `done`,
-    `echo "Cua Driver did not answer on $socket" >&2`,
+    `echo "CUA Driver did not answer on $socket" >&2`,
     `exit 1`,
   ].join("\n");
   return cuaExecArgs(["-ec", script], {

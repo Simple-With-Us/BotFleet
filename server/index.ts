@@ -77,10 +77,11 @@ import {
   snapshotAvatarGenerationState,
 } from "./avatar-image.ts";
 import { parseBotProfilePatch, resolveMaxToolRounds } from "./bot-profile.ts";
-import { doomedDispatches, enableDoomedDispatchPersist } from "./doomed-dispatch.ts";
+import { doomedDispatches, enableDoomedDispatchPersist, DOOMED_FAILURE_THRESHOLD } from "./doomed-dispatch.ts";
+import { effectiveFallbackTiers } from "./model-fallback.ts";
 import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
-import { effectiveToolRounds, toolBudgetPrompt } from "../shared/bot-profile.ts";
+import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
@@ -418,7 +419,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
-import { findRecallCli, recallStatus } from "./recall-transport.ts";
+import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
@@ -952,9 +953,152 @@ function noteDoomedSkip(botId: string, instanceId: string): void {
   }
 }
 
+/** The engine a turn will ACTUALLY execute on, which is not always the engine
+ *  its `modelSelection` names.
+ *
+ *  A Box-backed `runOn: "cloud"` routine is switched to the boxAgent instance
+ *  before it runs. Asking about `selection.instanceId` instead asks about an
+ *  engine the turn never touches — which is how a local setup-dead breaker
+ *  queued healthy Box work, how a boxAgent breaker went unseen, and, in the
+ *  first attempt at this fix, how a run was admitted by one gate and rejected
+ *  by the other.
+ *
+ *  One function, called by every gate that has to reason about the engine a
+ *  run will use. A second caller computing it differently is exactly how the
+ *  two gates came to disagree. */
+function executionInstanceFor(
+  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null },
+  policy: ModelSelection,
+  runOn: RoutineRunOn,
+): string {
+  if (cloudRunUsesBoxAgent(runOn, bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)) {
+    const boxCloud = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
+    if (boxCloud) return boxCloud.instanceId;
+  }
+  return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
+}
+
+/** Engines this bot's queued runs would actually execute on.
+ *
+ *  An open breaker is a hold only when a queued run would use that engine.
+ *  Counting every task override, and boxAgent whenever a cloud backend is
+ *  configured, reported a hold for work nobody had queued: an inactive task
+ *  whose breaker was open, or a Box engine with no cloud run waiting.  The
+ *  question is the one `dispatchHoldFor` asks, once per queued run, with
+ *  that run's thread and destination.  Coalesced children do not dispatch
+ *  on their own, so they are not a hold.
+ *
+ *  A diagnostics read on a thirty-second poll, not the dispatch path. */
+function instancesHeldByQueuedRuns(
+  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null },
+): Set<string> {
+  const instances = new Set<string>();
+  if (!routines) return instances;
+  for (const run of routines.listRuns()) {
+    if (run.coalescedInto || run.botId !== bot.id || run.status !== "queued") continue;
+    const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
+    const policy = task?.modelSelection ?? bot.modelSelection;
+    instances.add(executionInstanceFor(bot, policy, run.runOn));
+  }
+  return instances;
+}
+
+/** Why this bot's work must not go out right now, or undefined if it can.
+ *
+ *  One function, three callers: the dispatch gate answers yes/no, the scheduler
+ *  records the reason on a run it leaves QUEUED, and the roster marks the bot
+ *  `blocked`.  As three separate predicates they could disagree — which is
+ *  exactly what happened, because only the queue knew the engine was dead and
+ *  the roster kept offering work the queue then refused.
+ *
+ *  Every branch names the ENGINE, not the symptom.  "Waiting" reads the same
+ *  whether the CLI is missing, the account is capped, or the fleet is over its
+ *  ceiling, and an operator cannot act on that. */
+function dispatchHoldFor(
+  botId: string,
+  threadId: string | undefined,
+  runOn: RoutineRunOn,
+  opts: { count?: boolean } = {},
+): DispatchHold | undefined {
+  const bot = store.bot(botId);
+  if (!bot) return undefined;
+  const task = threadId ? store.taskByThread(bot.id, threadId) : undefined;
+  const policy = task?.modelSelection ?? bot.modelSelection;
+  // A Box-backed cloud run does NOT execute on the bot's model engine:
+  // `startTurn` switches it to the boxAgent instance. Judging the hold against
+  // the local engine queued healthy cloud work whenever the local engine was
+  // setup-dead, and never consulted a breaker that had opened on boxAgent.
+  // This is the engine the turn will actually reach, which is the only one a
+  // hold can honestly be about.
+  const instanceId = executionInstanceFor(bot, policy, runOn);
+  // The registry's own display name where it has one, so the reason says
+  // "DeepSeek Harness" rather than "dsh".  A queue full of "dsh could not
+  // start" is no easier to act on than the boolean it replaced.
+  const engine = registry.get(instanceId as never)?.displayName ?? instanceId;
+
+  // A (bot, engine) pair that has failed to START repeatedly is not going to
+  // start on the next tick either — the CLI is missing, not executable, or
+  // waiting on an interactive login, and none of those change on a timer.  The
+  // run stays QUEUED rather than failing, so it lands once the breaker
+  // half-opens.
+  if (doomedDispatches.isOpen(bot.id, instanceId)) {
+    // Counted once, at the gate that actually prevented a dispatch. The reason
+    // lookup runs the same predicate for the same run on the same tick, and
+    // counting from both reported twice as many prevented dispatches as
+    // occurred.
+    if (opts.count) noteDoomedSkip(bot.id, instanceId);
+    const entry = doomedDispatches.peek(bot.id, instanceId);
+    // Redact lastError before it lands in hint/reason: setup failure can carry
+    // provider text (paths, tokens, stack frames); holdReason is persisted and
+    // broadcast, same trust boundary as the /api/quotas route.
+    const safeError = entry?.lastError
+      ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
+      : undefined;
+    const hint = safeError
+      ? `Last error: ${safeError}`
+      : `Check that the ${engine} CLI is installed and logged in`;
+    const reason = `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row — ${hint}`;
+    return { reason, hint };
+  }
+
+  // Off unless a ceiling is configured, and consulted only for unattended work
+  // so a cap can stop background automation without refusing a message the
+  // owner is waiting on.  It also refuses to fire when too little of the
+  // window is priced to trust the total.
+  if (runOn === "bot") {
+    const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
+      ceilingUsd: cfg.usage?.spendCeilingUsd,
+      minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
+    });
+    if (decision.blocked) {
+      // Logged only when `count` is set, i.e. at the gate that actually
+      // refuses a dispatch.  The scheduler asks the same question twice per run
+      // per tick — once through canStart, once for the reason — so logging in
+      // both places wrote two warnings per run every ten seconds and flooded
+      // the log under a sustained ceiling.
+      if (opts.count) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
+      return { reason: decision.reason };
+    }
+  }
+
+  if (turnExternalCredentialPending(bot, instanceId, runOn)) {
+    const hint = `Add the ${engine} credential in Settings; the run resumes on its own once it lands`;
+    const reason = `${engine} is waiting on a credential — ${hint}`;
+    return { reason, hint };
+  }
+  return undefined;
+}
+
+/** The verdict `canStart` just computed, for the paired `dispatchHoldReason`
+ *  lookup to consume.  Set on every canStart call, cleared when the reason is
+ *  read, so a later tick (or an unpaired lookup) always re-evaluates. */
+let pendingDispatchHold: { key: string; hold: DispatchHold | undefined } | undefined;
+
 /** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
  *  consulted for work nobody is watching, so a cap can stop background
- *  automation without silently refusing a message the owner is waiting on. */
+ *  automation without silently refusing a message the owner is waiting on.
+ *  Kept for the jobs registry / wake coordinator, which ask only about spend
+ *  — not the full dispatch hold.  Routine canStart goes through dispatchHoldFor. */
 function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
   if (runOn !== "bot") return false;
   const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
@@ -4673,8 +4817,13 @@ async function startTurn(
       : undefined,
     isCooling: (instanceId, model) => Boolean(quotaCooldowns.get(bot.id, instanceId, model)),
   });
-  if (turnExternalCredentialPending(bot, selection.instanceId, opts?.runOn)) {
-    throw externalCredentialPendingError(selection.instanceId);
+  // The engine this turn will run on, not merely the one the selection names —
+  // see `executionInstanceFor`. Asking the credential gate about a Box-backed
+  // cloud run's LOCAL model rejects work whose Box credentials are perfectly
+  // ready, which is the mirror of the breaker bug.
+  const executingInstance = executionInstanceFor(bot, selection, opts?.runOn ?? "bot");
+  if (turnExternalCredentialPending(bot, executingInstance, opts?.runOn)) {
+    throw externalCredentialPendingError(executingInstance);
   }
   // A fresh user turn re-arms both the saved chain and the stop latch; the
   // fallback dispatch (which carries modelSelection) is a continuation of the
@@ -5173,9 +5322,12 @@ async function startTurn(
       // dispatch for a CLI/ACP-lane bot, which is never eligible anyway.
       const recallSettingsForTurn =
         usesDriverToolLoop && cfg.qdrant?.enabled !== false ? recallSettings() : undefined;
-      const hasRecall = Boolean(
-        recallSettingsForTurn && (recallSettingsForTurn.url || findRecallCli()),
-      );
+      // Short-circuited, not passed as a value: JS evaluates arguments eagerly,
+      // so passing findRecallCli() would run its synchronous existsSync probes
+      // on every dispatch even when recall is off or this engine cannot carry
+      // the tools. The old expression avoided exactly that.
+      const hasRecall = recallSettingsForTurn !== undefined
+        && recallAvailableForTurn(recallSettingsForTurn, usesDriverToolLoop, findRecallCli)
       // Same reasoning as `phoneEligible` above: the skill selection already
       // decided whether this message is phone-related, using the SAME
       // toolLoop eligibility.  Re-deriving that here would just risk the
@@ -5601,29 +5753,32 @@ routines = new RoutineManager({
     });
   },
   canStart: (botId, threadId, runOn) => {
-    const bot = store.bot(botId);
-    const task = bot && threadId ? store.taskByThread(bot.id, threadId) : undefined;
-    if (!bot) return true;
-    const policy = task?.modelSelection ?? bot.modelSelection;
-    const instanceId = quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
-    // A (bot, engine) pair that has failed to START repeatedly is not going to
-    // start on the next tick either — the CLI is missing, not executable, or
-    // waiting on an interactive login, and none of those change on a timer.
-    // Declining here leaves the run QUEUED rather than failed, so it still
-    // lands once the breaker half-opens after the TTL.  Same shape as the
-    // credential gate below it: both answer "should this go out right now".
-    if (doomedDispatches.isOpen(bot.id, instanceId)) {
-      noteDoomedSkip(bot.id, instanceId);
-      return false;
-    }
-    // Last, and off unless a ceiling is configured: an unattended fleet that
-    // silently stops working is a worse outcome than one that overspends, so
-    // this also refuses to fire when too little of the window is priced to
-    // trust the total.  The reason is logged rather than swallowed, because
-    // "the cap did not hold" needs to be explainable.
-    if (spendBlockedForUnattendedWork(runOn)) return false;
-    return !turnExternalCredentialPending(bot, instanceId, runOn);
+    const hold = dispatchHoldFor(botId, threadId, runOn, { count: true });
+    // The scheduler asks for the reason immediately after a `false` here, for
+    // the same run on the same tick.  Stash the verdict so the reason lookup
+    // below reuses it instead of running the whole predicate a second time.
+    // Consumed on read: the next tick must re-evaluate, not reuse this.
+    pendingDispatchHold = { key: `${botId}${threadId ?? ""}${runOn}`, hold };
+    return !hold;
   },
+  // The reason behind a `false` from canStart, read by the scheduler when it
+  // leaves a run QUEUED.  Takes the run's own destination and thread for the
+  // same reason canStart does, and passes `count: false` so asking why does not
+  // also count a second prevented dispatch.
+  dispatchHoldReason: (botId, threadId, runOn) => {
+    const key = `${botId}${threadId ?? ""}${runOn}`;
+    if (pendingDispatchHold && pendingDispatchHold.key === key) {
+      const { hold } = pendingDispatchHold;
+      pendingDispatchHold = undefined;
+      return hold?.reason;
+    }
+    return dispatchHoldFor(botId, threadId, runOn, { count: false })?.reason;
+  },
+  // Liveness only.  It has no thread and no runOn, so it CANNOT judge a hold:
+  // doing so hardcoded a destination and put the local spend ceiling and the
+  // local credential gate in front of CLOUD runs, which both deliberately
+  // exempt.  The hold belongs at the canStart site, which has the run's real
+  // context — and that is now where it is.
   botState: (botId) => {
     const bot = store.bot(botId);
     return !bot ? "missing" : bot.busy ? "busy" : "ready";
@@ -13035,6 +13190,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // GET /api/instances snapshot.quota.minimax — never one shared value
       // here, which is what let a second MiniMax connection read the
       // reserved instance's numbers.
+      // Per-request cache: each doomed entry would otherwise call
+      // instancesHeldByQueuedRuns for the same bot and re-walk the queue.
+      // Scope is this request only — a module-level cache would survive a
+      // later queue drain and report a stale set.
+      const holdsByBot = new Map<string, Set<string>>();
       return json(res, 200, {
         ok: true,
         cooldowns: quotaCooldowns.list(),
@@ -13046,7 +13206,82 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // stopped draining cannot be told apart without both lists.  `list()`
         // is the live registry including half-open entries, so the half-open
         // "we let one probe through" state is visible here too.
-        doomed: doomedDispatches.list(),
+        // `open` is carried because `list()` also returns sub-threshold
+        // counters and expired half-open entries, and both dispatch normally —
+        // rendering every row of that list as "held" reports a healthy engine
+        // as held after a single transient failure.  `lastError` is redacted on
+        // the way the runtime event path redacts before broadcasting: a setup
+        // failure can carry provider text, and this route is a different
+        // boundary from the one that already sanitises it.
+        doomed: doomedDispatches.list().map((entry) => {
+          const bot = store.bot(entry.botId);
+          const open = doomedDispatches.isOpen(entry.botId, entry.instanceId);
+          // `open` alone is not "held": a fallback engine's breaker can stay
+          // open long after the primary recovered and the bot is dispatching
+          // normally. Whether a pair HOLDS the bot depends on the engine that
+          // bot would actually use, which is the same question dispatchHoldFor
+          // asks — so it is answered here, once, instead of guessed at in the
+          // panel from a list that knows nothing about the bot's selection.
+          // Only a queued run's real engine.  An inactive task override, or
+          // boxAgent merely because a cloud backend is configured, is not a
+          // hold: nothing queued is waiting on it.  The run's own thread and
+          // destination are what dispatchHoldFor would judge. Computed only
+          // when the entry's own gate passed (`bot && open`); outside that
+          // branch the Set is never read, so a per-bot call would be wasted
+          // work for every bot whose breaker is closed.
+          let heldForBot: Set<string> | undefined;
+          if (bot && open) {
+            heldForBot = holdsByBot.get(bot.id);
+            if (!heldForBot) {
+              heldForBot = instancesHeldByQueuedRuns(bot);
+              holdsByBot.set(bot.id, heldForBot);
+            }
+          }
+          const holds = Boolean(heldForBot?.has(entry.instanceId));
+          return {
+            ...entry,
+            open,
+            holds,
+            lastError: entry.lastError
+              ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
+              : undefined,
+          };
+        }),
+        // Bots with an ADJACENT repeat in a fallback chain — the only kind the
+        // runtime cannot reach. `selectTurnFallback` compares a candidate with
+        // the engine that JUST failed, so a trailing repeat of the PRIMARY is
+        // perfectly reachable and is NOT reported here; only a repeat of the
+        // entry immediately before it is. Reported rather than corrected:
+        // removing the entry is a product decision, not a helper's.
+        // Bot-level AND per-task, because in Projects mode a task carries its
+        // own modelSelection and fallback chain and the runtime prefers it. A
+        // bot-only view reported chains that never run and missed the ones
+        // that do — including the thread an automation is actually holding.
+        fallbackChains: store.bots
+          .flatMap((bot) => {
+            const botLevel = {
+              botId: bot.id,
+              name: bot.name,
+              scope: "bot" as const,
+              threadId: null as string | null,
+              ...effectiveFallbackTiers(bot.modelSelection, bot.modelSelection.fallbacks),
+            };
+            // Only tasks that OVERRIDE the bot selection. A task without one
+            // inherits it, so emitting a row for it duplicated the bot-level
+            // finding — eleven rows for one redundant chain, which the panel
+            // then read as eleven bots.
+            const perTask = (bot.tasks ?? [])
+              .filter((task) => task.modelSelection)
+              .map((task) => ({
+              botId: bot.id,
+              name: bot.name,
+              scope: "task" as const,
+              threadId: task.threadId ?? null,
+              ...effectiveFallbackTiers(task.modelSelection!, task.modelSelection!.fallbacks),
+            }));
+            return [botLevel, ...perTask];
+          })
+          .filter((entry) => entry.redundant.length > 0),
         antigravity: lastAntigravityQuotaSnapshot(),
         grok: lastGrokQuotaSnapshot(),
         windows: usageQuotaPoller.getWindows(),

@@ -310,7 +310,7 @@ export function LocalVmRuntimeCard() {
               rel="noreferrer"
               className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
             >
-              <ExternalLink size={12} /> Watch screen
+              <ExternalLink size={12} /> Watch Screen
             </a>
           )}
         </div>
@@ -393,7 +393,7 @@ export function LocalVmRuntimeCard() {
             )}
           </Step>
 
-          <Step n={3} title="Prepare the Linux Desktop (one-time download and build)" done={Boolean(status?.image)}>
+          <Step n={3} title="Prepare the Linux Desktop (One-Time Download and Build)" done={Boolean(status?.image)}>
             {status?.daemonUp && (
               <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Linux Desktop</ActionButton>
             )}
@@ -402,7 +402,7 @@ export function LocalVmRuntimeCard() {
 
           <Step
             n={4}
-            title={perBot ? "Create a private desktop from each bot's Computer panel" : needsRecreate ? "Replace the older or unsafe VM" : "Create and start the Local VM"}
+            title={perBot ? "Create a Private Desktop from Each Bot's Computer Panel" : needsRecreate ? "Replace the Older or Unsafe VM" : "Create and Start the Local VM"}
             done={!perBot && ready}
           >
             {perBot ? (
@@ -421,7 +421,7 @@ export function LocalVmRuntimeCard() {
                 </div>
                 {status?.image ? (
                   <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
-                    <RotateCcw size={13} /> Delete and recreate
+                    <RotateCcw size={13} /> Delete and Recreate
                   </ActionButton>
                 ) : (
                   <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before replacing this VM.</div>
