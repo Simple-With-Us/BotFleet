@@ -32,7 +32,7 @@
 // one and never a missing pointer.
 
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -275,7 +275,31 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
 export async function discardRelease(commit, env = process.env) {
   const path = releasePath(commit, env);
   await makeWritable(path);
-  await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  try {
+    await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (error) {
+    // The tree was made writable to be deleted, and it still exists.  Put the
+    // immutability back rather than leaving a promoted release silently
+    // writable: `force: true` only suppresses ENOENT, so an EBUSY or EEXIST
+    // here returns with the release intact — and the next caller would find a
+    // "read-only" release that anything can write to.
+    let restored = false;
+    try {
+      await makeReadOnly(path);
+      restored = true;
+    } catch {
+      // Already gone, or no longer ours to fix; the original error is the one
+      // that explains why discard failed.
+    }
+    throw new ResolutionError(
+      `Could not discard ${path}: ${error?.message || error}` +
+        (restored
+          ? "  Its read-only permissions have been restored."
+          : "  AND its permissions could not be restored, so it is still writable — treat it as unsafe until someone removes it by hand."),
+      restored ? "discard-failed-read-only-restored" : "discard-failed-writable",
+      { releasePath: path },
+    );
+  }
   return path;
 }
 
@@ -364,6 +388,30 @@ async function createPointerAt(path, target, type) {
 export async function swapCurrent({ commit, env = process.env, renameImpl = rename } = {}) {
   const target = releasePath(commit, env);
   const link = currentLink(env);
+  // The pointer is only ever moved onto a release that exists.  Without this,
+  // a typo'd or already-pruned commit gets a `current` that resolves to
+  // nothing: the launcher follows it, finds no tree, and the harness cannot
+  // start — with no error anywhere saying the pointer is dangling, because from
+  // the store's point of view the swap succeeded.
+  let targetStat;
+  try {
+    targetStat = await stat(target);
+  } catch (error) {
+    throw new ResolutionError(
+      `Cannot point current at ${target}: ${error?.message || error}.  ` +
+        `Promote that commit first — swapCurrent only moves the pointer onto a release that already exists.`,
+      "release-missing",
+      { releasePath: target },
+    );
+  }
+  if (!targetStat.isDirectory()) {
+    throw new ResolutionError(
+      `${target} is not a directory, so it cannot be a release.  ` +
+        `Promote that commit first — swapCurrent only moves the pointer onto a release that already exists.`,
+      "release-missing",
+      { releasePath: target },
+    );
+  }
   const previous = await resolveCurrent(env);
   const scratch = await mkdtemp(join(storeRoot(env), ".current-"));
   const staged = join(scratch, CURRENT);
@@ -396,12 +444,33 @@ export async function swapCurrent({ commit, env = process.env, renameImpl = rena
       await rm(link, { recursive: true, force: true });
       try {
         await renameImpl(staged, link);
+        // The retry succeeded, so the spare has served its purpose: `previous`
+        // is returned below for the caller to keep.  Left in place it is a
+        // stray `current.displaced-<hex>` symlink per non-atomic swap, and
+        // nothing in the store ever prunes those.
+        if (displaced) await rm(displaced, { recursive: true, force: true }).catch(() => {});
       } catch (retryError) {
-        if (displaced) await rename(displaced, link).catch(() => {});
+        // Report what actually happened.  Swallowing the restore result and
+        // then always saying "could not restore" tells an operator staring at
+        // a harness outage that their previous release is gone when it is
+        // sitting there — which sends them looking for the wrong problem.
+        let restored = false;
+        let restoreError = null;
+        if (displaced) {
+          try {
+            await rename(displaced, link);
+            restored = true;
+          } catch (error) {
+            restoreError = error;
+          }
+        }
         throw new ResolutionError(
-          `Could not move the release pointer to ${target} and could not restore the previous release: ${retryError?.message || retryError}`,
-          "pointer-lost",
-          { previous },
+          restored
+            ? `Could not move the release pointer to ${target}, so the previous release was put back: ${retryError?.message || retryError}`
+            : `Could not move the release pointer to ${target} and could not restore the previous release: ${retryError?.message || retryError}` +
+              (restoreError ? `  Restoring it also failed: ${restoreError?.message || restoreError}` : ""),
+          restored ? "swap-failed-restored" : "pointer-lost",
+          { previous, restored },
         );
       }
     }
