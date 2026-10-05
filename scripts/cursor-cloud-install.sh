@@ -27,7 +27,7 @@ else
   npm install -g pnpm@10.33.0 >/dev/null 2>&1 || true
 fi
 
-# 2.  Shared VM CLI manifest (cloud + both targets) — same source as the
+# 2.  Shared VM CLI manifest (cloud + both targets) - same source as the
 #     Local VM / VPS desktop image and Box bootstrap.
 log "Installing BotFleet VM CLI toolchain from scripts/computer-vm-cli/manifest.json."
 bash scripts/computer-vm-cli/run-install.sh cloud

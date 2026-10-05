@@ -1,39 +1,60 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
-export type VmCliTarget = "cloud" | "local" | "both";
+const VmCliTargetSchema = z.enum(["cloud", "local", "both"]);
+
+const VmCliVerifySchema = z
+  .object({
+    command: z.string().min(1),
+    args: z.array(z.string()).optional(),
+  })
+  .strict();
+
+const VmCliCredentialTransformSchema = z.enum(["docker-linux-config", "gpg-public-tree", "gpg-private-tree"]);
+
+const VmCliCredentialPathSchema = z
+  .object({
+    rel: z.string().min(1),
+    transform: VmCliCredentialTransformSchema.optional(),
+  })
+  .strict();
+
+const VmCliToolSchema = z
+  .object({
+    name: z.string().min(1),
+    targets: z.array(VmCliTargetSchema).min(1),
+    version: z.string().min(1),
+    verify: VmCliVerifySchema.optional(),
+    apt: z.array(z.string().min(1)).optional(),
+    recipe: z.string().min(1).optional(),
+    npmPackage: z.string().min(1).optional(),
+    postInstall: z.string().min(1).optional(),
+    credentialPaths: z.array(VmCliCredentialPathSchema).optional(),
+  })
+  .strict();
+
+export const VmCliManifestSchema = z
+  .object({
+    schemaVersion: z.number().int().nonnegative(),
+    tools: z.array(VmCliToolSchema),
+  })
+  .strict();
+
+export type VmCliTarget = z.infer<typeof VmCliTargetSchema>;
 
 export type VmCliEnvironment = "cloud" | "local-vm";
 
-export interface VmCliVerify {
-  command: string;
-  args?: string[];
-}
+export type VmCliVerify = z.infer<typeof VmCliVerifySchema>;
 
-export type VmCliCredentialTransform = "docker-linux-config" | "gpg-public-tree" | "gpg-private-tree";
+export type VmCliCredentialTransform = z.infer<typeof VmCliCredentialTransformSchema>;
 
-export interface VmCliCredentialPath {
-  rel: string;
-  transform?: VmCliCredentialTransform;
-}
+export type VmCliCredentialPath = z.infer<typeof VmCliCredentialPathSchema>;
 
-export interface VmCliTool {
-  name: string;
-  targets: VmCliTarget[];
-  version: string;
-  verify?: VmCliVerify;
-  apt?: string[];
-  recipe?: string;
-  npmPackage?: string;
-  postInstall?: string;
-  credentialPaths?: VmCliCredentialPath[];
-}
+export type VmCliTool = z.infer<typeof VmCliToolSchema>;
 
-export interface VmCliManifest {
-  schemaVersion: number;
-  tools: VmCliTool[];
-}
+export type VmCliManifest = z.infer<typeof VmCliManifestSchema>;
 
 const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), "../scripts/computer-vm-cli/manifest.json");
 
@@ -45,7 +66,7 @@ export function vmCliManifestPath(): string {
 
 export function loadVmCliManifest(): VmCliManifest {
   if (!cachedManifest) {
-    cachedManifest = JSON.parse(readFileSync(MANIFEST_PATH, "utf8")) as VmCliManifest;
+    cachedManifest = VmCliManifestSchema.parse(JSON.parse(readFileSync(MANIFEST_PATH, "utf8")));
   }
   return cachedManifest;
 }
