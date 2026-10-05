@@ -1324,7 +1324,11 @@ export class RoutineManager {
           (run.triggerSource === "webhook" || run.triggerSource === "resource" || run.triggerSource === "schedule")
         ) {
           const ownerThreadId = threadId;
-          const ephemeral = this.options.createTask?.(run.botId, `${title} (one-shot)`, false);
+          const ephemeralKey = `${key}:one-shot`;
+          const existingEphemeral = this.options.taskForKey?.(run.botId, ephemeralKey);
+          const ephemeral = existingEphemeral
+            ? { threadId: existingEphemeral }
+            : this.options.createTask?.(run.botId, `${title} (one-shot)`, false, ephemeralKey);
           if (!ephemeral) {
             this.failRun(run, "Could not create a one-shot workspace for this run");
             continue;
@@ -1515,7 +1519,20 @@ export class RoutineManager {
     const run = this.runs.find((r) => !r.coalescedInto && r.threadId === threadId && ["running", "waiting"].includes(r.status));
     if (!run) return;
     this.failRun(run, message, code);
+    this.deliverEphemeralFailure(run, message);
     queueMicrotask(() => void this.tick());
+  }
+
+  private deliverEphemeralFailure(run: RoutineRun, message: string) {
+    if (!run.ownerThreadId || !run.threadId) return;
+    this.options.deliverEphemeralResult?.({
+      ownerThreadId: run.ownerThreadId,
+      ephemeralThreadId: run.threadId,
+      run,
+      ok: false,
+      output: run.output,
+      error: message,
+    });
   }
 
   /** Fail runs whose turn is no longer in flight. `turnLive` is the harness's

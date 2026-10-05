@@ -3,7 +3,28 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { RuntimeEvent } from "./contracts.ts";
 import { BUSY_DEFER_NOTE, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn } from "./routines.ts";
+
+type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
+
+function turnCompletedFixture(
+  threadId: string,
+  partial: Partial<TurnCompletedEvent> = {},
+): TurnCompletedEvent {
+  return {
+    eventId: "event",
+    provider: "claude",
+    providerInstanceId: "claude-fixture",
+    threadId,
+    createdAt: new Date().toISOString(),
+    type: "turn.completed",
+    ok: true,
+    cost: 0,
+    denials: [],
+    ...partial,
+  };
+}
 
 const dirs: string[] = [];
 
@@ -29,7 +50,11 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const checkInStarts: Array<{ run: any; routine: any }> = [];
   const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean }> = [];
   const ephemeralFlags: boolean[] = [];
-  const deliveredEphemeral: any[] = [];
+  const deliveredEphemeral: Array<{
+    ownerThreadId: string;
+    ephemeralThreadId: string;
+    ok: boolean;
+  }> = [];
   let checkInIdSeq = 0;
   let live = true;
   let admitting = true;
@@ -946,13 +971,7 @@ describe("RoutineManager", () => {
     expect(h.ephemeralFlags).toEqual([true]);
     const run = h.manager.listRuns().find((candidate) => candidate.deliveryId === "d-one-shot");
     expect(run?.ownerThreadId).toBe("thread-1");
-    h.manager.handleRuntimeEvent({
-      type: "turn.completed",
-      threadId: "thread-2",
-      ok: true,
-      cost: 0,
-      denials: [],
-    } as any);
+    h.manager.handleRuntimeEvent(turnCompletedFixture("thread-2"));
     expect(h.deliveredEphemeral).toEqual([
       expect.objectContaining({
         ownerThreadId: "thread-1",
@@ -960,6 +979,53 @@ describe("RoutineManager", () => {
         ok: true,
       }),
     ]);
+  });
+
+  it("posts a one-shot failure to the owner when dispatch fails", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    h.options.startTurn = async () => {
+      throw new Error("engine offline");
+    };
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Designer classify",
+      prompt: "Classify",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d-dispatch-fail",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.deliveredEphemeral).toEqual([
+      expect.objectContaining({
+        ownerThreadId: "thread-1",
+        ok: false,
+        error: expect.stringContaining("engine offline"),
+      }),
+    ]);
+  });
+
+  it("reuses the keyed one-shot workspace across deliveries", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    for (const deliveryId of ["d1", "d2"]) {
+      h.manager.enqueueWebhook({
+        webhookId: "hook-1",
+        webhookName: "Designer classify",
+        prompt: `Wake ${deliveryId}`,
+        botId: "maus-webhook",
+        runOn: "bot",
+        deliveryId,
+        receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+      });
+      await h.manager.tick();
+      h.manager.handleRuntimeEvent(turnCompletedFixture(h.started.at(-1)!.threadId));
+    }
+    expect(h.started.map((row) => row.threadId)).toEqual(["thread-2", "thread-2"]);
+    expect(h.taskActivations.filter(Boolean)).toHaveLength(1);
   });
 
   it("keeps every delivery of ONE webhook on that webhook's own thread", async () => {
