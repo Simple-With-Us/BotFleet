@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled/unlabeled re-runs the ratchet when the allow label is added or removed.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -15,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history so the ratchet can read the base branch baseline.
+          # The default pull_request checkout is the merge commit
+          # (refs/pull/<n>/merge).  Do not pin ref to the branch head.
+          # A branch that is only behind the base must be linted as merged,
+          # or the ratchet false-fails and seats regenerate the baseline.
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -27,6 +34,14 @@ jobs:
         env:
           LINT_BASE_REF: origin/${{ github.base_ref }}
         run: node scripts/lint-pr-gate.mjs
+      - name: Lint (per-rule ratchet against the base branch)
+        if: github.event_name == 'pull_request'
+        env:
+          LINT_BASELINE_REF: origin/${{ github.base_ref }}
+          # Exact "1" opts in.  Any other value stays strict.
+          # The label is the reviewable allow path.  Editing the JSON is not.
+          LINT_BASELINE_ALLOW_INCREASE: ${{ contains(github.event.pull_request.labels.*.name, 'allow-lint-baseline-increase') && '1' || '0' }}
+        run: node scripts/check-lint-baseline.mjs --baseline-ref "$LINT_BASELINE_REF"
       - name: Lint (full repo)
         if: github.event_name != 'pull_request'
         run: pnpm lint
