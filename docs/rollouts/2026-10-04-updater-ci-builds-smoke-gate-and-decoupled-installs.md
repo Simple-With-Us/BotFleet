@@ -1,8 +1,7 @@
 # 2026-10-04 — Updater Architecture: CI-Built Artifacts, A Pre-Activation Smoke Gate, And Decoupled Installs
 
 Board rows `34c834f1` (Rec 1), `49465fcb` (Rec 4), `1f3fe835` (Rec 3), `f1482275` (Rec 2).
-Branch `minimax/updater-architecture`, then `minimax/updater-decouple`.  Worktree
-the MINIMAX seat worktree.
+Branch `minimax/updater-architecture`, then `minimax/updater-decouple`.
 
 Owner approved all four recommendations from an architecture review that
 reverse-engineered how `mcode` swapped 0.5.5 to 0.6.2 in seven seconds with
@@ -48,7 +47,12 @@ outages were both *a healthy binary plus a starved CPU* at load 400–700, and e
 tolerance widened so far was inside a step that should not have been running on
 that machine at all.  So `classifySmokeFailure` keeps "too busy" and "broken"
 apart, exactly one readiness timeout is retried and nothing else, and the timeout
-message tells the operator to re-run when the machine is quieter.
+message tells the operator to re-run when the machine is quieter.  This is the
+third instance of one lesson, not a new one: fleet recall (`recall "busy host
+update timeout classified as corrupt artifact not a failure"`, 2026-10-04)
+returns the Oct 1 cloudflared version-probe incident (PR #780, board
+`fd1736f8`) and the open board sweep for six more short-timeout probes that
+misreport a busy host as a corrupt binary.
 
 ### 2. Commit-Keyed Builds On GitHub Runners, Installed By Commit
 
@@ -204,7 +208,13 @@ first.
   function**, and nothing in the JavaScript noticed a new local import.  The only
   warning was a comment.  Any future refactor that reaches for a new module
   would break `ubf` on every Mac at the moment it is trying to recover from a
-  failed update.  Now enforced in both directions.
+  failed update.  Now enforced in both directions.  **Not a new finding:** fleet
+  recall (`recall "updater bootstrap archive literal import list new import
+  breaks recovery"`, 2026-10-04) returns the Fleet-OPS evaluation of
+  2026-09-27, which logged it as `desktop-11` — "hard-coded archive list will
+  drift", citing `scripts/update-botfleet.sh:277-281` and `:316-321` — and the
+  2026-09-22 updater transition rollout, which introduced the list.  This work
+  is the enforcement that finding was still waiting for.
 - `scripts/update-progress.mjs` has a **second** step list, separate from
   `PREPARE_STEPS`.  Adding a step to one and not the other does not throw — it
   silently freezes the progress fraction on the Mac and the phone during that

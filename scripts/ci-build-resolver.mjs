@@ -43,6 +43,10 @@ const DOWNLOAD_ATTEMPTS = 3;
 // it accelerates.
 const DOWNLOAD_TOTAL_TIMEOUT_MS = 12 * 60 * 1000;
 const DOWNLOAD_RETRY_DELAY_MS = 5_000;
+// A real cap for every OTHER child this module runs.  `spawn` ignores the
+// `maxBuffer` option that belongs to `execFile`, so passing one was silently
+// doing nothing; `runBoundedText` caps the listing, and this caps the rest.
+const MAX_CHILD_STDOUT_BYTES = 16 * 1024 * 1024;
 const MANIFEST_SCHEMA_VERSION = 1;
 const FULL_COMMIT = /^[a-f0-9]{40}$/;
 
@@ -77,7 +81,7 @@ export function classifyResolutionFailure({ status, timedOut, spawnError } = {})
   return "unknown";
 }
 
-function resolutionMessage({ cause, commit, status, repository, detail, conclusion }) {
+function resolutionMessage({ cause, commit, status, repository, detail, conclusion, keyPreview }) {
   const sha = FULL_COMMIT.test(commit || "") ? commit : `${String(commit || "").slice(0, 12) || "unknown"} (not a full commit)`;
   switch (cause) {
     case "no-build":
@@ -93,7 +97,9 @@ function resolutionMessage({ cause, commit, status, repository, detail, conclusi
         `build.  Set GITHUB_TOKEN to authenticate, or retry shortly.`
       );
     case "unauthorized":
-      return `GitHub rejected the credentials used to look up a build for ${sha} (HTTP ${status}).  Unset GITHUB_TOKEN to use the public repo anonymously.`;
+      return keyPreview
+        ? `GitHub rejected the configured key (${keyPreview}) while looking up a build for ${sha} (HTTP ${status}).  A key from another account or host is the usual cause.  Unset it to use the public repo anonymously.`
+        : `GitHub rejected an anonymous request for ${sha} (HTTP ${status}), which should not happen on a public repo.  Set GITHUB_TOKEN to authenticate, or retry shortly.`;
     case "network-timed-out":
     case "network-failed":
       return (
@@ -146,7 +152,7 @@ async function requestJson(url, { headers = {}, fetchImpl = fetch, timeoutMs = A
   if (!response.ok) {
     const cause = classifyResolutionFailure({ status: response.status });
     const error = new ResolutionError(
-      resolutionMessage({ cause, commit: "(unresolved)", status: response.status }),
+      resolutionMessage({ cause, commit: "(unresolved)", status: response.status, keyPreview: maskedKeyPreview(headers) }),
       cause,
     );
     error.status = response.status;
@@ -190,7 +196,12 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
         // are the cases a retry genuinely can fix.
         const cause = classifyResolutionFailure({ status: response.status });
         const retryable = response.status === 429 || response.status >= 500;
-        lastError = new ResolutionError(`Downloading ${label} failed with HTTP ${response.status}`, cause);
+        lastError = new ResolutionError(
+          cause === "unauthorized"
+            ? resolutionMessage({ cause, commit: "(unresolved)", status: response.status, keyPreview: maskedKeyPreview(headers) })
+            : `Downloading ${label} failed with HTTP ${response.status}`,
+          cause,
+        );
         lastError.status = response.status;
         if (!retryable) {
           // Mark it before throwing: this throw happens inside the try, so the
@@ -225,6 +236,21 @@ async function requestBytes(url, { headers = {}, fetchImpl = fetch, timeoutMs = 
 function authHeaders(env = process.env) {
   const token = (env.GITHUB_TOKEN || env.GH_TOKEN || "").trim();
   return token ? { authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * A credential is never printed, and a 401 that does not say WHICH credential is
+ * not much of a diagnosis — the usual cause is a key from another account or a
+ * different host, and the first eight and last four characters are enough to
+ * tell that apart from the key the operator meant.  Anything too short to mask
+ * safely is reported as short rather than shown.
+ */
+export function maskedKeyPreview(headers = {}) {
+  const value = String(headers?.authorization || headers?.Authorization || "").trim();
+  const token = value.replace(/^(?:bearer|token)\s*/i, "").trim();
+  if (!token) return null;
+  if (token.length <= 12) return "a key too short to identify safely";
+  return `${token.slice(0, 8)}…${token.slice(-4)}`;
 }
 
 /**
@@ -322,7 +348,16 @@ function run(command, args, options) {
     // a token.  Drain it so the child can never block on a full pipe, and
     // discard it: the exit code is the diagnosis, stderr stays on this machine.
     child.stderr.resume();
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      // Nothing this module runs is chatty, so a child that reaches this is
+      // misbehaving and is stopped rather than allowed to exhaust memory while
+      // the updater holds its lock.
+      if (stdout.length > MAX_CHILD_STDOUT_BYTES) {
+        child.kill("SIGKILL");
+        fail(new Error(`${command} produced more than ${MAX_CHILD_STDOUT_BYTES} bytes of stdout`));
+      }
+    });
     child.once("error", fail);
     child.once("close", (code) => (code === 0 ? done(stdout) : fail(new Error(`${command} exited with code ${code}`))));
   });

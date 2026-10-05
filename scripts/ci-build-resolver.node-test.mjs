@@ -14,6 +14,7 @@ import {
   downloadBuiltBundle,
   findCommitArtifact,
   manifestArtifactName,
+  maskedKeyPreview,
   materializeBuild,
   ResolutionError,
   selectCommitRun,
@@ -412,3 +413,27 @@ test("an entry name crafted to defeat a column parser is still checked", () => {
 function escapeForRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+test("a rejected key is named by a masked preview, never printed", async () => {
+  // A 401 that cannot say WHICH key was rejected is not a diagnosis, and the
+  // answer must never be the key itself.
+  assert.equal(maskedKeyPreview({}), null);
+  assert.equal(maskedKeyPreview({ authorization: "Bearer " }), null);
+  assert.equal(maskedKeyPreview({ authorization: "Bearer ghp_short" }), "a key too short to identify safely");
+  assert.equal(
+    maskedKeyPreview({ authorization: "Bearer ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" }),
+    "ghp_ABCD…6789",
+  );
+
+  const token = "ghp_rejectedsessionkey0123456789abcd";
+  const fetchImpl = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  await assert.rejects(
+    () => downloadBuiltBundle({ commit: COMMIT, fetchImpl, env: { GITHUB_TOKEN: token } }),
+    (error) => {
+      assert.equal(error.cause, "unauthorized");
+      assert.match(error.message, /ghp_reje…abcd/);
+      assert.equal(error.message.includes(token), false, "the whole key must never reach the message");
+      return true;
+    },
+  );
+});

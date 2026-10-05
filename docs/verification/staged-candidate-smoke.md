@@ -107,8 +107,11 @@ if (!result.ready || !result.sqlite?.ok) process.exit(1);
 Observed on this Mac, 2026-10-04, against the installed `d9e646ffc292` bundle:
 `ready: true`, `sqliteOk: true`, 17.6s on a quiet machine and 51.4s while four
 other seats were compiling — which is the reason the boot budget is 180s rather
-than something tighter.  The live harness on `:8799` stayed `ready: true`
-throughout, with no scratch left behind and no stray processes.
+than something tighter.  The live harness stayed `ready: true` throughout, with
+no scratch left behind and no stray processes.  The port the harness itself
+listens on is a private operations detail, kept in the fleet's local-process
+record rather than in a public verification doc; the recipe above reserves its
+own port instead of naming one.
 
 ## Bypass
 

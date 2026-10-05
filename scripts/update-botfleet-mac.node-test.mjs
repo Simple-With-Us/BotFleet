@@ -1829,6 +1829,10 @@ test("another script with the same entry guard runs through a symlinked director
 // and the first version of this gate would have called both of them a corrupt
 // build.  These cases exist to keep that mistake from returning: a timeout and
 // a real failure must stay distinguishable, and only a timeout may be retried.
+// The diagnosis is not re-derived here either — fleet recall ("busy host update
+// timeout classified as corrupt artifact not a failure", 2026-10-04) returns the
+// Oct 1 cloudflared probe incident (PR #780, board fd1736f8) and the open board
+// sweep for the same failure in six other probes.
 test("the smoke test is on unless it is explicitly switched off", () => {
   assert.equal(smokeTestEnabled({}), true);
   assert.equal(smokeTestEnabled({ BOTFLEET_UPDATE_SMOKE: "1" }), true);
