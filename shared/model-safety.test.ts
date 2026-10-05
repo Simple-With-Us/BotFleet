@@ -52,10 +52,20 @@ describe("evaluateModelRiskForBypass", () => {
     }
   });
 
-  it("defaults unknown generic models to standard tier without false alarms", () => {
+  it("defaults unknown non-empty models to standard tier without false alarms", () => {
     const evaluation = evaluateModelRiskForBypass("custom-enterprise-agent-v1");
     expect(evaluation.isDangerous).toBe(false);
     expect(evaluation.tier).toBe("standard");
     expect(evaluation.warningTitle).toBeNull();
+  });
+
+  it("flags empty, blank, or undefined model as dangerous unknown model", () => {
+    for (const emptyVal of ["", "   ", undefined]) {
+      const evaluation = evaluateModelRiskForBypass(emptyVal);
+      expect(evaluation.isDangerous).toBe(true);
+      expect(evaluation.tier).toBe("standard");
+      expect(evaluation.warningTitle).toBe("Unknown Model: Permission Bypass Warning");
+      expect(evaluation.warningBody).toContain("This bot has no verifiable model selection");
+    }
   });
 });

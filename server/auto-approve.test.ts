@@ -907,4 +907,10 @@ describe("bypassPermissions", () => {
       rule: "permission-bypass",
     });
   });
+
+  it("does not bypass local-computer scope without explicit auto approval", () => {
+    const bypassBot = { bypassPermissions: true };
+    const verdict = autoVerdict(bypassBot, "mouse_click", "click at 100, 200", { scope: "local-computer" });
+    expect(verdict.approve).toBeNull();
+  });
 });

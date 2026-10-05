@@ -49,6 +49,18 @@ describe("BypassPermissionsWarning", () => {
     expect(html.match(/disabled=""/g)).toHaveLength(2);
   });
 
+  it("renders unknown model warning when model is empty or undefined", () => {
+    const html = renderToStaticMarkup(
+      createElement(BypassPermissionsWarning, {
+        ...baseProps,
+        model: "",
+      }),
+    );
+    expect(html).toContain("Unknown Model: Permission Bypass Warning");
+    expect(html).toContain("This bot has no verifiable model selection");
+    expect(html).toContain("I Understand the Risks, Enable Bypass");
+  });
+
   it("returns null when open is false", () => {
     const html = renderToStaticMarkup(
       createElement(BypassPermissionsWarning, {

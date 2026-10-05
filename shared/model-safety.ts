@@ -54,8 +54,20 @@ export function evaluateModelRiskForBypass(
   model: string | undefined,
   _engineId?: string,
 ): ModelRiskEvaluation {
-  const modelName = (model ?? "").trim() || "default";
+  const modelName = (model ?? "").trim();
   const lower = modelName.toLowerCase();
+
+  // An unknown model is not a known-safe model: warn rather than stay silent.
+  if (!lower) {
+    return {
+      model: "unknown",
+      isDangerous: true,
+      tier: "standard",
+      warningTitle: "Unknown Model: Permission Bypass Warning",
+      warningBody: "This bot has no verifiable model selection, so the risk of unprompted permission bypass cannot be assessed.  Continue with extreme caution.",
+      recommendation: "Select a known frontier reasoning model before enabling permission bypass.",
+    };
+  }
 
   for (const pattern of HIGH_RISK_PATTERNS) {
     if (pattern.test(lower)) {
