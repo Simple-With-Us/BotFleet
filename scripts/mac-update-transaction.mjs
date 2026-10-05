@@ -15,8 +15,10 @@ function requireSafe(snapshot, phase) {
 
 /**
  * Build and validate a replacement without touching the live checkout, bundle,
- * or processes.  The concrete adapter owns filesystem and command details;
- * this coordinator keeps the ordering testable.
+ * or processes.  Validation ends with actually running the candidate
+ * (`smokeTestBundle`), so a stage is only ever published for an artifact that
+ * has been proven to start.  The concrete adapter owns filesystem and command
+ * details; this coordinator keeps the ordering testable.
  */
 export async function prepareUpdate(plan, ops) {
   const lock = await ops.acquireLock("prepare");
@@ -28,6 +30,14 @@ export async function prepareUpdate(plan, ops) {
     await ops.installDependencies(source, targetCommit);
     const builtBundle = await ops.buildBundle(source, targetCommit);
     const identity = await ops.validateBundle(builtBundle, targetCommit);
+    // Prove the candidate actually STARTS before anything is published or
+    // installed.  Signature and build-identity checks read files; this one runs
+    // the artifact, which is the only check that can catch a bundle that
+    // verifies perfectly and dies on launch.  It sits here, inside prepare,
+    // because prepare is the last phase that touches nothing live — no
+    // capturePrevious, no candidate copy, no launchctl, no /Applications
+    // rename — so a failure here costs a staging directory.
+    await ops.smokeTestBundle(builtBundle, targetCommit);
     return await ops.persistPrepared({
       plan,
       source,
@@ -105,3 +115,42 @@ export async function runUpdate(plan, options, ops) {
   const prepared = await prepareUpdate(plan, ops);
   return applyPreparedUpdate(prepared, options, ops);
 }
+
+/**
+ * The step names each phase calls, in order.  Exported so the surface that
+ * renders them to a person (server/update-control.ts) can be tested for
+ * coverage: a new step that nobody gave a sentence would otherwise show its
+ * raw camelCase op name on the Mac and the phone.  Keep in step with the phase
+ * bodies above — a test in server/update-control.test.ts fails on drift.
+ */
+export const PREPARE_STEPS = Object.freeze([
+  "resolveTarget",
+  "prepareSource",
+  "assertStagingSource",
+  "installDependencies",
+  "buildBundle",
+  "validateBundle",
+  "smokeTestBundle",
+  "persistPrepared",
+  "releaseSource",
+]);
+
+export const APPLY_STEPS = Object.freeze([
+  "validatePrepared",
+  "preflight",
+  "capturePrevious",
+  "materializeCandidate",
+  "fence",
+  "quiesce",
+  "assertQuiesced",
+  "advanceCheckout",
+  "installCandidate",
+  "prepareCredentials",
+  "startHarness",
+  "verifyHarness",
+  "startApplication",
+  "verifySingleOwner",
+  "finish",
+  "rollback",
+  "cleanupCandidate",
+]);
