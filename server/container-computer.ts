@@ -13,6 +13,7 @@ import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/prom
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { z } from "zod";
 
 import { augmentedPath } from "./env-path.ts";
 import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
@@ -185,6 +186,19 @@ function runtimeProductName(runtime: Runtime): string {
   }
 }
 
+/** Parsed capacity from `docker info` / `podman info` format templates — trust boundary. */
+const runtimeHostCapacitySchema = z.object({
+  cpus: z.coerce.number().finite().positive(),
+  memoryBytes: z.coerce.number().finite().positive(),
+});
+
+function parseRuntimeHostInfoStdout(stdout: string): z.infer<typeof runtimeHostCapacitySchema> | null {
+  const parts = stdout.trim().split(/\s+/);
+  if (parts.length < 2) return null;
+  const parsed = runtimeHostCapacitySchema.safeParse({ cpus: parts[0], memoryBytes: parts[1] });
+  return parsed.success ? parsed.data : null;
+}
+
 /** Best-effort host capacity for the runtime VM (OrbStack, Colima, Podman machine, …). */
 export async function readRuntimeHost(
   runtime: Runtime,
@@ -194,11 +208,9 @@ export async function readRuntimeHost(
   const format = runtime === "podman" ? "{{.Host.CPUs}} {{.Host.MemTotal}}" : "{{.NCPU}} {{.MemTotal}}";
   try {
     const { stdout } = await runner(runtime, ["info", "--format", format], 8000);
-    const [cpus, memoryBytes] = stdout.trim().split(/\s+/).map(Number);
-    return {
-      cpus: Number.isFinite(cpus) ? cpus : undefined,
-      memoryBytes: Number.isFinite(memoryBytes) ? memoryBytes : undefined,
-    };
+    const capacity = parseRuntimeHostInfoStdout(stdout);
+    if (!capacity) return {};
+    return { cpus: capacity.cpus, memoryBytes: capacity.memoryBytes };
   } catch {
     return {};
   }

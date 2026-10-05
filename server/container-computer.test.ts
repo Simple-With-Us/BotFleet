@@ -37,6 +37,7 @@ import {
   healCuaShimsScript,
   limitsFromLabels,
   redactSecrets,
+  readRuntimeHost,
   resolveContainerLimits,
   boxGatewayUrl,
   computerProxyEnv,
@@ -1289,6 +1290,14 @@ describe("adaptive container limits", () => {
     expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 3 });
     const silent = runner({});
     expect(await resolveContainerLimits("docker", silent.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("ignores malformed docker info stdout instead of trusting manual coercion", async () => {
+    const junk = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "not-a-number 4294967296\n" });
+    expect(await readRuntimeHost("docker", junk.run)).toEqual({});
+    const partial = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3\n" });
+    expect(await readRuntimeHost("docker", partial.run)).toEqual({});
+    expect(await resolveContainerLimits("docker", junk.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
   });
 
   it("reads declared limits from the label and treats anything odd as the historical cap", () => {
