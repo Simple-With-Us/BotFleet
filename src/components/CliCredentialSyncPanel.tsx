@@ -65,9 +65,10 @@ export function CliCredentialSyncPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      const data = await response.json().catch(() => ({}));
+      const data: unknown = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(typeof data.error === "string" ? data.error : `Sync failed (${response.status})`);
+        const errorMessage = z.object({ error: z.string() }).safeParse(data);
+        throw new Error(errorMessage.success ? errorMessage.data.error : `Sync failed (${response.status})`);
       }
       const parsed = cliCredentialSyncResultSchema.safeParse(data);
       if (!parsed.success) {

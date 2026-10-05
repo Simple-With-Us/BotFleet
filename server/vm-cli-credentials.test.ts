@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  DockerConfigSchema,
   hostCliCredentialMounts,
   manifestCredentialCandidates,
   planCredentialSync,
@@ -28,7 +29,7 @@ describe("vm CLI credential sync", () => {
         credHelpers: { "https://index.docker.io/v1/": "osxkeychain", "ghcr.io": "pass" },
       }),
     );
-    const parsed = JSON.parse(sanitized) as Record<string, unknown>;
+    const parsed = DockerConfigSchema.parse(JSON.parse(sanitized));
     expect(parsed.credsStore).toBeUndefined();
     expect(parsed.credHelpers).toEqual({ "ghcr.io": "pass" });
   });
