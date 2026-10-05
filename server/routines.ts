@@ -1141,7 +1141,13 @@ export class RoutineManager {
         // webhook wake and leaves the receipt queued.  The 10s scheduler
         // tick tries again.  In-flight runs are not in this loop's queued
         // set, and resource wakes still start so Housekeeper can run.
-        if (run.triggerSource === "webhook" && this.options.hostHot?.()) continue;
+        if (run.triggerSource === "webhook" && this.options.hostHot?.()) {
+          // Same as snooze, busy, and the min-gap skip below.  A hot host is
+          // a deferral, not a hold, and a reason verified while the engine
+          // was dead must not keep rendering for the whole shed window.
+          this.clearHoldReason(run);
+          continue;
+        }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
         // and the whole batch goes into one turn when the gap closes, which
