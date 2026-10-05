@@ -10,6 +10,7 @@ import {
   readFileSync,
   statSync,
   writeFileSync,
+  rmSync,
 } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -282,6 +283,10 @@ export function resolveCredentialMountSource(
     const privatePaths = options.shareGpgPrivateKeys ? listGpgPrivateRelPaths(homeDir) : [];
     if (publicPaths.length === 0 && privatePaths.length === 0) return null;
     const stagedDir = join(stagingRoot, ".gnupg");
+    const stagedPrivateKeys = join(stagedDir, "private-keys-v1.d");
+    if (!options.shareGpgPrivateKeys && existsSync(stagedPrivateKeys)) {
+      rmSync(stagedPrivateKeys, { recursive: true, force: true });
+    }
     mkdirSync(stagedDir, { recursive: true });
     for (const publicRel of [...publicPaths, ...privatePaths]) {
       stageTransformedFile(homeDir, publicRel, undefined, stagingRoot);

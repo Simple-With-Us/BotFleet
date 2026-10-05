@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { VmCliManifestSchema, loadVmCliManifest } from "./vm-cli-manifest.ts";
+import { existsSync } from "node:fs";
+
+import { VmCliManifestSchema, loadVmCliManifest, parseVmCliShellEnvironment, vmCliManifestPath } from "./vm-cli-manifest.ts";
 
 describe("vmCliManifestSchema", () => {
   it("parses the committed manifest.json", () => {
@@ -17,6 +19,18 @@ describe("vmCliManifestSchema", () => {
         extra: true,
       }),
     ).toThrow();
+  });
+
+  it("parses shell environment argv", () => {
+    expect(parseVmCliShellEnvironment(undefined)).toBe("cloud");
+    expect(parseVmCliShellEnvironment("cloud")).toBe("cloud");
+    expect(parseVmCliShellEnvironment("local-vm")).toBe("local-vm");
+    expect(() => parseVmCliShellEnvironment("mars")).toThrow();
+  });
+
+  it("resolves the committed manifest on disk", () => {
+    expect(existsSync(vmCliManifestPath())).toBe(true);
+    loadVmCliManifest();
   });
 
   it("rejects tools with invalid target values", () => {

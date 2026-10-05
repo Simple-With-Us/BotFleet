@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AlertTriangle, Check, Loader2 } from "lucide-react";
+import { z } from "zod";
 
 export interface CliCredentialSyncToolResult {
   name: string;
@@ -17,6 +18,23 @@ export interface CliCredentialSyncResult {
   skippedTools: CliCredentialSyncSkip[];
   containerName: string;
 }
+
+const cliCredentialSyncResultSchema = z.object({
+  ok: z.boolean(),
+  syncedTools: z.array(
+    z.object({
+      name: z.string(),
+      paths: z.array(z.string()),
+    }),
+  ),
+  skippedTools: z.array(
+    z.object({
+      name: z.string(),
+      reason: z.string(),
+    }),
+  ),
+  containerName: z.string(),
+});
 
 export function CliCredentialSyncPanel({
   syncUrl,
@@ -49,9 +67,13 @@ export function CliCredentialSyncPanel({
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data.error ?? `Sync failed (${response.status})`);
+        throw new Error(typeof data.error === "string" ? data.error : `Sync failed (${response.status})`);
       }
-      setSyncResult(data as CliCredentialSyncResult);
+      const parsed = cliCredentialSyncResultSchema.safeParse(data);
+      if (!parsed.success) {
+        throw new Error("Sync returned an unexpected response shape");
+      }
+      setSyncResult(parsed.data);
     } catch (e) {
       setSyncError(e instanceof Error ? e.message : String(e));
     } finally {

@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { z } from "zod";
+
+import { SERVER_ROOT } from "./proxy-paths.ts";
 
 const VmCliTargetSchema = z.enum(["cloud", "local", "both"]);
 
@@ -56,14 +57,26 @@ export type VmCliTool = z.infer<typeof VmCliToolSchema>;
 
 export type VmCliManifest = z.infer<typeof VmCliManifestSchema>;
 
+const VmCliShellEnvironmentSchema = z.enum(["cloud", "local-vm"]);
+
 let cachedManifest: VmCliManifest | null = null;
 
+/** CLI argv for install/verify scripts (`cloud` | `local-vm`).  Omitted argv defaults to `cloud`. */
+export function parseVmCliShellEnvironment(raw: string | undefined): VmCliEnvironment {
+  if (raw === undefined || raw === "") return "cloud";
+  return VmCliShellEnvironmentSchema.parse(raw);
+}
+
 export function vmCliManifestPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const packaged = join(here, "computer-vm-cli/manifest.json");
-  if (existsSync(packaged)) return packaged;
-  const dev = join(here, "../scripts/computer-vm-cli/manifest.json");
-  return dev;
+  const candidates = [
+    join(SERVER_ROOT, "computer-vm-cli/manifest.json"),
+    join(SERVER_ROOT, "../computer-vm-cli/manifest.json"),
+    join(SERVER_ROOT, "../scripts/computer-vm-cli/manifest.json"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return candidates[candidates.length - 1]!;
 }
 
 export function loadVmCliManifest(): VmCliManifest {
