@@ -447,7 +447,7 @@ function createUnavailableLinuxRuntime({
   onChange = () => {},
   processId = process.pid,
   reasonCode = "bundled-driver-invalid",
-  message = "The bundled Cua Driver failed integrity validation.",
+  message = "The bundled CUA Driver failed integrity validation.",
 } = {}) {
   if (clearPreference) {
     try {
@@ -605,7 +605,7 @@ function createLinuxCuaRuntime({
     unavailable(
       "error",
       "daemon-exited",
-      "Cua Driver stopped unexpectedly. Try again before using this computer.",
+      "CUA Driver stopped unexpectedly. Try again before using this computer.",
       { generation: owned.generation, exitCode: code, exitSignal: signal },
     );
   };
@@ -654,7 +654,7 @@ function createLinuxCuaRuntime({
     if (startPromise) return startPromise;
 
     startPromise = (async () => {
-      unavailable("checking", "checking-driver", "Checking Cua Driver and the desktop session…");
+      unavailable("checking", "checking-driver", "Checking CUA Driver and the desktop session…");
       let inspected;
       try {
         inspected = await inspect({ platform, arch, env, bundledDriverPath });
@@ -662,7 +662,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "driver-inspection-failed",
-          "Cua Driver could not be inspected. Check the installation and try again.",
+          "CUA Driver could not be inspected. Check the installation and try again.",
         );
       }
       if (inspected.status !== "ready") {
@@ -687,7 +687,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           "socket-path-too-long",
-          "The private Cua Driver socket path is too long for this Linux installation.",
+          "The private CUA Driver socket path is too long for this Linux installation.",
         );
       }
 
@@ -724,7 +724,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           "driver-changed",
-          "Cua Driver changed after validation. Check the installation and try again.",
+          "CUA Driver changed after validation. Check the installation and try again.",
         );
       }
       const child = spawnProcess(inspected.path, args, {
@@ -748,7 +748,7 @@ function createLinuxCuaRuntime({
       child.stderr?.on("data", () => {});
       child.once("exit", (code, signal) => markUnexpectedExit(owned, code, signal));
       child.once("error", (error) => markUnexpectedExit(owned, null, error?.code ?? "spawn-error"));
-      unavailable("starting", "starting-daemon", "Starting the private Cua Driver runtime…", {
+      unavailable("starting", "starting-daemon", "Starting the private CUA Driver runtime…", {
         generation,
         driver: { path: inspected.path, version: inspected.driverVersion },
       });
@@ -822,7 +822,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "daemon-start-failed",
-          error?.message ?? "Cua Driver could not start.",
+          error?.message ?? "CUA Driver could not start.",
           { generation, driver: { path: inspected.path, version: inspected.driverVersion } },
         );
       }
@@ -832,7 +832,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "runtime-start-failed",
-          "The private Cua Driver runtime could not start. Check the installation and try again.",
+          "The private CUA Driver runtime could not start. Check the installation and try again.",
         );
       })
       .finally(() => {

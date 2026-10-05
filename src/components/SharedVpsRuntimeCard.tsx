@@ -111,7 +111,7 @@ export function SharedVpsRuntimeCard() {
   if (vpsMode !== "shared") {
     return (
       <Card
-        title="Self-hosted VPS"
+        title="Self-Hosted VPS"
         subtitle="This workspace runs bots on your own VPS."
       >
         <div className="text-[13px] text-ink-secondary">
@@ -139,7 +139,7 @@ export function SharedVpsRuntimeCard() {
           </div>
         ) : !status ? (
           <div className="flex items-center gap-2 text-[13px] text-ink-secondary">
-            <Loader2 size={13} className="animate-spin" /> Fetching VPS status...
+            <Loader2 size={13} className="animate-spin" /> Fetching VPS status…
           </div>
         ) : (
           <div className="flex flex-col gap-2">
@@ -157,7 +157,7 @@ export function SharedVpsRuntimeCard() {
             )}
             <div className="text-[13px] text-ink-secondary">
               {!selfHostedVpsEnabled
-                ? "Self-hosted VPS is disabled in workspace providers.\u00a0 Turn it on above to let bots use this."
+                ? "Self-Hosted VPS is disabled in workspace providers.\u00a0 Turn it on above to let bots use this."
                 : running
                   ? "The VPS container is up and running."
                   : "The VPS container will be provisioned automatically when a bot needs it."}
@@ -179,7 +179,7 @@ export function SharedVpsRuntimeCard() {
                   >
                     {syncing ? (
                       <>
-                        <Loader2 size={13} className="animate-spin" /> Syncing...
+                        <Loader2 size={13} className="animate-spin" /> Syncing…
                       </>
                     ) : (
                       <>Sync CLI Credentials</>

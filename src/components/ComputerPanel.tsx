@@ -367,8 +367,8 @@ export function ComputerPanel({
           setBoxState(status.container ?? null);
           setError(
             bot.autoStartVps
-              ? `${status.problem ?? "No ready VPS container"}. Auto will prepare or wake it when this bot next works.`
-              : `${status.problem ?? "No ready VPS container"}. Enable Start VPS automatically below, or choose ASCII.dev Box to provision it.`,
+              ? `${status.problem ?? "No ready VPS container"}.\u00a0 Auto will prepare or wake it when this bot next works.`
+              : `${status.problem ?? "No ready VPS container"}.\u00a0 Enable Start VPS automatically below, or choose ASCII.dev Box to provision it.`,
           );
           setPhase(status.container === "stopped" ? "vps-stopped" : "vps-unconfigured");
         })
@@ -1289,7 +1289,7 @@ export function ComputerPanel({
               Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
               in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
-          </div>
+            </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
             {(
               [

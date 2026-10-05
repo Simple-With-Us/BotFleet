@@ -211,7 +211,7 @@ describe("unavailable Linux CUA runtime", () => {
       enabled: false,
       status: "unavailable",
       reasonCode: "bundled-driver-invalid",
-      message: "The bundled Cua Driver failed integrity validation.",
+      message: "The bundled CUA Driver failed integrity validation.",
       driverPath: undefined,
       driverVersion: undefined,
       driverSource: undefined,

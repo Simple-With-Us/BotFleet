@@ -526,19 +526,19 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
 function statusProblem(status: ContainerComputerStatus): string | null {
   if (!status.runtime) return "Install a supported container runtime first";
   if (!status.daemonUp) return `Start ${status.runtime} first`;
-  if (!status.image) return `Prepare the Cua desktop image with Driver ${CUA_DRIVER_VERSION}`;
+  if (!status.image) return `Prepare the CUA desktop image with Driver ${CUA_DRIVER_VERSION}`;
   if (status.container === "missing" && !status.create_supported) {
     return "Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port";
   }
   if (status.container === "missing") return "Create the Local VM";
-  if (!status.imageMatches) return "The existing Local VM uses an older desktop or Cua Driver; recreate it";
+  if (!status.imageMatches) return "The existing Local VM uses an older desktop or CUA Driver; recreate it";
   if (!status.managed) return "The existing container was not created by BotFleet; recreate it";
   if (status.network === "unsafe") return "The existing Local VM exposes its viewer publicly; recreate it";
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
-  if (!status.desktopReady) return "The Local VM started, but Cua Driver is not ready yet";
+  if (!status.desktopReady) return "The Local VM started, but CUA Driver is not ready yet";
   return null;
 }
 
@@ -831,7 +831,7 @@ export async function containerComputerStatus(
         !Array.isArray(report.checks) ||
         (report.overall !== "ok" && report.overall !== "degraded")
       ) {
-        throw new Error(`Cua health report is ${report.overall ?? "invalid"}`);
+        throw new Error(`CUA health report is ${report.overall ?? "invalid"}`);
       }
       const readinessShot = "/tmp/botfleet-readiness.png";
       await runner(
@@ -853,7 +853,7 @@ export async function containerComputerStatus(
         20_000,
       );
       if (!wholeScreenshot(Buffer.from(captured.stdout.trim(), "base64")).ok) {
-        throw new Error("Cua Driver returned an incomplete readiness screenshot");
+        throw new Error("CUA Driver returned an incomplete readiness screenshot");
       }
       status.desktopReady = true;
     } catch (error) {
@@ -1436,7 +1436,7 @@ export async function containerComputerAction(
     throw Object.assign(new Error("A Local VM already exists; remove it before creating a replacement"), { status: 409 });
   }
   if (action === "run" && !before.image) {
-    throw Object.assign(new Error("Prepare the Cua desktop image before creating the Local VM"), { status: 409 });
+    throw Object.assign(new Error("Prepare the CUA desktop image before creating the Local VM"), { status: 409 });
   }
   if (action === "run" && !before.create_supported) {
     throw Object.assign(new Error(before.problem ?? "This runtime cannot create a per-bot Local VM"), { status: 409 });
@@ -1602,7 +1602,7 @@ export async function containerComputerScreenshot(
     const data = stdout.trim();
     const checked = wholeScreenshot(Buffer.from(data, "base64"));
     if (!checked.ok) {
-      throw Object.assign(new Error("Cua Driver returned an incomplete screenshot"), { status: 502 });
+      throw Object.assign(new Error("CUA Driver returned an incomplete screenshot"), { status: 502 });
     }
     return `data:${checked.mime};base64,${data}`;
   } catch (error) {
