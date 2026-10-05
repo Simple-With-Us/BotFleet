@@ -3487,6 +3487,12 @@ describe("harness HTTP API", () => {
     const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
     expect(threadApprove.status).toBe(200);
     expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // invalid route parameters return 400
+    const invalidBot = await api("POST", "/api/bots/bad%20bot%20id/approve-all");
+    expect(invalidBot.status).toBe(400);
+    const invalidThread = await api("POST", "/api/threads/bad%20thread%20id/approve-all");
+    expect(invalidThread.status).toBe(400);
   });
 
   it("closes the approvals a cancelled turn can no longer answer", async () => {
