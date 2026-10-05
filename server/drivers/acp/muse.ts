@@ -28,6 +28,10 @@
 // installer) and the adapter (`npm`).  `needsNode` is what lets the setup UI
 // say so instead of handing a user a `npm` line that cannot run.
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
@@ -98,37 +102,88 @@ export const STATIC_MUSE_MODELS: ModelCatalog = {
   ],
 };
 
+/** Where the launcher keeps its credential index, when one has been stored.
+ *
+ *  This file is NOT a credential store, and treating it as one was the original
+ *  bug.  A live run on 2026-10-05 found `~/.config/muse/auth.json` present on a
+ *  signed-in account containing only an index:  `schema_version`, and a
+ *  `providers.meta` block with `mechanism: "oauth"`, `storage: "keychain"`,
+ *  `obtained_via: "device_code"`, `api_base_url`, and the user's name, email,
+ *  and avatar URL.  No key, no token.
+ *
+ *  So the existence of this file proves nothing, and neither does its absence.
+ *  What it does carry is the discriminator that matters:  `storage`. */
+function museAuthIndexPath(env: Record<string, string | undefined>): string {
+  const fromEnv = env.MUSE_AUTH_PATH?.trim();
+  if (fromEnv) return fromEnv;
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const home = env.HOME || env.USERPROFILE || homedir();
+  return join(xdg && xdg.length > 0 ? xdg : join(home, ".config"), "muse", "auth.json");
+}
+
+/** The credential backend the CLI recorded, or null when there is no index.
+ *
+ *  `file` and friends mean the credential is in this very file and any client
+ *  can read it.  `keychain` means the token was handed to the OS keychain
+ *  instead, which is the one case this engine cannot use — see
+ *  `museAuthenticated`. */
+function museCredentialStorage(env: Record<string, string | undefined>): string | null {
+  const path = museAuthIndexPath(env);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null; // no index: not signed in, or not this CLI's index
+  }
+  try {
+    const parsed = JSON.parse(raw) as {
+      providers?: Record<string, { storage?: unknown } | undefined>;
+    };
+    for (const provider of Object.values(parsed.providers ?? {})) {
+      const storage = provider?.storage;
+      if (typeof storage === "string" && storage.length > 0) return storage;
+    }
+    return null;
+  } catch {
+    // A malformed index is not evidence of a credential, and must never throw
+    // out of a snapshot path.
+    return null;
+  }
+}
+
 /** Is Muse Code signed in *for this driver*?
  *
- *  **Only an API key counts.**  A live run on 2026-10-05 showed why the file
- *  cannot be the answer:  `~/.config/muse/auth.json` exists for a signed-in
- *  account and holds NO credential.  It is an index — `providers.meta` carries
- *  `mechanism: "oauth"`, `storage: "keychain"`, `obtained_via: "device_code"`,
- *  the api base url, and the user's name and avatar URL — while the token lives
- *  in the macOS Keychain under a service name the CLI picks.
+ *  Two tiers, and the distinction is the whole point.
  *
- *  And "the account is signed in" is not the question that matters, because
- *  **this driver cannot use a keychain OAuth session.**  Muse Code resolves
- *  credentials as `META_API_KEY`, then a stored key, then a stored browser
- *  session — and the community adapter we spawn bundles
- *  `@muse-code/sdk@1.3.0`, which predates the Keychain move and answers "not
- *  logged in" on exactly that account.  So the third tier is real for the CLI
- *  and unusable here, and reporting it as signed in is what produced the
- *  original bug:  a setup-complete badge over an engine that failed every turn.
+ *  **An API key, or a file-backed stored credential, is signed in.**  Muse Code
+ *  resolves credentials as `META_API_KEY` first, then a stored key, and only
+ *  then a stored browser session — so `META_API_KEY` and a `storage` of
+ *  anything other than `keychain` are both credentials a client can read.  On
+ *  Linux and Windows there is no macOS Keychain, so a file-backed credential is
+ *  the normal case there and treating it as "not signed in" would strand every
+ *  user on those platforms.
  *
- *  Why this returns false rather than trying harder:  the live consumers of
- *  this answer are the setup card and the failover chain at
+ *  **A keychain-backed session is reported as unproven, not signed in.**  This
+ *  is the case that produced the original bug.  The credential is real and the
+ *  CLI uses it happily — `muse exec` works on that account — but the community
+ *  adapter we spawn bundles `@muse-code/sdk@1.3.0`, which predates the
+ *  Keychain move and answers "not logged in".  Counting it would put a
+ *  setup-complete badge over an engine that fails every turn.
+ *
+ *  Why "unproven" has to be a real answer rather than an aside:  the live
+ *  consumers of this value are the setup card and the failover chain at
  *  `server/safety/turn-safety.ts`, which skips an instance whose
- *  `authenticated` is `false`.  `muse` does not set
- *  `requireAuthenticationBeforeSpawn` and uses `authFailure: "continue"`, so
- *  nothing blocks a turn on this value — which means a wrong `false` is not
- *  cosmetic.  It strands the setup card and the failover chain for a user who
- *  did everything right.  Hence `loginNote` and `signInCommand` name the API
- *  key as the sign-in path, so following the card actually produces a
- *  credential this function can see.
+ *  `authenticated` is `false`.  `muse` sets neither
+ *  `requireAuthenticationBeforeSpawn` nor `authFailure: "fail"`, so nothing
+ *  blocks a turn on it — which means a wrong `false` is not cosmetic.  It
+ *  strands the card and the failover chain for a user who did everything right,
+ *  so `loginNote` and `signInCommand` name the API key as the path, and a test
+ *  holds them to this function so the two cannot drift apart again.
  */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
-  return Boolean(env.META_API_KEY?.trim());
+  if (env.META_API_KEY?.trim()) return true;
+  const storage = museCredentialStorage(env);
+  return storage !== null && storage !== "keychain";
 }
 
 /** The sign-in sentence the harness shows when this engine is not authenticated.

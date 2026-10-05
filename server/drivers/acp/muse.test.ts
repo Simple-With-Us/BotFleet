@@ -109,19 +109,18 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ META_API_KEY: "   " })).toBe(false);
   });
 
-  it("reports a keychain-backed session as unusable, and only an API key as signed in", () => {
-    // The fixture goes where the REAL index lives — `$HOME/.config/muse/`,
-    // not `dir/auth.json` — so this is a genuine regression guard.  A build
-    // that reinstated `existsSync(museAuthPath(env))` would resolve this path,
-    // return true, and fail here.  Placing it anywhere else would leave the
-    // test green for the wrong reason, which is exactly what the first version
-    // of this test did.
-    const home = scratch();
-    const configDir = join(home, ".config", "muse");
-    mkdirSync(configDir, { recursive: true });
+  it("separates a keychain session from a file-backed credential", () => {
+    // Every fixture goes where the REAL index lives — `$HOME/.config/muse/`,
+    // not `dir/auth.json` — so these are genuine regression guards.  The first
+    // version of this test wrote elsewhere and passed for the wrong reason:  an
+    // implementation reading the file would not have found it.
+    const keychainHome = scratch();
+    const keychainDir = join(keychainHome, ".config", "muse");
+    mkdirSync(keychainDir, { recursive: true });
     writeFileSync(
-      join(configDir, "auth.json"),
-      // The observed shape:  an index with no credential in it at all.
+      join(keychainDir, "auth.json"),
+      // The observed macOS shape:  an index with no credential in it, naming
+      // the keychain as the place the token went.
       JSON.stringify({
         schema_version: 1,
         providers: {
@@ -136,15 +135,44 @@ describe("Muse Code driver", () => {
       "utf8",
     );
 
-    // A browser session signed into the keychain is real, and still unusable
-    // here:  the adapter's SDK cannot read it, so counting it would put a
-    // setup-complete badge over an engine that fails every turn.
-    expect(museAuthenticated({ HOME: home })).toBe(false);
-    // And pointing at the index explicitly changes nothing, which is what makes
-    // the first assertion above meaningful rather than incidental.
-    expect(museAuthenticated({ HOME: home, MUSE_AUTH_PATH: join(configDir, "auth.json") })).toBe(false);
-    // The one signal that does count.
-    expect(museAuthenticated({ META_API_KEY: "set", HOME: home })).toBe(true);
+    // A browser session signed into the keychain is real, and the CLI uses it —
+    // `muse exec` works on that account — but this engine's adapter cannot
+    // read it, so counting it would put a setup-complete badge over an engine
+    // that fails every turn.  Unproven, not signed in.
+    expect(museAuthenticated({ HOME: keychainHome })).toBe(false);
+    expect(
+      museAuthenticated({ HOME: keychainHome, MUSE_AUTH_PATH: join(keychainDir, "auth.json") }),
+    ).toBe(false);
+
+    // A file-backed credential is the NORMAL case on Linux and Windows, where
+    // there is no macOS Keychain to put it in.  Treating that as "not signed
+    // in" would strand every user on those platforms, so `storage` is the
+    // discriminator and only `keychain` is unproven.
+    const fileHome = scratch();
+    const fileDir = join(fileHome, ".config", "muse");
+    mkdirSync(fileDir, { recursive: true });
+    writeFileSync(
+      join(fileDir, "auth.json"),
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          meta: { mechanism: "api_key", storage: "file", api_base_url: "https://api.meta.ai/v1" },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: fileHome })).toBe(true);
+
+    // No index at all is plainly not signed in.
+    expect(museAuthenticated({ HOME: scratch() })).toBe(false);
+    // And the env key outranks everything.
+    expect(museAuthenticated({ META_API_KEY: "set", HOME: keychainHome })).toBe(true);
+    // A malformed index must not throw out of a snapshot path.
+    const brokenHome = scratch();
+    const brokenDir = join(brokenHome, ".config", "muse");
+    mkdirSync(brokenDir, { recursive: true });
+    writeFileSync(join(brokenDir, "auth.json"), "{ not json", "utf8");
+    expect(museAuthenticated({ HOME: brokenHome })).toBe(false);
   });
 
   it("names the same sign-in path the auth check can actually see", () => {
