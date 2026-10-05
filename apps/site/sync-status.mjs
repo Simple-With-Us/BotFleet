@@ -34,23 +34,33 @@ const prSchema = z.object({
   state: z.string(),
   merged_at: z.string().nullable(),
 });
-const featuresSchema = z.object({
-  sections: z.array(
-    z.object({
-      features: z.array(
-        z.object({
-          title: z.string(),
-          prov: z.object({
-            type: z.string(),
-            prs: z.array(z.number().int()).optional(),
-            state: z.string().optional(),
-            note: z.string().optional(),
-          }),
-        }),
-      ),
-    }),
-  ),
-});
+const provSchema = z
+  .object({
+    type: z.string(),
+    prs: z.array(z.number().int()).optional(),
+    state: z.string().optional(),
+    note: z.string().optional(),
+  })
+  .passthrough();
+
+const featureSchema = z
+  .object({
+    title: z.string(),
+    prov: provSchema,
+  })
+  .passthrough();
+
+const sectionSchema = z
+  .object({
+    features: z.array(featureSchema),
+  })
+  .passthrough();
+
+const featuresSchema = z
+  .object({
+    sections: z.array(sectionSchema),
+  })
+  .passthrough();
 
 /** Parse, but report only the paths — a ZodError carries the whole input. */
 function parseOrExplain(label, schema, value) {
