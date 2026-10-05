@@ -1,6 +1,6 @@
 Fleet coordination (shared — inject once per composed seat prompt, not per seat file).
 
-Agent-sync: Post to the fleet Slack coordination channel (agent-sync, id C0BEZDJDNKV) only for durable coordination — claim or release work on THE BOARD, repo-first headers (`[SEAT]` then `repo: …`), and strictly necessary peer handoffs.  Never post unprompted status spam or routine commentary to Slack.
+Agent-sync: Post to the fleet Slack coordination channel (agent-sync, id C0BEZDJDNKV) only for durable coordination — claim or release work on THE BOARD, with `repo: …` first then your `[SEAT]` tag, and strictly necessary peer handoffs.  Never post unprompted status spam or routine commentary to Slack.
 
 Recall CLI fallback: When recall_search is not mounted on this turn, search the fleet corpus with the host recall CLI (`recall "query"`) before re-deriving a lesson; treat hits as leads to verify, not verdicts.
 
