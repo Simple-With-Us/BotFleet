@@ -156,18 +156,23 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
     if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
       IS_UP_TO_DATE=1
 
-      # 1. Compare against the installed Mac app's build identity
+      # 1. Compare against the installed Mac app's build identity.  Absence of
+      # the manifest is "we cannot tell what is installed", not "out of date":
+      # a developer checkout, a fixture, or an uninstalled app must not block
+      # the shortcut on its own.  Only a manifest that names a different commit
+      # counts as positive evidence of a mismatch.
       APP_MANIFEST="${BOTFLEET_APP_PATH:-/Applications/BotFleet.app}/Contents/Resources/server/build-identity.json"
       if [[ -f "$APP_MANIFEST" ]]; then
         INSTALLED_COMMIT=$("$NODE_BIN" -e "try { console.log(JSON.parse(require('fs').readFileSync('$APP_MANIFEST', 'utf8')).sourceCommit) } catch { console.log('') }" 2>/dev/null)
-        if [[ "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
+        if [[ "$INSTALLED_COMMIT" =~ ^[0-9a-f]{40}$ && "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
           IS_UP_TO_DATE=0
         fi
-      else
-        IS_UP_TO_DATE=0
       fi
 
-      # 2. Compare against the running server's runtime commit
+      # 2. Compare against the running server's runtime commit.  Absence of
+      # the owner file or an unreachable runtime is also "no live harness to
+      # ask", not "out of date": only a runtime we could authenticate against
+      # and that answered with a different commit turns the shortcut off.
       if [[ "$IS_UP_TO_DATE" == "1" ]]; then
         OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
@@ -175,8 +180,9 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
           # authenticated GET inside one Node process so the secret never
           # crosses a process boundary as command output, argv, or a shell
           # variable.  Only the file path is passed in (via OWNER_FILE_PATH).
-          # On any failure that process exits non-zero and writes nothing.
-          # The shell treats that as not up to date and continues the updater.
+          # On any failure that process exits non-zero and writes nothing and
+          # IS_UP_TO_DATE stays 1: a missing or unreachable harness is not
+          # evidence of an outdated checkout.
           RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" "$NODE_BIN" -e '
             const fs = require("fs");
             const http = require("http");
@@ -218,13 +224,9 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
             req.on("timeout", () => { req.destroy(); process.exit(1); });
             req.end();
           ' 2>/dev/null) || RUNTIME_COMMIT=""
-          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" == "$LOCAL_HEAD" ]]; then
-            :
-          else
+          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
             IS_UP_TO_DATE=0
           fi
-        else
-          IS_UP_TO_DATE=0
         fi
       fi
 
