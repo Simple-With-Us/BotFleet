@@ -27,7 +27,7 @@ const fixtureParam =
 
 if (fixtureParam === "tv-face") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
-  // for in the real app boot path. The App render below is unchanged for any
+  // for in the real app boot path.  The App render below is unchanged for any
   // other URL.
   void import("./components/tv-face/TVFaceAvatarVisualFixture").then((mod) => {
     const Fixture = mod.default;
@@ -39,9 +39,21 @@ if (fixtureParam === "tv-face") {
   });
 } else if (fixtureParam === "engine-setup") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
-  // for in the real app boot path. The App render below is unchanged for any
+  // for in the real app boot path.  The App render below is unchanged for any
   // other URL.
   void import("./components/EngineSetupVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "engine-callout") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/EngineCalloutVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>
@@ -60,9 +72,33 @@ if (fixtureParam === "tv-face") {
   });
 } else if (fixtureParam === "computer-panel") {
   // Visual-spec harness: dynamically import so the fixture chunk is not paid
-  // for in the real app boot path. The App render below is unchanged for any
+  // for in the real app boot path.  The App render below is unchanged for any
   // other URL.
   void import("./components/ComputerPanelVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "voice-settings-personal") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/VoiceSettingsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "routine-hold") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/RoutineHoldVisualFixture").then((mod) => {
     const Fixture = mod.default;
     createRoot(rootElement).render(
       <StrictMode>

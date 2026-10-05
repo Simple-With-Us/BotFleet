@@ -329,7 +329,7 @@ export function ComputerPanel({
               setBoxState(result.container ?? null);
               if (result.ready) setPhase("ready");
               else {
-                setError(result.problem ?? "The VPS CUA desktop is not ready yet");
+                setError(result.problem ?? "The VPS Linux desktop is not ready yet");
                 setPhase("error");
               }
             });
@@ -468,7 +468,7 @@ export function ComputerPanel({
     };
   }, [phase, panelView, screenStreamState, bot.id, viewerOpen, pageVisible, bot.busy]);
 
-  // Local VM preview comes directly from Cua Driver through the harness. It
+  // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
   const vmInFlight = useRef(false);
   useEffect(() => {
@@ -642,7 +642,7 @@ export function ComputerPanel({
           setBoxState(result.container ?? null);
           if (result.ready) setPhase("ready");
           else {
-            setError(result.problem ?? "The VPS CUA desktop is not ready yet");
+            setError(result.problem ?? "The VPS Linux desktop is not ready yet");
             setPhase("error");
           }
         }
@@ -715,7 +715,7 @@ export function ComputerPanel({
       setVpsStatus(result);
       setBoxState(result.container ?? null);
       setPhase(result.ready ? "ready" : "error");
-      if (!result.ready) setError(result.problem ?? "The replacement VPS CUA desktop is not ready yet");
+      if (!result.ready) setError(result.problem ?? "The replacement VPS Linux desktop is not ready yet");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase("error");
@@ -1102,8 +1102,8 @@ export function ComputerPanel({
                   : cloudBackend === "vps"
                     ? "Auto reuses a ready VPS when one exists, otherwise this computer.\u00a0 "
                     : "Auto uses an ASCII.dev Box when one exists, otherwise this computer.\u00a0 ")}
-              Pick where this bot's computer lives.\u00a0 <b className="text-ink">Local VM</b> is a CUA-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop.\u00a0 Set it up in App
+              Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
+              in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
             </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">

@@ -129,7 +129,7 @@ export function SharedVpsRuntimeCard() {
     <Card
       id="setting-computers-shared-vps"
       title="Shared VPS VM"
-      subtitle="The shared CUA Linux sandbox running on your VPS, with a separate desktop for each bot.\u00a0 Bots share cookies, sign-ins, files, and installed apps/CLI tools."
+      subtitle="The shared Linux sandbox running on your VPS, with a separate desktop for each bot.\u00a0 Bots share cookies, sign-ins, files, and installed apps/CLI tools."
     >
       <div className="flex flex-col gap-4">
         {unavailable ? (
@@ -168,7 +168,7 @@ export function SharedVpsRuntimeCard() {
                   <div>
                     <div className="text-[13px] font-medium text-ink">Host CLI Credentials</div>
                     <div className="text-[12px] text-ink-secondary">
-                      Copy local developer logins (~/.infisical, ~/.ssh, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the shared VPS container.
+                      Copy local developer logins (~/.infisical, ~/.ssh, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the shared VPS container.{state.config?.localVm?.shareCliCredentials ? "\u00a0 Automatic sync is enabled in Host & CLI Integration." : ""}
                     </div>
                   </div>
                   <button

@@ -457,7 +457,13 @@ function piEnvironment(source: Record<string, string | undefined>): Record<strin
 
 export const PiDriver: ProviderDriver<PiConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "pi", supportsMultipleInstances: true, access: "custom" },
+  metadata: {
+    displayName: "pi",
+    supportsMultipleInstances: true,
+    access: "custom",
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @earendil-works/pi-coding-agent",

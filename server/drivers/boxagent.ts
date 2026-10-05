@@ -49,7 +49,15 @@ function decodeConfig(raw: unknown): BoxAgentConfig {
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "ASCII.dev Box", supportsMultipleInstances: false },
+  metadata: {
+    displayName: "ASCII.dev Box",
+    supportsMultipleInstances: false,
+    // The instance's `capabilities` block declares no MCP channel and no image
+    // input at all — it is a remote sandbox reached over its own API, not a
+    // CLI BotFleet can hand channels to.  Mirrored here so the capability
+    // matrix can say so with a citation instead of a shrug.
+    channelWiring: { agentsMcp: false, computerMcp: false, composioMcp: false, localComputerMcp: false, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),

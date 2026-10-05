@@ -54,7 +54,7 @@ export function LinuxLocalControl() {
             Local Control
           </div>
           <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
-            Beta · Ubuntu 24.04 GNOME/{wayland ? "Wayland" : "Xorg"} · CUA Driver 0.19.3
+            Beta · Ubuntu 24.04 GNOME/{wayland ? "Wayland" : "Xorg"} · Computer Driver 0.19.3
           </div>
         </div>
         <span
@@ -113,7 +113,7 @@ export function LinuxLocalControl() {
           </div>
           {local.driverPath && (
             <div className="mt-2 break-all font-mono text-[10px] text-ink-secondary/80" title={local.driverPath}>
-              {bundledDriver ? "Bundled CUA Driver" : local.driverPath}
+              {bundledDriver ? "Bundled Computer Driver" : local.driverPath}
               {local.driverVersion ? ` · ${local.driverVersion}` : ""}
             </div>
           )}
