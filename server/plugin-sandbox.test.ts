@@ -19,7 +19,7 @@ import { removeDirSafe } from "./plugin-registry.ts";
 import type { PluginListing } from "./plugin-types.ts";
 
 const SECRET_ENV = "BOTFLEET_SANDBOX_TEST_SECRET";
-const SECRET_VALUE = "sk-sandbox-test-0123456789";
+const SECRET_VALUE = "sandbox-sensitive-sentinel";
 
 let baseDir: string;
 let outsideDir: string;
@@ -29,9 +29,9 @@ const started: LoadedPlugin[] = [];
 function inputs(): PluginHostInputs {
   return {
     listBots: () => [{ id: "a", name: "Alpha", status: "running", driver: "claude" }],
-    listConfigKeys: () => ["appearance", "providerApiKey"],
+    listConfigKeys: () => ["rooms", "providerApiKey"],
     readConfig: <T = unknown>(key: string): T | undefined => {
-      if (key === "appearance") {
+      if (key === "rooms") {
         // SAFETY: test stub; the caller names T and the sandbox only forwards redacted JSON.
         return { theme: "dark", accessToken: SECRET_VALUE } as T;
       }
@@ -225,7 +225,7 @@ describe("plugin host snapshot", () => {
   it("withholds undeclared capabilities and reports the refusal", async () => {
     writePlugin("nocaps", `
       export function getCardData({ host }) {
-        return { result: { bots: host.getBots(), keys: host.config.listKeys(), theme: host.config.get("appearance") ?? null } };
+        return { result: { bots: host.getBots(), keys: host.config.listKeys(), theme: host.config.get("rooms") ?? null } };
       }
     `);
     const plugin = await load("nocaps", []);
@@ -238,8 +238,8 @@ describe("plugin host snapshot", () => {
 
   it("forwards only redacted, non-secret config keys", () => {
     const snapshot = buildHostSnapshot(inputs(), ["read.config"]);
-    expect(snapshot.configKeys).toEqual(["appearance"]);
-    expect(snapshot.config).toEqual({ appearance: { theme: "dark" } });
+    expect(snapshot.configKeys).toEqual(["rooms"]);
+    expect(snapshot.config).toEqual({ rooms: { theme: "dark" } });
     expect(JSON.stringify(snapshot)).not.toContain(SECRET_VALUE);
     expect(snapshot.bots).toBeNull();
   });

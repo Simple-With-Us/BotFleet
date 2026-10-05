@@ -165,8 +165,18 @@ async function readBoundedText(response: Response): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** Per-request deadline so a stalled GitHub peer cannot pin an install
+ *  handler open for undici's multi-minute default timeouts. */
+const FETCH_TIMEOUT_MS = 30_000;
+
+/** Overlap a few downloads without a MAX_FILES-wide Promise.all. */
+const DOWNLOAD_CONCURRENCY = 6;
+
 async function fetchText(url: string, fetcher: typeof fetch): Promise<string> {
-  const response = await fetcher(url, { headers: { "user-agent": "BotFleet-plugins" } });
+  const response = await fetcher(url, {
+    headers: { "user-agent": "BotFleet-plugins" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!response.ok) throw new PluginFetchError("download_failed", `download failed (${response.status})`);
   return readBoundedText(response);
 }
@@ -196,15 +206,15 @@ export async function fetchPluginFromGit(
     .filter((entry) => /\.(?:mjs|cjs|js|json)$/i.test(entry.name))
     .slice(0, MAX_FILES);
 
-  // Sequential downloads: a 64-wide Promise.all would buffer every body
-  // at once even with the per-file cap, multiplying peak memory.
+  // Bounded concurrency: enough to overlap round-trips without the peak
+  // memory of a 64-wide Promise.all, and every request is time-bounded.
   const files: Array<{ path: string; content: string }> = [];
-  for (const entry of plugins) {
-    files.push({
-      path: entry.name,
-      content: await fetchText(entry.download_url, fetcher),
-    });
-  }
+  const queue = [...plugins];
+  await Promise.all(Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, queue.length) }, async () => {
+    for (let entry = queue.shift(); entry; entry = queue.shift()) {
+      files.push({ path: entry.name, content: await fetchText(entry.download_url, fetcher) });
+    }
+  }));
 
   return {
     source: `${source.url}${source.ref ? `@${source.ref}` : ""}/${source.path}`.replace(/\/$/, ""),

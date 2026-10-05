@@ -75,6 +75,7 @@ export interface PluginRuntimeInputs {
 
 let runtimeInputs: PluginRuntimeInputs | null = null;
 const loaded = new Map<string, LoadedPlugin>();
+const loading = new Map<string, Promise<LoadedPlugin | { error: string }>>();
 
 const PluginActionSchema = z.enum(["enable", "disable", "update", "reload"]);
 export type PluginAction = z.infer<typeof PluginActionSchema>;
@@ -123,15 +124,27 @@ async function dropLoaded(name: string): Promise<void> {
 }
 
 /** The cached sandbox for an enabled plugin, respawned when the previous
- *  child exited (crash, timeout kill, or protocol violation). */
+ *  child exited (crash, timeout kill, or protocol violation).  Concurrent
+ *  callers share one in-flight load so a crash cannot spawn orphaned
+ *  children that `loaded.set` would overwrite. */
 async function liveSandbox(listing: PluginListing, baseDir: string): Promise<LoadedPlugin | { error: string }> {
   const cached = loaded.get(listing.name);
   if (cached?.sandbox.isAlive()) return cached;
-  await dropLoaded(listing.name);
-  const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
-  if ("error" in result) return result;
-  loaded.set(listing.name, result);
-  return result;
+  const inflight = loading.get(listing.name);
+  if (inflight) return inflight;
+  const attempt = (async () => {
+    await dropLoaded(listing.name);
+    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+    if ("error" in result) return result;
+    loaded.set(listing.name, result);
+    return result;
+  })();
+  loading.set(listing.name, attempt);
+  try {
+    return await attempt;
+  } finally {
+    loading.delete(listing.name);
+  }
 }
 
 /** One structured boot/listing warning.  `reason` is a stable code. */
@@ -176,6 +189,17 @@ export function compareSemver(a: string, b: string): number {
 function fsErrorMessage(action: string, name: string, error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error);
   return `plugin "${name}" ${action}: ${detail}`;
+}
+
+/** Persist a registry entry; map filesystem errors into `{ error }` so
+ *  route handlers never leak a bare 500 for ENOSPC/EACCES/EROFS. */
+function trySetPluginEntry(entry: Parameters<typeof setPluginEntry>[0], baseDir: string): PluginError | null {
+  try {
+    setPluginEntry(entry, baseDir);
+    return null;
+  } catch (error) {
+    return { error: fsErrorMessage("registry could not be written", entry.name, error) };
+  }
 }
 
 /** Expand a leading ~ to this computer's home directory.  `~user` is not
@@ -241,7 +265,8 @@ async function installFromFetched(
     source: pluginSource,
     warnings,
   });
-  setPluginEntry(entry, baseDir);
+  const writeError = trySetPluginEntry(entry, baseDir);
+  if (writeError) return writeError;
   return { entry };
 }
 
@@ -260,7 +285,11 @@ export async function installPlugin(
   if (!trimmed) return { error: "paste a folder path or a GitHub URL" };
 
   const folder = folderInputPath(trimmed);
-  if (folder) return installFromFolder(folder, baseDir);
+  if (folder) {
+    const parsedFolder = z.string().min(1).max(4096).safeParse(folder);
+    if (!parsedFolder.success) return { error: "invalid folder path" };
+    return installFromFolder(parsedFolder.data, baseDir);
+  }
 
   const parsed = parseGitPluginSource(trimmed);
   if (!parsed.ok) return { error: parsed.error };
@@ -323,7 +352,10 @@ export async function enablePlugin(
 
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
-  if (entry) setPluginEntry({ ...entry, enabled: true }, baseDir);
+  if (entry) {
+    const writeError = trySetPluginEntry({ ...entry, enabled: true }, baseDir);
+    if (writeError) return writeError;
+  }
   return listingOrError(name, baseDir);
 }
 
@@ -338,7 +370,10 @@ export async function disablePlugin(
   await dropLoaded(name);
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
-  if (entry) setPluginEntry({ ...entry, enabled: false }, baseDir);
+  if (entry) {
+    const writeError = trySetPluginEntry({ ...entry, enabled: false }, baseDir);
+    if (writeError) return writeError;
+  }
   return listingOrError(name, baseDir);
 }
 
@@ -426,14 +461,26 @@ export async function updatePlugin(
     source: entry.source,
     warnings,
   });
-  setPluginEntry(next, baseDir);
+  const writeError = trySetPluginEntry(next, baseDir);
+  if (writeError) return writeError;
 
-  // Reload the module if it was enabled.
+  // Reload the module if it was enabled.  Mirror bootPluginRuntime: a
+  // load failure persists enabled=false and surfaces the error instead
+  // of leaving the UI showing Enabled with no sandbox.
   if (wasEnabled) {
     const refreshed = listingOrError(name, baseDir);
     if (!("error" in refreshed)) {
       const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir);
-      if (!("error" in loaded_)) loaded.set(name, loaded_);
+      if ("error" in loaded_) {
+        warnPluginEvent("plugins.update.disabled", name, "reload_failed");
+        const current = readRegistry(baseDir).plugins[name];
+        if (current) {
+          const disableError = trySetPluginEntry({ ...current, enabled: false }, baseDir);
+          if (disableError) return disableError;
+        }
+        return { error: loaded_.error };
+      }
+      loaded.set(name, loaded_);
     }
   }
 
@@ -450,12 +497,14 @@ export async function removePlugin(
   if (!registry.plugins[name]) return { error: `no plugin named "${name}"` };
 
   await dropLoaded(name);
-  removePluginEntry(name, baseDir);
+  // Tree first, entry second: a failed rm must leave a still-listed plugin
+  // the user can retry, never an orphaned directory with no registry record.
   try {
     await removeDirSafe(join(baseDir, name));
   } catch (error) {
     return { error: fsErrorMessage("could not be removed", name, error) };
   }
+  removePluginEntry(name, baseDir);
   return { removed: true };
 }
 
@@ -510,7 +559,10 @@ export async function runPluginCommand(
     // Mirror bootPluginRuntime: persist enabled=false so the UI stops
     // showing "Enabled" while every subsequent call would 409.
     const current = readRegistry(baseDir).plugins[name];
-    if (current) setPluginEntry({ ...current, enabled: false }, baseDir);
+    if (current) {
+      const writeError = trySetPluginEntry({ ...current, enabled: false }, baseDir);
+      if (writeError) return writeError;
+    }
     return mismatch;
   }
 
@@ -539,7 +591,10 @@ export async function getPluginCardData(
   if (mismatch) {
     await dropLoaded(name);
     const current = readRegistry(baseDir).plugins[name];
-    if (current) setPluginEntry({ ...current, enabled: false }, baseDir);
+    if (current) {
+      const writeError = trySetPluginEntry({ ...current, enabled: false }, baseDir);
+      if (writeError) return writeError;
+    }
     return mismatch;
   }
 
@@ -569,14 +624,14 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
     }
     if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
       warnPluginEvent("plugins.boot.disabled", name, "host_version_mismatch");
-      setPluginEntry({ ...entry, enabled: false }, baseDir);
+      trySetPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
     const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
     if ("error" in result) {
       // loadPlugin already logged the sandbox's stable reason code.
       warnPluginEvent("plugins.boot.disabled", name, "load_failed");
-      setPluginEntry({ ...entry, enabled: false }, baseDir);
+      trySetPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
     loaded.set(name, result);
@@ -589,6 +644,7 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
 export async function _resetForTests(): Promise<void> {
   const names = [...loaded.keys()];
   await Promise.all(names.map((name) => dropLoaded(name)));
+  loading.clear();
   runtimeInputs = null;
 }
 

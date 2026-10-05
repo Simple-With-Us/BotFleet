@@ -150,6 +150,14 @@ describe("parsePluginManifest", () => {
     }
   });
 
+  it("rejects botfleet ranges the gate cannot evaluate (e.g. >=1.0.0)", () => {
+    const result = parsePluginManifest({ ...valid, botfleet: ">=1.0.0" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((i) => i.field === "botfleet")).toBeTruthy();
+    }
+  });
+
   it("includes a (root) field when input is not an object", () => {
     const result = parsePluginManifest("not an object");
     expect(result.ok).toBe(false);

@@ -9,6 +9,7 @@
 // contributes from its manifest — text summaries only, the host does
 // not render plugin-supplied UI here.
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { z } from "zod";
 import { ArrowUpCircle, Loader2, Power, PowerOff, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 
 import { cn } from "@/lib/cn";
@@ -114,6 +115,50 @@ async function readApiError(response: Response): Promise<ApiError | null> {
   return { error: errorText, issues };
 }
 
+const PluginSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("folder"), path: z.string().min(1) }).passthrough(),
+  z.object({
+    kind: z.literal("git"),
+    url: z.string().min(1),
+    ref: z.string().nullable().optional(),
+    path: z.string().optional(),
+  }).passthrough(),
+]);
+
+const PluginListingSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().min(1),
+  description: z.string(),
+  author: z.string().optional(),
+  license: z.string().optional(),
+  botfleet: z.string().min(1),
+  entry: z.string().min(1),
+  enabled: z.boolean(),
+  installedAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+  source: PluginSourceSchema,
+  warnings: z.array(z.string()),
+  capabilities: z.array(z.string()),
+  contributes: z.object({
+    cards: z.array(z.object({
+      id: z.string(),
+      title: z.string(),
+      description: z.string().optional(),
+      layout: z.enum(["stat-grid", "key-value", "list"]),
+      fields: z.array(z.string()).optional(),
+    }).passthrough()).optional(),
+    commands: z.array(z.object({
+      name: z.string(),
+      description: z.string(),
+      args: z.array(z.string()).optional(),
+    }).passthrough()).optional(),
+  }).passthrough().optional(),
+}).passthrough();
+
+const PluginsResponseSchema = z.object({
+  plugins: z.array(PluginListingSchema),
+});
+
 async function readPluginsResponse(response: Response): Promise<PluginsResponse | null> {
   let body: unknown;
   try {
@@ -121,14 +166,9 @@ async function readPluginsResponse(response: Response): Promise<PluginsResponse 
   } catch {
     return null;
   }
-  if (!isPlainObject(body)) return null;
-  const plugins = Array.isArray(body.plugins)
-    ? (
-      // SAFETY: filter+isPlainObject narrows each entry to Record<PropertyKey, unknown>; the cast to PluginListing is the boundary between the parser layer and the consumer that already trusts the server response shape.
-      body.plugins.filter((entry): entry is PluginListing => isPlainObject(entry)) as PluginListing[]
-    )
-    : [];
-  return { plugins };
+  const parsed = PluginsResponseSchema.safeParse(body);
+  // SAFETY: PluginsResponseSchema established the listing fields at runtime; PluginListing is the consumer shape.
+  return parsed.success ? (parsed.data as PluginsResponse) : null;
 }
 
 function errorMessage(error: ErrorLike): string {

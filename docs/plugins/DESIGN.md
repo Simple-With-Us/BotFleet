@@ -356,8 +356,8 @@ same review screen it already uses for skills.
 ## API Routes
 
 All routes follow the existing dispatch style in `server/index.ts`.
-Body shape mirrors the existing skills routes (see
-`/api/internal/routine-requests`).
+Body shape mirrors the existing skills routes (same install and review
+flow; the route path itself stays an implementation detail).
 
 | Method | Path | Body | Returns |
 |--------|------|------|---------|

@@ -142,7 +142,7 @@ const JSON_VALUE = z.json();
  *  its JSON round-trip parses as a JSON value.  Functions, symbols, and
  *  undefined fields drop out; anything unserializable is withheld. */
 function redactedConfigValue(inputs: PluginHostInputs, key: string): JsonValue | undefined {
-  const redacted = redactPluginConfig(inputs.readConfig(key));
+  const redacted = narrowPluginConfigSection(key, inputs.readConfig(key));
   if (redacted === undefined) return undefined;
   let text: string | undefined;
   try {
@@ -171,7 +171,7 @@ export function buildHostSnapshot(inputs: PluginHostInputs, capabilities: readon
     }))
     : null;
   if (!allowed.has("read.config")) return { bots, statusAllowed, configKeys: null, config: {} };
-  const configKeys = inputs.listConfigKeys().filter((key) => !isSecretConfigKey(key));
+  const configKeys = inputs.listConfigKeys().filter((key) => isPluginConfigKey(key) && !isSecretConfigKey(key));
   const config: Record<string, JsonValue> = {};
   for (const key of configKeys) {
     const value = redactedConfigValue(inputs, key);

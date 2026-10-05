@@ -176,10 +176,59 @@ async function invoke(message: Extract<ParentToChildMessage, { type: "invoke" }>
   send({ type: "result", id, value: json });
 }
 
-// Messages on this channel come from the trusted parent, which builds
-// them from ParentToChildMessage.  The untrusted direction is the other
-// one, and the parent validates it with zod.
-process.on("message", (message: ParentToChildMessage) => {
+/** Runtime shape check mirroring ParentToChildMessageSchema without
+ *  importing zod (this process cannot read node_modules under the
+ *  permission model when the .ts entry is strip-typed in dev). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isHostSnapshot(value: unknown): value is SandboxHostSnapshot {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.statusAllowed !== "boolean") return false;
+  if (value.bots !== null) {
+    if (!Array.isArray(value.bots)) return false;
+    for (const bot of value.bots) {
+      if (!isPlainObject(bot)) return false;
+      if (typeof bot.id !== "string" || typeof bot.name !== "string") return false;
+      if (typeof bot.status !== "string" || typeof bot.driver !== "string") return false;
+    }
+  }
+  if (value.configKeys !== null) {
+    if (!Array.isArray(value.configKeys) || value.configKeys.some((k) => typeof k !== "string")) return false;
+  }
+  if (!isPlainObject(value.config)) return false;
+  return true;
+}
+
+function parseParentMessage(raw: unknown): ParentToChildMessage | null {
+  if (!isPlainObject(raw) || typeof raw.type !== "string") return null;
+  if (raw.type === "load") {
+    if (typeof raw.entryUrl !== "string") return null;
+    return { type: "load", entryUrl: raw.entryUrl };
+  }
+  if (raw.type !== "invoke") return null;
+  if (typeof raw.id !== "number" || !Number.isInteger(raw.id) || raw.id < 1) return null;
+  if (!isHostSnapshot(raw.host)) return null;
+  if (raw.handler === "getCardData") {
+    if (typeof raw.cardId !== "string") return null;
+    return { type: "invoke", id: raw.id, handler: "getCardData", cardId: raw.cardId, host: raw.host };
+  }
+  if (raw.handler === "runCommand") {
+    if (typeof raw.command !== "string" || typeof raw.args !== "string") return null;
+    return { type: "invoke", id: raw.id, handler: "runCommand", command: raw.command, args: raw.args, host: raw.host };
+  }
+  return null;
+}
+
+// Messages on this channel come from the trusted parent.  Still reject
+// anything that fails the shape check before dispatch.
+process.on("message", (raw: unknown) => {
+  const message = parseParentMessage(raw);
+  if (!message) {
+    process.exit(70);
+    return;
+  }
   if (message.type === "load") {
     if (handlers === null) void load(message.entryUrl);
     return;

@@ -173,37 +173,64 @@ export function removePluginEntry(name: string, baseDir: string = PLUGINS_DIR): 
   return registry;
 }
 
-/** Write a fetched plugin to disk.  Manifest is written last so a
- *  half-written tree is always detectable by the missing manifest.
- *  Filesystem errors propagate to the caller; plugins.ts maps them to
- *  `{ error }` so nothing escapes the API boundary. */
+/** Write a fetched plugin to disk.  Stages into `<dir>.staging-<pid>` and
+ *  renames into place only after every file and the manifest are on disk,
+ *  so a failed write never destroys a working install.  Manifest is still
+ *  written last inside the staging tree.  Filesystem errors propagate to
+ *  the caller; plugins.ts maps them to `{ error }` so nothing escapes the
+ *  API boundary.  Callers must dispose any live sandbox for this plugin
+ *  before reaching here. */
 export async function writePluginTree(
   name: string,
   fetched: FetchedPlugin,
   baseDir: string = PLUGINS_DIR,
 ): Promise<void> {
   const dir = pluginDirFor(name, baseDir);
-  // Remove first so an update never inherits stale files.  Callers must
-  // dispose any live sandbox for this plugin before reaching here.
-  await removeDirSafe(dir);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const staging = `${dir}.staging-${process.pid}`;
+  // Drop a leftover staging tree from a prior crash before rewriting.
+  await removeDirSafe(staging);
+  mkdirSync(staging, { recursive: true, mode: 0o700 });
 
-  for (const file of fetched.files) {
-    if (file.path === "botfleet-plugin.json") continue;
-    const relative = file.path;
-    if (relative.startsWith("/") || relative.includes("..")) {
-      // never write outside the plugin dir, even if the manifest said so
-      continue;
+  try {
+    for (const file of fetched.files) {
+      if (file.path === "botfleet-plugin.json") continue;
+      const relative = file.path;
+      if (relative.startsWith("/") || relative.includes("..")) {
+        // never write outside the plugin dir, even if the manifest said so
+        continue;
+      }
+      const target = join(staging, relative);
+      mkdirSync(join(target, ".."), { recursive: true, mode: 0o700 });
+      writeFileSync(target, file.content, { mode: 0o600 });
     }
-    const target = join(dir, relative);
-    mkdirSync(join(target, ".."), { recursive: true, mode: 0o700 });
-    writeFileSync(target, file.content, { mode: 0o600 });
-  }
 
-  // Manifest goes last.  Anyone listing plugins reads the directory
-  // and validates the manifest; a missing manifest means "incomplete
-  // install" and we surface that to the user.
-  writeFileSync(join(dir, "botfleet-plugin.json"), fetched.manifestText, { mode: 0o600 });
+    // Manifest goes last inside staging.  Anyone listing plugins reads the
+    // live directory and validates the manifest; a missing manifest means
+    // "incomplete install" and we surface that to the user.
+    writeFileSync(join(staging, "botfleet-plugin.json"), fetched.manifestText, { mode: 0o600 });
+
+    const aside = `${dir}.replacing-${process.pid}`;
+    if (existsSync(dir)) {
+      renameSync(dir, aside);
+    }
+    try {
+      renameSync(staging, dir);
+    } catch (error) {
+      // Restore the previous tree when the staging rename fails.
+      if (existsSync(aside) && !existsSync(dir)) {
+        try { renameSync(aside, dir); } catch { /* best effort */ }
+      }
+      throw error;
+    }
+    try {
+      await removeDirSafe(aside);
+    } catch {
+      // aside may linger on Windows; the live path is already the new tree
+    }
+  } catch (error) {
+    try { await removeDirSafe(staging); } catch { /* best effort */ }
+    throw error;
+  }
 }
 
 /** Build a listing from a registry entry.  Re-reads the manifest from

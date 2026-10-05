@@ -45,7 +45,10 @@ export const PLUGIN_COMMAND_NAME = /^[a-z][a-z0-9-]{0,31}$/;
  *  pre-release tags, this is the gate that opens. */
 export const SEMVER = /^\d+\.\d+\.\d+$/;
 
-const SEMVER_RANGE = /^[><=^~]*\s*\d+(?:\.\d+\.\d+)?(?:\s*\|\|\s*[><=^~]*\s*\d+(?:\.\d+\.\d+)?)*$/;
+/** Exactly the forms `satisfiesBotfleetVersion` can evaluate.  Anything
+ *  else must fail validation at install time, not silently at enable time. */
+const SUPPORTED_BOTFLEET_RANGE =
+  /^(?:\d+|\d+\.\d+\.\d+|>=\s*\d+|<=\s*\d+|[\^~]\s*\d+\.\d+\.\d+)$/;
 
 /** Capability allowlist for v1.  Adding a new capability is a breaking
  *  change because plugins render this without a fallback.  Unknown
@@ -60,15 +63,16 @@ export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
 export const PLUGIN_CARD_LAYOUTS = ["stat-grid", "key-value", "list"] as const;
 export type PluginCardLayout = typeof PLUGIN_CARD_LAYOUTS[number];
 
-/** A botfleet version constraint.  v1 supports the four operators that
- *  matter for a single-host scenario: `>=`, `<=`, `^`, `~`, and a bare
- *  version.  Anything else fails validation. */
+/** A botfleet version constraint.  Exactly the forms the gate evaluates:
+ *  `>=N`, `<=N`, `^x.y.z`, `~x.y.z`, bare major, or bare MAJOR.MINOR.PATCH.
+ *  Wider grammar (e.g. `>=1.0.0`, `1 || 2`) fails here so enable never
+ *  sees an unsatisfiable-but-schema-valid constraint. */
 const BOTFLEET_VERSION = z
   .string()
   .min(1)
   .max(32)
-  .refine((value) => SEMVER_RANGE.test(value), {
-    message: "expected a semver range like \">=1\", \"^1.2.0\", or a bare MAJOR.MINOR.PATCH",
+  .refine((value) => SUPPORTED_BOTFLEET_RANGE.test(value.trim()), {
+    message: 'expected ">=1", "<=1", "^1.2.0", "~1.2.0", or a bare MAJOR / MAJOR.MINOR.PATCH',
   });
 
 const cardContribution = z.object({
