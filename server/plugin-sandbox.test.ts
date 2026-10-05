@@ -2,9 +2,9 @@
 // child processes against small hostile plugins and assert what the
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   buildHostSnapshot,
@@ -191,6 +191,33 @@ describe("plugin sandbox isolation", () => {
     expect(events).toContainEqual(expect.objectContaining({ event: "plugin.log", level: "error", length: SECRET_VALUE.length }));
     expect(JSON.stringify(events)).not.toContain(SECRET_VALUE);
     expect(JSON.stringify(events)).not.toContain("noisy");
+  });
+
+  it("loads when the plugin tree is reached through a symlink (macOS tmpdir)", async () => {
+    // macOS CI puts mkdtemp under `/var/folders/...`, a symlink to
+    // `/private/var/folders/...`.  Node's permission model matches the
+    // real path; without canonicalizing the grant and the entry URL the
+    // child reports import_failed.  Reproduce that shape on every OS.
+    const realRoot = mkdtempSync(join(tmpdir(), "botfleet-sandbox-real-"));
+    const linkRoot = join(mkdtempSync(join(tmpdir(), "botfleet-sandbox-link-")), "plugins");
+    symlinkSync(realRoot, linkRoot, process.platform === "win32" ? "junction" : "dir");
+    const previousBase = baseDir;
+    baseDir = linkRoot;
+    try {
+      expect(baseDir).not.toBe(realpathSync(baseDir));
+      writePlugin("symlink-ok", `
+        export function getCardData() { return { result: { ok: true } }; }
+      `);
+      const plugin = await load("symlink-ok");
+      const card = await invokePlugin(plugin, { handler: "getCardData", cardId: "x" }, inputs());
+      expect(card).toEqual({ ok: true, value: { result: { ok: true } } });
+    } finally {
+      await Promise.all(started.splice(0).map((plugin) => plugin.sandbox.dispose()));
+      baseDir = previousBase;
+      removeDirSafe(linkRoot);
+      removeDirSafe(dirname(linkRoot));
+      removeDirSafe(realRoot);
+    }
   });
 });
 

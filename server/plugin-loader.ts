@@ -27,7 +27,8 @@
 // Open Questions.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { z } from "zod";
@@ -192,6 +193,24 @@ export interface PluginSandboxOptions {
 const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_CALL_TIMEOUT_MS = 5_000;
 const DEFAULT_HEAP_MB = 64;
+
+/** Resolve a path the permission model will see.  On macOS, `os.tmpdir()`
+ *  and many CI paths live under `/var`, which is a symlink to `/private/var`.
+ *  Node's `--allow-fs-read` grant is matched against the real path the
+ *  kernel opens, so a grant of the logical path leaves `import()` denied
+ *  and the child reports `import_failed`.  Canonicalize before spawning. */
+function realPath(path: string): string {
+  return realpathSync(path);
+}
+
+/** True when `inner` is `outer` or a path strictly inside it.  Both sides
+ *  must already be realpath'd so a symlink inside the plugin folder cannot
+ *  point the entry at a file outside the granted tree. */
+function isInsideDir(outer: string, inner: string): boolean {
+  if (inner === outer) return true;
+  const prefix = outer.endsWith(sep) ? outer : `${outer}${sep}`;
+  return inner.startsWith(prefix);
+}
 
 /** The permission flag this Node build understands, or null when the
  *  permission model is unavailable.  Without it there is no sandbox, and
@@ -368,13 +387,30 @@ export async function startPluginSandbox(
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "sandbox_unavailable" });
     return { reason: "sandbox_unavailable" };
   }
-  const childScript = SPAWNED_PROXIES.pluginSandbox;
-  const pluginDir = resolve(options.pluginDir);
+  let childScript: string;
+  let pluginDir: string;
+  let entryPath: string;
+  try {
+    // Grant and load the real paths.  A logical grant (e.g. macOS `/var/...`)
+    // does not cover the kernel path (`/private/var/...`), and a logical
+    // `file://` URL fails the same way even when the grant is already real.
+    childScript = realPath(SPAWNED_PROXIES.pluginSandbox);
+    pluginDir = realPath(resolve(options.pluginDir));
+    entryPath = realPath(resolve(options.entryPath));
+  } catch {
+    options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
+    return { reason: "start_failed" };
+  }
+  if (!isInsideDir(pluginDir, entryPath)) {
+    options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
+    return { reason: "start_failed" };
+  }
+  const sandboxOptions: PluginSandboxOptions = { ...options, pluginDir, entryPath };
   const args = [
     flag,
     `--allow-fs-read=${childScript}`,
     `--allow-fs-read=${pluginDir}`,
-    `--max-old-space-size=${options.heapMb ?? DEFAULT_HEAP_MB}`,
+    `--max-old-space-size=${sandboxOptions.heapMb ?? DEFAULT_HEAP_MB}`,
   ];
   // The dev tree runs the .ts source; the packaged tree runs the bundled .js.
   if (childScript.endsWith(".ts")) args.push("--experimental-strip-types", "--no-warnings");
@@ -393,7 +429,7 @@ export async function startPluginSandbox(
     options.logger({ event: "plugin.sandbox", pluginId: options.pluginId, level: "warn", reason: "start_failed" });
     return { reason: "start_failed" };
   }
-  const sandbox = new ChildPluginSandbox(child, options);
+  const sandbox = new ChildPluginSandbox(child, sandboxOptions);
   const failure = await sandbox.start();
   if (failure) {
     await sandbox.dispose();
@@ -429,11 +465,21 @@ export async function loadPlugin(
     };
   }
 
-  const pluginDir = resolve(baseDir, listing.name);
-  const entryPath = resolve(pluginDir, listing.entry);
+  let pluginDir: string;
+  let entryPath: string;
+  try {
+    // Real paths so the macOS `/var` → `/private/var` tmpdir symlink (and
+    // any symlink inside the plugin tree) cannot desync the permission
+    // grant from the path `import()` opens.
+    pluginDir = realPath(resolve(baseDir, listing.name));
+    entryPath = realPath(resolve(pluginDir, listing.entry));
+  } catch {
+    return { error: `plugin "${listing.name}" failed to load (import_failed)` };
+  }
   // The manifest schema already rejects absolute and `..` entries; this is
-  // the belt to that brace, checked on the resolved path.
-  if (!entryPath.startsWith(`${pluginDir}/`) && !entryPath.startsWith(`${pluginDir}\\`)) {
+  // the belt to that brace, checked on the real path so a symlink cannot
+  // walk the entry outside the plugin folder.
+  if (!isInsideDir(pluginDir, entryPath)) {
     return { error: `plugin "${listing.name}" failed to load (entry_outside_plugin)` };
   }
 
