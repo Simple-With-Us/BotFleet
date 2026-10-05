@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   collectAptPackages,
   loadVmCliManifest,
+  vmCliInstallableTools,
   vmCliToolsForEnvironment,
   type VmCliEnvironment,
   type VmCliTool,
@@ -284,13 +285,15 @@ export function manifestPayloadBase64(): string {
 }
 
 export function renderVerifyScript(environment: VmCliEnvironment): string {
-  const tools = vmCliToolsForEnvironment(environment);
+  const tools = vmCliInstallableTools(environment);
   const lines = tools.map((tool) => {
+    const verify = tool.verify;
+    if (!verify) return `  : # skip verify for ${tool.name}`;
     if (tool.recipe === "pbcopy_shim") {
-      return `  if ! command -v ${tool.verify.command} >/dev/null 2>&1; then missing="$missing ${tool.name}"; fi`;
+      return `  if ! command -v ${verify.command} >/dev/null 2>&1; then missing="$missing ${tool.name}"; fi`;
     }
-    const args = (tool.verify.args ?? []).map((arg) => shellQuote(arg)).join(" ");
-    const cmd = args.length > 0 ? `${tool.verify.command} ${args}` : tool.verify.command;
+    const args = (verify.args ?? []).map((arg) => shellQuote(arg)).join(" ");
+    const cmd = args.length > 0 ? `${verify.command} ${args}` : verify.command;
     return `  if ! ${cmd} >/dev/null 2>&1; then missing="$missing ${tool.name}"; fi`;
   });
   return `#!/usr/bin/env bash

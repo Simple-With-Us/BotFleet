@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { loadVmCliManifest, vmCliToolsForEnvironment } from "./vm-cli-manifest.ts";
+import { loadVmCliManifest, vmCliInstallableTools, vmCliToolsForEnvironment } from "./vm-cli-manifest.ts";
 import {
   renderDockerfileCliInstallRun,
   renderLinuxInstallScript,
@@ -74,9 +74,9 @@ describe("vm CLI manifest install", () => {
     expect(vmCliManifestDigest()).toHaveLength(64);
   });
 
-  it("renders verify checks for every selected tool", () => {
+  it("renders verify checks for every installable tool", () => {
     const script = renderVerifyScript("cloud");
-    for (const tool of vmCliToolsForEnvironment("cloud")) {
+    for (const tool of vmCliInstallableTools("cloud")) {
       expect(script).toContain(tool.name);
     }
     expect(renderLinuxInstallScript("local-vm")).toContain("botfleet_install_apt");

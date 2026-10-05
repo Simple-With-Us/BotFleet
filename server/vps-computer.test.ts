@@ -686,7 +686,7 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toEqual([]);
+        expect(result.syncedTools).toEqual([]);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
         expect(fake.calls.some(({ args }) => args.includes("tar"))).toBe(false);
       } finally {
@@ -704,8 +704,8 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toContain(".ssh");
-        expect(result.synced).toContain(".gitconfig");
+        expect(result.syncedTools.some((entry) => entry.name === "ssh")).toBe(true);
+        expect(result.syncedTools.some((entry) => entry.name === "git")).toBe(true);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
 
         const tarCall = fake.calls.find(({ args }) => args.includes("tar") && args.includes("-xf"));

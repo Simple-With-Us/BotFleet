@@ -8,7 +8,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -17,6 +16,11 @@ import { z } from "zod";
 
 import { augmentedPath } from "./env-path.ts";
 import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
+import {
+  ALLOWED_CLI_GUEST_DESTINATIONS,
+  CLI_CREDENTIAL_CANDIDATES,
+  hostCliCredentialMounts,
+} from "./vm-cli-credentials.ts";
 import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -1029,58 +1033,8 @@ function samePodmanWindowsWorkspaceSource(source: string | undefined, expectedWo
   return actual.toLowerCase() === expected.toLowerCase();
 }
 
-export interface HostCliCredentialCandidate {
-  relPath: string[];
-  guest: string;
-}
-
-export const CLI_CREDENTIAL_CANDIDATES: readonly HostCliCredentialCandidate[] = [
-  // Infisical CLI
-  { relPath: [".infisical"], guest: "/home/cua/.infisical" },
-  { relPath: [".config", "infisical"], guest: "/home/cua/.config/infisical" },
-
-  // SSH & Git
-  { relPath: [".ssh"], guest: "/home/cua/.ssh" },
-  { relPath: [".gitconfig"], guest: "/home/cua/.gitconfig" },
-  { relPath: [".config", "git"], guest: "/home/cua/.config/git" },
-  { relPath: [".config", "gh"], guest: "/home/cua/.config/gh" },
-  { relPath: [".netrc"], guest: "/home/cua/.netrc" },
-
-  // Cloud Providers
-  { relPath: [".aws"], guest: "/home/cua/.aws" },
-  { relPath: [".config", "gcloud"], guest: "/home/cua/.config/gcloud" },
-  { relPath: [".azure"], guest: "/home/cua/.azure" },
-  { relPath: [".oci"], guest: "/home/cua/.oci" },
-
-  // Container & Kubernetes
-  { relPath: [".docker", "config.json"], guest: "/home/cua/.docker/config.json" },
-  { relPath: [".kube"], guest: "/home/cua/.kube" },
-
-  // Package Managers & Toolchains
-  { relPath: [".npmrc"], guest: "/home/cua/.npmrc" },
-  { relPath: [".cargo", "credentials.toml"], guest: "/home/cua/.cargo/credentials.toml" },
-  { relPath: [".cargo", "credentials"], guest: "/home/cua/.cargo/credentials" },
-  { relPath: [".cargo", "config.toml"], guest: "/home/cua/.cargo/config.toml" },
-  { relPath: [".cargo", "config"], guest: "/home/cua/.cargo/config" },
-  { relPath: [".pypirc"], guest: "/home/cua/.pypirc" },
-
-  // Hosting & Platform CLIs
-  { relPath: [".vercel"], guest: "/home/cua/.vercel" },
-  { relPath: [".fly"], guest: "/home/cua/.fly" },
-  { relPath: [".config", "cloudflare"], guest: "/home/cua/.config/cloudflare" },
-  { relPath: [".wrangler"], guest: "/home/cua/.wrangler" },
-
-  // Developer APIs & Tools
-  { relPath: [".config", "stripe"], guest: "/home/cua/.config/stripe" },
-  { relPath: [".config", "supabase"], guest: "/home/cua/.config/supabase" },
-  { relPath: [".config", "huggingface"], guest: "/home/cua/.config/huggingface" },
-  { relPath: [".sentryclirc"], guest: "/home/cua/.sentryclirc" },
-  { relPath: [".terraform.d"], guest: "/home/cua/.terraform.d" },
-] as const;
-
-export const ALLOWED_CLI_GUEST_DESTINATIONS: ReadonlySet<string> = new Set(
-  CLI_CREDENTIAL_CANDIDATES.map((c) => c.guest),
-);
+export type { HostCliCredentialCandidate } from "./vm-cli-credentials.ts";
+export { ALLOWED_CLI_GUEST_DESTINATIONS, CLI_CREDENTIAL_CANDIDATES, hostCliCredentialMounts };
 
 function dockerWorkspaceMountIsSafe(
   mounts:
@@ -1308,31 +1262,18 @@ export function containerNetworkArgs(runtime: Runtime, platform: NodeJS.Platform
  * ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.docker/config.json, ~/.npmrc, etc.
  * into the guest /home/cua directory, so terminal commands run inside the
  * Local VM container inherit the user's CLI authentication. */
-export function hostCliCredentialMounts(
-  platform: NodeJS.Platform = process.platform,
-  home = homedir(),
-): string[] {
-  if (platform === "win32") return [];
-  const mounts: string[] = [];
-  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
-    const hostPath = join(home, ...candidate.relPath);
-    try {
-      if (existsSync(hostPath)) {
-        mounts.push("--mount", `type=bind,source=${hostPath},target=${candidate.guest},readonly`);
-      }
-    } catch {
-      // Ignore if unreadable or inaccessible
-    }
-  }
-  return mounts;
-}
 
 export function containerRunArgs(
   runtime: Runtime,
   password = "CHANGE_ME",
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
   platform: NodeJS.Platform = process.platform,
-  options?: { shareCliCredentials?: boolean; homeDir?: string; limits?: ContainerLimits },
+  options?: {
+    shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
+    homeDir?: string;
+    limits?: ContainerLimits;
+  },
 ): string[] {
   const limits = clampContainerLimits(options?.limits ?? DEFAULT_CONTAINER_LIMITS);
   const memoryArg = `${limits.memoryGib}g`;
@@ -1405,7 +1346,11 @@ export function containerRunArgs(
   }
   common.push(...containerNetworkArgs(runtime, platform));
   if (options?.shareCliCredentials) {
-    common.push(...hostCliCredentialMounts(platform, options?.homeDir));
+    common.push(
+      ...hostCliCredentialMounts(platform, options?.homeDir ?? homedir(), {
+        shareGpgPrivateKeys: options?.shareGpgPrivateKeys,
+      }),
+    );
   }
   common.push(
     "--mount",
@@ -1505,6 +1450,14 @@ function shareCliCredentialsConfigured(): boolean {
   }
 }
 
+function shareGpgPrivateKeysConfigured(): boolean {
+  try {
+    return Boolean(loadConfig()?.localVm?.shareGpgPrivateKeys);
+  } catch {
+    return false;
+  }
+}
+
 export async function containerComputerAction(
   action: LifecycleAction,
   runner: CommandRunner = sh,
@@ -1541,6 +1494,7 @@ export async function containerComputerAction(
   } else {
     if (action === "run") await ensureVmWorkspace(platform, target);
     const shareCliCredentials = shareCliCredentialsConfigured();
+    const shareGpgPrivateKeys = shareGpgPrivateKeysConfigured();
     let limits: ContainerLimits | undefined;
     if (action === "run") {
       const host = await readRuntimeHost(runtime, runner);
@@ -1562,7 +1516,11 @@ export async function containerComputerAction(
         : target;
     const args =
       action === "run"
-        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), runTarget, platform, { shareCliCredentials, limits })
+        ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), runTarget, platform, {
+            shareCliCredentials,
+            shareGpgPrivateKeys,
+            limits,
+          })
         : action === "remove"
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
@@ -1786,7 +1744,12 @@ export function setupCommands(
     run:
       runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key
         ? null
-        : command(containerRunArgs(runtime, "CHANGE_ME", target, platform, { shareCliCredentials: shareCliCredentialsConfigured() })),
+        : command(
+            containerRunArgs(runtime, "CHANGE_ME", target, platform, {
+              shareCliCredentials: shareCliCredentialsConfigured(),
+              shareGpgPrivateKeys: shareGpgPrivateKeysConfigured(),
+            }),
+          ),
     start: null,
     stop: command(["stop", target.containerName]),
     remove: command(["rm", runtime === "container" ? "--force" : "-f", target.containerName]),

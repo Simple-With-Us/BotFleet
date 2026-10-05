@@ -54,7 +54,7 @@
     "test:watch": "vitest",
     "test:cua": "pnpm build:cua && node scripts/smoke-cua.mjs",
     "test:cua-container": "node scripts/smoke-cua-container.mjs",
-    "test:vm-cli": "node --test scripts/computer-vm-cli.node-test.mjs && vitest run server/vm-cli-install.test.ts",
+    "test:vm-cli": "node --test scripts/computer-vm-cli.node-test.mjs && vitest run server/vm-cli-install.test.ts server/vm-cli-credentials.test.ts",
     "check:electron": "node scripts/check-electron.mjs",
     "preview": "vite preview",
     "build:server": "tsc -p tsconfig.server.build.json && node scripts/bundle-server.mjs",

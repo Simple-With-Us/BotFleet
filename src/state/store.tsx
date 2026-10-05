@@ -512,6 +512,7 @@ export interface ConfigStatus {
     mode: "shared" | "per-bot";
     maxInstances: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
   };
   opencodeGo?: { configured: boolean };

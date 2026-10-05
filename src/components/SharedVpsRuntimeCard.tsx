@@ -16,11 +16,21 @@ interface VpsStatus {
   problem: string | null;
 }
 
+interface SyncToolResult {
+  name: string;
+  paths: string[];
+}
+
+interface SyncSkip {
+  name: string;
+  reason: string;
+}
+
 interface SyncResult {
   ok: boolean;
-  synced: string[];
+  syncedTools: SyncToolResult[];
+  skippedTools: SyncSkip[];
   containerName: string;
-  
 }
 /** Which face of the card a workspace gets: the live shared-runtime
  * panel, the per-bot caption, or nothing (VPS not configured). */
@@ -168,7 +178,7 @@ export function SharedVpsRuntimeCard() {
                   <div>
                     <div className="text-[13px] font-medium text-ink">Host CLI Credentials</div>
                     <div className="text-[12px] text-ink-secondary">
-                      Copy local developer logins (~/.infisical, ~/.ssh, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) into the shared VPS container.{state.config?.localVm?.shareCliCredentials ? "\u00a0 Automatic sync is enabled in Host & CLI Integration." : ""}
+                      Copy host CLI login files from the VM CLI manifest (Infisical, SSH, Git, cloud CLIs, registries, and more) into the shared VPS container.{state.config?.localVm?.shareCliCredentials ? "\u00a0 Automatic sync is enabled in Host & CLI Integration." : ""}
                     </div>
                   </div>
                   <button
@@ -187,13 +197,24 @@ export function SharedVpsRuntimeCard() {
                   </button>
                 </div>
                 {syncResult && (
-                  <div className="flex items-center gap-2 text-[12px] text-success">
-                    <Check size={13} className="shrink-0" />
-                    <span>
-                      {syncResult.synced.length > 0
-                        ? `Synced ${syncResult.synced.length} credential group(s): ${syncResult.synced.join(", ")}`
-                        : "No local CLI credentials found to sync."}
-                    </span>
+                  <div className="flex flex-col gap-1 text-[12px]">
+                    {syncResult.syncedTools.length > 0 ? (
+                      <div className="flex items-start gap-2 text-success">
+                        <Check size={13} className="mt-0.5 shrink-0" />
+                        <span>
+                          Synced {syncResult.syncedTools.length} tool(s):{" "}
+                          {syncResult.syncedTools.map((entry) => entry.name).join(", ")}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="text-ink-secondary">No local CLI credentials found to sync.</div>
+                    )}
+                    {syncResult.skippedTools.length > 0 && (
+                      <div className="text-ink-secondary">
+                        Skipped {syncResult.skippedTools.length} tool(s):{" "}
+                        {syncResult.skippedTools.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}
+                      </div>
+                    )}
                   </div>
                 )}
                 {syncError && (

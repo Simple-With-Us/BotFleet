@@ -11,15 +11,23 @@ export interface VmCliVerify {
   args?: string[];
 }
 
+export type VmCliCredentialTransform = "docker-linux-config" | "gpg-public-tree" | "gpg-private-tree";
+
+export interface VmCliCredentialPath {
+  rel: string;
+  transform?: VmCliCredentialTransform;
+}
+
 export interface VmCliTool {
   name: string;
   targets: VmCliTarget[];
   version: string;
-  verify: VmCliVerify;
+  verify?: VmCliVerify;
   apt?: string[];
   recipe?: string;
   npmPackage?: string;
   postInstall?: string;
+  credentialPaths?: VmCliCredentialPath[];
 }
 
 export interface VmCliManifest {
@@ -51,6 +59,14 @@ export function vmCliToolsForEnvironment(environment: VmCliEnvironment): VmCliTo
   const allowed = new Set(vmCliTargetsForEnvironment(environment));
   const manifest = loadVmCliManifest();
   return manifest.tools.filter((tool) => tool.targets.some((target) => allowed.has(target)));
+}
+
+export function vmCliInstallableTools(environment: VmCliEnvironment): VmCliTool[] {
+  return vmCliToolsForEnvironment(environment).filter((tool) => Boolean(tool.apt?.length || tool.recipe));
+}
+
+export function vmCliCredentialTools(): VmCliTool[] {
+  return loadVmCliManifest().tools.filter((tool) => (tool.credentialPaths?.length ?? 0) > 0);
 }
 
 export function collectAptPackages(tools: VmCliTool[]): string[] {

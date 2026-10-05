@@ -131,45 +131,24 @@ if [ -z "$SSH_ALIAS" ]; then
   SSH_ALIAS="$(resolve_config_alias)"
 fi
 
-# Candidate developer credentials to sync
-CANDIDATES=(
-  ".infisical"
-  ".config/infisical"
-  ".ssh"
-  ".gitconfig"
-  ".config/git"
-  ".config/gh"
-  ".netrc"
-  ".aws"
-  ".config/gcloud"
-  ".azure"
-  ".oci"
-  ".docker/config.json"
-  ".kube"
-  ".npmrc"
-  ".cargo/credentials.toml"
-  ".cargo/credentials"
-  ".cargo/config.toml"
-  ".cargo/config"
-  ".pypirc"
-  ".vercel"
-  ".fly"
-  ".config/cloudflare"
-  ".wrangler"
-  ".config/stripe"
-  ".config/supabase"
-  ".config/huggingface"
-  ".sentryclirc"
-  ".terraform.d"
-)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SHARE_GPG_PRIVATE_KEYS="${BOTFLEET_SHARE_GPG_PRIVATE_KEYS:-0}"
 
-# Detect which candidates exist in the source home
+# Candidate developer credentials to sync (manifest-driven)
 FOUND=()
-for rel in "${CANDIDATES[@]}"; do
-  if [ -e "$SRC_HOME/$rel" ]; then
-    FOUND+=("$rel")
-  fi
-done
+while IFS= read -r rel; do
+  [ -n "$rel" ] && FOUND+=("$rel")
+done < <(cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
+import { prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
+const homeDir = process.env.SRC_HOME ?? "";
+const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
+const { plan, cleanup } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+for (const rel of [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])].sort()) {
+  console.log(rel);
+}
+await cleanup();
+NODE
+)
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."

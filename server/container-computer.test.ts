@@ -700,7 +700,7 @@ describe("Cua integration", () => {
     writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
     writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
     writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
-    writeFileSync(join(fakeHome, ".docker", "config.json"), "fake docker");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), '{"credsStore":"osxkeychain"}\n');
 
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
@@ -708,7 +708,10 @@ describe("Cua integration", () => {
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".docker", "config.json")},target=/home/cua/.docker/config.json,readonly`);
+    expect(mounts.some((mount) => mount.includes("target=/home/cua/.docker/config.json,readonly"))).toBe(true);
+    expect(mounts.some((mount) => mount.includes("target=/home/cua/.docker/config.json,readonly") && !mount.includes("osxkeychain"))).toBe(
+      true,
+    );
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
