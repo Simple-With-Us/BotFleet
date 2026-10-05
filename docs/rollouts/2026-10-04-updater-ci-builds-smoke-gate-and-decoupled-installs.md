@@ -32,7 +32,7 @@ candidate was *after* the harness had already been quiesced and fenced.
 live: no prior-state capture, no candidate copy, no service restart, no bundle
 rename.  A failure there costs a staging directory instead of a rollback.
 
-The probe copies `Contents/Resources/server` out of the bundle and runs it on the
+The probe copies the packaged server out of the bundle and runs it on the
 **packaged Electron binary** under `ELECTRON_RUN_AS_NODE=1` — the runtime the
 harness actually uses, and the reason `electron-builder.yml` keeps the `runAsNode`
 fuse on.  It waits for a **validated** `/api/health` body (a boolean `ready` and a
@@ -184,8 +184,8 @@ architecturally correct end state, and it is also exactly the change that rule
 protects installed copies from.  It needs the owner's explicit call, not an
 agent's.  So Rec 2 proceeds on the half that touches no update-feed surface at
 all: a versioned release directory per commit for the always-on harness,
-a staging directory for preparation, `current` swapped with `ln -sfn`,
-and the service definition's working directory pointed at `current`.  That is where the
+a staging directory for preparation, and an activation pointer swapped
+atomically so the service definition's working directory never moves.  That is where the
 real pain is — the harness currently runs from a mutable linked worktree and
 `git checkout`s and swaps `node_modules` under a live Node process serving HTTP
 and SQLite writes (board `66bc29ad`) — and it resolves none of the ambiguity
