@@ -97,22 +97,40 @@ function Shell() {
   const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
-  const [appKeyboardRouting, setAppKeyboardRouting] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
+
+  const appKeyboardRouting = Boolean(
+    selectedAppId &&
+      ((group && !group.dm && group.id === selectedAppId) ||
+        (bot &&
+          state.viewedThreadId &&
+          state.viewedThreadId === threadIdForApp(bot, selectedAppId))),
+  );
 
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
   useEffect(() => {
     if (group && !group.dm) {
       setSelectedAppId(group.id);
     }
-  }, [group?.id]);
+  }, [group?.id, group?.dm]);
 
   // When selection changes via sidebar or store, yield matrix overview to the selected chat
   useEffect(() => {
     if (state.selectedId) {
       setMatrixOverviewActive(false);
     }
-  }, [state.selectedId]);
+    const selectedGroup = state.groups.find((g) => g.id === state.selectedId);
+    if (selectedGroup && !selectedGroup.dm) return;
+    const selectedBot = state.bots.find((b) => b.id === state.selectedId);
+    if (!selectedBot) return;
+    const inApp =
+      selectedAppId &&
+      state.viewedThreadId &&
+      state.viewedThreadId === threadIdForApp(selectedBot, selectedAppId);
+    if (!inApp) {
+      setSelectedAppId(null);
+    }
+  }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -394,25 +412,21 @@ function Shell() {
               if (appId === null) {
                 setMatrixOverviewActive(true);
                 setSelectedAppId(null);
-                setAppKeyboardRouting(false);
               } else {
                 setMatrixOverviewActive(false);
                 setSelectedAppId(appId);
-                setAppKeyboardRouting(true);
                 dispatch({ type: "select", id: appId });
               }
             }}
             activeBotId={bot?.id}
             onSelectBot={(botId) => {
               setMatrixOverviewActive(false);
-              setAppKeyboardRouting(false);
               setSelectedAppId(null);
               dispatch({ type: "select", id: botId });
             }}
             onSelectBotInApp={(botId, appId) => {
               setMatrixOverviewActive(false);
               setSelectedAppId(appId);
-              setAppKeyboardRouting(true);
               openBotInApp(botId, appId);
             }}
             onSelectGroupChat={(groupId) => {
@@ -429,26 +443,22 @@ function Shell() {
                 onSelectApp={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
-                  setAppKeyboardRouting(true);
                   dispatch({ type: "select", id: appId });
                 }}
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(null);
-                  setAppKeyboardRouting(false);
                   dispatch({ type: "select", id: botId });
                 }}
                 onSelectBotInApp={(botId, appId) => {
                   setMatrixOverviewActive(false);
                   // Remember the app we were viewing, so AppDeck shows it
                   setSelectedAppId(appId);
-                  setAppKeyboardRouting(true);
                   openBotInApp(botId, appId);
                 }}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
-                  setAppKeyboardRouting(true);
                   dispatch({ type: "select", id: appId });
                 }}
               />
