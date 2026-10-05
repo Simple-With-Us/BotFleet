@@ -1,7 +1,7 @@
 // Config + data dirs. One file, ~/.botfleet/config.json, env fallbacks:
 //   { "xai": {"key":"xai-…"}, "composio": {"apiKey":"ak_…"}, "box": {"token":"…"},
 //     "instances": { "<instanceId>": {"driver":"grok", …} } }
-import { readFileSync, mkdirSync, existsSync, renameSync, statSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
@@ -1169,33 +1169,23 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
   };
 }
 
-/** The set-aside files in `dir`, re-read only when the directory itself says it changed.
+/** The set-aside files in `dir`.
  *
  * `findSetAsideFiles` is a synchronous read of the whole data directory, and that directory grows
  * one message file per thread, so asking on every `loadConfig()` would put an O(files in the data
  * directory) read on a request path — `loadConfig()` is called per turn from the Linq webhook, the
  * tool lane and the index, and a fresh install has no config.json at all, which is the very branch
- * that asks.  One `statSync` of the directory is enough to tell whether the listing can have
- * changed: a set-aside file appears, or the owner removes one, and either way the directory's
- * mtime, ctime and size all move.  The answer therefore goes stale only if an entry is added or
- * removed within the clock's resolution, and a re-read is cheap enough that nothing depends on it
- * never happening twice. */
-let setAsideListing: { dir: string; stamp: string; files: SetAsideFile[] } | null = null;
-
+ * that asks.  A directory mtime/ctime/size stamp was tried here as a cheap change signal, but it is
+ * not reliable: a `writeFileSync` of a set-aside into the data directory left mtime, ctime and size
+ * unchanged on the windows-latest runner and on this Linux box, so a cached stamp returned a stale
+ * empty listing and `loadConfig()` after the first-run read reported a first run over a quarantined
+ * file for the life of the process (the "still sees a set-aside file that appears after an earlier
+ * first-run read" test).  The stamp is therefore not trusted to skip `findSetAsideFiles`; the
+ * directory is read every time.  The hot-path cost — one `readdirSync` plus a handful of `statSync`
+ * calls per `loadConfig()` — is accepted; the contract that a new set-aside is always seen is not
+ * worth trading for it. */
 function setAsideFilesIn(dir: string): SetAsideFile[] {
-  let stamp: string;
-  try {
-    const info = statSync(dir);
-    stamp = `${info.mtimeMs}:${info.ctimeMs}:${info.size}`;
-  } catch {
-    // No directory to stat: fall back to the uncached read, which already answers an unreadable
-    // one with an empty list.
-    return findSetAsideFiles(dir);
-  }
-  if (setAsideListing && setAsideListing.dir === dir && setAsideListing.stamp === stamp) return setAsideListing.files;
-  const files = findSetAsideFiles(dir);
-  setAsideListing = { dir, stamp, files };
-  return files;
+  return findSetAsideFiles(dir);
 }
 
 /** Read config.json.  Silent only when the file does not exist AND nothing of it is lying around, which
