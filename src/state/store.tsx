@@ -768,6 +768,7 @@ export interface InstanceInfo {
       supportsEffort?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
