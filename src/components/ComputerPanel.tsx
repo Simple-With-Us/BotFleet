@@ -96,6 +96,11 @@ const liveScreenFrame = z.object({
   botId: z.string(),
   png: z.string(),
   mime: z.string().optional(),
+  // The harness stamps this so a streamed frame and a polled screenshot are
+  // both aged against the server's clock.  Without it the comparison would
+  // mix a host timestamp with a browser one, and any skew between them would
+  // decide which picture wins.
+  capturedAt: z.number().optional(),
 });
 
 export function ComputerPanel({
@@ -477,10 +482,11 @@ export function ComputerPanel({
         const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
         if (parsed.success && parsed.data.botId === bot.id) {
           const frame = parsed.data;
-          const at = Date.now();
-          setLastFrameAt(at);
-          setLiveFrameAt(at);
-          setNowMs(at);
+          // Same clock as the polled capture's stamp.  The browser clock is
+          // only a fallback for a harness too old to stamp its own frames.
+          setLiveFrameAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
+          setLastFrameAt(Date.now());
+          setNowMs(Date.now());
           dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
         }
       } catch {
@@ -502,52 +508,75 @@ export function ComputerPanel({
     viewerOpen,
     pageVisible,
   });
-  const inFlight = useRef(false);
   const captureFailures = useRef(0);
   const [captureProblem, setCaptureProblem] = useState<string | null>(null);
   // When the polled capture landed, so `newestPreview` can compare ages.
   const [polledAt, setPolledAt] = useState(0);
+  // One capture at a time, SHARED across poll-effect generations.
+  //
+  // The gate changes mid-flight — including the staleness timer, every turn
+  // boundary — and a remote capture is a ~17s round trip that has already been
+  // paid for.  A per-generation guard threw that result away and then refused
+  // to replace it, because this ref was still held: the first picture of the
+  // silent-stream fallback arrived roughly 20s after the gate asked for it.
+  // So the pending capture is the shared thing, and a new generation adopts
+  // the one already running instead of starting a second.  Clearing the ref in
+  // the cleanup instead would let two full-frame SSH captures hit the box at
+  // once, which is the opposite of what this is for.
+  const pendingCapture = useRef<Promise<{ png: string; format: string; capturedAt?: number }> | null>(null);
+  // Whether this panel instance is still on screen.  Guarding the RESULT on
+  // this rather than on the effect generation is what lets an adopted capture
+  // still paint.  `key={bot.id}` remounts per bot, so one instance is one bot.
+  const panelLive = useRef(true);
+  useEffect(() => {
+    panelLive.current = true;
+    return () => {
+      panelLive.current = false;
+    };
+  }, []);
   useEffect(() => {
     if (!preview.poll) return;
-    let alive = true;
-    const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      const takenAt = Date.now();
+    const shoot = () => {
+      pendingCapture.current ??= (async () => {
+        try {
+          return await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+        } finally {
+          pendingCapture.current = null;
+        }
+      })();
+      return pendingCapture.current;
+    };
+    const apply = async () => {
+      let frame: { png: string; format: string; capturedAt?: number };
       try {
-        const { png, format, capturedAt } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
-        if (alive) {
-          setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-          // Compare PICTURE age, not arrival age.  This capture waited out a
-          // full remote round trip, so stamping it on receipt would let a
-          // slow capture outrank a newer streamed frame — the exact backward
-          // jump the comparison exists to prevent.  Prefer the server's stamp,
-          // taken between the pixels landing and the response leaving.
-          setPolledAt(typeof capturedAt === "number" ? capturedAt : takenAt);
-        }
-        if (captureFailures.current > 0) {
-          captureFailures.current = 0;
-          setCaptureProblem(null);
-        }
+        frame = await shoot();
       } catch (e) {
         /* A box mid-command or asleep fails transiently and retries next tick.
          * One that fails every tick is not slow, it is broken, and saying so
          * beats an eternal "Waiting for the first frame…". */
-        if (!alive) return;
+        if (!panelLive.current) return;
         captureFailures.current += 1;
         if (captureFailureIsActionable(captureFailures.current)) {
           setCaptureProblem(
             `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
           );
         }
-      } finally {
-        inFlight.current = false;
+        return;
+      }
+      if (!panelLive.current) return;
+      setPolledFrame({ png: frame.png, mime: frame.format === "jpeg" ? "image/jpeg" : "image/png" });
+      // Compare PICTURE age, not arrival age, and in the harness's clock for
+      // both sources.  The browser clock is a fallback for a harness too old
+      // to stamp its own frames.
+      setPolledAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
+      if (captureFailures.current > 0) {
+        captureFailures.current = 0;
+        setCaptureProblem(null);
       }
     };
-    void shoot();
-    const timer = setInterval(shoot, preview.intervalMs);
+    void apply();
+    const timer = setInterval(() => void apply(), preview.intervalMs);
     return () => {
-      alive = false;
       clearInterval(timer);
     };
   }, [preview.poll, preview.intervalMs, bot.id]);

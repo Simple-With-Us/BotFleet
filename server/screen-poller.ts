@@ -1,4 +1,4 @@
-export type ScreenFrame = { png: string; mime: string };
+export type ScreenFrame = { png: string; mime: string; capturedAt: number };
 
 type Entry = {
   timer: ReturnType<typeof setInterval> | null;
@@ -49,7 +49,11 @@ export class ScreenPollers {
         const pending = (async () => {
           try {
             const { png, format } = await capture();
-            const frame = { png, mime: format === "jpeg" ? "image/jpeg" : "image/png" };
+            // Stamped here, between the pixels landing and this returning, so
+            // it is comparable with the polled screenshot's own stamp.  The
+            // panel compares the two sources' ages, and two different clocks
+            // make that comparison meaningless.
+            const frame = { png, mime: format === "jpeg" ? "image/jpeg" : "image/png", capturedAt: Date.now() };
             entry.last = frame;
             this.publish(botId, frame);
           } catch {
