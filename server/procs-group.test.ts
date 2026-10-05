@@ -105,6 +105,10 @@ posix("trackCliGroup", () => {
     cleanup.push(() => {
       // Never process.kill(0, …): that signals the test runner's whole group.
       if (!(Number.isSafeInteger(descendant) && descendant > 0)) return;
+      // The group SIGKILL below normally reaps it first, freeing the pid for the
+      // OS to recycle.  Re-check that it is still alive and ours (kill(pid, 0)
+      // fails with ESRCH/EPERM otherwise) so we never signal a reused pid.
+      if (!alive(descendant)) return;
       try {
         process.kill(descendant, "SIGKILL");
       } catch {
