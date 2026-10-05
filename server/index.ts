@@ -11137,7 +11137,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
       for (const threadId of threadIds) lastReply.delete(threadId);
-      store.deleteGroup(group.id);
+      // Refuse before wiping transcripts when the roster cannot be saved: a
+      // false here means the room would reappear on the next boot pointing at
+      // logs that are already gone.
+      if (!store.deleteGroup(group.id)) {
+        return json(res, 409, { error: "the room roster could not be saved — fix or move groups.json, then retry" });
+      }
       stopJobsForDeleted(threadIds, "its conversation was deleted");
       // Both generations and any temp file, for every task this room had: a
       // `.ndjson.1` or a killed trim's `.tmp` left behind would outlive the
@@ -11706,6 +11711,22 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         cancelPeerApprovalsFor(bot.id);
         discardDelegations(commsBus, bot.threadId);
         computerControl.forget(bot.id);
+        // The snapshot above was taken before soft-cleanup awaits.  A task
+        // created while they ran has a record the delete below removes and a
+        // pair of logs the snapshot never heard of, so take the union rather
+        // than either list alone — before the roster delete, while the record
+        // still exists.
+        const current = store.bot(bot.id);
+        if (current) {
+          botThreadIds.add(current.threadId);
+          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
+        }
+        // Refuse before destroying the workspace when the roster cannot be
+        // saved: a false here means the bot would reappear on the next boot
+        // pointing at a container and transcripts that are already gone.
+        if (!store.deleteBot(bot.id)) {
+          return json(res, 409, { error: "the bot roster could not be saved — fix or move bots.json, then retry" });
+        }
         // Its per-bot Local VM goes with it.  Nothing else can name that
         // container once the store record is gone — the name is derived from
         // the bot id — so a later shared/per-bot mode switch cannot clean it
@@ -11723,16 +11744,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const perBotVpsTarget = vps.perBotVpsTarget(bot.id);
         await vps.vpsRemoveTargetIfPresent(cfg, perBotVpsTarget).catch(() => {});
         vps.closeVpsDesktopTunnelForTarget(perBotVpsTarget.key);
-        // The snapshot above was taken before two awaits.  A task created
-        // while they ran has a record the delete below removes and a pair of
-        // logs the snapshot never heard of, so take the union rather than
-        // either list alone.
-        const current = store.bot(bot.id);
-        if (current) {
-          botThreadIds.add(current.threadId);
-          for (const task of current.tasks ?? []) botThreadIds.add(task.threadId);
-        }
-        store.deleteBot(bot.id);
       } finally {
         localVmLifecycleBusy.delete(localVmTarget.key);
       }

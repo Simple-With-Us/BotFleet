@@ -9,7 +9,7 @@ export interface BuildIdentity {
 export const HARNESS_API_VERSION: number;
 export function validBuildIdentity(value: unknown): value is BuildIdentity;
 export function readPackagedBuildIdentity(directory: string): BuildIdentity;
-export function readSourceBuildIdentity(root: string): BuildIdentity;
+export function readSourceBuildIdentity(root: string, options?: { requireGit?: boolean }): BuildIdentity;
 export function hashStaticUi(directory: string | null | undefined): string | null;
 export function authorizedRuntime(owner: { nonce: string }, authorization: unknown): boolean;
 export function buildCompatibility(expected: unknown, actual: unknown): "incompatible" | "matching" | "bundled-ui";

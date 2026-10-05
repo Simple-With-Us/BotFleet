@@ -119,6 +119,23 @@ describe("loadConfig with a config.json it cannot fully use", () => {
     ]);
   });
 
+  it("treats a file where no section survives as ignored rather than partial", () => {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        autoUpdate: { enabled: "yes" },
+        callStt: { provider: "carrier-pigeon" },
+      }),
+    );
+    const cfg = loadConfig();
+    expect(cfg.autoUpdate).toBeUndefined();
+    expect(cfg.callStt).toBeUndefined();
+    expect(listDataFaults()).toEqual([
+      expect.objectContaining({ file: "config.json", kind: "config-ignored" }),
+    ]);
+    expect(warned()[0]).toContain("using defaults");
+  });
+
   it("keeps the valid engine entries when one entry under instances is bad", () => {
     writeFileSync(
       path,

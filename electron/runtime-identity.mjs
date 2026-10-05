@@ -68,11 +68,12 @@ export function readSourceBuildIdentity(root, { requireGit = false } = {}) {
       sourceCommit = head;
       sourceDirty = git("status", "--porcelain", "--untracked-files=no").length > 0;
     }
-  } catch (error) {
-    // A dev checkout can start without git, but a build that stamps this into
-    // build-identity.json must not: that manifest is the shipped provenance.
-    if (requireGit) throw new Error(`cannot read git identity for ${root}: ${error?.message ?? error}`);
-    /* otherwise git is absent, or this is not a checkout: the commit stays unknown */
+  } catch {
+    // Git may be absent, timed out, or unable to read the index.  A real HEAD
+    // already captured above still stands; only an unknown commit is refused
+    // below when requireGit is set.  A status failure after HEAD succeeds keeps
+    // sourceDirty true (the safe default), matching the documented fallback.
+    /* commit stays unknown when HEAD never arrived; otherwise keep what we have */
   }
   const value = {
     app: "botfleet", version: JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version,

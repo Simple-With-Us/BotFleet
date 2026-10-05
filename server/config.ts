@@ -1163,6 +1163,10 @@ function salvageStoredConfig(stored: JsonObject): StoredConfigRead {
       if (kept.length > 0) usable[section] = Object.fromEntries(kept);
     }
   }
+  // Nothing survived: every setting was left out, so this is a total loss —
+  // the same "using defaults" notice as an unreadable file, not a partial one
+  // that claims the rest of the file is in use.
+  if (Object.keys(usable).length === 0) return ignoredConfig(issues.join("; "));
   return {
     config: parseStoredConfig(usable),
     problem: { kind: "config-partial", reason: issues.join("; "), sections: left },
