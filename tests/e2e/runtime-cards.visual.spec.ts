@@ -10,9 +10,11 @@ import { test, expect, type Page, type Route } from '@playwright/test';
 // BotFleet has NO top-level `visual-tests/` directory; this follows the
 // existing convention of `tests/e2e/*.visual.spec.ts` with fixtures via
 // `/?fixture=...` in `src/main.tsx` (see ComputerPanelVisualFixture.tsx
-// and computer-panel.visual.spec.ts).  The update path is
-// `pnpm exec playwright test tests/e2e/runtime-cards.visual.spec.ts
-// --update-snapshots` — not `cd visual-tests && npm ci`.
+// and computer-panel.visual.spec.ts).  Run
+// `pnpm run e2e:update tests/e2e/runtime-cards.visual.spec.ts` to
+// regenerate the committed baselines — not `cd visual-tests && npm ci`.
+// Pass the spec path without a `--` separator:  pnpm forwards a literal
+// `--`, and Playwright then ignores the path and runs the whole suite.
 //
 // Screenshot tolerance is expect.toHaveScreenshot in playwright.config.ts:
 // maxDiffPixelRatio 0.02 and threshold 0.2.  Only animation and caret

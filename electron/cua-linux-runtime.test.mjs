@@ -544,7 +544,7 @@ describe.skipIf(process.platform === "win32")("Linux CUA opt-in and lifecycle", 
       runtimeOptions: {
         healthCheckIntervalMs: 30_000,
         healthProbe: vi.fn(async () => {
-          throw Object.assign(new Error("The Cua WinRects helper is no longer active."), {
+          throw Object.assign(new Error("The CUA WinRects helper is no longer active."), {
             code: "wayland-helper-required",
           });
         }),
