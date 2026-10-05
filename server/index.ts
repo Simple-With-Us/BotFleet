@@ -14839,9 +14839,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
       }
     }
-    m = path.match(/^\/api\/tts\/custom-voice\/([\w.-]+)$/);
+    // personal: and apple-personal: ids contain a colon.  The pathname keeps
+    // that colon percent-encoded, so the previous word class never matched and the
+    // refused row could not be removed.
+    m = path.match(/^\/api\/tts\/custom-voice\/([^/]+)$/);
     if (m && method === "DELETE") {
-      const [, voiceId] = m;
+      let voiceId: string;
+      try {
+        // The pathname is the only trust boundary on the DELETE id.  A
+        // malformed value used to slip past the word class straight to
+        // deleteCustomVoice.  Parse it through Zod so the downstream
+        // service only ever receives a trimmed, non-empty value, and a
+        // failed decode or a failed parse both return 400 without a
+        // delete.  personal: / apple-personal: ids with a colon are still
+        // accepted (Zod only constrains shape, not characters).
+        voiceId = z.string().trim().min(1).parse(decodeURIComponent(m[1]));
+      } catch {
+        return json(res, 400, { error: "invalid voice id" });
+      }
       const deleted = tts.deleteCustomVoice(voiceId);
       return json(res, 200, { ok: true, deleted });
     }
