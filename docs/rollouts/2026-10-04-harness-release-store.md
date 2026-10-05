@@ -1,7 +1,17 @@
 # 2026-10-04 — An Immutable Release Store For The Always-On Harness
 
-Board `f1482275` (Recommendation 2, harness half).  Branch
-`minimax/harness-release-store`, PR #858.  Author: MINIMAX.
+repo: BotFleet | [MM] Claim: board `f1482275` (Recommendation 2, harness half), branch
+`minimax/harness-release-store`, PR #858, seat MINIMAX, Mac.  `/Users/jay/apps/AGENT-SYNC.md`
+read for the board/closeout protocol, and the matching `repo: BotFleet`-first claim posted in
+`#agent-sync` on 2026-10-04.
+
+**Recorded late, and labelled as such rather than backdated:** this lane's coordination record
+was assembled during the review rounds, after the board row existed and after the `#agent-sync`
+post had gone out under the same repo-first format.  The board reservation was live before the
+first commit; the `#agent-sync` announcement followed the PR rather than preceding it.  That is
+the ordering, and it is recorded rather than tidied.
+
+Author: MINIMAX.
 
 ## Context & Objective
 

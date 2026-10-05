@@ -626,7 +626,12 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
     // release immutable and teaching the pruner about it are the same change.
     await discardRelease(commit, env);
     removed.push(commit);
-    onRemove?.(commit);
+    // Awaited.  Fire-and-forget let the caller receive {removed, kept, live}
+    // while its persistence or updater write was still in flight — so "the
+    // prune reported this release" could be true before anything recorded it —
+    // and a rejecting callback escaped as an unhandled rejection, which this
+    // same module calls the worst possible outcome elsewhere.
+    await onRemove?.(commit);
   }
   return { removed, kept, live };
 }

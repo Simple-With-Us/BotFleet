@@ -22,8 +22,22 @@ ROOT="${BOTFLEET_SERVER_ROOT:-$HOME/apps/botfleet-server}"
 # matters because the updater's dependency fingerprint and bundle identity checks
 # both refuse a symlinked root, and because two processes that disagree about
 # which path they are in cannot be compared.
+# If this fails, do NOT let `set -e` abort here: at this point in the script
+# fail_or_stop_storm does not exist yet, so an abort here would exit non-zero
+# with no ledger record and no operator message — the one failure that bypasses
+# the machinery that exists to report failures.  The half-resolved state is
+# carried and reported through the real channel below, once that function is
+# defined.
+ROOT_UNRESOLVED=""
 if [ -d "$ROOT" ]; then
-  ROOT="$(cd -P "$ROOT" && pwd)"
+  if ! ROOT_RESOLVED="$(cd -P "$ROOT" 2>/dev/null && pwd)"; then
+    ROOT_RESOLVED=""
+  fi
+  if [ -n "$ROOT_RESOLVED" ]; then
+    ROOT="$ROOT_RESOLVED"
+  else
+    ROOT_UNRESOLVED="$ROOT"
+  fi
 fi
 PORT="${BOTFLEET_PORT:-8799}"
 NODE="${BOTFLEET_NODE:-/opt/homebrew/bin/node}"
@@ -279,6 +293,15 @@ if [ "$HEAL_ONLY" != true ] && health; then
   exit 0
 fi
 
+if [ -n "$ROOT_UNRESOLVED" ]; then
+  echo "botfleet-server-start: could not resolve \$ROOT physically: $ROOT_UNRESOLVED" >&2
+  echo "botfleet-server-start: the path exists but will not resolve to a real directory." >&2
+  echo "botfleet-server-start: that is the signature of a release left half read-only by an" >&2
+  echo "  interrupted permission walk, or a release pruned while it was live. Check it with:" >&2
+  echo "    ls -ld '$ROOT_UNRESOLVED' && ls -l '$ROOT_UNRESOLVED'" >&2
+  echo "botfleet-server-start: fix the permissions or point BOTFLEET_SERVER_ROOT elsewhere." >&2
+  fail_or_stop_storm
+fi
 preflight || fail_or_stop_storm
 maybe_heal_dependencies || fail_or_stop_storm
 
