@@ -1047,8 +1047,14 @@ function dispatchHoldFor(
     // occurred.
     if (opts.count) noteDoomedSkip(bot.id, instanceId);
     const entry = doomedDispatches.peek(bot.id, instanceId);
-    const hint = entry?.lastError
-      ? `Last error: ${entry.lastError}`
+    // Redact lastError before it lands in hint/reason: setup failure can carry
+    // provider text (paths, tokens, stack frames); holdReason is persisted and
+    // broadcast, same trust boundary as the /api/quotas route.
+    const safeError = entry?.lastError
+      ? (redactRuntimeEventForWire({ type: "runtime.error", message: entry.lastError } as RuntimeEvent) as { message?: string }).message
+      : undefined;
+    const hint = safeError
+      ? `Last error: ${safeError}`
       : `Check that the ${engine} CLI is installed and logged in`;
     const reason = `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row — ${hint}`;
     return { reason, hint };
