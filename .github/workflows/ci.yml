@@ -75,7 +75,10 @@ jobs:
         # The harness and pure desktop capabilities stay portable across all
         # supported host platforms. POSIX-only process tests self-skip.
         os: [macos-latest, ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # Docs-only fast path still reports the required check names
+    # (typecheck + test (macos-latest) / windows-latest) but must not consume
+    # scarce free-plan macOS/Windows concurrent slots (2026-10-05 backlog).
+    runs-on: ${{ needs.changes.outputs.docs_only == 'true' && 'ubuntu-latest' || matrix.os }}
     # The test chain alone takes 10.5 to 13.5 minutes per host, and a full
     # job ran 14m49s on Ubuntu, so 15 cancelled healthy runs.  Keep this at
     # or below the Sentry CI check-in margin minus 15 (scripts/sentry-ci-report.py).
@@ -232,7 +235,9 @@ jobs:
     name: Swift tests + iOS build
     needs: changes
     if: ${{ !cancelled() }}
-    runs-on: macos-latest
+    # Fast-path (docs-only or no ios/ changes) reports the required check on
+    # ubuntu-latest so we do not burn a macOS concurrent slot for an echo.
+    runs-on: ${{ (needs.changes.outputs.docs_only == 'true' || needs.changes.outputs.ios_changed != 'true') && 'ubuntu-latest' || 'macos-latest' }}
     timeout-minutes: 20
     steps:
       - name: Documentation-only fast path
