@@ -17,6 +17,7 @@ import {
 } from "../shared/conversation-mode.ts";
 import { foldPrompts, gapEndsAt, withinGap } from "./trigger-gap.ts";
 import { routineFailureCode, routineFailurePhase, type RoutineOutcomeCode, type RoutineFailurePhase } from "../shared/routine-outcomes.ts";
+import { botAutomationsPausedMessage } from "./bot-stop-policy.ts";
 import { canonicalTimeZone, nextZonedOccurrence } from "../shared/time-zone.ts";
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
 
@@ -535,6 +536,9 @@ export class RoutineManager {
     return run ? { ...run } : null;
   }
 
+  /** Pause webhook, resource, and schedule dispatch for this bot.  Default
+   *  duration is until a person wakes the bot (a message, respond, or Run
+   *  now clears the snooze via `clearBotSnooze`). */
   snoozeBot(botId: string, durationMs = Infinity): void {
     this.botSnoozeUntil.set(botId, durationMs === Infinity ? Infinity : this.now() + durationMs);
     this.save();
@@ -1090,10 +1094,23 @@ export class RoutineManager {
       this.reconcileOrphanedRuns(now);
       let changed = false;
       for (const routine of this.routines) {
-        if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now || this.isBotSnoozed(routine.botId)) continue;
+        if (!routine.enabled || routine.nextRunAt == null || routine.nextRunAt > now) continue;
         const scheduledFor = routine.nextRunAt;
         const late = now - scheduledFor;
-        if (late > CATCH_UP_MS) {
+        const snoozed = this.isBotSnoozed(routine.botId);
+        if (snoozed) {
+          const skipped = this.newRun(routine, scheduledFor, false);
+          skipped.status = "missed";
+          skipped.finishedAt = now;
+          skipped.error = botAutomationsPausedMessage();
+          skipped.outcomeCode = "bot_stopped";
+          skipped.failurePhase = "lifecycle";
+          this.emitRun(skipped);
+          if (routine.schedule.type === "daily") {
+            const checkInId = this.options.checkInStart?.(skipped, routine);
+            if (checkInId) this.options.checkInFinish?.(skipped, checkInId, true);
+          }
+        } else if (late > CATCH_UP_MS) {
           const missed = this.newRun(routine, scheduledFor, false);
           missed.status = "missed";
           missed.finishedAt = now;
