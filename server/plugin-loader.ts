@@ -1,6 +1,7 @@
-// Load a plugin module and hand it a frozen PluginHost.  Each plugin's
-// ESM file is imported once on enable; re-importing returns a fresh
-// module record, which is what we want for reloads.
+// Load a plugin module and hand it a frozen PluginHost.  Node caches
+// ESM modules by URL, so a second import of the same file:// path would
+// return the first evaluation.  Reloads append a nonce query so the
+// loader reads the file again.
 //
 // The host API is the ONLY surface plugins see.  It is built with
 // Object.freeze (deep) so a plugin cannot smuggle references back into
@@ -64,22 +65,84 @@ export type PluginHostJsonValue =
   | PluginHostJsonValue[]
   | { [key: string]: PluginHostJsonValue };
 
+const SECRET_CONFIG_KEY = /key|token|secret|credential/i;
+
+/** Same filter `listConfigKeys` uses.  A plugin must not read a value
+ *  whose key looks like a credential, even if it guesses the name. */
+export function isSecretConfigKey(key: string): boolean {
+  return SECRET_CONFIG_KEY.test(key);
+}
+
+function isRedactableRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Copy a config value with secret-looking keys removed at every level.
+ *  The copy is the point: the plugin must not hold the live config object. */
+export function redactPluginConfig(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactPluginConfig(entry));
+  if (!isRedactableRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    if (isSecretConfigKey(key)) continue;
+    out[key] = redactPluginConfig(value[key]);
+  }
+  return out;
+}
+
+
 /** Build the frozen host API object.  The host's `getBots` reads the
- *  latest snapshot at call time, not at registration time. */
+ *  latest snapshot at call time, not at registration time.  Capabilities
+ *  the manifest did not declare return an empty result and one warning. */
 export function createPluginHost(
   name: string,
   inputs: PluginHostInputs,
+  capabilities: readonly string[] = [],
 ): PluginHost {
+  const allowed = new Set(capabilities);
+  const warned = new Set<string>();
+  const warnOnce = (code: string, message: string) => {
+    if (warned.has(code)) return;
+    warned.add(code);
+    inputs.logger("warn", name, message);
+  };
   const host: PluginHost = {
     version: HOST_API_VERSION,
     log: (level, message) => inputs.logger(level, name, message),
     getBots: () => {
+      if (!allowed.has("read.bots")) {
+        warnOnce("read.bots", "getBots refused: capability read.bots was not declared");
+        return [];
+      }
       const list = inputs.listBots();
+      if (!allowed.has("read.status")) {
+        warnOnce("read.status", "bot status omitted: capability read.status was not declared");
+        return list.map((bot) => ({ id: bot.id, name: bot.name, status: "", driver: bot.driver }));
+      }
       return list.map((bot) => ({ ...bot }));
     },
     config: {
-      get: <T = unknown>(key: string) => inputs.readConfig<T>(key),
-      listKeys: () => [...inputs.listConfigKeys()],
+      get: <T = unknown>(key: string): T | undefined => {
+        if (!allowed.has("read.config")) {
+          warnOnce("read.config", "config.get refused: capability read.config was not declared");
+          return undefined;
+        }
+        if (!inputs.listConfigKeys().includes(key) || isSecretConfigKey(key)) {
+          warnOnce("config.allowlist", "config.get refused: key is not on the non-secret allowlist");
+          return undefined;
+        }
+        // SAFETY: redactPluginConfig returns a copy of the allow-listed value.  The caller names T and accepts that the host does not validate the value against T.
+        return redactPluginConfig(inputs.readConfig<T>(key)) as T | undefined;
+      },
+      listKeys: () => {
+        if (!allowed.has("read.config")) {
+          warnOnce("read.config.keys", "config.listKeys refused: capability read.config was not declared");
+          return [];
+        }
+        return [...inputs.listConfigKeys()];
+      },
     },
   };
   // Tag the host with a non-enumerable sentinel BEFORE freezing so test
@@ -134,45 +197,84 @@ export function isPluginHost(value: unknown): value is PluginHost {
   return (value as PluginHostRecordLike)[NONCE] === true;
 }
 
-/** Load one plugin module.  Returns the imported module + the listing
- *  shape the host stores in memory. */
+function isCallable(value: unknown): boolean {
+  const tag = Object.prototype.toString.call(value);
+  return tag === "[object Function]" || tag === "[object AsyncFunction]";
+}
+
+function isCardHandler(value: unknown): value is NonNullable<PluginModule["getCardData"]> {
+  return isCallable(value);
+}
+
+function isCommandHandler(value: unknown): value is NonNullable<PluginModule["runCommand"]> {
+  return isCallable(value);
+}
+
+/** Named exports only.  A module namespace has a null prototype, so a
+ *  plain-object check would reject a real import.  Optional handlers must
+ *  be functions; anything else is a contract failure, not a cast. */
+function pluginModuleFromNamespace(value: unknown): { module: PluginModule } | { error: string } {
+  if (!isRedactableRecord(value)) return { error: "plugin entry did not export a module" };
+  const card = value.getCardData;
+  const command = value.runCommand;
+  if (card !== undefined && !isCardHandler(card)) {
+    return { error: "plugin getCardData export is not a function" };
+  }
+  if (command !== undefined && !isCommandHandler(command)) {
+    return { error: "plugin runCommand export is not a function" };
+  }
+  const module: PluginModule = {};
+  if (isCardHandler(card)) module.getCardData = card;
+  if (isCommandHandler(command)) module.runCommand = command;
+  return { module };
+}
+
+/** A loaded plugin module.  A host-version mismatch is an error from
+ *  `loadPlugin`, not a flag the caller can ignore. */
 export interface LoadedPlugin {
   name: string;
   version: string;
   source: PluginSource;
   module: PluginModule;
   host: PluginHost;
-  /** When the host API version does not satisfy the plugin's botfleet
-   *  constraint, load still returns the module but this flag is set so
-   *  the caller can warn or refuse to enable. */
-  hostMismatch: boolean;
 }
 
-async function importPluginFile(entryPath: string): Promise<PluginModule> {
-  const url = pathToFileURL(entryPath).href;
-  const mod = await import(url);
-  // SAFETY: dynamic import() returns a Module Namespace Object (a frozen record).  Plugin authors export named bindings; the type assertion downcasts to PluginModule because no shared schema exists for plugin exports, only a hand-checked convention.
-  return mod as PluginModule;
+let reloadNonce = 0;
+
+async function importPluginFile(entryPath: string): Promise<PluginModule | { error: string }> {
+  reloadNonce += 1;
+  const url = `${pathToFileURL(entryPath).href}?botfleetReload=${reloadNonce}`;
+  const imported: unknown = await import(url);
+  const parsed = pluginModuleFromNamespace(imported);
+  if ("error" in parsed) return parsed;
+  return parsed.module;
 }
 
-/** Load (or reload) one enabled plugin.  Validates the on-disk manifest
- *  against the host API version before importing.  The `baseDir` is the
- *  registry base directory; production callers pass the default, tests
- *  pass a mkdtemp'd directory so they never touch the host's user data. */
+/** Load (or reload) one enabled plugin.  Refuses a host-version mismatch
+ *  before importing, and only hands the plugin the capabilities it declared.
+ *  The `baseDir` is the registry base directory; production callers pass the
+ *  default, tests pass a mkdtemp'd directory so they never touch the host's
+ *  user data. */
 export async function loadPlugin(
   listing: PluginListing,
   inputs: PluginHostInputs,
   baseDir: string = PLUGINS_DIR,
 ): Promise<LoadedPlugin | { error: string }> {
+  if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
+    return {
+      error: `plugin "${listing.name}" requires botfleet "${listing.botfleet}" but the host API is ${HOST_API_VERSION}`,
+    };
+  }
+
   const pluginDir = join(baseDir, listing.name);
   const entryPath = join(pluginDir, listing.entry ?? "plugin.mjs");
-
-  const hostMismatch = !satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION);
-  const host = createPluginHost(listing.name, inputs);
+  const host = createPluginHost(listing.name, inputs, listing.capabilities);
 
   let module: PluginModule;
   try {
-    module = await importPluginFile(entryPath);
+    const imported = await importPluginFile(entryPath);
+    if ("error" in imported) return imported;
+    module = imported;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return {
@@ -186,6 +288,5 @@ export async function loadPlugin(
     source: listing.source,
     module,
     host,
-    hostMismatch,
   };
 }

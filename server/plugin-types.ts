@@ -5,10 +5,11 @@ import type { PluginManifest } from "../shared/plugin-manifest.ts";
 
 /** Install source kinds.  A plugin's source is either a folder the user
  *  pointed at, or a git URL that was fetched once at install time and
- *  is fetched again on update. */
+ *  is fetched again on update.  Git sources keep the subdirectory path
+ *  so an update fetches the same folder it installed. */
 export type PluginSource =
   | { kind: "folder"; path: string }
-  | { kind: "git"; url: string; ref: string | null };
+  | { kind: "git"; url: string; ref: string | null; path: string };
 
 /** One entry in `registry.json`.  Everything the host needs to load,
  *  enable, disable, update, or remove the plugin. */

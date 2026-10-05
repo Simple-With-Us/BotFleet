@@ -1,10 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { AlertTriangle } from "lucide-react";
 
 export type ConfirmDialogProps = {
   open: boolean;
   title: string;
-  body: string;
+  body: ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   destructive?: boolean;

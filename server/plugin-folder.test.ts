@@ -56,6 +56,24 @@ describe("readPluginFolder", () => {
     expect(errorFrom(result)).toMatch(/full path/);
   });
 
+  it("stops reading once the plugin file cap is reached", () => {
+    const entries = [{ name: "botfleet-plugin.json", isDirectory: false }];
+    for (let i = 0; i < 70; i += 1) entries.push({ name: `file-${i}.js`, isDirectory: false });
+    let reads = 0;
+    const result = readPluginFolder(dir, stubFolder({
+      entries,
+      byteSize: () => 8,
+      read: () => {
+        reads += 1;
+        return "{}";
+      },
+    }));
+    expect("error" in result).toBe(true);
+    if ("error" in result) expect(result.error).toMatch(/import cap is 64/);
+    // The manifest is read once.  Only 64 plugin files are read, not all 70.
+    expect(reads).toBe(65);
+  });
+
   it("refuses a manifest over the size cap", () => {
     const result = readPluginFolder(dir, stubFolder({
       entries: [{ name: "botfleet-plugin.json", isDirectory: false }],

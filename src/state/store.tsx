@@ -1651,14 +1651,18 @@ export function reducer(state: AppState, action: Action): AppState {
     }
     case "togglePlugins":
       return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
-    case "togglePluginsManager":
+    case "togglePluginsManager": {
+      const open = action.open ?? !state.pluginsManagerOpen;
       return {
         ...state,
-        pluginsManagerOpen: action.open ?? !state.pluginsManagerOpen,
-        pluginsOpen: action.open === true ? false : state.pluginsOpen,
-        settingsOpen: action.open === true ? false : state.settingsOpen,
-        appSettingsOpen: action.open === true ? false : state.appSettingsOpen,
+        pluginsManagerOpen: open,
+        pluginsOpen: open ? false : state.pluginsOpen,
+        settingsOpen: open ? false : state.settingsOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
       };
+    }
     case "focusMessage":
       return {
         ...state,

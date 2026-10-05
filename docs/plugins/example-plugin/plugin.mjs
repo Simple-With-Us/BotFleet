@@ -21,8 +21,16 @@ export function getCardData({ cardId, host }) {
   return { result: { a: bots.length, b: bots.length * 2 } };
 }
 
+const HELLO_NAME_MAX = 64;
+
 export function runCommand({ command: _command, args, host }) {
-  const who = args?.trim() || "world";
-  host.log("info", `/hello ${who}`);
+  const raw = typeof args === "string" ? args.trim() : "";
+  if (raw.length > HELLO_NAME_MAX) {
+    host.log("info", "hello command rejected");
+    return "That name is too long for this example.";
+  }
+  const who = raw || "world";
+  // The greeting the person asked for may include the name.  The log must not.
+  host.log("info", "hello command");
   return `Hello, ${who}, from your plugin.`;
 }

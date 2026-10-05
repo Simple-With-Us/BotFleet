@@ -203,7 +203,6 @@ import {
   EVENTS_DIR,
   ITEM_IO_DIR,
   NATIVE_DIR,
-  type AppConfig,
 } from "./config.ts";
 import {
   appendBounded,
@@ -445,6 +444,7 @@ import { readHostLoad } from "./drivers/acp/init-deadline.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
+import { isSecretConfigKey, redactPluginConfig } from "./plugin-loader.ts";
 import * as pluginsModule from "./plugins.ts";
 import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
@@ -857,10 +857,16 @@ pluginsModule.initPluginRuntime({
     status: bot.busy === true ? "running" : bot.busy === false ? "stopped" : "unknown",
     driver: bot.modelSelection?.instanceId ?? "unknown",
   })),
-  listConfigKeys: () => Object.keys(cfg).filter((key) => !/key|token|secret|credential/i.test(key)),
-  // SAFETY: `cfg` is the resolved AppConfig snapshot (string-keyed), so a
-  // string-keyed read is sound; the caller names `T` and accepts the cast.
-  readConfig: <T = unknown>(key: string): T | undefined => (cfg as Record<string, AppConfig[keyof AppConfig]>)[key] as T | undefined,
+  listConfigKeys: () => Object.keys(cfg).filter((key) => !isSecretConfigKey(key)),
+  // Refuse secret-looking keys, then return a redacted copy.  The live
+  // AppConfig object must not cross into plugin code, and a section name
+  // that does not itself look like a secret can still hold a key field.
+  readConfig: <T = unknown>(key: string): T | undefined => {
+    if (isSecretConfigKey(key)) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
+    // SAFETY: `key` was confirmed as an own property of the resolved AppConfig.  redactPluginConfig copies the value and drops secret-looking fields; the caller names T.
+    return redactPluginConfig(cfg[key as keyof typeof cfg]) as T | undefined;
+  },
   logger: (level, name, message) => {
     const tag = `[plugin:${name}]`;
     if (level === "error") console.error(tag, message);
@@ -14940,18 +14946,25 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // the UI can render one row per problem.
     // `readBody` returns `any`, so this guard narrows unparsed JSON input to
     // a real string without relying on `typeof`.
-    function isString(value: string | number | boolean | null | undefined): value is string {
+    function isString(value: unknown): value is string {
       return Object.prototype.toString.call(value) === "[object String]";
+    }
+    function isJsonRecord(value: unknown): value is Record<string, unknown> {
+      if (value === null || Array.isArray(value)) return false;
+      return Object.prototype.toString.call(value) === "[object Object]";
     }
     if (method === "GET" && path === "/api/plugins") {
       return json(res, 200, { plugins: pluginsModule.listPlugins() });
     }
     if (method === "POST" && path === "/api/plugins/install") {
-      const body = await readBody(req);
+      const body: unknown = await readBody(req);
+      if (!isJsonRecord(body)) return json(res, 400, { error: "source is required" });
       const source = isString(body.source) ? body.source : "";
       if (!source.trim()) return json(res, 400, { error: "source is required" });
       const result = await pluginsModule.installPlugin(source);
-      if ("error" in result) return json(res, 400, { error: result.error });
+      if ("error" in result) {
+        return json(res, 400, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
       return json(res, 200, result);
     }
     m = path.match(/^\/api\/plugins\/([\w][\w-]*)$/);
@@ -14968,7 +14981,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const pluginAction = method === "POST" ? pluginsModule.matchPluginActionRoute(path) : null;
     if (pluginAction) {
       const { name, action } = pluginAction;
-      let result: PluginListing | { error: string } | { removed: true };
+      let result: PluginListing | { error: string; issues?: Array<{ field: string; message: string }> } | { removed: true };
       if (action === "enable") result = await pluginsModule.enablePlugin(name);
       else if (action === "disable") result = await pluginsModule.disablePlugin(name);
       else if (action === "update") result = await pluginsModule.updatePlugin(name);
@@ -14977,7 +14990,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // is not installed), 400 for everything else (bad request shape,
       // host-version mismatch, etc.).  Mirrors the GET delete pattern.
       const status = "error" in result && result.error.startsWith("no plugin named") ? 404 : 400;
-      if ("error" in result) return json(res, status, { error: result.error });
+      if ("error" in result) {
+        return json(res, status, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
+      }
       return json(res, 200, result);
     }
     const cardMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/);
@@ -14988,7 +15003,8 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     const cmdMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/);
     if (cmdMatch && method === "POST") {
-      const body = await readBody(req);
+      const body: unknown = await readBody(req);
+      if (!isJsonRecord(body)) return json(res, 400, { error: "expected a JSON object" });
       const args = isString(body.args) ? body.args : "";
       const result = await pluginsModule.runPluginCommand(cmdMatch[1]!, cmdMatch[2]!, args);
       if ("error" in result) return json(res, 409, { error: result.error });

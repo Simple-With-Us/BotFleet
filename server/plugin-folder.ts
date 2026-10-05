@@ -97,6 +97,12 @@ export function readPluginFolder(
       continue;
     }
 
+    // Stop before reading another file.  Checking only after the loop
+    // would pull every matching file into memory first.
+    if (files.length >= MAX_FILES) {
+      return { error: `that folder has more than ${MAX_FILES} plugin files — the import cap is ${MAX_FILES}` };
+    }
+
     const filePath = join(dir, entry.name);
     let size: number;
     try {
@@ -111,10 +117,6 @@ export function readPluginFolder(
     } catch {
       return { error: `${entry.name} could not be read` };
     }
-  }
-
-  if (files.length > MAX_FILES) {
-    return { error: `that folder has ${files.length} plugin files — the import cap is ${MAX_FILES}` };
   }
 
   return {

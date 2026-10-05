@@ -75,24 +75,21 @@ const CONTENT_ENTRY = z.object({
   name: z.string(),
   path: z.string(),
   download_url: z.string().nullable().optional(),
-});
+}).strip();
 type ContentEntry = z.infer<typeof CONTENT_ENTRY>;
 
-const CONTENT_LISTING = z.array(z.unknown()).catch([]);
-
-function asEntries(listing: z.infer<typeof CONTENT_LISTING>): ContentEntry[] {
-  return listing.flatMap((item) => {
-    const entry = CONTENT_ENTRY.safeParse(item);
-    return entry.success ? [entry.data] : [];
-  });
-}
+const CONTENT_LISTING = z.array(CONTENT_ENTRY);
 
 async function fetchListing(url: string, fetcher: typeof fetch): Promise<ContentEntry[]> {
   const response = await fetcher(url, {
     headers: { accept: "application/vnd.github+json", "user-agent": "BotFleet-plugins" },
   });
   if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
-  return asEntries(CONTENT_LISTING.parse(await response.json()));
+  const parsed = CONTENT_LISTING.safeParse(await response.json());
+  if (!parsed.success) {
+    throw new Error(`GitHub listing for ${url} did not match the contents schema`);
+  }
+  return parsed.data;
 }
 
 async function fetchText(url: string, fetcher: typeof fetch): Promise<string> {

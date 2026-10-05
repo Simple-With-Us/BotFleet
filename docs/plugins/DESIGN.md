@@ -172,7 +172,7 @@ state across plugins.
       "updatedAt": "2026-10-04T12:00:00.000Z",
       "source": {
         "kind": "folder",           // "folder" | "git"
-        "path": "/Users/jay/code/fleet-overview-plugin",
+        "path": "/path/to/fleet-overview-plugin",
         "ref": null
       },
       "warnings": []                // reserved for the future scan pass
@@ -244,7 +244,7 @@ ships only reads.  Writes come later, behind a more careful trust gate.
 
 `HOST_API_VERSION = 1`.  The manifest's `botfleet` constraint is checked
 against it on load.  A plugin whose manifest says `"botfleet": ">=2"`
-loads with a `hostMismatch` warning and is not enabled.
+is refused at load time and is not enabled.
 
 ## Contribution Points
 

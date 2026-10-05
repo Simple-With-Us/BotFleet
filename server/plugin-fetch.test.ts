@@ -86,13 +86,32 @@ describe("fetchPluginFromGit", () => {
     });
     await expect(() => fetchPluginFromGit(source, fetcher)).rejects.toThrow(/botfleet-plugin\.json/);
   });
+
+  it("rejects a listing that is not an array of content entries", async () => {
+    const source: GitPluginSource = {
+      kind: "git",
+      url: "github.com/acme/widget",
+      ref: null,
+      owner: "acme",
+      repo: "widget",
+      path: "",
+    };
+    const fetcher = makeFakeFetcher({
+      "https://api.github.com/repos/acme/widget/contents/": { kind: "json", value: { message: "not a listing" } },
+    });
+    await expect(() => fetchPluginFromGit(source, fetcher)).rejects.toThrow(/contents schema/);
+  });
 });
 
+function fetchInputUrl(input: Parameters<typeof fetch>[0]): string {
+  if (input instanceof URL) return input.toString();
+  if (input instanceof Request) return input.url;
+  return input;
+}
+
 function makeFakeFetcher(responses: FakeResponseMap): typeof fetch {
-  // SAFETY: the cast downcasts the inner async closure to `typeof fetch` because the wrapper has the same call signature, but the inner function takes only the inputs the global fetch accepts.  Plugin authors do not see this type — it lives behind this single test helper.
-  return (async (input: string | URL) => {
-    // oxlint-disable-next-line anti-slop/no-runtime-typeof
-    const url = typeof input === "string" ? input : input.toString();
+  const fetcher: typeof fetch = async (input) => {
+    const url = fetchInputUrl(input);
     const response = responses[url];
     if (!response) {
       return new Response("not found", { status: 404 });
@@ -101,5 +120,6 @@ function makeFakeFetcher(responses: FakeResponseMap): typeof fetch {
       return new Response(response.value, { status: 200, headers: { "content-type": "text/plain" } });
     }
     return new Response(JSON.stringify(response.value), { status: 200, headers: { "content-type": "application/json" } });
-  }) as typeof fetch;
+  };
+  return fetcher;
 }

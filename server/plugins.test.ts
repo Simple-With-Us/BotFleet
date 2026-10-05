@@ -220,7 +220,7 @@ describe("host API version gate", () => {
       }),
     );
     const result = await enablePlugin("fleet-overview", baseDir);
-    expect("error" in result).toBeTruthy();
+    if (!("error" in result)) throw new Error("expected enable to fail");
     expect(result.error).toMatch(/requires botfleet ">=2" but the host API is \d/);
     // The plugin must remain disabled after the refused enable.
     const after = readRegistry(baseDir).plugins["fleet-overview"];
@@ -284,7 +284,7 @@ describe("installFromFetched entry validation", () => {
         }),
       );
       const result = await installPlugin(sourceDir, baseDir);
-      expect("error" in result).toBeTruthy();
+      if (!("error" in result)) throw new Error("expected install to fail");
       expect(result.error).toMatch(/^entry: "phantom\.mjs" is not one of the installed plugin files$/);
       // The registry must not have been mutated.
       expect(readRegistry(baseDir).plugins["missing-entry"]).toBe(undefined);
@@ -311,11 +311,112 @@ describe("installFromFetched entry validation", () => {
       );
       writeFileSync(join(sourceDir, "plugin.mjs"), "export default {};\n");
       const result = await installPlugin(sourceDir, baseDir);
-      expect(!("error" in result)).toBeTruthy();
+      if ("error" in result) throw new Error(result.error);
       expect(result.name).toBe("present-entry");
       expect(result.entry).toBe("plugin.mjs");
     } finally {
       rmSync(sourceDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("install failures the UI can render", () => {
+  it("returns one issue per manifest field instead of only a flattened error", async () => {
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-bad-manifest-"));
+    try {
+      writeFileSync(join(sourceDir, "botfleet-plugin.json"), JSON.stringify({
+        name: "bad-version",
+        version: "1.0",
+        description: "not semver",
+        botfleet: ">=1",
+        entry: "plugin.mjs",
+      }));
+      writeFileSync(join(sourceDir, "plugin.mjs"), "export {}\n");
+      const result = await installPlugin(sourceDir, baseDir);
+      if (!("error" in result)) throw new Error("expected install to fail");
+      expect(result.error).toBe("invalid manifest");
+      expect(result.issues?.some((issue) => issue.field === "version")).toBe(true);
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a tilde path as a folder on this computer", async () => {
+    const result = await installPlugin("~/no-such-botfleet-plugin-dir", baseDir);
+    if (!("error" in result)) throw new Error("expected install to fail");
+    expect(result.error).not.toMatch(/full path/);
+    expect(result.error).toMatch(/could not be read/);
+  });
+
+  it("records a git subdirectory and updates from that folder", async () => {
+    const manifest = JSON.stringify({
+      name: "sub-plugin",
+      version: "1.0.0",
+      description: "nested",
+      botfleet: ">=1",
+      entry: "plugin.mjs",
+    });
+    const calls: string[] = [];
+    const fetcher: typeof fetch = async (input) => {
+      const url = input instanceof Request ? input.url : input instanceof URL ? input.toString() : String(input);
+      calls.push(url);
+      if (url.includes("/contents/plugins/foo")) {
+        return Response.json([
+          { type: "file", name: "botfleet-plugin.json", path: "botfleet-plugin.json", download_url: "https://example/manifest", sha: "abc" },
+          { type: "file", name: "plugin.mjs", path: "plugin.mjs", download_url: "https://example/plugin", sha: "def" },
+        ]);
+      }
+      if (url === "https://example/manifest") return new Response(manifest);
+      if (url === "https://example/plugin") return new Response("export {}\n");
+      return new Response("missing", { status: 404 });
+    };
+    const installed = await installPlugin("https://github.com/acme/widget/tree/main/plugins/foo", baseDir, fetcher);
+    if ("error" in installed) throw new Error(installed.error);
+    expect(installed.source).toEqual({
+      kind: "git",
+      url: "github.com/acme/widget",
+      ref: "main",
+      path: "plugins/foo",
+    });
+    calls.length = 0;
+    const updated = await updatePlugin("sub-plugin", baseDir, fetcher);
+    if ("error" in updated) throw new Error(updated.error);
+    expect(calls.some((url) => url.includes("/contents/plugins/foo"))).toBe(true);
+  });
+
+  it("refuses an update whose entry file is not in the fetched tree", async () => {
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-update-entry-"));
+    try {
+      for (const name of readdirSync(FIXTURE)) {
+        copyFileSync(join(FIXTURE, name), join(sourceDir, name));
+      }
+      await installPlugin(sourceDir, baseDir);
+      writeFileSync(join(sourceDir, "botfleet-plugin.json"), JSON.stringify({
+        name: "fleet-overview",
+        version: "1.2.0",
+        description: "missing entry",
+        botfleet: ">=1",
+        entry: "phantom.mjs",
+      }));
+      const updated = await updatePlugin("fleet-overview", baseDir);
+      if (!("error" in updated)) throw new Error("expected update to fail");
+      expect(updated.error).toMatch(/phantom\.mjs/);
+      const listing = getPlugin("fleet-overview", baseDir);
+      if ("error" in listing) throw new Error(listing.error);
+      expect(listing.version).toBe("1.0.0");
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a command when the manifest host version no longer matches", async () => {
+    await installPlugin(FIXTURE, baseDir);
+    await enablePlugin("fleet-overview", baseDir);
+    const manifestPath = join(baseDir, "fleet-overview", "botfleet-plugin.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as PluginManifest;
+    writeFileSync(manifestPath, JSON.stringify({ ...manifest, botfleet: ">=2" }));
+    const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
+    if (!("error" in result)) throw new Error("expected the command to fail");
+    expect(result.error).toMatch(/requires botfleet ">=2"/);
   });
 });

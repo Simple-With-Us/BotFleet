@@ -3,8 +3,9 @@
 //
 // Each method is idempotent and returns the same PluginListing shape so
 // the UI can render the result without a second fetch.  Errors are
-// objects with a single `error` field — never thrown across the API
-// boundary because that policy is meaningless at HTTP edges and slow
+// objects with an `error` string.  Manifest failures also carry `issues`
+// so the UI can render one row per field.  Nothing is thrown across the
+// API boundary because that policy is meaningless at HTTP edges and slow
 // elsewhere.
 //
 // The in-memory cache of loaded plugins is one module-level Map.  It
@@ -17,12 +18,14 @@
 // touch the host's user data.
 
 import { rmSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 
 import {
   HOST_API_VERSION,
   parsePluginManifestJson,
   satisfiesBotfleetVersion,
+  type PluginManifestIssue,
 } from "../shared/plugin-manifest.ts";
 
 import {
@@ -95,6 +98,32 @@ function inputsOrThrow(): PluginHostInputs {
   };
 }
 
+/** Manifest and other lifecycle failures.  `issues` is set only when
+ *  zod rejected the manifest, one row per field. */
+export interface PluginError {
+  error: string;
+  issues?: PluginManifestIssue[];
+}
+
+function missingEntryFile(
+  entry: string,
+  files: Array<{ path: string }>,
+): PluginError | null {
+  if (files.some((file) => file.path === entry)) return null;
+  return { error: `entry: "${entry}" is not one of the installed plugin files` };
+}
+
+/** Expand a leading ~ to this computer's home directory.  `~user` is not
+ *  expanded; only `~` and `~/...` are folder installs. */
+function folderInputPath(trimmed: string): string | null {
+  if (trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    const rest = trimmed === "~" ? "" : trimmed.slice(2);
+    return rest ? join(homedir(), rest) : homedir();
+  }
+  if (isAbsolute(trimmed)) return trimmed;
+  return null;
+}
+
 /** Validate a fetched plugin and write its tree to disk.  Returns the
  *  parsed manifest so the caller can read fields like `name` and
  *  `version` before recording the registry entry. */
@@ -106,12 +135,10 @@ async function installFromFetched(
   },
   pluginSource: PluginSource,
   baseDir: string,
-): Promise<{ entry: PluginRegistryEntry } | { error: string }> {
+): Promise<{ entry: PluginRegistryEntry } | PluginError> {
   const parsed = parsePluginManifestJson(fetched.manifestText);
   if (!parsed.ok) {
-    return {
-      error: `manifest validation failed: ${parsed.issues.map((i) => `${i.field}: ${i.message}`).join("; ")}`,
-    };
+    return { error: "invalid manifest", issues: parsed.issues };
   }
 
   const manifest = parsed.manifest;
@@ -121,12 +148,8 @@ async function installFromFetched(
   // only top-level files in the tree would install cleanly and then fail
   // at enable with "failed to load".  v1 keeps installs top-level-only,
   // so verify the entry is one of the files we are about to write.
-  const entryFiles = fetched.files.filter((file) => file.path === manifest.entry);
-  if (entryFiles.length === 0) {
-    return {
-      error: `entry: "${manifest.entry}" is not one of the installed plugin files`,
-    };
-  }
+  const missing = missingEntryFile(manifest.entry, fetched.files);
+  if (missing) return missing;
 
   const registry = readRegistry(baseDir);
   if (registry.plugins[manifest.name]) {
@@ -161,20 +184,20 @@ function listingOrError(name: string, baseDir: string): PluginListing | { error:
 export async function installPlugin(
   sourceInput: string,
   baseDir: string = PLUGINS_DIR,
-): Promise<PluginListing | { error: string }> {
+  fetcher: typeof fetch = fetch,
+): Promise<PluginListing | PluginError> {
   const trimmed = sourceInput.trim();
   if (!trimmed) return { error: "paste a folder path or a GitHub URL" };
 
-  if (trimmed.startsWith("/") || trimmed.startsWith("~")) {
-    return installFromFolder(trimmed, baseDir);
-  }
+  const folder = folderInputPath(trimmed);
+  if (folder) return installFromFolder(folder, baseDir);
 
   const parsed = parseGitPluginSource(trimmed);
   if (!parsed.ok) return { error: parsed.error };
 
   let fetched;
   try {
-    fetched = await fetchPluginFromGit(parsed.source);
+    fetched = await fetchPluginFromGit(parsed.source, fetcher);
   } catch (error) {
     // SAFETY: fetchPluginFromGit throws plain `Error` instances; the catch clause here only sees that shape.
     const detail = (error as Error).message;
@@ -185,6 +208,7 @@ export async function installPlugin(
     kind: "git",
     url: parsed.source.url,
     ref: parsed.source.ref,
+    path: parsed.source.path,
   };
   const result = await installFromFetched(fetched.source, fetched, pluginSource, baseDir);
   if ("error" in result) return result;
@@ -194,7 +218,7 @@ export async function installPlugin(
 async function installFromFolder(
   folder: string,
   baseDir: string,
-): Promise<PluginListing | { error: string }> {
+): Promise<PluginListing | PluginError> {
   const read = readPluginFolder(folder);
   if ("error" in read) return { error: read.error };
   const pluginSource: PluginSource = { kind: "folder", path: folder };
@@ -254,7 +278,8 @@ export async function disablePlugin(
 export async function updatePlugin(
   name: string,
   baseDir: string = PLUGINS_DIR,
-): Promise<PluginListing | { error: string }> {
+  fetcher: typeof fetch = fetch,
+): Promise<PluginListing | PluginError> {
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
   if (!entry) return { error: `no plugin named "${name}"` };
@@ -271,8 +296,9 @@ export async function updatePlugin(
       const source = {
         ...parsed.source,
         ref: entry.source.ref ?? parsed.source.ref,
+        path: entry.source.path || parsed.source.path,
       };
-      fetched = await fetchPluginFromGit(source);
+      fetched = await fetchPluginFromGit(source, fetcher);
     }
   } catch (error) {
     // SAFETY: the read/fetch paths only throw `Error` instances; the catch here sees that shape.
@@ -282,11 +308,20 @@ export async function updatePlugin(
 
   const parsed = parsePluginManifestJson(fetched.manifestText);
   if (!parsed.ok) {
-    return { error: `updated manifest is invalid: ${parsed.issues.map((i) => `${i.field}: ${i.message}`).join("; ")}` };
+    return { error: "invalid manifest", issues: parsed.issues };
   }
 
   if (parsed.manifest.name !== name) {
     return { error: `updated manifest claims a different name "${parsed.manifest.name}"` };
+  }
+
+  const missing = missingEntryFile(parsed.manifest.entry, fetched.files);
+  if (missing) return missing;
+
+  if (entry.enabled && !satisfiesBotfleetVersion(parsed.manifest.botfleet, HOST_API_VERSION)) {
+    return {
+      error: `plugin "${name}" requires botfleet "${parsed.manifest.botfleet}" but the host API is ${HOST_API_VERSION}`,
+    };
   }
 
   writePluginTree(name, {
@@ -359,6 +394,13 @@ export function getPlugin(name: string, baseDir: string = PLUGINS_DIR): PluginLi
   return listingFor(name, baseDir);
 }
 
+function hostVersionError(listing: PluginListing): PluginError | null {
+  if (satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) return null;
+  return {
+    error: `plugin "${listing.name}" requires botfleet "${listing.botfleet}" but the host API is ${HOST_API_VERSION}`,
+  };
+}
+
 /** Run a plugin's slash command. */
 export async function runPluginCommand(
   name: string,
@@ -370,6 +412,11 @@ export async function runPluginCommand(
   if ("error" in listing) return listing;
   const registry = readRegistry(baseDir);
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
+  const mismatch = hostVersionError(listing);
+  if (mismatch) {
+    loaded.delete(name);
+    return mismatch;
+  }
 
   let plugin = loaded.get(name);
   if (!plugin) {
@@ -399,6 +446,11 @@ export async function getPluginCardData(
   if ("error" in listing) return listing;
   const registry = readRegistry(baseDir);
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
+  const mismatch = hostVersionError(listing);
+  if (mismatch) {
+    loaded.delete(name);
+    return mismatch;
+  }
 
   let plugin = loaded.get(name);
   if (!plugin) {

@@ -213,6 +213,9 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
       }
       setInstallSource("");
       await refresh();
+    } catch (error) {
+      setInstallError(errorMessage(asObject(error)));
+      setInstallIssues([]);
     } finally {
       setInstalling(false);
     }
@@ -263,7 +266,7 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
         <div>
           <h1 className="text-[20px] font-semibold">Plugins</h1>
           <p className="text-[13px] text-ink-secondary">
-            Drop-in extensions you can install, enable, and remove without a BotFleet update.{" "}
+            Drop-in extensions you can install, enable, and remove without a BotFleet update.{"\u00a0 "}
             Imports land disabled until you enable them.
           </p>
         </div>
@@ -281,14 +284,15 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
       <section className="rounded-lg border border-border bg-panel p-4">
         <h2 className="mb-2 text-[14px] font-medium">Install Plugin</h2>
         <p className="mb-3 text-[12px] text-ink-secondary">
-          Paste a folder path on this Mac, a GitHub repository (<code className="rounded bg-raised px-1">owner/repo</code>),
-          or a full URL. The plugin is downloaded and validated against the manifest schema before anything is written.
+          Paste a folder path on this computer, a GitHub repository (<code className="rounded bg-raised px-1">owner/repo</code>),
+          or a full URL.{"\u00a0 "}
+          The plugin is downloaded and validated against the manifest schema before anything is written.
         </p>
         <div className="flex flex-col gap-2 sm:flex-row">
           <input
             type="text"
             value={installSource}
-            placeholder="/Users/me/code/my-plugin or acme/widget"
+            placeholder="…/my-plugin or acme/widget"
             onChange={(event) => setInstallSource(event.target.value)}
             disabled={installing}
             className="flex-1 rounded-md border border-border bg-raised px-3 py-2 text-[13px] focus:border-accent focus:outline-none"
@@ -343,7 +347,8 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
           </div>
         ) : plugins.length === 0 ? (
           <div className="px-4 py-6 text-[13px] text-ink-secondary">
-            No plugins installed yet.  Install one above to get started.
+            No plugins installed yet.{"\u00a0 "}
+            Install one above to get started.
           </div>
         ) : (
           <ul className="divide-y divide-border">
@@ -366,7 +371,12 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
       <ConfirmDialog
         open={Boolean(confirmRemove)}
         title={`Remove ${confirmRemove?.name ?? ""}?`}
-        body="This deletes the plugin's installed files and removes its registry entry.  Installs can be redone later."
+        body={
+          <>
+            This deletes the plugin's installed files and removes its registry entry.{"\u00a0 "}
+            Installs can be redone later.
+          </>
+        }
         confirmLabel="Remove"
         destructive
         onConfirm={() => {
