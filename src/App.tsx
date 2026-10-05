@@ -124,7 +124,7 @@ function Shell() {
     const b = state.bots.find((x) => x.id === botId);
     const threadId = threadIdForApp(b, appId);
     dispatch({ type: "select", id: botId, viewedThreadId: threadId });
-    if (threadId && threadId !== b?.threadId) {
+    if (threadId && threadId !== b?.threadId && !b?.busy) {
       dispatch({ type: "switchTask", botId, threadId });
     }
   }, [state.bots, dispatch]);

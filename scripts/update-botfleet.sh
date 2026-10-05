@@ -174,7 +174,7 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
       # ask", not "out of date": only a runtime we could authenticate against
       # and that answered with a different commit turns the shortcut off.
       if [[ "$IS_UP_TO_DATE" == "1" ]]; then
-        OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/owner.json"
+        OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
         if [[ -f "$OWNER_FILE" ]]; then
           # The owner file holds a bearer secret.  Read it and perform the
           # authenticated GET inside one Node process so the secret never
@@ -214,7 +214,7 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
               res.on("end", () => {
                 if (res.statusCode !== 200) process.exit(1);
                 let commit;
-                try { commit = JSON.parse(body).build.sourceCommit; } catch { process.exit(1); }
+                try { commit = JSON.parse(body).sourceCommit; } catch { process.exit(1); }
                 if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) process.exit(1);
                 process.stdout.write(commit);
                 process.exit(0);

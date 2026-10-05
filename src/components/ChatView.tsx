@@ -1208,8 +1208,12 @@ export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; exp
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
-  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
