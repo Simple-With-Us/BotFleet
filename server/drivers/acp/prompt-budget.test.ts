@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTurnContext, TURN_REPLY_CUE } from "../../turn-context.ts";
+import { buildTurnContext, ROOM_REPLY_PREFIX, TURN_REPLY_CUE } from "../../turn-context.ts";
 import {
   ACP_PROMPT_SECTION_OMITTED,
   applyAcpPromptBudget,
@@ -205,6 +205,53 @@ describe("applyAcpPromptBudget", () => {
     expect(result.text).not.toContain("ancient");
     expect(result.text).toContain(ACP_PROMPT_SECTION_OMITTED);
     expect(result.text.endsWith(current)).toBe(true);
+  });
+
+  it("uses the last inline reply cue so payload text cannot become trimmable history", () => {
+    const listed = sections();
+    const system = listed.map((section) => section.text).join("");
+    const userText = [
+      "User: earlier turn",
+      `User: quoted ${TURN_REPLY_CUE} inside the message`,
+      "",
+      TURN_REPLY_CUE,
+      "",
+      "final question",
+    ].join("\n");
+    const composed = compose(system, userText);
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: bytes(composed) - bytes("User: earlier turn\n"),
+    });
+    expect(result.trimmed).toBe(true);
+    expect(result.text).toContain(`quoted ${TURN_REPLY_CUE} inside`);
+    expect(result.text.endsWith("final question")).toBe(true);
+    expect(result.text).toContain(TURN_REPLY_CUE);
+  });
+
+  it("trims the oldest room context line before volatile sections", () => {
+    const listed: AcpPromptSection[] = [{ id: "persona", text: stable, volatile: false }];
+    const oldLine = `Jay: ${"ancient ".repeat(300)}`;
+    const recentLine = "Bot: recent";
+    const userText = `${oldLine}\n${recentLine}\n\n${ROOM_REPLY_PREFIX}Scout.)`;
+    const composed = compose(stable, userText);
+    const target = compose(
+      stable,
+      `${ACP_PROMPT_SECTION_OMITTED}\n${recentLine}\n\n${ROOM_REPLY_PREFIX}Scout.)`,
+    );
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: bytes(target),
+    });
+    expect(result.text).toBe(target);
+    expect(result.trimmed).toBe(true);
+    expect(result.text).not.toContain("ancient");
+    expect(result.text).toContain("recent");
+    expect(result.text).toContain(`${ROOM_REPLY_PREFIX}Scout.)`);
   });
 });
 

@@ -11,7 +11,9 @@
 // later mentions note).  Those are the parts that legitimately change
 // between turns.  The stable system block and the current user message
 // stay, even when they alone are already over the budget.
-import { TURN_REPLY_CUE } from "../../turn-context.ts";
+import { z } from "zod";
+
+import { ROOM_REPLY_PREFIX, TURN_REPLY_CUE } from "../../turn-context.ts";
 
 /** UTF-8 ceiling used when an instance does not set one.  128 KiB is the
  *  same order as the inline-replay cap: a normal system prompt (tens of
@@ -25,6 +27,11 @@ export const MAX_ACP_PROMPT_BUDGET_BYTES = 8 * 1024 * 1024;
 
 /** One line, substituted for each section the budget drops. */
 export const ACP_PROMPT_SECTION_OMITTED = "[Earlier section omitted to fit the prompt budget]";
+
+const promptBudgetBytesSchema = z.union([
+  z.literal(0),
+  z.number().int().min(1).max(MAX_ACP_PROMPT_BUDGET_BYTES),
+]);
 
 export interface AcpPromptSection {
   id: string;
@@ -51,10 +58,8 @@ export interface AcpPromptBudgetResult {
 /** `0` disables the budget.  A positive integer up to the max is a ceiling.
  *  Anything else is ignored so the caller keeps the default. */
 export function decodeAcpPromptBudgetBytes(raw: unknown): number | undefined {
-  if (raw === 0) return 0;
-  if (typeof raw !== "number" || !Number.isFinite(raw) || !Number.isInteger(raw)) return undefined;
-  if (raw < 1 || raw > MAX_ACP_PROMPT_BUDGET_BYTES) return undefined;
-  return raw;
+  const parsed = promptBudgetBytesSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
 }
 
 /** `undefined` is the default ceiling.  `0` is off. */
@@ -115,18 +120,38 @@ function peelSystem(composed: string, userText: string): string | null {
   return composed.slice(0, composed.length - suffix.length);
 }
 
-/** Prior turns inside a replayed user message.  Without the reply cue the
- *  whole user text is the current message and is not split. */
-function splitHistory(userText: string): { history: Piece[]; current: string } {
-  const at = userText.indexOf(TURN_REPLY_CUE);
-  if (at < 0) return { history: [], current: userText };
-  const region = userText.slice(0, at);
-  if (!/(?:^|\n)(?:User|Assistant): /.test(region)) return { history: [], current: userText };
+const INLINE_REPLAY_LINE = /(?:^|\n)(?:User|Assistant): /;
+const ROOM_CONTEXT_LINE = /(?:^|\n)[^:\n]+: /;
+const ROOM_REPLY_BOUNDARY = `\n\n${ROOM_REPLY_PREFIX}`;
+
+function splitInlineReplay(userText: string): { history: Piece[]; current: string } | null {
+  const cueAt = userText.lastIndexOf(TURN_REPLY_CUE);
+  if (cueAt < 0) return null;
+  const region = userText.slice(0, cueAt);
+  if (!INLINE_REPLAY_LINE.test(region)) return null;
   const parts = region.split(/\n(?=(?:User|Assistant): )/);
   return {
     history: parts.map((text) => ({ kind: "history" as const, text })),
-    current: userText.slice(at),
+    current: userText.slice(cueAt),
   };
+}
+
+function splitRoomReplay(userText: string): { history: Piece[]; current: string } | null {
+  const boundaryAt = userText.lastIndexOf(ROOM_REPLY_BOUNDARY);
+  if (boundaryAt < 0) return null;
+  const region = userText.slice(0, boundaryAt);
+  if (!ROOM_CONTEXT_LINE.test(region)) return null;
+  const lines = region.split("\n").filter((line) => line.length > 0);
+  return {
+    history: lines.map((text) => ({ kind: "history" as const, text })),
+    current: userText.slice(boundaryAt),
+  };
+}
+
+/** Prior turns inside a replayed user message.  Without a harness boundary
+ *  the whole user text is the current message and is not split. */
+function splitHistory(userText: string): { history: Piece[]; current: string } {
+  return splitInlineReplay(userText) ?? splitRoomReplay(userText) ?? { history: [], current: userText };
 }
 
 function systemPieces(systemText: string, sections: readonly AcpPromptSection[] | undefined): Piece[] {
@@ -182,9 +207,16 @@ export function applyAcpPromptBudget(input: {
 
   const size = () => utf8(render(nextSystem, nextHistory, current));
   while (size() > budget) {
-    const historyIndex = nextHistory.findIndex((piece) => shrinks(piece.text));
+    const historyIndex = nextHistory.findIndex(
+      (piece) => piece.text.length > 0 && !piece.text.includes(ACP_PROMPT_SECTION_OMITTED),
+    );
     if (historyIndex >= 0) {
-      nextHistory[historyIndex] = { kind: "history", text: omittedReplacement(nextHistory[historyIndex].text) };
+      const piece = nextHistory[historyIndex]!;
+      if (shrinks(piece.text)) {
+        nextHistory[historyIndex] = { kind: "history", text: omittedReplacement(piece.text) };
+      } else {
+        nextHistory.splice(historyIndex, 1);
+      }
       trimmed = true;
       continue;
     }

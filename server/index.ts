@@ -377,7 +377,7 @@ import {
 import { summarizeForVoice } from "./tts/speech-summary.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { fitListToBudget, serializedPreview } from "./serialized-preview.ts";
-import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { boundNativeTranscript, boundRoomContextLines, buildTurnContext, engineIsFresh, ROOM_REPLY_PREFIX } from "./turn-context.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import {
   ensureWorkspace,
@@ -7363,7 +7363,7 @@ async function runGroupMemberTurn(
     .filter(Boolean)
     .join("\n");
 
-  const text = `${serializeRoomContext(threadId, userName, !cardContinuation)}\n\n(Reply to the conversation above as ${bot.name}.)${
+  const text = `${serializeRoomContext(threadId, userName, !cardContinuation)}\n\n${ROOM_REPLY_PREFIX}${bot.name}.)${
     cardContinuation ? `\n\n${cardContinuation}` : ""
   }`;
 

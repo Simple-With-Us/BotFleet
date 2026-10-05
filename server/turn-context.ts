@@ -49,6 +49,11 @@ const FRESH_PREAMBLE =
  *  user message and will not trim it. */
 export const TURN_REPLY_CUE = "[Now reply to the user's latest message:]";
 
+/** Harness boundary between replayed room lines and the member reply
+ *  instruction (see `runGroupMemberTurn` in index.ts).  The bot name
+ *  follows this prefix on the same line. */
+export const ROOM_REPLY_PREFIX = "(Reply to the conversation above as ";
+
 const MAX_REPLAY_BYTES = 128 * 1024;
 const OMITTED_HISTORY = "[Earlier conversation omitted for length]";
 
