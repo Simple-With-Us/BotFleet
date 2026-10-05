@@ -5659,6 +5659,7 @@ async function startTurn(
         system: prompt.text,
         systemStable: prompt.stable,
         systemVolatile: prompt.volatile,
+        systemSections: prompt.sections.map(({ id, text, volatile }) => ({ id, text, volatile })),
         volatileDigest: prompt.volatileDigest,
         // the mentions section describes this turn: identical consecutive
         // tags must still deliver their note (SendTurnInput.mentionTurn)
@@ -7706,6 +7707,7 @@ async function runGroupMemberTurn(
         system: roomSystem.text,
         systemStable: roomSystem.stable,
         systemVolatile: roomSystem.volatile,
+        systemSections: roomSystem.sections.map(({ id, text, volatile }) => ({ id, text, volatile })),
         volatileDigest: roomSystem.volatileDigest,
         cwd,
         integrations,

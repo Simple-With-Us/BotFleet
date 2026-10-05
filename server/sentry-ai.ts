@@ -617,6 +617,35 @@ function failureTags(
   return tags;
 }
 
+/** Stamp the ACP prompt budget onto the open `gen_ai.invoke_agent` span.
+ *  `before` is the composed prompt, `after` is what was sent, and `trimmed`
+ *  is whether a volatile or history section was replaced.  No-op when the
+ *  span was never opened.  Never throws: a telemetry failure must not fail
+ *  the turn. */
+export function annotatePromptBudget(
+  threadId: string,
+  turnId: string | undefined,
+  stats: {
+    before: { stable: number; volatile: number };
+    after: { stable: number; volatile: number };
+    trimmed: boolean;
+  },
+): void {
+  try {
+    const turn = turns.get(turnKey(threadId, turnId));
+    if (!turn) return;
+    const finite = (value: number) => (Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0);
+    turn.span.setAttribute("botfleet.prompt.stable_bytes_before", finite(stats.before.stable));
+    turn.span.setAttribute("botfleet.prompt.volatile_bytes_before", finite(stats.before.volatile));
+    turn.span.setAttribute("botfleet.prompt.stable_bytes_after", finite(stats.after.stable));
+    turn.span.setAttribute("botfleet.prompt.volatile_bytes_after", finite(stats.after.volatile));
+    turn.span.setAttribute("botfleet.prompt.trimmed", stats.trimmed);
+  } catch {
+    // The span is diagnostic.  A throw here would discard the turn the
+    // budget was only trying to measure.
+  }
+}
+
 /** Map a harness runtime event onto gen_ai spans.  No-op without a sink. */
 export function observeRuntimeEvent(event: RuntimeEvent, sink: SentryAiSink | null = liveSink()): void {
   if (!sink) return;

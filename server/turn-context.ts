@@ -44,6 +44,11 @@ const REWOUND_PREAMBLE =
 const FRESH_PREAMBLE =
   "[You are joining this conversation mid-thread (the user switched this bot over to you). The conversation so far:]";
 
+/** The line between replayed history and the message the person just sent.
+ *  The ACP prompt budget treats everything after this cue as the current
+ *  user message and will not trim it. */
+export const TURN_REPLY_CUE = "[Now reply to the user's latest message:]";
+
 const MAX_REPLAY_BYTES = 128 * 1024;
 const OMITTED_HISTORY = "[Earlier conversation omitted for length]";
 
@@ -156,7 +161,7 @@ export function buildTurnContext(input: TurnContextInput): {
       ...(truncated ? [OMITTED_HISTORY, ""] : [""]),
       ...lines,
       "",
-      "[Now reply to the user's latest message:]",
+      TURN_REPLY_CUE,
       "",
       text,
     ].join("\n"),
