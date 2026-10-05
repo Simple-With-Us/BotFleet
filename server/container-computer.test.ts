@@ -75,13 +75,11 @@ function bindMountSpecs(args: string[]): string[] {
 function expectBindMount(args: string[], guestTarget: string, sourcePath: string): void {
   const mount = bindMountSpecs(args).find((entry) => entry.includes(`target=${guestTarget},readonly`));
   expect(mount).toBeDefined();
-  if (process.platform === "win32") {
-    // Docker on Windows may rewrite bind sources to 8.3 or mixed separators.
-    return;
-  }
-  const normalizedSource = sourcePath.replaceAll("\\", "/");
-  const normalizedMount = mount!.replaceAll("\\", "/");
-  expect(normalizedMount.includes(normalizedSource)).toBe(true);
+  const normalize = (value: string) =>
+    process.platform === "win32"
+      ? value.replaceAll("\\", "/").toLowerCase()
+      : value.replaceAll("\\", "/");
+  expect(normalize(mount!).includes(normalize(sourcePath))).toBe(true);
 }
 
 function runner(responses: Record<string, string | Error>) {

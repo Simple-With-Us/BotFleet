@@ -27,15 +27,15 @@ else
   npm install -g pnpm@10.33.0 >/dev/null 2>&1 || true
 fi
 
-# 2.  Shared VM CLI manifest (cloud + both targets) - same source as the
+# 2.  Install workspace dependencies with the frozen lockfile so the agent
+#     gets the exact graph the repo was authored against (install.mjs needs zod).
+log "Running pnpm install --frozen-lockfile."
+pnpm install --frozen-lockfile
+
+# 3.  Shared VM CLI manifest (cloud + both targets) - same source as the
 #     Local VM / VPS desktop image and Box bootstrap.
 log "Installing BotFleet VM CLI toolchain from scripts/computer-vm-cli/manifest.json."
 bash scripts/computer-vm-cli/run-install.sh cloud
-
-# 3.  Install workspace dependencies with the frozen lockfile so the agent
-#     gets the exact graph the repo was authored against.
-log "Running pnpm install --frozen-lockfile."
-pnpm install --frozen-lockfile
 
 # 4.  Skip macOS / iOS / Electron packaging:
 #     - electron-builder mac targets need a macOS host.

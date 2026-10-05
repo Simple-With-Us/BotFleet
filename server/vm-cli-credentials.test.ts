@@ -33,6 +33,10 @@ describe("vm CLI credential sync", () => {
     expect(parsed.credHelpers).toEqual({ "ghcr.io": "pass" });
   });
 
+  it("rejects malformed docker config at the trust boundary", () => {
+    expect(() => sanitizeDockerConfigForLinux("null")).toThrow();
+  });
+
   it("reports synced and skipped tools without requiring every path to exist", () => {
     const home = mkdtempSync(join(tmpdir(), "bf-cred-plan-"));
     mkdirSync(join(home, ".ssh"), { recursive: true });

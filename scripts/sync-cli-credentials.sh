@@ -136,9 +136,8 @@ SHARE_GPG_PRIVATE_KEYS="${BOTFLEET_SHARE_GPG_PRIVATE_KEYS:-0}"
 
 # Candidate developer credentials to sync (manifest-driven)
 FOUND=()
-while IFS= read -r rel; do
-  [ -n "$rel" ] && FOUND+=("$rel")
-done < <(cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
+CREDENTIAL_LIST="$(
+  cd "$REPO_ROOT" && SRC_HOME="$SRC_HOME" SHARE_GPG_PRIVATE_KEYS="$SHARE_GPG_PRIVATE_KEYS" node --experimental-strip-types - <<'NODE'
 import { prepareCredentialSyncWorkspace } from "./server/vm-cli-credentials.ts";
 const homeDir = process.env.SRC_HOME ?? "";
 const shareGpgPrivateKeys = process.env.SHARE_GPG_PRIVATE_KEYS === "1";
@@ -148,7 +147,10 @@ for (const rel of [...new Set([...plan.archiveRelPaths, ...plan.stagedRelPaths])
 }
 await cleanup();
 NODE
-)
+)" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
+while IFS= read -r rel; do
+  [ -n "$rel" ] && FOUND+=("$rel")
+done <<< "$CREDENTIAL_LIST"
 
 if [ ${#FOUND[@]} -eq 0 ]; then
   log "No matching CLI credentials found in $SRC_HOME."

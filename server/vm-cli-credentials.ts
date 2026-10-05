@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,11 +17,22 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 
+import { z } from "zod";
+
 import { DATA_DIR } from "./config.ts";
 import {
   type VmCliCredentialTransform,
   vmCliCredentialTools,
 } from "./vm-cli-manifest.ts";
+
+export const DockerConfigSchema = z
+  .object({
+    credsStore: z.string().optional(),
+    credHelpers: z.record(z.string(), z.string()).optional(),
+  })
+  .passthrough();
+
+type DockerConfig = z.infer<typeof DockerConfigSchema>;
 
 export const VM_CLI_GUEST_HOME = "/home/cua";
 
@@ -53,6 +65,8 @@ export interface CredentialSyncOptions {
   homeDir?: string;
   shareGpgPrivateKeys?: boolean;
   stagingDir?: string;
+  /** When false, avoid staging copies (setup-command preview only). */
+  materializeCredentials?: boolean;
 }
 
 export interface CredentialSyncResult {
@@ -102,11 +116,21 @@ export function manifestCredentialCandidates(): HostCliCredentialCandidate[] {
   return candidates.sort((a, b) => a.guest.localeCompare(b.guest));
 }
 
-export const CLI_CREDENTIAL_CANDIDATES: readonly HostCliCredentialCandidate[] = manifestCredentialCandidates();
+let cachedCredentialCandidates: readonly HostCliCredentialCandidate[] | null = null;
 
-export const ALLOWED_CLI_GUEST_DESTINATIONS: ReadonlySet<string> = new Set(
-  CLI_CREDENTIAL_CANDIDATES.map((candidate) => candidate.guest),
-);
+export function cliCredentialCandidates(): readonly HostCliCredentialCandidate[] {
+  if (!cachedCredentialCandidates) cachedCredentialCandidates = manifestCredentialCandidates();
+  return cachedCredentialCandidates;
+}
+
+let cachedAllowedGuestDestinations: ReadonlySet<string> | null = null;
+
+export function allowedCliGuestDestinations(): ReadonlySet<string> {
+  if (!cachedAllowedGuestDestinations) {
+    cachedAllowedGuestDestinations = new Set(cliCredentialCandidates().map((candidate) => candidate.guest));
+  }
+  return cachedAllowedGuestDestinations;
+}
 
 function pathExists(homeDir: string, rel: string): boolean {
   try {
@@ -117,13 +141,13 @@ function pathExists(homeDir: string, rel: string): boolean {
 }
 
 export function sanitizeDockerConfigForLinux(raw: string): string {
-  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const parsed: DockerConfig = DockerConfigSchema.parse(JSON.parse(raw));
   delete parsed.credsStore;
   const helpers = parsed.credHelpers;
-  if (helpers && typeof helpers === "object" && !Array.isArray(helpers)) {
-    const next = { ...(helpers as Record<string, string>) };
+  if (helpers) {
+    const next = { ...helpers };
     for (const key of Object.keys(next)) {
-      const helper = String(next[key] ?? "");
+      const helper = next[key] ?? "";
       if (/osx|desktop|wincred|secretservice/i.test(key) || /osx|desktop|wincred|secretservice/i.test(helper)) {
         delete next[key];
       }
@@ -273,20 +297,34 @@ export function resolveCredentialMountSource(
   stagingRoot: string,
   options: CredentialSyncOptions,
 ): string | null {
+  const materialize = options.materializeCredentials !== false;
   const rel = candidate.relPath.join("/");
   if (candidate.transform === "docker-linux-config") {
+    if (!materialize) {
+      const host = join(homeDir, rel);
+      return existsSync(host) ? host : null;
+    }
     const staged = join(stagingRoot, rel);
     if (stageTransformedFile(homeDir, rel, candidate.transform, stagingRoot)) return staged;
     return null;
   }
   if (candidate.transform === "gpg-public-tree") {
+    const stagedDir = join(stagingRoot, ".gnupg");
+    if (!options.shareGpgPrivateKeys) {
+      const stagedPrivateKeys = join(stagedDir, "private-keys-v1.d");
+      if (existsSync(stagedPrivateKeys)) {
+        rmSync(stagedPrivateKeys, { recursive: true, force: true });
+      }
+    }
     const publicPaths = listGpgPublicRelPaths(homeDir);
     const privatePaths = options.shareGpgPrivateKeys ? listGpgPrivateRelPaths(homeDir) : [];
     if (publicPaths.length === 0 && privatePaths.length === 0) return null;
-    const stagedDir = join(stagingRoot, ".gnupg");
-    const stagedPrivateKeys = join(stagedDir, "private-keys-v1.d");
-    if (!options.shareGpgPrivateKeys && existsSync(stagedPrivateKeys)) {
-      rmSync(stagedPrivateKeys, { recursive: true, force: true });
+    if (!materialize) {
+      const hostGnupg = join(homeDir, ".gnupg");
+      return existsSync(hostGnupg) ? hostGnupg : null;
+    }
+    if (existsSync(stagedDir)) {
+      rmSync(stagedDir, { recursive: true, force: true });
     }
     mkdirSync(stagedDir, { recursive: true });
     for (const publicRel of [...publicPaths, ...privatePaths]) {
@@ -307,11 +345,14 @@ export function hostCliCredentialMounts(
   options: CredentialSyncOptions = {},
 ): string[] {
   if (platform === "win32") return [];
+  const materialize = options.materializeCredentials !== false;
   const stagingRoot = credentialMountStagingRoot(home);
-  mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
+  if (materialize) {
+    mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
+  }
   const mounts: string[] = [];
   const mountedGuests = new Set<string>();
-  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
+  for (const candidate of cliCredentialCandidates()) {
     if (mountedGuests.has(candidate.guest)) continue;
     const source = resolveCredentialMountSource(home, candidate, stagingRoot, options);
     if (!source) continue;
@@ -384,11 +425,20 @@ export async function prepareCredentialSyncWorkspace(
   }
   const stagingDir = await mkdtemp(join(tmpdir(), "bf-cli-cred-stage-"));
   const plan = planCredentialSync({ ...options, homeDir, stagingDir });
-  for (const rel of plan.archiveRelPaths) {
-    const source = join(homeDir, rel);
-    const target = join(stagingDir, rel);
-    mkdirSync(dirname(target), { recursive: true });
-    copyFileSync(source, target);
+  try {
+    for (const rel of plan.archiveRelPaths) {
+      const source = join(homeDir, rel);
+      const target = join(stagingDir, rel);
+      mkdirSync(dirname(target), { recursive: true });
+      if (statSync(source).isDirectory()) {
+        cpSync(source, target, { recursive: true, force: true });
+      } else {
+        copyFileSync(source, target);
+      }
+    }
+  } catch (error) {
+    await rm(stagingDir, { recursive: true, force: true });
+    throw error;
   }
   return {
     plan: { ...plan, stagingDir },

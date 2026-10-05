@@ -17,8 +17,8 @@ import { z } from "zod";
 import { augmentedPath } from "./env-path.ts";
 import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
 import {
-  ALLOWED_CLI_GUEST_DESTINATIONS,
-  CLI_CREDENTIAL_CANDIDATES,
+  allowedCliGuestDestinations,
+  cliCredentialCandidates,
   hostCliCredentialMounts,
 } from "./vm-cli-credentials.ts";
 import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
@@ -1034,7 +1034,11 @@ function samePodmanWindowsWorkspaceSource(source: string | undefined, expectedWo
 }
 
 export type { HostCliCredentialCandidate } from "./vm-cli-credentials.ts";
-export { ALLOWED_CLI_GUEST_DESTINATIONS, CLI_CREDENTIAL_CANDIDATES, hostCliCredentialMounts };
+export {
+  allowedCliGuestDestinations as ALLOWED_CLI_GUEST_DESTINATIONS,
+  cliCredentialCandidates as CLI_CREDENTIAL_CANDIDATES,
+  hostCliCredentialMounts,
+};
 
 function dockerWorkspaceMountIsSafe(
   mounts:
@@ -1060,7 +1064,7 @@ function dockerWorkspaceMountIsSafe(
   for (const mount of mounts) {
     if (mount === workspaceMount) continue;
     if (mount.Type !== "bind" || mount.RW !== false) return false;
-    if (!mount.Destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.Destination)) return false;
+    if (!mount.Destination || !allowedCliGuestDestinations().has(mount.Destination)) return false;
   }
   return true;
 }
@@ -1083,7 +1087,7 @@ function appleWorkspaceMountIsSafe(
     const options = mount.options ?? [];
     const isReadOnly = options.some((opt) => opt === "ro" || opt === "readonly");
     if (!isReadOnly) return false;
-    if (!mount.destination || !ALLOWED_CLI_GUEST_DESTINATIONS.has(mount.destination)) return false;
+    if (!mount.destination || !allowedCliGuestDestinations().has(mount.destination)) return false;
   }
   return true;
 }
@@ -1273,6 +1277,7 @@ export function containerRunArgs(
     shareGpgPrivateKeys?: boolean;
     homeDir?: string;
     limits?: ContainerLimits;
+    materializeCredentials?: boolean;
   },
 ): string[] {
   const limits = clampContainerLimits(options?.limits ?? DEFAULT_CONTAINER_LIMITS);
@@ -1349,6 +1354,7 @@ export function containerRunArgs(
     common.push(
       ...hostCliCredentialMounts(platform, options?.homeDir ?? homedir(), {
         shareGpgPrivateKeys: options?.shareGpgPrivateKeys,
+        materializeCredentials: options?.materializeCredentials,
       }),
     );
   }
@@ -1748,6 +1754,7 @@ export function setupCommands(
             containerRunArgs(runtime, "CHANGE_ME", target, platform, {
               shareCliCredentials: shareCliCredentialsConfigured(),
               shareGpgPrivateKeys: shareGpgPrivateKeysConfigured(),
+              materializeCredentials: false,
             }),
           ),
     start: null,

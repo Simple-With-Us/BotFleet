@@ -8558,6 +8558,7 @@ function configStatus() {
       mode: cfg.localVm?.mode ?? "shared",
       maxInstances: localVmMaxInstances(cfg),
       shareCliCredentials: Boolean(cfg.localVm?.shareCliCredentials),
+      shareGpgPrivateKeys: Boolean(cfg.localVm?.shareGpgPrivateKeys),
       allowHostTerminal: Boolean(cfg.localVm?.allowHostTerminal),
     },
     // No invented endpoint or collection: the operator's own values or
