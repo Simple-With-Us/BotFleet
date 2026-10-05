@@ -83,6 +83,12 @@ import { resolvePlaybookInstall } from "./playbook-install.ts";
 import { spendCeilingDecision } from "./rolling-spend.ts";
 import { effectiveToolRounds, toolBudgetPrompt, type DispatchHold } from "../shared/bot-profile.ts";
 import { groupTurnCwd } from "./room-cwd.ts";
+import {
+  activeTurnWorktreeLeases,
+  admitTurnWorktree,
+  gitWorktreeLeasesEnabled,
+  worktreeLeaseManager,
+} from "./turn-worktree-admission.ts";
 import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from "./room-turn-timeout.ts";
 import { buildSystemPrompt, ownerNotesPrompt } from "./system-prompt.ts";
 import { telemetry } from "./telemetry.ts";
@@ -2817,6 +2823,7 @@ function releaseStalledTurnIfUnowned(
   if (vpsLease?.threadId === turn.threadId && vpsLease.dispatchId === stalledDispatchId) {
     activeVpsThreads.release(vpsLease);
   }
+  releaseTurnWorktreeLease(turn.threadId, turn.botId, stalledDispatchId);
   store.setActivity(bot.id, "idle");
   store.patchBot(bot.id, { inflightThreadId: undefined });
   // This grace fallback replaces a missing turn.completed event.  Release
@@ -3221,6 +3228,35 @@ const roomComputerLeases = new TurnOwnerClaims<ExactTurnLease>();
 /** Give back one room member's VPS lease.  Without a bot id — the
  * `turn.completed` subscriber, which is thread-keyed and names no speaker —
  * only a thread with exactly one claim is released; see `TurnOwnerClaims`. */
+function releaseTurnWorktreeLease(threadId: string, botId: string, dispatchId?: number): void {
+  if (dispatchId === undefined) return;
+  void activeTurnWorktreeLeases.releaseFor({ threadId, botId, dispatchId });
+}
+
+async function applyTurnWorktreeAdmission(
+  bot: NonNullable<ReturnType<typeof store.bot>>,
+  threadId: string,
+  dispatchId: number,
+  cwd: string | null | undefined,
+  privateWorkspace: string | undefined,
+  enabled: boolean,
+): Promise<string | undefined> {
+  const admitted = await admitTurnWorktree({
+    enabled,
+    manager: worktreeLeaseManager,
+    botId: bot.id,
+    threadId,
+    dispatchId,
+    baseCwd: cwd ?? undefined,
+    privateWorkspace,
+    log: (line) => console.warn(line),
+  });
+  if (admitted.lease) {
+    activeTurnWorktreeLeases.register({ threadId, botId: bot.id, dispatchId }, admitted.lease);
+  }
+  return admitted.cwd ?? cwd ?? undefined;
+}
+
 function releaseRoomComputerLease(threadId: string, botId?: string): void {
   const lease =
     botId === undefined
@@ -3931,6 +3967,10 @@ bus.subscribe((event: RuntimeEvent) => {
       const completionToken = Symbol(event.turnId);
       const completionFold = (async () => {
       const settledOwner = activeTurnOwners.settle(event.threadId, event.providerInstanceId);
+      const worktreeBotId = bot?.id ?? groupSpeakers.get(event.threadId)?.botId;
+      if (worktreeBotId && settledOwner) {
+        releaseTurnWorktreeLease(event.threadId, worktreeBotId, settledOwner.dispatchId);
+      }
       const reply = lastReply.get(event.threadId) ?? "";
       lastReply.delete(event.threadId);
       const lastReported = turnUsage.get(event.threadId);
@@ -5134,7 +5174,14 @@ async function startTurn(
         privateWorkspace && opts?.runOn !== "cloud"
           ? store.pinTaskCwd(bot.id, threadId, privateWorkspace)
           : null;
-      const cwd = pinnedCwd ?? undefined;
+      let cwd = await applyTurnWorktreeAdmission(
+        bot,
+        threadId,
+        dispatchOwner.dispatchId,
+        pinnedCwd ?? undefined,
+        privateWorkspace,
+        gitWorktreeLeasesEnabled(cfg, bot) && opts?.runOn !== "cloud",
+      );
       // Checkpoint explicit project folders, where a bot can overwrite the
       // user's work. Its private BotFleet workspace is app-owned and changes
       // on nearly every ordinary chat; snapshotting it would add hidden disk
@@ -5175,7 +5222,10 @@ async function startTurn(
       // The lease outlives this statement: the settle fold releases it, and
       // so does the catch below.
       vpsLease = turnComputers.vpsLease;
-      if (turnComputers.cancelled) return;
+      if (turnComputers.cancelled) {
+        releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
+        return;
+      }
       // What this turn really holds from here on; a provider disable judges
       // the turn by it (see interruptTurnsUsingDisabledProviders).
       activeTurnOwners.recordMounted(threadId, dispatchOwner.dispatchId, mountedProviders(turnComputers));
@@ -5298,10 +5348,16 @@ async function startTurn(
       if (checkpointCwd) {
         await checkpoints.snapshot(bot.id, checkpointCwd, `turn ${threadId.slice(0, 8)}`);
         if (providerReloadInProgress) await waitForProviderReloads();
-        if (!dispatchStillCurrent()) return;
+        if (!dispatchStillCurrent()) {
+          releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
+          return;
+        }
       }
       if (providerReloadInProgress) await waitForProviderReloads();
-      if (!dispatchStillCurrent()) return;
+      if (!dispatchStillCurrent()) {
+        releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
+        return;
+      }
       watchdog.watch(threadId, bot.id);
       // One catalog, used twice: what the model is told it has, and what the
       // host will actually run.  Deriving both from the same call is what
@@ -5673,6 +5729,7 @@ async function startTurn(
         else if (opts?.linqChatId) releaseLinqChat(threadId, `pending:${threadId}`);
         // the model never read its opening reminder: the next turn carries it
         restoreJobNotices(threadId, jobNoticeItems);
+        releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
         return;
       }
       // the opening reminder reached the model
@@ -5702,6 +5759,7 @@ async function startTurn(
       activeTurnOwners.settle(threadId, instanceId);
       releaseLocalVmThread(threadId, bot.id);
       if (vpsLease) activeVpsThreads.release(vpsLease);
+      releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
       watchdog.settle(threadId);
       turnUsage.delete(threadId);
       turnStats.discard(threadId);
@@ -7318,7 +7376,15 @@ async function runGroupMemberTurn(
   // has its folder moved underneath it. Off-host members skip the folder
   // but must not decide the pin: the room's desk is a property of the
   // room, not of whichever member happened to speak first.
-  const cwd = groupTurnCwd(workspace, () => store.pinGroupCwd(group.id, threadId));
+  let cwd = groupTurnCwd(workspace, () => store.pinGroupCwd(group.id, threadId));
+  cwd = await applyTurnWorktreeAdmission(
+    bot,
+    threadId,
+    roomDispatch.dispatchId,
+    cwd,
+    workspace,
+    gitWorktreeLeasesEnabled(cfg, bot),
+  ) ?? cwd;
   // The same computers as a 1:1 turn, through the same helper.  A room used
   // to resolve none of this: `integrations.computer` / `computers` /
   // `localComputer` were never set here, so a bot holding Cua, a Box, a Local
@@ -7379,6 +7445,7 @@ async function runGroupMemberTurn(
     // container pinned against the idle reaper unless this hands it back.
     releaseRoomComputerLease(threadId, bot.id);
     releaseLocalVmThread(threadId, bot.id);
+    releaseTurnWorktreeLease(threadId, bot.id, roomDispatch.dispatchId);
     activeTurnOwners.settle(threadId, instance.instanceId);
     store.appendMessage(threadId, {
       role: "bot",
@@ -7407,6 +7474,7 @@ async function runGroupMemberTurn(
     // before its checkpoint, so a stop during resolution must give it back.
     releaseRoomComputerLease(threadId, bot.id);
     releaseLocalVmThread(threadId, bot.id);
+    releaseTurnWorktreeLease(threadId, bot.id, roomDispatch.dispatchId);
     activeTurnOwners.settle(threadId, instance.instanceId);
     releaseRoomSpeaker();
     return false;
@@ -7420,6 +7488,7 @@ async function runGroupMemberTurn(
     const message = "computer settings changed during turn setup";
     releaseRoomComputerLease(threadId, bot.id);
     releaseLocalVmThread(threadId, bot.id);
+    releaseTurnWorktreeLease(threadId, bot.id, roomDispatch.dispatchId);
     activeTurnOwners.settle(threadId, instance.instanceId);
     store.appendMessage(threadId, {
       role: "bot",
@@ -7660,6 +7729,7 @@ async function runGroupMemberTurn(
         // remove, alias and backend changes for a turn that never ran.
         releaseRoomComputerLease(threadId, bot.id);
         releaseLocalVmThread(threadId, bot.id);
+        releaseTurnWorktreeLease(threadId, bot.id, roomDispatch.dispatchId);
         turnPromptBytes.delete(threadId);
         restoreJobNotices(threadId, roomJobReminder.items);
         const message = err instanceof Error ? err.message : "turn failed";
@@ -7691,6 +7761,7 @@ async function runGroupMemberTurn(
   // finishes and self-heals (which is what board aac035dd tracked).
   releaseRoomComputerLease(threadId, bot.id);
   releaseLocalVmThread(threadId, bot.id);
+  releaseTurnWorktreeLease(threadId, bot.id, roomDispatch.dispatchId);
   // A timed-out provider still owns the room thread until its interrupt
   // produces turn.completed (or the stall watchdog's grace fallback runs).
   // Do not clear busy or start the next member on that same thread early.
@@ -8632,6 +8703,7 @@ function settleInterruptedBots(
     if (vmClaim) releaseLocalVmThread(vmClaim.threadId, vmClaim.botId);
     screenPollers.stop(b.id);
     activeVpsThreads.clearBot(b.id);
+    void activeTurnWorktreeLeases.clearBot(b.id);
     finalizeDelegationWatch(
       inflight,
       false,
@@ -11787,6 +11859,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (typeof body.autoApprove !== "boolean") return json(res, 400, { error: "autoApprove must be true or false" });
         patch.autoApprove = body.autoApprove;
       }
+      if (body.gitWorktreeLeases !== undefined) {
+        if (typeof body.gitWorktreeLeases !== "boolean") {
+          return json(res, 400, { error: "gitWorktreeLeases must be true or false" });
+        }
+        patch.gitWorktreeLeases = body.gitWorktreeLeases;
+      }
       if (body.autoReview !== undefined) {
         if (body.autoReview !== "off" && body.autoReview !== "shadow" && body.autoReview !== "enforce") {
           return json(res, 400, { error: "autoReview must be off, shadow, or enforce" });
@@ -11905,6 +11983,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(bot.threadId).catch(() => {});
         screenPollers.stop(bot.id);
         activeVpsThreads.clearBot(bot.id);
+        void activeTurnWorktreeLeases.clearBot(bot.id);
         routines!.disableForBot(bot.id);
         webhooks.disableForBot(bot.id);
         resourceTriggers.disableForBot(bot.id);

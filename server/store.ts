@@ -601,6 +601,9 @@ export interface BotRecord {
   /** where NEW tasks run their shell tools; each task pins its own copy
    * on its first turn (TaskRecord.cwd). Absent = the home folder. */
   cwd?: string;
+  /** When true, each turn with a Git project folder runs in an isolated
+   * worktree.  When false, opts out even if the workspace feature flag is on. */
+  gitWorktreeLeases?: boolean;
   /** Auto mode: the bot approves its own tool permissions and keeps
    * working instead of stopping to ask. Questions it asks YOU still come
    * through, and a short list of destructive commands still stops it. */

@@ -236,6 +236,8 @@ const featureConfigSchema = z.object({
   showToolCalls: z.boolean().optional(),
   /** Summarize consecutive tool actions into an expandable live summary card. On by default. */
   summarizeToolCalls: z.boolean().optional(),
+  /** Per-turn Git worktree isolation for bots working in a shared repository. */
+  gitWorktreeLeases: z.boolean().optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -619,7 +621,12 @@ export interface AppConfig {
     refreshMinutes?: number;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    gitWorktreeLeases?: boolean;
+  };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
   /** What this person calls a room: one of the presets, or "custom" with a
