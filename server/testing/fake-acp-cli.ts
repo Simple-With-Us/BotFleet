@@ -5,8 +5,14 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | resume-fails | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | happy-with-lingering-child | resume-fails | no-auth | auth-required | permission
 //                   | interleave (message → tool → message → tool → message)
+//                   | exit-with-lingering-child (the leader exits before the
+//                     prompt result while a SIGTERM-ignoring descendant stays
+//                     alive in its process group — the wedge stop() must reap)
+//                   | happy-with-lingering-child (a normal turn whose
+//                     SIGTERM-ignoring descendant outlives the leader when the
+//                     driver tears the group down after the result)
 //                   | late-input-tool-call (a tool_call announced with an empty
 //                     rawInput whose real arguments arrive on a later
 //                     tool_call_update; on the completion itself when
@@ -88,16 +94,38 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
-if (mode === "cancel-exits-with-child") {
+const LINGERING_CHILD_MODES = new Set(["cancel-exits-with-child", "exit-with-lingering-child", "happy-with-lingering-child"]);
+/** Spawn the SIGTERM-ignoring MCP-shaped descendant, once, in this CLI's
+ * process group, and call `ready` once it has installed its SIGTERM handler.
+ * Only the session/prompt path calls this, never module load: the driver
+ * also launches this file for its `--version` probe, and a descendant spawned
+ * there would outlive the probe's own tree kill and leak for the rest of the
+ * suite.  Modes whose leader goes on to finish or exit wait for `ready`: a
+ * turn that ends while the descendant is still booting would have it die on
+ * the driver's SIGTERM by default, and nothing would be left lingering to
+ * test. */
+let lingeringChildReady = false;
+let lingeringChildWaiters: Array<() => void> | null = null;
+const spawnLingeringChild = (ready: () => void) => {
+  if (lingeringChildWaiters) {
+    lingeringChildWaiters.push(ready);
+    return;
+  }
+  lingeringChildWaiters = [ready];
   const descendant = spawn(
     process.execPath,
-    ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
-    { stdio: "ignore" },
+    ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"],
+    { stdio: ["ignore", "pipe", "ignore"] },
   );
   if (process.env.FAKE_ACP_DESCENDANT_PID && descendant.pid) {
     writeFileSync(process.env.FAKE_ACP_DESCENDANT_PID, String(descendant.pid));
   }
-}
+  descendant.stdout.once("data", () => {
+    descendant.stdout.destroy();
+    lingeringChildReady = true;
+    for (const waiter of lingeringChildWaiters ?? []) waiter();
+  });
+};
 // opencode-shaped surface: the session carries its own model catalog and the
 // model is chosen with session/set_config_option, because `opencode acp` takes
 // no -m. Off unless FAKE_ACP_MODELS is set, so every existing mode is byte-
@@ -379,7 +407,7 @@ process.stdin.on("data", (c) => {
   }
 });
 
-function handle(msg: any) {
+function handle(msg: any, resumed = false) {
   // client's response to our permission request
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && msg.id === pendingPermissionId) {
     pendingPermissionId = null;
@@ -387,7 +415,7 @@ function handle(msg: any) {
     return;
   }
   if (!msg.method) return;
-  recordMethod(msg.method);
+  if (!resumed) recordMethod(msg.method);
 
   switch (msg.method) {
     case "initialize": {
@@ -538,6 +566,22 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      if (LINGERING_CHILD_MODES.has(mode) && !lingeringChildReady) {
+        if (mode === "cancel-exits-with-child") {
+          // The prompt hangs from here on, so there is nothing to hold back.
+          spawnLingeringChild(() => {});
+        } else {
+          spawnLingeringChild(() => handle(msg, true));
+          return;
+        }
+      }
+      if (mode === "exit-with-lingering-child") {
+        // The leader dies before the prompt result while its SIGTERM-ignoring
+        // descendant stays alive in the process group it still leads — the
+        // shape core.ts's stop() must still reap once the leader is already
+        // gone (killCliTree early-returns on an exited leader).
+        process.exit(3);
+      }
       if (
         mode === "hang" ||
         mode === "hang-exit-gated" ||

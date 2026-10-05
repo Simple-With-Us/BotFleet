@@ -4735,11 +4735,16 @@ describe("harness HTTP API", () => {
       });
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
-      // and the same on the wire, not just in the HTTP responses
+      // and the same on the wire, not just in the HTTP responses.  Wait for
+      // hello before the unread nudge — every other SSE test in this file does
+      // the same, and under windows-latest parallel suite load the unread PATCH
+      // can otherwise land before the client has proved it can receive frames
+      // (seen as a bare 20s vitest timeout rather than until's own message).
       const stream = await openSse(`${BASE}/api/events`);
       try {
+        await stream.until((f) => f.kind === "hello");
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
-        const frame = await stream.until((f) => f.kind === "bot");
+        const frame = await stream.until((f) => f.kind === "bot" && f.bot?.id === botId);
         expect(frame.bot).not.toHaveProperty("resumeCursors");
         expect(JSON.stringify(frame)).not.toContain("resumeCursors");
       } finally {
@@ -4748,7 +4753,9 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
     }
-  });
+    // Bot create + task + SSE + delete; windows-latest is about a third slower
+    // and overlaps its files more, so the default 20s budget is a coin flip.
+  }, 30_000);
 
   it("validates the event inspector limit at the HTTP boundary", async () => {
     const bot = (await api("GET", "/api/bots")).body.bots[0];
