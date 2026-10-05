@@ -5,8 +5,11 @@
 // session/prompt, and streams session/update notifications for a scripted
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
-//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | resume-fails | no-auth | auth-required | permission
+//   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | hang-exit-gated | cancel-exits | cancel-exits-with-child | exit-with-lingering-child | resume-fails | no-auth | auth-required | permission
 //                   | interleave (message → tool → message → tool → message)
+//                   | exit-with-lingering-child (the leader exits before the
+//                     prompt result while a SIGTERM-ignoring descendant stays
+//                     alive in its process group — the wedge stop() must reap)
 //                   | late-input-tool-call (a tool_call announced with an empty
 //                     rawInput whose real arguments arrive on a later
 //                     tool_call_update; on the completion itself when
@@ -88,7 +91,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
-if (mode === "cancel-exits-with-child") {
+if (mode === "cancel-exits-with-child" || mode === "exit-with-lingering-child") {
   const descendant = spawn(
     process.execPath,
     ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
@@ -538,6 +541,13 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      if (mode === "exit-with-lingering-child") {
+        // The leader dies before the prompt result while its SIGTERM-ignoring
+        // descendant stays alive in the process group it still leads — the
+        // shape core.ts's stop() must reap with one group kill once the leader
+        // is already gone (killCliTree early-returns on an exited leader).
+        process.exit(3);
+      }
       if (
         mode === "hang" ||
         mode === "hang-exit-gated" ||

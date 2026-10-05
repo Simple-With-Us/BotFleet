@@ -508,6 +508,81 @@ describe("ACP turns (fake CLI)", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")("reaps a lingering descendant after the CLI leader has already exited", async () => {
+    // A lock is only released when every holder is gone, and killCliTree
+    // early-returns once the leader has exited.  So when an MCP descendant
+    // ignores SIGTERM and outlives its parent while still holding the session
+    // lock, stop() must issue one process-group kill of its own — mirroring
+    // stopAndWaitForExit's already-exited branch — or the wedge survives and
+    // the next run collides with the lock.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "exit-with-lingering-child", { promptTimeoutMs: 30_000 });
+    await instance.adapter.sendTurn({ threadId: "t-lingering-child", text: "never finishes" });
+    await vi.waitFor(() => {
+      expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
+    });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+
+    try {
+      const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+
+      // Without the already-exited group kill the descendant is never signalled
+      // again: it holds the lock forever.  With it, the SIGTERM-ignoring
+      // descendant is reaped as soon as the turn settles.
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the leader-already-exited group kill has reaped it
+      }
+    }
+  });
+
+  it("never sends a stale process-group SIGKILL once the child has exited", async () => {
+    // stop() arms a 2s force-kill on the per-turn hot path (settle() calls
+    // stop() on every normal completion while the child is alive).  By the time
+    // that timer fires the child has usually exited on SIGTERM and its pid is
+    // free for the OS to recycle, so the callback must re-check liveness before
+    // signalling the group — otherwise it can SIGKILL an unrelated group that
+    // inherited the recycled pid (another turn's CLI, the deployer's children).
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await create(GrokAgentDriver);
+      // drop anything earlier tests left behind, so the group id below is this
+      // turn's own child
+      kill.mockClear();
+      await instance.adapter.sendTurn({ threadId: "t-stale-group-kill", text: "hi" });
+      const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+      expect(done).toMatchObject({ ok: true });
+
+      // killCliTree signalled THIS child's own process group on the way out
+      // (the only negative-pid SIGTERM a settled turn sends), and that group id
+      // is the one a 2s force-kill would reuse if it fired against a pgid the
+      // OS had already recycled.  Leftover timers from earlier tests only ever
+      // send SIGKILL and belong to other groups, so scoping by it keeps them
+      // out of the assertion.
+      const pgid = kill.mock.calls.find(
+        ([pid, signal]) => typeof pid === "number" && pid < 0 && signal === "SIGTERM",
+      )?.[0];
+      expect(typeof pgid).toBe("number");
+
+      // Outlive the 2s force-kill window, then prove it never SIGKILLed the
+      // group of a child that had already exited.
+      await new Promise((resolve) => setTimeout(resolve, 2_600));
+      const staleGroupKills = kill.mock.calls.filter(
+        ([pid, signal]) => pid === pgid && signal === "SIGKILL",
+      );
+      expect(staleGroupKills).toEqual([]);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
   it("keeps a turn alive past the idle window as long as it keeps streaming", async () => {
     process.env.FAKE_ACP_DRIP_MS = "30";
     process.env.FAKE_ACP_DRIP_COUNT = "8";
