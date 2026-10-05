@@ -925,6 +925,7 @@ private extension AvatarCrop {
     var label: String {
         switch self {
         case .mascot: "Mascot"
+        case .tvface: "TV Face"
         case .circle: "Circle"
         case .rounded: "Rounded"
         case .square: "Square"
