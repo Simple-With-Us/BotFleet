@@ -92,7 +92,13 @@ test.use({
   userAgent: LINUX_CHROME_UA,
 });
 
+// `/api/vps-computer` requests held open for the "Fetching VPS status…"
+// loading shot.  Each one is aborted in `test.afterEach` so no route
+// handler is still pending when Playwright closes the page and context.
+let pendingVpsRoutes: Route[] = [];
+
 test.beforeEach(async ({ page }) => {
+  pendingVpsRoutes = [];
   // Cards poll these endpoints.  Hand back deterministic bodies so the
   // screenshot is stable.  The page URL `state=` param picks the body.
   await page.route('**/api/local-computer', async (route: Route) => {
@@ -114,13 +120,15 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/vps-computer', async (route: Route) => {
     // SharedVpsRuntimeCard only polls when the workspace is in shared
     // mode and VPS is configured.  For the loading-state screenshot we
-    // never fulfill: the card renders "Fetching VPS status…" until a
-    // body arrives, and we capture the shot while status is still null.
+    // hold the request open: the card renders "Fetching VPS status…"
+    // until a body arrives, and we capture the shot while status is
+    // still null.  The handler returns immediately rather than awaiting
+    // a promise that never settles; the held route is tracked and
+    // aborted in `test.afterEach`.
     if (route.request().method() !== 'GET') return route.fallback();
     const pageState = new URL(page.url()).searchParams.get('state') ?? 'normal';
     if (pageState === 'normal' || pageState === 'loading') {
-      // Hang forever so status stays null (loading copy).
-      await new Promise(() => {});
+      pendingVpsRoutes.push(route);
       return;
     }
     return route.fulfill({
@@ -139,6 +147,17 @@ test.beforeEach(async ({ page }) => {
       }),
     });
   });
+});
+
+test.afterEach(async ({ page }) => {
+  // Settle every held `/api/vps-computer` request before teardown, then
+  // drop the handlers so nothing is still in flight when the page and
+  // context close.  A route the page already cancelled throws on abort,
+  // which is fine to ignore here.
+  const held = pendingVpsRoutes;
+  pendingVpsRoutes = [];
+  await Promise.all(held.map((route) => route.abort('aborted').catch(() => {})));
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
 test('visual: LocalVmRuntimeCard — per-bot mode (Step 4 = per-bot instruction)', async ({ page }) => {
