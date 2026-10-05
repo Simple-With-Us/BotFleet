@@ -1,5 +1,4 @@
-import { describe, it } from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it } from "vitest";
 
 import {
   parseGitPluginSource,
@@ -16,33 +15,33 @@ interface FakeResponseMap {
 describe("parseGitPluginSource", () => {
   it("accepts owner/repo shorthand", () => {
     const result = parseGitPluginSource("acme/widget");
-    assert.equal(result.ok, true);
+    expect(result.ok).toBe(true);
     if (result.ok) {
-      assert.equal(result.source.kind, "git");
-      assert.equal(result.source.owner, "acme");
-      assert.equal(result.source.repo, "widget");
-      assert.equal(result.source.ref, null);
-      assert.equal(result.source.path, "");
+      expect(result.source.kind).toBe("git");
+      expect(result.source.owner).toBe("acme");
+      expect(result.source.repo).toBe("widget");
+      expect(result.source.ref).toBe(null);
+      expect(result.source.path).toBe("");
     }
   });
 
   it("accepts a full GitHub URL with ref and path", () => {
     const result = parseGitPluginSource("https://github.com/acme/widget/tree/main/plugins/foo");
-    assert.equal(result.ok, true);
+    expect(result.ok).toBe(true);
     if (result.ok) {
-      assert.equal(result.source.ref, "main");
-      assert.equal(result.source.path, "plugins/foo");
+      expect(result.source.ref).toBe("main");
+      expect(result.source.path).toBe("plugins/foo");
     }
   });
 
   it("rejects an empty string", () => {
     const result = parseGitPluginSource("");
-    assert.equal(result.ok, false);
+    expect(result.ok).toBe(false);
   });
 
   it("rejects garbage", () => {
     const result = parseGitPluginSource("hello there");
-    assert.equal(result.ok, false);
+    expect(result.ok).toBe(false);
   });
 });
 
@@ -66,9 +65,9 @@ describe("fetchPluginFromGit", () => {
       "https://example/plugin": { kind: "text", value: "export const x = 1;" },
     });
     const fetched = await fetchPluginFromGit(source, fetcher);
-    assert.equal(fetched.manifestText, manifest);
-    assert.equal(fetched.files.length, 1);
-    assert.equal(fetched.files[0]!.path, "plugin.mjs");
+    expect(fetched.manifestText).toBe(manifest);
+    expect(fetched.files.length).toBe(1);
+    expect(fetched.files[0]!.path).toBe("plugin.mjs");
   });
 
   it("throws when the manifest is missing", async () => {
@@ -85,7 +84,7 @@ describe("fetchPluginFromGit", () => {
         { type: "file", name: "plugin.mjs", path: "plugin.mjs", download_url: "https://example/plugin" },
       ] },
     });
-    await assert.rejects(() => fetchPluginFromGit(source, fetcher), /botfleet-plugin\.json/);
+    await expect(() => fetchPluginFromGit(source, fetcher)).rejects.toThrow(/botfleet-plugin\.json/);
   });
 });
 

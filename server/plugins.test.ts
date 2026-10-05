@@ -1,5 +1,4 @@
-import { describe, it, beforeEach, afterEach } from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,23 +65,23 @@ describe("plugin lifecycle", () => {
   it("install -> disabled by default", async () => {
     const installed = await installPlugin(FIXTURE, baseDir);
     if ("error" in installed) throw new Error(installed.error);
-    assert.equal(installed.enabled, false);
-    assert.equal(installed.name, "fleet-overview");
-    assert.equal(installed.capabilities.length, 2);
-    assert.equal(existsSync(join(baseDir, "fleet-overview", "botfleet-plugin.json")), true);
+    expect(installed.enabled).toBe(false);
+    expect(installed.name).toBe("fleet-overview");
+    expect(installed.capabilities.length).toBe(2);
+    expect(existsSync(join(baseDir, "fleet-overview", "botfleet-plugin.json"))).toBe(true);
   });
 
   it("install rejects when the manifest is invalid", async () => {
     const bad = await installPlugin(process.cwd(), baseDir);
-    assert.ok("error" in bad);
+    expect("error" in bad).toBeTruthy();
   });
 
   it("enable imports the module and records enabled=true", async () => {
     await installPlugin(FIXTURE, baseDir);
     const enabled = await enablePlugin("fleet-overview", baseDir);
     if ("error" in enabled) throw new Error(enabled.error);
-    assert.equal(enabled.enabled, true);
-    assert.ok(_loadedNames().includes("fleet-overview"));
+    expect(enabled.enabled).toBe(true);
+    expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
   });
 
   it("host API sees bots through getCardData", async () => {
@@ -92,10 +91,10 @@ describe("plugin lifecycle", () => {
     if ("error" in card) throw new Error(card.error);
     // SAFETY: the fixture plugin returns { result: counts }; the test knows the shape because it wrote the fixture.
     const data = (card.data as { result: CardData }).result;
-    assert.equal(data.total, 3);
-    assert.equal(data.running, 1);
-    assert.equal(data.stopped, 1);
-    assert.equal(data.errored, 1);
+    expect(data.total).toBe(3);
+    expect(data.running).toBe(1);
+    expect(data.stopped).toBe(1);
+    expect(data.errored).toBe(1);
   });
 
   it("host API runs a slash command", async () => {
@@ -103,27 +102,27 @@ describe("plugin lifecycle", () => {
     await enablePlugin("fleet-overview", baseDir);
     const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
     if ("error" in result) throw new Error(result.error);
-    assert.match(result.text, /Fleet has 3 bots/);
+    expect(result.text).toMatch(/Fleet has 3 bots/);
   });
 
   it("runPluginCommand refuses when the plugin is disabled", async () => {
     await installPlugin(FIXTURE, baseDir);
     const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
     if ("error" in result) {
-      assert.match(result.error, /disabled/);
+      expect(result.error).toMatch(/disabled/);
     } else {
-      assert.fail("expected an error result");
+      throw new Error("expected an error result");
     }
   });
 
   it("disable drops the loaded module and flips the flag", async () => {
     await installPlugin(FIXTURE, baseDir);
     await enablePlugin("fleet-overview", baseDir);
-    assert.ok(_loadedNames().includes("fleet-overview"));
+    expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
     const disabled = await disablePlugin("fleet-overview", baseDir);
     if ("error" in disabled) throw new Error(disabled.error);
-    assert.equal(disabled.enabled, false);
-    assert.ok(!_loadedNames().includes("fleet-overview"));
+    expect(disabled.enabled).toBe(false);
+    expect(!_loadedNames().includes("fleet-overview")).toBeTruthy();
   });
 
   it("update refreshes the tree and reloads the module", async () => {
@@ -144,7 +143,7 @@ describe("plugin lifecycle", () => {
       writeFileSync(manifestPath, JSON.stringify(original, null, 2));
       const updated = await updatePlugin("fleet-overview", baseDir);
       if ("error" in updated) throw new Error(updated.error);
-      assert.equal(updated.version, "1.1.0");
+      expect(updated.version).toBe("1.1.0");
     } finally {
       rmSync(sourceDir, { recursive: true, force: true });
     }
@@ -154,18 +153,18 @@ describe("plugin lifecycle", () => {
     await installPlugin(FIXTURE, baseDir);
     const removed = await removePlugin("fleet-overview", baseDir);
     if ("error" in removed) throw new Error(removed.error);
-    assert.equal(removed.removed, true);
-    assert.equal(existsSync(join(baseDir, "fleet-overview")), false);
-    assert.equal(readRegistry(baseDir).plugins["fleet-overview"], undefined);
+    expect(removed.removed).toBe(true);
+    expect(existsSync(join(baseDir, "fleet-overview"))).toBe(false);
+    expect(readRegistry(baseDir).plugins["fleet-overview"]).toBe(undefined);
   });
 
   it("list and get return the current state", async () => {
     await installPlugin(FIXTURE, baseDir);
     const list = listPlugins(baseDir);
-    assert.equal(list.length, 1);
+    expect(list.length).toBe(1);
     const one = getPlugin("fleet-overview", baseDir);
     if ("error" in one) throw new Error(one.error);
-    assert.equal(one.name, "fleet-overview");
+    expect(one.name).toBe("fleet-overview");
   });
 
   it("reload re-imports without changing the enabled flag", async () => {
@@ -173,8 +172,8 @@ describe("plugin lifecycle", () => {
     await enablePlugin("fleet-overview", baseDir);
     const reloaded = await reloadPlugin("fleet-overview", baseDir);
     if ("error" in reloaded) throw new Error(reloaded.error);
-    assert.equal(reloaded.enabled, true);
-    assert.ok(_loadedNames().includes("fleet-overview"));
+    expect(reloaded.enabled).toBe(true);
+    expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
   });
 
   it("bootPluginRuntime loads every enabled plugin", async () => {
@@ -183,24 +182,24 @@ describe("plugin lifecycle", () => {
     _resetForTests();
     initPluginRuntime(makeRuntimeInputs());
     await bootPluginRuntime(baseDir);
-    assert.ok(_loadedNames().includes("fleet-overview"));
+    expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
   });
 
   it("install refuses a duplicate name", async () => {
     await installPlugin(FIXTURE, baseDir);
     const second = await installPlugin(FIXTURE, baseDir);
     if ("error" in second) {
-      assert.match(second.error, /already installed/);
+      expect(second.error).toMatch(/already installed/);
     } else {
-      assert.fail("expected an error result");
+      throw new Error("expected an error result");
     }
   });
 });
 
 describe("host API version gate", () => {
   it("satisfiesBotfleetVersion recognizes >=1 against the host version", () => {
-    assert.equal(satisfiesBotfleetVersion(">=1", HOST_API_VERSION), true);
-    assert.equal(satisfiesBotfleetVersion(">=2", HOST_API_VERSION), false);
+    expect(satisfiesBotfleetVersion(">=1", HOST_API_VERSION)).toBe(true);
+    expect(satisfiesBotfleetVersion(">=2", HOST_API_VERSION)).toBe(false);
   });
 
   it("enablePlugin refuses when the listing declares a higher host version", async () => {
@@ -221,19 +220,13 @@ describe("host API version gate", () => {
       }),
     );
     const result = await enablePlugin("fleet-overview", baseDir);
-    assert.ok("error" in result, "enablePlugin should refuse on a host-version mismatch");
-    assert.match(
-      result.error,
-      /requires botfleet ">=2" but the host API is \d/,
-    );
+    expect("error" in result).toBeTruthy();
+    expect(result.error).toMatch(/requires botfleet ">=2" but the host API is \d/);
     // The plugin must remain disabled after the refused enable.
     const after = readRegistry(baseDir).plugins["fleet-overview"];
-    assert.equal(after?.enabled, false, "refused enable must not flip the flag");
+    expect(after?.enabled).toBe(false);
     // The module must NOT have been loaded.
-    assert.ok(
-      !_loadedNames().includes("fleet-overview"),
-      "refused enable must not import the module",
-    );
+    expect(!_loadedNames().includes("fleet-overview")).toBeTruthy();
   });
 });
 
@@ -241,30 +234,30 @@ describe("matchPluginActionRoute", () => {
   it("matches the four action paths with the right name and action", () => {
     for (const action of ["enable", "disable", "update", "reload"] as const) {
       const result = matchPluginActionRoute(`/api/plugins/fleet-overview/${action}`);
-      assert.deepEqual(result, { name: "fleet-overview", action });
+      expect(result).toEqual({ name: "fleet-overview", action });
     }
   });
 
   it("returns null for /api/plugins/foo (no action segment)", () => {
-    assert.equal(matchPluginActionRoute("/api/plugins/foo"), null);
+    expect(matchPluginActionRoute("/api/plugins/foo")).toBe(null);
   });
 
   it("returns null for /api/plugins/foo/cards/x (card path, not an action)", () => {
-    assert.equal(matchPluginActionRoute("/api/plugins/foo/cards/x"), null);
+    expect(matchPluginActionRoute("/api/plugins/foo/cards/x")).toBe(null);
   });
 
   it("returns null for /api/plugins/foo/enable/extra (trailing segment)", () => {
-    assert.equal(matchPluginActionRoute("/api/plugins/foo/enable/extra"), null);
+    expect(matchPluginActionRoute("/api/plugins/foo/enable/extra")).toBe(null);
   });
 
   it("returns null for malformed names", () => {
-    assert.equal(matchPluginActionRoute("/api/plugins/-bad/enable"), null);
-    assert.equal(matchPluginActionRoute("/api/plugins/.bad/enable"), null);
-    assert.equal(matchPluginActionRoute("/api/plugins//enable"), null);
+    expect(matchPluginActionRoute("/api/plugins/-bad/enable")).toBe(null);
+    expect(matchPluginActionRoute("/api/plugins/.bad/enable")).toBe(null);
+    expect(matchPluginActionRoute("/api/plugins//enable")).toBe(null);
   });
 
   it("returns null for an unknown action verb", () => {
-    assert.equal(matchPluginActionRoute("/api/plugins/foo/install"), null);
+    expect(matchPluginActionRoute("/api/plugins/foo/install")).toBe(null);
   });
 });
 
@@ -291,10 +284,10 @@ describe("installFromFetched entry validation", () => {
         }),
       );
       const result = await installPlugin(sourceDir, baseDir);
-      assert.ok("error" in result, "install should refuse when entry is missing");
-      assert.match(result.error, /^entry: "phantom\.mjs" is not one of the installed plugin files$/);
+      expect("error" in result).toBeTruthy();
+      expect(result.error).toMatch(/^entry: "phantom\.mjs" is not one of the installed plugin files$/);
       // The registry must not have been mutated.
-      assert.equal(readRegistry(baseDir).plugins["missing-entry"], undefined);
+      expect(readRegistry(baseDir).plugins["missing-entry"]).toBe(undefined);
     } finally {
       rmSync(sourceDir, { recursive: true, force: true });
     }
@@ -318,9 +311,9 @@ describe("installFromFetched entry validation", () => {
       );
       writeFileSync(join(sourceDir, "plugin.mjs"), "export default {};\n");
       const result = await installPlugin(sourceDir, baseDir);
-      assert.ok(!("error" in result), `install should succeed, got: ${"error" in result ? result.error : ""}`);
-      assert.equal(result.name, "present-entry");
-      assert.equal(result.entry, "plugin.mjs");
+      expect(!("error" in result)).toBeTruthy();
+      expect(result.name).toBe("present-entry");
+      expect(result.entry).toBe("plugin.mjs");
     } finally {
       rmSync(sourceDir, { recursive: true, force: true });
     }

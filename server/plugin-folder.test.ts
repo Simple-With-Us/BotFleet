@@ -1,5 +1,4 @@
-import { describe, it, beforeEach } from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it, beforeEach } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,8 +19,8 @@ function errorFrom(result: { error: string } | unknown): string {
 describe("readPluginFolder", () => {
   it("returns an error when no manifest is present", () => {
     const result = readPluginFolder(dir, stubFolder({ entries: [{ name: "plugin.mjs", isDirectory: false }] }));
-    assert.ok("error" in result);
-    assert.match(errorFrom(result), /no botfleet-plugin\.json/);
+    expect("error" in result).toBeTruthy();
+    expect(errorFrom(result)).toMatch(/no botfleet-plugin\.json/);
   });
 
   it("returns an error when the manifest cannot be read", () => {
@@ -30,7 +29,7 @@ describe("readPluginFolder", () => {
       byteSize: () => 32,
       read: () => { throw new Error("EACCES"); },
     }));
-    assert.ok("error" in result);
+    expect("error" in result).toBeTruthy();
   });
 
   it("reads the manifest plus allowed files", () => {
@@ -46,15 +45,15 @@ describe("readPluginFolder", () => {
       read: (file) => file.endsWith("plugin.mjs") ? "export const x = 1;" : manifest,
     }));
     if ("error" in result) throw new Error(result.error);
-    assert.equal(result.fetched.manifestText, manifest);
-    assert.equal(result.fetched.files.length, 1);
-    assert.equal(result.fetched.files[0]!.path, "plugin.mjs");
+    expect(result.fetched.manifestText).toBe(manifest);
+    expect(result.fetched.files.length).toBe(1);
+    expect(result.fetched.files[0]!.path).toBe("plugin.mjs");
   });
 
   it("refuses absolute paths", () => {
     const result = readPluginFolder("relative/path");
-    assert.ok("error" in result);
-    assert.match(errorFrom(result), /full path/);
+    expect("error" in result).toBeTruthy();
+    expect(errorFrom(result)).toMatch(/full path/);
   });
 
   it("refuses a manifest over the size cap", () => {
@@ -62,8 +61,8 @@ describe("readPluginFolder", () => {
       entries: [{ name: "botfleet-plugin.json", isDirectory: false }],
       byteSize: () => 1024 * 1024,
     }));
-    assert.ok("error" in result);
-    assert.match(errorFrom(result), /256KB/);
+    expect("error" in result).toBeTruthy();
+    expect(errorFrom(result)).toMatch(/256KB/);
   });
 });
 

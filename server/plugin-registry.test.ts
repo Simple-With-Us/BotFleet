@@ -1,5 +1,4 @@
-import { describe, it, beforeEach } from "node:test";
-import assert from "node:assert/strict";
+import { describe, expect, it, beforeEach } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,8 +23,8 @@ beforeEach(() => {
 describe("plugin registry", () => {
   it("reads an empty registry when no file exists", () => {
     const registry = readRegistry(baseDir);
-    assert.equal(registry.version, 1);
-    assert.deepEqual(registry.plugins, {});
+    expect(registry.version).toBe(1);
+    expect(registry.plugins).toEqual({});
   });
 
   it("writes and reads back a registry", () => {
@@ -37,8 +36,8 @@ describe("plugin registry", () => {
     });
     setPluginEntry(entry, baseDir);
     const registry = readRegistry(baseDir);
-    assert.equal(registry.plugins.demo?.name, "demo");
-    assert.equal(registry.plugins.demo?.enabled, false);
+    expect(registry.plugins.demo?.name).toBe("demo");
+    expect(registry.plugins.demo?.enabled).toBe(false);
   });
 
   it("writes the plugin tree and reads it back through listingFor", () => {
@@ -65,10 +64,10 @@ describe("plugin registry", () => {
 
     const listing = listingFor("demo", baseDir);
     if ("error" in listing) throw new Error(listing.error);
-    assert.equal(listing.name, "demo");
-    assert.equal(listing.version, "1.0.0");
-    assert.equal(listing.description, "Demo plugin.");
-    assert.equal(listing.capabilities.length, 0);
+    expect(listing.name).toBe("demo");
+    expect(listing.version).toBe("1.0.0");
+    expect(listing.description).toBe("Demo plugin.");
+    expect(listing.capabilities.length).toBe(0);
   });
 
   it("fails listingFor with a useful message when the manifest is unreadable", () => {
@@ -82,7 +81,7 @@ describe("plugin registry", () => {
     setPluginEntry(entry, baseDir);
 
     const listing = listingFor("broken", baseDir);
-    assert.ok("error" in listing);
+    expect("error" in listing).toBeTruthy();
   });
 
   it("fails listingFor when the manifest is invalid JSON", () => {
@@ -97,9 +96,9 @@ describe("plugin registry", () => {
     });
     setPluginEntry(entry, baseDir);
     const listing = listingFor("bad-json", baseDir);
-    assert.ok("error" in listing);
+    expect("error" in listing).toBeTruthy();
     // SAFETY: the previous line narrowed `listing` to an error variant; the cast is for the reader's benefit so they don't have to inspect the conditional above.
-    assert.match((listing as { error: string }).error, /unreadable|invalid/i);
+    expect((listing as { error: string }).error).toMatch(/unreadable|invalid/i);
   });
 
   it("fails listingFor when the manifest fails schema validation", () => {
@@ -118,7 +117,7 @@ describe("plugin registry", () => {
     });
     setPluginEntry(entry, baseDir);
     const listing = listingFor("bad-schema", baseDir);
-    assert.ok("error" in listing);
+    expect("error" in listing).toBeTruthy();
   });
 
   it("removes an entry and its directory", () => {
@@ -142,8 +141,8 @@ describe("plugin registry", () => {
     });
     setPluginEntry(entry, baseDir);
     removePluginEntry("demo", baseDir);
-    assert.equal(readRegistry(baseDir).plugins.demo, undefined);
-    assert.equal(existsSync(join(baseDir, "demo")), true); // tree was not deleted by removePluginEntry alone
+    expect(readRegistry(baseDir).plugins.demo).toBe(undefined);
+    expect(existsSync(join(baseDir, "demo"))).toBe(true); // tree was not deleted by removePluginEntry alone
   });
 
   it("lists every plugin directory on disk", () => {
@@ -151,13 +150,13 @@ describe("plugin registry", () => {
       mkdirSync(join(baseDir, name), { recursive: true, mode: 0o700 });
     }
     const names = listPluginDirs(baseDir);
-    assert.deepEqual(names, ["alpha", "beta"]);
+    expect(names).toEqual(["alpha", "beta"]);
   });
 
   it("clearPluginsDir wipes everything", () => {
     mkdirSync(join(baseDir, "alpha"), { recursive: true, mode: 0o700 });
     clearPluginsDir(baseDir);
-    assert.equal(existsSync(baseDir), true);
-    assert.deepEqual(listPluginDirs(baseDir), []);
+    expect(existsSync(baseDir)).toBe(true);
+    expect(listPluginDirs(baseDir)).toEqual([]);
   });
 });
