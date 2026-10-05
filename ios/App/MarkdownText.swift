@@ -79,27 +79,7 @@ struct MarkdownText: View {
             .fixedSize(horizontal: false, vertical: true)
 
         case let .code(language, text):
-            VStack(alignment: .leading, spacing: 4) {
-                if let language, !language.isEmpty {
-                    Text(language)
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.secondary)
-                }
-                // Horizontal scroll rather than wrapping: wrapped code is
-                // harder to read than code you have to push sideways, and
-                // indentation is most of what a snippet is saying.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    (Text(text) + caretText(tail))
-                        .font(.system(size: 14, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.secondary.opacity(0.14))
-            )
+            CodeBlockView(language: language, text: text, tail: tail)
 
         case .rule:
             Divider().padding(.vertical, 2)
@@ -142,6 +122,116 @@ struct MarkdownText: View {
     /// rather than touching it. Empty when not streaming — an empty `Text`
     /// concatenated in costs nothing and keeps the callers branch-free.
     private func caretText(_ tail: Bool) -> Text {
-        tail ? Text("\u{2007}▍").foregroundStyle(Color.secondary) : Text("")
+        streamingCaret(tail)
     }
+}
+
+/// One monospaced run inside a horizontal scroller, for a fence that fits
+/// in a single page.  Larger fences show one page and open the rest in
+/// `CodeBlockReader`.  The page is the bound: this view never puts the
+/// whole fence into `Text`.
+private struct CodeBlockView: View {
+    let language: String?
+    let text: String
+    let tail: Bool
+    @State private var showingFullCode = false
+
+    var body: some View {
+        let preview = CodeBlockWindow.preview(text, anchorToEnd: tail)
+        VStack(alignment: .leading, spacing: 4) {
+            if let language, !language.isEmpty {
+                Text(language)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.secondary)
+            }
+            // Horizontal scroll rather than wrapping: wrapped code is
+            // harder to read than code you have to push sideways, and
+            // indentation is most of what a snippet is saying.
+            codeScroll(preview.text, showCaret: tail && !preview.hasLater)
+            if preview.needsPaging {
+                Text(preview.caption)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondary)
+                Button("Show Full Code") { showingFullCode = true }
+                    .font(.system(size: 12, weight: .semibold))
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.secondary.opacity(0.14))
+        )
+        .sheet(isPresented: $showingFullCode) {
+            CodeBlockReader(source: text, anchorToEnd: tail)
+        }
+    }
+
+    private func codeScroll(_ source: String, showCaret: Bool) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            (Text(source) + streamingCaret(showCaret))
+                .font(.system(size: 14, design: .monospaced))
+                .textSelection(.enabled)
+        }
+    }
+}
+
+/// Pages the fence.  One `Text` is mounted at a time, so opening the
+/// full block cannot reintroduce the unbounded measure.
+private struct CodeBlockReader: View {
+    let source: String
+    let anchorToEnd: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var pageIndex = 0
+    @State private var userPaged = false
+
+    var body: some View {
+        let count = CodeBlockWindow.pageCount(in: source)
+        let resolved = !userPaged && anchorToEnd
+            ? max(count - 1, 0)
+            : min(max(0, pageIndex), max(count - 1, 0))
+        let page = CodeBlockWindow.page(source, index: resolved)
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                ScrollView {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(page.text)
+                            .font(.system(size: 14, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+                Text(page.caption)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondary)
+                HStack {
+                    Button("Earlier Lines") {
+                        userPaged = true
+                        pageIndex = max(0, page.pageIndex - 1)
+                    }
+                    .disabled(!page.hasEarlier)
+                    Spacer()
+                    Button("Later Lines") {
+                        userPaged = true
+                        pageIndex = min(page.pageCount - 1, page.pageIndex + 1)
+                    }
+                    .disabled(!page.hasLater)
+                }
+                .font(.system(size: 15, weight: .semibold))
+            }
+            .padding(16)
+            .navigationTitle("Full Code")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+}
+
+private func streamingCaret(_ on: Bool) -> Text {
+    on ? Text("\u{2007}▍").foregroundStyle(Color.secondary) : Text("")
 }
