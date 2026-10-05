@@ -3931,7 +3931,14 @@ describe("harness HTTP API", () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
     const before = await api("GET", "/api/config");
-    expect(before.body.localVm).toEqual({ mode: "shared", maxInstances: 2 });
+    // The Host & CLI Integration booleans ride in the same section: a status
+    // that omitted them made the Settings checkboxes snap back after a save.
+    expect(before.body.localVm).toEqual({
+      mode: "shared",
+      maxInstances: 2,
+      shareCliCredentials: false,
+      allowHostTerminal: false,
+    });
 
     const shared = await api("GET", `/api/bots/${first.id}/local-computer`);
     expect(shared.status).toBe(200);
@@ -3941,7 +3948,12 @@ describe("harness HTTP API", () => {
       localVm: { mode: "per-bot", maxInstances: 3 },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
+    expect(saved.body.localVm).toEqual({
+      mode: "per-bot",
+      maxInstances: 3,
+      shareCliCredentials: false,
+      allowHostTerminal: false,
+    });
 
     const [firstStatus, secondStatus] = await Promise.all([
       api("GET", `/api/bots/${first.id}/local-computer`),
@@ -3960,6 +3972,35 @@ describe("harness HTTP API", () => {
     const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
     expect(disk.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
     await api("PATCH", "/api/config", { localVm: { mode: "shared", maxInstances: 2 } });
+  });
+
+  it("persists the Host & CLI Integration toggles across a save and a fresh read", async () => {
+    // The Settings checkboxes are controlled inputs bound to this response.
+    // They used to snap back because the status dropped both flags.
+    // Restored in `finally`: both flags are process-global, and a leaked
+    // `shareCliCredentials` would let a later VPS test mount real host
+    // credentials into a container.
+    try {
+      const saved = await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: true, allowHostTerminal: true },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+
+      const reread = await api("GET", "/api/config");
+      expect(reread.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+
+      // Turning one off must not disturb the other.
+      const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
+      expect(half.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+
+      // The in-memory status above is served from the same `cfg` the PUT
+      // wrote, so only the file on disk proves the save round trip.
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+    } finally {
+      await api("PUT", "/api/config", { localVm: { shareCliCredentials: false, allowHostTerminal: false } });
+    }
   });
 
   it("keeps an active turn alive when only the room timeout changes", async () => {
