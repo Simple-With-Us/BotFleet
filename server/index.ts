@@ -418,6 +418,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
+import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -5371,8 +5372,10 @@ async function startTurn(
       // changed them, and the rest stays the stable prefix a warm CLI or a
       // provider cache is keyed on (docs/prompt-prefix.md).
       const promptFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
+      const fleetSeat = fleetSeatPromptPart(bot);
       const prompt = buildSystemPrompt([
         { id: "persona", label: "Identity", text: persona },
+        ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
         {
           id: "computer",
@@ -7476,8 +7479,10 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
+    ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
     { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
     // Same sentence the 1:1 lane sends, in the same position: a computer the
     // bot is never told about is one it reaches for by accident.
