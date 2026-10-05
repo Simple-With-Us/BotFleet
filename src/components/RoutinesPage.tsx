@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  PauseCircle,
   Cloud,
   ExternalLink,
   Gauge,
@@ -461,7 +462,10 @@ export function RoutineEditor({
   );
 }
 
-function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
+// Exported for the visual fixture (src/components/RoutineHoldVisualFixture.tsx),
+// which mounts this panel in its hold state.  The app only ever renders it from
+// RoutinesPage below.
+export function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bot: Bot; onClose: () => void; onEdit: (routine: Routine) => void }) {
   const { state, dispatch } = useStore();
   const routine = item.routine;
   const run = item.run;
@@ -494,7 +498,7 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+      <div data-testid="routine-details" className="w-full max-w-[520px] overflow-hidden rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
         <div className="relative overflow-hidden border-b border-hairline/40 px-5 py-5" style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${BOT_COLORS[bot.color]} 28%, #111), #111)` }}>
           <button onClick={onClose} aria-label="Close Routine Details" className="absolute right-3 top-3 rounded-lg p-2 text-white/60 hover:bg-white/10 hover:text-white"><X size={18} /></button>
           <div className="flex items-center gap-4 pr-10">
@@ -514,6 +518,19 @@ function RoutineDetails({ item, bot, onClose, onEdit }: { item: CalendarItem; bo
           {run?.coalescedInto && <p className="text-[12px] text-ink-secondary">Combined with another delivery in this turn.{'\u00a0 '}All combined deliveries share its final outcome and cancellation.</p>}
           {outcome && outcome !== "completed" && <p className="text-[12px] font-medium text-ink">{ROUTINE_OUTCOME_LABELS[outcome]}{run?.failurePhase ? ` · ${run.failurePhase}` : ""}</p>}
           {run?.engineId && <p className="text-[12px] text-ink-secondary">Engine: {run.engineId}{run.model ? ` · ${run.model}` : ""}</p>}
+          {run?.holdReason && (
+            // The reason is only rendered while it is true, and it is cleared
+            // wherever the run stops being queued, so this cannot outlive the
+            // wait it describes.  A run still showing "queued" with nothing
+            // under it is the exact state this whole change set removed.
+            <div className="flex items-start gap-2 rounded-xl border border-hairline/25 bg-inset/40 px-3.5 py-3 text-[13px] leading-relaxed text-ink-secondary">
+              <PauseCircle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <span className="font-medium text-ink">Holding</span>{"\u00a0\u00a0"}
+                {run.holdReason}
+              </span>
+            </div>
+          )}
           {run?.error && <div className="flex items-start gap-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-3 text-[13px] text-danger"><CircleAlert size={16} className="mt-0.5 shrink-0" /><span>{run.error}</span></div>}
           {routine && (
             <div className="grid grid-cols-2 gap-3">

@@ -1,4 +1,5 @@
 import { normalizeRunOn, type RoutineRunOn } from "../shared/run-on.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
@@ -332,7 +333,7 @@ export interface ResourceTriggerManagerOptions {
   now?: () => number;
   sample?: () => HostSample;
   emit?: (event: ResourceTriggerManagerEvent) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
   enqueue: (input: {
