@@ -42,6 +42,19 @@ export interface KanbanCardItem {
   rawRun?: RoutineRun;
 }
 
+export function safeAvatarUrl(url?: string | null): string | null {
+  if (!url) return null;
+  try {
+    if (!URL.canParse(url)) return null;
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
 export function KanbanCommandCenter({
   onSelectApp,
   onSelectBot,
@@ -435,8 +448,8 @@ export function KanbanCommandCenter({
 
                     <div className="mt-1 flex items-center justify-between border-t border-hairline/30 pt-2 text-[11px]">
                       <div className="flex items-center gap-1.5 text-ink-secondary">
-                        {card.appAvatar ? (
-                          <img src={card.appAvatar} alt="" className="h-3.5 w-3.5 rounded-xs" />
+                        {safeAvatarUrl(card.appAvatar) ? (
+                          <img src={safeAvatarUrl(card.appAvatar)!} alt="" className="h-3.5 w-3.5 rounded-xs" />
                         ) : (
                           <FolderGit2 size={12} className="text-ink-tertiary" />
                         )}
@@ -513,8 +526,8 @@ export function KanbanCommandCenter({
 
                   <div className="mt-1 flex items-center justify-between border-t border-hairline/30 pt-2 text-[11px]">
                     <div className="flex items-center gap-1.5 text-ink-secondary">
-                      {card.botAvatar ? (
-                        <img src={card.botAvatar} alt="" className="h-3.5 w-3.5 rounded-xs" />
+                      {safeAvatarUrl(card.botAvatar) ? (
+                        <img src={safeAvatarUrl(card.botAvatar)!} alt="" className="h-3.5 w-3.5 rounded-xs" />
                       ) : (
                         <BotIcon size={12} className="text-ink-tertiary" />
                       )}
