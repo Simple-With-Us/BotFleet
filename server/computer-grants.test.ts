@@ -965,6 +965,11 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    const prompt = computerSystemPrompt(result.mounts, {
+      hasHostTerminal: true,
+      hostPlatform: "darwin",
+    });
+    expect(prompt).toContain("bash");
   });
 
   it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {

@@ -224,8 +224,9 @@ const localVmConfigSchema = z.object({
     .optional(),
   shareCliCredentials: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
-  /** Optional ceilings for the Local VM container.  Absent means "adapt to
-   * what the container runtime actually has, up to 4 CPUs / 8 GiB". */
+  /** Optional ceilings for the Local VM container.  Absent means "request about
+   * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
+   * up to 4 CPUs / 8 GiB". */
   cpus: z.number().int().min(1).max(4).optional(),
   memoryGib: z.number().int().min(1).max(8).optional(),
 });
