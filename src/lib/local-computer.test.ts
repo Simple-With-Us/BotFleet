@@ -102,7 +102,7 @@ describe("local computer UI eligibility", () => {
     expect(
       localComputerDisabledReason({ capabilities, providerSupportsLocal: true }),
     ).toBe(
-      "Local computer control is not available on Wayland yet.  Sign out and choose Ubuntu on Xorg to use This computer.",
+      "Local computer control is not available on Wayland yet.  Sign out and choose Ubuntu on Xorg to use This Computer.",
     );
   });
 

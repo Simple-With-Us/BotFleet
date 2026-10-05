@@ -499,7 +499,11 @@ function Shell() {
       )}
       {state.computerOpen && bot && (
         <Suspense fallback={<PanelFallback />}>
-          <ComputerPanel bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} />
+          {/* Keyed by bot so switching bots remounts the panel: its capture
+              refs and stream state are per-bot, and an inherited one hands
+              the next bot a previous bot's failure count and in-flight
+              request. */}
+          <ComputerPanel key={bot.id} bot={bot} onOpenVmWorkspace={openLocalVmWorkspace} />
         </Suspense>
       )}
       {state.inspectorOpen && bot && (

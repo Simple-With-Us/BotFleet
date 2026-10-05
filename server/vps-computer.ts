@@ -1379,7 +1379,7 @@ export async function vpsComputerScreenshot(
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
-): Promise<{ png: string; format: "png" | "jpeg" }> {
+): Promise<{ png: string; format: "png" | "jpeg"; capturedAt: number }> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
   const target = vpsTargetFor(cfg, botId);
@@ -1430,7 +1430,12 @@ export async function vpsComputerScreenshot(
     ]), { timeoutMs: 30_000 })).stdout.trim();
     const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
     if (!checked.ok) throw Object.assign(new Error("CUA Driver returned an incomplete VPS screenshot"), { status: 502 });
-    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
+    // Stamped here, between the pixels landing on the box and this returning,
+    // rather than left to the client to stamp on receipt.  Everything before
+    // this line — status check, lifecycle lock, SSH, the capture, the base64
+    // read-back — is latency the client would otherwise charge to the picture
+    // and use to decide it is newer than a streamed frame that beat it.
+    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png", capturedAt: Date.now() };
   } catch (error) {
     if (cacheable) statusCache.delete(key);
     throw error;

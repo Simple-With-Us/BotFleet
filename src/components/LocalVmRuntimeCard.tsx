@@ -368,7 +368,7 @@ export function LocalVmRuntimeCard() {
             )}
           </Step>
 
-          <Step n={3} title="Prepare the Linux Desktop (one-time download and build)" done={Boolean(status?.image)}>
+          <Step n={3} title="Prepare the Linux Desktop (One-Time Download and Build)" done={Boolean(status?.image)}>
             {status?.daemonUp && (
               <ActionButton action="pull" pending={pending} onClick={() => void act("pull")}>Prepare Linux Desktop</ActionButton>
             )}

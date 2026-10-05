@@ -431,5 +431,10 @@ export async function screenshotBox(cfg: AppConfig, botId: string, knownBoxId?: 
   }
   const data = await readFileBase64(cfg, boxId, PANEL_PATH);
   if (!data) throw new Error("could not read the frame back from the box");
-  return { png: data, format: "jpeg" };
+  // Stamped in the harness clock, matching vpsComputerScreenshot and the
+  // frames ScreenPollers publishes.  The panel ages a polled capture against a
+  // streamed one to decide which picture is newer, and that comparison is only
+  // meaningful when both stamps come from one clock — a browser-clock fallback
+  // here would reintroduce exactly that skew for the Box backend alone.
+  return { png: data, format: "jpeg" as const, capturedAt: Date.now() };
 }
