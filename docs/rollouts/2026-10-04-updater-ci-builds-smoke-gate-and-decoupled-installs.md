@@ -30,7 +30,7 @@ candidate was *after* the harness had already been quiesced and fenced.
 
 `prepareUpdate` gains a `smokeTestBundle` step between `validateBundle` and
 `persistPrepared` — the last point in the transaction that still touches nothing
-live: no `capturePrevious`, no candidate copy, no `launchctl`, no `/Applications`
+live: no prior-state capture, no candidate copy, no service restart, no bundle
 rename.  A failure there costs a staging directory instead of a rollback.
 
 The probe copies `Contents/Resources/server` out of the bundle and runs it on the
@@ -148,8 +148,8 @@ mis-parses a non-ASCII byte adjacent to a `$VAR`.
 - **The probe against the real installed signed bundle** `d9e646ffc292` on the
   owner's Mac: `ready: true`, `sqliteOk: true`, **17.6s quiet and 51.4s while four
   other seats were compiling** — the measured reason the boot budget is 180s.  The
-  live harness on `:8799` stayed `ready: true` throughout, with no scratch left
-  behind and no stray processes.  Recipe in `docs/verification/staged-candidate-smoke.md`.
+  the live harness stayed ready throughout, with no scratch left behind and no
+  stray processes.  Recipe in `docs/verification/staged-candidate-smoke.md`.
 - **Mutation-checked**, because a green test proves nothing until the fix is
   removed and it goes red: removing the `smokeTestBundle` label fails the update
   card's coverage guard with the step named; adding an import of
@@ -179,9 +179,9 @@ Retiring that path on macOS in favour of "one installation controller" is the
 architecturally correct end state, and it is also exactly the change that rule
 protects installed copies from.  It needs the owner's explicit call, not an
 agent's.  So Rec 2 proceeds on the half that touches no update-feed surface at
-all: `~/.botfleet/releases/<sha>/` for the always-on `app.botfleet.server`,
-`~/.botfleet/staging/<sha>/` for preparation, `current` swapped with `ln -sfn`,
-and the LaunchAgent `WorkingDirectory` pointed at `current`.  That is where the
+all: a versioned release directory per commit for the always-on harness,
+a staging directory for preparation, `current` swapped with `ln -sfn`,
+and the service definition's working directory pointed at `current`.  That is where the
 real pain is — the harness currently runs from a mutable linked worktree and
 `git checkout`s and swaps `node_modules` under a live Node process serving HTTP
 and SQLite writes (board `66bc29ad`) — and it resolves none of the ambiguity
