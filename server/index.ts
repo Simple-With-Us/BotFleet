@@ -14846,11 +14846,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (m && method === "DELETE") {
       let voiceId: string;
       try {
-        voiceId = decodeURIComponent(m[1]).trim();
+        // The pathname is the only trust boundary on the DELETE id.  A
+        // malformed value used to slip past the word class straight to
+        // deleteCustomVoice.  Parse it through Zod so the downstream
+        // service only ever receives a trimmed, non-empty value, and a
+        // failed decode or a failed parse both return 400 without a
+        // delete.  personal: / apple-personal: ids with a colon are still
+        // accepted (Zod only constrains shape, not characters).
+        voiceId = z.string().trim().min(1).parse(decodeURIComponent(m[1]));
       } catch {
         return json(res, 400, { error: "invalid voice id" });
       }
-      if (!voiceId) return json(res, 400, { error: "voiceId required" });
       const deleted = tts.deleteCustomVoice(voiceId);
       return json(res, 200, { ok: true, deleted });
     }

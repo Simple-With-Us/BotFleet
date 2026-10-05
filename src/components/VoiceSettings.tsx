@@ -8,7 +8,7 @@ import { Check, ExternalLink, Loader2, Mic, Plus, Trash2, Volume2, X } from "luc
 
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { speaker } from "@/lib/tts";
-import { parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
+import { CustomVoiceResponseSchema, parsePersonalVoiceList, parseTtsVoicesResponse } from "@/lib/tts/schema";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { resolveVoiceSummaryMode } from "../../shared/voice-summary";
@@ -205,42 +205,54 @@ export function VoiceSettings({
     setCustomAdding(true);
     setCustomError(null);
     try {
-      const res = (await api("/api/tts/custom-voice", {
+      const raw = await api("/api/tts/custom-voice", {
         method: "POST",
         body: JSON.stringify({ voiceId: id, label: customVoiceLabel.trim() || undefined }),
-      })) as { ok?: boolean; error?: string; voice?: { id: string; label: string } };
-      if (res.error) {
-        setCustomError(res.error);
-      } else {
-        const addedId = res.voice?.id;
-        // Refuse before clearing. A personal: id on a computer that cannot
-        // speak it must leave the typed id and label in the open form.
-        // The same refusal before capabilities arrive still needs a message:
-        // skipping it leaves the form open and silent.  Delete the row we
-        // just posted so loadVoices cannot list an id the picker will not
-        // select.  The gate is the ref after this await, so a Personal Voice
-        // that became allowed in flight is committed and kept.
-        if (addedId && !commitVoice(addedId, false)) {
-          if (isPersonalVoice(addedId)) {
-            try {
-              await api(`/api/tts/custom-voice/${encodeURIComponent(addedId)}`, { method: "DELETE" });
-            } catch {
-              // The id stays refused when cleanup fails.  The form still
-              // explains why it was not selected.
-            }
+      });
+      // The destructive DELETE URL below is built from this response, so it
+      // cannot be trusted through a cast.  Parse it through the strict
+      // CustomVoiceResponseSchema, stop on failure, and derive both the
+      // committed voice id and the encoded DELETE path from parsed.data.
+      const parsed = CustomVoiceResponseSchema.safeParse(raw);
+      if (!parsed.success) {
+        // Parse failure stops the whole flow: do not commit, do not DELETE,
+        // and surface a failure in the still-open custom-voice form so the
+        // typed id and label remain for the user to retry or correct.
+        setCustomError("Failed to add voice identifier.");
+        return;
+      }
+      if ("error" in parsed.data) {
+        setCustomError(parsed.data.error);
+        return;
+      }
+      const addedId = parsed.data.voice.id;
+      // Refuse before clearing. A personal: id on a computer that cannot
+      // speak it must leave the typed id and label in the open form.
+      // The same refusal before capabilities arrive still needs a message:
+      // skipping it leaves the form open and silent.  Delete the row we
+      // just posted so loadVoices cannot list an id the picker will not
+      // select.  The gate is the ref after this await, so a Personal Voice
+      // that became allowed in flight is committed and kept.
+      if (addedId && !commitVoice(addedId, false)) {
+        if (isPersonalVoice(addedId)) {
+          try {
+            await api(`/api/tts/custom-voice/${encodeURIComponent(addedId)}`, { method: "DELETE" });
+          } catch {
+            // The id stays refused when cleanup fails.  The form still
+            // explains why it was not selected.
           }
-          await loadVoices();
-          setCustomError(personalVoiceDisabledReasonFor(
-            capabilitiesReadyRef.current,
-            capabilitiesRef.current.dictation.reasonCode,
-          ));
-          return;
         }
         await loadVoices();
-        setCustomVoiceId("");
-        setCustomVoiceLabel("");
-        setCustomOpen(false);
+        setCustomError(personalVoiceDisabledReasonFor(
+          capabilitiesReadyRef.current,
+          capabilitiesRef.current.dictation.reasonCode,
+        ));
+        return;
       }
+      await loadVoices();
+      setCustomVoiceId("");
+      setCustomVoiceLabel("");
+      setCustomOpen(false);
     } catch (e) {
       setCustomError(e instanceof Error ? e.message : "Failed to add voice identifier.");
     } finally {
