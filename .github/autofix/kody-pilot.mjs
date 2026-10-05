@@ -1,7 +1,7 @@
 // Trusted control plane.  Never import or execute code from a target PR.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir, mkdtemp } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -40,9 +40,9 @@ export function validatePull(pr, input) {
   assert.equal(pr.base?.ref, 'main', 'Pilot targets main-bound PRs only.');
   assert.equal(pr.head?.sha, input.head, 'PR head moved; request a fresh review and dispatch.');
   assert.equal(pr.user?.type, 'User', 'Bot-authored PRs are unsupported.');
+  assert.equal(typeof pr.head.ref, 'string', 'Malformed source branch ref.');
   assert(!pr.head.ref.startsWith('codex/kody-fix-'), 'Fixer branches cannot trigger another fix.');
   assert.notEqual(pr.head.ref, 'main', 'The source branch must not be main.');
-  assert.equal(typeof pr.head.ref, 'string');
   return pr.head.ref;
 }
 export function selectFindings(threads, head) {
@@ -185,12 +185,14 @@ export function applyEdits(snapshot, answer) {
 }
 // A request limiter independently bounds retries and rejects every other route.
 // Only this trusted process sees the provider key; the tool-less CLI gets a dummy token.
-export async function startProxy(key, fetcher = fetch) {
+export async function startProxy(key, fetcher = fetch, report = console.error) {
   let requests = 0;
+  let blockedStatus = null;
   const server = createServer(async (req, res) => {
     const reject = (status) => { res.writeHead(status, { 'content-type': 'application/json' });
       res.end('{"type":"error","error":{"type":"invalid_request_error","message":"Pilot request rejected"}}'); };
     try {
+      if (blockedStatus !== null) return reject(blockedStatus);
       if (req.method !== 'POST' || req.url?.split('?')[0] !== '/v1/messages') return reject(400);
       const chunks = []; let size = 0;
       for await (const chunk of req) {
@@ -205,13 +207,23 @@ export async function startProxy(key, fetcher = fetch) {
         headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01', 'x-api-key': key },
         body: JSON.stringify(body),
       });
-      if (!upstream.ok) return reject(502);
+      if (!upstream.ok) {
+        if ([401, 402, 403, 429].includes(upstream.status)) {
+          blockedStatus = upstream.status;
+          report(JSON.stringify({event: 'kody_pilot.provider_rejected', keyRef: 'KODY_DEEPSEEK_API_KEY', status: blockedStatus}));
+          return reject(blockedStatus);
+        }
+        return reject(502);
+      }
       res.writeHead(200, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
       for await (const chunk of upstream.body) res.write(chunk);
       res.end();
     } catch { if (!res.headersSent) reject(502); else res.end(); }
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
   return { url: `http://127.0.0.1:${server.address().port}`, close: () => {
     server.closeAllConnections(); return new Promise((resolve) => server.close(resolve));
   } };
@@ -225,9 +237,10 @@ export function claudeArguments() {
 }
 export async function generate(snapshot, outputPath, env, fetcher = fetch) {
   assert(env.DEEPSEEK_API_KEY, 'DEEPSEEK_API_KEY is missing; activation is incomplete.');
-  const proxy = await startProxy(env.DEEPSEEK_API_KEY, fetcher);
   const home = await mkdtemp(join(tmpdir(), 'kody-pilot-'));
+  let proxy;
   try {
+    proxy = await startProxy(env.DEEPSEEK_API_KEY, fetcher);
     const result = await new Promise((resolve, reject) => {
       const child = spawn('claude', claudeArguments(), { cwd: home, env: {
         PATH: env.PATH, HOME: home, TMPDIR: home, CI: 'true',
@@ -258,7 +271,10 @@ export async function generate(snapshot, outputPath, env, fetcher = fetch) {
     assert.equal(response.is_error, false, 'Claude returned an unsuccessful result.');
     applyEdits(snapshot, response.structured_output);
     await writeFile(outputPath, JSON.stringify(response.structured_output));
-  } finally { await proxy.close(); }
+  } finally {
+    try { if (proxy) await proxy.close(); }
+    finally { await rm(home, {recursive: true, force: true}); }
+  }
 }
 export async function publish(request, original, answer, input) {
   assert.equal(original.version, 1);
@@ -315,8 +331,8 @@ async function main() {
   } else fail('Expected prepare, generate, or publish.');
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch((error) => {
-    console.error(`Pilot refused: ${String(error.message).split(/[\r\n]/)[0].slice(0, 200)}`);
+  main().catch(() => {
+    console.error('Kody pilot failed closed.  Inspect the failed step and runbook; raw errors are not logged.');
     process.exitCode = 1;
   });
 }

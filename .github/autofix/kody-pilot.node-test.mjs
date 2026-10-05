@@ -171,3 +171,40 @@ test('overlapping occurrences of old_text are ambiguous', () => {
   const data=packageData();data.files[0].content='===';const a=answer();a.edits[0].old_text='==';
   assert.throws(()=>applyEdits(data,a),/exactly once/);
 });
+
+test('malformed branch refs fail validation before string-method use', () => {
+  for(const value of [null,undefined,123,{}]) {const p=pull();p.head.ref=value;
+    assert.throws(()=>validatePull(p,input),/Malformed source branch ref/);}
+});
+test('credential, payment, permission and quota refusals stop upstream retries without key disclosure', async () => {
+  for(const status of [401,402,403,429]) {
+    let calls=0;const events=[];
+    const proxy=await startProxy('not-a-real-secret',async()=>{calls++;return new Response('sensitive upstream body',{status});},event=>events.push(event));
+    try {
+      const call=()=>fetch(proxy.url+'/v1/messages',{method:'POST',body:JSON.stringify({model:MODEL,max_tokens:100})});
+      assert.equal((await call()).status,status);assert.equal((await call()).status,status);
+      assert.equal(calls,1);assert.deepEqual(events,[JSON.stringify({event:'kody_pilot.provider_rejected',keyRef:'KODY_DEEPSEEK_API_KEY',status})]);
+    } finally {await proxy.close();}
+  }
+});
+test('model scratch home is removed after CLI startup failure and no provider call occurs', async () => {
+  const {generate}=await import('./kody-pilot.mjs');
+  const {readdir}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os');
+  const before=new Set((await readdir(tmpdir())).filter(name=>name.startsWith('kody-pilot-')));
+  let calls=0;
+  await assert.rejects(generate(packageData(),'/unused-output.json',{PATH:'/nonexistent-kody-fixture',DEEPSEEK_API_KEY:'fixture-only'},
+    async()=>{calls++;assert.fail('No upstream request is permitted.');}),/failed to start/);
+  assert.equal(calls,0);
+  const after=(await readdir(tmpdir())).filter(name=>name.startsWith('kody-pilot-')&&!before.has(name));
+  assert.deepEqual(after,[]);
+});
+test('top-level failures log a stable message without raw input', async () => {
+  const {spawnSync}=await import('node:child_process');
+  const {fileURLToPath}=await import('node:url');
+  const script=new URL('./kody-pilot.mjs',import.meta.url);
+  const result=spawnSync(process.execPath,[fileURLToPath(script),'prepare'],{encoding:'utf8',env:{...env,GITHUB_REPOSITORY:'private-input-marker'}});
+  assert.equal(result.status,1);
+  assert.equal(result.stderr.trim(),'Kody pilot failed closed.  Inspect the failed step and runbook; raw errors are not logged.');
+  assert(!result.stderr.includes('private-input-marker'));
+});
