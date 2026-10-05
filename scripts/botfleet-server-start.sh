@@ -38,6 +38,14 @@ if [ -d "$ROOT" ]; then
   else
     ROOT_UNRESOLVED="$ROOT"
   fi
+elif [ -L "$ROOT" ] || [ -e "$ROOT" ]; then
+  # It exists but is not a directory.  For a symlink root this is a DANGLING
+  # `current` pointer, because `test -d` follows symlinks — so the branch above
+  # never sees it, and without this the operator gets only preflight's
+  # "missing $ROOT/server/index.ts" plus a generic "run pnpm install" that
+  # reinstalls IN PLACE and cannot recreate a release that has been deleted.
+  # That is the precise misdiagnosis the block above exists to prevent.
+  ROOT_UNRESOLVED="$ROOT"
 fi
 PORT="${BOTFLEET_PORT:-8799}"
 NODE="${BOTFLEET_NODE:-/opt/homebrew/bin/node}"
