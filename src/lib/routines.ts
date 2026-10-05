@@ -48,6 +48,7 @@ export interface RoutineRun {
   webhookId?: string;
   deliveryId?: string;
   threadId?: string;
+  ownerThreadId?: string;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
