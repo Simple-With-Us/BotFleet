@@ -981,8 +981,12 @@ export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
   const macInset = capabilities.windowChrome === "mac-inset";
-  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
-  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);

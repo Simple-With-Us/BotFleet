@@ -1,5 +1,5 @@
 import { downloadAllBots, downloadAllConversations } from "@/lib/team-files";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Menu, X } from "lucide-react";
 import { StoreProvider, useStore, getRoomTerminology, type AppSettingsSection } from "@/state/store";
 import { eligibleTaskApps } from "@/lib/task-app-context";
@@ -14,6 +14,7 @@ import { UpdateBanner } from "@/components/UpdateBanner";
 import { DesktopCapabilitiesProvider } from "@/components/DesktopCapabilities";
 import { NoEngines } from "@/components/NoEngines";
 import { noEngineCanRun } from "@/lib/engine-status";
+import { threadIdForApp } from "@/lib/task-app-thread";
 
 // UI2: every one of these is already conditionally rendered — near-modal
 // panels/pages that most sessions never open in a given launch — so they
@@ -98,19 +99,38 @@ function Shell() {
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
+  const appKeyboardRouting = Boolean(
+    selectedAppId &&
+      ((group && !group.dm && group.id === selectedAppId) ||
+        (bot &&
+          state.viewedThreadId &&
+          state.viewedThreadId === threadIdForApp(bot, selectedAppId))),
+  );
+
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
   useEffect(() => {
     if (group && !group.dm) {
       setSelectedAppId(group.id);
     }
-  }, [group?.id]);
+  }, [group?.id, group?.dm]);
 
   // When selection changes via sidebar or store, yield matrix overview to the selected chat
   useEffect(() => {
     if (state.selectedId) {
       setMatrixOverviewActive(false);
     }
-  }, [state.selectedId]);
+    const selectedGroup = state.groups.find((g) => g.id === state.selectedId);
+    if (selectedGroup && !selectedGroup.dm) return;
+    const selectedBot = state.bots.find((b) => b.id === state.selectedId);
+    if (!selectedBot) return;
+    const inApp =
+      selectedAppId &&
+      state.viewedThreadId &&
+      state.viewedThreadId === threadIdForApp(selectedBot, selectedAppId);
+    if (!inApp) {
+      setSelectedAppId(null);
+    }
+  }, [state.selectedId, state.viewedThreadId, state.bots, state.groups, selectedAppId]);
 
   // Nothing on this machine can run a bot. A missing cloud login does not
   // count — that CLI can still host a local model. Wait for the first
@@ -118,6 +138,15 @@ function Shell() {
   // yet", and flashing the setup screen at every launch would be worse.  An
   // engine whose probe has not answered yet is not proof of an empty Mac.
   const noEngines = state.connected && noEngineCanRun(state.instances);
+
+  const openBotInApp = useCallback((botId: string, appId: string) => {
+    const b = state.bots.find((x) => x.id === botId);
+    const threadId = threadIdForApp(b, appId);
+    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+    if (threadId && threadId !== b?.threadId && !b?.busy) {
+      dispatch({ type: "switchTask", botId, threadId });
+    }
+  }, [state.bots, dispatch]);
 
   // App-wide shortcuts: ⌘N new bot · ⌘1–9 jump to bot · ⌘⇧[ / ⌘⇧] prev/next.
   // Kept deliberately small; every panel already closes on Esc.
@@ -133,20 +162,28 @@ function Shell() {
         const target = bots[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
-          dispatch({ type: "select", id: target.id });
+          if (selectedAppId && appKeyboardRouting) {
+            openBotInApp(target.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: target.id });
+          }
         }
       } else if (e.shiftKey && (e.key === "[" || e.key === "]")) {
         const idx = bots.findIndex((b) => b.id === state.selectedId);
         const next = bots[(idx + (e.key === "]" ? 1 : -1) + bots.length) % bots.length];
         if (next) {
           e.preventDefault();
-          dispatch({ type: "select", id: next.id });
+          if (selectedAppId && appKeyboardRouting) {
+            openBotInApp(next.id, selectedAppId);
+          } else {
+            dispatch({ type: "select", id: next.id });
+          }
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state.bots, state.selectedId, dispatch]);
+  }, [state.bots, state.selectedId, selectedAppId, appKeyboardRouting, dispatch, openBotInApp]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);
@@ -306,15 +343,6 @@ function Shell() {
   // `select` only changes client state.  Messages, reactions, recordings, and
   // loadEarlier follow `bot.threadId`, so a pin onto another thread would
   // render a transcript the store never loaded.
-  const openBotInApp = (botId: string, appId: string) => {
-    const b = state.bots.find((x) => x.id === botId);
-    const explicitTask = (b?.tasks ?? []).find((t) => t.workspaceContext?.appRef.id === appId);
-    const threadId = explicitTask?.threadId ?? b?.threadId;
-    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
-    if (threadId && threadId !== b?.threadId) {
-      dispatch({ type: "switchTask", botId, threadId });
-    }
-  };
 
   return (
     <div className="flex h-full flex-col">
@@ -393,6 +421,7 @@ function Shell() {
             activeBotId={bot?.id}
             onSelectBot={(botId) => {
               setMatrixOverviewActive(false);
+              setSelectedAppId(null);
               dispatch({ type: "select", id: botId });
             }}
             onSelectBotInApp={(botId, appId) => {
@@ -418,6 +447,7 @@ function Shell() {
                 }}
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
+                  setSelectedAppId(null);
                   dispatch({ type: "select", id: botId });
                 }}
                 onSelectBotInApp={(botId, appId) => {
@@ -426,6 +456,7 @@ function Shell() {
                   setSelectedAppId(appId);
                   openBotInApp(botId, appId);
                 }}
+                filterAppId={selectedAppId}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);

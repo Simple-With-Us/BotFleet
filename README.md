@@ -31,8 +31,8 @@ These are features this fork layered on after OpenMausBot.  **All of them are in
 
 ### Engines, failover, and telemetry
 
-- **Native DeepSeek driver** — DeepSeek models join Claude, Codex, Cursor, Grok, Gemini, and Antigravity via a native driver plus the dsh bot, with in-app rates and token pricing.
-- **Gemini and Antigravity engines** — engine options with tool access and local computer dispatch where configured and approved.
+- **Native DeepSeek driver** — DeepSeek models join the engine list via a native driver plus the dsh bot, with in-app rates and token pricing.
+- **Antigravity engine, including the Gemini models** — Antigravity is the engine; it serves Google's Gemini 3.7/3.8 Flash catalog alongside its own models.  There is no separate "Gemini engine" in the picker — see [Engines](#engines) below.
 - **Multi-tier model fallbacks** — first, second, and third choice models per bot.  Quota, usage-cap, and session-limit chips fail over to the saved chain automatically, including after tools already ran and in rooms.  Other streamed error paths are still in review.
 - **Elapsed turn timer** — a live timer on the in-progress turn, plus duration on completed activity runs.
 - **Usage telemetry** — live token consumption (prompt, completion, cache hits) and model costs stream to a Usage Monitor instance you configure, with project and repo classification.  Working-directory classification uses the folder **basename only**, never the full path.
@@ -50,6 +50,38 @@ These are features this fork layered on after OpenMausBot.  **All of them are in
 
 None of the items above are "done."  Treat them as a testing list.
 
+## Engines
+
+`server/drivers/builtIn.ts` currently registers **18 engines**.  The table below is the real list — it is generated from that registry, not from a hand-kept marketing list, so if you add a driver this section is the thing to update.
+
+| Engine | Driver | Talks to |
+|---|---|---|
+| Claude Code | `drivers/claude.ts` | local `claude` CLI, your login |
+| Codex | `drivers/codex.ts` | local `codex` CLI, your login |
+| Grok CLI | `drivers/grok.ts` | xAI API or local CLI |
+| Grok (ACP) | `drivers/acp/grok.ts` | Agent Client Protocol |
+| DeepSeek | `drivers/acp/deepseek.ts` | Agent Client Protocol |
+| DSH (DeepSeek Harness) | `drivers/acp/dsh.ts` | Agent Client Protocol |
+| Kimi | `drivers/acp/kimi.ts` | Agent Client Protocol |
+| MiniMax M Code | `drivers/acp/mcode.ts` | Agent Client Protocol |
+| Factory Droid | `drivers/acp/droid.ts` | Agent Client Protocol |
+| Cursor | `drivers/acp/cursor.ts` | Agent Client Protocol |
+| OpenCode | `drivers/acp/opencode-go.ts` | Agent Client Protocol |
+| Qwen | `drivers/acp/qwen.ts` | Agent Client Protocol |
+| Hermes | `drivers/acp/hermes.ts` | Agent Client Protocol |
+| pi | `drivers/pi.ts` | local agent runtime |
+| Antigravity | `drivers/antigravity.ts` | Antigravity — **also serves the Gemini 3.7/3.8 Flash models** |
+| MiniMax | `drivers/minimax.ts` | MiniMax API (`MINIMAX_API_KEY`) |
+| OpenAI-compatible | `drivers/openai-compat.ts` | any endpoint you point it at |
+| Box | `drivers/boxagent.ts` | ascii.dev cloud computer |
+
+Two things worth knowing before you read a model picker:
+
+- **Gemini is a model, not an engine here.**  The Gemini 3.7/3.8 Flash entries come from the Antigravity driver's catalog (`server/antigravity-models.ts`) and appear under Antigravity.  There is no separate Gemini engine in the registry.
+- **Adding one is deliberately cheap.**  The driver SPI in `server/contracts.ts` is small on purpose: write `server/drivers/<name>.ts` and append one line to `BUILT_IN_DRIVERS`.
+
+Some engines need a key (xAI, OpenAI-compatible, MiniMax, DeepSeek, Box, OpenCode) and the rest run against a CLI you have already logged into.  Composio is a separate tool integration, not an engine.  Unconfigured models stay out of the picker.
+
 ## From OpenMausBot
 
 BotFleet is a friendly fork of **[OpenMausBot](https://github.com/milind-soni/OpenMausBot)** by Milind Soni and contributors.
@@ -58,7 +90,7 @@ BotFleet is a friendly fork of **[OpenMausBot](https://github.com/milind-soni/Op
 
 When we forked, that project already shipped the core app this repo still runs on:
 
-- **Bring-your-own engines** — bots run on `claude`, `codex`, and `grok` CLIs installed on your machine (your logins and subscriptions, no proxy in the middle), with a custom-binary override in Settings → Engines.  Cursor and OpenCode engines were already in the box.
+- **Bring-your-own engines** — bots run on `claude`, `codex`, and `grok` CLIs installed on your machine (your logins and subscriptions, no proxy in the middle), with a custom-binary override in Settings → Engines.  Cursor and OpenCode engines were already in the box.  This fork has since grown the engine list well past that — see [Engines](#engines) for what is registered today.
 - **Local-first harness** — one small server on `127.0.0.1` owns every bot process.  Transcripts, keys, and events live on disk, not a vendor cloud.
 - **Per-bot model picker** — a provider rail, defaults marked, unavailable providers dimmed with the reason.  Switch a bot's model mid-conversation.
 - **A computer per bot** — cloud Linux desktop (Box), isolated Local VM, or this computer after explicit opt-in, with a live screen preview and browser takeover.
@@ -78,7 +110,7 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 
 ## Quick start
 
-**Released builds ([latest](https://github.com/jaywedgeworth22/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  Desktop numbering matches iOS (`1.0.x`).  This page always points at the latest packaged assets rather than a frozen tag.
+**Released builds ([latest](https://github.com/jaywedgeworth22/BotFleet/releases/latest)):** the harness server is embedded, so no separate server setup is required.  This page always points at the latest packaged assets rather than a frozen tag, so it tracks whatever is actually published.
 
 | | Download | Install |
 |---|---|---|
@@ -87,7 +119,16 @@ See the [OpenMausBot repository](https://github.com/milind-soni/OpenMausBot) for
 | **Windows** (x64) | Not published yet | The Windows installer is built by the release workflow but no Windows build has shipped.  Watch the [releases page](https://github.com/jaywedgeworth22/BotFleet/releases) or build from source below. |
 | **Ubuntu 24.04** (x64) | Not published yet | Ubuntu packages are built by the release workflow but no Ubuntu build has shipped.  See the [Ubuntu Desktop guide](docs/linux-desktop.md) to build one from source. |
 
-In-app **Check for updates** reads `latest-mac.yml` plus the macOS zips on the GitHub release.  v0.1.38 shipped DMGs only; 1.0.31 is the first desktop cut prepared with the complete feed.
+In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
+
+| | Value |
+|---|---|
+| Published release / tag | **v0.1.38** (the only tag) |
+| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No zip payload is published, so in-app updates install the DMG. |
+| `package.json` version on `main` | `1.0.31` |
+| iOS companion `MARKETING_VERSION` | `1.0.30` |
+
+`main` is ahead of the last cut, so **the build the download links above hand you is v0.1.38**, not `1.0.31`.  Desktop and iOS are numbered independently and currently differ by one patch.
 
 See the [Ubuntu Desktop guide](docs/linux-desktop.md) for installation, capabilities, and troubleshooting.
 
@@ -136,7 +177,9 @@ These credentials are optional — local chat works without them.  Paste a key o
 | Box API key | Give bots an isolated remote Linux computer with a desktop and terminal | [Box API key guide](https://docs.ascii.dev/box/api-keys) |
 | ElevenLabs key | Read replies aloud, and call your bots | [ElevenLabs API keys](https://elevenlabs.io/app/settings/api-keys) |
 
-Composio and Box are third-party services with their own accounts and terms.  Box is a paid service after its trial, and using a cloud computer may incur charges.
+**"Box" here means [ascii.dev](https://ascii.dev)'s cloud computer product** — the dashboard is `box.ascii.dev`, the API is `https://ascii.dev/api/box/v1`, and its keys start with `box_`.  It is **not** Box Inc. (`box.com`), and the two keys are not interchangeable.
+
+Composio is a third-party service with its own account and terms.  ascii.dev's Box needs a paid plan before it will create a computer, and using a cloud computer may incur charges from your provider.
 
 ```sh
 pnpm typecheck     # app + server
@@ -165,7 +208,13 @@ See [MCP server setup and tool reference](docs/mcp-server.md) for the stdio cont
 
 ## Status
 
-Early but real — the loop works end to end: message → bot → streamed reply → tools → approvals → computer use.  macOS has the primary released build; Windows and Ubuntu packages are produced by CI but have not shipped yet.  Ubuntu remains a beta with the capability limits above.  Hosted/mobile connectivity is still being built.  Voice needs an ElevenLabs key, and calls are macOS-only for now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md).
+Early but real — the loop works end to end: message → bot → streamed reply → tools → approvals → computer use.
+
+- **macOS is the only released platform.**  The published build is **v0.1.38** (Apple Silicon and Intel DMGs).  Windows and Ubuntu packages are produced by CI but **no Windows or Ubuntu build has ever shipped** — see the download table above.
+- **Ubuntu is beta**, with the capability limits in the table earlier in this file.
+- **Hosted/mobile connectivity is still being built.**  The iOS companion is on public TestFlight.
+- **Voice needs an ElevenLabs key**, and calls are macOS-only for now (they ride the same on-device dictation as the composer mic) — see [`docs/voice-mode.md`](docs/voice-mode.md).
+- The engine list is much larger than the one the project started with — see [Engines](#engines).
 
 Every BotFleet-layer add-on listed above is in testing.
 

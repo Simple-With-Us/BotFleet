@@ -224,8 +224,9 @@ const localVmConfigSchema = z.object({
     .optional(),
   shareCliCredentials: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
-  /** Optional ceilings for the Local VM container.  Absent means "adapt to
-   * what the container runtime actually has, up to 4 CPUs / 8 GiB". */
+  /** Optional ceilings for the Local VM container.  Absent means "request about
+   * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
+   * up to 4 CPUs / 8 GiB". */
   cpus: z.number().int().min(1).max(4).optional(),
   memoryGib: z.number().int().min(1).max(8).optional(),
 });
@@ -236,6 +237,8 @@ const featureConfigSchema = z.object({
   showToolCalls: z.boolean().optional(),
   /** Summarize consecutive tool actions into an expandable live summary card. On by default. */
   summarizeToolCalls: z.boolean().optional(),
+  /** Per-turn Git worktree isolation for bots working in a shared repository. */
+  gitWorktreeLeases: z.boolean().optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -619,7 +622,12 @@ export interface AppConfig {
     refreshMinutes?: number;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    gitWorktreeLeases?: boolean;
+  };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
   /** What this person calls a room: one of the presets, or "custom" with a

@@ -18,7 +18,10 @@ import { api, useStore, type ConfigStatus } from "@/state/store";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { productErrorHeadline } from "@/lib/product-error";
+import { redactCommandSecrets } from "@/lib/redact-command-secrets";
+import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
+
+const STATUS_TIMEOUT_MS = 15_000;
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -112,7 +115,8 @@ export function LocalVmRuntimeCard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<Action | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<null | { title: string; body: string; confirmLabel: string; action: Action }>(null);
   const [modePending, setModePending] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
@@ -138,7 +142,7 @@ export function LocalVmRuntimeCard() {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error ?? `Status request failed (${response.status})`);
     setStatus(body as Status);
-    setError(null);
+    setStatusError(null);
   }, []);
 
   useEffect(() => {
@@ -147,14 +151,26 @@ export function LocalVmRuntimeCard() {
     let controller: AbortController | undefined;
     const poll = async () => {
       controller = new AbortController();
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller?.abort();
+      }, STATUS_TIMEOUT_MS);
       try {
         await refresh(controller.signal);
       } catch (e) {
-        if (active && !(e instanceof DOMException && e.name === "AbortError")) {
-          setStatus(null);
-          setError(e instanceof Error ? e.message : String(e));
-        }
+        if (!active) return;
+        if (e instanceof DOMException && e.name === "AbortError" && !timedOut) return;
+        const message = e instanceof Error ? e.message : String(e);
+        setStatusError(
+          redactCommandSecrets(
+            timedOut
+              ? `Status check timed out after ${Math.round(STATUS_TIMEOUT_MS / 1000)} seconds. The container runtime may be busy or not responding.`
+              : message,
+          ),
+        );
       } finally {
+        window.clearTimeout(timeoutId);
         if (active) {
           setLoading(false);
           timer = window.setTimeout(() => void poll(), 5000);
@@ -200,7 +216,7 @@ export function LocalVmRuntimeCard() {
       return;
     }
     setPending(action);
-    setError(null);
+    setActionError(null);
     try {
       if (action === "recreate") {
         await post("remove");
@@ -210,7 +226,7 @@ export function LocalVmRuntimeCard() {
       }
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setActionError(redactCommandSecrets(e instanceof Error ? e.message : String(e)));
     } finally {
       setPending(null);
     }
@@ -228,7 +244,7 @@ export function LocalVmRuntimeCard() {
         status?.security === "unsafe" ||
         status?.persistence === "unsafe"),
   );
-  const unavailable = !loading && !status;
+  const unavailable = !loading && !status && Boolean(statusError);
   const host = status?.platform === "darwin" ? "Mac" : "computer";
   const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
   const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
@@ -298,7 +314,16 @@ export function LocalVmRuntimeCard() {
             </a>
           )}
         </div>
-        {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger" title={error}>{productErrorHeadline(error)}</div>}
+        {statusError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={statusError} onDismiss={() => setStatusError(null)} />
+          </div>
+        )}
+        {actionError && (
+          <div className="mt-3">
+            <PersistentActionErrorCard message={actionError} onDismiss={() => setActionError(null)} />
+          </div>
+        )}
       </Card>
 
       <Card
@@ -403,7 +428,19 @@ export function LocalVmRuntimeCard() {
                 )}
               </>
             ) : status?.container === "stopped" ? (
-              <ActionButton action="start" pending={pending} onClick={() => void act("start")} disabled={localVmOff}>Start Local VM</ActionButton>
+              <>
+                <div className="flex gap-2 text-[13px] text-warning">
+                  <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                  <span>{status?.problem ?? "This desktop cannot be resumed safely. Create a new Local VM instead."}</span>
+                </div>
+                {status?.image ? (
+                  <ActionButton action="recreate" pending={pending} onClick={() => void act("recreate")} danger disabled={localVmOff}>
+                    <RotateCcw size={13} /> Delete and recreate
+                  </ActionButton>
+                ) : (
+                  <div className="text-[13px] text-ink-secondary">Prepare the pinned Linux desktop above before recreating this VM.</div>
+                )}
+              </>
             ) : status?.container === "running" ? (
               <div className="flex items-center gap-2 text-[13px] text-ink-secondary"><Loader2 size={13} className="animate-spin" /> Waiting for the desktop…</div>
             ) : status?.image ? (
@@ -429,8 +466,8 @@ export function LocalVmRuntimeCard() {
       <Card
         title="Safety and Storage"
         subtitle={perBot
-          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 Each VM keeps the existing 8 GB, 4 CPU, 512-process and dropped-capability limits.\u00a0 VMs can still reach the internet.`
-          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are limited to 8 GB memory, 4 CPUs and 512 processes; all Linux capabilities are dropped except the two the desktop supervisor needs to switch to its unprivileged user.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
+          ? `Computer Driver operates only this VM's desktop.\u00a0 Every bot gets a private host folder mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; its files and browser profile survive VM replacement.\u00a0 Viewers bind only to loopback, and exact bot-derived targets prevent one bot from attaching to another bot's container.\u00a0 CPU and memory are sized to your container runtime (about 2 CPUs and 2–3 GiB by default), with a 512-process cap and dropped Linux capabilities.\u00a0 VMs can still reach the internet.`
+          : `Computer Driver operates only the VM's desktop.\u00a0 Exactly one private host folder is mounted at ${status?.workspace_guest_path ?? "/home/cua/workspace"}; files and browser sign-ins there survive VM replacement, while everything elsewhere in the VM remains disposable.\u00a0 The password-protected viewer is available only on this machine.\u00a0 Docker and Podman runs are sized to your runtime (about 2 CPUs and 2–3 GiB by default), capped at 512 processes, with all Linux capabilities dropped except the two the desktop supervisor needs.\u00a0 The VM can still reach the internet, and every bot sees the same files and sign-ins.`}
       >
         {existing && (
           <div className="flex flex-wrap gap-2">
