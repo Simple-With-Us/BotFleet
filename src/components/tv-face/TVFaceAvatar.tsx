@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { BotState, BotColor } from "@/lib/mascot";
 import {
   TVFACE_HAS_ENTER_RETURN,
+  TVFACE_HAS_HOLD,
   TVFACE_MANIFEST,
   type TVFaceExpression,
 } from "./manifest";
@@ -184,6 +185,36 @@ export function planFrame(
   return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
 }
 
+/** A plan rebuilt for a new speed, and the step of it that is still on screen. */
+export interface InFlightPlan {
+  steps: FrameStep[];
+  resumeIndex: number;
+}
+
+/**
+ * Rebuild the plan that is currently in flight for a new `transitionSpeed`.
+ *
+ * `planFrame` is keyed on the ORIGIN expression, so a speed-only rerun cannot
+ * call it with the expression already on screen: `prev === next` collapses the
+ * plan to a bare hold, which drops the enter/return already playing and — via
+ * a fresh `<img key>` — restarts it from frame 0.  The caller therefore keeps
+ * the origin and the current step index in a ref and hands them here.
+ *
+ * `resumeIndex` is the step still on screen; the wait that FOLLOWS it is
+ * recomputed for the new speed, and that step's own media is unchanged so the
+ * GIF is not remounted.
+ */
+export function replanInFlight(
+  origin: TVFaceExpression,
+  current: TVFaceExpression,
+  stepIndex: number,
+  speed: number,
+): InFlightPlan {
+  const steps = planFrame(origin, current, { speed });
+  const resumeIndex = Math.min(Math.max(stepIndex, 0), steps.length - 1);
+  return { steps, resumeIndex };
+}
+
 function tvFaceAssetPath(
   skinDir: string,
   expr: TVFaceExpression,
@@ -192,7 +223,9 @@ function tvFaceAssetPath(
   isStill = false,
 ): string {
   const base = `/tv-face/skins/${skinDir}`;
-  if (isStill || !animated) {
+  // A hold whose GIF no pack ships resolves to the still up front rather than
+  // 404ing into the same PNG through `onError`.
+  if (isStill || !animated || (type === "hold" && !TVFACE_HAS_HOLD.has(expr))) {
     return `${base}/stills/${expr}.png`;
   }
   return `${base}/gifs/${expr}_${type}.gif`;
@@ -262,6 +295,11 @@ export function TVFaceAvatar({
   const previousFrame = useRef<TVFaceFrame>({ expression: RESTING, skin: skinDir });
   const prevSpeed = useRef<number>(transitionSpeed);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The plan in flight, with the origin it was built from and the index of the
+  // step on screen.  A speed-only rerun needs the origin: `previousFrame`
+  // already holds the destination, and re-planning from it would collapse the
+  // plan to a bare hold (see `replanInFlight`).
+  const inFlight = useRef<{ origin: TVFaceExpression; steps: FrameStep[]; index: number } | null>(null);
 
   const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) =>
     tvFaceAssetPath(skinDir, expr, type, animated, isStill);
@@ -277,32 +315,59 @@ export function TVFaceAvatar({
     }
 
     const prev = previousFrame.current;
-    // A speed-only change must re-plan the wait with the new delay: the
-    // frame comparison below would otherwise compare the frame against
-    // itself and skip planFrame, leaving the in-flight wait unscaled.
+    // A speed-only change must re-arm the wait: the frame comparison below
+    // compares the frame against itself and skips planFrame, which would leave
+    // the in-flight wait unscaled.
     const speedChanged = prevSpeed.current !== transitionSpeed;
 
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
 
-    if (tvFaceFrameChanged(prev, { expression, skin: skinDir }) || speedChanged) {
-      const steps = planFrame(prev.expression, expression, { speed: transitionSpeed });
-      let i = 0;
-      const advance = () => {
-        const step = steps[i];
-        const src = pathForStep(step);
-        if (step.kind === "hold") {
-          holdEpochRef.current += 1;
-          setImgKey(imgKeyForStep(skinDir, step, holdEpochRef.current));
-        } else {
-          setImgKey(imgKeyForStep(skinDir, step, 0));
-        }
-        setCurrentGif(src);
-        i += 1;
-        if (i < steps.length) {
-          timeoutRef.current = setTimeout(advance, steps[i - 1].delayAfterMs);
-        }
+    const playFrom = (from: number) => {
+      const plan = inFlight.current;
+      if (!plan) return;
+      const step = plan.steps[from];
+      if (!step) return;
+      plan.index = from;
+      const src = pathForStep(step);
+      if (step.kind === "hold") {
+        holdEpochRef.current += 1;
+        setImgKey(imgKeyForStep(skinDir, step, holdEpochRef.current));
+      } else {
+        setImgKey(imgKeyForStep(skinDir, step, 0));
+      }
+      setCurrentGif(src);
+      if (from + 1 < plan.steps.length) {
+        timeoutRef.current = setTimeout(() => playFrom(from + 1), step.delayAfterMs);
+      }
+    };
+
+    if (tvFaceFrameChanged(prev, { expression, skin: skinDir })) {
+      inFlight.current = {
+        origin: prev.expression,
+        steps: planFrame(prev.expression, expression, { speed: transitionSpeed }),
+        index: 0,
       };
-      advance();
+      playFrom(0);
+    } else if (speedChanged && inFlight.current) {
+      // Rescale the wait that follows the step already playing.  `currentGif`
+      // and `imgKey` stay untouched on purpose — reassigning either would
+      // restart that GIF from frame 0.
+      const { steps, resumeIndex } = replanInFlight(
+        inFlight.current.origin,
+        expression,
+        inFlight.current.index,
+        transitionSpeed,
+      );
+      inFlight.current = { origin: inFlight.current.origin, steps, index: resumeIndex };
+      if (resumeIndex + 1 < steps.length) {
+        timeoutRef.current = setTimeout(
+          () => playFrom(resumeIndex + 1),
+          steps[resumeIndex].delayAfterMs,
+        );
+      }
     } else if (!currentGif) {
       holdEpochRef.current += 1;
       setImgKey(`${skinDir}:${expression}:hold:${holdEpochRef.current}`);
@@ -315,8 +380,6 @@ export function TVFaceAvatar({
     return () => {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
     };
-    // transitionSpeed intentionally included: changing it re-plans the wait
-    // with the new delay (see speedChanged above).
   }, [expression, animated, color, skinDir, transitionSpeed]);
 
   return (

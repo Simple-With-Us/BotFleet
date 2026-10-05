@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   planFrame,
+  replanInFlight,
   tvFaceFrameChanged,
   tvFaceSkinDir,
   transitionDelayMs,
@@ -14,6 +15,7 @@ import {
   TVFACE_URGENT,
   SHIPPED_SKINS,
 } from "./TVFaceAvatar";
+import { TVFACE_HAS_HOLD } from "./manifest";
 
 describe("tvFaceFrameChanged", () => {
   it("stays quiet when nothing about the frame changed", () => {
@@ -182,5 +184,54 @@ describe("planFrame", () => {
     const steps = planFrame("resting", "thinking", { speed: 2 });
     expect(steps[0]).toEqual({ expression: "thinking", kind: "enter", delayAfterMs: 500 });
     expect(steps[1]).toEqual({ expression: "thinking", kind: "hold", delayAfterMs: 0 });
+  });
+});
+
+describe("replanInFlight", () => {
+  // A speed-only rerun used to call planFrame(prev, prev), which hit the
+  // `prev === next` early return, dropped the enter already playing, and
+  // remounted the GIF from frame 0.  These pin the origin-keyed rebuild.
+  it("keeps the in-flight enter and rescales the wait that follows it", () => {
+    const { steps, resumeIndex } = replanInFlight("resting", "thinking", 0, 2);
+    expect(resumeIndex).toBe(0);
+    expect(steps[0]).toEqual({ expression: "thinking", kind: "enter", delayAfterMs: 500 });
+    expect(steps[1]).toEqual({ expression: "thinking", kind: "hold", delayAfterMs: 0 });
+  });
+
+  it("leaves the step on screen identical, so its GIF is not remounted", () => {
+    const playing = planFrame("resting", "thinking", { speed: 1 })[0];
+    const { steps, resumeIndex } = replanInFlight("resting", "thinking", 0, 2);
+    const resumed = steps[resumeIndex];
+    expect({ expression: resumed.expression, kind: resumed.kind }).toEqual({
+      expression: playing.expression,
+      kind: playing.kind,
+    });
+  });
+
+  it("rebuilds the return half of a plan from the same origin", () => {
+    const { steps, resumeIndex } = replanInFlight("typing", "resting", 0, 4);
+    expect(resumeIndex).toBe(0);
+    expect(steps[0]).toEqual({ expression: "typing", kind: "return", delayAfterMs: 250 });
+    expect(steps[1]).toEqual({ expression: "resting", kind: "still", delayAfterMs: 0 });
+  });
+
+  it("leaves a terminal step terminal, with nothing left to schedule", () => {
+    const { steps, resumeIndex } = replanInFlight("resting", "thinking", 1, 4);
+    expect(resumeIndex).toBe(1);
+    expect(steps).toHaveLength(2);
+    expect(steps[resumeIndex].kind).toBe("hold");
+  });
+
+  it("stays on the last step when the index overshoots a shorter plan", () => {
+    const { steps, resumeIndex } = replanInFlight("typing", "resting", 7, 2);
+    expect(resumeIndex).toBe(steps.length - 1);
+  });
+
+  it("does not turn a still-backed hold into a hold GIF that no pack ships", () => {
+    // `scared` ships a still only, so its plan is hold-shaped.  The speed
+    // rebuild must leave it alone rather than request `scared_hold.gif`.
+    const { steps, resumeIndex } = replanInFlight("resting", "scared", 0, 2);
+    expect(steps[resumeIndex]).toEqual({ expression: "scared", kind: "hold", delayAfterMs: 0 });
+    expect(TVFACE_HAS_HOLD.has("scared")).toBe(false);
   });
 });

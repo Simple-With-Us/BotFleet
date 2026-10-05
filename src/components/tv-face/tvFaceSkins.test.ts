@@ -17,7 +17,7 @@ import {
   tvFaceSkinDir,
   TVFACE_TRANSITION_MS,
 } from "./TVFaceAvatar";
-import { TVFACE_HAS_ENTER_RETURN, TVFACE_MANIFEST } from "./manifest";
+import { TVFACE_HAS_ENTER_RETURN, TVFACE_HAS_HOLD, TVFACE_MANIFEST, type TVFaceExpression } from "./manifest";
 
 const SKINS_DIR = join(process.cwd(), "public", "tv-face", "skins");
 const GIFS = join(SKINS_DIR, "default", "gifs");
@@ -69,7 +69,8 @@ const skinsOnDisk = (): string[] =>
         .sort()
     : [];
 
-const reachable = (): string[] => [...new Set(Object.values(TVFACE_MANIFEST))].sort();
+const reachable = (): TVFaceExpression[] =>
+  [...new Set(Object.values(TVFACE_MANIFEST))].sort();
 
 describe("the skins directory", () => {
   it("exists, so a missing-directory failure is never a false pass", () => {
@@ -123,7 +124,7 @@ describe("every reachable asset path exists", () => {
     const bad: string[] = [];
     for (const from of exprs) {
       for (const to of exprs) {
-        for (const step of planFrame(from as never, to as never)) {
+        for (const step of planFrame(from, to)) {
           if (step.kind === "enter" || step.kind === "return") {
             if (!TVFACE_HAS_ENTER_RETURN.has(step.expression)) {
               bad.push(`${from}->${to} asked for ${step.expression}_${step.kind}.gif`);
@@ -137,7 +138,7 @@ describe("every reachable asset path exists", () => {
 
   it("only ever plans a still, never a hold, for resting", () => {
     for (const from of reachable()) {
-      const last = planFrame(from as never, "resting").slice(-1)[0];
+      const last = planFrame(from, "resting").slice(-1)[0];
       if (from !== "resting") expect(last.kind, `from ${from}`).toBe("still");
     }
   });
@@ -205,6 +206,61 @@ describe("color skin packs mirror the default asset set", () => {
       }
       const { totalMs } = readGif(bytes);
       expect(Math.abs(totalMs - TVFACE_TRANSITION_MS), `${skin} thinking_enter ${totalMs}ms`).toBeLessThanOrEqual(20);
+    }
+  });
+});
+
+describe("hold art matches the shipped packs", () => {
+  it("declares no hold the default pack does not ship", () => {
+    const missing = [...TVFACE_HAS_HOLD].filter((e) => !existsSync(join(GIFS, `${e}_hold.gif`)));
+    expect(missing, `declared in TVFACE_HAS_HOLD but absent on disk: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("declares every hold the default pack does ship, so no plan 404s", () => {
+    const shipped = reachable().filter((e) => existsSync(join(GIFS, `${e}_hold.gif`)));
+    expect(
+      [...shipped].sort(),
+      "hold art exists on disk but is missing from TVFACE_HAS_HOLD",
+    ).toEqual([...TVFACE_HAS_HOLD].sort());
+  });
+
+  it("has the declared hold GIF in every shipped skin, not just default", () => {
+    const bad: string[] = [];
+    for (const skin of skinsOnDisk()) {
+      for (const e of TVFACE_HAS_HOLD) {
+        if (!existsSync(join(SKINS_DIR, skin, "gifs", `${e}_hold.gif`))) bad.push(`${skin}/gifs/${e}_hold.gif`);
+      }
+    }
+    expect(bad, `color packs missing declared hold GIFs:\n  ${bad.slice(0, 12).join("\n  ")}`).toEqual([]);
+  });
+
+  it("routes every planned hold to art that actually exists", () => {
+    // A hold step resolves to its GIF when TVFACE_HAS_HOLD claims one and to
+    // the still otherwise; either way the file must be on disk.
+    const bad: string[] = [];
+    for (const from of reachable()) {
+      for (const to of reachable()) {
+        for (const step of planFrame(from, to)) {
+          if (step.kind !== "hold") continue;
+          const file = TVFACE_HAS_HOLD.has(step.expression)
+            ? join(GIFS, `${step.expression}_hold.gif`)
+            : join(STILLS, `${step.expression}.png`);
+          if (!existsSync(file)) bad.push(`${from}->${to} requested ${file.split("/skins/")[1]}`);
+        }
+      }
+    }
+    expect(bad, `planned holds with no art on disk:\n  ${bad.slice(0, 8).join("\n  ")}`).toEqual([]);
+  });
+
+  it("gives a still-backed urgent cue no hold GIF to miss", () => {
+    // `scared` is urgent and ships a still only, which is what used to send the
+    // player to a 404 on the cue this PR exists to make land fast.
+    for (const e of ["alerting", "crash", "angry", "scared", "notifying"] as const) {
+      if (TVFACE_HAS_HOLD.has(e)) {
+        expect(existsSync(join(GIFS, `${e}_hold.gif`)), `${e} claims a hold GIF`).toBe(true);
+      } else {
+        expect(existsSync(join(STILLS, `${e}.png`)), `${e} has neither a hold GIF nor a still`).toBe(true);
+      }
     }
   });
 });
