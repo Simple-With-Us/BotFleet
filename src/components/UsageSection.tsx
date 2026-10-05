@@ -158,7 +158,7 @@ const RedundantFallbackSchema = z.object({
   instanceId: z.string(),
   model: z.string(),
   reason: z.enum(["same-as-primary", "duplicate"]),
-});
+}).strict();
 
 const RedundantChainSchema = z.object({
   botId: z.string(),
@@ -168,7 +168,7 @@ const RedundantChainSchema = z.object({
   total: z.number(),
   effective: z.number(),
   redundant: z.array(RedundantFallbackSchema),
-});
+}).strict();
 
 const RedundantChainArraySchema = z.array(RedundantChainSchema);
 

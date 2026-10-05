@@ -258,6 +258,37 @@ describe("RoutineManager", () => {
     expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("running");
   });
 
+  it("clears a stale hold reason when a hot host defers a webhook", async () => {
+    // The other skip paths (snooze, busy, min-gap) drop a reason they will
+    // not re-check.  A hot-host defer is the same kind of skip: the engine
+    // may have recovered, and the receipt must not keep naming a dead CLI
+    // for as long as the host stays hot.
+    const h = harness();
+    let hot = false;
+    h.options.hostHot = () => hot;
+    h.setCanStart(false);
+    h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-hold",
+      receivedAt: 1,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason)
+      .toBe("DeepSeek Harness could not start 3 times in a row");
+    hot = true;
+    h.setCanStart(true);
+    await h.manager.tick();
+    const deferred = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(deferred?.status).toBe("queued");
+    expect(deferred?.holdReason).toBeUndefined();
+    expect(h.triggerSources).toEqual([]);
+  });
+
   it("does not cancel an in-flight webhook when the host turns hot", async () => {
     const h = harness();
     let hot = false;

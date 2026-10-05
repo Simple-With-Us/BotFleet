@@ -977,27 +977,27 @@ function executionInstanceFor(
   return quotaCooldowns.resolveModel(bot.id, policy).selection.instanceId;
 }
 
-/** Every engine a turn for this bot could execute on.
+/** Engines this bot's queued runs would actually execute on.
  *
- *  A superset on purpose: the diagnostics panel needs to know whether an open
- *  breaker is holding a bot, and answering that per (bot, engine) with one
- *  selection is how a task-scoped or Box-backed hold gets reported as nothing
- *  happening.  Each entry is an engine the scheduler might legitimately be
- *  holding a run for, so membership is the honest question.
+ *  An open breaker is a hold only when a queued run would use that engine.
+ *  Counting every task override, and boxAgent whenever a cloud backend is
+ *  configured, reported a hold for work nobody had queued: an inactive task
+ *  whose breaker was open, or a Box engine with no cloud run waiting.  The
+ *  question is the one `dispatchHoldFor` asks, once per queued run, with
+ *  that run's thread and destination.  Coalesced children do not dispatch
+ *  on their own, so they are not a hold.
  *
- *  Bounded by the bot's own task count — it is a diagnostics read on a
- *  thirty-second poll, not the dispatch path. */
-function executableInstancesFor(
-  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null; tasks?: { modelSelection?: ModelSelection }[] },
+ *  A diagnostics read on a thirty-second poll, not the dispatch path. */
+function instancesHeldByQueuedRuns(
+  bot: { id: string; modelSelection: ModelSelection; cloudBackend?: "box" | "vps" | null },
 ): Set<string> {
   const instances = new Set<string>();
-  instances.add(executionInstanceFor(bot, bot.modelSelection, "bot"));
-  for (const task of bot.tasks ?? []) {
-    if (task.modelSelection) instances.add(executionInstanceFor(bot, task.modelSelection, "bot"));
-  }
-  if (cloudRunUsesBoxAgent("cloud", bot.cloudBackend ?? undefined, cfg.botDefaults?.cloudBackend)) {
-    const box = registry.instances().find((candidate) => candidate.driverKind === "boxAgent");
-    if (box) instances.add(box.instanceId);
+  if (!routines) return instances;
+  for (const run of routines.listRuns()) {
+    if (run.coalescedInto || run.botId !== bot.id || run.status !== "queued") continue;
+    const task = run.threadId ? store.taskByThread(bot.id, run.threadId) : undefined;
+    const policy = task?.modelSelection ?? bot.modelSelection;
+    instances.add(executionInstanceFor(bot, policy, run.runOn));
   }
   return instances;
 }
@@ -13199,15 +13199,12 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // bot would actually use, which is the same question dispatchHoldFor
           // asks — so it is answered here, once, instead of guessed at in the
           // panel from a list that knows nothing about the bot's selection.
-          // The engines a HELD run could actually be on for this bot: its own
-          // selection, every task that overrides it (the scheduler prefers the
-          // task), and boxAgent when the bot has cloud automation. Answering
-          // with the bot-level selection alone reported a task-held routine and
-          // a Box-backed cloud routine as NOT held, because neither uses the
-          // bot's engine — the same "judged on the wrong selection" mistake as
-          // the two earlier P1s, in a diagnostic.
+          // Only a queued run's real engine.  An inactive task override, or
+          // boxAgent merely because a cloud backend is configured, is not a
+          // hold: nothing queued is waiting on it.  The run's own thread and
+          // destination are what dispatchHoldFor would judge.
           const holds = Boolean(
-            bot && open && executableInstancesFor(bot).has(entry.instanceId),
+            bot && open && instancesHeldByQueuedRuns(bot).has(entry.instanceId),
           );
           return {
             ...entry,
