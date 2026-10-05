@@ -271,10 +271,7 @@ export class WorktreeLeaseManager {
         }
 
         if (options.removeBranch) {
-          await this.runGit(
-            ["branch", "-D", leaseInfo.branch],
-            leaseInfo.repoRoot,
-          ).catch(() => {});
+          throw new Error("Branch deletion requires explicit owner confirmation");
         }
       });
     } finally {
@@ -315,8 +312,7 @@ export class WorktreeLeaseManager {
             const targetKey = `worktree:${hashDir.name}:${targetKeySuffix}`;
             if (this.exactTurnLeases.hasTarget(targetKey)) continue;
 
-            rmSync(entryPath, { recursive: true, force: true });
-            pruned++;
+            continue;
           } catch {
             errors++;
           }

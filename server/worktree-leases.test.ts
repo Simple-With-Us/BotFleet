@@ -177,7 +177,7 @@ describe("WorktreeLeaseManager", () => {
     await manager.release(recovered);
   });
 
-  it("prunes stale unclaimed worktrees older than maxAgeMs", async () => {
+  it("stops automatic deletion of stale worktrees without confirmed workflow", async () => {
     const lease = await manager.acquire(repoDir, "bot-stale", "thread-stale", 50);
     const worktreePath = lease.worktreePath;
 
@@ -185,9 +185,16 @@ describe("WorktreeLeaseManager", () => {
     await manager.release(lease, { keepWorktree: true });
     expect(existsSync(worktreePath)).toBe(true);
 
-    // Prune with maxAgeMs = 0 (everything older than 0ms is eligible)
+    // Prune with maxAgeMs = 0 skips automatic deletion
     const result = await manager.pruneStaleWorktrees(0);
-    expect(result.pruned).toBeGreaterThanOrEqual(1);
-    expect(existsSync(worktreePath)).toBe(false);
+    expect(result.pruned).toBe(0);
+    expect(existsSync(worktreePath)).toBe(true);
+  });
+
+  it("refuses unconfirmed branch deletion during release", async () => {
+    const lease = await manager.acquire(repoDir, "bot-del", "thread-del", 60);
+    await expect(manager.release(lease, { removeBranch: true })).rejects.toThrow(
+      "Branch deletion requires explicit owner confirmation",
+    );
   });
 });
