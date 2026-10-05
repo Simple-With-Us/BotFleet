@@ -13,6 +13,7 @@ describe("HostCliIntegrationCard", () => {
 
   it("saves each toggle through the config route and reports a failed save itself", () => {
     expect(card).toContain('"/api/config"');
+    expect(card).toContain("PersistentActionErrorCard");
     expect(card).toContain("shareCliCredentials");
     expect(card).toContain("allowHostTerminal");
     expect(card).toContain("setError(");

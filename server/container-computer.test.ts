@@ -27,8 +27,10 @@ import {
   VM_WORKSPACE_ROOT,
   WORKSPACE_LABEL,
   DEFAULT_CONTAINER_LIMITS,
+  LEGACY_UNLABELED_CONTAINER_LIMITS,
   LIMITS_LABEL,
   adaptContainerLimits,
+  localVmHostCapacityError,
   declaredHardening,
   authorizeBoxGateway,
   defaultCommandRunner,
@@ -877,6 +879,8 @@ describe("wakeContainerComputer", () => {
       if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
       if (key === "/usr/bin/which podman") throw new Error("missing");
       if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "Linux\n" };
       if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
       if (key === `docker inspect ${CONTAINER}`) {
         if (phase === "running") return { stdout: readyInspect() };
@@ -950,11 +954,31 @@ describe("wakeContainerComputer", () => {
     const stopped = await containerComputerStatus(fake.run, "linux");
 
     await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
-      /could not be restarted: daemon exploded/,
+      /could not be started: daemon exploded/,
     );
     // The removal really happened (no silent skip), and no stale "stopped"
     // verdict was reused.
     expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+  });
+
+  it("creates a missing container on wake without calling remove first", async () => {
+    const fake = wakeFake();
+    let containerMissing = true;
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === `docker inspect ${CONTAINER}` && containerMissing) throw new Error("No such container");
+      if (key.startsWith("docker run ")) containerMissing = false;
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "4 8589934592\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      return fake.run(command, args);
+    };
+    const missing = await containerComputerStatus(run, "linux");
+    expect(missing.container).toBe("missing");
+
+    const woken = await wakeContainerComputer(missing, run, "linux");
+    expect(woken.container).toBe("running");
+    expect(fake.calls.filter((call) => call === `docker rm -f ${CONTAINER}`)).toHaveLength(0);
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
   });
 
   it("reports a remove failure without attempting a run", async () => {
@@ -962,7 +986,7 @@ describe("wakeContainerComputer", () => {
     const stopped = await containerComputerStatus(fake.run, "linux");
 
     await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
-      /could not be restarted: rm refused/,
+      /could not be started: rm refused/,
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });
@@ -1016,8 +1040,8 @@ describe("setupCommands", () => {
 
   it("limits resources and retains only the sandbox supervisor's identity-switch caps", () => {
     const command = setupCommands("docker", "linux").run!;
-    expect(command).toContain("--memory 8g --memory-swap 8g");
-    expect(command).toContain("--cpus 4 --pids-limit 512");
+    expect(command).toContain("--memory 3g --memory-swap 3g");
+    expect(command).toContain("--cpus 2 --pids-limit 512");
     expect(command).toContain("--ipc private --cgroupns private");
     expect(command).toContain("--cap-drop ALL --cap-add SETUID --cap-add SETGID");
     expect(command).toContain(`--label ${MANAGED_LABEL}=1`);
@@ -1051,7 +1075,7 @@ describe("setupCommands", () => {
     const commands = setupCommands("container", "darwin");
     expect(commands.runtimeStart).toBe("container system start");
     expect(commands.remove).toBe(`container rm --force ${CONTAINER}`);
-    expect(commands.run).toContain("--memory 8g --cpus 4 --cap-drop ALL");
+    expect(commands.run).toContain("--memory 3g --cpus 2 --cap-drop ALL");
     expect(commands.run).not.toContain("--memory-swap");
   });
 
@@ -1226,40 +1250,53 @@ describe("Box gateway", () => {
   });
 });
 
+describe("localVmHostCapacityError", () => {
+  it("refuses hosts below the CPU and memory floors with plain guidance", () => {
+    expect(localVmHostCapacityError({ cpus: 1, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toMatch(
+      /OrbStack has 1 CPUs.*at least 2.*Settings → System/,
+    );
+    expect(localVmHostCapacityError({ cpus: 4, memoryBytes: 1024 ** 3 }, "Docker")).toMatch(
+      /about 1 GiB.*at least 2 GiB/,
+    );
+    expect(localVmHostCapacityError({ cpus: 3, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toBeNull();
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+  });
+});
+
 describe("adaptive container limits", () => {
-  it("keeps the historical 4 CPU / 8 GiB cap on a roomy runtime", () => {
-    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 })).toEqual({ cpus: 4, memoryGib: 8 });
+  it("requests a modest 2 CPU / 3 GiB cap on a roomy runtime", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
     expect(adaptContainerLimits(null)).toEqual(DEFAULT_CONTAINER_LIMITS);
   });
 
   it("shrinks to an OrbStack-sized runtime (3 CPUs, 4 GiB) instead of failing to start", () => {
-    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
     expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 1 });
   });
 
   it("honours a configured ceiling and never exceeds 4 / 8", () => {
-    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 }, { cpus: 2, memoryGib: 3 })).toEqual({
-      cpus: 2,
-      memoryGib: 3,
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 }, { cpus: 4, memoryGib: 8 })).toEqual({
+      cpus: 4,
+      memoryGib: 8,
     });
     expect(adaptContainerLimits(null, { cpus: 99, memoryGib: 99 })).toEqual({ cpus: 4, memoryGib: 8 });
   });
 
   it("asks the runtime what it has, and falls back to the ceiling when it will not say", async () => {
     const answering = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3 4294967296\n" });
-    expect(await resolveContainerLimits("docker", answering.run)).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(await resolveContainerLimits("docker", answering.run)).toEqual({ cpus: 2, memoryGib: 3 });
     const podman = runner({ "podman info --format {{.Host.CPUs}} {{.Host.MemTotal}}": "2 8589934592\n" });
-    expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 6 });
+    expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 3 });
     const silent = runner({});
     expect(await resolveContainerLimits("docker", silent.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
   });
 
   it("reads declared limits from the label and treats anything odd as the historical cap", () => {
     expect(limitsFromLabels({ [LIMITS_LABEL]: "3x3" })).toEqual({ cpus: 3, memoryGib: 3 });
-    expect(limitsFromLabels({})).toEqual(DEFAULT_CONTAINER_LIMITS);
-    expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(DEFAULT_CONTAINER_LIMITS);
-    expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(DEFAULT_CONTAINER_LIMITS);
-    expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(DEFAULT_CONTAINER_LIMITS);
+    expect(limitsFromLabels({})).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
   });
 
   it("judges declaredHardening against safety floors and rejects self-declared sub-minimum limits", () => {
@@ -1272,8 +1309,8 @@ describe("adaptive container limits", () => {
       memoryBytes: 1 * 1024 ** 3,
     });
     expect(declaredHardening(null)).toEqual({
-      nanoCpus: DEFAULT_CONTAINER_LIMITS.cpus * 1_000_000_000,
-      memoryBytes: DEFAULT_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+      nanoCpus: LEGACY_UNLABELED_CONTAINER_LIMITS.cpus * 1_000_000_000,
+      memoryBytes: LEGACY_UNLABELED_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
     });
   });
 
@@ -1284,8 +1321,8 @@ describe("adaptive container limits", () => {
     expect(args[args.indexOf("--cpus") + 1]).toBe("3");
     expect(args).toContain(`${LIMITS_LABEL}=3x3`);
     const defaults = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux");
-    expect(defaults[defaults.indexOf("--memory") + 1]).toBe("8g");
-    expect(defaults[defaults.indexOf("--cpus") + 1]).toBe("4");
+    expect(defaults[defaults.indexOf("--memory") + 1]).toBe("3g");
+    expect(defaults[defaults.indexOf("--cpus") + 1]).toBe("2");
   });
 
   it("reports a container built with adapted limits as hardened, and a mismatch as unsafe", async () => {
@@ -1366,7 +1403,7 @@ describe("Local VM creation on a busy host", () => {
     const runCalls: string[][] = [];
     await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(null));
     expect(runCalls).toHaveLength(1);
-    expect(runCalls[0]![runCalls[0]!.indexOf("--cpus") + 1]).toBe("3");
+    expect(runCalls[0]![runCalls[0]!.indexOf("--cpus") + 1]).toBe("2");
     expect(runCalls[0]![runCalls[0]!.indexOf("--memory") + 1]).toBe("3g");
   });
 

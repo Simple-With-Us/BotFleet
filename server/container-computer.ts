@@ -89,38 +89,49 @@ export type LifecycleAction = "pull" | "run" | "start" | "stop" | "remove";
 
 const INTERNAL_VIEWER_PORT = 6901;
 const HOST_VIEWER_PORT = 6080;
-/** Resource limits every managed container gets: the Local VM here and the
- * BYO-VPS container in vps-computer.ts.  PR #122 raised them from 4 GiB and
- * 2 CPUs to 8 GiB and 4 CPUs.  The run arguments and the inspect matchers
- * below are all derived from these two numbers so they cannot drift apart:
- * a container created with `--cpus 4` and then checked against 2 CPUs is
- * rejected as "unsafe" by the very runtime that created it. */
-export const CONTAINER_MEMORY_GIB = 8;
-export const CONTAINER_CPUS = 4;
-export const CONTAINER_MEMORY_ARG = `${CONTAINER_MEMORY_GIB}g`;
-export const CONTAINER_CPUS_ARG = String(CONTAINER_CPUS);
-const MEMORY_BYTES = CONTAINER_MEMORY_GIB * 1024 * 1024 * 1024;
-const NANO_CPUS = CONTAINER_CPUS * 1_000_000_000;
+/** Hard ceiling for a Local VM (config override cannot exceed). */
+export const LOCAL_VM_MAX_CPUS = 4;
+export const LOCAL_VM_MAX_MEMORY_GIB = 8;
+/** Modest default request before fitting to the runtime VM (OrbStack, Colima, …). */
+export const LOCAL_VM_REQUEST_CPUS = 2;
+export const LOCAL_VM_REQUEST_MEMORY_GIB = 3;
+/** @deprecated Use LOCAL_VM_MAX_* — kept for callers that imported the old names. */
+export const CONTAINER_MEMORY_GIB = LOCAL_VM_MAX_MEMORY_GIB;
+export const CONTAINER_CPUS = LOCAL_VM_MAX_CPUS;
+export const CONTAINER_MEMORY_ARG = `${LOCAL_VM_MAX_MEMORY_GIB}g`;
+export const CONTAINER_CPUS_ARG = String(LOCAL_VM_MAX_CPUS);
+const MEMORY_BYTES = LOCAL_VM_MAX_MEMORY_GIB * 1024 * 1024 * 1024;
+const NANO_CPUS = LOCAL_VM_MAX_CPUS * 1_000_000_000;
 const PIDS_LIMIT = 512;
 const SHM_BYTES = 512 * 1024 * 1024;
 
-/** What one Local VM container is capped at.  The maximum (4 CPUs, 8 GiB) is
- * only a ceiling: a runtime with less (OrbStack's default VM is 3 CPUs and
- * 4 GiB) cannot start a container asking for more, so the limits adapt. */
+/** What one Local VM container is capped at.  The configured request (2 CPUs,
+ * 3 GiB by default) is only a starting point: `adaptContainerLimits` fits it
+ * to what the runtime reports, up to LOCAL_VM_MAX_* and down to 1 CPU / 1 GiB
+ * when the runtime is tight. */
 export interface ContainerLimits {
   cpus: number;
   memoryGib: number;
 }
-export const DEFAULT_CONTAINER_LIMITS: ContainerLimits = { cpus: CONTAINER_CPUS, memoryGib: CONTAINER_MEMORY_GIB };
+export const DEFAULT_CONTAINER_LIMITS: ContainerLimits = {
+  cpus: LOCAL_VM_REQUEST_CPUS,
+  memoryGib: LOCAL_VM_REQUEST_MEMORY_GIB,
+};
+/** Pre-adaptive containers without a limits label used the old 4 / 8 cap. */
+export const LEGACY_UNLABELED_CONTAINER_LIMITS: ContainerLimits = {
+  cpus: LOCAL_VM_MAX_CPUS,
+  memoryGib: LOCAL_VM_MAX_MEMORY_GIB,
+};
 export const LIMITS_LABEL = "com.botfleet.limits";
 const MIN_CONTAINER_MEMORY_GIB = 2;
+export const MIN_CONTAINER_CPUS = 2;
 
 export function clampContainerLimits(limits: Partial<ContainerLimits>): ContainerLimits {
   const whole = (value: number | undefined, fallback: number, min: number, max: number) =>
     Number.isFinite(value) ? Math.min(max, Math.max(min, Math.floor(value as number))) : fallback;
   return {
-    cpus: whole(limits.cpus, CONTAINER_CPUS, 1, CONTAINER_CPUS),
-    memoryGib: whole(limits.memoryGib, CONTAINER_MEMORY_GIB, 1, CONTAINER_MEMORY_GIB),
+    cpus: whole(limits.cpus, LOCAL_VM_REQUEST_CPUS, 1, LOCAL_VM_MAX_CPUS),
+    memoryGib: whole(limits.memoryGib, LOCAL_VM_REQUEST_MEMORY_GIB, 1, LOCAL_VM_MAX_MEMORY_GIB),
   };
 }
 
@@ -131,18 +142,18 @@ export function limitsLabelValue(limits: ContainerLimits): string {
 /** The limits a container declares it was created with.  An absent or
  * malformed label is a container from before limits adapted, so the historical
  * 4 CPU / 8 GiB cap applies.  The declared numbers are only ever compared with
- * what the runtime reports — never trusted past the 4 / 8 ceiling. */
+ * what the runtime reports — never trusted past the LOCAL_VM_MAX ceiling. */
 export function limitsFromLabels(labels: Record<string, string> | undefined | null): ContainerLimits {
   const match = /^(\d{1,2})x(\d{1,2})$/.exec(labels?.[LIMITS_LABEL] ?? "");
-  if (!match) return DEFAULT_CONTAINER_LIMITS;
+  if (!match) return LEGACY_UNLABELED_CONTAINER_LIMITS;
   const limits = { cpus: Number(match[1]), memoryGib: Number(match[2]) };
   const clamped = clampContainerLimits(limits);
   return clamped.cpus === limits.cpus && clamped.memoryGib === limits.memoryGib && limits.cpus >= 1 && limits.memoryGib >= 1
     ? limits
-    : DEFAULT_CONTAINER_LIMITS;
+    : LEGACY_UNLABELED_CONTAINER_LIMITS;
 }
 
-/** Pick limits for a new container: the configured ceiling (or 4 / 8), cut to
+/** Pick limits for a new container: the configured request (default 2 / 3), cut to
  * what the runtime has.  Memory keeps a quarter of the runtime's RAM free for
  * the runtime itself and its other containers. */
 export function adaptContainerLimits(
@@ -159,6 +170,74 @@ export function adaptContainerLimits(
   return { cpus: Math.max(1, cpus), memoryGib };
 }
 
+function runtimeProductName(runtime: Runtime): string {
+  switch (runtime) {
+    case "docker":
+      return "Docker";
+    case "podman":
+      return "Podman";
+    case "container":
+      return "Apple Container";
+    default: {
+      const never: never = runtime;
+      return never;
+    }
+  }
+}
+
+/** Best-effort host capacity for the runtime VM (OrbStack, Colima, Podman machine, …). */
+export async function readRuntimeHost(
+  runtime: Runtime,
+  runner: CommandRunner,
+): Promise<{ cpus?: number; memoryBytes?: number }> {
+  if (runtime === "container") return {};
+  const format = runtime === "podman" ? "{{.Host.CPUs}} {{.Host.MemTotal}}" : "{{.NCPU}} {{.MemTotal}}";
+  try {
+    const { stdout } = await runner(runtime, ["info", "--format", format], 8000);
+    const [cpus, memoryBytes] = stdout.trim().split(/\s+/).map(Number);
+    return {
+      cpus: Number.isFinite(cpus) ? cpus : undefined,
+      memoryBytes: Number.isFinite(memoryBytes) ? memoryBytes : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Product name shown in operator-facing errors (OrbStack when Docker reports it). */
+export async function resolveRuntimeHostLabel(runtime: Runtime, runner: CommandRunner): Promise<string> {
+  if (runtime === "container") return "Apple Container";
+  try {
+    const { stdout } = await runner(runtime, ["info", "--format", "{{.OperatingSystem}}"], 8000);
+    const os = stdout.trim();
+    if (/orbstack/i.test(os)) return "OrbStack";
+    if (/colima/i.test(os)) return "Colima";
+    if (/docker desktop/i.test(os)) return "Docker Desktop";
+    if (/rancher desktop/i.test(os)) return "Rancher Desktop";
+  } catch {
+    // Fall back to the runtime family name.
+  }
+  return runtimeProductName(runtime);
+}
+
+/** Plain-language refusal when the runtime VM is smaller than a Local VM can use. */
+export function localVmHostCapacityError(
+  host: { cpus?: number; memoryBytes?: number },
+  runtimeLabel: string,
+): string | null {
+  const cpus = host.cpus ?? 0;
+  const gib = host.memoryBytes && host.memoryBytes > 0 ? host.memoryBytes / 1024 ** 3 : 0;
+  if (cpus > 0 && cpus < MIN_CONTAINER_CPUS) {
+    const cpusText = Number.isInteger(cpus) ? String(Math.floor(cpus)) : cpus.toFixed(2);
+    return `${runtimeLabel} has ${cpusText} CPUs; the Local VM needs at least ${MIN_CONTAINER_CPUS}. Raise it in ${runtimeLabel} Settings → System, then try again.`;
+  }
+  if (gib > 0 && gib < MIN_CONTAINER_MEMORY_GIB) {
+    const gibText = gib < 10 ? gib.toFixed(1).replace(/\.0$/, "") : String(Math.floor(gib));
+    return `${runtimeLabel} has about ${gibText} GiB of memory; the Local VM needs at least ${MIN_CONTAINER_MEMORY_GIB} GiB. Raise it in ${runtimeLabel} Settings → System, then try again.`;
+  }
+  return null;
+}
+
 /** Ask the runtime how much it has.  Best effort: a runtime that will not say
  * leaves the configured ceiling in place. */
 export async function resolveContainerLimits(
@@ -167,17 +246,8 @@ export async function resolveContainerLimits(
   configured: Partial<ContainerLimits> = {},
 ): Promise<ContainerLimits> {
   if (runtime === "container") return clampContainerLimits(configured);
-  const format = runtime === "podman" ? "{{.Host.CPUs}} {{.Host.MemTotal}}" : "{{.NCPU}} {{.MemTotal}}";
-  try {
-    const { stdout } = await runner(runtime, ["info", "--format", format], 8000);
-    const [cpus, memoryBytes] = stdout.trim().split(/\s+/).map(Number);
-    return adaptContainerLimits(
-      { cpus: Number.isFinite(cpus) ? cpus : undefined, memoryBytes: Number.isFinite(memoryBytes) ? memoryBytes : undefined },
-      configured,
-    );
-  } catch {
-    return clampContainerLimits(configured);
-  }
+  const host = await readRuntimeHost(runtime, runner);
+  return adaptContainerLimits(host, configured);
 }
 
 export interface LocalVmTarget {
@@ -1170,7 +1240,7 @@ export function declaredHardening(labels: Record<string, string> | undefined | n
   // Match what `adaptContainerLimits` can emit (down to 1 CPU / 1 GiB on small
   // runtimes).  Absent or invalid labels still use the historical 4 / 8 cap.
   const usable =
-    declared.cpus >= 1 && declared.memoryGib >= 1 ? declared : DEFAULT_CONTAINER_LIMITS;
+    declared.cpus >= 1 && declared.memoryGib >= 1 ? declared : LEGACY_UNLABELED_CONTAINER_LIMITS;
   return { memoryBytes: usable.memoryGib * 1024 ** 3, nanoCpus: usable.cpus * 1_000_000_000 };
 }
 
@@ -1456,7 +1526,16 @@ export async function containerComputerAction(
   } else {
     if (action === "run") await ensureVmWorkspace(platform, target);
     const shareCliCredentials = shareCliCredentialsConfigured();
-    const limits = action === "run" ? await resolveContainerLimits(runtime, runner, configuredContainerLimits()) : undefined;
+    let limits: ContainerLimits | undefined;
+    if (action === "run") {
+      const host = await readRuntimeHost(runtime, runner);
+      const runtimeLabel = await resolveRuntimeHostLabel(runtime, runner);
+      const capacityError = localVmHostCapacityError(host, runtimeLabel);
+      if (capacityError) {
+        throw Object.assign(new Error(capacityError), { status: 409 });
+      }
+      limits = await resolveContainerLimits(runtime, runner, configuredContainerLimits());
+    }
     // The historical shared target asks for host port 6080.  A second OS user
     // on the same Mac (or anything else already on 6080) must not make the
     // Local VM fail to start, so a busy port falls back to an ephemeral
@@ -1501,17 +1580,16 @@ export async function wakeContainerComputer(
   platform: NodeJS.Platform = process.platform,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
 ): Promise<ContainerComputerStatus> {
-  if (
-    status.container !== "stopped" ||
-    !status.image ||
-    !status.runtime ||
-    !status.daemonUp ||
-    !status.create_supported
-  ) {
+  const canWake =
+    Boolean(status.image && status.runtime && status.daemonUp && status.create_supported) &&
+    (status.container === "stopped" || status.container === "missing");
+  if (!canWake) {
     return status;
   }
   try {
-    await containerComputerAction("remove", runner, platform, target);
+    if (status.container === "stopped") {
+      await containerComputerAction("remove", runner, platform, target);
+    }
     return await containerComputerAction("run", runner, platform, target);
   } catch (error) {
     let fresh = status;
@@ -1522,7 +1600,7 @@ export async function wakeContainerComputer(
     }
     if (fresh.container === "running") return fresh;
     throw new Error(
-      `the Local VM could not be restarted: ${error instanceof Error ? error.message : String(error)}`,
+      `the Local VM could not be started: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }

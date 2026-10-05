@@ -140,6 +140,7 @@ import {
   containerComputerMcp,
   containerComputerScreenshot,
   containerComputerStatus,
+  redactSecrets,
   wakeContainerComputer,
   handleBoxGatewayRequest,
   SHARED_LOCAL_VM_TARGET,
@@ -8060,6 +8061,14 @@ async function localVmPayload(target: LocalVmTarget) {
   };
 }
 
+function localComputerActionError(error: unknown): { status: number; error: string } {
+  const status = typeof (error as { status?: unknown }).status === "number"
+    ? (error as { status: number }).status
+    : 500;
+  const raw = error instanceof Error ? error.message : String(error);
+  return { status, error: redactSecrets(raw) };
+}
+
 
 
 /** Read one mapped credential out of a config-shaped object.
@@ -12657,6 +12666,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           mode: cfg.localVm?.mode ?? "shared",
           max_instances: localVmMaxInstances(cfg),
         });
+      } catch (error) {
+        const failure = localComputerActionError(error);
+        return json(res, failure.status, { error: failure.error });
       } finally {
         if (action === "pull") localVmImageBusy = false;
         else localVmLifecycleBusy.delete(SHARED_LOCAL_VM_TARGET.key);
@@ -12768,7 +12780,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (action === "run") {
           const before = await containerComputerStatus(undefined, undefined, target);
           if (!before.runtime) return json(res, 409, { error: before.problem ?? "No container runtime is installed" });
-          
         }
         const status = await containerComputerAction(action, undefined, undefined, target);
         if (action === "run") localVmIdleFor(target).touch();
@@ -12780,6 +12791,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           mode: cfg.localVm?.mode ?? "shared",
           max_instances: localVmMaxInstances(cfg),
         });
+      } catch (error) {
+        const failure = localComputerActionError(error);
+        return json(res, failure.status, { error: failure.error });
       } finally {
         if (action === "run") localVmProvisionBusy = false;
         localVmLifecycleBusy.delete(target.key);
