@@ -39,7 +39,7 @@ public enum TVFaceManifest {
     ]
 
     /// BotState → expression. Prefer a 1:1 map whenever a sheet face exists.
-    public static func expression(for state: BotState) -> TVFaceExpression {
+    static func expression(for state: BotState) -> TVFaceExpression {
         switch state {
         case .sleeping: return .sleeping
         case .waking: return .waking
