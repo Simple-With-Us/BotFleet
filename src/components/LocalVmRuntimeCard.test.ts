@@ -21,7 +21,7 @@ describe("LocalVmRuntimeCard runtime UX", () => {
 
 describe("LocalVmRuntimeCard copy", () => {
   it("uses the non-breaking sentence gap in the Safety and Storage subtitle", () => {
-    const lines = codeLines.filter((line) => line.includes("operates only"));
+    const lines = codeLines.filter((line) => line.includes("Computer Driver operates only"));
     // One line each for the per-bot and shared-VM variants.
     expect(lines).toHaveLength(2);
     for (const line of lines) {

@@ -1057,7 +1057,8 @@ test("quiesce treats a process that exits between verification and SIGTERM as st
   assert.deepEqual(strict.signals, [[501, "SIGTERM"]]);
 });
 
-test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", async () => {
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   const { signals, deps } = processTable({
     501: { command: electronMain, cwd: "/", exitDuringPs: true },
     16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
@@ -1069,7 +1070,8 @@ test("quiesce skips a process that exits while ps is describing it instead of ca
   assert.deepEqual(signals, [[16529, "SIGTERM"]]);
 });
 
-test("quiesce re-resolves the harness when its pid changed between capture and quiesce", async () => {
+// quiesce helpers shell out to lsof, which is unavailable on win32 CI hosts.
+test("quiesce re-resolves the harness when its pid changed between capture and quiesce", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   // Capture recorded harness pid 233.  By quiesce that harness is gone, 233
   // names an unrelated process, and the replacement harness 16529 holds the
   // database and answers port 8799.
@@ -1248,19 +1250,19 @@ test("desktop local-update UI does not report normal packaging latency as failur
   assert.doesNotMatch(source, /did not finish\. Quit the app and try again/);
 });
 
-test("process verification binds relative server commands to the live checkout cwd", () => {
+test("process verification binds relative server commands to the live checkout cwd", async () => {
   const config = { appPath: "/Applications/BotFleet.app", checkout: "/Users/test/apps/botfleet-server" };
   assert.equal(
-    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", config.checkout, config),
     true,
   );
   assert.equal(
-    isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
+    await isExpectedBotFleetProcess("/opt/homebrew/bin/node --experimental-strip-types server/index.ts", "/tmp/decoy", config),
     false,
   );
-  assert.equal(isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
-  assert.equal(isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
-  assert.equal(isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
+  assert.equal(await isExpectedBotFleetProcess("/usr/bin/python3 server/index.ts", config.checkout, config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/Other.app/Contents/MacOS/BotFleet", "/", config), false);
+  assert.equal(await isExpectedBotFleetProcess("/Applications/BotFleet.app/Contents/MacOS/BotFleet", "/", config), true);
 });
 
 test("the updater covers every desktop harness fallback port", () => {
