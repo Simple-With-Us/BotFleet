@@ -1,7 +1,7 @@
 // trackCliGroup: a CLI's process group is signalled only while `-pid` can
 // still be shown to name it.  Real children (node one-liners), POSIX only:
 // Windows has no process groups and trackCliGroup never signals there.
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -71,16 +71,25 @@ posix("trackCliGroup", () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-cli-group-"));
     cleanup.push(() => removeTempDir(dir));
     const pidFile = join(dir, "descendant.pid");
+    const readyFile = join(dir, "descendant.ready");
+    // Mirror fake-acp-cli.ts: install the SIGTERM no-op, THEN write ready, so a
+    // group SIGTERM cannot land under the default disposition mid-boot.
+    const descendantScript = [
+      "process.on('SIGTERM', () => {});",
+      `require('node:fs').writeFileSync(${JSON.stringify(readyFile)}, 'ready\\n');`,
+      "setInterval(() => {}, 1000)",
+    ].join(" ");
     const child = leader(
       [
         "const { spawn } = require('node:child_process');",
-        "const d = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)\"], { stdio: 'ignore' });",
+        `const d = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: 'ignore' });`,
         `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(d.pid));`,
         "process.exit(0);",
       ].join(" "),
     );
     const group = trackCliGroup(child);
     await exited(child);
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 5_000 });
     const descendant = Number(readFileSync(pidFile, "utf8"));
     cleanup.push(() => {
       try {
@@ -89,6 +98,9 @@ posix("trackCliGroup", () => {
         // reaped by the group kill below
       }
     });
+    // Wait for the descendant to actually install its SIGTERM handler, or the
+    // group SIGTERM below kills it mid-boot under the default disposition.
+    await vi.waitFor(() => expect(existsSync(readyFile)).toBe(true), { timeout: 5_000 });
     // The descendant keeps the group (and so the id) alive: still ours.
     expect(alive(descendant)).toBe(true);
     expect(group.owned).toBe(true);
