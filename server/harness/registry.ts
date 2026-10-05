@@ -62,6 +62,8 @@ export function isCustomInstance(driverKind: string, instanceId: InstanceId): bo
  * be probed in parallel, and on a saturated Mac the pile-up is what pushed
  * each CLI past its own deadline. */
 const DEFAULT_PROBE_CONCURRENCY = 6;
+/** When the host is hot, cap parallel engine probes this low. */
+const DEFAULT_HOT_PROBE_CONCURRENCY = 2;
 /** How long one engine may take to describe before the sweep answers for it
  * from its last definitive snapshot.  The probe keeps running; its answer is
  * folded in (and pushed to clients) when it lands. */
@@ -81,11 +83,21 @@ const DEFINITIVE_MAX_AGE_MS = KNOWN_VERSION_MAX_AGE_MS;
 const DEFAULT_TRANSIENT_RECHECK_MS = 20_000;
 const TRANSIENT_RECHECK_MAX_MS = 5 * 60_000;
 
+export interface DescribeOptions {
+  maxAgeMs?: number;
+  staleWhileRevalidate?: boolean;
+  /** User-initiated refresh — probe even when the host is hot. */
+  force?: boolean;
+}
+
 export interface ProviderRegistryOptions {
   probeConcurrency?: number;
   entryDeadlineMs?: number;
   /** First re-check delay for "Checking" engines; 0 turns re-checks off. */
   transientRecheckMs?: number;
+  /** Same signal as webhook dispatch deferral (`webhookDispatchHot`). */
+  hostHot?: () => boolean;
+  hotProbeConcurrency?: number;
 }
 
 /** The sweep queued behind the running one for callers who must not be
@@ -259,15 +271,40 @@ export class ProviderRegistry {
   private minimaxContextByInstance = new Map<InstanceId, { apiKey: string; apiUrl: string }>();
   private driversByKind: Map<string, AnyProviderDriver>;
   private readonly probeConcurrency: number;
+  private readonly hotProbeConcurrency: number;
   private readonly entryDeadlineMs: number;
   private readonly transientRecheckMs: number;
+  private readonly hostHot: () => boolean;
+  /** Set when a describe() answers from cache because the host is hot. */
+  private describeStale = new WeakMap<DescribedInstance[], boolean>();
 
   constructor(drivers: readonly AnyProviderDriver[], options: ProviderRegistryOptions = {}) {
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
     this.probeConcurrency = Math.max(1, options.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY);
+    this.hotProbeConcurrency = Math.max(1, options.hotProbeConcurrency ?? DEFAULT_HOT_PROBE_CONCURRENCY);
     this.entryDeadlineMs = options.entryDeadlineMs ?? DEFAULT_ENTRY_DEADLINE_MS;
     this.transientRecheckMs = Math.max(0, options.transientRecheckMs ?? DEFAULT_TRANSIENT_RECHECK_MS);
+    this.hostHot = options.hostHot ?? (() => false);
     this.recheckDelayMs = this.transientRecheckMs;
+  }
+
+  private probeLimit(): number {
+    if (this.hostHot()) return Math.min(this.probeConcurrency, this.hotProbeConcurrency);
+    return this.probeConcurrency;
+  }
+
+  private isForcedDescribe(opts?: DescribeOptions): boolean {
+    if (opts === undefined) return true;
+    return opts.force === true;
+  }
+
+  private markDescribeStale(result: DescribedInstance[]): void {
+    this.describeStale.set(result, true);
+  }
+
+  /** Whether `result` was served from cache while the host was hot. */
+  describeWasStale(result: DescribedInstance[]): boolean {
+    return this.describeStale.get(result) === true;
   }
 
   private async loadEntry(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
@@ -584,14 +621,23 @@ export class ProviderRegistry {
     }
   }
 
-  async describe(opts?: { maxAgeMs?: number; staleWhileRevalidate?: boolean }): Promise<DescribedInstance[]> {
+  async describe(opts?: DescribeOptions): Promise<DescribedInstance[]> {
     const maxAge = opts?.maxAgeMs ?? 0;
+    const forced = this.isForcedDescribe(opts);
+    const hot = this.hostHot();
     // Ages are read on both clocks (see procs.ts elapsedSince): a stamp can
     // run ahead of the wall clock after it is corrected backwards, and plain
     // subtraction would keep a stale answer inside maxAge for the size of the
     // correction on top of maxAge itself.
     const clock = readClock();
     const done = this.lastDone;
+    // Under swap/load thrash, spawning six CLIs at once makes every probe miss
+    // its deadline.  Passive callers get the last answer, flagged stale, until
+    // the host cools; explicit refreshes still probe (at reduced concurrency).
+    if (hot && !forced && done) {
+      this.markDescribeStale(done.result);
+      return done.result;
+    }
     // A sweep already running that started after the last completed one is
     // the newest answer there is, and a caller that decides something from
     // engine health (the automatic fallback walk) must see it rather than an
@@ -618,7 +664,7 @@ export class ProviderRegistry {
     // making every caller block on it is what makes the model picker look
     // empty rather than slow.
     if (opts?.staleWhileRevalidate && done) {
-      void this.ensureSweep().catch(() => {});
+      if (!hot) void this.ensureSweep().catch(() => {});
       return done.result;
     }
 
@@ -750,6 +796,7 @@ export class ProviderRegistry {
    * every engine has answered. */
   private scheduleRecheck(result: DescribedInstance[]): void {
     if (this.transientRecheckMs <= 0 || this.disposed) return;
+    if (this.hostHot()) return;
     const waiting = result.some((info) => info.snapshot.transient && !info.snapshot.hidden);
     if (!waiting) {
       this.recheckDelayMs = this.transientRecheckMs;
@@ -799,7 +846,7 @@ export class ProviderRegistry {
     // generation would let the old config's answer pass as the replacement's.
     const entries = this.entries();
     const gens = new Map(entries.map((entry) => [entry.instanceId, this.genOf(entry.instanceId)] as const));
-    const probed = await mapWithConcurrency(entries, this.probeConcurrency, (entry) => {
+    const probed = await mapWithConcurrency(entries, this.probeLimit(), (entry) => {
       const gen = gens.get(entry.instanceId)!;
       // The fleet changed since this sweep began: its answer is thrown away
       // (startSweep), so it starts no more probes beside its replacement's.

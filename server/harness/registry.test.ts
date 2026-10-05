@@ -1398,6 +1398,59 @@ describe("ProviderRegistry describe: single flight and last-known-good", () => {
     expect(described).toHaveLength(5);
     expect(peak).toBe(2);
   });
+
+  it("serves the last describe stale while the host is hot and skips background sweeps", async () => {
+    let hot = true;
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => ({ state: "available", version: `v${call}` }),
+    });
+    const registry = new ProviderRegistry([fake.driver], { hostHot: () => hot });
+    await registry.load({ a: { driver: "fake" } });
+    await registry.describe();
+    expect(fake.snapshotCalls).toBe(1);
+
+    const deferred = await registry.describe({ maxAgeMs: 15_000, staleWhileRevalidate: true });
+    expect(fake.snapshotCalls).toBe(1);
+    expect(deferred[0].snapshot.version).toBe("v1");
+    expect(registry.describeWasStale(deferred)).toBe(true);
+
+    hot = false;
+    await registry.describe({ force: true });
+    expect(fake.snapshotCalls).toBe(2);
+  });
+
+  it("still probes on an explicit refresh while the host is hot", async () => {
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => ({ state: "available", version: `v${call}` }),
+    });
+    const registry = new ProviderRegistry([fake.driver], { hostHot: () => true });
+    await registry.load({ a: { driver: "fake" } });
+    await registry.describe();
+    await registry.describe({ force: true });
+    expect(fake.snapshotCalls).toBe(2);
+  });
+
+  it("caps probe concurrency lower while the host is hot", async () => {
+    let running = 0;
+    let peak = 0;
+    const fake = makeFakeDriver({
+      snapshotImpl: async () => {
+        running++;
+        peak = Math.max(peak, running);
+        await tick(15);
+        running--;
+        return { state: "available", version: "1" };
+      },
+    });
+    const registry = new ProviderRegistry([fake.driver], {
+      probeConcurrency: 6,
+      hotProbeConcurrency: 2,
+      hostHot: () => true,
+    });
+    await registry.load(Object.fromEntries(["a", "b", "c", "d", "e"].map((id) => [id, { driver: "fake" }])));
+    await registry.describe({ force: true });
+    expect(peak).toBe(2);
+  });
 });
 
 type ProviderSnapshotLike = { authenticated?: boolean };

@@ -351,7 +351,7 @@ import { KNOB_FIELDS, knobSource, readKnobField } from "./knob-map.ts";
 import { patchChangesInfisicalConnection, writeThroughKnobs } from "./knob-write-through.ts";
 import { configureTurnIdentity, observeRuntimeEvent } from "./sentry-ai.ts";
 import { checkInRoutineFinish, checkInRoutineStart } from "./sentry-crons.ts";
-import { ProviderRegistry } from "./harness/registry.ts";
+import { ProviderRegistry, type DescribedInstance } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
 import {
   mentionedBots,
@@ -446,9 +446,8 @@ import { resolveLinqBinding } from "./linq/dispatch.ts";
 import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopLinqTypingForThread } from "./linq/outbound.ts";
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
-import { ResourceTriggerManager, webhookDispatchHot } from "./resource-triggers.ts";
-import { createHostProbe, type HostProbe } from "./jobs/admission.ts";
-import { readHostLoad } from "./drivers/acp/init-deadline.ts";
+import { ResourceTriggerManager } from "./resource-triggers.ts";
+import { readHostDispatchHot } from "./host-dispatch-hot.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -761,7 +760,7 @@ telemetry.configure(() => ({
   ingestToken: cfg.usage?.ingestToken,
   projects: usageProjectRules(cfg),
 }));
-const registry = new ProviderRegistry(BUILT_IN_DRIVERS);
+const registry = new ProviderRegistry(BUILT_IN_DRIVERS, { hostHot: readHostDispatchHot });
 await registry.load(instanceConfigs(cfg));
 registry.setDiskCachePath(join(DATA_DIR, "engine-cache.json"));
 // The credential fingerprint the provider fleet was actually BUILT with, kept
@@ -1446,6 +1445,14 @@ function presentInstances<T extends Parameters<typeof presentDescribedInstances>
   const presented = presentDescribedInstances(described);
   reconcileModelLineage({ skipBusy: true });
   return presented;
+}
+
+function instancesPayload(described: DescribedInstance[]) {
+  return {
+    instances: presentInstances(described),
+    describedAt: registry.describedAtOf(described),
+    ...(registry.describeWasStale(described) ? { stale: true } : {}),
+  };
 }
 
 function lineageContextForInstance(instanceId: string): LineageContext | undefined {
@@ -3050,8 +3057,6 @@ bus.subscribe((event: RuntimeEvent) => {
 // mark at all (autoVerdict).
 type UnattendedSource = "job" | "outside";
 const unattendedBots = new Map<string, { at: number; source: UnattendedSource }>();
-/** Built on first webhook admission so importing this module does not probe. */
-let unattendedHostProbe: HostProbe | undefined;
 const NON_THINKING_MINIMAX_FLASH = "MiniMax-M3.1-Flash-Preview";
 
 /** A catalog row for non-thinking Flash, preferring the seat's own engine.
@@ -5804,13 +5809,7 @@ routines = new RoutineManager({
   // Defer new webhook wakes while the host is hot.  The probe is the jobs
   // admission swap cache (non-blocking) plus the ACP init load reading.
   // Resource wakes are not shed: that is how Housekeeper still runs.
-  hostHot: () => {
-    unattendedHostProbe ??= createHostProbe();
-    return webhookDispatchHot({
-      swapUsedPercent: unattendedHostProbe.swapUsedPercent(),
-      load: readHostLoad(),
-    });
-  },
+  hostHot: readHostDispatchHot,
   canStart: (botId, threadId, runOn) => {
     const hold = dispatchHoldFor(botId, threadId, runOn, { count: true });
     // The scheduler asks for the reason immediately after a `false` here, for
@@ -13538,14 +13537,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // actions and right after a CLI/fullAuto override is saved — bypasses
       // it so the user's own action is never served a stale answer.
       const described = await registry.describe(
-        fresh ? undefined : { maxAgeMs: 15_000, staleWhileRevalidate: true },
+        fresh ? { force: true } : { maxAgeMs: 15_000, staleWhileRevalidate: true },
       );
-      // presentInstances moves saved selections forward against what the
-      // engines offer now.  describedAt is the stamp of the raw list: a client
-      // holding a newer answer (from the `instances` push or another request)
-      // can drop this one.
-      const instances = presentInstances(described);
-      return json(res, 200, { instances, describedAt: registry.describedAtOf(described) });
+      return json(res, 200, instancesPayload(described));
     }
 
     // ── CLI binary discovery for the Engines "detected" dropdown ──
@@ -13692,10 +13686,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           drainDeferredBootRecoveries();
           void routines?.tick();
         });
-        return json(res, 200, {
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
-        });
+        return json(res, 200, instancesPayload(instances));
       } finally {
         providerConfigBusy = false;
       }
@@ -13871,8 +13862,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, {
           ok: true,
           instanceId,
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
+          ...instancesPayload(instances),
         });
       } finally {
         providerConfigBusy = false;
@@ -13995,8 +13985,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const instances = await registry.describe();
         return json(res, 200, {
           ok: true,
-          instances: presentInstances(instances),
-          describedAt: registry.describedAtOf(instances),
+          ...instancesPayload(instances),
         });
       } finally {
         providerConfigBusy = false;
