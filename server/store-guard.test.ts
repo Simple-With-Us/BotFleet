@@ -18,6 +18,13 @@ import {
 const list = (parsed: JsonValue): Interpreted<JsonValue[]> =>
   Array.isArray(parsed) ? { ok: true, value: parsed, omitted: 0 } : { ok: false, reason: "it is not a list" };
 
+/** Keeps the odd numbers, and counts what it left out the way a real store does. */
+const keepOdd = (parsed: JsonValue): Interpreted<JsonValue[]> => {
+  if (!Array.isArray(parsed)) return { ok: false, reason: "it is not a list" };
+  const kept = parsed.filter((n) => Number(n) % 2 === 1);
+  return { ok: true, value: kept, omitted: parsed.length - kept.length };
+};
+
 describe("store-guard", () => {
   let dir: string;
   let error: MockInstance<typeof console.error>;
@@ -163,17 +170,71 @@ describe("store-guard", () => {
     it("keeps the usable entries, copies the whole original aside, and says how many were left out", () => {
       const original = "[1,2,3,4]";
       writeFileSync(file(), original);
-      const keepOdd = (parsed: JsonValue): Interpreted<JsonValue[]> =>
-        Array.isArray(parsed)
-          ? { ok: true, value: parsed.filter((n) => Number(n) % 2 === 1), omitted: 2 }
-          : { ok: false, reason: "it is not a list" };
       const loaded = loadGuarded(file(), keepOdd, 1790000000000);
       expect(loaded).toEqual({ status: "ok", value: [1, 3], writesRefused: false });
-      expect(readFileSync(file(), "utf8")).toBe(original);
+      // The original now holds only what was kept; the copy holds all of it.
+      expect(JSON.parse(readFileSync(file(), "utf8"))).toEqual([1, 3]);
       expect(readFileSync(join(dir, "bots.json.corrupt-1790000000000"), "utf8")).toBe(original);
+      expect(names()).toEqual(["bots.json", "bots.json.corrupt-1790000000000"]);
       expect(listDataFaults()).toEqual([
         expect.objectContaining({ kind: "partial", omitted: 2, setAsideAs: "bots.json.corrupt-1790000000000", writesRefused: false }),
       ]);
+    });
+
+    it("does not copy the same damage aside again on the next start", () => {
+      writeFileSync(file(), "[1,2,3,4]");
+      loadGuarded(file(), keepOdd, 1790000000000);
+      resetDataFaults();
+      error.mockClear();
+      const again = loadGuarded(file(), keepOdd, 1790000000001);
+      expect(again).toEqual({ status: "ok", value: [1, 3], writesRefused: false });
+      expect(names()).toEqual(["bots.json", "bots.json.corrupt-1790000000000"]);
+      expect(listDataFaults()).toEqual([]);
+      expect(error).not.toHaveBeenCalled();
+    });
+
+    it("refuses to save, and keeps the copy, when the cleaned file cannot be written back", () => {
+      // The write-back goes through a temporary name beside the file that is longer than the
+      // ".corrupt-<epoch>" name the copy takes, so a file name sized to sit exactly at the 255-unit
+      // name limit once the copy's suffix is added lets the copy succeed and makes the write-back
+      // fail.  Ask the platform first, as the move-aside test below does, and say so when it
+      // declines to enforce the limit.
+      const base = `${"c".repeat(228)}.json`;
+      const long = join(dir, base);
+      const copyName = `${base}.corrupt-1790000000000`;
+      expect(copyName).toHaveLength(255);
+      let enforced = false;
+      try {
+        writeFileSync(join(dir, copyName), "probe");
+        rmSync(join(dir, copyName));
+        try {
+          writeFileSync(join(dir, `${base}.${"t".repeat(43)}`), "probe");
+          rmSync(join(dir, `${base}.${"t".repeat(43)}`));
+        } catch {
+          enforced = true;
+        }
+      } catch {
+        /* the copy's own name is refused here, so this case cannot be set up */
+      }
+      const original = "[1,2,3,4]";
+      writeFileSync(long, original);
+      const loaded = loadGuarded(long, keepOdd, 1790000000000);
+      // The copy holds the whole original in every case.
+      expect(readFileSync(join(dir, copyName), "utf8")).toBe(original);
+      expect(names()).toEqual([base, copyName]);
+      if (!enforced) {
+        expect(loaded).toEqual({ status: "ok", value: [1, 3], writesRefused: false });
+        expect(JSON.parse(readFileSync(long, "utf8"))).toEqual([1, 3]);
+        return;
+      }
+      expect(loaded).toEqual({ status: "ok", value: [1, 3], writesRefused: true });
+      // Neither file was lost: the original is untouched and the durable copy is still there.
+      expect(readFileSync(long, "utf8")).toBe(original);
+      expect(listDataFaults()).toEqual([
+        expect.objectContaining({ kind: "partial", omitted: 2, setAsideAs: copyName, writesRefused: true }),
+      ]);
+      expect(listDataFaults()[0]!.reason).toContain("the cleaned file could not be written back (");
+      expect(String(error.mock.calls[0]![0])).toContain(`will not save to ${base}`);
     });
 
     it("leaves a file it cannot read where it is, and refuses to save over it", () => {

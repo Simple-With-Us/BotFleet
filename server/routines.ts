@@ -215,8 +215,10 @@ function interpretRoutineFile(parsed: JsonValue): Interpreted<Partial<RoutineFil
   const found = (parsed.routines?.length ?? 0) + (parsed.runs?.length ?? 0);
   const usable = routines.length + runs.length;
   if (found > 0 && usable === 0) return { ok: false, reason: `none of its ${found} entries is a usable routine or run` };
-  const { routineRequestReceipts, botSnoozes } = parsed;
-  return { ok: true, value: { routines, runs, routineRequestReceipts, botSnoozes }, omitted: found - usable };
+  // Everything else in the file is carried through untouched: when entries are left out, this value
+  // is what store-guard writes back over routines.json, and it must lose only those entries.
+  const whole: Partial<RoutineFile> = parsed;
+  return { ok: true, value: { ...whole, routines, runs }, omitted: found - usable };
 }
 
 export type RoutineRequestOwner = Pick<RoutineRequestReceipt, "requestId" | "messageId" | "botId" | "threadId">;

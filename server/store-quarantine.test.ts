@@ -145,11 +145,17 @@ describe("Store with an unusable bots.json or groups.json", () => {
       const [name] = setAside("bots.json");
       expect(setAside("bots.json")).toHaveLength(1);
       expect(readFileSync(join(DATA_DIR, name!), "utf8")).toBe(damaged);
-      expect(readFileSync(BOTS, "utf8")).toBe(damaged);
+      // The live file already holds only the readable bots, so the next start does not copy the
+      // same damage aside again; the copy still has everything.
+      expect(JSON.parse(readFileSync(BOTS, "utf8")).map((bot: { id: string }) => bot.id).sort()).toEqual([lead.id, helper.id].sort());
       expect(listDataFaults()).toEqual([
         expect.objectContaining({ file: "bots.json", kind: "partial", omitted: 3, setAsideAs: name, writesRefused: false }),
       ]);
-      // The next save drops the damaged entries from the live file; the copy still has them.
+      resetDataFaults();
+      const restarted = new Store(selection);
+      expect(restarted.bots.map((bot) => bot.id).sort()).toEqual([lead.id, helper.id].sort());
+      expect(setAside("bots.json")).toEqual([name]);
+      expect(listDataFaults()).toEqual([]);
       reloaded.createBot({ name: "Third" });
       reloaded.flushBotsNow();
       expect(JSON.parse(readFileSync(BOTS, "utf8"))).toHaveLength(3);

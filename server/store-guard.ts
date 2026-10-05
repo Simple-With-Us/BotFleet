@@ -18,7 +18,9 @@
 //   * When a list holds some usable entries and some not, the usable ones are
 //     kept and the whole original is COPIED aside first — and flushed to disk
 //     before the copy is called a success, so what is left out is still on
-//     disk even across a power loss.
+//     disk even across a power loss.  Then the original is replaced with the
+//     cleaned value, so the next start reads a clean file instead of copying
+//     the same damage aside again.  If that replace fails, saving stops.
 //
 // Every fault is logged once at the moment it is found and recorded in
 // data-faults.ts for the app's banner.  Nothing logged or recorded here ever
@@ -26,6 +28,7 @@
 import { closeSync, constants, copyFileSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
+import { writeFileAtomic } from "./atomic.ts";
 import { ROSTER_FILES, recordDataFault, type DataFault } from "./data-faults.ts";
 import { parseJson, type JsonValue } from "./schema.ts";
 
@@ -113,12 +116,12 @@ export function setFileAside(path: string, how: "move" | "copy", now: number = D
     copyFileSync(path, target, constants.COPYFILE_EXCL);
     // copyFileSync returns once the bytes are in the page cache, not once they
     // are on the disk.  The load below treats this copy as the record of what
-    // it could not parse, then lets the store write the pruned file over the
-    // original through writeFileAtomic, which IS durable.  So without this
+    // it could not parse, then writes the pruned file over the original
+    // through writeFileAtomic, which IS durable.  So without this
     // flush the only durable file is the one missing those entries, and a
     // power loss takes them for good.  If the flush fails, the copy is removed
     // and the call fails, which leaves the original in place and stops the
-    // save that would have replaced it.
+    // rewrite and every save that would have replaced it.
     if (!makeDurable(target)) {
       try {
         unlinkSync(target);
@@ -246,12 +249,27 @@ export function loadGuarded<T>(
     return { status: "ok", value: result.value, writesRefused: true };
   }
   const to = copied.path;
+  const setAsideAs = to ? basename(to) : null;
+  // The durable copy holds everything, so the original can now be replaced with what was kept.
+  // Leaving the damaged original for a later save to replace meant every restart before that save
+  // read the same damage and copied it aside again, one more .corrupt file per start.
+  try {
+    writeFileAtomic(path, JSON.stringify(result.value, null, 2));
+  } catch (error) {
+    const code = fsFailureCode(error instanceof Error ? error : new Error(String(error)));
+    const reason = `${result.omitted} ${entries} could not be read, and the cleaned file could not be written back (${code})`;
+    console.error(
+      `store: ${result.omitted} ${entries} in ${path} could not be read and ${result.omitted === 1 ? "was" : "were"} left out.  The whole original is saved as ${to}, but the cleaned file could not be written back (${code}), so BotFleet will not save to ${file}.  Nothing was deleted.  Fix or move the file, then restart BotFleet.`,
+    );
+    notice(path, { kind: "partial", reason, setAsideAs, omitted: result.omitted, writesRefused: true }, now);
+    return { status: "ok", value: result.value, writesRefused: true };
+  }
   console.error(
-    `store: ${result.omitted} ${entries} in ${path} could not be read and ${result.omitted === 1 ? "was" : "were"} left out.  The whole original is saved as ${to}.  Nothing was deleted.`,
+    `store: ${result.omitted} ${entries} in ${path} could not be read and ${result.omitted === 1 ? "was" : "were"} left out.  The whole original is saved as ${to}, and ${file} now holds only the entries that could be read.  Nothing was deleted.`,
   );
   notice(
     path,
-    { kind: "partial", reason: `${result.omitted} ${entries} could not be read`, setAsideAs: to ? basename(to) : null, omitted: result.omitted, writesRefused: false },
+    { kind: "partial", reason: `${result.omitted} ${entries} could not be read`, setAsideAs, omitted: result.omitted, writesRefused: false },
     now,
   );
   return { status: "ok", value: result.value, writesRefused: false };
