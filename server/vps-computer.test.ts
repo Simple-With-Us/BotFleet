@@ -35,6 +35,7 @@ import {
   vpsDockerArgs,
   vpsDriverError,
   vpsSshTunnelArgs,
+  perBotVpsTarget,
   vpsSyncCliCredentials,
   resetVpsCliSyncThrottle,
   reuseVps,
@@ -714,6 +715,20 @@ describe("VPS computer", () => {
 
         const chmodCall = fake.calls.find(({ args }) => args.some((arg) => arg.includes("chmod")));
         expect(chmodCall).toBeDefined();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("uses the per-bot container name when target is per-bot", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-per-bot-"));
+      const botTarget = perBotVpsTarget("bot-sync-test");
+      try {
+        const fake = fixture({ container: true, running: true, containerName: botTarget.containerName });
+        const result = await vpsSyncCliCredentials(CONFIG, botTarget, fake.runner, tempDir);
+        expect(result.containerName).toBe(botTarget.containerName);
+        const execArgs = fake.calls.flatMap(({ args }) => args);
+        expect(execArgs).toContain(botTarget.containerName);
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }

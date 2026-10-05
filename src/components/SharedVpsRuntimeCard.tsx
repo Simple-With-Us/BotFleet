@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, Loader2 } from "lucide-react";
+import { AlertTriangle, Loader2 } from "lucide-react";
 import { useStore } from "@/state/store";
 import { Card } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
+import { CliCredentialSyncPanel } from "./CliCredentialSyncPanel";
 
 interface VpsStatus {
   backend: string;
@@ -16,22 +17,6 @@ interface VpsStatus {
   problem: string | null;
 }
 
-interface SyncToolResult {
-  name: string;
-  paths: string[];
-}
-
-interface SyncSkip {
-  name: string;
-  reason: string;
-}
-
-interface SyncResult {
-  ok: boolean;
-  syncedTools: SyncToolResult[];
-  skippedTools: SyncSkip[];
-  containerName: string;
-}
 /** Which face of the card a workspace gets: the live shared-runtime
  * panel, the per-bot caption, or nothing (VPS not configured). */
 export function sharedVpsCardMode(vpsConfigured: boolean, vpsMode: string | null | undefined): "shared" | "per-bot" | "hidden" {
@@ -43,10 +28,6 @@ export function SharedVpsRuntimeCard() {
   const { state } = useStore();
   const [status, setStatus] = useState<VpsStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [syncing, setSyncing] = useState(false);
-  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
-  const [syncError, setSyncError] = useState<string | null>(null);
-
   const providers = state.config?.botDefaults?.computerProviders;
   const selfHostedVpsEnabled = providers?.selfHostedVps === true;
   const vpsMode = state.config?.botDefaults?.vpsMode;
@@ -59,28 +40,6 @@ export function SharedVpsRuntimeCard() {
     setStatus(body as VpsStatus);
     setError(null);
   }, []);
-
-  const handleSyncCredentials = async () => {
-    setSyncing(true);
-    setSyncError(null);
-    setSyncResult(null);
-    try {
-      const response = await fetch("/api/vps-computer/sync-credentials", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.error ?? `Sync failed (${response.status})`);
-      }
-      setSyncResult(data as SyncResult);
-    } catch (e) {
-      setSyncError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSyncing(false);
-    }
-  };
 
   useEffect(() => {
     // Only poll if VPS is configured and mode is shared
@@ -125,7 +84,8 @@ export function SharedVpsRuntimeCard() {
         subtitle="This workspace runs bots on your own VPS."
       >
         <div className="text-[13px] text-ink-secondary">
-          Per-bot mode: each bot gets its own VPS container.{"\u00a0 "}The VPS mode is set in the
+          Per-bot mode: each bot gets its own VPS container.{"\u00a0 "}Use <b className="text-ink">Sync CLI Credentials</b> on
+          each bot&apos;s Computer panel to copy host logins into that bot&apos;s container.{"\u00a0 "}The VPS mode is set in the
           server config (<code>botDefaults.vpsMode</code>); there is no settings control for it.
         </div>
       </Card>
@@ -173,56 +133,12 @@ export function SharedVpsRuntimeCard() {
                   : "The VPS container will be provisioned automatically when a bot needs it."}
             </div>
             {running && (
-              <div className="mt-2 flex flex-col gap-2 rounded-lg border border-hairline/40 bg-surface-subtle/40 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-[13px] font-medium text-ink">Host CLI Credentials</div>
-                    <div className="text-[12px] text-ink-secondary">
-                      Copy host CLI login files from the VM CLI manifest (Infisical, SSH, Git, cloud CLIs, registries, and more) into the shared VPS container.{state.config?.localVm?.shareCliCredentials ? "\u00a0 Automatic sync is enabled in Host & CLI Integration." : ""}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={syncing}
-                    onClick={handleSyncCredentials}
-                    className="flex shrink-0 items-center gap-1.5 rounded-lg border border-hairline/60 bg-control px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-control/80 disabled:opacity-50"
-                  >
-                    {syncing ? (
-                      <>
-                        <Loader2 size={13} className="animate-spin" /> Syncing…
-                      </>
-                    ) : (
-                      <>Sync CLI Credentials</>
-                    )}
-                  </button>
-                </div>
-                {syncResult && (
-                  <div className="flex flex-col gap-1 text-[12px]">
-                    {syncResult.syncedTools.length > 0 ? (
-                      <div className="flex items-start gap-2 text-success">
-                        <Check size={13} className="mt-0.5 shrink-0" />
-                        <span>
-                          Synced {syncResult.syncedTools.length} tool(s):{" "}
-                          {syncResult.syncedTools.map((entry) => entry.name).join(", ")}
-                        </span>
-                      </div>
-                    ) : (
-                      <div className="text-ink-secondary">No local CLI credentials found to sync.</div>
-                    )}
-                    {syncResult.skippedTools.length > 0 && (
-                      <div className="text-ink-secondary">
-                        Skipped {syncResult.skippedTools.length} tool(s):{" "}
-                        {syncResult.skippedTools.map((entry) => `${entry.name} (${entry.reason})`).join("; ")}
-                      </div>
-                    )}
-                  </div>
-                )}
-                {syncError && (
-                  <div className="flex items-center gap-2 text-[12px] text-danger">
-                    <AlertTriangle size={13} className="shrink-0" />
-                    <span>{syncError}</span>
-                  </div>
-                )}
+              <div className="mt-2">
+                <CliCredentialSyncPanel
+                  syncUrl="/api/vps-computer/sync-credentials"
+                  description="Copy host CLI login files from the VM CLI manifest (Infisical, SSH, Git, cloud CLIs, registries, and more) into the shared cloud VPS container."
+                  autoSyncEnabled={Boolean(state.config?.localVm?.shareCliCredentials)}
+                />
               </div>
             )}
           </div>

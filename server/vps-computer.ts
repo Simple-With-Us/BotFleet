@@ -1108,6 +1108,10 @@ export interface VpsSyncCredentialsResult extends CredentialSyncResult {
   containerName: string;
 }
 
+/** Manifest-driven host → cloud VPS credential sync for every target
+ * (shared cloud container and per-bot VPS containers). Settings and
+ * per-bot Computer panels call this with `SHARED_VPS_TARGET` or
+ * `vpsTargetFor(cfg, botId)`; auto-sync on provision/start uses the same path. */
 export async function vpsSyncCliCredentials(
   cfg: AppConfig,
   target: VpsTarget = SHARED_VPS_TARGET,
