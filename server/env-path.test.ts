@@ -2,7 +2,7 @@
 // well-known install dir — or an nvm bin dir — must be findable even
 // when the process itself started with a bare GUI PATH.
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -124,14 +124,17 @@ describe("augmentedPath", () => {
   const posixIt2 = it.skipIf(process.platform === "win32");
 
   // Hoisting is gated on the farm really shadowing the CLI, so the tests that
-  // expect a hoist plant the shim in both dirs, the shape the MiniMax Code
-  // installer leaves behind.
+  // expect a hoist plant the shape the MiniMax Code installer leaves behind:
+  // the real CLI in the canonical dir and a symlink to it in the farm.  A
+  // symlink, not a copy, so findCliCandidates' dedupeByInode collapses the two
+  // into one row and only PATH order decides which path that row is.
   const plantShims = (installerDir: string, symlinkFarm: string, name = "mcode"): void => {
-    for (const dir of [installerDir, symlinkFarm]) {
-      const file = join(dir, name);
-      writeFileSync(file, "#!/bin/sh\nexit 0\n");
-      chmodSync(file, 0o755);
-    }
+    const real = join(installerDir, name);
+    const shim = join(symlinkFarm, name);
+    writeFileSync(real, "#!/bin/sh\nexit 0\n");
+    chmodSync(real, 0o755);
+    rmSync(shim, { force: true });
+    symlinkSync(real, shim);
   };
 
   // setup.ts shares one throwaway home across this file, so shims an earlier
@@ -187,6 +190,13 @@ describe("augmentedPath", () => {
       expect(installer).toBeGreaterThanOrEqual(0);
       expect(symlinks).toBeGreaterThanOrEqual(0);
       expect(installer).toBeLessThan(symlinks);
+      // The farm entry is a symlink to the canonical CLI, so dedupeByInode
+      // keeps one row: whichever path PATH order reaches first.  Without the
+      // hoist that row would be the farm symlink, the copy that cannot run.
+      // (Only the head is pinned: the inherited PATH may carry a real mcode.)
+      const candidates = findCliCandidates("mcode");
+      expect(candidates[0]).toBe(join(installerDir, "mcode"));
+      expect(candidates).not.toContain(join(symlinkFarm, "mcode"));
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
@@ -355,8 +365,9 @@ describe("augmentedPath", () => {
     // since the farm arrives ahead of every known dir in the merge.
     const installerDir = join(homedir(), ".minimax-code", "bin");
     const symlinkFarm = join(homedir(), ".local", "bin");
-    mkdirSync(installerDir, { recursive: true });
-    mkdirSync(symlinkFarm, { recursive: true });
+    // Clean dirs: a farm symlink an earlier test planted would otherwise
+    // redirect the farm write below onto the canonical file.
+    freshDirs(installerDir, symlinkFarm);
     const canonical = join(installerDir, "mcode");
     const farmCopy = join(symlinkFarm, "mcode");
     writeFileSync(canonical, "#!/bin/sh\necho canonical\n");
