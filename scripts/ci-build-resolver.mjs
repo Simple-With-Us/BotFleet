@@ -47,6 +47,23 @@ const DOWNLOAD_RETRY_DELAY_MS = 5_000;
 // `maxBuffer` option that belongs to `execFile`, so passing one was silently
 // doing nothing; `runBoundedText` caps the listing, and this caps the rest.
 const MAX_CHILD_STDOUT_BYTES = 16 * 1024 * 1024;
+
+/** GitHub's own "not finished yet" vocabulary.
+ *
+ *  Matching only the single literal `in_progress` once made the still-running
+ *  branch dead for every other status a queued or waiting build actually
+ *  reports, so an operator was told a running build had "failed".  The comment
+ *  on `ResolutionError.conclusion` still records that this field is compared
+ *  against raw statuses by consumers, so the set has to be raw statuses too. */
+const STILL_RUNNING = new Set([
+  "in_progress",
+  "queued",
+  "waiting",
+  "pending",
+  "requested",
+  "waiting_for_runner",
+  "requested_waiting",
+]);
 const MANIFEST_SCHEMA_VERSION = 1;
 const FULL_COMMIT = /^[a-f0-9]{40}$/;
 
@@ -108,7 +125,7 @@ function resolutionMessage({ cause, commit, status, repository, detail, conclusi
       );
     case "build-failed":
       return (
-        `A hosted build exists for ${sha} but it did not succeed${conclusion ? ` (${conclusion === "in_progress" ? "still running" : conclusion})` : ""}.  ` +
+        `A hosted build exists for ${sha} but it did not succeed${conclusion ? ` (${STILL_RUNNING.has(conclusion) ? "still running" : conclusion})` : ""}.  ` +
         `Re-run it, or update with BOTFLEET_UPDATE_SOURCE=local to package on this Mac.  Note that this ` +
         `workflow cancels superseded builds, so a build cancelled because a newer commit landed on main is expected.`
       );
@@ -523,7 +540,16 @@ async function listArchiveEntries(archivePath) {
     const match = line.match(/^([-dlbcps])[-rwxsStT]{9}\s+(.*)$/);
     if (!match) continue;
     typedLines += 1;
-    if (match[1] === "l") symlinks.add(match[2].trim());
+    // The NAME is the last field, not the rest of the line.  A `zipinfo -l`
+    // row is `-rw-r--r--  3.0 unx  123 tx  defN 26-Jan-01 12:00 some/path`,
+    // so capturing group 2 whole stored the whole tail — permissions, sizes,
+    // dates and the name — in the set.  `symlinks.has(name)` then never
+    // matched, so every symlinked entry was recorded as a plain file and the
+    // archive check passed on the exact thing it exists to catch.
+    if (match[1] === "l") {
+      const name = match[2].trim().split(/\s+/).pop();
+      if (name) symlinks.add(name);
+    }
   }
   // Zero PARSED type lines means the format is not what we expect, so we cannot
   // tell a symlink from a regular file and must refuse.  A parsed listing with
@@ -656,6 +682,14 @@ export async function downloadBuiltBundle({
     await run("unzip", ["-q", "-j", "-o", wrapper, "build-manifest.json", "-d", scratch]);
     manifest = JSON.parse(await readFile(join(scratch, "build-manifest.json"), "utf8"));
   } catch (error) {
+    // Only wrap what is genuinely "could not read the manifest".  A
+    // ResolutionError from `assertSafeArchiveEntries` means the archive
+    // contains something that must not be extracted — an unsafe-archive
+    // refusal.  Re-labelling that `bad-manifest` told an operator their build
+    // was simply missing a file when the real answer was "this artifact
+    // contains a path or link we refuse to unpack", which is the one message
+    // in this file that must not be blurred.
+    if (error instanceof ResolutionError) throw error;
     throw new ResolutionError(`Hosted build artifact has no readable build-manifest.json: ${error?.message}`, "bad-manifest");
   } finally {
     await rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});

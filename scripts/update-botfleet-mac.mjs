@@ -1046,25 +1046,49 @@ export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targe
  * report a timeout as its own outcome rather than as a non-zero exit, for the
  * same reason the boot classifier has a distinct "too busy" cause.
  */
-function runBounded(command, args, { cwd, env, timeoutMs }) {
+function runBounded(command, args, { cwd, env, timeoutMs, maxBytes = 1024 * 1024 } = {}) {
   return new Promise((resolveRun) => {
     const child = spawn(command, args, {
       cwd,
-      env: env ? { ...process.env, ...env } : process.env,
+      // A probe this runs must not inherit the updater's real environment.
+      // It writes a probe file and, in the SQLite case, touches HOME and the
+      // Sentry/OMB variables; a smoke test that can reach the owner's real
+      // state, or ship the owner's real telemetry under the updater's key, is
+      // not a smoke test.  PATH is carried because the probe needs node; the
+    // rest of the ambient environment is not.
+      env: env ? { PATH: process.env.PATH, ...env } : { PATH: process.env.PATH },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    // Capped, unlike the sibling helpers' absence of a cap elsewhere: a command
+    // that writes without bound would grow these strings until the updater
+    // itself ran out of memory, which is a worse outcome than a truncated
+    // diagnostic.  `overflow` is reported so the caller can tell a truncated
+    // capture from a short one.
+    let overflow = false;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const append = (which, chunk) => {
+      if (overflow) return;
+      if (stdout.length + stderr.length + chunk.length > maxBytes) {
+        overflow = true;
+        stdout = stdout.slice(0, Math.max(0, maxBytes - stderr.length));
+        stderr = stderr.slice(0, Math.max(0, maxBytes - stdout.length));
+        child.kill("SIGKILL");
+        return;
+      }
+      if (which === "out") stdout += chunk;
+      else stderr += chunk;
+    };
+    child.stdout.on("data", (chunk) => append("out", chunk));
+    child.stderr.on("data", (chunk) => append("err", chunk));
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      resolveRun({ code: null, signal: "SIGKILL", stdout, stderr, timedOut: true });
+      resolveRun({ code: null, signal: "SIGKILL", stdout, stderr, timedOut: true, overflow });
     }, timeoutMs);
     const settle = (result) => {
       if (settled) return;
@@ -1072,8 +1096,8 @@ function runBounded(command, args, { cwd, env, timeoutMs }) {
       clearTimeout(timer);
       resolveRun(result);
     };
-    child.once("error", (error) => settle({ code: null, signal: null, stdout, stderr, spawnError: error, timedOut: false }));
-    child.once("close", (code, signal) => settle({ code, signal, stdout, stderr, timedOut: false }));
+    child.once("error", (error) => settle({ code: null, signal: null, stdout, stderr, spawnError: error, timedOut: false, overflow }));
+    child.once("close", (code, signal) => settle({ code, signal, stdout, stderr, timedOut: false, overflow }));
   });
 }
 
