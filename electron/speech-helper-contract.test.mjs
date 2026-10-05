@@ -62,4 +62,18 @@ describe("Personal Voice helper contract", () => {
     expect(quitPath).toContain("stopSpeech()");
     expect(quitPath).toContain("stopPersonalVoice()");
   });
+
+  it("retries a canceled chunk from the unspoken remainder", () => {
+    // didCancel used to call speakCurrentChunk() on the original chunk, so an
+    // interruption replayed audio the user had already heard.  willSpeakRange
+    // is UTF-16 and is relative to the utterance currently in flight.
+    expect(helperSource).toContain("willSpeakRangeOfSpeechString");
+    expect(helperSource).toContain("static func remainderAfterCancel(chunk: String, nextRangeLocation: Int)");
+    expect(helperSource).toContain("return ns.substring(from: location)");
+    const cancelStart = helperSource.indexOf("func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel");
+    const cancelEnd = helperSource.indexOf("let speaker = PersonalVoiceSpeaker()");
+    const cancel = helperSource.slice(cancelStart, cancelEnd);
+    expect(cancel).toContain("remainderAfterCancel(");
+    expect(cancel).not.toMatch(/attempts < 2 \{\s*speakCurrentChunk\(\)/);
+  });
 });
