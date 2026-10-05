@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import {
@@ -75,7 +75,8 @@ const GPG_PUBLIC_FILES = new Set([
 ]);
 
 function guestPath(rel: string): string {
-  return join(VM_CLI_GUEST_HOME, rel);
+  // Linux container paths must stay POSIX even when planning mounts on Windows hosts.
+  return posix.join(VM_CLI_GUEST_HOME, rel);
 }
 
 function relPathParts(rel: string): string[] {

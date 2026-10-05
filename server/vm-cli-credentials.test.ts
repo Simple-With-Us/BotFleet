@@ -16,6 +16,9 @@ describe("vm CLI credential sync", () => {
     expect(names.has("docker")).toBe(true);
     expect(names.has("turso")).toBe(true);
     expect(names.has("infisical")).toBe(true);
+    for (const candidate of manifestCredentialCandidates()) {
+      expect(candidate.guest.startsWith("/home/cua/") || candidate.guest === "/home/cua/.gitconfig").toBe(true);
+    }
   });
 
   it("strips macOS docker credential helpers for Linux guests", () => {
