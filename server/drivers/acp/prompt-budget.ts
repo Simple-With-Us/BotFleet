@@ -122,22 +122,40 @@ function peelSystem(composed: string, userText: string): string | null {
 
 const INLINE_REPLAY_LINE = /(?:^|\n)(?:User|Assistant): /;
 const ROOM_CONTEXT_LINE = /(?:^|\n)[^:\n]+: /;
-const ROOM_REPLY_BOUNDARY = `\n\n${ROOM_REPLY_PREFIX}`;
+/** Harness delimiter from `buildTurnContext` — not a bare `TURN_REPLY_CUE`
+ *  substring, which the current message may quote. */
+const INLINE_REPLY_BOUNDARY = `\n\n${TURN_REPLY_CUE}\n\n`;
+/** Full room instruction line from `runGroupMemberTurn` — not the prefix
+ *  alone, which `cardContinuation` may quote after the boundary. */
+const ROOM_REPLY_BOUNDARY_RE = new RegExp(
+  `\\n\\n${ROOM_REPLY_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\\n]+\\.\\)`,
+  "g",
+);
+
+function lastRoomReplyBoundaryAt(userText: string): number {
+  const re = ROOM_REPLY_BOUNDARY_RE;
+  re.lastIndex = 0;
+  let boundaryAt = -1;
+  for (let match = re.exec(userText); match; match = re.exec(userText)) {
+    boundaryAt = match.index;
+  }
+  return boundaryAt;
+}
 
 function splitInlineReplay(userText: string): { history: Piece[]; current: string } | null {
-  const cueAt = userText.lastIndexOf(TURN_REPLY_CUE);
-  if (cueAt < 0) return null;
-  const region = userText.slice(0, cueAt);
+  const boundaryAt = userText.lastIndexOf(INLINE_REPLY_BOUNDARY);
+  if (boundaryAt < 0) return null;
+  const region = userText.slice(0, boundaryAt);
   if (!INLINE_REPLAY_LINE.test(region)) return null;
   const parts = region.split(/\n(?=(?:User|Assistant): )/);
   return {
     history: parts.map((text) => ({ kind: "history" as const, text })),
-    current: userText.slice(cueAt),
+    current: userText.slice(boundaryAt),
   };
 }
 
 function splitRoomReplay(userText: string): { history: Piece[]; current: string } | null {
-  const boundaryAt = userText.lastIndexOf(ROOM_REPLY_BOUNDARY);
+  const boundaryAt = lastRoomReplyBoundaryAt(userText);
   if (boundaryAt < 0) return null;
   const region = userText.slice(0, boundaryAt);
   if (!ROOM_CONTEXT_LINE.test(region)) return null;

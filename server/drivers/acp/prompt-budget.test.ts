@@ -207,6 +207,29 @@ describe("applyAcpPromptBudget", () => {
     expect(result.text.endsWith(current)).toBe(true);
   });
 
+  it("uses the harness inline reply delimiter so a quoted cue in the current message stays protected", () => {
+    const listed = sections();
+    const system = listed.map((section) => section.text).join("");
+    const userText = [
+      "User: earlier turn",
+      "",
+      TURN_REPLY_CUE,
+      "",
+      `Please explain what ${TURN_REPLY_CUE} means`,
+    ].join("\n");
+    const composed = compose(system, userText);
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: bytes(composed) - bytes("User: earlier turn\n"),
+    });
+    expect(result.trimmed).toBe(true);
+    expect(result.text).toContain(`Please explain what ${TURN_REPLY_CUE} means`);
+    expect(result.text).not.toMatch(/explain what.*omitted/s);
+    expect(result.text.endsWith(`Please explain what ${TURN_REPLY_CUE} means`)).toBe(true);
+  });
+
   it("uses the last inline reply cue so payload text cannot become trimmable history", () => {
     const listed = sections();
     const system = listed.map((section) => section.text).join("");
@@ -229,6 +252,26 @@ describe("applyAcpPromptBudget", () => {
     expect(result.text).toContain(`quoted ${TURN_REPLY_CUE} inside`);
     expect(result.text.endsWith("final question")).toBe(true);
     expect(result.text).toContain(TURN_REPLY_CUE);
+  });
+
+  it("uses the harness room reply line so cardContinuation cannot become trimmable history", () => {
+    const listed: AcpPromptSection[] = [{ id: "persona", text: stable, volatile: false }];
+    const oldLine = `Jay: ${"ancient ".repeat(80)}`;
+    const recentLine = "Bot: recent";
+    const harnessLine = `${ROOM_REPLY_PREFIX}Scout.)`;
+    const continuation = `Card body quoting ${harnessLine} verbatim`;
+    const userText = `${oldLine}\n${recentLine}\n\n${harnessLine}\n\n${continuation}`;
+    const composed = compose(stable, userText);
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: bytes(composed) - bytes(`${oldLine}\n`),
+    });
+    expect(result.trimmed).toBe(true);
+    expect(result.text).toContain(continuation);
+    expect(result.text.endsWith(continuation)).toBe(true);
+    expect(result.text).toContain(harnessLine);
   });
 
   it("trims the oldest room context line before volatile sections", () => {
