@@ -27,6 +27,7 @@ export interface Routine {
   schedule: RoutineSchedule;
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes: number;
+  oneShotWake?: boolean;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -47,6 +48,7 @@ export interface RoutineRun {
   webhookId?: string;
   deliveryId?: string;
   threadId?: string;
+  ownerThreadId?: string;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
