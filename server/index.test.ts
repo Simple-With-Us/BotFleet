@@ -3093,11 +3093,18 @@ describe("harness HTTP API", () => {
         // cleanup racing its own test produces on a slow runner.  Assert 200 on
         // the first attempt anyway and the cleanup fails the test it is trying
         // to protect, leaving the instance disabled for whatever runs next.
+        //
+        // 4s, not the helper's default: six of these run back to back in a
+        // test with a 40s budget, so a 15s wait each would turn this flake
+        // into a timeout — trading one red for a different red.  A drain takes
+        // about a second, so 4s is four times the real thing and leaves the
+        // budget intact.
         expect(
           (
             await until(
               () => api("PATCH", `/api/instances/${instanceId}`, { enabled: true }),
               (response) => response.status === 200,
+              4_000,
             )
           ).status,
         ).toBe(200);
@@ -3108,6 +3115,7 @@ describe("harness HTTP API", () => {
             await until(
               () => api("PATCH", path, { enabled: false, fullAuto: false }),
               (response) => response.status === 200,
+              4_000,
             )
           ).status,
         ).toBe(200);
@@ -5564,8 +5572,11 @@ describe("instance CLI override API", () => {
           ),
         // No annotation here on purpose: annotating the predicate also narrows
         // what `until` infers it returned, and the rest of the test needs the
-        // full instance (`.models`, `.snapshot`).
+        // full instance (`.models`, `.snapshot`).  Bounded rather than the
+        // helper default so a genuinely dead engine fails this line instead of
+        // eating the test's own budget waiting.
         (instance) => instance?.snapshot?.state === "available",
+        8_000,
       );
       expect(claude?.snapshot.state).toBe("available");
 
