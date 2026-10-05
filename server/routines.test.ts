@@ -1595,19 +1595,66 @@ describe("RoutineManager", () => {
         botId: "compiler-bot",
         schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
       });
+      const nextBefore = routine.nextRunAt!;
       h.manager.snoozeBot("compiler-bot");
       expect(h.manager.isBotSnoozed("compiler-bot")).toBe(true);
 
-      h.setNow(routine.nextRunAt! + 1000);
+      h.setNow(nextBefore + 1000);
       await h.manager.tick();
       expect(h.started).toHaveLength(0);
-      expect(h.manager.listRuns()).toHaveLength(0);
+      expect(h.manager.listRuns()).toHaveLength(1);
+      expect(h.manager.listRuns()[0]).toMatchObject({
+        status: "missed",
+        outcomeCode: "bot_stopped",
+        error: "Automations paused because this bot is stopped",
+        scheduledFor: nextBefore,
+      });
+      expect(h.manager.listRoutines()[0]!.nextRunAt).toBeGreaterThan(nextBefore);
 
       h.manager.clearBotSnooze("compiler-bot");
       expect(h.manager.isBotSnoozed("compiler-bot")).toBe(false);
+      const nextAfterSkip = h.manager.listRoutines()[0]!.nextRunAt!;
+      h.setNow(nextAfterSkip + 1000);
       await h.manager.tick();
       expect(h.started).toHaveLength(1);
-      expect(h.manager.listRuns()[0]).toMatchObject({ status: "running", botId: "compiler-bot" });
+      expect(h.manager.listRuns().filter((r) => r.status === "running")).toHaveLength(1);
+    });
+
+    it("records a stopped-bot receipt (not offline) when a snoozed schedule is far past due", async () => {
+      const h = harness();
+      const routine = h.manager.create({
+        name: "Compiler check",
+        prompt: "Check compiler status",
+        botId: "compiler-bot",
+        schedule: { type: "daily", time: "09:00", weekdays: [0, 1, 2, 3, 4, 5, 6] },
+      });
+      h.manager.snoozeBot("compiler-bot");
+      h.setNow(routine.nextRunAt! + 13 * 60 * 60_000);
+      await h.manager.tick();
+      expect(h.manager.listRuns()[0]).toMatchObject({
+        status: "missed",
+        outcomeCode: "bot_stopped",
+        error: "Automations paused because this bot is stopped",
+      });
+      expect(h.manager.listRuns()[0]?.error).not.toMatch(/offline/i);
+      expect(h.started).toHaveLength(0);
+    });
+
+    it("closes a Sentry check-in when a scheduled run is skipped because the bot is stopped", async () => {
+      const h = harness();
+      const routine = h.manager.create({
+        name: "Housekeeper sweep",
+        prompt: "check disk",
+        botId: "compiler-bot",
+        schedule: { type: "daily", time: "09:00", weekdays: [1] },
+      });
+      h.manager.snoozeBot("compiler-bot");
+      h.setNow(routine.nextRunAt!);
+      await h.manager.tick();
+      expect(h.checkInStarts).toHaveLength(1);
+      expect(h.checkInFinishes).toHaveLength(1);
+      expect(h.checkInFinishes[0]).toMatchObject({ checkInId: "check-in-1", ok: true });
+      expect(h.started).toHaveLength(0);
     });
 
     it("cancels all queued, running, and waiting runs for a bot", async () => {
