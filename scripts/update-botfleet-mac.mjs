@@ -960,6 +960,11 @@ export async function validateBuiltBundle(bundlePath, expectedCommit) {
 // healthy binary plus a starved CPU.  One retry on timeout only — a genuinely
 // bad artifact fails identically a second later, so retrying it would only
 // delay the real error, and a missing file cannot become present by waiting.
+// Not a lesson learned here: fleet recall ("busy host update timeout
+// classified as corrupt artifact not a failure", 2026-10-04) returns the Oct 1
+// cloudflared probe incident (PR #780, board fd1736f8) and an open board sweep
+// for six more short-timeout probes with the same failure.  This is the third
+// place that mistake has been paid for.
 const SMOKE_BOOT_TIMEOUT_MS = 180_000;
 const SMOKE_BOOT_ATTEMPTS = 2;
 const SMOKE_SQLITE_TIMEOUT_MS = 60_000;
