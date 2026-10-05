@@ -456,6 +456,7 @@ function Shell() {
                   setSelectedAppId(appId);
                   openBotInApp(botId, appId);
                 }}
+                filterAppId={selectedAppId}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);

@@ -1,13 +1,15 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertCircle,
   Clock,
   FolderGit2,
+  Kanban,
   LayoutGrid,
   Loader2,
   MessageSquare,
   Bot as BotIcon,
 } from "lucide-react";
+import { z } from "zod";
 import { cn } from "@/lib/cn";
 import {
   getRoomTerminology,
@@ -18,12 +20,14 @@ import {
   summarizeFleetAttention,
   type RoomAttention,
 } from "@/lib/attention-index";
+import { KanbanCommandCenter } from "./KanbanCommandCenter";
 
 interface FleetMatrixViewProps {
   onSelectApp: (appId: string) => void;
   onSelectBot: (botId: string) => void;
   onOpenAppRoom: (appId: string) => void;
   onSelectBotInApp: (botId: string, appId: string) => void;
+  filterAppId?: string | null;
 }
 
 export function FleetMatrixView({
@@ -31,9 +35,30 @@ export function FleetMatrixView({
   onSelectBot,
   onOpenAppRoom,
   onSelectBotInApp,
+  filterAppId = null,
 }: FleetMatrixViewProps) {
   const { state } = useStore();
   const terminology = getRoomTerminology(state.config);
+
+  const [viewMode, setViewMode] = useState<"matrix" | "kanban">(() => {
+    try {
+      const saved = globalThis.localStorage?.getItem("botfleet.matrix_view_mode");
+      const parsedViewMode = z.enum(["matrix", "kanban"]).safeParse(saved);
+      if (parsedViewMode.success) return parsedViewMode.data;
+    } catch {
+      // Ignore storage errors in SSR or restricted environments
+    }
+    return "matrix";
+  });
+
+  const handleSetViewMode = (mode: "matrix" | "kanban") => {
+    setViewMode(mode);
+    try {
+      globalThis.localStorage?.setItem("botfleet.matrix_view_mode", mode);
+    } catch {
+      // Ignore storage errors
+    }
+  };
 
   const nonDmGroups = useMemo(
     () => state.groups.filter((g) => !g.dm),
@@ -76,58 +101,105 @@ export function FleetMatrixView({
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-              <LayoutGrid size={22} />
+              {viewMode === "matrix" ? <LayoutGrid size={22} /> : <Kanban size={22} />}
             </div>
             <div>
               <h2 className="text-[16px] font-semibold text-ink">
-                Fleet Matrix ({terminology.plural} × Bots)
+                {viewMode === "matrix"
+                  ? `Fleet Matrix (${terminology.plural} × Bots)`
+                  : "Kanban Command Center"}
               </h2>
               <p className="text-[12px] text-ink-secondary">
-                Mission control view across all software development workspaces and assigned bots.
+                {viewMode === "matrix"
+                  ? "Mission control view across all software development workspaces and assigned bots."
+                  : "Attention-ranked effort board and live human decision queue across all workspaces."}
               </p>
             </div>
           </div>
 
-          {/* Aggregate Telemetry Strip */}
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-raised/50 px-2.5 py-1 text-[12px]">
-              <span className="text-ink-secondary">{terminology.plural}:</span>
-              <span className="font-semibold text-ink">{nonDmGroups.length}</span>
+          <div className="flex flex-wrap items-center gap-3">
+            {/* View Mode Switcher */}
+            <div className="flex items-center rounded-lg border border-hairline/60 bg-raised/80 p-0.5 text-[12px]">
+              <button
+                type="button"
+                onClick={() => handleSetViewMode("matrix")}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer",
+                  viewMode === "matrix"
+                    ? "bg-panel text-ink shadow-2xs font-semibold"
+                    : "text-ink-secondary hover:text-ink",
+                )}
+              >
+                <LayoutGrid size={13} />
+                <span>Matrix Grid</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSetViewMode("kanban")}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition-colors cursor-pointer",
+                  viewMode === "kanban"
+                    ? "bg-panel text-ink shadow-2xs font-semibold"
+                    : "text-ink-secondary hover:text-ink",
+                )}
+              >
+                <Kanban size={13} />
+                <span>Kanban Board</span>
+              </button>
             </div>
-            <div className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-raised/50 px-2.5 py-1 text-[12px]">
-              <span className="text-ink-secondary">Active Bots:</span>
-              <span className="font-semibold text-ink">{activeBots.length}</span>
+
+            {/* Aggregate Telemetry Strip */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-raised/50 px-2.5 py-1 text-[12px]">
+                <span className="text-ink-secondary">{terminology.plural}:</span>
+                <span className="font-semibold text-ink">{nonDmGroups.length}</span>
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-hairline/40 bg-raised/50 px-2.5 py-1 text-[12px]">
+                <span className="text-ink-secondary">Active Bots:</span>
+                <span className="font-semibold text-ink">{activeBots.length}</span>
+              </div>
+              {fleetSummary.totalErrors > 0 && (
+                <div className="flex items-center gap-1.5 rounded-lg border border-danger/30 bg-danger/10 px-2.5 py-1 text-[12px] text-danger font-semibold">
+                  <AlertCircle size={14} />
+                  <span>{fleetSummary.totalErrors} Errors</span>
+                </div>
+              )}
+              {fleetSummary.totalNeedsAction > 0 && (
+                <div className="flex items-center gap-1.5 rounded-lg border border-warning/30 bg-warning/10 px-2.5 py-1 text-[12px] text-warning font-semibold">
+                  <Clock size={14} />
+                  <span>{fleetSummary.totalNeedsAction} Needs Action</span>
+                </div>
+              )}
+              {fleetSummary.totalWorking > 0 && (
+                <div className="flex items-center gap-1.5 rounded-lg border border-info/30 bg-info/10 px-2.5 py-1 text-[12px] text-info font-semibold">
+                  <Loader2 size={14} className="animate-spin" />
+                  <span>{fleetSummary.totalWorking} Working</span>
+                </div>
+              )}
+              {fleetSummary.totalUnread > 0 && (
+                <div className="flex items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-2.5 py-1 text-[12px] text-accent font-semibold">
+                  <MessageSquare size={14} />
+                  <span>{fleetSummary.totalUnread} Unread</span>
+                </div>
+              )}
             </div>
-            {fleetSummary.totalErrors > 0 && (
-              <div className="flex items-center gap-1.5 rounded-lg border border-danger/30 bg-danger/10 px-2.5 py-1 text-[12px] text-danger font-semibold">
-                <AlertCircle size={14} />
-                <span>{fleetSummary.totalErrors} Errors</span>
-              </div>
-            )}
-            {fleetSummary.totalNeedsAction > 0 && (
-              <div className="flex items-center gap-1.5 rounded-lg border border-warning/30 bg-warning/10 px-2.5 py-1 text-[12px] text-warning font-semibold">
-                <Clock size={14} />
-                <span>{fleetSummary.totalNeedsAction} Needs Action</span>
-              </div>
-            )}
-            {fleetSummary.totalWorking > 0 && (
-              <div className="flex items-center gap-1.5 rounded-lg border border-info/30 bg-info/10 px-2.5 py-1 text-[12px] text-info font-semibold">
-                <Loader2 size={14} className="animate-spin" />
-                <span>{fleetSummary.totalWorking} Working</span>
-              </div>
-            )}
-            {fleetSummary.totalUnread > 0 && (
-              <div className="flex items-center gap-1.5 rounded-lg border border-accent/30 bg-accent/10 px-2.5 py-1 text-[12px] text-accent font-semibold">
-                <MessageSquare size={14} />
-                <span>{fleetSummary.totalUnread} Unread</span>
-              </div>
-            )}
           </div>
         </div>
       </div>
 
-      {/* 2D Matrix Grid */}
-      <div className="min-w-0 flex-1 overflow-x-auto rounded-xl border border-hairline/50 bg-panel shadow-xs">
+      {viewMode === "kanban" ? (
+        <div className="min-w-0 flex-1">
+          <KanbanCommandCenter
+            onSelectApp={onSelectApp}
+            onSelectBot={onSelectBot}
+            onSelectBotInApp={onSelectBotInApp}
+            onOpenAppRoom={onOpenAppRoom}
+            filterAppId={filterAppId}
+          />
+        </div>
+      ) : (
+        /* 2D Matrix Grid */
+        <div className="min-w-0 flex-1 overflow-x-auto rounded-xl border border-hairline/50 bg-panel shadow-xs">
         <table className="w-full border-collapse text-left text-[12px]">
           <thead>
             <tr className="border-b border-hairline/50 bg-raised/60">
@@ -326,6 +398,7 @@ export function FleetMatrixView({
           </tbody>
         </table>
       </div>
-    </div>
-  );
+    )}
+  </div>
+);
 }

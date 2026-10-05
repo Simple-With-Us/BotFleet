@@ -142,6 +142,30 @@ if (fixtureParam === "tv-face") {
       </StrictMode>,
     );
   });
+} else if (fixtureParam === "kanban-command-center") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.  Drive state with ?state=populated|empty|filtered.
+  void import("./components/KanbanCommandCenterVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "fleet-matrix-view") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  Drives the FleetMatrixView's view-mode
+  // switch (matrix grid vs kanban board) for visual coverage of both modes.
+  void import("./components/FleetMatrixViewVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
 } else {
   createRoot(rootElement).render(
     <StrictMode>
