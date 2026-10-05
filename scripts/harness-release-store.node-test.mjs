@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   currentCommit,
   currentLink,
+  discardRelease,
   isHeld,
   isReleaseDirectory,
   listReleases,
@@ -60,9 +61,38 @@ function awaitOpenDescriptor(child, timeoutMs = 10_000) {
   });
 }
 
+/**
+ * Remove a temp tree even when it contains read-only files.
+ *
+ * Releases are read-only by construction now, so a plain recursive remove in a
+ * fixture's teardown fails — and a fixture that cannot clean up after itself
+ * leaves state behind that makes the NEXT test lie.  Test-side only: the module
+ * exports discardRelease for production disposal.
+ */
+async function forceRemove(dir) {
+  const { chmod, readdir } = await import("node:fs/promises");
+  let entries = [];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const child = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await chmod(child, 0o755).catch(() => {});
+      await forceRemove(child);
+    } else {
+      await chmod(child, 0o644).catch(() => {});
+    }
+  }
+  await chmod(dir, 0o755).catch(() => {});
+  await rm(dir, { recursive: true, force: true, maxRetries: 5 }).catch(() => {});
+}
+
 async function store(t) {
   const dir = await mkdtemp(join(tmpdir(), "botfleet-releases-"));
-  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  t.after(() => forceRemove(dir));
   const env = { BOTFLEET_RELEASES_ROOT: dir, HOME: dir };
   return { env, dir };
 }
@@ -192,7 +222,7 @@ test("resolveCurrent is the physical path, because the fingerprint checks refuse
 test("a pointer at something that is not a release reports no commit", async (t) => {
   const { env } = await store(t);
   const stranger = await mkdtemp(join(tmpdir(), "botfleet-not-a-release-"));
-  t.after(() => rm(stranger, { recursive: true, force: true }));
+  t.after(() => forceRemove(stranger));
   await symlink(stranger, currentLink(env));
   assert.equal(await isReleaseDirectory(stranger), false);
   assert.equal(await currentCommit(env), null, "an unmapped pointer must not invent a commit");
@@ -359,22 +389,11 @@ test("retention ranks by when a release was promoted, not by its commit name", a
     const path = stagingPath(commit, env);
     await mkdir(path, { recursive: true });
     await writeFile(join(path, "marker.txt"), commit);
-    await rm(join(path, ".botfleet-release.json"), { force: true });
-    // The manifest is what carries the ordering, so write it the way promotion
-    // does and then let promoteStaging re-stamp it.
-    await writeFile(
-      join(path, ".botfleet-release.json"),
-      `${JSON.stringify({ schemaVersion: 1, commit, promotedAt: when })}\n`,
-    );
-    await rm(join(path, ".botfleet-release.json"), { force: true });
-    const real = Date.now();
-    await promoteStaging({ commit, env });
-    // Re-stamp promotedAt so the three releases are ordered deterministically
-    // instead of by whatever millisecond the test happened to run in.
-    const manifestPath = join(releasePath(commit, env), ".botfleet-release.json");
-    await rm(manifestPath, { force: true });
-    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, commit, promotedAt: when })}\n`);
-    assert.ok(real);
+    // The time is passed in rather than written afterwards: a promoted release
+    // is read-only, and the first version of this test rewrote the manifest
+    // after promotion to force an order — which the review rightly called dead
+    // computation, and which immutability turned into a hard failure.
+    await promoteStaging({ commit, env, promotedAt: when });
   };
 
   await promoteAt(B, "2026-10-01T00:00:00.000Z");
@@ -457,7 +476,7 @@ test("a manifest is validated in full, and an unknown key rejects it", async (t)
   // was accepted.  For a file nothing else is meant to write, an unrecognised
   // key is a signal that something else wrote it.
   const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-strict-"));
-  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  t.after(() => forceRemove(dir));
   const valid = {
     schemaVersion: 1,
     commit: A,
@@ -500,7 +519,7 @@ test("a manifest whose commit is not a full SHA is not a release", async (t) => 
   // validates the format — a manifest claiming commit: 42, or commit: "main",
   // or no commit at all, must not be mistaken for a release.
   const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-"));
-  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  t.after(() => forceRemove(dir));
   const write = async (body) => {
     await writeFile(join(dir, ".botfleet-release.json"), typeof body === "string" ? body : JSON.stringify(body));
     return isReleaseDirectory(dir);
@@ -577,15 +596,76 @@ test("currentCommit answers for every pointer state, not just a happy one", asyn
   // A pointer at a plain directory that is not a release: the name is used, so
   // a legacy checkout named like a commit still answers.
   const legacy = await mkdtemp(join(tmpdir(), "botfleet-legacy-"));
-  t.after(() => rm(legacy, { recursive: true, force: true }));
+  t.after(() => forceRemove(legacy));
   await rm(currentLink(env), { force: true });
   await symlink(legacy, currentLink(env));
   assert.equal(await currentCommit(env), null, "a directory named like nothing is not a commit");
 
   // An unreadable manifest must degrade to null rather than throw, because the
   // caller documents a null return and checks for it.
+  // The release is read-only now, so removing its manifest goes through the
+  // module's own disposal path rather than a bare unlink.
+  const { chmod } = await import("node:fs/promises");
+  await chmod(releasePath(A, env), 0o755).catch(() => {});
   await rm(join(releasePath(A, env), ".botfleet-release.json"), { force: true });
   await rm(currentLink(env), { force: true });
   await symlink(releasePath(A, env), currentLink(env));
   assert.equal(await currentCommit(env), A, "a release with no manifest still reports its name");
+});
+
+test("a promoted release is actually read-only, not merely documented as such", async (t) => {
+  // The design rests on a release being byte-identical to the commit it names.
+  // Marking one manifest 0o444 and calling the tree immutable asserts something
+  // the filesystem does not agree with, so the directory is made read-only and
+  // a failure to do so is a failure to promote.
+  const { env } = await store(t);
+  await stage(env, A, "payload");
+  const promoted = await promoteStaging({ commit: A, env });
+  const { stat, chmod } = await import("node:fs/promises");
+
+  assert.equal((await stat(promoted)).mode & 0o222, 0, "the release directory must not be writable");
+  assert.equal((await stat(join(promoted, "marker.txt"))).mode & 0o222, 0, "nothing inside a release may be writable");
+  await assert.rejects(writeFile(join(promoted, "marker.txt"), "tampered"), "writing into a release must fail");
+
+  // And disposal restores permission deliberately rather than failing — the
+  // pruner is the one place allowed to break the invariant.
+  await t.test("disposal restores write permission and removes it", async () => {
+    const spare = await store(t);
+    await stage(spare.env, B, "payload");
+    const path = await promoteStaging({ commit: B, env: spare.env });
+    assert.equal((await stat(path)).mode & 0o222, 0);
+    await discardRelease(B, spare.env);
+    await assert.rejects(stat(path), "disposal must actually remove the release");
+  });
+  await chmod(promoted, 0o755).catch(() => {});
+});
+
+test("re-promoting an already-released commit says so, not 'check your filesystem'", async (t) => {
+  // The catch used to rewrap EVERY promotion failure as a cross-device problem,
+  // so re-running apply on a commit that is already a release told an operator
+  // to go and move a directory they never broke.
+  const { env } = await store(t);
+  await stage(env, A, "payload");
+  await promoteStaging({ commit: A, env });
+
+  // A rename onto an existing non-empty directory reports ENOTEMPTY.
+  await stage(env, A, "payload-again");
+  const { rename: realRename } = await import("node:fs/promises");
+  const collision = async (from, to) => {
+    if (to.endsWith(`/${A}`)) {
+      const error = new Error("directory not empty");
+      error.code = "ENOTEMPTY";
+      throw error;
+    }
+    return realRename(from, to);
+  };
+  await assert.rejects(
+    promoteStaging({ commit: A, env, renameImpl: collision }),
+    (error) => {
+      assert.equal(error.cause, "already-released");
+      assert.match(error.message, /already a release/);
+      assert.doesNotMatch(error.message, /same filesystem/);
+      return true;
+    },
+  );
 });
