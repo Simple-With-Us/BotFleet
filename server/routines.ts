@@ -97,6 +97,9 @@ export interface Routine {
    * recurrence or supplied from the current harness for display only. */
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes: number;
+  /** When true, each wake runs on a fresh thread with no transcript replay;
+   *  the owner automation thread receives one summary message. */
+  oneShotWake?: boolean;
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
@@ -123,6 +126,9 @@ export interface RoutineRun {
   webhookId?: string;
   deliveryId?: string;
   threadId?: string;
+  /** Automation home thread for a one-shot wake; `threadId` is the ephemeral
+   *  workspace while the run is in flight. */
+  ownerThreadId?: string;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
@@ -189,6 +195,7 @@ export interface RoutineInput {
   schedule: RoutineSchedule;
   scheduleTimeZoneSource?: "stored" | "host";
   durationMinutes?: number;
+  oneShotWake?: boolean;
 }
 
 interface RoutineFile {
@@ -272,6 +279,18 @@ export interface RoutineManagerOptions {
     title: string,
     activate: boolean,
   ) => { threadId: string } | null;
+  /** True when this run should use a fresh ephemeral workspace (see
+   *  `server/ephemeral-dispatch.ts`). */
+  oneShotWakeForRun?: (run: RoutineRun) => boolean;
+  /** Post the one-shot summary onto the owner automation thread. */
+  deliverEphemeralResult?: (input: {
+    ownerThreadId: string;
+    ephemeralThreadId: string;
+    run: RoutineRun;
+    ok: boolean;
+    output?: string;
+    error?: string;
+  }) => void;
   startTurn: (
     botId: string,
     threadId: string,
@@ -279,6 +298,7 @@ export interface RoutineManagerOptions {
     runOn: RoutineRunOn,
     triggerSource: RoutineRunTrigger,
     onDispatchError: (message: string) => void,
+    turnOpts?: { ephemeralDispatch?: boolean },
   ) => Promise<void>;
   interruptTurn?: (botId: string, threadId: string, runOn: RoutineRunOn) => Promise<void>;
   onRunFailed?: (run: RoutineRun) => void;
@@ -395,6 +415,7 @@ function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | 
     enabled: input.enabled !== false,
     schedule: cleanSchedule(schedule),
     durationMinutes: Math.min(240, Math.max(15, Math.round(Number(input.durationMinutes) || 30))),
+    ...(input.oneShotWake === true ? { oneShotWake: true } : {}),
   };
 }
 
@@ -719,6 +740,7 @@ export class RoutineManager {
       // routine remains zone-less because there is no zone to carry forward.
       schedule: nextSchedule,
       durationMinutes: patch.durationMinutes ?? routine.durationMinutes,
+      oneShotWake: patch.oneShotWake ?? routine.oneShotWake,
     });
     if (this.options.botState(clean.botId) === "missing") throw new Error("That Bot no longer exists");
     const cancelledRuns: RoutineRun[] = [];
@@ -729,6 +751,7 @@ export class RoutineManager {
         // confirmation cards. Keep it monotonic even for two writes in one ms.
         updatedAt: Math.max(now, routine.updatedAt + 1),
       });
+      if (patch.oneShotWake === false) delete routine.oneShotWake;
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
@@ -1291,21 +1314,38 @@ export class RoutineManager {
             continue;
           }
           threadId = task.threadId;
-        } else if (
+        }
+        if (!threadId) {
+          this.failRun(run, "Could not create a task for this run");
+          continue;
+        }
+        if (
+          this.options.oneShotWakeForRun?.(run) &&
+          (run.triggerSource === "webhook" || run.triggerSource === "resource" || run.triggerSource === "schedule")
+        ) {
+          const ownerThreadId = threadId;
+          const ephemeral = this.options.createTask?.(run.botId, `${title} (one-shot)`, false);
+          if (!ephemeral) {
+            this.failRun(run, "Could not create a one-shot workspace for this run");
+            continue;
+          }
+          run.ownerThreadId = ownerThreadId;
+          threadId = ephemeral.threadId;
+        }
+        const ownerThreadId =
+          run.ownerThreadId ??
+          threadId;
+        if (
           allowsMultipleBotThreads(mode) &&
           (run.triggerSource === "webhook" || run.triggerSource === "resource")
         ) {
-          this.options.activateTask?.(run.botId, threadId);
+          this.options.activateTask?.(run.botId, ownerThreadId);
         }
         if (
           (run.triggerSource === "webhook" || run.triggerSource === "resource") &&
           !allowsMultipleBotThreads(mode)
         ) {
-          this.options.activateTask?.(run.botId, threadId);
-        }
-        if (!threadId) {
-          this.failRun(run, "Could not create a task for this run");
-          continue;
+          this.options.activateTask?.(run.botId, ownerThreadId);
         }
         run.threadId = threadId;
         run.startedAt = this.now();
@@ -1372,6 +1412,7 @@ export class RoutineManager {
             normalizeRunOn(run.runOn),
             scheduledTriggerSource,
             (message) => this.failThread(threadId, message, "dispatch_failed"),
+            { ephemeralDispatch: Boolean(run.ownerThreadId) },
           );
         } catch (error) {
           this.failThread(threadId, error instanceof Error ? error.message : String(error), "dispatch_failed");
@@ -1430,6 +1471,16 @@ export class RoutineManager {
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, false);
       } else if (!event.ok) {
         this.failRun(run, reason ?? "The bot did not complete this run", code);
+        if (run.ownerThreadId && run.threadId) {
+          this.options.deliverEphemeralResult?.({
+            ownerThreadId: run.ownerThreadId,
+            ephemeralThreadId: run.threadId,
+            run,
+            ok: false,
+            output: run.output,
+            error: run.error,
+          });
+        }
         queueMicrotask(() => void this.tick());
         return { ...run };
       } else {
@@ -1440,6 +1491,16 @@ export class RoutineManager {
         run.finishedAt = this.now();
         run.error = undefined;
         if (run.sentryCheckInId) this.options.checkInFinish?.(run, run.sentryCheckInId, true);
+      }
+      if (run.ownerThreadId && run.threadId && event.ok) {
+        this.options.deliverEphemeralResult?.({
+          ownerThreadId: run.ownerThreadId,
+          ephemeralThreadId: run.threadId,
+          run,
+          ok: true,
+          output: run.output,
+          error: run.error,
+        });
       }
     } else {
       return null;

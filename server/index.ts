@@ -433,6 +433,7 @@ import {
   automationRolloverCaps,
   shouldRolloverAutomationThread,
 } from "./automation-rollover.ts";
+import { formatEphemeralResultMessage } from "./ephemeral-dispatch.ts";
 import { RoutineRequestError, RoutineRequestService } from "./routine-requests.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
 import { scoutProject, suggestTeam } from "./project-scout.ts";
@@ -4722,6 +4723,8 @@ async function startTurn(
     automationSource?: TurnAutomationSource;
     /** the caller was already running unattended, so this turn is too */
     unattended?: boolean;
+    /** One-shot automation wake: no transcript replay and a fresh session. */
+    ephemeralDispatch?: boolean;
     /** Resume an agent after the user completed an inline connection or credential card.
      * The prompt is control-plane context: it reaches the provider without
      * masquerading as another message authored by the user. */
@@ -4985,13 +4988,17 @@ async function startTurn(
   // Resolve its quote from full storage, while the replay itself remains
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
-  const transcript = activeMessages
+  let transcript = activeMessages
     .filter((m) => m.kind === "text" && m.text && !skipTranscript.has(m.id))
     .slice(-40)
     .map((m) => ({
       role: m.role === "user" || m.role === "system" ? ("user" as const) : ("assistant" as const),
       text: transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
     }));
+  if (opts?.ephemeralDispatch) {
+    store.setResumeCursor(bot.id, selection.instanceId, undefined, threadId);
+    transcript = [];
+  }
 
   // After a rewind (edit / branch switch) the provider's native session
   // still contains the abandoned branch: start a fresh session instead of
@@ -4999,15 +5006,16 @@ async function startTurn(
   // inline (transcript-replay drivers get it via transcript). The flag is
   // cleared only once the turn is actually dispatched — clearing it here
   // would cost the next attempt its history if this dispatch fails.
-  const rewound = threadId === bot.threadId && Boolean(bot.rewound);
+  const rewound = !opts?.ephemeralDispatch && threadId === bot.threadId && Boolean(bot.rewound);
   // A fresh engine — the user switched this bot's model mid-thread — has no
   // current session here either, so it gets the same replay. Distinct from
   // rewound: the OTHER instances' cursors are left alone (a rewind wipes
   // them all), and "fresh" is decided by who ran the last turn, not by
   // whether we hold a cursor — see engineIsFresh.
   const fresh =
-    !rewound &&
-    engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+    opts?.ephemeralDispatch === true ||
+    (!rewound &&
+      engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript }));
   // the message with a reply's framing and quoted excerpt, as the model gets it
   const replyBase = promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User");
   const { turnText, resume } = buildTurnContext({
@@ -5794,6 +5802,7 @@ async function startTurn(
 // The scheduler owns timing and receipts; the existing harness remains the
 // only owner of provider sessions, approvals, tools, computers and messages.
 const routineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+let webhookOneShotWakeLookup: ((webhookId: string) => boolean) | undefined;
 routines = new RoutineManager({
   emit: broadcast,
   timeZone: routineTimeZone,
@@ -5896,8 +5905,42 @@ routines = new RoutineManager({
     if (task && bot) broadcast({ kind: "bot", bot: publicBot(bot) });
     return task;
   },
-  startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
-    startTurn(botId, prompt, { threadId, runOn, automationSource: triggerSource, onDispatchError }),
+  oneShotWakeForRun: (run): boolean => {
+    if (run.triggerSource === "webhook" && run.webhookId) {
+      return webhookOneShotWakeLookup?.(run.webhookId) === true;
+    }
+    if (run.triggerSource === "schedule") {
+      return routines!.listRoutines().find((routine) => routine.id === run.routineId)?.oneShotWake === true;
+    }
+    return false;
+  },
+  deliverEphemeralResult: ({ ownerThreadId, run, ok, output, error }) => {
+    const text = formatEphemeralResultMessage({
+      ownerThreadId,
+      ephemeralThreadId: run.threadId ?? ownerThreadId,
+      routineName: run.routineName,
+      triggerSource: run.triggerSource,
+      ok,
+      output,
+      error,
+    });
+    store.appendMessage(ownerThreadId, {
+      role: "bot",
+      kind: "text",
+      text,
+      automationSource: run.triggerSource === "manual" ? "manual" : run.triggerSource,
+    });
+    const bot = store.bot(run.botId);
+    if (bot) broadcast({ kind: "bot", bot: publicBot(bot) });
+  },
+  startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError, turnOpts) =>
+    startTurn(botId, prompt, {
+      threadId,
+      runOn,
+      automationSource: triggerSource,
+      onDispatchError,
+      ephemeralDispatch: turnOpts?.ephemeralDispatch,
+    }),
   interruptTurn: async (botId, threadId, runOn) => {
     const bot = store.bot(botId);
     const instance = bot && cloudRunUsesBoxAgent(runOn, bot.cloudBackend, cfg.botDefaults?.cloudBackend)
@@ -6116,6 +6159,8 @@ const webhooks = new WebhookManager({
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
 });
+webhookOneShotWakeLookup = (webhookId) =>
+  webhooks.list().find((hook) => hook.id === webhookId)?.oneShotWake === true;
 
 let webhookIngress: WebhookIngress | null = null;
 let webhookIngressError: string | null = null;

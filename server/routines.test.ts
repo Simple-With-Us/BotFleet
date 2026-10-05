@@ -28,6 +28,8 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
   const failed: any[] = [];
   const checkInStarts: Array<{ run: any; routine: any }> = [];
   const checkInFinishes: Array<{ run: any; checkInId: string; ok: boolean }> = [];
+  const ephemeralFlags: boolean[] = [];
+  const deliveredEphemeral: any[] = [];
   let checkInIdSeq = 0;
   let live = true;
   let admitting = true;
@@ -53,10 +55,14 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
       keys.set(automationKey, threadId);
     },
     taskExists: (_botId, threadId) => threads.has(threadId),
-    startTurn: async (botId, threadId, prompt, runOn, triggerSource) => {
+    startTurn: async (botId, threadId, prompt, runOn, triggerSource, _onError, turnOpts) => {
       started.push({ botId, threadId, prompt });
       runOns.push(runOn);
       triggerSources.push(triggerSource);
+      ephemeralFlags.push(turnOpts?.ephemeralDispatch === true);
+    },
+    deliverEphemeralResult: (input) => {
+      deliveredEphemeral.push(input);
     },
     onRunFailed: (run) => failed.push(run),
     checkInStart: (run, routine) => {
@@ -80,6 +86,8 @@ function harness(start = new Date(2026, 7, 17, 8, 0, 0).getTime()) {
     failed,
     checkInStarts,
     checkInFinishes,
+    ephemeralFlags,
+    deliveredEphemeral,
     setNow: (value: number) => (now = value),
     setBot: (value: typeof bot) => (bot = value),
     setLive: (value: boolean) => (live = value),
@@ -917,6 +925,41 @@ describe("RoutineManager", () => {
     expect(h.runOns).toEqual(["cloud"]);
     expect(h.triggerSources).toEqual(["webhook"]);
     expect(h.taskActivations).toEqual([true]);
+  });
+
+  it("dispatches one-shot webhooks on a fresh thread and posts back to the owner", async () => {
+    const h = harness();
+    h.options.conversationMode = () => "projects";
+    h.options.oneShotWakeForRun = () => true;
+    h.manager.enqueueWebhook({
+      webhookId: "hook-1",
+      webhookName: "Designer classify",
+      prompt: "Classify this UI pass",
+      botId: "maus-webhook",
+      runOn: "bot",
+      deliveryId: "d-one-shot",
+      receivedAt: new Date(2026, 7, 17, 8, 2).getTime(),
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.started[0].threadId).toBe("thread-2");
+    expect(h.ephemeralFlags).toEqual([true]);
+    const run = h.manager.listRuns().find((candidate) => candidate.deliveryId === "d-one-shot");
+    expect(run?.ownerThreadId).toBe("thread-1");
+    h.manager.handleRuntimeEvent({
+      type: "turn.completed",
+      threadId: "thread-2",
+      ok: true,
+      cost: 0,
+      denials: [],
+    } as any);
+    expect(h.deliveredEphemeral).toEqual([
+      expect.objectContaining({
+        ownerThreadId: "thread-1",
+        ephemeralThreadId: "thread-2",
+        ok: true,
+      }),
+    ]);
   });
 
   it("keeps every delivery of ONE webhook on that webhook's own thread", async () => {
