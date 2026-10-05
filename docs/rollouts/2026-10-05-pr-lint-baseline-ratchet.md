@@ -1,6 +1,6 @@
 # 2026-10-05 — Pull Request Lint Baseline Ratchet
 
-Board `7d1aca0b`.  Branch `cursor/pr-lint-baseline-ratchet-5dcb`.
+Board `7d1aca0b`.  Branch `cursor/pr-lint-baseline-ratchet-5dcb`.  PR #878.
 
 ## Behavior
 
