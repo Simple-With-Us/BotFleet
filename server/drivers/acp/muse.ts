@@ -28,10 +28,6 @@
 // installer) and the adapter (`npm`).  `needsNode` is what lets the setup UI
 // say so instead of handing a user a `npm` line that cannot run.
 
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
@@ -61,24 +57,31 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
  *  supported rung, which makes it a poor fit for a flat list anyway. */
 export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 
-/** The only model this driver offers, and it is the CLI's own documented
- *  default rather than the best model on the card.
+/** The only model this driver names, and the honest reason it names just one.
  *
  *  Muse Spark ships `muse-spark-1.3`, `muse-spark-1.2`, and `muse-spark-1.1`,
- *  all on a 1,048,576-token window, and `1.3` is the one "tuned for agentic
- *  workflows".  The CLI's default is `muse-spark-1.2` (the API defaults to
- *  `1.3`, which is a different surface with a different default).
+ *  all on a 1,048,576-token window.  Two separate things stopped this listing
+ *  more than one model.
  *
- *  This catalog lists `1.2` alone on purpose.  The adapter is verified to
- *  support model switching **at idle**, but its documented ACP config-option
- *  ids are `mode`, `nativeApprovalPolicy`, `sandbox`, `sandboxNetwork`,
- *  `workspaceWrite`, and `shell` — there is no `model` among them, and
- *  BotFleet's `selectModel` hook negotiates through exactly that
- *  `session/set_config_option` channel.  So no model switch is wired here,
- *  and listing `1.3` would put a row in the picker that a user can select and
- *  cannot get.  A single honest row beats three hopeful ones; the fix is a
- *  `selectModel` hook once the adapter exposes model as a config option, and
- *  the ACP core stops reporting `sessionModelSwitch: "unsupported"`. */
+ *  **We cannot switch.**  The adapter is verified to support model switching at
+ *  idle, but its documented ACP config-option ids are `mode`,
+ *  `nativeApprovalPolicy`, `sandbox`, `sandboxNetwork`, `workspaceWrite`, and
+ *  `shell` — there is no `model` among them, and BotFleet's `selectModel` hook
+ *  negotiates through exactly that `session/set_config_option` channel.  So no
+ *  model switch is wired, and listing `1.3` would put a row in the picker a
+ *  user can select and cannot get.
+ *
+ *  **And the model that actually runs is the account's choice, not ours.**
+ *  A live run on 2026-10-05 reported `run.model.configured` with `model_id:
+ *  "muse-spark-1.3-contributor"`, `provider_id: "meta"`, `profile_id: "tbh"`,
+ *  `source: "startup"` — so the runtime model came from the account's startup
+ *  profile, and on that account it was a 1.3 *Contributor* tier rather than the
+ *  1.2 the docs describe as the CLI default.  This entry therefore names the
+ *  model we can point at, while the matrix row says plainly that the model a
+ *  turn actually uses is the account's startup default until a switch is
+ *  wired.  Reporting one confident model id when the engine may run a
+ *  different tier would be the same overclaim as the `max` effort rung, one
+ *  level up. */
 export const STATIC_MUSE_MODELS: ModelCatalog = {
   default: "muse-spark-1.2",
   options: [
@@ -95,29 +98,32 @@ export const STATIC_MUSE_MODELS: ModelCatalog = {
   ],
 };
 
-/** Where the launcher keeps a browser/device-code session, when one has been
- *  stored.  CAVEAT: this path comes from the `muse` launcher script
- *  (`MUSE_AUTH_PATH`, defaulting to `$XDG_CONFIG_HOME/muse/auth.json`, else
- *  `$HOME/.config/muse/auth.json`), NOT from the CLI documentation — no Meta
- *  page states where the CLI stores credentials.  It is used only as a
- *  best-effort second signal, and the comment above it is the reason this
- *  function returns a boolean instead of a confidence. */
-function museAuthPath(env: Record<string, string | undefined>): string {
-  const fromEnv = env.MUSE_AUTH_PATH?.trim();
-  if (fromEnv) return fromEnv;
-  const xdg = env.XDG_CONFIG_HOME?.trim();
-  const home = env.HOME || env.USERPROFILE || homedir();
-  return join(xdg && xdg.length > 0 ? xdg : join(home, ".config"), "muse", "auth.json");
-}
-
-/** Is Muse Code signed in?  An API key always wins over a browser session —
- *  "Muse Code uses `META_API_KEY` if set, then a stored key, and only then a
- *  stored browser session" — so that env var is the one trustworthy signal.
- *  A stored auth file is a weaker second: see `museAuthPath`.  The value is
- *  never read, only tested for existence, so no credential reaches a log. */
+/** Is Muse Code signed in?
+ *
+ *  **Only an API key counts as proof.**  A live run on 2026-10-05 showed why:
+ *  `~/.config/muse/auth.json` exists for a Keychain-backed OAuth session, and
+ *  this function used to read that file's existence as proof — but the file
+ *  holds NO credential.  It is an index:  `providers.meta` carries
+ *  `mechanism: "oauth"`, `storage: "keychain"`, `obtained_via: "device_code"`,
+ *  `api_base_url`, and the user's name and avatar URL, while the token itself
+ *  lives in the macOS Keychain under a service name the CLI chooses.  So
+ *  "the index exists" said yes for an engine that could not complete a turn.
+ *
+ *  There is no honest fallback.  `muse` has `login`, `logout`, and `auth set`,
+ *  but no `auth status` or `whoami`, so there is nothing cheap to shell out to
+ *  and ask.  A Keychain-backed session is therefore reported as *not* proven,
+ *  which sends the user to the setup card instead of promising a working
+ *  engine.  That is the right way round to be wrong:  a false negative costs
+ *  one setup click, and a false positive costs a bot that fails every turn.
+ *
+ *  Note this is also a real limitation of the community adapter we drive,
+ *  which bundles `@muse-code/sdk@1.3.0` — that SDK does not read the Keychain
+ *  token Muse Code 1.4.2 writes, so it answers "not logged in" on exactly this
+ *  account.  A first-party MSP bridge spawns `muse serve` and inherits the
+ *  CLI's own credential handling, which is the strongest argument for
+ *  building one. */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
-  if (env.META_API_KEY?.trim()) return true;
-  return existsSync(museAuthPath(env));
+  return Boolean(env.META_API_KEY?.trim());
 }
 
 const support: AcpSupport = {

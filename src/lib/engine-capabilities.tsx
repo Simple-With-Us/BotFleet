@@ -747,7 +747,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
           "Muse Code subscription.  Meta publishes plan names and quotas but no monthly price, so BotFleet does not state one.  PAYG rates below are the public Model API catalog, not an invoice.",
       },
       api: {
-        // Muse Spark Standard tier, per 1M tokens: $1.25 in / $0.15 cached /
+        // Muse Spark STANDARD tier, per 1M tokens: $1.25 in / $0.15 cached /
         // $4.25 out.  Divided by 1000 for the per-1k shape the projection
         // uses.  No long-context tier: Meta bills the same rate whether the
         // window is nearly empty or nearly full, which is unusual enough to
@@ -756,7 +756,7 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
         outputPer1k: 0.00425,
         cachedInputPer1k: 0.00015,
         notes:
-          "Muse Spark Standard pay-as-you-go rates.  No long-context premium — a full 1M window costs the same per token as an empty one.  Catalog reference for the what-if projection, not an invoice.  Source:  https://dev.meta.ai/docs/pricing-rate-limits",
+          "Muse Spark Standard pay-as-you-go rates.  These are Standard, not Contributor:  a live run on a Contributor account reported its model as muse-spark-1.3-contributor, and Contributor is roughly an order of magnitude cheaper per token, so treat this as an upper bound rather than your bill.  No long-context premium — a full 1M window costs the same per token as an empty one.  Catalog reference for the what-if projection, not an invoice.  Source:  https://dev.meta.ai/docs/pricing-rate-limits",
       },
       notes: "Subscription is the pricing mode.  API rates are a what-if catalog, not an invoice.",
     },
@@ -802,8 +802,10 @@ export const ENGINE_CAPABILITIES: EngineCapabilityRegistry = {
       headline: "Meta's coding CLI, over a 1M-token window with no long-context premium.",
       prose: [
         "Muse Code runs inside BotFleet through Meta's Muse Spark models.  Files, terminal, this computer, image attachments, and long context are available.",
-        "Connected apps, cross-bot coordination, rooms, and computer use are mounted through the adapter but have not been run on a real turn yet, so the matrix marks them unaudited rather than claiming them.",
+        "The model a turn actually uses is your account's startup model, which the engine does not control yet; the matrix names Muse Spark 1.2 because that is the one this driver can point at.",
+        "Connected apps, cross-bot coordination, rooms, and computer use are mounted through the adapter but have not completed a real turn yet, so the matrix marks them unaudited rather than claiming them.",
         "Voice chat is not available on this engine.  BotFleet drives Muse Code through a community ACP adapter, because Muse Code speaks its own session protocol rather than ACP.",
+        "Signing in needs an API key:  a browser session stored in the Mac keychain is not readable by the adapter, so a keychain-only account cannot run a turn.",
       ],
     },
     defaultModels: [

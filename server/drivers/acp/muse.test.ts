@@ -108,13 +108,35 @@ describe("Muse Code driver", () => {
     expect(museAuthenticated({ META_API_KEY: "   " })).toBe(false);
   });
 
-  it("falls back to the stored auth file, and never reads the credential", () => {
+  it("reports a keychain-backed session as unproven rather than signed in", () => {
+    // The live run that produced this expectation:  `~/.config/muse/auth.json`
+    // exists for an OAuth session whose `storage` is `keychain`, and that file
+    // holds NO credential — only `mechanism`, `storage`, `obtained_via`, the
+    // api base url, and the user's name and avatar.  The token is in the
+    // keychain.  Reading that file's existence as proof made the driver claim
+    // an engine that could not complete a single turn.
+    //
+    // A false negative here costs one setup click; a false positive costs a bot
+    // that fails every turn, so this errs toward unproven.
     const dir = scratch();
-    const authPath = join(dir, "auth.json");
-    expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(false);
-    // `{}` on purpose:  the assertion is about the file existing, so there is
-    // no reason to put a credential-shaped string into committed source.
-    writeFileSync(authPath, "{}", "utf8");
-    expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(true);
+    const indexPath = join(dir, "auth.json");
+    writeFileSync(
+      indexPath,
+      JSON.stringify({
+        schema_version: 1,
+        providers: {
+          meta: {
+            mechanism: "oauth",
+            storage: "keychain",
+            obtained_via: "device_code",
+            api_base_url: "https://api.meta.ai/v1",
+          },
+        },
+      }),
+      "utf8",
+    );
+    expect(museAuthenticated({ HOME: dir })).toBe(false);
+    // And the one signal that does count.
+    expect(museAuthenticated({ META_API_KEY: "set", HOME: dir })).toBe(true);
   });
 });
