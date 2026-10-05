@@ -546,6 +546,21 @@ test("a swap that fails after deleting the pointer puts the old one back", async
   await swapCurrent({ commit: A, env });
   assert.equal(await currentCommit(env), A);
 
+  // A pointer is only ever moved onto a release that exists.  Without this a
+  // typo'd or already-pruned commit leaves `current` resolving to nothing, and
+  // nothing says so — the swap "succeeded" from the store's point of view and
+  // the harness simply cannot start.
+  await assert.rejects(
+    () => swapCurrent({ commit: "0".repeat(40), env }),
+    (error) => {
+      assert.equal(error.cause, "release-missing");
+      assert.match(error.message, /Promote that commit first/);
+      return true;
+    },
+    "swapCurrent must refuse to point current at a release that does not exist",
+  );
+  assert.equal(await currentCommit(env), A, "a refused swap must leave current exactly where it was");
+
   // Refuse the FIRST rename (so the fallback engages), then fail the retry.
   // Caught rather than asserted through assert.rejects, because the checks
   // below need to await a realpath comparison.
@@ -566,7 +581,14 @@ test("a swap that fails after deleting the pointer puts the old one back", async
     caught = error;
   }
   assert.ok(caught, "the swap must fail rather than silently succeed");
-  assert.equal(caught.cause, "pointer-lost");
+  // The restore SUCCEEDED here — the assertions below prove `current` resolves
+  // back to A — so the cause must say so.  This test used to expect
+  // "pointer-lost" while simultaneously proving the pointer was found, which is
+  // how an operator staring at a recovered harness was told their previous
+  // release was gone, and sent looking for a problem that did not exist.
+  assert.equal(caught.cause, "swap-failed-restored");
+  assert.equal(caught.restored, true, "the cause must report the restore actually happening");
+  assert.doesNotMatch(caught.message, /could not restore/, "a successful restore must not be described as a failed one");
   assert.equal(caught.previous, await realpath(releasePath(A, env)), "the error must name what was live before");
 
   // The point: `current` still resolves, and it still points at the release
