@@ -489,7 +489,7 @@ describe("ACP turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-cancel-child", text: "never finishes" });
     await vi.waitFor(() => {
       expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
-    });
+    }, { timeout: 5_000 });
     const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
 
     try {
@@ -512,25 +512,25 @@ describe("ACP turns (fake CLI)", () => {
     // A lock is only released when every holder is gone, and killCliTree
     // early-returns once the leader has exited.  So when an MCP descendant
     // ignores SIGTERM and outlives its parent while still holding the session
-    // lock, stop() must issue one process-group kill of its own — mirroring
-    // stopAndWaitForExit's already-exited branch — or the wedge survives and
-    // the next run collides with the lock.
+    // lock, stop() must reap the group itself (SIGTERM, then the 2s SIGKILL),
+    // or the wedge survives and the next run collides with the lock.  The
+    // descendant keeps the group alive, so the group id is still this CLI's.
     const descendantPidFile = join(scratch, "descendant.pid");
     process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
     await create(GrokAgentDriver, "exit-with-lingering-child", { promptTimeoutMs: 30_000 });
     await instance.adapter.sendTurn({ threadId: "t-lingering-child", text: "never finishes" });
     await vi.waitFor(() => {
       expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
-    });
+    }, { timeout: 5_000 });
     const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
 
     try {
       const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
       expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
 
-      // Without the already-exited group kill the descendant is never signalled
-      // again: it holds the lock forever.  With it, the SIGTERM-ignoring
-      // descendant is reaped as soon as the turn settles.
+      // Without the already-exited group reap the descendant is never
+      // signalled again: it holds the lock forever.  With it, the
+      // SIGTERM-ignoring descendant is gone within the force-kill window.
       await vi.waitFor(() => {
         expect(() => process.kill(descendantPid, 0)).toThrow();
       }, { timeout: 4_000 });
@@ -543,13 +543,44 @@ describe("ACP turns (fake CLI)", () => {
     }
   });
 
-  it("never sends a stale process-group SIGKILL once the child has exited", async () => {
+  it.skipIf(process.platform === "win32")("reaps a SIGTERM-ignoring descendant that outlives a leader stopped on a normal completion", async () => {
+    // Kody #831: settle() calls stop() while the leader is alive, the leader
+    // dies on the SIGTERM within milliseconds, and the SIGTERM-ignoring
+    // descendant lives on holding the session lock.  settle() has already
+    // dropped the turn from `active`, so stopAll/dispose can never reach it:
+    // the 2s force-kill is the only thing left that can reap it, and it must
+    // not stand down just because the leader is gone.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "happy-with-lingering-child");
+    await instance.adapter.sendTurn({ threadId: "t-happy-lingering", text: "hi" });
+    const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+    expect(done).toMatchObject({ ok: true });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+    try {
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the force-kill has reaped it
+      }
+    }
+  });
+
+  // POSIX only: the assertion reads the negative-pid SIGTERM killCliTree sends
+  // to the CLI's process group, and Windows has no process groups (killCliTree
+  // runs taskkill /T there and never calls process.kill with a negative pid).
+  it.skipIf(process.platform === "win32")("never sends a stale process-group SIGKILL once the child has exited", async () => {
     // stop() arms a 2s force-kill on the per-turn hot path (settle() calls
     // stop() on every normal completion while the child is alive).  By the time
-    // that timer fires the child has usually exited on SIGTERM and its pid is
-    // free for the OS to recycle, so the callback must re-check liveness before
-    // signalling the group — otherwise it can SIGKILL an unrelated group that
-    // inherited the recycled pid (another turn's CLI, the deployer's children).
+    // that timer fires the child has usually exited on SIGTERM and, with no
+    // descendant left in its group, its pid is free for the OS to recycle, so
+    // the force-kill must stand down rather than SIGKILL an unrelated group
+    // that inherited the recycled pid (another turn's CLI, the deployer's
+    // children).
     const kill = vi.spyOn(process, "kill");
     try {
       await create(GrokAgentDriver);
