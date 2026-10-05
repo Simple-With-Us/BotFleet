@@ -1,5 +1,7 @@
 # 2026-10-01 — MiniMax M3.1 Reasoning Effort On Harness (DSH)
 
+## Context
+
 Board row `873f0bbe`, branch `claude/dsh-m31-effort`.  Owner approval 2026-10-01: enable MiniMax M3.1 on the Harness (DSH) engine with the `settings.yaml` entry, a Harness change for effort levels plus this BotFleet bump, and one paid MiniMax call to confirm it works.  This follows PR #756 (MiniMax Code and the direct HTTP engine), whose rollout doc `2026-09-30-minimax-m31-effort.md` lives in that PR until it merges and whose "Harness (DSH): What Unlocks M3.1" section listed these three steps.
 
 ## What Ships
@@ -53,9 +55,13 @@ All tests use temporary homes and the fake ACP CLI.  No test reads `~/.botfleet`
 - `src/lib/model-effort.test.ts`: the DSH M3.1 picker shows only when its row carries levels.
 - Offline payload check against the installed dsh and pi-ai with a blocked `fetch`: Default sends no thinking field, and Low, X-High and Max send `thinking: {type: "adaptive", display: "summarized"}` with `output_config.effort` set to the level.  Zero network calls.
 
-## Still To Do
+## Owner Action Items
 
-One paid MiniMax call (owner-approved) to confirm MiniMax accepts pi-ai's `thinking.display: "summarized"` with an effort, on the live harness after this lands.
+One paid MiniMax call (owner-approved) to confirm MiniMax accepts pi-ai's `thinking.display: "summarized"` with an effort, on the live harness after this lands.  Nothing else in this note waits on a person; every other check above is automated and green.
+
+## Rollback
+
+Revert the Clutch pin.  The M3.1 row simply loses its effort levels and the picker row disappears; M2.7 Highspeed stays hidden either way, and no stored setting becomes invalid, because the levels were never persisted.  Reverting also restores the previous `readDshSettingsPath` behaviour, which means a `$DSH_HOME` set by hand goes back to reading the wrong folder — so prefer the forward fix over the revert unless Clutch is unusable.
 
 ## Merge Order
 

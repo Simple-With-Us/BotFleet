@@ -3,6 +3,13 @@ import { fileURLToPath } from "node:url";
 
 const OPEN = new Set(["open", "in_progress"]);
 const REPO = "Simple-With-Us/BotFleet";
+// The former owner still appears in `external_uid` on board rows created
+// before the rename, and in historical effort-log PR URLs.  Hard-matching the
+// current owner alone would flag every pre-rename root row as missing its
+// canonical issue link, so both are accepted here exactly as they are in the
+// PR-URL matcher below.
+const REPO_OWNER_ALTERNATION = "(?:jaywedgeworth22|Simple-With-Us)";
+const issueUidPrefix = new RegExp(`^issue-${REPO_OWNER_ALTERNATION}/BotFleet-`);
 const plain = (value) => String(value ?? "").replace(/\b[a-z][a-z0-9+.-]*:\S+/gi, "[link]").replace(/[\r\n]+/g, " ");
 const normalized = (value) => plain(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const summary = (row) => ({ id: row.id, title: plain(row.title), status: row.status, sourceKind: row.source_kind, owner: row.addressed_by || row.reported_by || null });
@@ -36,7 +43,7 @@ export function auditEffortBoard({ board, issues, mergedPullRequests, deployment
     if (OPEN.has(row.status) && /\b(COMPLETED|DEPLOYED|MERGED)\b/i.test(row.title ?? "")) {
       findings.push({ kind: "terminal-text-open-status", ...summary(row) });
     }
-    if (row.source_kind !== "effort-row" && !issueLinks.length && !String(row.external_uid ?? "").startsWith(`issue-${REPO}-`)) {
+    if (row.source_kind !== "effort-row" && !issueLinks.length && !issueUidPrefix.test(String(row.external_uid ?? ""))) {
       findings.push({ kind: "missing-canonical-issue-link", ...summary(row) });
     }
     const prNumbers = [...text.matchAll(/https?:\/\/github\.com\/(?:jaywedgeworth22|Simple-With-Us)\/BotFleet\/pull\/(\d+)/gi)].map((match) => Number(match[1]));
