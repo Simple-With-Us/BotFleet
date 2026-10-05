@@ -2,6 +2,13 @@
 
 PR #831 (`ag/fix-acp-wedged-lock`).  Close the recycled-pgid kill window when an ACP turn's force-kill timer fires after the CLI leader has already exited, while still reaping SIGTERM-ignoring MCP descendants that hold a session lock.
 
+## Pre-work Claim
+
+- `AGENT-SYNC.md` (`/Users/jay/apps/AGENT-SYNC.md`) was read before claiming this work.
+- The #agent-sync claim was posted to `#agent-sync` (`C0BEZDJDNKV`) with `repo: BotFleet` as its first body field.  Seat `BF-FIXER`, claimed Mon, Oct 5, 2026, state WIP.
+- Claim reference:  ts `1791237243.397089`, permalink https://simple-with-us.slack.com/archives/C0BEZDJDNKV/p1791237243397089
+- Claimed scope:  `ag/fix-acp-wedged-lock` `server/procs.ts` `server/procs-group.test.ts` `server/drivers/acp/**` (PR #831 at tip `26acb0b7`).
+
 ## Context & Objective
 
 ACP `stop()` used to arm a 2 s process-group `SIGKILL` against the raw `-pid` captured at stop time.  Once the leader exited, that pid/pgid could be recycled by the OS before the timer fired, so the callback could signal an unrelated group (another turn's CLI, or the deployer's children).  A liveness re-check on the *leader* closed the recycle window but also made the timer a no-op exactly when a SIGTERM-ignoring MCP descendant outlived the leader on a normal completion — the wedge this PR exists to reap.  The fix is ownership of the process group itself: signal only while `-pid` can still be shown to name this CLI's group.
