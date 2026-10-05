@@ -418,7 +418,11 @@ export function autoVerdict(
     fileWrite?: FileWriteCheck;
   },
 ): AutoVerdict {
-  if (bot.bypassPermissions) {
+  // Permission bypass is still an auto-approval grant, so the local-computer
+  // consent boundary still applies: `localAutoAcknowledgementError` treats
+  // bypassPermissions as an auto-approve request and demands
+  // acknowledgeLocalAuto before this combination is created.
+  if (bot.bypassPermissions && context?.scope !== "local-computer") {
     const key = approvalKey(tool, summary, context?.scope);
     return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: "permission-bypass" };
   }

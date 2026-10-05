@@ -1658,6 +1658,7 @@ type ComputerGrantSubject = {
   /** The pre-array spelling some stored bots still carry. */
   computer?: unknown;
   autoApprove?: boolean;
+  bypassPermissions?: boolean;
   modelSelection?: ModelSelection;
 };
 
@@ -1799,7 +1800,7 @@ function localAutoAcknowledgementError(
   // A bot that ALREADY holds the pair keeps it: the warning was answered
   // once, and re-saving an unrelated field must not demand it again.
   const capability = botLocalAutoCapability(existing);
-  const alreadyGranted = existing?.autoApprove === true && requiresLocalAutoConsent(
+  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true) && requiresLocalAutoConsent(
     storedComputerGrants(existing),
     context.currentDefault,
     context.currentAllowed,
@@ -11931,7 +11932,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : body.computer !== undefined
           ? (body.computer === "off" ? [] : [body.computer])
           : storedComputerGrants(existingBot);
-      const wantsAuto = body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true;
+      const wantsAuto = body.autoApprove !== undefined
+        ? body.autoApprove
+        : body.bypassPermissions !== undefined
+          ? body.bypassPermissions
+          : (existingBot?.autoApprove === true || existingBot?.bypassPermissions === true);
       const ackError = localAutoAcknowledgementError(
         existingBot,
         wantsComputers,
@@ -12594,6 +12599,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         (message) =>
           message.kind === "options" &&
           message.card?.requestId &&
+          message.card.tool &&
           !message.card.answered &&
           !message.card.dismissed,
       );
