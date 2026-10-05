@@ -85,6 +85,27 @@ const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutM
   }
 };
 
+/** The async twin of `vi_waitFor`, for states that settle across a request.
+ *
+ *  The Windows runner is roughly a third slower than the others and its test
+ *  files overlap more, so anything that asserts a settled instance state or a
+ *  write landing *immediately* is a coin flip there and a certainty here.  Both
+ *  call sites below passed on macOS and ubuntu across many runs, which is
+ *  exactly the shape of a flake that only ever reports itself on one platform.
+ */
+const until = async <T,>(
+  read: () => Promise<T>,
+  ok: (value: T) => boolean,
+  timeoutMs = 15_000,
+): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+};
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
@@ -3067,10 +3088,30 @@ describe("harness HTTP API", () => {
         await api("DELETE", `/api/bots/${bot.id}`);
       }
       for (const instanceId of otherInstances) {
-        expect((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status).toBe(200);
+        // The endpoint answers 409 while a previous overlapping write is still
+        // draining — which is the documented behaviour, and exactly what a
+        // cleanup racing its own test produces on a slow runner.  Assert 200 on
+        // the first attempt anyway and the cleanup fails the test it is trying
+        // to protect, leaving the instance disabled for whatever runs next.
+        expect(
+          (
+            await until(
+              () => api("PATCH", `/api/instances/${instanceId}`, { enabled: true }),
+              (response) => response.status === 200,
+            )
+          ).status,
+        ).toBe(200);
       }
-      expect((await api("PATCH", "/api/instances/gatedQuota", { enabled: false, fullAuto: false })).status).toBe(200);
-      expect((await api("PATCH", "/api/instances/slowProbe", { enabled: false, fullAuto: false })).status).toBe(200);
+      for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
+        expect(
+          (
+            await until(
+              () => api("PATCH", path, { enabled: false, fullAuto: false }),
+              (response) => response.status === 200,
+            )
+          ).status,
+        ).toBe(200);
+      }
     }
   }, 40_000);
 
@@ -5512,8 +5553,20 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
-      const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+      // An engine that a neighbouring test left reloading is still settling;
+      // `unavailable` here means "asked too early", not "broken".  Poll for
+      // the settled state and keep the assertion, so a genuinely unavailable
+      // engine still fails here rather than being retried past.
+      const claude = await until(
+        async () =>
+          (await api("GET", "/api/instances?fresh=1")).body.instances.find(
+            (instance: { instanceId: string }) => instance.instanceId === "claude",
+          ),
+        // No annotation here on purpose: annotating the predicate also narrows
+        // what `until` infers it returned, and the rest of the test needs the
+        // full instance (`.models`, `.snapshot`).
+        (instance) => instance?.snapshot?.state === "available",
+      );
       expect(claude?.snapshot.state).toBe("available");
 
       const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
