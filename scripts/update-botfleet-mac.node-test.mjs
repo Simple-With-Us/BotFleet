@@ -3,7 +3,7 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ResolutionError } from "./ci-build-resolver.mjs";
+import { downloadBuiltBundle, ResolutionError } from "./ci-build-resolver.mjs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
@@ -51,6 +51,10 @@ import {
 } from "./update-botfleet-mac.mjs";
 
 const scripts = dirname(fileURLToPath(import.meta.url));
+
+// A real 40-char commit, so the resolver is driven with a target it will accept.
+const COMMIT = "c".repeat(40);
+
 
 test("a detached run is given a progress file and a run id to report under", () => {
   const parsed = parseArguments(["update", "--progress", "/tmp/state/run.json", "--run-id", "run_one"]);
@@ -1996,7 +2000,7 @@ test("only a well-formed health body establishes readiness", () => {
   }
 });
 
-test("only an expected cancellation justifies packaging on this Mac", () => {
+test("only an expected cancellation justifies packaging on this Mac", async () => {
   // The real class: the check is an instanceof, so a stand-in would make the
   // test pass for the wrong reason.
 
@@ -2004,18 +2008,55 @@ test("only an expected cancellation justifies packaging on this Mac", () => {
   // actually FAILED is a signal — its signature gate, tests, or packaging step
   // rejected the commit — and quietly building it locally for 15 minutes would
   // turn a broken pipeline into a deceptively successful install.
-  const outcome = (cause, conclusion) => {
-    const error = new ResolutionError("x");
-    error.cause = cause;
-    error.conclusion = conclusion;
-    return isRecoverableResolutionFailure(error);
+  // This used to construct a `ResolutionError("x")` and hand-assign `cause` and
+  // `conclusion` onto it — which is a restatement of the function's own body.
+  // It would still pass if ci-build-resolver.mjs were deleted outright, so it
+  // could not catch the bug it was written for: the resolver reporting
+  // "still running" while the consumer tests for "in_progress".
+  //
+  // So the error is produced by the RESOLVER, from a real workflow status, and
+  // the assertion is on the value the consumer actually reads — not on the
+  // prose, which is identical for "in_progress" and "still running".
+  const fromResolver = async (status, conclusion) => {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        workflow_runs: [{ id: 1, head_sha: COMMIT, status, conclusion, event: "push" }],
+      }),
+    });
+    try {
+      await downloadBuiltBundle({ commit: COMMIT, destination: "/tmp/unused-by-this-test", fetchImpl });
+    } catch (error) {
+      return error;
+    }
+    throw new Error(`expected the resolver to refuse a run with status=${status}`);
   };
-  assert.equal(outcome("no-build", undefined), true, "the commit predates the workflow");
-  assert.equal(outcome("build-failed", "cancelled"), true, "a newer commit landed on main");
-  assert.equal(outcome("build-failed", "in_progress"), true, "worth a moment");
-  assert.equal(outcome("build-failed", "failure"), false, "the build rejected the commit");
-  assert.equal(outcome("build-failed", "timed_out"), false);
-  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "unauthorized"]) {
-    assert.equal(outcome(cause, undefined), false, `${cause} must surface, not fall back`);
+
+  // Sanity: the run really is refused, with the cause the consumer branches on.
+  const stillRunning = await fromResolver("in_progress", null);
+  assert.equal(stillRunning.cause, "build-failed");
+  // THE BUG.  The prose says "still running"; the value is the raw status.
+  assert.equal(stillRunning.conclusion, "in_progress",
+    "the resolver must carry the raw workflow status, because the consumer compares against that literal");
+  assert.equal(isRecoverableResolutionFailure(stillRunning), true, "a build still running is worth a moment");
+
+  const cancelled = await fromResolver("completed", "cancelled");
+  assert.equal(cancelled.conclusion, "cancelled");
+  assert.equal(isRecoverableResolutionFailure(cancelled), true, "a superseded build is expected, not a failure");
+
+  const failed = await fromResolver("completed", "failure");
+  assert.equal(isRecoverableResolutionFailure(failed), false,
+    "a build that actually rejected the commit must surface, not fall back to a local package");
+  assert.equal(isRecoverableResolutionFailure(await fromResolver("completed", "timed_out")), false);
+
+  assert.equal(isRecoverableResolutionFailure(new ResolutionError("x", "no-build")), true,
+    "the commit predates the workflow");
+  for (const cause of ["network-failed", "network-timed-out", "rate-limited", "checksum-mismatch", "bad-manifest", "unauthorized", "pointer-lost"]) {
+    assert.equal(
+      isRecoverableResolutionFailure(new ResolutionError("x", cause)),
+      false,
+      `${cause} must surface rather than fall back`,
+    );
   }
 });

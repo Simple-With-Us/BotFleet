@@ -118,7 +118,12 @@ export class ResolutionError extends Error {
     super(message);
     this.name = "ResolutionError";
     this.cause = cause;
-    /** For cause "build-failed": "cancelled", "failure", "still running", ... */
+    /**
+     * For cause "build-failed": the RAW workflow status — "in_progress", "cancelled",
+     * "failure", "timed_out".  Consumers compare against these literals, so this
+     * must be the status and not a human-readable label: the message prettifies
+     * it separately, and a label here once made the still-running branch dead.
+     */
     this.conclusion = undefined;
   }
 }
