@@ -11,7 +11,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { UsageWhatIfProjection, apiEquivalentCost, projectionRows } from "./UsageWhatIfProjection.tsx";
 import { ENGINE_CAPABILITIES, uniqueModelToEngineId } from "@/lib/engine-capabilities.tsx";
-import { hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
+import { DoomedPairArraySchema, hasEngineSpendActivity, hidesIdleUnavailableEngineRow, unpricedTurnCount } from "./UsageSection.tsx";
 import type { DoomedPair, RedundantChain } from "./UsageSection.tsx";
 
 describe("uniqueModelToEngineId", () => {
@@ -353,5 +353,89 @@ describe("held-engine and redundant-chain payloads", () => {
     expect(doomed[0].consecutiveFailures).toBe(3);
     expect(chains[0].redundant[0].reason).toBe("same-as-primary");
     expect(chains[0].effective).toBeLessThan(chains[0].total);
+  });
+});
+
+describe("DoomedPairArraySchema", () => {
+  // The exact pair server/index.ts builds: one DoomedEntry spread, plus the
+  // two fields that decide whether the entry is holding anything.
+  const wired = {
+    botId: "bot-abcdef12",
+    instanceId: "dsh",
+    consecutiveFailures: 3,
+    openedAt: 1_780_000_000_000,
+    lastFailureAt: 1_780_000_000_000,
+    lastError: "spawn dsh-agent ENOENT",
+    open: true,
+    holds: true,
+  };
+  /** Every case below is a payload the panel must refuse.  A named union
+   *  rather than `unknown` keeps each negative case one line. */
+  const refuses = (value: unknown[] | string | null | undefined) =>
+    !DoomedPairArraySchema.safeParse(value).success;
+
+  it("keeps a pair the server sends, flags included", () => {
+    expect(DoomedPairArraySchema.safeParse([wired]).data).toEqual([wired]);
+  });
+
+  it("accepts a server that predates the open and holds flags", () => {
+    // Absent means OPEN, the compatibility contract DoomedPair documents.  A
+    // strict schema must not turn an older server's pairs into a dropped list.
+    const legacy = {
+      botId: "bot-abcdef12",
+      instanceId: "dsh",
+      consecutiveFailures: 3,
+      openedAt: 1_780_000_000_000,
+      lastFailureAt: 1_780_000_000_000,
+    };
+    expect(DoomedPairArraySchema.safeParse([legacy]).data).toEqual([legacy]);
+  });
+
+  it("accepts an empty list as an answer, not a failure", () => {
+    // An empty list is the panel's "nothing is held" state, and it has to
+    // clear the previous list — the one payload that is allowed through.
+    expect(DoomedPairArraySchema.safeParse([]).data).toEqual([]);
+  });
+
+  it("rejects a truthy string where a boolean flag belongs", () => {
+    // The defect an array check cannot see: `heldPairs` reads `holds`, and
+    // "false" is truthy, so a stringified flag reports a healthy engine as held
+    // no matter what it says.
+    expect(refuses([{ ...wired, holds: "false" }])).toBe(true);
+    expect(refuses([{ ...wired, open: "true" }])).toBe(true);
+  });
+
+  it("rejects a number sent as a string and a counter sent as a fraction", () => {
+    expect(refuses([{ ...wired, consecutiveFailures: "3" }])).toBe(true);
+    expect(refuses([{ ...wired, consecutiveFailures: 2.5 }])).toBe(true);
+    expect(refuses([{ ...wired, openedAt: Number.NaN }])).toBe(true);
+  });
+
+  it("rejects a pair missing a required field", () => {
+    const { lastFailureAt: _dropped, ...withoutTimestamp } = wired;
+    expect(refuses([withoutTimestamp])).toBe(true);
+  });
+
+  it("rejects an unknown field rather than trusting the rest of the entry", () => {
+    expect(refuses([{ ...wired, holdReason: "ready to dispatch" }])).toBe(true);
+  });
+
+  it("rejects a null or non-object entry inside the list", () => {
+    // A JSON array can carry null, and the old filter would have read `.holds`
+    // off it.  One bad entry rejects the list; it is not silently dropped.
+    expect(refuses([null])).toBe(true);
+    expect(refuses(["dsh"])).toBe(true);
+    expect(refuses([wired, null])).toBe(true);
+  });
+
+  it("rejects a payload that is not a list at all", () => {
+    // Including absent: a server old enough to omit the field sends nothing,
+    // and the panel must keep its current answer rather than clear it.
+    expect(refuses(undefined)).toBe(true);
+    expect(refuses(null)).toBe(true);
+    // A single object where a list belongs, asserted directly: the helper's
+    // union has no room for it and widening it re-arms the dictionary rule.
+    expect(DoomedPairArraySchema.safeParse({ botId: "bot-abcdef12" }).success).toBe(false);
+    expect(refuses("dsh")).toBe(true);
   });
 });
