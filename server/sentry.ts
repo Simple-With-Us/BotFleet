@@ -212,21 +212,31 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   }
 }
 
-/** Stop the running client and wait for its close to finish.  `initialized`
- * drops first, so `isSentryActive()` gates captures off the instant the
- * switch flips.  Awaited before `init()` so the global scope never keeps a
- * closed client while cron check-ins and error capture still run. */
-async function closeRunningClient(): Promise<void> {
+/** Best-effort flush budget when swapping clients.  Buffered events are
+ * discarded after this cap so `PATCH /api/config` is not held open for two
+ * seconds on every observability save. */
+const SENTRY_CLIENT_CLOSE_MS = 500;
+
+/** Stop the running client.  `initialized` drops first, so `isSentryActive()`
+ * gates captures off the instant the switch flips.  Only the re-init path
+ * awaits the close so `init()` never races a stale global client; turning
+ * diagnostics off keeps the historical fire-and-forget close. */
+async function closeRunningClient(options?: { awaitFlush?: boolean }): Promise<void> {
   const sdk = sentrySdk;
   sentrySdk = null;
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
-  try {
-    await Promise.resolve(sdk.close(2000)).catch(() => {});
-  } catch {
-    /* an SDK that cannot close must not take the harness down with it */
+  const close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
+  if (options?.awaitFlush) {
+    try {
+      await close;
+    } catch {
+      /* an SDK that cannot close must not take the harness down with it */
+    }
+    return;
   }
+  void close;
 }
 
 /** @sentry/profiling-node is in neither package.json nor the lockfile, so
@@ -430,7 +440,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   };
 
   if (!input.enabled || !input.dsn || !parsed) {
-    await closeRunningClient();
+    await closeRunningClient({ awaitFlush: false });
     killed = !input.enabled;
     runtimeState = {
       ...base,
@@ -467,7 +477,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     return runtimeState;
   }
 
-  await closeRunningClient();
+  await closeRunningClient({ awaitFlush: true });
   const { sdk, error } = await loadSdk();
   if (!sdk) {
     runtimeState = { ...base, active: false, lastError: error };
@@ -570,7 +580,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // module exists to prevent.  A stand-in SDK without `getClient` answers
   // "unknown" and is left alone.
   if (acceptedDsn(sdk) === "rejected") {
-    await closeRunningClient();
+    await closeRunningClient({ awaitFlush: false });
     runtimeState = { ...base, active: false, lastError: SDK_REJECTED_DSN_MESSAGE };
     return runtimeState;
   }

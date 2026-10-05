@@ -25,9 +25,12 @@ import {
 } from "./sentry.ts";
 
 export interface ObservabilityStatusView {
-  /** Reporting is actually meant to be happening: a DSN is stored and the
-   * kill switch is on.  The Settings pill reads straight off this. */
+  /** Configuration fact: a valid DSN is on file and the kill switch is on.
+   *  The renderer uses this to decide whether it should keep a browser
+   *  client — not whether the Node SDK has finished restarting. */
   enabled: boolean;
+  /** Whether the harness Node SDK can deliver events right now. */
+  delivering: boolean;
   /** The stored switch before DSN/configuration validity is folded in. */
   requestedEnabled: boolean;
   configured: boolean;
@@ -125,12 +128,9 @@ class ObservabilityManager {
     const malformed = input.dsn !== null && parsed === null;
     const wantsReporting = input.enabled && input.dsn !== null && !malformed;
     const delivering = wantsReporting && isSentryActive();
-    const stalled =
-      wantsReporting && !delivering && !runtime.lastError && !malformed
-        ? SENTRY_DELIVERY_NOT_READY_MESSAGE
-        : null;
     return {
-      enabled: delivering,
+      enabled: wantsReporting,
+      delivering,
       requestedEnabled: input.enabled,
       configured: input.dsn !== null,
       source: this.dsnFromVault() ? "infisical" : input.source,
@@ -148,7 +148,7 @@ class ObservabilityManager {
       // The runtime only knows what the last `apply()` saw; a DSN that has
       // not reached the SDK yet is judged here so a status read before boot
       // finishes still names the problem.
-      lastError: runtime.lastError ?? (malformed ? MALFORMED_DSN_MESSAGE : stalled),
+      lastError: runtime.lastError ?? (malformed ? MALFORMED_DSN_MESSAGE : null),
     };
   }
 
@@ -236,6 +236,9 @@ export function observabilityBootLine(view: ObservabilityStatusView): string {
   }
   if (!view.enabled) {
     return "[sentry] disabled by settings: a DSN is stored, diagnostics are turned off";
+  }
+  if (!view.delivering) {
+    return `[sentry] starting (${view.source}): ${SENTRY_DELIVERY_NOT_READY_MESSAGE.slice(0, 120)}`;
   }
   const parts = [
     `[sentry] enabled (${view.source})`,

@@ -2,12 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { observabilitySettings, type AppConfig } from "./config.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
-import {
-  isSentryActive,
-  resetSentryForTests,
-  SENTRY_DELIVERY_NOT_READY_MESSAGE,
-  setSentryLoaderForTests,
-} from "./sentry.ts";
+import { isSentryActive, resetSentryForTests, setSentryLoaderForTests } from "./sentry.ts";
 
 // Obviously fake.  Nothing in this suite may ever reach a real ingest host,
 // and the key halves below are what the leak assertions search for.
@@ -139,13 +134,15 @@ describe("observability status resolution", () => {
     expect(observability.effectiveDsn()).toBe(ENV_DSN);
   });
 
-  it("does not claim live delivery before observability.apply has run", () => {
+  it("keeps enabled as configuration while delivering stays false before apply", () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
     expect(status.configured).toBe(true);
     expect(status.requestedEnabled).toBe(true);
-    expect(status.enabled).toBe(false);
-    expect(status.lastError).toBe(SENTRY_DELIVERY_NOT_READY_MESSAGE);
+    expect(status.enabled).toBe(true);
+    expect(status.delivering).toBe(false);
+    expect(status.lastError).toBeNull();
+    expect(observabilityBootLine(status)).toContain("[sentry] starting (config)");
   });
 
   it("uses the stored DSN when the environment has none", async () => {
@@ -157,6 +154,7 @@ describe("observability status resolution", () => {
       source: "config",
       configured: true,
       enabled: true,
+      delivering: true,
       requestedEnabled: true,
       host: "o0.ingest.sentry.io",
       projectId: "1",
