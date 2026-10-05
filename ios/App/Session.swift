@@ -946,9 +946,15 @@ final class Session: ObservableObject {
     // frame (or 202 queueId) lands. Everything else still waits on the
     // harness so the phone does not invent a second fold.
 
+    struct MessageSendOutcome: Sendable {
+        let ok: Bool
+        let clientNonce: String
+    }
+
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> Bool {
-        guard let client else { return false }
+    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+        guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
+        var clientNonce = ""
         do {
             var prompt = text
             if !attachments.isEmpty {
@@ -964,7 +970,7 @@ final class Session: ObservableObject {
                 }
                 prompt = ChatAttachments.composeMessage(text: text, attachments: uploaded)
             }
-            guard !prompt.isEmpty else { return false }
+            guard !prompt.isEmpty else { return MessageSendOutcome(ok: false, clientNonce: "") }
             let savedRecording: IncomingRecording?
             if let recording {
                 let path = try await client.uploadRecording(recording.data)
@@ -978,6 +984,7 @@ final class Session: ObservableObject {
             case let .room(room): threadId = room.threadId
             }
             let localId = UUID().uuidString
+            clientNonce = localId
             state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
             do {
                 switch chat {
@@ -1007,7 +1014,7 @@ final class Session: ObservableObject {
                         recording: savedRecording
                     )
                 }
-                return true
+                return MessageSendOutcome(ok: true, clientNonce: localId)
             } catch {
                 state.cancelPendingQueued(threadId: threadId, queueId: localId)
                 if let apiError = error as? APIError, apiError.isConflict {
@@ -1017,10 +1024,10 @@ final class Session: ObservableObject {
             }
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         } catch {
             recordActionError(error)
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         }
     }
 
