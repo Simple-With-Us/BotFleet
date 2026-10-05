@@ -5754,6 +5754,7 @@ async function startTurn(
       if (activeTurnOwners.forEvent(threadId, instanceId)?.dispatchId !== dispatchOwner.dispatchId) {
         // superseded, but this dispatch's notices were never read either
         restoreJobNotices(threadId, jobNoticeItems);
+        releaseTurnWorktreeLease(threadId, bot.id, dispatchOwner.dispatchId);
         return;
       }
       activeTurnOwners.settle(threadId, instanceId);
