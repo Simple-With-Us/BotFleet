@@ -102,8 +102,45 @@ export function currentLink(env = process.env) {
 
 /** Is this path a release directory we promoted, as opposed to a live checkout? */
 export async function isReleaseDirectory(path) {
-  const manifest = await readReleaseManifest(path);
-  return FULL_COMMIT.test(manifest?.commit ?? "");
+  return validateReleaseManifest(await readReleaseManifest(path)) !== null;
+}
+
+const MANIFEST_FIELDS = Object.freeze(["schemaVersion", "commit", "promotedAt", "node", "platform"]);
+
+/**
+ * Strictly validate a release manifest, or return null.
+ *
+ * The review asked for a schema, and the substance of that is right: a manifest
+ * is untrusted on-disk JSON at a trust boundary, and a check that only looks at
+ * `commit` will happily accept an object that also carries anything else.  The
+ * first version did exactly that.
+ *
+ * This is hand-written rather than zod, and the reason is structural rather
+ * than preference: this module is about to be imported by the updater, which
+ * bootstraps itself by archiving a fixed graph into a temp directory with no
+ * node_modules beside it, so a bare third-party import works in CI and then
+ * throws ERR_MODULE_NOT_FOUND on every Mac at the moment the updater might need
+ * to recover.  Every module in that graph imports nothing but node: builtins.
+ *
+ * So: every declared field is type-checked, and an UNKNOWN key is rejected —
+ * which is the part a single-regex check could not do and the part that matters
+ * for a file nothing else is meant to write.
+ */
+export function validateReleaseManifest(manifest) {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- these type checks ARE the boundary parse this function exists to do; the rule discourages typeof as a SUBSTITUTE for parsing, which is the opposite of what these lines are
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return null;
+  for (const key of Object.keys(manifest)) {
+    if (!MANIFEST_FIELDS.includes(key)) return null; // unknown property
+  }
+  if (manifest.schemaVersion !== 1) return null;
+  if (!FULL_COMMIT.test(manifest.commit ?? "")) return null;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (typeof manifest.promotedAt !== "string" || !Number.isFinite(Date.parse(manifest.promotedAt))) return null;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.node !== undefined && typeof manifest.node !== "string") return null;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- schema field validation
+  if (manifest.platform !== undefined && typeof manifest.platform !== "string") return null;
+  return manifest;
 }
 
 /**
@@ -130,10 +167,8 @@ export async function currentCommit(env = process.env) {
   // and a prune landing between the two made the second read throw out of a
   // function documented to return null — so a caller doing the documented null
   // check still crashed, on the exact path where a release is being deleted.
-  const manifest = await readReleaseManifest(physical);
-  if (manifest && FULL_COMMIT.test(manifest.commit ?? "")) {
-    return manifest.commit;
-  }
+  const manifest = validateReleaseManifest(await readReleaseManifest(physical));
+  if (manifest) return manifest.commit;
   // A pointer aimed at something that is not a release (a legacy checkout, or a
   // half-built directory) still tells the caller which commit is live, by name.
   // Split on the platform's separator: a hard-coded "/" would make every path
@@ -291,8 +326,8 @@ export async function listReleases(env = process.env) {
 
 async function promotedAtOf(path) {
   try {
-    const manifest = JSON.parse(await readFile(join(path, MANIFEST), "utf8"));
-    const when = Date.parse(manifest?.promotedAt ?? "");
+    const manifest = validateReleaseManifest(JSON.parse(await readFile(join(path, MANIFEST), "utf8")));
+    const when = manifest ? Date.parse(manifest.promotedAt) : Number.NaN;
     if (Number.isFinite(when)) return when;
   } catch {
     // fall through to the filesystem

@@ -19,6 +19,7 @@ import {
   resolveCurrent,
   stagingPath,
   stagingRoot,
+  validateReleaseManifest,
   storeRoot,
   swapCurrent,
 } from "./harness-release-store.mjs";
@@ -448,6 +449,49 @@ test("where rename-over is refused, the swap still works and says it was not ato
       (error) => error.code === "EIO",
     );
   });
+});
+
+test("a manifest is validated in full, and an unknown key rejects it", async (t) => {
+  // The first version checked only `commit`, so a manifest carrying anything
+  // else at all — a path, a command, whatever a future writer felt like adding —
+  // was accepted.  For a file nothing else is meant to write, an unrecognised
+  // key is a signal that something else wrote it.
+  const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-strict-"));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 5 }));
+  const valid = {
+    schemaVersion: 1,
+    commit: A,
+    promotedAt: "2026-10-04T00:00:00.000Z",
+    node: process.version,
+    platform: process.platform,
+  };
+  assert.ok(validateReleaseManifest(valid), "a complete, well-formed manifest is valid");
+  assert.ok(validateReleaseManifest({ schemaVersion: 1, commit: A, promotedAt: valid.promotedAt }),
+    "node and platform are informational and may be absent");
+
+  for (const [patch, why] of [
+    [{ schemaVersion: 2 }, "an unknown schema version"],
+    [{ commit: 42 }, "a non-string commit"],
+    [{ commit: "main" }, "a branch name as commit"],
+    [{ promotedAt: "not a date" }, "an unparseable promotedAt"],
+    [{ promotedAt: 1750000000 }, "a numeric promotedAt"],
+    [{ node: 24 }, "a non-string node"],
+    [{ platform: [] }, "an array platform"],
+    [{ extra: "anything" }, "an UNKNOWN key"],
+    [{ installPath: "/tmp/elsewhere" }, "an unknown key carrying a path"],
+  ]) {
+    const manifest = { ...valid, ...patch };
+    assert.equal(validateReleaseManifest(manifest), null, why);
+  }
+  for (const body of [null, undefined, [], "a string", 7, true]) {
+    assert.equal(validateReleaseManifest(body), null, `${JSON.stringify(body)} is not a manifest`);
+  }
+
+  // And the same strictness applies through the filesystem entry point.
+  await writeFile(join(dir, ".botfleet-release.json"), JSON.stringify({ ...valid, injected: true }));
+  assert.equal(await isReleaseDirectory(dir), false, "an unknown key means the directory is not a release");
+  await writeFile(join(dir, ".botfleet-release.json"), JSON.stringify(valid));
+  assert.equal(await isReleaseDirectory(dir), true);
 });
 
 test("a manifest whose commit is not a full SHA is not a release", async (t) => {
