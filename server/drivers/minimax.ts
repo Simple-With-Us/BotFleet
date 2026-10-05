@@ -343,7 +343,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   // ~/.mmx/config.json (loadLocalMiniMaxConfig above), and only as one of
   // three key sources. "MiniMax CLI" told users to install and debug a
   // binary that has no bearing on whether a turn works.
-  metadata: { displayName: "MiniMax", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "MiniMax",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below, including what it
+    // does NOT declare: this driver mounts agents + local-computer tools and
+    // no Composio bridge, no screen channel, and no image input.  That
+    // absence is the reason the matrix shows connected apps as unavailable
+    // here while MiniMax Code shows them as available.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   install: {
     docsUrl: "https://platform.minimax.io/docs/token-plan/minimax-cli",

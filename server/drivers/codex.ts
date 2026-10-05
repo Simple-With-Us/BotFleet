@@ -166,7 +166,12 @@ export function codexLoginAnswer(output: string): boolean | undefined {
 
 export const CodexDriver: ProviderDriver<CodexConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Codex", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Codex",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "npm install -g @openai/codex",
