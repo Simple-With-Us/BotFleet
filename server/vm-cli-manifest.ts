@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -56,17 +56,20 @@ export type VmCliTool = z.infer<typeof VmCliToolSchema>;
 
 export type VmCliManifest = z.infer<typeof VmCliManifestSchema>;
 
-const MANIFEST_PATH = join(dirname(fileURLToPath(import.meta.url)), "../scripts/computer-vm-cli/manifest.json");
-
 let cachedManifest: VmCliManifest | null = null;
 
 export function vmCliManifestPath(): string {
-  return MANIFEST_PATH;
+  const here = dirname(fileURLToPath(import.meta.url));
+  const packaged = join(here, "computer-vm-cli/manifest.json");
+  if (existsSync(packaged)) return packaged;
+  const dev = join(here, "../scripts/computer-vm-cli/manifest.json");
+  return dev;
 }
 
 export function loadVmCliManifest(): VmCliManifest {
   if (!cachedManifest) {
-    cachedManifest = VmCliManifestSchema.parse(JSON.parse(readFileSync(MANIFEST_PATH, "utf8")));
+    const manifestPath = vmCliManifestPath();
+    cachedManifest = VmCliManifestSchema.parse(JSON.parse(readFileSync(manifestPath, "utf8")));
   }
   return cachedManifest;
 }

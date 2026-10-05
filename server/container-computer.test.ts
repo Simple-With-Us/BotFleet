@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
+import { credentialMountStagingRoot } from "./vm-cli-credentials.ts";
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
@@ -702,16 +703,17 @@ describe("Cua integration", () => {
     writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
     writeFileSync(join(fakeHome, ".docker", "config.json"), '{"credsStore":"osxkeychain"}\n');
 
+    const stagingRoot = credentialMountStagingRoot(fakeHome);
+    const stagedDockerConfig = join(stagingRoot, ".docker", "config.json");
+
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
     expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(mounts.some((mount) => mount.includes("target=/home/cua/.docker/config.json,readonly"))).toBe(true);
-    expect(mounts.some((mount) => mount.includes("target=/home/cua/.docker/config.json,readonly") && !mount.includes("osxkeychain"))).toBe(
-      true,
-    );
+    expect(mounts).toContain(`type=bind,source=${stagedDockerConfig},target=/home/cua/.docker/config.json,readonly`);
+    expect(readFileSync(stagedDockerConfig, "utf8")).not.toContain("osxkeychain");
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
@@ -720,6 +722,7 @@ describe("Cua integration", () => {
     expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
     expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
     expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+    expect(args).toContain(`type=bind,source=${stagedDockerConfig},target=/home/cua/.docker/config.json,readonly`);
   });
 
   it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
