@@ -172,7 +172,9 @@ export interface PluginSandbox {
   readonly exports: PluginExports;
   isAlive(): boolean;
   call(request: PluginSandboxCall, host: SandboxHostSnapshot): Promise<PluginSandboxResult>;
-  dispose(): void;
+  /** Kill the child and resolve once its OS handles are released.  Callers
+   *  that delete the plugin tree must await this first on Windows. */
+  dispose(): Promise<void>;
 }
 
 export interface PluginSandboxOptions {
@@ -214,6 +216,8 @@ class ChildPluginSandbox implements PluginSandbox {
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (result: PluginSandboxResult) => void; timer: NodeJS.Timeout }>();
   private onStart: ((result: PluginSandboxReason | "import_failed" | "invalid_exports" | "bad_request" | null) => void) | null = null;
+  private readonly exitPromise: Promise<void>;
+  private resolveExit: () => void = () => {};
 
   private readonly child: ChildProcess;
   private readonly options: PluginSandboxOptions;
@@ -221,11 +225,17 @@ class ChildPluginSandbox implements PluginSandbox {
   constructor(child: ChildProcess, options: PluginSandboxOptions) {
     this.child = child;
     this.options = options;
+    this.exitPromise = new Promise<void>((resolve) => {
+      this.resolveExit = resolve;
+    });
     // serialization: "json" means every message is a JSON value; its shape
     // is still untrusted until ChildToParentMessageSchema parses it.
     child.on("message", (raw: JsonValue) => this.handleMessage(raw));
     child.on("error", () => this.terminate("start_failed"));
-    child.on("exit", () => this.terminate("sandbox_exited"));
+    child.on("exit", () => {
+      this.terminate("sandbox_exited");
+      this.resolveExit();
+    });
   }
 
   start(): Promise<PluginSandboxReason | "import_failed" | "invalid_exports" | "bad_request" | null> {
@@ -257,8 +267,19 @@ class ChildPluginSandbox implements PluginSandbox {
     });
   }
 
-  dispose(): void {
+  dispose(): Promise<void> {
     this.terminate(null);
+    // SIGKILL is usually instant, but Windows can keep directory handles
+    // open briefly after the exit event.  Bound the wait so a stuck child
+    // cannot hang an update or remove forever.
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      this.resolveExit();
+      return this.exitPromise;
+    }
+    return Promise.race([
+      this.exitPromise,
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
   }
 
   private send(message: ParentToChildMessage): void {
@@ -319,7 +340,7 @@ class ChildPluginSandbox implements PluginSandbox {
         if (!this.onStart) return this.terminate("protocol_violation");
         this.log(message.reason);
         this.onStart(message.reason);
-        this.dispose();
+        void this.dispose();
         return;
       case "call_failed":
         if (!this.pending.has(message.id)) return this.terminate("protocol_violation");
@@ -375,7 +396,7 @@ export async function startPluginSandbox(
   const sandbox = new ChildPluginSandbox(child, options);
   const failure = await sandbox.start();
   if (failure) {
-    sandbox.dispose();
+    await sandbox.dispose();
     return { reason: failure };
   }
   return sandbox;

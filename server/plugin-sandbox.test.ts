@@ -2,7 +2,7 @@
 // child processes against small hostile plugins and assert what the
 // plugin can and cannot reach.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import {
   type PluginLogEvent,
 } from "./plugin-loader.ts";
 import { PluginCardResultSchema } from "./plugin-sandbox-protocol.ts";
+import { removeDirSafe } from "./plugin-registry.ts";
 import type { PluginListing } from "./plugin-types.ts";
 
 const SECRET_ENV = "BOTFLEET_SANDBOX_TEST_SECRET";
@@ -80,11 +81,11 @@ beforeEach(() => {
   process.env[SECRET_ENV] = SECRET_VALUE;
 });
 
-afterEach(() => {
-  for (const plugin of started.splice(0)) plugin.sandbox.dispose();
+afterEach(async () => {
+  await Promise.all(started.splice(0).map((plugin) => plugin.sandbox.dispose()));
   delete process.env[SECRET_ENV];
-  rmSync(baseDir, { recursive: true, force: true });
-  rmSync(outsideDir, { recursive: true, force: true });
+  removeDirSafe(baseDir);
+  removeDirSafe(outsideDir);
 });
 
 describe("plugin sandbox isolation", () => {

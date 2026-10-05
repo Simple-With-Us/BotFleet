@@ -17,7 +17,6 @@
 // uses the default; tests pass a mkdtemp'd directory so they never
 // touch the host's user data.
 
-import { rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -37,6 +36,7 @@ import {
   PLUGINS_DIR,
   readRegistry,
   rebuildEntryForUpdate,
+  removeDirSafe,
   removePluginEntry,
   setPluginEntry,
   writePluginTree,
@@ -112,12 +112,14 @@ function inputsOrThrow(): PluginHostInputs {
 }
 
 /** Stop a plugin's sandbox process and forget it.  Every path that drops
- *  a plugin from the cache goes through here so no child is orphaned. */
-function dropLoaded(name: string): void {
+ *  a plugin from the cache goes through here so no child is orphaned.
+ *  Awaits process exit so Windows releases directory handles before the
+ *  caller deletes the on-disk tree. */
+async function dropLoaded(name: string): Promise<void> {
   const plugin = loaded.get(name);
   if (!plugin) return;
   loaded.delete(name);
-  plugin.sandbox.dispose();
+  await plugin.sandbox.dispose();
 }
 
 /** The cached sandbox for an enabled plugin, respawned when the previous
@@ -125,7 +127,7 @@ function dropLoaded(name: string): void {
 async function liveSandbox(listing: PluginListing, baseDir: string): Promise<LoadedPlugin | { error: string }> {
   const cached = loaded.get(listing.name);
   if (cached?.sandbox.isAlive()) return cached;
-  dropLoaded(listing.name);
+  await dropLoaded(listing.name);
   const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
   if ("error" in result) return result;
   loaded.set(listing.name, result);
@@ -308,7 +310,7 @@ export async function disablePlugin(
   const listing = listingOrError(name, baseDir);
   if ("error" in listing) return listing;
 
-  dropLoaded(name);
+  await dropLoaded(name);
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
   if (entry) setPluginEntry({ ...entry, enabled: false }, baseDir);
@@ -364,6 +366,11 @@ export async function updatePlugin(
     };
   }
 
+  // Dispose before rewriting the tree.  On Windows the child holds open
+  // handles under the plugin dir; rmSync fails with EPERM until exit.
+  const wasEnabled = entry.enabled;
+  await dropLoaded(name);
+
   writePluginTree(name, {
     source: fetched.source,
     manifestText: fetched.manifestText,
@@ -378,14 +385,11 @@ export async function updatePlugin(
   setPluginEntry(next, baseDir);
 
   // Reload the module if it was enabled.
-  if (loaded.has(name)) {
-    dropLoaded(name);
-    if (entry.enabled) {
-      const refreshed = listingOrError(name, baseDir);
-      if (!("error" in refreshed)) {
-        const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir);
-        if (!("error" in loaded_)) loaded.set(name, loaded_);
-      }
+  if (wasEnabled) {
+    const refreshed = listingOrError(name, baseDir);
+    if (!("error" in refreshed)) {
+      const loaded_ = await loadPlugin(refreshed, inputsOrThrow(), baseDir);
+      if (!("error" in loaded_)) loaded.set(name, loaded_);
     }
   }
 
@@ -401,9 +405,9 @@ export async function removePlugin(
   const registry = readRegistry(baseDir);
   if (!registry.plugins[name]) return { error: `no plugin named "${name}"` };
 
-  dropLoaded(name);
+  await dropLoaded(name);
   removePluginEntry(name, baseDir);
-  rmSync(join(baseDir, name), { recursive: true, force: true });
+  removeDirSafe(join(baseDir, name));
   return { removed: true };
 }
 
@@ -414,7 +418,7 @@ export async function reloadPlugin(
 ): Promise<PluginListing | { error: string }> {
   const listing = listingOrError(name, baseDir);
   if ("error" in listing) return listing;
-  dropLoaded(name);
+  await dropLoaded(name);
   const registry = readRegistry(baseDir);
   if (registry.plugins[name]?.enabled) {
     const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
@@ -454,7 +458,7 @@ export async function runPluginCommand(
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
   const mismatch = hostVersionError(listing);
   if (mismatch) {
-    dropLoaded(name);
+    await dropLoaded(name);
     return mismatch;
   }
 
@@ -481,7 +485,7 @@ export async function getPluginCardData(
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
   const mismatch = hostVersionError(listing);
   if (mismatch) {
-    dropLoaded(name);
+    await dropLoaded(name);
     return mismatch;
   }
 
@@ -525,9 +529,12 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
   }
 }
 
-/** Test-only: drop all loaded modules and the runtime inputs. */
-export function _resetForTests(): void {
-  for (const name of loaded.keys()) dropLoaded(name);
+/** Test-only: drop all loaded modules and the runtime inputs.  Awaits
+ *  every sandbox exit so test teardown can delete temp plugin dirs on
+ *  Windows without racing open handles. */
+export async function _resetForTests(): Promise<void> {
+  const names = [...loaded.keys()];
+  await Promise.all(names.map((name) => dropLoaded(name)));
   runtimeInputs = null;
 }
 

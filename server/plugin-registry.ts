@@ -34,6 +34,62 @@ function pluginDirFor(name: string, baseDir: string): string {
   return join(baseDir, name);
 }
 
+const TRANSIENT_RM_CODES = new Set(["EPERM", "EBUSY", "ENOTEMPTY"]);
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function errnoCode(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code: unknown }).code;
+    return typeof code === "string" ? code : "";
+  }
+  return "";
+}
+
+/** Windows-safe recursive remove for plugin trees.  A just-killed sandbox
+ *  child can still hold directory handles on win32, so bare rmSync fails
+ *  with EPERM.  Retries with backoff on EPERM/EBUSY/ENOTEMPTY.  Midway on
+ *  win32, renames the tree aside so a caller can recreate the original
+ *  path while the aside delete keeps retrying.  Never swallows a permanent
+ *  error, and never returns success while the original path still exists
+ *  after exhausting retries. */
+export function removeDirSafe(target: string, options: { attempts?: number } = {}): void {
+  const attempts = options.attempts ?? 10;
+  let path = target;
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (!existsSync(path)) return;
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = errnoCode(error);
+      if (!TRANSIENT_RM_CODES.has(code)) throw error;
+      if (
+        process.platform === "win32" &&
+        path === target &&
+        i >= Math.floor(attempts / 2) &&
+        existsSync(target)
+      ) {
+        const aside = `${target}.removing-${process.pid}-${Date.now()}-${i}`;
+        try {
+          renameSync(target, aside);
+          path = aside;
+        } catch {
+          // rename failed; keep retrying the original path
+        }
+      }
+      sleepSyncMs(20 + i * 10);
+    }
+  }
+  // Rename-aside freed the original path even if the aside is still locked.
+  if (path !== target && !existsSync(target)) return;
+  throw lastError;
+}
+
 /** Production paths used by the host.  Tests pass an explicit baseDir
  *  so they never touch the host data directory. */
 export function getPluginDir(name: string): string {
@@ -120,8 +176,9 @@ export function writePluginTree(
   baseDir: string = PLUGINS_DIR,
 ): void {
   const dir = pluginDirFor(name, baseDir);
-  // remove first so an update never inherits stale files
-  rmSync(dir, { recursive: true, force: true });
+  // Remove first so an update never inherits stale files.  Callers must
+  // dispose any live sandbox for this plugin before reaching here.
+  removeDirSafe(dir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   for (const file of fetched.files) {
@@ -251,7 +308,7 @@ export function rebuildEntryForUpdate(args: {
 
 /** Used by tests to fully reset a base directory. */
 export function clearPluginsDir(baseDir: string = PLUGINS_DIR): void {
-  rmSync(baseDir, { recursive: true, force: true });
+  removeDirSafe(baseDir);
   mkdirSync(baseDir, { recursive: true, mode: 0o700 });
 }
 

@@ -20,7 +20,7 @@ import {
   _loadedNames,
   _resetForTests,
 } from "./plugins.ts";
-import { clearPluginsDir, readRegistry, setPluginEntry } from "./plugin-registry.ts";
+import { clearPluginsDir, readRegistry, removeDirSafe, setPluginEntry } from "./plugin-registry.ts";
 import type { PluginLogEvent } from "./plugin-loader.ts";
 import { z } from "zod";
 
@@ -56,16 +56,16 @@ function makeRuntimeInputs() {
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   baseDir = mkdtempSync(join(tmpdir(), "botfleet-plugins-"));
   clearPluginsDir(baseDir);
-  _resetForTests();
+  await _resetForTests();
   initPluginRuntime(makeRuntimeInputs());
 });
 
-afterEach(() => {
-  _resetForTests();
-  rmSync(baseDir, { recursive: true, force: true });
+afterEach(async () => {
+  await _resetForTests();
+  removeDirSafe(baseDir);
 });
 
 describe("plugin lifecycle", () => {
@@ -184,7 +184,7 @@ describe("plugin lifecycle", () => {
   it("bootPluginRuntime loads every enabled plugin", async () => {
     await installPlugin(FIXTURE, baseDir);
     await enablePlugin("fleet-overview", baseDir);
-    _resetForTests();
+    await _resetForTests();
     initPluginRuntime(makeRuntimeInputs());
     await bootPluginRuntime(baseDir);
     expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
