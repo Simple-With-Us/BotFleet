@@ -3,8 +3,8 @@ import { z } from 'zod';
 
 // Personal Voice denial after Add Voice ID submits a personal: identifier.
 // The card is the real VoiceSettings component via
-// /?fixture=voice-settings-personal (see src/main.tsx). The desktop stub in
-// the fixture reports personalVoice false with requires-macos-14. There is
+// /?fixture=voice-settings-personal (see src/main.tsx).  The desktop stub in
+// the fixture reports personalVoice false with requires-macos-14.  There is
 // no visual-tests/ directory; this follows tests/e2e/visual.spec.ts.
 const stableShot = { animations: 'disabled', caret: 'hide', maxDiffPixelRatio: 0.02, threshold: 0.2 } as const;
 
@@ -114,7 +114,7 @@ test('visual: Personal Voice denial after a personal: voice id is submitted', as
 
   const denial = 'Personal Voices need macOS 14 or later, or an iPhone';
   await expect(board.getByRole('alert').filter({ hasText: denial })).toBeVisible();
-  // The id is refused, not written onto the bot. The picker stays on the
+  // The id is refused, not written onto the bot.  The picker stays on the
   // workspace default instead of selecting the personal: row, and the typed
   // id stays in the still-open form.
   await expect(board.getByRole('combobox', { name: "Assistant's voice" })).toHaveValue('');

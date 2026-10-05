@@ -1,6 +1,6 @@
-// Client render of the voice card. Static markup cannot show a refusal that
+// Client render of the voice card.  Static markup cannot show a refusal that
 // only exists after commitVoice runs, or a gate that changes while an add
-// request is still in flight. The suite stays on the node environment (the
+// request is still in flight.  The suite stays on the node environment (the
 // store graph imports node:sqlite) and installs a DOM before React loads.
 
 import { createElement, useEffect, useState } from "react";
@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.hoisted(() => {
   const happy = require("happy-dom");
   const win = new happy.Window({ url: "http://127.0.0.1:5199/" });
-  // Node's DOM lib and happy-dom's classes are different types. Reflect.set
+  // Node's DOM lib and happy-dom's classes are different types.  Reflect.set
   // installs the runtime globals React reads without claiming they are the
   // lib.dom constructors.
   const install: Array<[string, unknown]> = [
@@ -302,7 +302,7 @@ describe("VoiceSettings rendered voice commit", () => {
     await act(async () => {
       capState.notify();
     });
-    // The stored sentence is not the gate. The alert follows the reason code.
+    // The stored sentence is not the gate.  The alert follows the reason code.
     expect(alerts().some((text) => text.includes("Personal Voices play on-device on a Mac or iPhone"))).toBe(true);
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(false);
 

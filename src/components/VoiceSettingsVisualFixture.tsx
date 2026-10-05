@@ -1,8 +1,8 @@
 // Test harness for tests/e2e/voice-settings-personal-voice.visual.spec.ts.
 //
 // Mounts the real VoiceSettings card with the desktop bridge reporting that
-// Personal Voice cannot be spoken (macOS older than 14). The spec then
-// submits a personal: voice id through Add Voice ID. commitVoice is what
+// Personal Voice cannot be spoken (macOS older than 14).  The spec then
+// submits a personal: voice id through Add Voice ID.  commitVoice is what
 // paints the denial; this file does not pre-render that error.
 import { useEffect, useState } from "react";
 import { DesktopCapabilitiesProvider, useDesktopCapabilities } from "./DesktopCapabilities";
@@ -43,9 +43,9 @@ const unavailableLocalControl = {
   status: "unavailable" as const,
 };
 
-// A complete desktop bridge, not a cast. The visual lane and the unit tests
+// A complete desktop bridge, not a cast.  The visual lane and the unit tests
 // both need personalVoice.speak (and getCapabilities) to type-check as the
-// real preload contract. Missing a required method is a type error.
+// real preload contract.  Missing a required method is a type error.
 export function personalVoiceDesktopBridge(over: {
   capabilities?: DesktopCapabilities;
   speak?: (text: string, voiceId?: string) => Promise<void>;
@@ -80,7 +80,7 @@ export function personalVoiceDesktopBridge(over: {
   };
 }
 
-// Installed before DesktopCapabilitiesProvider mounts. Playwright's chromium
+// Installed before DesktopCapabilitiesProvider mounts.  Playwright's chromium
 // lane has no Electron bridge, so without this stub the card would deny with
 // the browser reason instead of the macOS 14 sentence this path exists for.
 if (typeof window !== "undefined" && !window.ogb) {

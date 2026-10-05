@@ -1,4 +1,4 @@
-// Per-bot voice profile. The key is shared; the voice and autoplay choice
+// Per-bot voice profile.  The key is shared; the voice and autoplay choice
 // belong to the selected bot.
 //
 // The voice list comes from the harness, which holds the key — the
@@ -38,7 +38,7 @@ export function VoiceSettings({
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // A Personal Voice refusal is a condition, not a stored sentence. The
+  // A Personal Voice refusal is a condition, not a stored sentence.  The
   // visible copy is whatever the current reason code says, so a refresh
   // from "not available" to "not available on this computer" cannot leave
   // the previous sentence stuck, and a later accepted voice clears it
@@ -73,7 +73,7 @@ export function VoiceSettings({
   const isPersonalVoice = (id: string) => id.startsWith("personal:") || id.startsWith("apple-personal:");
   // `requires-macos-14` means this computer is a Mac, just not new enough.
   // Naming only "Mac or iPhone" is false there, and naming any platform
-  // before capabilities arrive is a guess. The code, not a previously
+  // before capabilities arrive is a guess.  The code, not a previously
   // rendered sentence, decides the copy.
   const personalVoiceDisabledReason = personalVoiceDisabledReasonFor(
     capabilitiesReady,
@@ -81,9 +81,9 @@ export function VoiceSettings({
   );
 
   // initialDesktopCapabilities() hardcodes personalVoice false, then the
-  // effect runs again when the real flag arrives. Add and clone await the
+  // effect runs again when the real flag arrives.  Add and clone await the
   // network and loadVoices before they commit, and that await is long
-  // enough for capabilities to resolve. Read the gate at call time so the
+  // enough for capabilities to resolve.  Read the gate at call time so the
   // commit function from the render that started the request cannot drop a
   // Personal Voice that is allowed now, or hide the denial because ready
   // was still false then.
@@ -96,10 +96,10 @@ export function VoiceSettings({
   const loadRequestRef = useRef(0);
 
   // One gate for every way a voice id becomes this bot's voice: the picker,
-  // a typed custom id, and a clone result. Free text can start with
+  // a typed custom id, and a clone result.  Free text can start with
   // personal: or apple-personal:, and saving that on a computer that cannot
-  // speak it is the same refusal as picking it. False means the id was
-  // refused. The picker reports that on the shared banner. Add Voice ID
+  // speak it is the same refusal as picking it.  False means the id was
+  // refused.  The picker reports that on the shared banner.  Add Voice ID
   // passes reportDenial false and keeps the message in the still-open form.
   const commitVoice = (next: string, reportDenial = true): boolean => {
     const allowed = personalVoiceAllowedRef.current;
@@ -113,7 +113,7 @@ export function VoiceSettings({
     return true;
   };
 
-  // The single loader. Every refresh path (mount, key save, add, clone,
+  // The single loader.  Every refresh path (mount, key save, add, clone,
   // delete) goes through here, so the Personal Voice merge can never be
   // dropped by a refresh that only reloads the harness list.
   //
@@ -226,7 +226,7 @@ export function VoiceSettings({
         return;
       }
       const addedId = parsed.data.voice.id;
-      // Refuse before clearing. A personal: id on a computer that cannot
+      // Refuse before clearing.  A personal: id on a computer that cannot
       // speak it must leave the typed id and label in the open form.
       // The same refusal before capabilities arrive still needs a message:
       // skipping it leaves the form open and silent.  Delete the row we

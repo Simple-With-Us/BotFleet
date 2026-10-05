@@ -80,7 +80,7 @@ describe("VoiceSettings", () => {
       })
     );
 
-    // Gate is off (requires-macos-14). Naming on-device Mac / iOS is false.
+    // Gate is off (requires-macos-14).  Naming on-device Mac / iOS is false.
     expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay");
     expect(html).not.toContain("On-device Mac / iOS");
     expect(html).not.toContain("Synthesis runs on-device on your authorized Mac or iPhone");
@@ -256,7 +256,7 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(guard).not.toContain("current === personalVoiceDisabledReason");
     expect(guard).toContain("onPatch({ voice: next })");
 
-    // The typed id is cleared only after commitVoice accepts. A refusal
+    // The typed id is cleared only after commitVoice accepts.  A refusal
     // returns first and leaves the form fields alone.
     expect(add).toContain("if (addedId && !commitVoice(addedId, false))");
     expect(add.indexOf("commitVoice(addedId, false)")).toBeLessThan(add.indexOf('setCustomVoiceId("")'));
