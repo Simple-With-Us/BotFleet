@@ -469,3 +469,79 @@ test("a manifest whose commit is not a full SHA is not a release", async (t) => 
   assert.equal(await write({ schemaVersion: 1 }), false, "no commit is not a release");
   assert.equal(await write("not json at all"), false, "unparseable is not a release");
 });
+
+test("a swap that fails after deleting the pointer puts the old one back", async (t) => {
+  // The fallback removes `current` and renames into place.  If that second
+  // rename fails too, the pointer is GONE — and absent is the one state the
+  // harness cannot start from, because the launcher resolves the pointer and a
+  // missing one means no harness at all.  A stale pointer is recoverable.
+  const { env } = await store(t);
+  for (const commit of [A, B]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env });
+  }
+  await swapCurrent({ commit: A, env });
+  assert.equal(await currentCommit(env), A);
+
+  // Refuse the FIRST rename (so the fallback engages), then fail the retry.
+  // Caught rather than asserted through assert.rejects, because the checks
+  // below need to await a realpath comparison.
+  let calls = 0;
+  let caught = null;
+  try {
+    await swapCurrent({
+      commit: B,
+      env,
+      renameImpl: async () => {
+        calls += 1;
+        const error = new Error(calls === 1 ? "EPERM: not permitted" : "EIO: i/o error");
+        error.code = calls === 1 ? "EPERM" : "EIO";
+        throw error;
+      },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, "the swap must fail rather than silently succeed");
+  assert.equal(caught.cause, "pointer-lost");
+  assert.equal(caught.previous, await realpath(releasePath(A, env)), "the error must name what was live before");
+
+  // The point: `current` still resolves, and it still points at the release
+  // that was live before the failed attempt.
+  assert.equal(await currentCommit(env), A, "the previous release must be live again");
+  assert.equal(await realpath(currentLink(env)), await realpath(releasePath(A, env)));
+  await t.test("and no spare pointer is left behind", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const strays = (await readdir(storeRoot(env))).filter((name) => name.includes(".displaced-"));
+    assert.deepEqual(strays, [], `stray pointer spares left in the store root: ${strays.join(", ")}`);
+  });
+});
+
+test("currentCommit answers for every pointer state, not just a happy one", async (t) => {
+  // The coverage gap: nothing exercised currentCommit against a missing
+  // pointer, a pointer at a non-release, or a release whose manifest is
+  // unreadable — and it is the function every caller uses to decide what is
+  // live, so a wrong answer is a wrong install.
+  const { env } = await store(t);
+  assert.equal(await currentCommit(env), null, "no pointer at all is null, not a throw");
+
+  await stage(env, A, "x");
+  await promoteStaging({ commit: A, env });
+  await swapCurrent({ commit: A, env });
+  assert.equal(await currentCommit(env), A, "a real release reports its commit");
+
+  // A pointer at a plain directory that is not a release: the name is used, so
+  // a legacy checkout named like a commit still answers.
+  const legacy = await mkdtemp(join(tmpdir(), "botfleet-legacy-"));
+  t.after(() => rm(legacy, { recursive: true, force: true }));
+  await rm(currentLink(env), { force: true });
+  await symlink(legacy, currentLink(env));
+  assert.equal(await currentCommit(env), null, "a directory named like nothing is not a commit");
+
+  // An unreadable manifest must degrade to null rather than throw, because the
+  // caller documents a null return and checks for it.
+  await rm(join(releasePath(A, env), ".botfleet-release.json"), { force: true });
+  await rm(currentLink(env), { force: true });
+  await symlink(releasePath(A, env), currentLink(env));
+  assert.equal(await currentCommit(env), A, "a release with no manifest still reports its name");
+});
