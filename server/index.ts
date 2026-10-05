@@ -364,6 +364,7 @@ import {
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
+  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -3236,7 +3237,7 @@ function releaseTurnWorktreeLease(threadId: string, botId: string, dispatchId?: 
 }
 
 async function applyTurnWorktreeAdmission(
-  bot: NonNullable<ReturnType<typeof store.bot>>,
+  bot: BotRecord,
   threadId: string,
   dispatchId: number,
   cwd: string | null | undefined,
@@ -8293,10 +8294,18 @@ async function localVmPayload(target: LocalVmTarget) {
   };
 }
 
-function localComputerActionError(error: unknown): { status: number; error: string } {
-  const status = typeof (error as { status?: unknown }).status === "number"
-    ? (error as { status: number }).status
-    : 500;
+type LocalComputerActionFailure = { status: number; error: string };
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- computer routes throw at the handler boundary
+function localComputerActionError(error: unknown): LocalComputerActionFailure {
+  // SAFETY: computer proxy failures may attach a numeric HTTP status on a plain object.
+  const statusField = (error as { status?: unknown }).status;
+  const status =
+    statusField === undefined
+      ? 500
+      : Number.isFinite(Number(statusField))
+        ? Number(statusField)
+        : 500;
   const raw = error instanceof Error ? error.message : String(error);
   return { status, error: redactSecrets(raw) };
 }
@@ -11875,7 +11884,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.autoApprove = body.autoApprove;
       }
       if (body.gitWorktreeLeases !== undefined) {
-        if (typeof body.gitWorktreeLeases !== "boolean") {
+        if (body.gitWorktreeLeases !== true && body.gitWorktreeLeases !== false) {
           return json(res, 400, { error: "gitWorktreeLeases must be true or false" });
         }
         patch.gitWorktreeLeases = body.gitWorktreeLeases;

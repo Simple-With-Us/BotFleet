@@ -98,7 +98,7 @@ export class ActiveTurnWorktreeLeases {
     const held = this.byKey.get(leaseKey(key));
     if (!held) return;
     this.byKey.delete(leaseKey(key));
-    await this.manager.release(held.lease).catch((error: unknown) => {
+    await this.manager.release(held.lease).catch((error) => {
       const reason = error instanceof Error ? error.message : String(error);
       console.error(
         `[worktree] failed to release lease for ${key.threadId} (bot ${key.botId}, dispatch ${key.dispatchId}): ${reason}`,

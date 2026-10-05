@@ -109,7 +109,10 @@ const DESC_SEAT = /@fleet-seat:\s*([a-z0-9_-]+)/i;
 
 function normalizeSeatSlug(raw: string): FleetSeatId | null {
   const slug = raw.trim().toLowerCase().replace(/\s+/g, "-");
-  return (FLEET_SEAT_IDS as readonly string[]).includes(slug) ? (slug as FleetSeatId) : null;
+  for (const seatId of FLEET_SEAT_IDS) {
+    if (seatId === slug) return seatId;
+  }
+  return null;
 }
 
 /** Resolve a bot record to a fleet seat id, or null when this bot is not a seat. */
