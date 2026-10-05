@@ -124,7 +124,7 @@ In-app **Check for updates** reads `latest-mac.yml` from the GitHub release.
 | | Value |
 |---|---|
 | Published release / tag | **v0.1.38** (the only tag) |
-| Update feed | **not shipped** — `latest-mac.yml` is missing from the v0.1.38 release, so in-app Check for updates 404s; the DMGs are the only shipped artifacts and `~/apps/update-botfleet.sh` is the only update route until the feed ships |
+| Update feed | **shipped** — that release carries `latest-mac.yml` alongside four DMGs.  The feed lists the two versioned ones (`BotFleet-0.1.38-arm64.dmg`, `BotFleet-0.1.38-x64.dmg`); the stable `BotFleet.dmg` and `BotFleet-intel.dmg` the download links above point at are there too.  No zip payload is published, so in-app updates install the DMG. |
 | `package.json` version on `main` | `1.0.31` |
 | iOS companion `MARKETING_VERSION` | `1.0.30` |
 
