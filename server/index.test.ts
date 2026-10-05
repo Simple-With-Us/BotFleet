@@ -5530,28 +5530,50 @@ describe("instance CLI override API", () => {
       boxTurnGate = null;
       releaseBoxTurnGate = null;
 
-      const persistedTask = () => {
-        const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
+      const botsJsonPath = join(home, ".botfleet", "bots.json");
+      const readSuccessorPersistence = () => {
+        const bots = JSON.parse(readFileSync(botsJsonPath, "utf8")) as Array<{
           id: string;
           tasks: Array<{ threadId: string; lastInstanceId?: string; resumeCursors: Record<string, unknown> }>;
         }>;
-        return bots.find((candidate) => candidate.id === bot.id)?.tasks.find((task) => task.threadId === bot.threadId);
-      };
-      await expect.poll(() => ({
-        launches: existsSync(launchLog)
+        const task = bots
+          .find((candidate) => candidate.id === bot.id)
+          ?.tasks.find((candidate) => candidate.threadId === bot.threadId);
+        const launches = existsSync(launchLog)
           ? readFileSync(launchLog, "utf8").split("\n").filter(Boolean).length
-          : 0,
-        lastInstanceId: persistedTask()?.lastInstanceId,
-        cursor: persistedTask()?.resumeCursors.claude,
-      }), { timeout: 5_000 }).toEqual({
+          : 0;
+        return { launches, task };
+      };
+      // Gate release unblocks the box and the hanging CLI; on Windows the
+      // successor dispatch, markTaskDispatched, and debounced bots.json flush
+      // can land several seconds later.  Read the files fresh each tick — do
+      // not memoize a task snapshot — and abort in-flight bot polls before the
+      // settle deadline so a hung tick cannot eat the whole window.
+      await settlesWithin(
+        async ({ signal }) => {
+          const { launches, task } = readSuccessorPersistence();
+          const cursor = task?.resumeCursors?.claude;
+          if (launches !== 1) return false;
+          if (task?.lastInstanceId !== "claude" || typeof cursor !== "string" || cursor.length === 0) return false;
+          const live = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return live?.busy === true;
+        },
+        10_000,
+        200,
+        "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
+      );
+      const settled = readSuccessorPersistence();
+      expect({
+        launches: settled.launches,
+        lastInstanceId: settled.task?.lastInstanceId,
+        cursor: settled.task?.resumeCursors.claude,
+      }).toEqual({
         launches: 1,
         lastInstanceId: "claude",
         cursor: expect.any(String),
       });
-      const live = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-        (candidate: { id: string }) => candidate.id === bot.id,
-      );
-      expect(live?.busy).toBe(true);
     } finally {
       releaseBoxTurnGate?.();
       boxTurnGate = null;
@@ -5563,7 +5585,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
