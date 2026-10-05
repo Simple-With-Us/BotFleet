@@ -254,13 +254,8 @@ export function LocalVmRuntimeCard() {
         id="setting-computers-local-vm"
         title="Local VM"
         subtitle={perBot
-<<<<<<< HEAD
-          ? `Private CUA Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
-          : `A shared CUA Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
-=======
           ? `Private Linux desktops on this ${host}, with one container and durable workspace per bot.\u00a0 Distinct bots can work concurrently and idle desktops stop after 8 hours.`
           : `A shared Linux sandbox on this ${host} for bots to browse and work in, each on its own desktop, backed by one durable workspace and automatically recycled after 8 hours without activity.`}
->>>>>>> origin/main
       >
         <div className="flex flex-wrap items-center gap-2">
           <span
