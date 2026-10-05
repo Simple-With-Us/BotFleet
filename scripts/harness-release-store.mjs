@@ -33,10 +33,26 @@
 
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+
+/**
+ * A failure the caller must be able to branch on by CAUSE, not by matching a
+ * message.  The pointer-restore path raises one of these, and it used to raise
+ * a class that did not exist in this module — so the error path itself died
+ * with a ReferenceError instead of reporting what had happened.
+ */
+export class ResolutionError extends Error {
+  constructor(message, cause, details = {}) {
+    super(message);
+    this.name = "ResolutionError";
+    this.cause = cause;
+    Object.assign(this, details);
+  }
+}
 
 const FULL_COMMIT = /^[a-f0-9]{40}$/;
 const CURRENT = "current";
@@ -185,6 +201,13 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
  * and therefore atomic.  A reader following `current` at any instant sees either
  * the previous release or the new one.
  */
+/** Create a symlink at `path` pointing at `target`, used to keep a spare. */
+async function createPointerAt(path, target, type) {
+  const spare = `${path}.displaced-${randomUUID().slice(0, 8)}`;
+  await symlink(target, spare, type);
+  return spare;
+}
+
 export async function swapCurrent({ commit, env = process.env, renameImpl = rename } = {}) {
   const target = releasePath(commit, env);
   const link = currentLink(env);
@@ -211,8 +234,23 @@ export async function swapCurrent({ commit, env = process.env, renameImpl = rena
       // path is the atomic one and this is never reached.
       if (!["EPERM", "EACCES", "ENOTEMPTY", "EEXIST"].includes(error?.code)) throw error;
       atomic = false;
+      // Put the old pointer back if the retry fails, because we just deleted it.
+      // Without this a failed swap leaves `current` ABSOLENT rather than stale,
+      // and absent is the one state the harness cannot start from: the launcher
+      // resolves the pointer and a missing one means no harness at all.  A stale
+      // pointer is recoverable; a missing one is an outage.
+      const displaced = previous ? await createPointerAt(link, previous, linkType) : null;
       await rm(link, { recursive: true, force: true });
-      await renameImpl(staged, link);
+      try {
+        await renameImpl(staged, link);
+      } catch (retryError) {
+        if (displaced) await rename(displaced, link).catch(() => {});
+        throw new ResolutionError(
+          `Could not move the release pointer to ${target} and could not restore the previous release: ${retryError?.message || retryError}`,
+          "pointer-lost",
+          { previous },
+        );
+      }
     }
   } finally {
     await rm(scratch, { recursive: true, force: true }).catch(() => {});
