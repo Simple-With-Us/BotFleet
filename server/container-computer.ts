@@ -830,7 +830,11 @@ export const CLI_CREDENTIAL_CANDIDATES: readonly HostCliCredentialCandidate[] = 
   { relPath: [".vercel"], guest: "/home/cua/.vercel" },
   { relPath: [".fly"], guest: "/home/cua/.fly" },
   { relPath: [".config", "cloudflare"], guest: "/home/cua/.config/cloudflare" },
+  { relPath: [".config", "cf"], guest: "/home/cua/.config/cf" },
+  { relPath: [".cf"], guest: "/home/cua/.cf" },
   { relPath: [".wrangler"], guest: "/home/cua/.wrangler" },
+  { relPath: [".turso"], guest: "/home/cua/.turso" },
+  { relPath: [".kodus"], guest: "/home/cua/.kodus" },
 
   // Developer APIs & Tools
   { relPath: [".config", "stripe"], guest: "/home/cua/.config/stripe" },
