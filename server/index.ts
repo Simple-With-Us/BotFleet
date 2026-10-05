@@ -12592,9 +12592,6 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const approveAllForThread = async (
       targetThreadId: string,
     ): Promise<{ ok: boolean; approvedCount: number }> => {
-      const threadBot = store.botByThread(targetThreadId);
-      if (threadBot) routines?.clearBotSnooze(threadBot.id);
-
       const pending = store.messagesFor(targetThreadId).filter(
         (message) =>
           message.kind === "options" &&
