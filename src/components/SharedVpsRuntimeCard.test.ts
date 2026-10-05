@@ -47,7 +47,7 @@ describe("the sentence gap is present, not merely not-doubled", () => {
   const boundaries: Array<[string, string]> = [
     ["per-bot caption", "own VPS container.{\"\\u00a0 \"}Use"],
     ["per-bot sync hint", "bot&apos;s container.{\"\\u00a0 \"}The VPS mode"],
-    ["shared subtitle", "for each bot.\\u00a0 Bots share"],
+    ["shared subtitle", "for each bot.{\"\\u00a0 \"}Bots share"],
     ["runtime error", "inspect the VPS runtime.{\"\\u00a0 \"}{error}"],
     ["disabled notice", "in workspace providers.\\u00a0 Turn it on"],
   ];

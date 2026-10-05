@@ -11,7 +11,7 @@ export function Card({
   className,
 }: {
   title?: string;
-  subtitle?: string;
+  subtitle?: React.ReactNode;
   /** Optional right-aligned control area on the header row — used by the
    *  Usage card's "Expand all / Collapse all" toggle.  Slot comes AFTER
    *  title+subtitle so wrapping a long subtitle never pushes the button
