@@ -147,6 +147,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/export$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/respond$/ },
+  { method: "POST", path: /^\/api\/threads\/[\w-]+\/approve-all$/ },
   { method: "GET", path: /^\/api\/search$/ },
 
   // App-owned profile images. Upload is image-only and capped at 10 MB by

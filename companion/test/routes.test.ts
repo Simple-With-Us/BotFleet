@@ -136,6 +136,7 @@ describe("what it may not", () => {
     // fields on profile are still refused by the harness, not widened here.
     expect(ask("PATCH", "/api/bots/bot_123/profile")).toBeNull();
     expect(ask("POST", "/api/threads/th_1/respond")).toBeNull();
+    expect(ask("POST", "/api/threads/th_1/approve-all")).toBeNull();
   });
 
   it("accepts every paired profile field and refuses host-control fields", () => {
@@ -145,6 +146,7 @@ describe("what it may not", () => {
     for (const field of [
       "autoApprove",
       "autoReview",
+      "bypassPermissions",
       "composio",
       "connectorTools",
       "computers",

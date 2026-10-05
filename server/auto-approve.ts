@@ -364,6 +364,7 @@ export function offerableApprovalKey(
 
 export interface AutoApprover {
   autoApprove?: boolean;
+  bypassPermissions?: boolean;
   alwaysAllow?: string[];
 }
 
@@ -417,6 +418,10 @@ export function autoVerdict(
     fileWrite?: FileWriteCheck;
   },
 ): AutoVerdict {
+  if (bot.bypassPermissions) {
+    const key = approvalKey(tool, summary, context?.scope);
+    return { approve: `auto-approved ${key} (permission bypass)`, source: "auto-mode", rule: "permission-bypass" };
+  }
   // Owner ruling, 2026-10-01 and applied literally 2026-10-02: a bot in full
   // auto never gets an approval card for the harness's own `job_start`.  It
   // stands ahead of everything below on purpose, so no guard and no kind of

@@ -3470,6 +3470,25 @@ describe("harness HTTP API", () => {
     expect(nothing.status).toBe(404);
   });
 
+  it("approves all pending approvals for a thread or bot", async () => {
+    const listRes = await api("GET", "/api/bots");
+    const bot = listRes.body.bots[0];
+
+    // non-existent bot returns 404
+    const notFound = await api("POST", "/api/bots/non-existent-bot-id/approve-all");
+    expect(notFound.status).toBe(404);
+
+    // bot with no pending approvals returns ok with approvedCount: 0
+    const emptyApprove = await api("POST", `/api/bots/${bot.id}/approve-all`);
+    expect(emptyApprove.status).toBe(200);
+    expect(emptyApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // thread approve-all endpoint
+    const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
+    expect(threadApprove.status).toBe(200);
+    expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+  });
+
   it("closes the approvals a cancelled turn can no longer answer", async () => {
     // "Cancel turn" is a button ON the approval card, and a pending approval
     // owns the composer. Stopping the turn without closing its card leaves the

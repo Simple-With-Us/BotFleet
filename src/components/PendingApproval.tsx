@@ -80,10 +80,12 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
   pending,
   count,
   index,
+  bypassActive,
 }: {
   pending: Pending;
   count: number;
   index: number;
+  bypassActive?: boolean;
 }) {
   return (
     <div
@@ -96,6 +98,11 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
         {count > 1 && (
           <span className="rounded-full bg-control px-1.5 py-0.5 text-[11px] tabular-nums text-ink-secondary">
             {index + 1} of {count}
+          </span>
+        )}
+        {bypassActive && (
+          <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] font-semibold text-accent">
+            Bypass Active
           </span>
         )}
         <span className="text-[13px] text-ink">{pendingApprovalLabel(pending)}</span>
@@ -124,13 +131,17 @@ export function PendingApprovalActions({
   pending,
   threadId,
   bot,
+  totalCount,
   onCancelTurn,
+  onApproveAll,
 }: {
   pending: Pending;
   threadId: string;
   /** who asked — "always allow" is remembered against them */
   bot?: Bot;
+  totalCount?: number;
   onCancelTurn: () => void;
+  onApproveAll?: () => void;
 }) {
   const { dispatch } = useStore();
   const isRoutineRequest = isRoutineApproval(pending);
@@ -143,6 +154,8 @@ export function PendingApprovalActions({
       message: behavior === "deny" ? "Denied by the user." : undefined,
       alwaysAllow: always && bot && pending.allowKey ? { botId: bot.id, key: pending.allowKey } : undefined,
     });
+
+  const approveAll = onApproveAll ?? (() => dispatch({ type: "approveAllRequests", threadId }));
 
   const base = "rounded-full px-3.5 py-1.5 text-[13.5px] transition-colors";
   return (
@@ -165,6 +178,15 @@ export function PendingApprovalActions({
           className={cn(base, "border border-hairline/50 text-ink hover:bg-control")}
         >
           Always allow
+        </button>
+      )}
+      {totalCount !== undefined && totalCount > 1 && (
+        <button
+          onClick={approveAll}
+          title="Approve all waiting requests in this conversation"
+          className={cn(base, "border border-accent/40 bg-accent/15 font-medium text-accent hover:bg-accent/25")}
+        >
+          Approve All ({totalCount})
         </button>
       )}
       <button
