@@ -97,6 +97,7 @@ function Shell() {
   const taskCreationBot = state.bots.find((entry) => entry.id === state.taskCreationBotId);
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() => (group && !group.dm ? group.id : null));
   const [matrixOverviewActive, setMatrixOverviewActive] = useState(false);
+  const [appKeyboardRouting, setAppKeyboardRouting] = useState(false);
   const hasApps = state.groups.some((g) => !g.dm);
 
   // If a group was chosen in the sidebar or store, keep selectedAppId aligned
@@ -143,7 +144,7 @@ function Shell() {
         const target = bots[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
-          if (selectedAppId) {
+          if (selectedAppId && appKeyboardRouting) {
             openBotInApp(target.id, selectedAppId);
           } else {
             dispatch({ type: "select", id: target.id });
@@ -154,7 +155,7 @@ function Shell() {
         const next = bots[(idx + (e.key === "]" ? 1 : -1) + bots.length) % bots.length];
         if (next) {
           e.preventDefault();
-          if (selectedAppId) {
+          if (selectedAppId && appKeyboardRouting) {
             openBotInApp(next.id, selectedAppId);
           } else {
             dispatch({ type: "select", id: next.id });
@@ -164,7 +165,7 @@ function Shell() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [state.bots, state.selectedId, selectedAppId, dispatch, openBotInApp]);
+  }, [state.bots, state.selectedId, selectedAppId, appKeyboardRouting, dispatch, openBotInApp]);
 
   useEffect(() => {
     window.ogb?.setUnreadCount?.(unreadCount);
@@ -393,20 +394,25 @@ function Shell() {
               if (appId === null) {
                 setMatrixOverviewActive(true);
                 setSelectedAppId(null);
+                setAppKeyboardRouting(false);
               } else {
                 setMatrixOverviewActive(false);
                 setSelectedAppId(appId);
+                setAppKeyboardRouting(true);
                 dispatch({ type: "select", id: appId });
               }
             }}
             activeBotId={bot?.id}
             onSelectBot={(botId) => {
               setMatrixOverviewActive(false);
+              setAppKeyboardRouting(false);
+              setSelectedAppId(null);
               dispatch({ type: "select", id: botId });
             }}
             onSelectBotInApp={(botId, appId) => {
               setMatrixOverviewActive(false);
               setSelectedAppId(appId);
+              setAppKeyboardRouting(true);
               openBotInApp(botId, appId);
             }}
             onSelectGroupChat={(groupId) => {
@@ -423,21 +429,26 @@ function Shell() {
                 onSelectApp={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
+                  setAppKeyboardRouting(true);
                   dispatch({ type: "select", id: appId });
                 }}
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
+                  setSelectedAppId(null);
+                  setAppKeyboardRouting(false);
                   dispatch({ type: "select", id: botId });
                 }}
                 onSelectBotInApp={(botId, appId) => {
                   setMatrixOverviewActive(false);
                   // Remember the app we were viewing, so AppDeck shows it
                   setSelectedAppId(appId);
+                  setAppKeyboardRouting(true);
                   openBotInApp(botId, appId);
                 }}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
                   setSelectedAppId(appId);
+                  setAppKeyboardRouting(true);
                   dispatch({ type: "select", id: appId });
                 }}
               />

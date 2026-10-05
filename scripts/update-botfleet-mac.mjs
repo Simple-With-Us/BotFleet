@@ -1007,7 +1007,8 @@ export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
   }
   if (pid) {
     const txtPaths = await processTxtPaths(pid);
-    if (txtPaths.some(p => p.startsWith(`${config.appPath}/Contents/`))) {
+    const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
+    if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
       return true;
     }
   }

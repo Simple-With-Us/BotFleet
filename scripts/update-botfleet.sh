@@ -163,7 +163,7 @@ elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; 
       # counts as positive evidence of a mismatch.
       APP_MANIFEST="${BOTFLEET_APP_PATH:-/Applications/BotFleet.app}/Contents/Resources/server/build-identity.json"
       if [[ -f "$APP_MANIFEST" ]]; then
-        INSTALLED_COMMIT=$("$NODE_BIN" -e "try { console.log(JSON.parse(require('fs').readFileSync('$APP_MANIFEST', 'utf8')).sourceCommit) } catch { console.log('') }" 2>/dev/null)
+        INSTALLED_COMMIT=$(APP_MANIFEST_PATH="$APP_MANIFEST" "$NODE_BIN" -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.env.APP_MANIFEST_PATH, "utf8")).sourceCommit) } catch { console.log("") }' 2>/dev/null) || INSTALLED_COMMIT=""
         if [[ "$INSTALLED_COMMIT" =~ ^[0-9a-f]{40}$ && "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
           IS_UP_TO_DATE=0
         fi
