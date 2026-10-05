@@ -89,9 +89,22 @@ posix("trackCliGroup", () => {
     );
     const group = trackCliGroup(child);
     await exited(child);
-    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 5_000 });
-    const descendant = Number(readFileSync(pidFile, "utf8"));
+    // existsSync alone is not "ready": the leader may still be mid-write, and an
+    // empty/partial file parses to 0, which process.kill would treat as "my own
+    // process group".  Accept only a positive safe-integer pid.
+    let descendant = 0;
+    await vi.waitFor(
+      () => {
+        expect(existsSync(pidFile)).toBe(true);
+        const parsed = Number(readFileSync(pidFile, "utf8").trim());
+        expect(Number.isSafeInteger(parsed) && parsed > 0).toBe(true);
+        descendant = parsed;
+      },
+      { timeout: 5_000 },
+    );
     cleanup.push(() => {
+      // Never process.kill(0, …): that signals the test runner's whole group.
+      if (!(Number.isSafeInteger(descendant) && descendant > 0)) return;
       try {
         process.kill(descendant, "SIGKILL");
       } catch {

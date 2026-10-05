@@ -23,21 +23,19 @@ Extra-ship no.  Same branch only.  Never the Mac.
 
 ## Verification State
 
-Commands run on the Linux tip-fix box (America/Chicago).  No Mac / Xcode / iOS build was run for this tip — do not invent those results.
+Commands run on the Linux tip-fix box (America/Chicago), in the repo's mandated order using its `package.json` scripts (pnpm; `pnpm typecheck` is this repo's `tsc` step, `tsc -b && tsc -p tsconfig.server.json`, in place of `npx tsc --noEmit`).  Exit statuses are recorded exactly as observed.  Box Node is v22.23.3 / pnpm 9.15.9; `package.json` wants Node >=24 and pnpm 10 (engine warning only).  No Mac / Xcode / iOS build was run for this tip.
 
 ```
-pnpm exec vitest run server/procs-group.test.ts
-# → Test Files 1 passed; Tests 3 passed (3).  Duration ~595ms.
-
-pnpm exec vitest run server/drivers/acp/acp.test.ts
-# → Test Files 1 passed; Tests 97 passed (97).  Duration ~34.75s.
-
-pnpm typecheck
-# → tsc -b && tsc -p tsconfig.server.json — exit 0 (clean).
-#   Note: box Node is v22.23.3; package engines want >=24 (warn only).
+1. pnpm lint        # exit 1 — lint baseline exceeded (4697 warnings vs baseline 4654)
+2. pnpm typecheck   # exit 0
+3. pnpm test        # exit 1 — vitest: 3 files / 15 tests failed, 8135 passed, 9 skipped (8159 counted)
+4. pnpm build       # exit 0
 ```
 
-Windows CI paths for `procs-group` remain `skipIf(win32)` (no process groups).  No Mac app rebuild, no `xcodebuild`, no iOS `swift test` on this tip.
+- `pnpm lint` exit 1 is not introduced by this tip or this PR's diff on this box: the PR head before this tip (`f0b3ec55`) reports the identical 4697-vs-4654 count, and `origin/main` itself fails the same check here (4858 vs 4852).  CI lints the PR merge commit with the pinned toolchain; treat lint as unverified locally until the CI `lint` job reports.
+- `pnpm test` exit 1: all 15 failures are in `server/tools/computer.test.ts`, `server/tools/host.test.ts` and `server/tools/process-group.test.ts` (none touched by this PR), failing with `Could not start the shell: spawn /bin/zsh ENOENT` — this box has no `/bin/zsh`.  Environmental, not a regression.  The files this PR touches passed in that same run: `server/procs-group.test.ts` (3/3) and `server/drivers/acp/acp.test.ts` (97/97).
+- Because `pnpm test` chains its sub-suites with `&&`, the post-vitest sub-suites (`broker:test`, `test:updater`, `test:mac-updater`, ... `test:server-start`) did not run on this box.  Those are unverified here, not PASS.
+- Windows CI paths for `procs-group` remain `skipIf(win32)` (no process groups).  No Mac app rebuild, no `xcodebuild`, no iOS `swift test` on this tip.
 
 ## Next Steps & Blockers
 
@@ -47,4 +45,6 @@ Windows CI paths for `procs-group` remain `skipIf(win32)` (no process groups).  
 
 ## Zero-Code Findings
 
-None for this tip.  The ownership-reuse residual above is already encoded in the `trackCliGroup` comment and restated under Decisions so the handoff does not invent a follow-up that needs no code yet.
+The ownership-reuse residual above is already encoded in the `trackCliGroup` comment and restated under Decisions so the handoff does not invent a follow-up that needs no code yet.
+
+Recall closeout: BF-FIXER contributed the process-group ownership lesson via fleet-recall (category `lesson`, app `botfleet`) — retain group ownership until an empty-group probe disowns it, re-probe before every delayed signal, document residual PID-reuse windows, and never treat a pid file's existence alone as ready (parse to a positive safe integer before any cleanup kill).  Result: `status: ok`, `id: 460c350c-fd9e-5bd8-b803-4f794bf4ee83`, `doc_id: contrib/BF-FIXER/2026-10-05/7eee4629`.
