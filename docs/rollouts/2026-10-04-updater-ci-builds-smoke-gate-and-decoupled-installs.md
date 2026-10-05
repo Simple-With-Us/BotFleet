@@ -2,7 +2,7 @@
 
 Board rows `34c834f1` (Rec 1), `49465fcb` (Rec 4), `1f3fe835` (Rec 3), `f1482275` (Rec 2).
 Branch `minimax/updater-architecture`, then `minimax/updater-decouple`.  Worktree
-`~/apps/botfleet-minimax-updater-arch`.
+the MINIMAX seat worktree.
 
 Owner approved all four recommendations from an architecture review that
 reverse-engineered how `mcode` swapped 0.5.5 to 0.6.2 in seven seconds with
@@ -189,11 +189,14 @@ between two updaters because it does not involve either one.
 
 Migrating the live LaunchAgent is an on-demand operator step with a verified
 rollback, not something a pull request applies silently.  Three things must move
-with it: the start script writes `.botfleet-heal-stamp` into `$ROOT` and runs
-`pnpm install` inside `$ROOT` for self-heal, both of which break against a
-read-only release; and `dependencyFingerprint` and `validateBuiltBundle` both
-reject a symlinked root, so `current` can only be a launchd-level indirection that
-the updater resolves physically for fingerprinting.
+with it.  The launcher cannot write its heal stamp into the server's own tree,
+and cannot reinstall dependencies there either, because a promoted release is
+read-only and must stay byte-identical to the commit it names — so its
+self-heal has to detect a release and refuse rather than repair one in place.
+And because `dependencyFingerprint` and `validateBuiltBundle` both reject a
+symlinked root, the activation pointer can only be a launchd-level
+indirection, with anything that reasons about the tree resolving it physically
+first.
 
 ## Zero-Code Findings
 
