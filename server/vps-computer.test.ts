@@ -508,7 +508,9 @@ describe("VPS computer", () => {
   it("captures screenshots through Cua Driver and validates the returned image", async () => {
     const fake = fixture();
     const frame = await vpsComputerScreenshot(CONFIG, BOT_ID, fake.runner);
-    expect(frame).toEqual({ png: screenshot.toString("base64"), format: "png" });
+    expect(frame).toMatchObject({ png: screenshot.toString("base64"), format: "png" });
+    expect(typeof frame.capturedAt).toBe("number");
+    expect(Number.isFinite(frame.capturedAt)).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("get_desktop_state"))).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("base64") && args.includes("-u") && args.includes("cua"))).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("rm") && args.includes("-f"))).toBe(true);
