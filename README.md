@@ -11,7 +11,7 @@
 <br>
 <br>
 
-<a href="https://botfleet.app"><b>botfleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://simplewithus.com/">From Simple With Us</a> &nbsp;·&nbsp; <a href="https://github.com/jaywedgeworth22/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
+<a href="https://botfleet.app"><b>BotFleet.app</b></a> &nbsp;·&nbsp; <a href="https://testflight.apple.com/join/ER6sPNMh">iPhone companion on TestFlight (public beta)</a> &nbsp;·&nbsp; <a href="https://simplewithus.com/">From Simple With Us</a> &nbsp;·&nbsp; <a href="https://github.com/jaywedgeworth22/BotFleet">source</a> &nbsp;·&nbsp; <a href="https://github.com/milind-soni/OpenMausBot"><b>upstream OpenMausBot</b></a>
 
 </div>
 
