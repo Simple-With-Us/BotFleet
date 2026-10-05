@@ -554,7 +554,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
 
         {extraCwds.length === 0 ? (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            No secondary repositories attached. Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
+            No secondary repositories attached.{"\u00a0 "}Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
           </div>
         ) : (
           <div className="mt-2 flex flex-col gap-1.5">
@@ -979,6 +979,10 @@ function formatHoverTime(at: number) {
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle = macInset ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
+  const noDragStyle = macInset ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1291,13 +1295,14 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: responsive container so chips fold gracefully */}
       <div
+        style={dragStyle}
         className={cn(
           "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
+        <div style={noDragStyle} className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
           <button
             type="button"
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
@@ -1335,7 +1340,7 @@ export function GroupView({ group }: { group: Group }) {
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}

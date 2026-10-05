@@ -329,7 +329,7 @@ export function ComputerPanel({
               setBoxState(result.container ?? null);
               if (result.ready) setPhase("ready");
               else {
-                setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+                setError(result.problem ?? "The VPS Linux desktop is not ready yet");
                 setPhase("error");
               }
             });
@@ -468,7 +468,7 @@ export function ComputerPanel({
     };
   }, [phase, panelView, screenStreamState, bot.id, viewerOpen, pageVisible, bot.busy]);
 
-  // Local VM preview comes directly from Cua Driver through the harness. It
+  // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
   const vmInFlight = useRef(false);
   useEffect(() => {
@@ -642,7 +642,7 @@ export function ComputerPanel({
           setBoxState(result.container ?? null);
           if (result.ready) setPhase("ready");
           else {
-            setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+            setError(result.problem ?? "The VPS Linux desktop is not ready yet");
             setPhase("error");
           }
         }
@@ -715,7 +715,7 @@ export function ComputerPanel({
       setVpsStatus(result);
       setBoxState(result.container ?? null);
       setPhase(result.ready ? "ready" : "error");
-      if (!result.ready) setError(result.problem ?? "The replacement VPS Cua desktop is not ready yet");
+      if (!result.ready) setError(result.problem ?? "The replacement VPS Linux desktop is not ready yet");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase("error");
@@ -939,7 +939,7 @@ export function ComputerPanel({
         {phase === "vps-unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
-              Configure the VPS SSH alias in App Settings → Connections. Auto only reuses an existing ready container.
+              Configure the VPS SSH alias in App Settings → Connections.{"\u00a0 "}Auto only reuses an existing ready container.
             </div>
             <button
               onClick={openConnectionSettings}
@@ -1097,13 +1097,13 @@ export function ComputerPanel({
               {!bot.computers &&
                 (isLinux || !localSelectable
                   ? cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
-                    : `${linuxAutoDescription()} `
+                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off.\u00a0 "
+                    : `${linuxAutoDescription()}\u00a0 `
                   : cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one exists, otherwise this computer. "
-                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer. ")}
-              Pick where this bot's computer lives. <b className="text-ink">Local VM</b> is a Cua-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop. Set it up in App
+                    ? "Auto reuses a ready VPS when one exists, otherwise this computer.\u00a0 "
+                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer.\u00a0 ")}
+              Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
+              in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
           </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
@@ -1178,7 +1178,7 @@ export function ComputerPanel({
                   <div className="min-w-0">
                     <div className="text-[13px] text-ink">Start VPS automatically</div>
                     <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                      Off by default. When enabled, Auto may create or wake this bot's managed container.
+                      Off by default.{"\u00a0 "}When enabled, Auto may create or wake this bot's managed container.
                     </div>
                   </div>
                   <button
@@ -1227,7 +1227,7 @@ export function ComputerPanel({
           {!computerDestination && (
             <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-warning">
               <Power size={13} className="mt-0.5 shrink-0" />
-              Scheduled tasks on this computer will not have desktop access while this is Off. Choose ASCII.dev Box in the schedule editor to run the whole job there.
+              Scheduled tasks on this computer will not have desktop access while this is Off.{"\u00a0 "}Choose ASCII.dev Box in the schedule editor to run the whole job there.
             </div>
           )}
           {activeRoutineRun && (

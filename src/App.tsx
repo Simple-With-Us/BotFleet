@@ -302,6 +302,20 @@ function Shell() {
     });
   }, [dispatch]);
 
+  // Pin the app thread, and switch the server's active task when it differs.
+  // `select` only changes client state.  Messages, reactions, recordings, and
+  // loadEarlier follow `bot.threadId`, so a pin onto another thread would
+  // render a transcript the store never loaded.
+  const openBotInApp = (botId: string, appId: string) => {
+    const b = state.bots.find((x) => x.id === botId);
+    const explicitTask = (b?.tasks ?? []).find((t) => t.workspaceContext?.appRef.id === appId);
+    const threadId = explicitTask?.threadId ?? b?.threadId;
+    dispatch({ type: "select", id: botId, viewedThreadId: threadId });
+    if (threadId && threadId !== b?.threadId) {
+      dispatch({ type: "switchTask", botId, threadId });
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* fixed-position popup, bottom-left — outside the layout flow */}
@@ -381,6 +395,11 @@ function Shell() {
               setMatrixOverviewActive(false);
               dispatch({ type: "select", id: botId });
             }}
+            onSelectBotInApp={(botId, appId) => {
+              setMatrixOverviewActive(false);
+              setSelectedAppId(appId);
+              openBotInApp(botId, appId);
+            }}
             onSelectGroupChat={(groupId) => {
               setMatrixOverviewActive(false);
               dispatch({ type: "select", id: groupId });
@@ -400,6 +419,12 @@ function Shell() {
                 onSelectBot={(botId) => {
                   setMatrixOverviewActive(false);
                   dispatch({ type: "select", id: botId });
+                }}
+                onSelectBotInApp={(botId, appId) => {
+                  setMatrixOverviewActive(false);
+                  // Remember the app we were viewing, so AppDeck shows it
+                  setSelectedAppId(appId);
+                  openBotInApp(botId, appId);
                 }}
                 onOpenAppRoom={(appId) => {
                   setMatrixOverviewActive(false);
@@ -434,7 +459,7 @@ function Shell() {
           ) : group ? (
             <GroupView key={group.id} group={group} />
           ) : bot ? (
-            <ChatView key={bot.id} bot={bot} />
+            <ChatView key={bot.id} bot={bot} explicitThreadId={state.viewedThreadId || undefined} />
           ) : (
             <main className="flex h-full min-w-0 flex-1 flex-col items-center justify-center gap-3 bg-app text-ink-secondary">
               <Loader2 size={20} className="animate-spin" />

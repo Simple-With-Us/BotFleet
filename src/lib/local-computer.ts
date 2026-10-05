@@ -66,14 +66,14 @@ export function localComputerDisabledReason({
       return "Wayland local control is currently limited to GNOME. Xorg remains available on supported desktops.";
     }
     if (!capabilities.localComputer.enabled) {
-      return "Enable the local control beta and complete the Cua Driver checks first.";
+      return "Enable the local control beta and complete the Computer Driver checks first.";
     }
-    return capabilities.localComputer.message ?? "Cua Driver is not ready for local control.";
+    return capabilities.localComputer.message ?? "Computer Driver is not ready for local control.";
   }
   if (capabilities.host.label === "Browser") {
     return "Local computer control requires the desktop app.";
   }
-  return "CUA Driver is not ready for local computer control.";
+  return "Computer Driver is not ready for local computer control.";
 }
 
 export function linuxAutoDescription(): string {

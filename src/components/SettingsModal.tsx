@@ -44,6 +44,7 @@ import { EnginesSettings } from "./EnginesSettings";
 import { FleetModelsSection } from "./FleetModelsSection";
 import { BotComputerDefaults } from "./BotComputerDefaults";
 import { LocalComputerSection } from "./LocalComputerSection";
+import { HostCliIntegrationCard } from "./HostCliIntegrationCard";
 import { LocalVmRuntimeCard } from "./LocalVmRuntimeCard";
 import { SharedVpsRuntimeCard } from "./SharedVpsRuntimeCard";
 import { CompanionSection } from "./CompanionSection";
@@ -867,7 +868,7 @@ function AnalyticsRow() {
   return (
     <Card
       title="Usage Analytics"
-      subtitle="Anonymous product events — app opened, which features get used. Never conversations, prompts, file contents, or bot output. Your email is only attached if you shared it during setup."
+      subtitle={"Anonymous product events — app opened, which features get used.\u00a0 Never conversations, prompts, file contents, or bot output.\u00a0 Your email is only attached if you shared it during setup."}
     >
       <button
         role="switch"
@@ -920,7 +921,7 @@ function ToolCallsRow() {
           <div className="min-w-0">
             <div className="text-[14px] font-medium text-ink">Show tool calls</div>
             <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-              Named chips for Bash, search, and other tools. Errors and bot-to-bot messages still appear.
+              Named chips for Bash, search, and other tools.{"\u00a0 "}Errors and bot-to-bot messages still appear.
             </div>
           </div>
           <button
@@ -985,7 +986,7 @@ function ExperimentalFeaturesRow() {
   return (
     <Card
       title="Experimental Features"
-      subtitle="Early features may change while we test them. They stay off unless you enable them."
+      subtitle={"Early features may change while we test them.\u00a0 They stay off unless you enable them."}
     >
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
@@ -1039,7 +1040,7 @@ function DiagnosticsRow() {
   return (
     <Card
       title="Diagnostics"
-      subtitle="Versions, configuration on/off state and a redacted server log tail. Review the file before sharing it."
+      subtitle={"Versions, configuration on/off state and a redacted server log tail.\u00a0 Review the file before sharing it."}
     >
       <div className="flex min-w-0 flex-col items-end gap-2">
         <button
@@ -1352,7 +1353,7 @@ export function SettingsModal() {
                     id="setting-general-profile"
                     className={highlightClass("setting-general-profile")}
                     title="Profile"
-                    subtitle="Shown in the sidebar. Saved as you go."
+                    subtitle={"Shown in the sidebar.\u00a0 Saved as you go."}
                   >
                     <ProfileFields />
                   </Card>
@@ -1468,7 +1469,7 @@ export function SettingsModal() {
                   id="setting-engines-clis"
                   className={highlightClass("setting-engines-clis")}
                   title="Engine CLIs"
-                  subtitle="Which binary each engine runs. Saved as you go."
+                  subtitle={"Which binary each engine runs.\u00a0 Saved as you go."}
                 >
                   <EnginesSettings highlightClass={highlightClass} />
                 </Card>
@@ -1490,6 +1491,9 @@ export function SettingsModal() {
                 <>
                   <div id="setting-computers-providers" className={highlightClass("setting-computers-providers")}>
                     <LocalComputerSection />
+                  </div>
+                  <div className={highlightClass("setting-computers-cli-credentials")}>
+                    <HostCliIntegrationCard />
                   </div>
                   <div id="setting-computers-local-vm" className={highlightClass("setting-computers-local-vm")}>
                     <LocalVmRuntimeCard />

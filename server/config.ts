@@ -224,6 +224,10 @@ const localVmConfigSchema = z.object({
     .optional(),
   shareCliCredentials: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
+  /** Optional ceilings for the Local VM container.  Absent means "adapt to
+   * what the container runtime actually has, up to 4 CPUs / 8 GiB". */
+  cpus: z.number().int().min(1).max(4).optional(),
+  memoryGib: z.number().int().min(1).max(8).optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -534,6 +538,8 @@ export interface AppConfig {
     maxInstances?: number;
     shareCliCredentials?: boolean;
     allowHostTerminal?: boolean;
+    cpus?: number;
+    memoryGib?: number;
   };
   /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
    * `accessClientSecret` are a Cloudflare Access service token: a pair of
@@ -1745,6 +1751,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     antigravity: { driver: "antigravityAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -1767,6 +1774,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     dsh: { driver: "dshAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;

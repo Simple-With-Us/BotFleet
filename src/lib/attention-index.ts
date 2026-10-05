@@ -64,6 +64,13 @@ export interface AttentionSummaryRollup {
   totalUnread: number;
 }
 
+export interface AttentionMessage {
+  id?: string;
+  parentId?: string | null;
+  kind: string;
+  tool?: { name: string };
+}
+
 export interface MinimalBot {
   id: string;
   name: string;
@@ -72,6 +79,55 @@ export interface MinimalBot {
   activity?: "working" | "waiting-on-you" | "idle" | "no-signal" | "dead";
   unread?: boolean;
   hidden?: boolean;
+  hasError?: boolean;
+  errorReason?: string;
+  /** Leaf of the visible branch.  Absent falls back to the flat list. */
+  activeLeafId?: string | null;
+  messages?: readonly AttentionMessage[];
+}
+
+/** One id index per messages-array identity.  Rooms that share a bot, and
+ * the error check plus its reason, must not scan that transcript again. */
+const attentionMessageIndex = new WeakMap<
+  readonly AttentionMessage[],
+  Map<string, AttentionMessage>
+>();
+
+function indexAttentionMessages<T extends AttentionMessage>(
+  messages: readonly T[],
+): Map<string, T> {
+  const cached = attentionMessageIndex.get(messages);
+  if (cached) return cached as Map<string, T>;
+  const byId = new Map<string, T>();
+  for (const message of messages) {
+    if (message.id) byId.set(message.id, message);
+  }
+  attentionMessageIndex.set(messages, byId);
+  return byId;
+}
+
+/** Visible tail for turn-error checks.  When the leaf id is in the index,
+ * that message is the tail: the old parent walk pushed it first and then
+ * reversed, so `.at(-1)` was always the leaf.  A cycle break cannot change
+ * that, and a missing leaf still falls back to the flat last message. */
+function visibleAttentionTail<T extends AttentionMessage>(
+  messages: readonly T[] | undefined,
+  activeLeafId: string | null | undefined,
+): T | undefined {
+  if (!messages || messages.length === 0) return undefined;
+  if (!activeLeafId) return messages.at(-1);
+  return indexAttentionMessages(messages).get(activeLeafId) ?? messages.at(-1);
+}
+
+function messageIsTurnError(message: AttentionMessage | undefined): boolean {
+  return message?.kind === "activity" && Boolean(message.tool?.name.startsWith("error:"));
+}
+
+export function isBotTurnError(bot: {
+  activeLeafId?: string | null;
+  messages?: readonly AttentionMessage[];
+}): boolean {
+  return messageIsTurnError(visibleAttentionTail(bot.messages, bot.activeLeafId));
 }
 
 export interface MinimalGroup {
@@ -106,15 +162,29 @@ export function computeRoomAttentionIndex(
         .map((id) => botMap.get(id))
         .filter((b): b is MinimalBot => Boolean(b));
 
-      // 1. Errors: dead activity or terminal unresolved failures
-      const errorBots: AttentionParticipant[] = assignedBots
-        .filter((b) => b.activity === "dead")
-        .map((b) => ({
+      // 1. Errors: dead activity or terminal unresolved failures.
+      // The visible tail is one leaf lookup, reused for the check and the reason.
+      const errorBots: AttentionParticipant[] = [];
+      for (const b of assignedBots) {
+        const visibleTail = visibleAttentionTail(b.messages, b.activeLeafId);
+        const turnError = messageIsTurnError(visibleTail);
+        if (b.activity !== "dead" && !b.hasError && !turnError) continue;
+        const errorDetail = turnError
+          ? visibleTail?.tool?.name.slice(6).trim()
+          : undefined;
+        errorBots.push({
           botId: b.id,
           botName: b.name,
           avatarUrl: b.avatarUrl,
-          reason: "Process terminated or dead harness",
-        }));
+          reason:
+            b.errorReason ||
+            (b.activity === "dead"
+              ? "Process terminated"
+              : errorDetail
+                ? `Turn error: ${errorDetail}`
+                : "Active error"),
+        });
+      }
 
       // 2. Needs Action: waiting-on-you (prompts, permissions, confirmation)
       const needsActionBots: AttentionParticipant[] = assignedBots

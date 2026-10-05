@@ -71,7 +71,7 @@ Plans, designs, reviews, handoffs, rollouts, and completion notes also go to App
 
 ## Copy Rules (owner — ALL agents, ALL surfaces)
 
-Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Slack posts, Apple Notes, this file (`&nbsp; ` inside HTML strings).  Title Case headings.  Light theme is the first-visit default.  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.  Canonical: `/Users/jay/apps/FLEET-UI-COPY.md`.
+Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Slack posts, Apple Notes, this file (`&nbsp; ` inside HTML strings).  Title Case headings.  System theme is the first-visit default (follows OS appearance; marketing captures default light).  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.
 
 ## App Icon And Logo Policy: Full-Bleed Square Only, Never Squircle
 

@@ -566,8 +566,10 @@ export function hostShellGranted(
   allowed: ComputerDestination[] | null,
 ): boolean {
   const { granted } = resolveGrants(bot.computers, undefined, cfg.botDefaults?.computers, allowed);
-  const filtered = filterGrantedByProviders(granted, cfg, resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend));
-  return filtered.includes("local") || (filtered.includes("vm") && cfg.localVm?.allowHostTerminal === true);
+  const cloudBackend = resolveCloudBackend(bot.cloudBackend, cfg.botDefaults?.cloudBackend);
+  const filtered = filterGrantedByProviders(granted, cfg, cloudBackend);
+  const hasVmOrVps = filtered.includes("vm") || (filtered.includes("cloud") && cloudBackend === "vps");
+  return filtered.includes("local") || (hasVmOrVps && cfg.localVm?.allowHostTerminal === true);
 }
 
 export async function resolveTurnComputerMounts<Lease>(
@@ -676,18 +678,34 @@ async function resolveMounts<Lease>(
   });
   const mountsCloudComputer = reach.box;
   const mountsLocalComputer = reach.local && !unattendedAgy;
-  const allowHostTerminalWithVm = Boolean(wantsVm && cfg.localVm?.allowHostTerminal === true);
+  const allowHostTerminalWithVm = Boolean(
+    (wantsVm || (wantsCloudFiltered && cloudBackend === "vps")) &&
+    cfg.localVm?.allowHostTerminal === true,
+  );
   const hasHostComputer = Boolean((wantsLocal || allowHostTerminalWithVm) && mountsLocalComputer);
 
   // Explicit destinations are strict.  In particular, Local VM must never
-  // fall through to host CUA and accidentally click on the user's Mac.
+  // fall through to host CUA and accidentally click on the user's Mac.  The one
+  // softening is a bot that was ALSO explicitly granted another computer: a
+  // Local VM that is missing or not ready then degrades to those grants (with a
+  // notice saying why) rather than failing the whole turn, the same way an
+  // unreachable VPS does.  A VM-only grant, or runOn=vm, still refuses.
+  let vmFailure: Error | undefined;
   if (wantsVm) {
     if (!reach.vm) {
       throw new Error("this model engine cannot use the Local VM — choose Claude or an ACP engine, or select another computer destination");
     }
-    const stdio = await deps.acquireLocalVm();
+    const vmMayDegrade = runOn !== "vm" && granted.some((destination) => destination !== "vm");
+    let stdio: Awaited<ReturnType<typeof deps.acquireLocalVm>> | undefined;
+    try {
+      stdio = await deps.acquireLocalVm();
+    } catch (err) {
+      if (!vmMayDegrade) throw err;
+      vmFailure = err instanceof Error ? err : new Error(String(err));
+      deps.notice(`Local VM not mounted: ${vmFailure.message}`, false);
+    }
     if (!(await deps.checkpoint())) return stopped();
-    mounts.push({ name: "", label: computerLabel("vm", hostPlatform), kind: "vm", stdio });
+    if (stdio) mounts.push({ name: "", label: computerLabel("vm", hostPlatform), kind: "vm", stdio });
   }
   // Deliberately not an "else": "the Local VM and this computer" is a
   // legitimate grant, and each destination resolves independently.
@@ -885,6 +903,12 @@ async function resolveMounts<Lease>(
       : "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.";
     throw new Error(`${autoVpsProblem}. ${hint}`);
   }
+
+  // The Local VM degraded but no other granted computer actually resolved:
+  // fail with the VM's own reason rather than run the turn with no computer.
+  // Hybrid host-shell grants (`allowHostTerminal`) never mount here; when the
+  // engine exposes host tools through `hasHostComputer`, keep degrading like cloud.
+  if (vmFailure && mounts.length === 0 && !(hasHostComputer && engine.toolLoop === true)) throw vmFailure;
 
   // Name the servers once, here, so a room turn and a direct turn hand the
   // driver byte-identical mounts.

@@ -3120,31 +3120,40 @@ async function acquireLocalVmMount(botId: string, threadId: string) {
   localVmThreadTargets.set(threadId, botId, target);
   setLocalVmLaneActive(target, threadId, botId, true);
   localVmIdleFor(target).touch();
-  let localVm = await containerComputerStatus(undefined, undefined, target);
   try {
-    localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
-  } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
-  }
-  if (!localVm.ready || !localVm.runtime) {
-    throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
-  }
-  // The container is up but this bot's desktop may not be: in shared mode each
-  // bot owns its own display + socket, and the first turn for a bot is the one
-  // that has to start it.  Idempotent, so every later turn is a no-op.  The
-  // shared `:1` supervisor desktop is never touched.
-  if (target.session) {
+    let localVm = await containerComputerStatus(undefined, undefined, target);
     try {
-      await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+      localVm = await wakeContainerComputer(localVm, undefined, undefined, target);
     } catch (error) {
-      throw new Error(
-        `could not start this bot's shared VM desktop on ${target.session.display}: ${
-          error instanceof Error ? error.message : String(error)
-        } (App Settings → Local VM)`,
-      );
+      throw new Error(`${error instanceof Error ? error.message : String(error)} (App Settings → Local VM)`);
     }
+    if (!localVm.ready || !localVm.runtime) {
+      throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
+    }
+    // The container is up but this bot's desktop may not be: in shared mode each
+    // bot owns its own display + socket, and the first turn for a bot is the one
+    // that has to start it.  Idempotent, so every later turn is a no-op.  The
+    // shared `:1` supervisor desktop is never touched.
+    if (target.session) {
+      try {
+        await ensureContainerComputerSession(localVm.runtime, target.containerName, botId);
+      } catch (error) {
+        throw new Error(
+          `could not start this bot's shared VM desktop on ${target.session.display}: ${
+            error instanceof Error ? error.message : String(error)
+          } (App Settings → Local VM)`,
+        );
+      }
+    }
+    return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
+  } catch (error) {
+    // The turn may carry on with another granted computer, so the claim must
+    // not outlive the failure: a lingering lease would hold the container
+    // against idle teardown and block Local VM lifecycle actions.  Release is
+    // idempotent, so the dispatcher's own unwind is still safe.
+    releaseLocalVmThread(threadId, botId);
+    throw error;
   }
-  return containerComputerMcp(localVm.runtime, controlIntegration(botId), target);
 }
 
 /** The harness state `resolveTurnComputerMounts` borrows, gathered in one
@@ -8254,6 +8263,8 @@ function configStatus() {
     localVm: {
       mode: cfg.localVm?.mode ?? "shared",
       maxInstances: localVmMaxInstances(cfg),
+      shareCliCredentials: Boolean(cfg.localVm?.shareCliCredentials),
+      allowHostTerminal: Boolean(cfg.localVm?.allowHostTerminal),
     },
     // No invented endpoint or collection: the operator's own values or
     // nothing at all, so an unconfigured install reads as unconfigured.
@@ -14839,9 +14850,24 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
       }
     }
-    m = path.match(/^\/api\/tts\/custom-voice\/([\w.-]+)$/);
+    // personal: and apple-personal: ids contain a colon.  The pathname keeps
+    // that colon percent-encoded, so the previous word class never matched and the
+    // refused row could not be removed.
+    m = path.match(/^\/api\/tts\/custom-voice\/([^/]+)$/);
     if (m && method === "DELETE") {
-      const [, voiceId] = m;
+      let voiceId: string;
+      try {
+        // The pathname is the only trust boundary on the DELETE id.  A
+        // malformed value used to slip past the word class straight to
+        // deleteCustomVoice.  Parse it through Zod so the downstream
+        // service only ever receives a trimmed, non-empty value, and a
+        // failed decode or a failed parse both return 400 without a
+        // delete.  personal: / apple-personal: ids with a colon are still
+        // accepted (Zod only constrains shape, not characters).
+        voiceId = z.string().trim().min(1).parse(decodeURIComponent(m[1]));
+      } catch {
+        return json(res, 400, { error: "invalid voice id" });
+      }
       const deleted = tts.deleteCustomVoice(voiceId);
       return json(res, 200, { ok: true, deleted });
     }

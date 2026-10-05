@@ -131,7 +131,9 @@ export function CallTargetButton({
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
             ? personalVoiceChosen
-              ? "Personal Voice needs a Mac or iPhone"
+              ? capabilities.dictation.reasonCode === "requires-macos-14"
+                ? "Personal Voice needs macOS 14 or later, or an iPhone"
+                : "Personal Voice needs a Mac or iPhone"
               : "Pick a voice in a bot profile to make calls"
             : `Call ${targetName}`;
 
@@ -145,7 +147,9 @@ export function CallTargetButton({
         ? "Add a MiniMax API key in Settings so the bot can speak during calls."
         : !voiceReady
           ? personalVoiceChosen
-            ? "Apple Personal Voice speaks on Apple devices (Mac and iPhone).\u00A0 Pick another voice to make calls on this computer."
+            ? capabilities.dictation.reasonCode === "requires-macos-14"
+              ? "Apple Personal Voice needs macOS 14 or later, or an iPhone.\u00A0 Pick another voice to make calls on this computer."
+              : "Apple Personal Voice speaks on Apple devices (Mac and iPhone).\u00A0 Pick another voice to make calls on this computer."
             : voices.length > 1
               ? "Give every channel member a voice before starting a channel call."
               : "Choose a voice before starting a call."
