@@ -10,7 +10,7 @@ A legacy standalone site repo previously also deployed to the same domain and th
 
 ## Stack
 
-Static HTML/CSS rendered from `features.json` via `node build.mjs`, hosted on Vercel.  DNS is a Cloudflare zone (`botfleet.app`) on the Usage.Jays.Services account; the registrar is Namecheap with nameservers pointed at Cloudflare.
+Static HTML/CSS rendered from `features.json` via `node build.mjs`, hosted on Vercel.  DNS is a Cloudflare zone for the product domain; the account, zone ids, registrar and nameserver values live in the private operations inventory.
 
 - `features.json` — the feature list (the only file to edit for content changes).
 - `template.html` + `build.mjs` — render `dist/index.html` from the data.
@@ -44,7 +44,7 @@ Edit `features.json`, run `node build.mjs` (or `npm run build`), push to
 - No internal agent seat names on the public site.
 - The bot roster is an example fleet, not a product claim — keep it framed that way.
 
-Manual deploy fallback: `vercel deploy --prod` from `apps/site` (project `botfleet-site`).
+Manual deploy fallback: `vercel deploy --prod` from `apps/site`.  The project name is in the private operations inventory, not here.
 
 ## Coordination
 

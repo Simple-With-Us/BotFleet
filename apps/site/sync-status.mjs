@@ -62,10 +62,19 @@ const featuresSchema = z
   })
   .passthrough();
 
-/** Parse, but report only the paths — a ZodError carries the whole input. */
-function parseOrExplain(label, schema, value) {
+/** Validate, or explain precisely — a ZodError carries the whole input.
+ *
+ *  Returns NOTHING.  The parsed value is deliberately discarded: `z.object()`
+ * strips undeclared keys unless every level opts out, and this script rewrites
+ * the very file it validated.  Handing the parse result onward would make the
+ * schema a silent transform, so a missing `.passthrough()` anywhere below would
+ * write features.json back stripped of `site`, `exampleFleet`, section ids,
+ * badges and descriptions — committed as if it were the truth.  Validation is a
+ * gate here, never an edit.
+ */
+function assertShape(label, schema, value) {
   const result = schema.safeParse(value);
-  if (result.success) return result.data;
+  if (result.success) return;
   const where = result.error.issues
     .slice(0, 10)
     .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
@@ -73,17 +82,15 @@ function parseOrExplain(label, schema, value) {
   throw new Error(`${label} did not match the expected shape — ${where}`);
 }
 
-const data = parseOrExplain("features.json", featuresSchema, JSON.parse(readFileSync(path, "utf8")));
-const prs = parseOrExplain(
-  "the GitHub pulls response",
-  z.array(prSchema),
-  JSON.parse(
-    execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100", "--jq", PR_FIELDS], {
-      encoding: "utf8",
-      maxBuffer: 16 * 1024 * 1024,
-    }),
-  ),
+const data = JSON.parse(readFileSync(path, "utf8"));
+assertShape("features.json", featuresSchema, data);
+const prs = JSON.parse(
+  execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100", "--jq", PR_FIELDS], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  }),
 );
+assertShape("the GitHub pulls response", z.array(prSchema), prs);
 const stateOf = new Map(prs.map((p) => [p.number, p.merged_at ? "merged" : p.state]));
 
 let changed = 0;
