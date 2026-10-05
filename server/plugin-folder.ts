@@ -36,6 +36,8 @@ export const nodePluginFolderReader: PluginFolderReader = {
 export interface ReadPluginFolder {
   source: string;
   fetched: FetchedPlugin;
+  /** Files and folders that were refused, for the install review screen. */
+  skipped: string[];
 }
 
 /** Walk one folder, returning a manifest text + a file list.  Only
@@ -126,5 +128,6 @@ export function readPluginFolder(
       manifestText,
       files,
     },
+    skipped,
   };
 }

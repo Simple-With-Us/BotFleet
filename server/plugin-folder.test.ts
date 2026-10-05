@@ -48,6 +48,7 @@ describe("readPluginFolder", () => {
     expect(result.fetched.manifestText).toBe(manifest);
     expect(result.fetched.files.length).toBe(1);
     expect(result.fetched.files[0]!.path).toBe("plugin.mjs");
+    expect(result.skipped).toEqual(["README.md", "sub"]);
   });
 
   it("refuses absolute paths", () => {

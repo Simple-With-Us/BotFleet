@@ -224,6 +224,8 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   const callAction = useCallback(
     async (name: string, action: "enable" | "disable" | "update" | "reload") => {
       setBusyName(name);
+      setInstallError(null);
+      setInstallIssues([]);
       try {
         const response = await fetch(`/api/plugins/${name}/${action}`, { method: "POST" });
         if (!response.ok) {
@@ -243,6 +245,8 @@ export function PluginsManagerView({ onClose }: { onClose?: () => void }) {
   const handleRemove = useCallback(
     async (plugin: PluginListing) => {
       setBusyName(plugin.name);
+      setInstallError(null);
+      setInstallIssues([]);
       try {
         const response = await fetch(`/api/plugins/${plugin.name}`, { method: "DELETE" });
         if (!response.ok) {

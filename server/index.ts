@@ -444,7 +444,7 @@ import { readHostLoad } from "./drivers/acp/init-deadline.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
-import { isSecretConfigKey, redactPluginConfig } from "./plugin-loader.ts";
+import { isPluginConfigKey, narrowPluginConfigSection, PLUGIN_CONFIG_ALLOWLIST } from "./plugin-loader.ts";
 import * as pluginsModule from "./plugins.ts";
 import type { PluginListing } from "./plugin-types.ts";
 import { createBotPackageExport } from "./package-export.ts";
@@ -865,15 +865,18 @@ pluginsModule.initPluginRuntime({
     status: bot.busy === true ? "running" : bot.busy === false ? "stopped" : "unknown",
     driver: bot.modelSelection?.instanceId ?? "unknown",
   })),
-  listConfigKeys: () => Object.keys(cfg).filter((key) => !isSecretConfigKey(key)),
-  // Refuse secret-looking keys, then return a redacted copy.  The live
-  // AppConfig object must not cross into plugin code, and a section name
-  // that does not itself look like a secret can still hold a key field.
+  // DESIGN.md: a small allowlist of non-secret settings, not every
+  // AppConfig section minus a denylist.  Only keys present on the live
+  // config are advertised so plugins do not probe absent sections.
+  listConfigKeys: () => PLUGIN_CONFIG_ALLOWLIST.filter((key) => Object.prototype.hasOwnProperty.call(cfg, key)),
+  // Refuse anything outside the allowlist, then return a narrowed /
+  // redacted copy.  The live AppConfig object must not cross into plugin
+  // code.
   readConfig: <T = unknown>(key: string): T | undefined => {
-    if (isSecretConfigKey(key)) return undefined;
+    if (!isPluginConfigKey(key)) return undefined;
     if (!Object.prototype.hasOwnProperty.call(cfg, key)) return undefined;
-    // SAFETY: `key` was confirmed as an own property of the resolved AppConfig.  redactPluginConfig copies the value and drops secret-looking fields; the caller names T.
-    return redactPluginConfig(cfg[key as keyof typeof cfg]) as T | undefined;
+    // SAFETY: `key` was confirmed as an own allowlisted property of the resolved AppConfig.  narrowPluginConfigSection copies and drops secret-looking / out-of-scope fields; the caller names T.
+    return narrowPluginConfigSection(key, cfg[key as keyof typeof cfg]) as T | undefined;
   },
   // Plugin events are allow-listed structures from plugin-loader.ts: an
   // event name, a level, a hashed plugin id, and a length or stable code.
@@ -15001,7 +15004,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const cardPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/)?.slice(1));
     if (cardPath.success && method === "GET") {
       const result = await pluginsModule.getPluginCardData(cardPath.data[0], cardPath.data[1]);
-      if ("error" in result) return json(res, 409, { error: result.error });
+      if ("error" in result) {
+        // DESIGN.md: unknown plugin names → 404; disabled / other → 409.
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
       return json(res, 200, { data: result.data });
     }
     const cmdPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/)?.slice(1));
@@ -15009,7 +15016,10 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const body = PLUGIN_COMMAND_BODY.safeParse(await readBody(req));
       if (!body.success) return json(res, 400, { error: "expected a JSON object with an optional string `args`" });
       const result = await pluginsModule.runPluginCommand(cmdPath.data[0], cmdPath.data[1], body.data.args);
-      if ("error" in result) return json(res, 409, { error: result.error });
+      if ("error" in result) {
+        const status = result.error.startsWith("no plugin named") ? 404 : 409;
+        return json(res, status, { error: result.error });
+      }
       return json(res, 200, result);
     }
 

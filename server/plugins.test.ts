@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,7 @@ import {
   updatePlugin,
   _loadedNames,
   _resetForTests,
+  compareSemver,
 } from "./plugins.ts";
 import { clearPluginsDir, readRegistry, removeDirSafe, setPluginEntry } from "./plugin-registry.ts";
 import type { PluginLogEvent } from "./plugin-loader.ts";
@@ -58,14 +59,14 @@ function makeRuntimeInputs() {
 
 beforeEach(async () => {
   baseDir = mkdtempSync(join(tmpdir(), "botfleet-plugins-"));
-  clearPluginsDir(baseDir);
+  await clearPluginsDir(baseDir);
   await _resetForTests();
   initPluginRuntime(makeRuntimeInputs());
 });
 
 afterEach(async () => {
   await _resetForTests();
-  removeDirSafe(baseDir);
+  await removeDirSafe(baseDir);
 });
 
 describe("plugin lifecycle", () => {
@@ -422,5 +423,66 @@ describe("install failures the UI can render", () => {
     const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
     if (!("error" in result)) throw new Error("expected the command to fail");
     expect(result.error).toMatch(/requires botfleet ">=2"/);
+    // Request-time mismatch must persist enabled=false like bootPluginRuntime.
+    expect(readRegistry(baseDir).plugins["fleet-overview"]?.enabled).toBe(false);
+  });
+});
+
+
+describe("compareSemver", () => {
+  it("orders strict MAJOR.MINOR.PATCH strings", () => {
+    expect(compareSemver("1.0.0", "1.0.0")).toBe(0);
+    expect(compareSemver("1.0.0", "1.1.0")).toBe(-1);
+    expect(compareSemver("2.0.0", "1.9.9")).toBe(1);
+  });
+});
+
+describe("install folder skipped warnings", () => {
+  it("records skipped directories and non-script files as install warnings", async () => {
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-skipped-"));
+    try {
+      const fixtureFiles = readdirSync(FIXTURE);
+      for (const name of fixtureFiles) {
+        copyFileSync(join(FIXTURE, name), join(sourceDir, name));
+      }
+      mkdirSync(join(sourceDir, "helpers"), { recursive: true });
+      writeFileSync(join(sourceDir, "README.md"), "# demo\n");
+      const installed = await installPlugin(sourceDir, baseDir);
+      if ("error" in installed) throw new Error(installed.error);
+      expect(installed.warnings.some((w) => w === "skipped helpers")).toBe(true);
+      expect(installed.warnings.some((w) => w === "skipped README.md")).toBe(true);
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("update downgrade warning", () => {
+  it("warns when an update would downgrade the installed version", async () => {
+    const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-downgrade-"));
+    try {
+      const fixtureFiles = readdirSync(FIXTURE);
+      for (const name of fixtureFiles) {
+        copyFileSync(join(FIXTURE, name), join(sourceDir, name));
+      }
+      await installPlugin(sourceDir, baseDir);
+      const manifestPath = join(sourceDir, "botfleet-plugin.json");
+      const original = readManifest(manifestPath);
+      // Bump first so we have room to downgrade.
+      original.version = "1.2.0";
+      writeFileSync(manifestPath, JSON.stringify(original, null, 2));
+      const bumped = await updatePlugin("fleet-overview", baseDir);
+      if ("error" in bumped) throw new Error(bumped.error);
+      expect(bumped.version).toBe("1.2.0");
+
+      original.version = "1.0.0";
+      writeFileSync(manifestPath, JSON.stringify(original, null, 2));
+      const downgraded = await updatePlugin("fleet-overview", baseDir);
+      if ("error" in downgraded) throw new Error(downgraded.error);
+      expect(downgraded.version).toBe("1.0.0");
+      expect(downgraded.warnings.some((w) => /downgrade.*1\.2\.0.*1\.0\.0/.test(w))).toBe(true);
+    } finally {
+      rmSync(sourceDir, { recursive: true, force: true });
+    }
   });
 });

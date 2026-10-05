@@ -67,7 +67,7 @@ describe("plugin registry", () => {
     expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, source: { kind: "ftp", path: "x" } } } }).success).toBe(false);
   });
 
-  it("writes the plugin tree and reads it back through listingFor", () => {
+  it("writes the plugin tree and reads it back through listingFor", async () => {
     const manifest = JSON.stringify({
       name: "demo",
       version: "1.0.0",
@@ -75,7 +75,7 @@ describe("plugin registry", () => {
       botfleet: ">=1",
       entry: "plugin.mjs",
     });
-    writePluginTree("demo", {
+    await writePluginTree("demo", {
       source: "/tmp/demo",
       manifestText: manifest,
       files: [{ path: "plugin.mjs", content: "export const hello = 'world';\n" }],
@@ -147,7 +147,7 @@ describe("plugin registry", () => {
     expect("error" in listing).toBeTruthy();
   });
 
-  it("removes an entry and its directory", () => {
+  it("removes an entry and its directory", async () => {
     const manifest = JSON.stringify({
       name: "demo",
       version: "1.0.0",
@@ -155,7 +155,7 @@ describe("plugin registry", () => {
       botfleet: ">=1",
       entry: "plugin.mjs",
     });
-    writePluginTree("demo", {
+    await writePluginTree("demo", {
       source: "/tmp/demo",
       manifestText: manifest,
       files: [],
@@ -180,10 +180,24 @@ describe("plugin registry", () => {
     expect(names).toEqual(["alpha", "beta"]);
   });
 
-  it("clearPluginsDir wipes everything", () => {
+  it("clearPluginsDir wipes everything", async () => {
     mkdirSync(join(baseDir, "alpha"), { recursive: true, mode: 0o700 });
-    clearPluginsDir(baseDir);
+    await clearPluginsDir(baseDir);
     expect(existsSync(baseDir)).toBe(true);
     expect(listPluginDirs(baseDir)).toEqual([]);
+  });
+
+  it("writes the registry via temp + rename so a crash cannot truncate it", () => {
+    const entry = buildEntry({
+      name: "demo",
+      version: "1.0.0",
+      source: { kind: "folder", path: "/tmp/demo" },
+      warnings: [],
+    });
+    setPluginEntry(entry, baseDir);
+    const files = readdirSync(baseDir);
+    expect(files.includes("registry.json")).toBe(true);
+    expect(files.some((file) => file.startsWith("registry.json.tmp-"))).toBe(false);
+    expect(readRegistry(baseDir).plugins.demo?.name).toBe("demo");
   });
 });

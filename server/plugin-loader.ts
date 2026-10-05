@@ -84,8 +84,19 @@ export interface PluginHostInputs {
 
 const SECRET_CONFIG_KEY = /key|token|secret|credential/i;
 
-/** Same filter `listConfigKeys` uses.  A plugin must not read a value
- *  whose key looks like a credential, even if it guesses the name. */
+/** Top-level AppConfig sections plugins with `read.config` may see.
+ *  DESIGN.md promises a small allowlist of non-secret settings, not
+ *  "everything minus secret-looking keys".  Keep this list tiny. */
+export const PLUGIN_CONFIG_ALLOWLIST = ["rooms", "callStt"] as const;
+
+/** True when `key` is one of the closed plugin config allowlist entries. */
+export function isPluginConfigKey(key: string): boolean {
+  return (PLUGIN_CONFIG_ALLOWLIST as readonly string[]).includes(key);
+}
+
+/** Same filter `listConfigKeys` uses as defense in depth.  A plugin must
+ *  not read a value whose key looks like a credential, even if it guesses
+ *  the name. */
 export function isSecretConfigKey(key: string): boolean {
   return SECRET_CONFIG_KEY.test(key);
 }
@@ -107,6 +118,16 @@ export function redactPluginConfig(value: unknown): unknown {
     out[key] = redactPluginConfig(value[key]);
   }
   return out;
+}
+
+/** Narrow an allowlisted AppConfig section before it crosses into a plugin.
+ *  `callStt` exposes only `provider` — keyterms are user vocabulary and
+ *  must not leak.  Other allowlisted sections are redacted as usual. */
+export function narrowPluginConfigSection(key: string, value: unknown): unknown {
+  if (key === "callStt" && isRedactableRecord(value)) {
+    return value.provider === undefined ? {} : { provider: value.provider };
+  }
+  return redactPluginConfig(value);
 }
 
 /** Short, stable correlation id for a plugin in logs.  The raw name comes

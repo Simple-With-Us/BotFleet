@@ -36,9 +36,9 @@ function pluginDirFor(name: string, baseDir: string): string {
 
 const TRANSIENT_RM_CODES = new Set(["EPERM", "EBUSY", "ENOTEMPTY"]);
 
-function sleepSyncMs(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
+/** Non-blocking backoff between rmSync retries.  Never use Atomics.wait
+ *  here: install/update/remove run on the server event loop. */
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function errnoCode(error: unknown): string {
   if (error && typeof error === "object" && "code" in error) {
@@ -50,12 +50,12 @@ function errnoCode(error: unknown): string {
 
 /** Windows-safe recursive remove for plugin trees.  A just-killed sandbox
  *  child can still hold directory handles on win32, so bare rmSync fails
- *  with EPERM.  Retries with backoff on EPERM/EBUSY/ENOTEMPTY.  Midway on
- *  win32, renames the tree aside so a caller can recreate the original
- *  path while the aside delete keeps retrying.  Never swallows a permanent
- *  error, and never returns success while the original path still exists
- *  after exhausting retries. */
-export function removeDirSafe(target: string, options: { attempts?: number } = {}): void {
+ *  with EPERM.  Retries with async backoff on EPERM/EBUSY/ENOTEMPTY so the
+ *  event loop stays free.  Midway on win32, renames the tree aside so a
+ *  caller can recreate the original path while the aside delete keeps
+ *  retrying.  Never swallows a permanent error, and never returns success
+ *  while the original path still exists after exhausting retries. */
+export async function removeDirSafe(target: string, options: { attempts?: number } = {}): Promise<void> {
   const attempts = options.attempts ?? 10;
   let path = target;
   let lastError: unknown;
@@ -82,7 +82,7 @@ export function removeDirSafe(target: string, options: { attempts?: number } = {
           // rename failed; keep retrying the original path
         }
       }
-      sleepSyncMs(20 + i * 10);
+      await sleepMs(20 + i * 10);
     }
   }
   // Rename-aside freed the original path even if the aside is still locked.
@@ -141,10 +141,15 @@ export function readRegistry(baseDir: string = PLUGINS_DIR): PluginRegistry {
 }
 
 /** Atomically write the registry.  The directory is created with
- *  mode 0o700 because plugin paths contain user code. */
+ *  mode 0o700 because plugin paths contain user code.  Write to a
+ *  sibling temp file and rename over the target so a crash mid-write
+ *  cannot leave a truncated registry.json. */
 export function writeRegistry(registry: PluginRegistry, baseDir: string = PLUGINS_DIR): void {
   mkdirSync(baseDir, { recursive: true, mode: 0o700 });
-  writeFileSync(registryPathFor(baseDir), `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
+  const target = registryPathFor(baseDir);
+  const temp = `${target}.tmp-${process.pid}`;
+  writeFileSync(temp, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temp, target);
 }
 
 export function pluginExists(name: string): boolean {
@@ -169,16 +174,18 @@ export function removePluginEntry(name: string, baseDir: string = PLUGINS_DIR): 
 }
 
 /** Write a fetched plugin to disk.  Manifest is written last so a
- *  half-written tree is always detectable by the missing manifest. */
-export function writePluginTree(
+ *  half-written tree is always detectable by the missing manifest.
+ *  Filesystem errors propagate to the caller; plugins.ts maps them to
+ *  `{ error }` so nothing escapes the API boundary. */
+export async function writePluginTree(
   name: string,
   fetched: FetchedPlugin,
   baseDir: string = PLUGINS_DIR,
-): void {
+): Promise<void> {
   const dir = pluginDirFor(name, baseDir);
   // Remove first so an update never inherits stale files.  Callers must
   // dispose any live sandbox for this plugin before reaching here.
-  removeDirSafe(dir);
+  await removeDirSafe(dir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   for (const file of fetched.files) {
@@ -297,18 +304,20 @@ export function rebuildEntryForUpdate(args: {
   existing: PluginRegistryEntry;
   version: string;
   source: PluginSource;
+  warnings?: string[];
 }): PluginRegistryEntry {
   return {
     ...args.existing,
     version: args.version,
     updatedAt: new Date().toISOString(),
     source: args.source,
+    warnings: args.warnings ?? args.existing.warnings,
   };
 }
 
 /** Used by tests to fully reset a base directory. */
-export function clearPluginsDir(baseDir: string = PLUGINS_DIR): void {
-  removeDirSafe(baseDir);
+export async function clearPluginsDir(baseDir: string = PLUGINS_DIR): Promise<void> {
+  await removeDirSafe(baseDir);
   mkdirSync(baseDir, { recursive: true, mode: 0o700 });
 }
 

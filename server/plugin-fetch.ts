@@ -132,14 +132,43 @@ async function fetchListing(url: string, fetcher: typeof fetch): Promise<Content
   return parsed.data;
 }
 
+/** Read a response body with a hard byte cap.  Rejects a declared
+ *  content-length above the cap before buffering, and aborts the stream
+ *  once the running total crosses MAX_FILE_BYTES so a missing or lying
+ *  content-length cannot force unbounded memory use. */
+async function readBoundedText(response: Response): Promise<string> {
+  const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+  if (Number.isFinite(declared) && declared > MAX_FILE_BYTES) {
+    throw new PluginFetchError("file_too_large", "file is larger than the 256KB import cap");
+  }
+  if (!response.body) {
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) {
+      throw new PluginFetchError("file_too_large", "file is larger than the 256KB import cap");
+    }
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_FILE_BYTES) {
+      try { await reader.cancel(); } catch { /* best effort */ }
+      throw new PluginFetchError("file_too_large", "file is larger than the 256KB import cap");
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function fetchText(url: string, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher(url, { headers: { "user-agent": "BotFleet-plugins" } });
   if (!response.ok) throw new PluginFetchError("download_failed", `download failed (${response.status})`);
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) {
-    throw new PluginFetchError("file_too_large", "file is larger than the 256KB import cap");
-  }
-  return text;
+  return readBoundedText(response);
 }
 
 async function listDir(source: GitPluginSource, path: string, fetcher: typeof fetch): Promise<ContentEntry[]> {
@@ -167,12 +196,15 @@ export async function fetchPluginFromGit(
     .filter((entry) => /\.(?:mjs|cjs|js|json)$/i.test(entry.name))
     .slice(0, MAX_FILES);
 
-  const files = await Promise.all(
-    plugins.map(async (entry) => ({
+  // Sequential downloads: a 64-wide Promise.all would buffer every body
+  // at once even with the per-file cap, multiplying peak memory.
+  const files: Array<{ path: string; content: string }> = [];
+  for (const entry of plugins) {
+    files.push({
       path: entry.name,
       content: await fetchText(entry.download_url, fetcher),
-    })),
-  );
+    });
+  }
 
   return {
     source: `${source.url}${source.ref ? `@${source.ref}` : ""}/${source.path}`.replace(/\/$/, ""),

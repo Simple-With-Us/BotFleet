@@ -159,6 +159,25 @@ function missingEntryFile(
   return { error: `entry: "${entry}" is not one of the installed plugin files` };
 }
 
+/** Compare two strict MAJOR.MINOR.PATCH strings.  Returns <0 when `a` is
+ *  older than `b`, 0 when equal, >0 when `a` is newer.  Manifest versions
+ *  are already schema-checked as SEMVER, so this stays numeric. */
+export function compareSemver(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Map a filesystem failure into the plugins API error shape. */
+function fsErrorMessage(action: string, name: string, error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error);
+  return `plugin "${name}" ${action}: ${detail}`;
+}
+
 /** Expand a leading ~ to this computer's home directory.  `~user` is not
  *  expanded; only `~` and `~/...` are folder installs. */
 function folderInputPath(trimmed: string): string | null {
@@ -181,6 +200,7 @@ async function installFromFetched(
   },
   pluginSource: PluginSource,
   baseDir: string,
+  warnings: string[] = [],
 ): Promise<{ entry: PluginRegistryEntry } | PluginError> {
   const parsed = parsePluginManifestJson(fetched.manifestText);
   if (!parsed.ok) {
@@ -205,17 +225,21 @@ async function installFromFetched(
   // Write the tree, then record the registry.  Order matters: a tree
   // without a registry entry is "incomplete install", which the user
   // can retry; a registry entry without a tree is a worse failure.
-  writePluginTree(manifest.name, {
-    source,
-    manifestText: fetched.manifestText,
-    files: fetched.files,
-  }, baseDir);
+  try {
+    await writePluginTree(manifest.name, {
+      source,
+      manifestText: fetched.manifestText,
+      files: fetched.files,
+    }, baseDir);
+  } catch (error) {
+    return { error: fsErrorMessage("directory could not be written", manifest.name, error) };
+  }
 
   const entry = buildEntry({
     name: manifest.name,
     version: manifest.version,
     source: pluginSource,
-    warnings: [],
+    warnings,
   });
   setPluginEntry(entry, baseDir);
   return { entry };
@@ -266,7 +290,8 @@ async function installFromFolder(
   const read = readPluginFolder(folder);
   if ("error" in read) return { error: read.error };
   const pluginSource: PluginSource = { kind: "folder", path: folder };
-  const result = await installFromFetched(read.source, read.fetched, pluginSource, baseDir);
+  const warnings = read.skipped.map((name) => `skipped ${name}`);
+  const result = await installFromFetched(read.source, read.fetched, pluginSource, baseDir, warnings);
   if ("error" in result) return result;
   return listingOrError(result.entry.name, baseDir);
 }
@@ -329,11 +354,13 @@ export async function updatePlugin(
   if (!entry) return { error: `no plugin named "${name}"` };
 
   let fetched: FetchedPlugin;
+  let sourceWarnings: string[] = [];
   try {
     if (entry.source.kind === "folder") {
       const read = readPluginFolder(entry.source.path);
       if ("error" in read) return { error: read.error };
       fetched = read.fetched;
+      sourceWarnings = read.skipped.map((skipped) => `skipped ${skipped}`);
     } else {
       const parsed = parseGitPluginSource(`https://${entry.source.url}`);
       if (!parsed.ok) return { error: parsed.error };
@@ -366,21 +393,36 @@ export async function updatePlugin(
     };
   }
 
+  // DESIGN.md: semver check (warn on downgrade).  Still apply the update
+  // so a deliberate republish of an older tag is not silently blocked,
+  // but surface the warning on the listing for the install review UI.
+  const warnings = [...sourceWarnings];
+  if (compareSemver(parsed.manifest.version, entry.version) < 0) {
+    warnings.push(
+      `update would downgrade ${name} from ${entry.version} to ${parsed.manifest.version}`,
+    );
+  }
+
   // Dispose before rewriting the tree.  On Windows the child holds open
   // handles under the plugin dir; rmSync fails with EPERM until exit.
   const wasEnabled = entry.enabled;
   await dropLoaded(name);
 
-  writePluginTree(name, {
-    source: fetched.source,
-    manifestText: fetched.manifestText,
-    files: fetched.files,
-  }, baseDir);
+  try {
+    await writePluginTree(name, {
+      source: fetched.source,
+      manifestText: fetched.manifestText,
+      files: fetched.files,
+    }, baseDir);
+  } catch (error) {
+    return { error: fsErrorMessage("directory could not be written", name, error) };
+  }
 
   const next = rebuildEntryForUpdate({
     existing: entry,
     version: parsed.manifest.version,
     source: entry.source,
+    warnings,
   });
   setPluginEntry(next, baseDir);
 
@@ -407,7 +449,11 @@ export async function removePlugin(
 
   await dropLoaded(name);
   removePluginEntry(name, baseDir);
-  removeDirSafe(join(baseDir, name));
+  try {
+    await removeDirSafe(join(baseDir, name));
+  } catch (error) {
+    return { error: fsErrorMessage("could not be removed", name, error) };
+  }
   return { removed: true };
 }
 
@@ -459,6 +505,10 @@ export async function runPluginCommand(
   const mismatch = hostVersionError(listing);
   if (mismatch) {
     await dropLoaded(name);
+    // Mirror bootPluginRuntime: persist enabled=false so the UI stops
+    // showing "Enabled" while every subsequent call would 409.
+    const current = readRegistry(baseDir).plugins[name];
+    if (current) setPluginEntry({ ...current, enabled: false }, baseDir);
     return mismatch;
   }
 
@@ -486,6 +536,8 @@ export async function getPluginCardData(
   const mismatch = hostVersionError(listing);
   if (mismatch) {
     await dropLoaded(name);
+    const current = readRegistry(baseDir).plugins[name];
+    if (current) setPluginEntry({ ...current, enabled: false }, baseDir);
     return mismatch;
   }
 

@@ -138,6 +138,31 @@ describe("fetchPluginFromGit", () => {
     ]);
     expect(parsed).toEqual([{ type: "file", name: "a.mjs", path: "a.mjs", download_url: "https://example/a" }]);
   });
+
+  it("rejects a declared content-length above the 256KB cap before reading", async () => {
+    const source: GitPluginSource = {
+      kind: "git",
+      url: "github.com/acme/widget",
+      ref: null,
+      owner: "acme",
+      repo: "widget",
+      path: "",
+    };
+    const fetcher: typeof fetch = async (input) => {
+      const url = fetchInputUrl(input);
+      if (url.includes("/contents/")) {
+        return new Response(JSON.stringify([
+          { type: "file", name: "botfleet-plugin.json", path: "botfleet-plugin.json", download_url: "https://example/big" },
+        ]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("x", {
+        status: 200,
+        headers: { "content-type": "text/plain", "content-length": String(512 * 1024) },
+      });
+    };
+    await expect(fetchPluginFromGit(source, fetcher)).rejects.toMatchObject({ code: "file_too_large" });
+  });
+
 });
 
 function fetchInputUrl(input: Parameters<typeof fetch>[0]): string {

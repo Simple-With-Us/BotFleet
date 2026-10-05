@@ -84,8 +84,8 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(started.splice(0).map((plugin) => plugin.sandbox.dispose()));
   delete process.env[SECRET_ENV];
-  removeDirSafe(baseDir);
-  removeDirSafe(outsideDir);
+  await removeDirSafe(baseDir);
+  await removeDirSafe(outsideDir);
 });
 
 describe("plugin sandbox isolation", () => {
@@ -214,9 +214,9 @@ describe("plugin sandbox isolation", () => {
     } finally {
       await Promise.all(started.splice(0).map((plugin) => plugin.sandbox.dispose()));
       baseDir = previousBase;
-      removeDirSafe(linkRoot);
-      removeDirSafe(dirname(linkRoot));
-      removeDirSafe(realRoot);
+      await removeDirSafe(linkRoot);
+      await removeDirSafe(dirname(linkRoot));
+      await removeDirSafe(realRoot);
     }
   });
 });
