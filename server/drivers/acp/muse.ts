@@ -36,27 +36,30 @@ import type { ModelCatalog } from "../../contracts.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 /** Reasoning effort, narrowed to the rungs BotFleet's shared `EFFORT_LEVELS`
- *  union can carry.  Muse publishes eight levels —
+ *  union can carry AND that this engine's own catalog can actually serve.
+ *  Muse publishes eight levels —
  *  `none, minimal, low, medium, high, xhigh, max, ultra` — and this list is a
  *  deliberate subset, not a transcription:
  *
+ *    - `max` is excluded because it is Standard-tier `muse-spark-1.3` only,
+ *      and 1.3 is not a model this driver offers (see `STATIC_MUSE_MODELS` for
+ *      why).  Advertising a rung no reachable model takes is the overclaim
+ *      this whole driver is written to avoid — the picker would offer `max`
+ *      and the request would come back refused.  It is the one omission that
+ *      the engine could take back by adding 1.3 and a `selectModel` hook.
+ *    - `none` is excluded because the Meta provider rejects it outright
+ *      ("The Meta provider does not accept `none`", HTTP 400), so offering it
+ *      would be a level that always fails.
  *    - `minimal` and `ultra` are absent because `EFFORT_LEVELS` in
  *      `server/contracts.ts` has no member for either.  Widening that union
  *      is not free: `server/drivers/pi.ts` advertises the whole union
  *      verbatim, so adding a rung there would silently put two levels in
  *      pi's picker that pi's CLI does not take.  That is the same
- *      overclaim this file is written to avoid, one layer up.
- *    - `none` is excluded on purpose: the Meta provider rejects it outright
- *      ("The Meta provider does not accept `none`", HTTP 400), so offering it
- *      would be a level that always fails.
- *    - `max` is kept.  It is Standard-tier `muse-spark-1.3` only, which is the
- *      model this engine's own catalog does not currently reach (see the
- *      `STATIC_MUSE_MODELS` note), so it is declared for the engine and not
- *      claimed for any row below.
+ *      overclaim one layer up.
  *
  *  `ultra` is a client-side setting that maps to each provider's highest
  *  supported rung, which makes it a poor fit for a flat list anyway. */
-export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 
 /** The only model this driver offers, and it is the CLI's own documented
  *  default rather than the best model on the card.

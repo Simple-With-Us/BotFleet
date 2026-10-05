@@ -1428,18 +1428,27 @@ export function EngineCalloutBody(props: {
     <div
       className={className ?? "rounded-xl border border-hairline/30 bg-inset/30 p-3 text-[12.5px] leading-relaxed text-ink-secondary"}
     >
-      <p className="mb-1.5 flex flex-wrap items-center gap-1.5 text-ink">
-        {providers.map((kind) => (
-          <span
-            key={kind}
-            className="inline-flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-hairline/40 bg-surface"
-            title={`${providerMarkLabel(kind)} models`}
-          >
-            <ProviderMark driverKind={kind} size={14} />
+      <p className="mb-1.5 flex items-start gap-1.5 text-ink">
+        {providers.length > 0 && (
+          <span className="inline-flex shrink-0 items-center gap-1">
+            {providers.map((kind) => (
+              <span
+                key={kind}
+                className="inline-flex size-4 items-center justify-center rounded-[4px] border border-hairline/40 bg-surface"
+                title={`${providerMarkLabel(kind)} models`}
+              >
+                <ProviderMark driverKind={kind} size={14} />
+              </span>
+            ))}
           </span>
-        ))}
-        <strong className={providers.length > 0 ? "" : "mr-1.5"}>Why This Engine?</strong>{" "}
-        {entry.whyThisEngine.headline}
+        )}
+        {/* The label and the headline share ONE inline box on purpose.  Making
+         *  them separate flex items put a 6px `gap` where the rendered space
+         *  used to be, and `flex-wrap` could drop the headline onto its own
+         *  line away from the label that introduces it. */}
+        <span>
+          <strong>Why This Engine?</strong> {entry.whyThisEngine.headline}
+        </span>
       </p>
       {entry.whyThisEngine.prose.map((line, index) => (
         <p key={index} className="mb-1 last:mb-0">

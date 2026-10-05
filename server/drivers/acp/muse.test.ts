@@ -87,11 +87,18 @@ describe("Muse Code driver", () => {
 
   it("advertises only the effort rungs it can actually send", () => {
     // `none` is excluded because the Meta provider rejects it (HTTP 400).
-    // `minimal` and `ultra` are absent because the shared EFFORT_LEVELS union
-    // has no member for them, and widening that union would put two rungs in
-    // pi's picker that pi does not take.  Both are deliberate.
-    expect(MUSE_EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    // `max` is excluded because it is muse-spark-1.3 only and 1.3 is not a
+    // model this driver offers.  `minimal` and `ultra` are absent because the
+    // shared EFFORT_LEVELS union has no member for them, and widening that
+    // union would put two rungs in pi's picker that pi does not take.  All
+    // four omissions are deliberate, and each one is a rung the picker must
+    // not offer rather than a rung that quietly fails on the first turn.
+    expect(MUSE_EFFORT_LEVELS).toEqual(["low", "medium", "high", "xhigh"]);
     expect(MUSE_EFFORT_LEVELS).not.toContain("none");
+    expect(MUSE_EFFORT_LEVELS).not.toContain("max");
+    // Guard the reason itself: if 1.3 ever enters the catalog, `max` becomes
+    // reachable and this assertion is the reminder to put it back.
+    expect(STATIC_MUSE_MODELS.options.map((option) => option.id)).not.toContain("muse-spark-1.3");
   });
 
   it("treats META_API_KEY as proof of a sign-in", () => {
@@ -105,7 +112,9 @@ describe("Muse Code driver", () => {
     const dir = scratch();
     const authPath = join(dir, "auth.json");
     expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(false);
-    writeFileSync(authPath, JSON.stringify({ token: "super-secret-value" }), "utf8");
+    // `{}` on purpose:  the assertion is about the file existing, so there is
+    // no reason to put a credential-shaped string into committed source.
+    writeFileSync(authPath, "{}", "utf8");
     expect(museAuthenticated({ MUSE_AUTH_PATH: authPath })).toBe(true);
   });
 });
