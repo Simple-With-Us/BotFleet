@@ -9,13 +9,70 @@
 //        node sync-status.mjs --check  (report only, do not rewrite json)
 import { readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { z } from "zod";
 
 const checkOnly = process.argv.includes("--check");
 const path = new URL("./features.json", import.meta.url);
-const data = JSON.parse(readFileSync(path, "utf8"));
 
-const prs = JSON.parse(
-  execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100"], { encoding: "utf8" })
+// Both of these cross a trust boundary: one is an external API response and
+// the other is a file this script then rewrites.  A shape change or an error
+// body that happens to parse would otherwise map `undefined` states straight
+// into features.json and be committed as fact.
+//
+// The response is projected down with `--jq` before it ever reaches this
+// process.  That is not only cheaper — a full 100-PR page carries every PR
+// body and blew execFileSync's 1 MiB default maxBuffer, so this script was
+// failing outright on the current repo size — it also means a body that
+// violates the schema cannot leak the rest of the payload into an error
+// message.  maxBuffer is raised anyway, as defence in depth.
+// A jq ARRAY, not a bare `.[]` — jq emits one value per line otherwise, which
+// is not the JSON document this parses.
+const PR_FIELDS = "[.[] | {number, title, state, merged_at}]";
+const prSchema = z.object({
+  number: z.number().int(),
+  title: z.string(),
+  state: z.string(),
+  merged_at: z.string().nullable(),
+});
+const featuresSchema = z.object({
+  sections: z.array(
+    z.object({
+      features: z.array(
+        z.object({
+          title: z.string(),
+          prov: z.object({
+            type: z.string(),
+            prs: z.array(z.number().int()).optional(),
+            state: z.string().optional(),
+            note: z.string().optional(),
+          }),
+        }),
+      ),
+    }),
+  ),
+});
+
+/** Parse, but report only the paths — a ZodError carries the whole input. */
+function parseOrExplain(label, schema, value) {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  const where = result.error.issues
+    .slice(0, 10)
+    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+    .join("; ");
+  throw new Error(`${label} did not match the expected shape — ${where}`);
+}
+
+const data = parseOrExplain("features.json", featuresSchema, JSON.parse(readFileSync(path, "utf8")));
+const prs = parseOrExplain(
+  "the GitHub pulls response",
+  z.array(prSchema),
+  JSON.parse(
+    execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100", "--jq", PR_FIELDS], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+    }),
+  ),
 );
 const stateOf = new Map(prs.map((p) => [p.number, p.merged_at ? "merged" : p.state]));
 
