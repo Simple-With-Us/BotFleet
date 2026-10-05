@@ -124,8 +124,11 @@ export function transitionDelayMs(
   // Returning home is never urgent — keep full return for polish unless
   // planFrame's interrupt path skipped the return entirely.
   void kind;
-  const s = Math.max(0.25, speed);
-  return Math.round(TVFACE_TRANSITION_MS / s);
+  return scaledTransitionMs(speed);
+}
+
+function scaledTransitionMs(speed = 1): number {
+  return Math.round(TVFACE_TRANSITION_MS / Math.max(0.25, speed));
 }
 
 /**
@@ -161,7 +164,7 @@ export function planFrame(
       return [{ expression: RESTING, kind: "still", delayAfterMs: 0 }];
     }
     return [
-      { expression: prev, kind: "return", delayAfterMs: transitionDelayMs("return", RESTING, speed) },
+      { expression: prev, kind: "return", delayAfterMs: scaledTransitionMs(speed) },
       { expression: RESTING, kind: "still", delayAfterMs: 0 },
     ];
   }
@@ -171,7 +174,7 @@ export function planFrame(
       return [{ expression: next, kind: "hold", delayAfterMs: 0 }];
     }
     return [
-      { expression: next, kind: "enter", delayAfterMs: transitionDelayMs("enter", next, speed) },
+      { expression: next, kind: "enter", delayAfterMs: scaledTransitionMs(speed) },
       { expression: next, kind: "hold", delayAfterMs: 0 },
     ];
   }

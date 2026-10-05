@@ -196,7 +196,14 @@ describe("color skin packs mirror the default asset set", () => {
     for (const skin of named) {
       const file = join(SKINS_DIR, skin, "gifs", "thinking_enter.gif");
       if (!existsSync(file)) continue;
-      const { totalMs } = readGif(readFileSync(file));
+      const bytes = readFileSync(file);
+      // Color packs ship via Git LFS.  A pointer stub is ~130 bytes of text and
+      // is not a GIF — skip until `git lfs pull` materializes the art.  Real
+      // GIFs (default pack, or pulled color packs) still get the timing assert.
+      if (bytes.length < 256 || bytes.subarray(0, 20).toString("utf8").startsWith("version https://git-lfs")) {
+        continue;
+      }
+      const { totalMs } = readGif(bytes);
       expect(Math.abs(totalMs - TVFACE_TRANSITION_MS), `${skin} thinking_enter ${totalMs}ms`).toBeLessThanOrEqual(20);
     }
   });
