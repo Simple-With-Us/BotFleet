@@ -242,7 +242,7 @@ sync_to_container() {
 
   # Harden permissions inside container
   "${docker_cmd[@]}" exec -u "$CONTAINER_USER" "$c_name" sh -c "
-    for d in .ssh .infisical .aws .config .azure .oci .kube .cargo; do
+    for d in .ssh .infisical .aws .config .azure .oci .kube .cargo .cf .kodus; do
       if [ -d \"/home/$CONTAINER_USER/\$d\" ]; then
         chmod 700 \"/home/$CONTAINER_USER/\$d\" 2>/dev/null || true
       fi

@@ -457,7 +457,7 @@ export function hostCliCredentialMounts(
 
 export function credentialPermissionHardeningShell(user = "cua"): string {
   return [
-    `for d in .ssh .infisical .aws .azure .oci .kube .cargo .config .gnupg .vercel .turso .docker .wrangler .deno; do`,
+    `for d in .ssh .infisical .aws .azure .oci .kube .cargo .config .gnupg .vercel .turso .kodus .docker .wrangler .cf .deno; do`,
     `  [ -d "/home/${user}/$d" ] && chmod 700 "/home/${user}/$d" 2>/dev/null || true`,
     `done`,
     `[ -d "/home/${user}/.ssh" ] && chmod 600 /home/${user}/.ssh/id_* /home/${user}/.ssh/known_hosts* /home/${user}/.ssh/config 2>/dev/null || true`,

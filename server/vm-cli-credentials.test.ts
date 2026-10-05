@@ -15,11 +15,17 @@ import {
 
 describe("vm CLI credential sync", () => {
   it("derives mount candidates from the manifest", () => {
-    const names = new Set(manifestCredentialCandidates().map((entry) => entry.tool));
+    const candidates = manifestCredentialCandidates();
+    const names = new Set(candidates.map((entry) => entry.tool));
     expect(names.has("docker")).toBe(true);
     expect(names.has("turso")).toBe(true);
     expect(names.has("infisical")).toBe(true);
-    for (const candidate of manifestCredentialCandidates()) {
+    const guests = new Set(candidates.map((entry) => entry.guest));
+    expect(guests.has("/home/cua/.turso")).toBe(true);
+    expect(guests.has("/home/cua/.kodus")).toBe(true);
+    expect(guests.has("/home/cua/.config/cf")).toBe(true);
+    expect(guests.has("/home/cua/.cf")).toBe(true);
+    for (const candidate of candidates) {
       expect(candidate.guest.startsWith("/home/cua/") || candidate.guest === "/home/cua/.gitconfig").toBe(true);
     }
   });
