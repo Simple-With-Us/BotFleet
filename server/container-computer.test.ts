@@ -773,6 +773,8 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain("migrate_profile chromium");
     expect(dockerfile).toContain("SingletonLock");
     expect(dockerfile).toContain(`${IMAGE_LAYER_LABEL}="${IMAGE_LAYER_VERSION}"`);
+    expect(dockerfile).toContain("BOTFLEET_VM_CLI_INSTALL");
+    expect(dockerfile).toContain("botfleet-vm-cli-verify");
     expect(dockerfile).toContain("did not become ready within 45 seconds");
     expect(dockerfile).not.toContain("while ! DISPLAY=:1 xset q");
   });

@@ -1,0 +1,331 @@
+{
+  "schemaVersion": 1,
+  "tools": [
+    {
+      "name": "curl",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "curl", "args": ["--version"] },
+      "apt": ["curl"]
+    },
+    {
+      "name": "jq",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "jq", "args": ["--version"] },
+      "apt": ["jq"]
+    },
+    {
+      "name": "rsync",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "rsync", "args": ["--version"] },
+      "apt": ["rsync"]
+    },
+    {
+      "name": "vim",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "vim", "args": ["--version"] },
+      "apt": ["vim"]
+    },
+    {
+      "name": "tmux",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "tmux", "args": ["-V"] },
+      "apt": ["tmux"]
+    },
+    {
+      "name": "sqlite3",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "sqlite3", "args": ["--version"] },
+      "apt": ["sqlite3"]
+    },
+    {
+      "name": "python3",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "python3", "args": ["--version"] },
+      "apt": ["python3", "python3-pip", "python3-venv"]
+    },
+    {
+      "name": "openssl",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "openssl", "args": ["version"] },
+      "apt": ["openssl"]
+    },
+    {
+      "name": "gpg",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "gpg", "args": ["--version"] },
+      "apt": ["gnupg"]
+    },
+    {
+      "name": "zip",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "zip", "args": ["-v"] },
+      "apt": ["zip"]
+    },
+    {
+      "name": "unzip",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "unzip", "args": ["-v"] },
+      "apt": ["unzip"]
+    },
+    {
+      "name": "ssh",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "ssh", "args": ["-V"] },
+      "apt": ["openssh-client"]
+    },
+    {
+      "name": "scp",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "scp", "args": ["-V"] },
+      "apt": ["openssh-client"]
+    },
+    {
+      "name": "sftp",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "sftp", "args": ["-V"] },
+      "apt": ["openssh-client"]
+    },
+    {
+      "name": "awk",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "awk", "args": ["--version"] },
+      "apt": ["gawk"]
+    },
+    {
+      "name": "sed",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "sed", "args": ["--version"] },
+      "apt": ["sed"]
+    },
+    {
+      "name": "grep",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "grep", "args": ["--version"] },
+      "apt": ["grep"]
+    },
+    {
+      "name": "tar",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "tar", "args": ["--version"] },
+      "apt": ["tar"]
+    },
+    {
+      "name": "make",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "make", "args": ["--version"] },
+      "apt": ["make"]
+    },
+    {
+      "name": "clang",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "clang", "args": ["--version"] },
+      "apt": ["clang"]
+    },
+    {
+      "name": "gcc",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "gcc", "args": ["--version"] },
+      "apt": ["gcc"]
+    },
+    {
+      "name": "java",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "java", "args": ["--version"] },
+      "apt": ["openjdk-17-jre-headless"]
+    },
+    {
+      "name": "ruby",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "ruby", "args": ["--version"] },
+      "apt": ["ruby"]
+    },
+    {
+      "name": "gem",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "gem", "args": ["--version"] },
+      "apt": ["ruby"]
+    },
+    {
+      "name": "perl",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "perl", "args": ["--version"] },
+      "apt": ["perl"]
+    },
+    {
+      "name": "psql",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "psql", "args": ["--version"] },
+      "apt": ["postgresql-client"]
+    },
+    {
+      "name": "ffmpeg",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "ffmpeg", "args": ["-version"] },
+      "apt": ["ffmpeg"]
+    },
+    {
+      "name": "fzf",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "fzf", "args": ["--version"] },
+      "apt": ["fzf"]
+    },
+    {
+      "name": "fd",
+      "targets": ["both"],
+      "version": "apt",
+      "verify": { "command": "fd", "args": ["--version"] },
+      "apt": ["fd-find"],
+      "postInstall": "fd_symlink"
+    },
+    {
+      "name": "node",
+      "targets": ["both"],
+      "version": "24.11.0",
+      "verify": { "command": "node", "args": ["--version"] },
+      "recipe": "node"
+    },
+    {
+      "name": "npm",
+      "targets": ["both"],
+      "version": "bundled-with-node",
+      "verify": { "command": "npm", "args": ["--version"] },
+      "recipe": "node"
+    },
+    {
+      "name": "pnpm",
+      "targets": ["both"],
+      "version": "10.33.0",
+      "verify": { "command": "pnpm", "args": ["--version"] },
+      "recipe": "pnpm"
+    },
+    {
+      "name": "cf",
+      "targets": ["both"],
+      "version": "latest",
+      "verify": { "command": "cf", "args": ["--version"] },
+      "recipe": "npm_global",
+      "npmPackage": "cf"
+    },
+    {
+      "name": "vercel",
+      "targets": ["both"],
+      "version": "latest",
+      "verify": { "command": "vercel", "args": ["--version"] },
+      "recipe": "npm_global",
+      "npmPackage": "vercel"
+    },
+    {
+      "name": "kodus",
+      "targets": ["both"],
+      "version": "0.4.21",
+      "verify": { "command": "kodus", "args": ["--version"] },
+      "recipe": "npm_global",
+      "npmPackage": "@kodus/cli"
+    },
+    {
+      "name": "aws",
+      "targets": ["both"],
+      "version": "2.27.50",
+      "verify": { "command": "aws", "args": ["--version"] },
+      "recipe": "awscli"
+    },
+    {
+      "name": "gcloud",
+      "targets": ["both"],
+      "version": "latest",
+      "verify": { "command": "gcloud", "args": ["--version"] },
+      "recipe": "gcloud"
+    },
+    {
+      "name": "gh",
+      "targets": ["both"],
+      "version": "2.63.2",
+      "verify": { "command": "gh", "args": ["--version"] },
+      "recipe": "gh"
+    },
+    {
+      "name": "kubectl",
+      "targets": ["both"],
+      "version": "1.32.0",
+      "verify": { "command": "kubectl", "args": ["version", "--client=true"] },
+      "recipe": "kubectl"
+    },
+    {
+      "name": "docker",
+      "targets": ["both"],
+      "version": "27.4.1",
+      "verify": { "command": "docker", "args": ["--version"] },
+      "recipe": "docker_cli"
+    },
+    {
+      "name": "turso",
+      "targets": ["both"],
+      "version": "latest",
+      "verify": { "command": "turso", "args": ["--version"] },
+      "recipe": "turso"
+    },
+    {
+      "name": "deno",
+      "targets": ["both"],
+      "version": "2.2.0",
+      "verify": { "command": "deno", "args": ["--version"] },
+      "recipe": "deno"
+    },
+    {
+      "name": "cargo",
+      "targets": ["both"],
+      "version": "stable",
+      "verify": { "command": "cargo", "args": ["--version"] },
+      "recipe": "rustup"
+    },
+    {
+      "name": "rustc",
+      "targets": ["both"],
+      "version": "stable",
+      "verify": { "command": "rustc", "args": ["--version"] },
+      "recipe": "rustup"
+    },
+    {
+      "name": "pbcopy",
+      "targets": ["local"],
+      "version": "shim",
+      "verify": { "command": "pbcopy", "args": ["--help"] },
+      "recipe": "pbcopy_shim"
+    },
+    {
+      "name": "pbpaste",
+      "targets": ["local"],
+      "version": "shim",
+      "verify": { "command": "pbpaste", "args": ["--help"] },
+      "recipe": "pbcopy_shim"
+    }
+  ]
+}

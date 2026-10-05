@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 
 import { augmentedPath } from "./env-path.ts";
+import { renderDockerfileCliInstallRun, renderDockerfileVerifyArtifacts } from "./vm-cli-install.ts";
 import { DATA_DIR, loadConfig, type AppConfig } from "./config.ts";
 import {
   BOX_GATEWAY_PATH,
@@ -44,7 +45,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "5";
+export const IMAGE_LAYER_VERSION = "6";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {
@@ -443,6 +444,8 @@ RUN printf '%s\\n' \\
       'stderr_logfile=/var/log/supervisor/cua-driver.error.log' \\
       'priority=30' \\
       >> /etc/supervisor/supervisord.conf
+${renderDockerfileCliInstallRun("local-vm")}
+${renderDockerfileVerifyArtifacts("local-vm")}
 LABEL ${MANAGED_LABEL}="1" \\
       ${DRIVER_LABEL}="${CUA_DRIVER_VERSION}" \\
       ${BASE_IMAGE_LABEL}="${BASE_IMAGE_DIGEST}" \\
