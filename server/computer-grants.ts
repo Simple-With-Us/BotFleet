@@ -906,7 +906,9 @@ async function resolveMounts<Lease>(
 
   // The Local VM degraded but no other granted computer actually resolved:
   // fail with the VM's own reason rather than run the turn with no computer.
-  if (vmFailure && mounts.length === 0) throw vmFailure;
+  // Hybrid host-shell grants (`allowHostTerminal`) never mount here; when the
+  // engine exposes host tools through `hasHostComputer`, keep degrading like cloud.
+  if (vmFailure && mounts.length === 0 && !(hasHostComputer && engine.toolLoop === true)) throw vmFailure;
 
   // Name the servers once, here, so a room turn and a direct turn hand the
   // driver byte-identical mounts.

@@ -828,6 +828,28 @@ describe("routine failure resiliency and unattended safety", () => {
       };
       await expect(turn(["vm", "cloud"], deps)).rejects.toThrow("Docker-over-SSH command timed out");
     });
+
+    it("keeps degrading onto hybrid host shell when VM and VPS both fail but allowHostTerminal is on", async () => {
+      const notices: string[] = [];
+      const deps = vmDown(notices);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      const result = await resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["vm", "cloud"], cloudBackend: "vps" },
+        cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: true },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      });
+      expect(result.mounts).toEqual([]);
+      expect(result.hasHostComputer).toBe(true);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+      expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+    });
   });
 
   it("fails clearly when an unattended cloud-only turn cannot reach the VPS", async () => {

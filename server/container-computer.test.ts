@@ -1267,10 +1267,9 @@ describe("adaptive container limits", () => {
       nanoCpus: 3_000_000_000,
       memoryBytes: 3 * 1024 ** 3,
     });
-    // Labels declaring under 2 CPUs or under MIN_CONTAINER_MEMORY_GIB must fall back to DEFAULT_CONTAINER_LIMITS
     expect(declaredHardening({ [LIMITS_LABEL]: "1x1" })).toEqual({
-      nanoCpus: DEFAULT_CONTAINER_LIMITS.cpus * 1_000_000_000,
-      memoryBytes: DEFAULT_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+      nanoCpus: 1_000_000_000,
+      memoryBytes: 1 * 1024 ** 3,
     });
     expect(declaredHardening(null)).toEqual({
       nanoCpus: DEFAULT_CONTAINER_LIMITS.cpus * 1_000_000_000,

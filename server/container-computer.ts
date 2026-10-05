@@ -1167,9 +1167,10 @@ export function declaredHardening(labels: Record<string, string> | undefined | n
   nanoCpus: number;
 } {
   const declared = limitsFromLabels(labels);
-  // A declared value may never lower the hardening floor: an absent or
-  // under-specified label is judged against the historical 4 CPU / 8 GiB cap.
-  const usable = declared.cpus >= 2 && declared.memoryGib >= MIN_CONTAINER_MEMORY_GIB ? declared : DEFAULT_CONTAINER_LIMITS;
+  // Match what `adaptContainerLimits` can emit (down to 1 CPU / 1 GiB on small
+  // runtimes).  Absent or invalid labels still use the historical 4 / 8 cap.
+  const usable =
+    declared.cpus >= 1 && declared.memoryGib >= 1 ? declared : DEFAULT_CONTAINER_LIMITS;
   return { memoryBytes: usable.memoryGib * 1024 ** 3, nanoCpus: usable.cpus * 1_000_000_000 };
 }
 
