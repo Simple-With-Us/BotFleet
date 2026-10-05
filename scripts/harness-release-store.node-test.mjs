@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
@@ -633,6 +633,28 @@ test("currentCommit answers for every pointer state, not just a happy one", asyn
   await rm(currentLink(env), { force: true });
   await symlink(releasePath(A, env), currentLink(env));
   assert.equal(await currentCommit(env), A, "a release with no manifest still reports its name");
+});
+
+test("promoting preserves each file's mode and only removes write bits", async (t) => {
+  // "Read-only" is a statement about who may write, not a constant mode.
+  // Flattening to 0o444 stripped the execute bit off anything runnable and made
+  // a deliberately group-only file world-readable, so a release stopped being
+  // the thing it was verified as.
+  const { env } = await store(t);
+  const commit = "b".repeat(40);
+  const staging = await stage(env, commit, commit);
+  await writeFile(join(staging, "tool.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  await writeFile(join(staging, "restricted"), "secret\n", { mode: 0o640 });
+  await promoteStaging({ commit, env });
+
+  const release = releasePath(commit, env);
+  const modeOf = async (name) => (await stat(join(release, name))).mode & 0o777;
+  assert.equal(await modeOf("tool.sh"), 0o555, "an executable stays executable, minus write");
+  assert.equal(await modeOf("restricted"), 0o440, "a 0640 file keeps its group read and loses group write");
+
+  // And the round trip back to writable does not invent permissions either.
+  await discardRelease(commit, env);
+  await assert.rejects(() => stat(release), /ENOENT/);
 });
 
 test("a promoted release is actually read-only, not merely documented as such", async (t) => {

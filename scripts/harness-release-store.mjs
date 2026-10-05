@@ -314,9 +314,17 @@ export async function discardRelease(commit, env = process.env) {
  * nothing stopped anyone from editing a release in place.
  */
 async function setTreePermission(path, { writable, readOnly, errors = [] }) {
-  const { chmod, readdir } = await import("node:fs/promises");
   try {
-    await chmod(path, writable ? 0o755 : 0o555);
+    // Adjust the WRITE bits and leave the rest alone.  Substituting a constant
+    // mode flattened two things that matter: the execute bit (so a promoted
+    // release containing an executable came out non-runnable) and the group and
+    // other bits (so a deliberately mode-0640 file came out world-readable).
+    // "Read-only" and "writable" are statements about who may write, not about
+    // what every file's mode should be.
+    const { mode } = await stat(path);
+    const type = mode & 0o7000;
+    const perm = writable ? (mode & 0o777) | 0o200 : (mode & 0o777) & ~0o222;
+    await chmod(path, type | perm);
   } catch (err) {
     errors.push({ path, error: err });
   }
@@ -327,19 +335,26 @@ async function setTreePermission(path, { writable, readOnly, errors = [] }) {
     errors.push({ path, error: err });
     return errors;
   }
-  for (const entry of entries) {
-    const child = join(path, entry.name);
-    if (entry.isDirectory()) {
-      await setTreePermission(child, { writable, readOnly, errors });
-    } else if (!entry.isSymbolicLink()) {
-      // chmod follows symlinks; a link in the tree would chmod its target outside the release
-      try {
-        await chmod(child, writable ? 0o644 : readOnly);
-      } catch (err) {
-        errors.push({ path: child, error: err });
+  // Concurrent rather than one awaited syscall at a time: a release tree is
+  // thousands of files and this ran serially, so the walk dominated the prune.
+  await Promise.all(
+    entries.map(async (entry) => {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) {
+        await setTreePermission(child, { writable, readOnly, errors });
+      } else if (!entry.isSymbolicLink()) {
+        // chmod follows symlinks; a link in the tree would chmod its target outside the release
+        try {
+          const { mode } = await stat(child);
+          const type = mode & 0o7000;
+          const perm = writable ? (mode & 0o777) | 0o200 : (mode & 0o777) & ~0o222;
+          await chmod(child, type | perm);
+        } catch (err) {
+          errors.push({ path: child, error: err });
+        }
       }
-    }
-  }
+    }),
+  );
   return errors;
 }
 
