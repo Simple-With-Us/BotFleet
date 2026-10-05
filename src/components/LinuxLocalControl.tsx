@@ -51,7 +51,7 @@ export function LinuxLocalControl() {
         <div>
           <div id="linux-local-control-title" className="flex items-center gap-2 text-[15px] font-medium text-ink">
             <MonitorCog size={16} className={ready ? "text-success" : "text-ink-secondary"} />
-            Local control
+            Local Control
           </div>
           <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
             Beta · Ubuntu 24.04 GNOME/{wayland ? "Wayland" : "Xorg"} · Computer Driver 0.19.3
@@ -78,9 +78,9 @@ export function LinuxLocalControl() {
           <div className="flex gap-2 text-[12px] leading-relaxed text-ink-secondary">
             <AlertTriangle size={15} className="mt-0.5 shrink-0 text-danger" />
             <span>
-              Local control is available on Ubuntu Xorg. It remains disabled on Wayland until its input-safety
-              boundary is validated. Sign out and choose <strong className="font-medium text-ink">Ubuntu on Xorg</strong>
-              {" "}to use This computer; Chat, Cloud, Local VM, and screen preview still work here.
+              Local control is available on Ubuntu Xorg.{"\u00a0 "}It remains disabled on Wayland until its input-safety
+              boundary is validated.{"\u00a0 "}Sign out and choose <strong className="font-medium text-ink">Ubuntu on Xorg</strong>
+              {" "}to use This Computer; Chat, Cloud, Local VM, and screen preview still work here.
             </span>
           </div>
         </div>
@@ -90,8 +90,8 @@ export function LinuxLocalControl() {
             <AlertTriangle size={15} className="mt-0.5 shrink-0 text-warning" />
             <span>
               Enabling lets bots you explicitly assign to <strong className="font-medium text-ink">This Computer</strong>{" "}
-              inspect the active desktop and request mouse or keyboard actions. Every local action asks you first.
-              {wayland && " GNOME may also ask you to allow foreground input for this desktop session."}
+              inspect the active desktop and request mouse or keyboard actions.{"\u00a0 "}Every local action asks you first.
+              {wayland && "\u00a0 GNOME may also ask you to allow foreground input for this desktop session."}
             </span>
           </div>
         </div>
@@ -107,7 +107,7 @@ export function LinuxLocalControl() {
             )}
             <span aria-live="polite">
               {ready
-                ? "Ready for bots explicitly assigned to this computer. Bot actions use a private cursor, so your pointer stays under your control."
+                ? `Ready for bots explicitly assigned to this computer.\u00a0 Bot actions use a private cursor, so your pointer stays under your control.`
                 : local.message ?? "Checking the driver and desktop session…"}
             </span>
           </div>
@@ -131,7 +131,7 @@ export function LinuxLocalControl() {
             className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-accent py-2 text-[13px] font-medium text-white hover:opacity-90 disabled:opacity-50"
           >
             {pending === "enable" ? <Loader2 size={14} className="animate-spin" /> : <Power size={14} />}
-            Enable local control (Beta)
+            Enable Local Control (Beta)
           </button>
         ) : (
           <>
@@ -143,7 +143,7 @@ export function LinuxLocalControl() {
                 className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
               >
                 {pending === "retry" ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
-                Try again
+                Try Again
               </button>
             )}
             <button
@@ -153,7 +153,7 @@ export function LinuxLocalControl() {
               className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-raised py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50"
             >
               {pending === "disable" ? <Loader2 size={14} className="animate-spin" /> : <Power size={14} />}
-              Disable local control
+              Disable Local Control
             </button>
           </>
         )}

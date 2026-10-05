@@ -554,7 +554,7 @@ function hasNoPublishedPorts(config: {
 function statusProblem(status: VpsComputerStatus): string | null {
   if (!status.configured) return "Configure a VPS SSH alias in App Settings → Connections";
   if (!status.daemonUp) return "Docker over SSH could not reach the VPS; check the SSH alias and Docker on the VPS";
-  if (!status.image) return `Prepare the pinned BotFleet Cua image on the VPS (Driver ${CUA_DRIVER_VERSION})`;
+  if (!status.image) return `Prepare the pinned BotFleet CUA image on the VPS (Driver ${CUA_DRIVER_VERSION})`;
   if (status.container === "missing") return "No BotFleet container exists for this bot on the VPS";
   if (!status.imageMatches) return "The VPS container uses an incompatible or untrusted BotFleet image";
   if (!status.managed) return "The VPS container name is occupied by a container BotFleet did not create";
@@ -562,8 +562,8 @@ function statusProblem(status: VpsComputerStatus): string | null {
   if (status.mounts === "unsafe") return "The VPS container has host mounts; refusing to use it";
   if (status.security === "unsafe") return "The VPS container is missing BotFleet safety limits";
   if (status.container === "stopped") return "The BotFleet VPS container is stopped";
-  if (status.desktop_error) return `The VPS Cua desktop failed to start: ${status.desktop_error}`;
-  if (!status.desktopReady) return "The VPS container started, but Cua Driver is not ready yet";
+  if (status.desktop_error) return `The VPS CUA desktop failed to start: ${status.desktop_error}`;
+  if (!status.desktopReady) return "The VPS container started, but CUA Driver is not ready yet";
   return null;
 }
 
@@ -734,7 +734,7 @@ async function computeVpsComputerStatus(
     if (canProbe && containerRef) {
       try {
         const version = await run(cuaExecArgs(["--version"], { container: containerRef }));
-        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected Cua Driver version");
+        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected CUA Driver version");
         await run(cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: containerRef }));
         const health = await run(
           cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: containerRef }),
@@ -750,7 +750,7 @@ async function computeVpsComputerStatus(
           !Array.isArray(report.checks) ||
           (report.overall !== "ok" && report.overall !== "degraded")
         ) {
-          throw new Error(`Cua health report is ${report.overall ?? "invalid"}`);
+          throw new Error(`CUA health report is ${report.overall ?? "invalid"}`);
         }
         // The desktop must ANSWER, not render: get_desktop_state succeeding
         // is the readiness proof. The Local VM also pulls a pixel-validated
@@ -1429,7 +1429,7 @@ export async function vpsComputerScreenshot(
       screenshotPath,
     ]), { timeoutMs: 30_000 })).stdout.trim();
     const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
-    if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
+    if (!checked.ok) throw Object.assign(new Error("CUA Driver returned an incomplete VPS screenshot"), { status: 502 });
     // Stamped here, between the pixels landing on the box and this returning,
     // rather than left to the client to stamp on receipt.  Everything before
     // this line — status check, lifecycle lock, SSH, the capture, the base64
