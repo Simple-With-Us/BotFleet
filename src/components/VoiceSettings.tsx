@@ -171,6 +171,13 @@ export function VoiceSettings({
     void loadVoices();
   }, [configured, personalVoiceAllowed]);
 
+  // personalVoiceDenied is only cleared by a later accepted voice or a
+  // delete.  A capability event can open the gate while this card stays
+  // mounted, and the banner would keep the old "not available" sentence.
+  useEffect(() => {
+    if (personalVoiceAllowed) setPersonalVoiceDenied(false);
+  }, [personalVoiceAllowed]);
+
   const saveKey = () => {
     const nextKey = key.trim();
     if (!nextKey) return Promise.resolve();
@@ -205,19 +212,31 @@ export function VoiceSettings({
       if (res.error) {
         setCustomError(res.error);
       } else {
-        await loadVoices();
         const addedId = res.voice?.id;
         // Refuse before clearing. A personal: id on a computer that cannot
         // speak it must leave the typed id and label in the open form.
+        // The same refusal before capabilities arrive still needs a message:
+        // skipping it leaves the form open and silent.  Delete the row we
+        // just posted so loadVoices cannot list an id the picker will not
+        // select.  The gate is the ref after this await, so a Personal Voice
+        // that became allowed in flight is committed and kept.
         if (addedId && !commitVoice(addedId, false)) {
-          if (capabilitiesReadyRef.current) {
-            setCustomError(personalVoiceDisabledReasonFor(
-              true,
-              capabilitiesRef.current.dictation.reasonCode,
-            ));
+          if (isPersonalVoice(addedId)) {
+            try {
+              await api(`/api/tts/custom-voice/${encodeURIComponent(addedId)}`, { method: "DELETE" });
+            } catch {
+              // The id stays refused when cleanup fails.  The form still
+              // explains why it was not selected.
+            }
           }
+          await loadVoices();
+          setCustomError(personalVoiceDisabledReasonFor(
+            capabilitiesReadyRef.current,
+            capabilitiesRef.current.dictation.reasonCode,
+          ));
           return;
         }
+        await loadVoices();
         setCustomVoiceId("");
         setCustomVoiceLabel("");
         setCustomOpen(false);
@@ -518,9 +537,9 @@ export function VoiceSettings({
             {selectedVoice && !voices.some((voice) => voice.id === selectedVoice) && (
               <option value={selectedVoice}>
                 {isSelectedPersonal
-                  ? capabilitiesReady && !personalVoiceAllowed
-                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
-                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
+                  ? personalVoiceAllowed
+                    ? `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")} (On-device Mac / iOS)`
+                    : `Apple Personal Voice: ${selectedVoice.replace(/^(personal|apple-personal):/, "")}`
                   : `${selectedVoice} (Current)`}
               </option>
             )}

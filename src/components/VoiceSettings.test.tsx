@@ -132,7 +132,7 @@ describe("VoiceSettings", () => {
     }
   });
 
-  it("keeps the on-device option label while capabilities are still unknown", () => {
+  it("does not claim on-device while capabilities are still unknown", () => {
     mockPersonalVoice = false;
     mockCapabilitiesReady = false;
     try {
@@ -142,9 +142,11 @@ describe("VoiceSettings", () => {
           onPatch: () => {},
         })
       );
-      // Optimistic personalVoice:false is not a denial. The suffix stays
-      // until capabilities confirm this computer cannot speak one.
-      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
+      // Optimistic personalVoice:false is not a confirmed denial, and it is
+      // also not permission.  The suffix is an on-device claim, so it waits
+      // until personalVoiceAllowed.  The checking sentence still shows.
+      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay");
+      expect(html).not.toContain("On-device Mac / iOS");
       expect(html).toContain("Checking Personal Voice availability");
       expect(html).not.toContain("Personal Voices need macOS 14 or later, or an iPhone");
     } finally {
@@ -209,13 +211,18 @@ describe("VoiceSettings voice loading", () => {
     expect(SRC).toContain("const allowed = personalVoiceAllowedRef.current");
     expect(SRC).toContain("if (isPersonalVoice(next) && !allowed)");
     expect(SRC).toContain("if (ready && reportDenial) setPersonalVoiceDenied(true);");
-    // On-device suffix is omitted only after a confirmed denial, not while
-    // capabilities are still the optimistic personalVoice:false.
-    expect(SRC).toContain("capabilitiesReady && !personalVoiceAllowed");
+    // The on-device suffix is claimed only when the gate is open.  Hiding it
+    // solely for a confirmed denial still shows it while capabilities are
+    // the optimistic personalVoice:false.
+    const option = SRC.slice(SRC.indexOf("isSelectedPersonal"), SRC.indexOf("voices.map"));
+    expect(option).toContain("personalVoiceAllowed");
+    expect(option).toContain("(On-device Mac / iOS)");
+    expect(option).not.toContain("capabilitiesReady && !personalVoiceAllowed");
   });
 
   it("has the mount effect call that loader instead of fetching on its own", () => {
     expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured, personalVoiceAllowed\]\);/);
+    expect(SRC).toContain("if (personalVoiceAllowed) setPersonalVoiceDenied(false);");
     // A second, effect-local fetch is exactly what dropped the personal entries.
     expect(SRC.match(/api\("\/api\/tts\/voices"\)/g)).toHaveLength(1);
   });
@@ -253,6 +260,9 @@ describe("VoiceSettings personal voice selection guard", () => {
     // returns first and leaves the form fields alone.
     expect(add).toContain("if (addedId && !commitVoice(addedId, false))");
     expect(add.indexOf("commitVoice(addedId, false)")).toBeLessThan(add.indexOf('setCustomVoiceId("")'));
+    expect(add).toContain('method: "DELETE"');
+    expect(add).toContain("setCustomError(personalVoiceDisabledReasonFor(");
+    expect(add).toContain("capabilitiesReadyRef.current");
     expect(add).not.toContain("onPatch(");
     const del = between("const handleDeleteVoice", "const handleCloneFile");
     expect(del).toContain("setPersonalVoiceDenied(false)");

@@ -67,6 +67,14 @@ test('visual: Personal Voice denial after a personal: voice id is submitted', as
       });
       return;
     }
+    if (url.includes('/api/tts/custom-voice/') && method === 'DELETE') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ok: true, deleted: true }),
+      });
+      return;
+    }
     if (url.includes('/api/tts/voices') && method === 'GET') {
       await route.fulfill({
         status: 200,

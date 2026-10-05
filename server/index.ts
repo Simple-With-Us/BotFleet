@@ -14839,9 +14839,18 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
       }
     }
-    m = path.match(/^\/api\/tts\/custom-voice\/([\w.-]+)$/);
+    // personal: and apple-personal: ids contain a colon.  The pathname keeps
+    // that colon percent-encoded, so the previous word class never matched and the
+    // refused row could not be removed.
+    m = path.match(/^\/api\/tts\/custom-voice\/([^/]+)$/);
     if (m && method === "DELETE") {
-      const [, voiceId] = m;
+      let voiceId: string;
+      try {
+        voiceId = decodeURIComponent(m[1]).trim();
+      } catch {
+        return json(res, 400, { error: "invalid voice id" });
+      }
+      if (!voiceId) return json(res, 400, { error: "voiceId required" });
       const deleted = tts.deleteCustomVoice(voiceId);
       return json(res, 200, { ok: true, deleted });
     }

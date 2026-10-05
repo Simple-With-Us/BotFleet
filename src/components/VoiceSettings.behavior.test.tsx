@@ -334,4 +334,98 @@ describe("VoiceSettings rendered voice commit", () => {
     await flush();
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(false);
   });
+
+  it("tells the user when a personal id is added before capabilities are ready", async () => {
+    capState.state.ready = false;
+    capState.state.personalVoice = false;
+    await mount();
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice ID"));
+    if (!add) throw new Error("missing Add Voice ID");
+    await act(async () => {
+      add.click();
+    });
+    const id = container.querySelector<HTMLInputElement>('[aria-label="Custom Voice ID"]');
+    if (!id) throw new Error("missing id");
+    await act(async () => {
+      setInputValue(id, "personal:early-voice");
+    });
+    const submit = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice"));
+    if (!submit) throw new Error("missing Add Voice");
+    await act(async () => {
+      submit.click();
+    });
+    await flush();
+    await flush();
+
+    expect(select().value).toBe("");
+    expect(patches.some((patch) => patch.voice === "personal:early-voice")).toBe(false);
+    expect(alerts().some((text) => text.includes("Checking Personal Voice availability"))).toBe(true);
+    expect(id.value).toBe("personal:early-voice");
+    expect(container.textContent).toContain("Add Voice Identifier");
+  });
+
+  it("clears the denial banner when the Personal Voice gate opens", async () => {
+    await mount();
+    await act(async () => {
+      setSelectValue(select(), "personal:jay");
+    });
+    expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
+
+    capState.state.personalVoice = true;
+    capState.state.reasonCode = undefined;
+    await act(async () => {
+      capState.notify();
+    });
+    await flush();
+
+    expect(alerts().some((text) => text.includes(MACOS_14) || text.includes(OTHER_COMPUTER))).toBe(false);
+    expect(select().value).toBe("");
+  });
+
+  it("deletes a refused personal id so the picker does not list it", async () => {
+    const stored = new Map<string, { id: string; label: string; description: string }>();
+    await mount();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/api/tts/voices") {
+        return { voices: [...stored.values()] };
+      }
+      if (path === "/api/tts/custom-voice" && init?.method === "POST") {
+        const body: { voiceId?: string; label?: string } = JSON.parse(String(init.body));
+        const voiceId = body.voiceId ?? "";
+        const voice = { id: voiceId, label: body.label || voiceId, description: "Custom" };
+        stored.set(voiceId, voice);
+        return { ok: true, voice };
+      }
+      if (path.startsWith("/api/tts/custom-voice/") && init?.method === "DELETE") {
+        const id = decodeURIComponent(path.slice("/api/tts/custom-voice/".length));
+        stored.delete(id);
+        return { ok: true };
+      }
+      return {};
+    });
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice ID"));
+    if (!add) throw new Error("missing Add Voice ID");
+    await act(async () => {
+      add.click();
+    });
+    const id = container.querySelector<HTMLInputElement>('[aria-label="Custom Voice ID"]');
+    if (!id) throw new Error("missing id");
+    await act(async () => {
+      setInputValue(id, "personal:fixture-voice");
+    });
+    const submit = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice"));
+    if (!submit) throw new Error("missing Add Voice");
+    await act(async () => {
+      submit.click();
+    });
+    await flush();
+    await flush();
+
+    const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
+    expect(deleted.map((call) => String(call[0]))).toContain("/api/tts/custom-voice/personal%3Afixture-voice");
+    expect([...select().options].some((option) => option.value === "personal:fixture-voice")).toBe(false);
+    expect(select().value).toBe("");
+    expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
+    expect(id.value).toBe("personal:fixture-voice");
+  });
 });
