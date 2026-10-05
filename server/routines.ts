@@ -148,9 +148,10 @@ export interface RoutineRun {
    *  way.  Carried on the run so it survives from the `runtime.error` to the
    *  `turn.completed` that closes it. */
   setupFailed?: boolean;
-  /** Why this run is sitting QUEUED instead of dispatching.  Set by the
-   *  scheduler when `canStart` refuses the dispatch (see `dispatchHoldReason`);
-   *  cleared on dispatch and on any skip path that bypasses `canStart`. */
+  /** Why this run is sitting QUEUED instead of dispatching.  Set when
+   *  `canStart` refuses (see `dispatchHoldReason`) and when a hot host
+   *  defers a webhook.  Cleared on dispatch and on any skip that is not
+   *  itself a hold. */
   holdReason?: string;
   engineId?: string;
   driver?: string;
@@ -225,11 +226,19 @@ export interface RoutineManagerOptions {
   botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
-  /** True when the host is too hot for a new unattended webhook wake.
-   *  Absent never sheds, so tests and older wiring keep dispatching.
-   *  Does not apply to resource, schedule, or manual runs, and never
-   *  touches a run that is already going. */
-  hostHot?: () => boolean;
+  /** Why a new webhook wake should wait, or null when the host can take it.
+   *  The string is the hold reason ("Host is busy (load X per core, swap
+   *  Y%)").  Absent never sheds, so tests and older wiring keep dispatching.
+   *  Resource, schedule, and manual runs are not asked, a run that is
+   *  already going is not asked, and a person's turn never reaches this. */
+  hostHot?: () => string | null;
+  /** How long a queued webhook may wait on `hostHot` before it dispatches
+   *  anyway.  Measured from the receipt's `createdAt`.  Absent uses
+   *  `DEFAULT_WEBHOOK_HOT_DEFER_MS` (20 minutes).  Read on each tick so a
+   *  live config refresh applies without rebuilding the scheduler. */
+  webhookHotDeferMaxMs?: () => number;
+  /** One-line operational log.  Absent writes with `console.log`. */
+  log?: (line: string) => void;
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
@@ -324,6 +333,11 @@ export interface RoutineManagerOptions {
 
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 const CATCH_UP_MS = 12 * 60 * 60_000;
+/** A webhook shed for a hot host dispatches anyway after this long, so a
+ *  Mac that stays hot cannot park the receipt for hours.  The harness
+ *  overrides it with `jobs.webhookHotDeferMinutes` when that knob is set. */
+export const DEFAULT_WEBHOOK_HOT_DEFER_MINUTES = 20;
+export const DEFAULT_WEBHOOK_HOT_DEFER_MS = DEFAULT_WEBHOOK_HOT_DEFER_MINUTES * 60_000;
 const MAX_RUNS = 2_000;
 /** What acknowledging the backlog is allowed to clear — see markAllSeen. */
 const ATTENTION_STATUSES: ReadonlySet<RoutineRunStatus> = new Set(ROUTINE_ATTENTION_STATUSES);
@@ -1154,6 +1168,9 @@ export class RoutineManager {
       }
       if (changed) this.save();
 
+      // One reading for the whole tick.  Every queued webhook shares it, and
+      // a person's turn never asks: this loop only admits routine receipts.
+      const hostHotReason = this.options.hostHot?.() ?? null;
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
         // `holdReason` is a cached verdict from the last time canStart ran, and
@@ -1178,15 +1195,22 @@ export class RoutineManager {
         }
         // Defer, don't drop.  A hot host (swap at the jobs admission
         // ceiling, or load per core at the ACP init ceiling) skips a new
-        // webhook wake and leaves the receipt queued.  The 10s scheduler
-        // tick tries again.  In-flight runs are not in this loop's queued
-        // set, and resource wakes still start so Housekeeper can run.
-        if (run.triggerSource === "webhook" && this.options.hostHot?.()) {
-          // Same as snooze, busy, and the min-gap skip below.  A hot host is
-          // a deferral, not a hold, and a reason verified while the engine
-          // was dead must not keep rendering for the whole shed window.
-          this.clearHoldReason(run);
-          continue;
+        // webhook wake and leaves the receipt queued with a hold reason, so
+        // the automations receipt says why.  The 10s scheduler tick tries
+        // again.  Past the max deferral age the wake dispatches anyway: a
+        // Mac that stays hot must not park a webhook for hours.  In-flight
+        // runs are not in this loop's queued set.  Resource, schedule, and
+        // manual runs still start, and a person's turn is not in this loop.
+        let hotDeferExpiredReason: string | undefined;
+        if (run.triggerSource === "webhook" && hostHotReason) {
+          const ageMs = this.now() - run.createdAt;
+          if (Number.isFinite(ageMs) && ageMs < this.webhookHotDeferMaxMs()) {
+            // Replaces a stale engine reason.  The host is why this tick is
+            // waiting, and the receipt should say that.
+            this.setHoldReason(run, hostHotReason);
+            continue;
+          }
+          hotDeferExpiredReason = hostHotReason;
         }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
@@ -1311,11 +1335,7 @@ export class RoutineManager {
           // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
           // writes a day for one sustained hold, scaling with queue depth.
           // A client that already has this run is already showing this reason.
-          if (reason !== run.holdReason) {
-            run.holdReason = reason;
-            this.save();
-            this.emitRun(run);
-          }
+          this.setHoldReason(run, reason);
           continue;
         }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1372,6 +1392,12 @@ export class RoutineManager {
         run.startedAt = this.now();
         run.status = "running";
         run.holdReason = undefined;
+        if (hotDeferExpiredReason) {
+          const waitedMin = Math.max(0, Math.round((this.now() - run.createdAt) / 60_000));
+          this.writeLog(
+            `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
+          );
+        }
         this.lastStartedByKey.set(key, run.startedAt);
         // A genuine recurring firing, not "Run now" or a webhook/resource
         // trigger riding the same dispatch path — those have no calendar
@@ -1584,6 +1610,25 @@ export class RoutineManager {
     run.holdReason = undefined;
     this.save();
     this.emitRun(run);
+  }
+
+  /** Publish a hold reason only when it changed.  The scheduler ticks every
+   *  ten seconds, so an unchanged reason must not rewrite the state file. */
+  private setHoldReason(run: RoutineRun, reason: string): void {
+    if (reason === run.holdReason) return;
+    run.holdReason = reason;
+    this.save();
+    this.emitRun(run);
+  }
+
+  private webhookHotDeferMaxMs(): number {
+    const value = this.options.webhookHotDeferMaxMs?.();
+    if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_WEBHOOK_HOT_DEFER_MS;
+    return value;
+  }
+
+  private writeLog(line: string): void {
+    (this.options.log ?? console.log)(line);
   }
 
   /** Move a run out of `queued` and drop the reason it was being held.
