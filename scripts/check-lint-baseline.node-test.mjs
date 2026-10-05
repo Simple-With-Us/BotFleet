@@ -232,6 +232,42 @@ describe("readBaselineRulesFromRef", () => {
     const rules = readBaselineRulesFromRef("main", root);
     assert.deepEqual(rules, { "anti-slop/example": 4 });
   });
+
+  test("a shallow clone that is behind fetches the base baseline instead of the branch copy", () => {
+    const root = mkdtempSync(join(tmpdir(), "lint-baseline-shallow-"));
+    scratch.push(root);
+    const origin = join(root, "origin");
+    const git = (cwd, ...args) => {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8", env: gitEnv });
+      assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+    };
+    git(root, "init", "-q", "-b", "main", origin);
+    writeFileSync(
+      join(origin, ".oxlint-baseline.json"),
+      JSON.stringify({ rules: { "anti-slop/example": 3 } }) + "\n",
+    );
+    git(origin, "add", ".oxlint-baseline.json");
+    git(origin, "commit", "-q", "-m", "base");
+    git(origin, "commit", "-q", "--allow-empty", "-m", "main moves");
+    git(origin, "checkout", "-q", "-b", "feature");
+    writeFileSync(
+      join(origin, ".oxlint-baseline.json"),
+      JSON.stringify({ rules: { "anti-slop/example": 30 } }) + "\n",
+    );
+    git(origin, "add", ".oxlint-baseline.json");
+    git(origin, "commit", "-q", "-m", "stale regen");
+
+    const clone = join(root, "clone");
+    git(root, "clone", "-q", "--depth=1", "--branch", "feature", origin, clone);
+    const missing = spawnSync("git", ["rev-parse", "--verify", "origin/main"], {
+      cwd: clone,
+      encoding: "utf8",
+    });
+    assert.notEqual(missing.status, 0);
+
+    const rules = readBaselineRulesFromRef("origin/main", clone);
+    assert.deepEqual(rules, { "anti-slop/example": 3 });
+  });
 });
 
 describe("node-ci pull request ratchet", () => {

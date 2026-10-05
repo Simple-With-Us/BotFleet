@@ -320,15 +320,61 @@ export function formatRatchetReport(result, { baselineRef = null, allowIncrease 
   return lines.join("\n");
 }
 
+export function originBranchFromRef(ref) {
+  return ref.startsWith("origin/") ? ref.slice("origin/".length) : null;
+}
+
+function gitExec(args, cwd) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function refExists(ref, cwd) {
+  try {
+    gitExec(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Pull-request runners sometimes only have the merge commit checked out.
+// Fetch the base branch so the ceiling is main's baseline, not the file in
+// the head.  A missing ref stays a hard failure.  There is no fallback to
+// the working tree copy.
+export function ensureBaselineRef(ref, cwd = repoRoot) {
+  assertSafeRef(ref);
+  if (refExists(ref, cwd)) return;
+  const branch = originBranchFromRef(ref);
+  if (!branch) {
+    throw new Error(
+      `Baseline ref ${ref} is not in this checkout, and only origin/<branch> is fetched automatically.`,
+    );
+  }
+  const fetchArgs = ["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`];
+  if (gitExec(["rev-parse", "--is-shallow-repository"], cwd).trim() === "true") {
+    fetchArgs.push("--unshallow");
+  }
+  try {
+    gitExec(fetchArgs, cwd);
+  } catch (err) {
+    const detail = err.stderr || err.message || "";
+    throw new Error(`Could not fetch ${ref}.\n${detail}`);
+  }
+  if (!refExists(ref, cwd)) {
+    throw new Error(`Fetched origin/${branch}, but ${ref} is still missing.`);
+  }
+}
+
 export function readBaselineRulesFromRef(ref, cwd = repoRoot) {
   assertSafeRef(ref);
+  ensureBaselineRef(ref, cwd);
   let raw;
   try {
-    raw = execFileSync("git", ["show", `${ref}:.oxlint-baseline.json`], {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    raw = gitExec(["show", `${ref}:.oxlint-baseline.json`], cwd);
   } catch (err) {
     const detail = err.stderr || err.message || "";
     throw new Error(
