@@ -39,6 +39,48 @@ describe("server Sentry init", () => {
     );
   });
 
+  it("does not call init until the previous client has finished closing", async () => {
+    let closing = false;
+    let initWhileClosing = false;
+    const sdk = {
+      init() {
+        if (closing) initWhileClosing = true;
+      },
+      close() {
+        closing = true;
+        return new Promise<boolean>((resolve) => {
+          setTimeout(() => {
+            closing = false;
+            resolve(true);
+          }, 15);
+        });
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      isEnabled: () => !closing,
+      getClient: () => ({
+        getDsn: () => ({}),
+        getOptions: () => ({ enabled: true }),
+        getTransport: () => ({}),
+      }),
+    } as unknown as typeof import("@sentry/node");
+    setSentryLoaderForTests(async () => sdk);
+    const base = {
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: true,
+      source: "config" as const,
+    };
+    await applySentryConfig(base);
+    await applySentryConfig({ ...base, tracesSampleRate: 0.1 });
+    expect(initWhileClosing).toBe(false);
+    expect(isSentryActive()).toBe(true);
+  });
+
   it("serializes concurrent applies so the same fingerprint inits once", async () => {
     let inits = 0;
     let inflight = 0;

@@ -156,6 +156,40 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
     expect(checkIns[1].checkIn).toMatchObject({ status: "error", checkInId: "check-in-id-1" });
   });
 
+  it("returns undefined when captureCheckIn would fabricate an id on a disabled client", async () => {
+    setSentryLoaderForTests(async () =>
+      ({
+        init() {},
+        close() {
+          return Promise.resolve(true);
+        },
+        addIntegration() {},
+        consoleLoggingIntegration() {
+          return { name: "ConsoleLogs" };
+        },
+        isEnabled: () => false,
+        getClient: () => ({
+          getDsn: () => ({}),
+          getOptions: () => ({ enabled: true }),
+          getTransport: () => undefined,
+        }),
+        captureCheckIn() {
+          return "fabricated-check-in-id";
+        },
+      }) as unknown as typeof import("@sentry/node"),
+    );
+    await applySentryConfig({
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 1,
+      logsEnabled: false,
+      source: "config",
+    });
+    expect(isSentryActive()).toBe(false);
+    expect(checkInRoutineStart(run(), routine())).toBeUndefined();
+  });
+
   it("never throws when the SDK call itself throws", async () => {
     setSentryLoaderForTests(async () =>
       ({

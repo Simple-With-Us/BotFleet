@@ -17,6 +17,7 @@ import {
   getSentry,
   isSentryActive,
   MALFORMED_DSN_MESSAGE,
+  SENTRY_DELIVERY_NOT_READY_MESSAGE,
   sentryDsnFromEnv,
   sentryRuntimeState,
   type SentryRuntimeInput,
@@ -122,8 +123,14 @@ class ObservabilityManager {
     // is on file — that is what makes a malformed DSN legible rather than
     // looking like nothing was set.
     const malformed = input.dsn !== null && parsed === null;
+    const wantsReporting = input.enabled && input.dsn !== null && !malformed;
+    const delivering = wantsReporting && isSentryActive();
+    const stalled =
+      wantsReporting && !delivering && !runtime.lastError && !malformed
+        ? SENTRY_DELIVERY_NOT_READY_MESSAGE
+        : null;
     return {
-      enabled: input.enabled && input.dsn !== null && !malformed,
+      enabled: delivering,
       requestedEnabled: input.enabled,
       configured: input.dsn !== null,
       source: this.dsnFromVault() ? "infisical" : input.source,
@@ -141,7 +148,7 @@ class ObservabilityManager {
       // The runtime only knows what the last `apply()` saw; a DSN that has
       // not reached the SDK yet is judged here so a status read before boot
       // finishes still names the problem.
-      lastError: runtime.lastError ?? (malformed ? MALFORMED_DSN_MESSAGE : null),
+      lastError: runtime.lastError ?? (malformed ? MALFORMED_DSN_MESSAGE : stalled),
     };
   }
 
@@ -168,7 +175,7 @@ class ObservabilityManager {
     if (!status.configured) {
       return { ok: false, error: "Set a Sentry DSN first.", eventId: null };
     }
-    if (!status.enabled) {
+    if (!status.requestedEnabled) {
       return {
         ok: false,
         error: "Diagnostics are turned off.  Turn them on to send a test event.",

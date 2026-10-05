@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { observabilitySettings, type AppConfig } from "./config.ts";
 import { observability, observabilityBootLine } from "./observability.ts";
-import { isSentryActive, resetSentryForTests, setSentryLoaderForTests } from "./sentry.ts";
+import {
+  isSentryActive,
+  resetSentryForTests,
+  SENTRY_DELIVERY_NOT_READY_MESSAGE,
+  setSentryLoaderForTests,
+} from "./sentry.ts";
 
 // Obviously fake.  Nothing in this suite may ever reach a real ingest host,
 // and the key halves below are what the leak assertions search for.
@@ -70,6 +75,7 @@ function fakeSentry(options: { acceptsDsn?: boolean } = {}) {
       record.messages.push(message);
       return "evt0000000000000000000000000000ab";
     },
+    isEnabled: () => true,
   });
   // Only stamped when a test asks for it: the real SDK answers a DSN its own
   // parser refused by building a client that kept none, and `init` never
@@ -133,9 +139,20 @@ describe("observability status resolution", () => {
     expect(observability.effectiveDsn()).toBe(ENV_DSN);
   });
 
-  it("uses the stored DSN when the environment has none", async () => {
+  it("does not claim live delivery before observability.apply has run", () => {
     useConfig({ observability: { sentryDsn: CONFIG_DSN } });
     const status = observability.getStatus();
+    expect(status.configured).toBe(true);
+    expect(status.requestedEnabled).toBe(true);
+    expect(status.enabled).toBe(false);
+    expect(status.lastError).toBe(SENTRY_DELIVERY_NOT_READY_MESSAGE);
+  });
+
+  it("uses the stored DSN when the environment has none", async () => {
+    const { loader } = fakeSentry();
+    setSentryLoaderForTests(loader);
+    useConfig({ observability: { sentryDsn: CONFIG_DSN } });
+    const status = await observability.apply();
     expect(status).toMatchObject({
       source: "config",
       configured: true,
@@ -147,8 +164,10 @@ describe("observability status resolution", () => {
   });
 
   it("reports an explicit zero trace sample rate as zero, not as the default", async () => {
+    const { loader } = fakeSentry();
+    setSentryLoaderForTests(loader);
     useConfig({ observability: { sentryDsn: CONFIG_DSN, tracesSampleRate: 0 } });
-    const status = observability.getStatus();
+    const status = await observability.apply();
     expect(status.tracesSampleRate).toBe(0);
     expect(observabilityBootLine(status)).toContain("traces=0 ");
   });

@@ -122,6 +122,12 @@ export const MALFORMED_DSN_MESSAGE = "The stored DSN is not a Sentry https:// DS
 export const SDK_REJECTED_DSN_MESSAGE =
   "Sentry refused this DSN, so nothing is being reported.  Check it in Settings > Observability.";
 
+/** Shown when configuration looks healthy but the SDK client is closed or has
+ * no transport — for example after a config refresh closed the old client
+ * before the replacement finished starting. */
+export const SENTRY_DELIVERY_NOT_READY_MESSAGE =
+  "Sentry is configured but not delivering events yet.  Save Settings or wait for the client to finish restarting.";
+
 /** Split a DSN into the two halves that are safe to show.  Returns null for
  * anything that is not a DSN, which is how a malformed stored value becomes
  * a visible `lastError` instead of a silently inert SDK. */
@@ -206,18 +212,18 @@ async function loadSdk(): Promise<SentrySdkLoad> {
   }
 }
 
-/** Stop the running client.  The close is deliberately not awaited: this
- * runs on the PATCH /api/config path, and a hung flush must not hold a
- * request open.  `initialized` drops first, so `isSentryActive()` gates
- * captures off the instant the switch flips, flush or no flush. */
-function shutdown(): void {
+/** Stop the running client and wait for its close to finish.  `initialized`
+ * drops first, so `isSentryActive()` gates captures off the instant the
+ * switch flips.  Awaited before `init()` so the global scope never keeps a
+ * closed client while cron check-ins and error capture still run. */
+async function closeRunningClient(): Promise<void> {
   const sdk = sentrySdk;
   sentrySdk = null;
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
   try {
-    void Promise.resolve(sdk.close(2000)).catch(() => {});
+    await Promise.resolve(sdk.close(2000)).catch(() => {});
   } catch {
     /* an SDK that cannot close must not take the harness down with it */
   }
@@ -424,7 +430,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   };
 
   if (!input.enabled || !input.dsn || !parsed) {
-    shutdown();
+    await closeRunningClient();
     killed = !input.enabled;
     runtimeState = {
       ...base,
@@ -461,7 +467,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
     return runtimeState;
   }
 
-  shutdown();
+  await closeRunningClient();
   const { sdk, error } = await loadSdk();
   if (!sdk) {
     runtimeState = { ...base, active: false, lastError: error };
@@ -564,7 +570,7 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   // module exists to prevent.  A stand-in SDK without `getClient` answers
   // "unknown" and is left alone.
   if (acceptedDsn(sdk) === "rejected") {
-    shutdown();
+    await closeRunningClient();
     runtimeState = { ...base, active: false, lastError: SDK_REJECTED_DSN_MESSAGE };
     return runtimeState;
   }
@@ -577,11 +583,32 @@ async function applySentryConfigLocked(input: SentryRuntimeInput): Promise<Sentr
   return runtimeState;
 }
 
+/** True when the SDK can actually send events.  `@sentry/core`'s
+ * `captureCheckIn` returns a uuid even when there is no live client, so
+ * callers must gate on this — not merely on `initialized`. */
+export function isSentryDeliveryReady(): boolean {
+  if (!initialized || killed) return false;
+  const sdk = sentrySdk;
+  if (!sdk) return false;
+  const canProbe =
+    typeof sdk.isEnabled === "function" || typeof sdk.getClient === "function";
+  if (!canProbe) return true;
+  try {
+    if (typeof sdk.isEnabled === "function") return sdk.isEnabled();
+    const client = sdk.getClient?.();
+    if (!client) return false;
+    if (client.getOptions?.().enabled === false) return false;
+    return Boolean(client.getTransport?.());
+  } catch {
+    return false;
+  }
+}
+
 /** True only while a client is running and nobody has turned it off.  Every
  * capture site gates on this, not on `isSentryInitialized`, so flipping the
  * switch stops reporting immediately instead of at the next restart. */
 export function isSentryActive(): boolean {
-  return initialized && !killed;
+  return isSentryDeliveryReady();
 }
 
 export function sentryRuntimeState(): SentryRuntimeState {
