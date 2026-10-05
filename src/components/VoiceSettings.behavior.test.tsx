@@ -7,6 +7,7 @@ import { createElement, useEffect, useState } from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 vi.hoisted(() => {
   const happy = require("happy-dom");
@@ -41,6 +42,21 @@ const baseTts = {
   ready: true,
   voice: "standard-default",
 };
+
+// The POST body the renderer sends to /api/tts/custom-voice.  JSON.parse
+// returns any, so the test mock would silently accept out-of-contract
+// payloads.  Strict Zod parsing forces the fixture to throw on malformed
+// bodies instead of hiding the bug in a typed annotation.
+const CustomVoiceRequestBodySchema = z
+  .object({
+    voiceId: z.string().optional(),
+    label: z.string().optional(),
+  })
+  .strict();
+
+function parseCustomVoiceRequestBody(init: RequestInit | undefined): { voiceId?: string; label?: string } {
+  return CustomVoiceRequestBodySchema.parse(JSON.parse(String(init?.body)));
+}
 
 const apiMock = vi.hoisted(() => vi.fn());
 
@@ -189,7 +205,7 @@ describe("VoiceSettings rendered voice commit", () => {
         };
       }
       if (path === "/api/tts/custom-voice" && init?.method === "POST") {
-        const body: { voiceId?: string; label?: string } = JSON.parse(String(init.body));
+        const body = parseCustomVoiceRequestBody(init);
         const voiceId = body.voiceId ?? "";
         return { ok: true, voice: { id: voiceId, label: body.label || voiceId } };
       }
@@ -362,6 +378,11 @@ describe("VoiceSettings rendered voice commit", () => {
     expect(alerts().some((text) => text.includes("Checking Personal Voice availability"))).toBe(true);
     expect(id.value).toBe("personal:early-voice");
     expect(container.textContent).toContain("Add Voice Identifier");
+    // Unresolved gate: the row may be selected once capabilities arrive, so
+    // the refusal must not run a compensating DELETE while the user still
+    // sees "Checking Personal Voice availability".
+    const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
+    expect(deleted).toHaveLength(0);
   });
 
   it("clears the denial banner when the Personal Voice gate opens", async () => {
@@ -390,7 +411,7 @@ describe("VoiceSettings rendered voice commit", () => {
         return { voices: [...stored.values()] };
       }
       if (path === "/api/tts/custom-voice" && init?.method === "POST") {
-        const body: { voiceId?: string; label?: string } = JSON.parse(String(init.body));
+        const body = parseCustomVoiceRequestBody(init);
         const voiceId = body.voiceId ?? "";
         const voice = { id: voiceId, label: body.label || voiceId, description: "Custom" };
         stored.set(voiceId, voice);
@@ -427,5 +448,177 @@ describe("VoiceSettings rendered voice commit", () => {
     expect(select().value).toBe("");
     expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
     expect(id.value).toBe("personal:fixture-voice");
+  });
+
+  it("does not delete a personal id that was already in the voices list on a closed gate", async () => {
+    // The id is already in `voices` before the POST.  addCustomVoice upserts,
+    // so the POST is a no-op, and a refusal cleanup must not silently
+    // destroy the pre-existing row.
+    const preExistingId = "personal:preexisting";
+    await mount();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/api/tts/voices") {
+        return {
+          voices: [
+            { id: preExistingId, label: "Pre-existing Personal", description: "Custom" },
+          ],
+        };
+      }
+      if (path === "/api/tts/custom-voice" && init?.method === "POST") {
+        const body = parseCustomVoiceRequestBody(init);
+        const voiceId = body.voiceId ?? "";
+        return { ok: true, voice: { id: voiceId, label: body.label || voiceId } };
+      }
+      if (path.startsWith("/api/tts/custom-voice/") && init?.method === "DELETE") {
+        return { ok: true };
+      }
+      return {};
+    });
+    // Re-mount with the new mock so the initial loadVoices returns the
+    // pre-existing id before the user clicks Add.
+    await act(async () => {
+      root.unmount();
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root.render(createElement(Harness));
+    });
+    await flush();
+    await flush();
+    expect([...select().options].some((option) => option.value === preExistingId)).toBe(true);
+
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice ID"));
+    if (!add) throw new Error("missing Add Voice ID");
+    await act(async () => {
+      add.click();
+    });
+    const id = container.querySelector<HTMLInputElement>('[aria-label="Custom Voice ID"]');
+    if (!id) throw new Error("missing id");
+    await act(async () => {
+      setInputValue(id, preExistingId);
+    });
+    const submit = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice"));
+    if (!submit) throw new Error("missing Add Voice");
+    await act(async () => {
+      submit.click();
+    });
+    await flush();
+    await flush();
+
+    const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
+    expect(deleted).toHaveLength(0);
+    expect(select().value).toBe("");
+    expect(patches.some((patch) => patch.voice === preExistingId)).toBe(false);
+    expect(alerts().some((text) => text.includes(MACOS_14))).toBe(true);
+    // The pre-existing row stays listed; the user can still pick it later
+    // when the gate opens.
+    expect([...select().options].some((option) => option.value === preExistingId)).toBe(true);
+    expect(id.value).toBe(preExistingId);
+  });
+
+  it("surfaces an honest error when the cleanup DELETE fails on a refused new personal id", async () => {
+    const stored = new Map<string, { id: string; label: string; description: string }>();
+    await mount();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/api/tts/voices") {
+        return { voices: [...stored.values()] };
+      }
+      if (path === "/api/tts/custom-voice" && init?.method === "POST") {
+        const body = parseCustomVoiceRequestBody(init);
+        const voiceId = body.voiceId ?? "";
+        const voice = { id: voiceId, label: body.label || voiceId, description: "Custom" };
+        stored.set(voiceId, voice);
+        return { ok: true, voice };
+      }
+      if (path.startsWith("/api/tts/custom-voice/") && init?.method === "DELETE") {
+        throw new Error("server down");
+      }
+      return {};
+    });
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice ID"));
+    if (!add) throw new Error("missing Add Voice ID");
+    await act(async () => {
+      add.click();
+    });
+    const id = container.querySelector<HTMLInputElement>('[aria-label="Custom Voice ID"]');
+    if (!id) throw new Error("missing id");
+    await act(async () => {
+      setInputValue(id, "personal:leftover-voice");
+    });
+    const submit = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice"));
+    if (!submit) throw new Error("missing Add Voice");
+    await act(async () => {
+      submit.click();
+    });
+    await flush();
+    await flush();
+
+    const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
+    expect(deleted.map((call) => String(call[0]))).toContain("/api/tts/custom-voice/personal%3Aleftover-voice");
+    // The form must tell the user the row remains on the server instead of
+    // silently re-listing an unselectable orphan.
+    const cleanupAlerts = alerts();
+    expect(cleanupAlerts.some((text) => text.includes(MACOS_14))).toBe(true);
+    expect(cleanupAlerts.some((text) => text.includes("The saved voice could not be removed"))).toBe(true);
+    // The row is still persisted on the server and reloads into the picker.
+    expect(stored.has("personal:leftover-voice")).toBe(true);
+  });
+
+  it("refreshes the voice list when the POST response fails to parse", async () => {
+    const stored = new Map<string, { id: string; label: string; description: string }>();
+    await mount();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/api/tts/voices") {
+        return { voices: [...stored.values()] };
+      }
+      if (path === "/api/tts/custom-voice" && init?.method === "POST") {
+        const body = parseCustomVoiceRequestBody(init);
+        const voiceId = body.voiceId ?? "";
+        stored.set(voiceId, {
+          id: voiceId,
+          label: body.label || voiceId,
+          description: "Custom",
+        });
+        // Return a malformed success body: missing `voice` field.  The
+        // renderer must not delete this row, and must call loadVoices so
+        // the user can see and remove it instead of it becoming an orphan.
+        return { ok: true };
+      }
+      if (path.startsWith("/api/tts/custom-voice/") && init?.method === "DELETE") {
+        const id = decodeURIComponent(path.slice("/api/tts/custom-voice/".length));
+        stored.delete(id);
+        return { ok: true };
+      }
+      return {};
+    });
+    const add = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice ID"));
+    if (!add) throw new Error("missing Add Voice ID");
+    await act(async () => {
+      add.click();
+    });
+    const id = container.querySelector<HTMLInputElement>('[aria-label="Custom Voice ID"]');
+    if (!id) throw new Error("missing id");
+    await act(async () => {
+      setInputValue(id, "personal:malformed-response");
+    });
+    const submit = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Add Voice"));
+    if (!submit) throw new Error("missing Add Voice");
+    await act(async () => {
+      submit.click();
+    });
+    await flush();
+    await flush();
+
+    // No compensating DELETE — the renderer could not even derive the
+    // encoded URL from a malformed response.
+    const deleted = apiMock.mock.calls.filter((call) => call[1]?.method === "DELETE");
+    expect(deleted).toHaveLength(0);
+    // The persisted row reloads into the picker so the user can remove it.
+    expect([...select().options].some((option) => option.value === "personal:malformed-response")).toBe(true);
+    // And the still-open form explains the failure.
+    expect(alerts().some((text) => text.includes("Failed to add voice identifier."))).toBe(true);
+    expect(id.value).toBe("personal:malformed-response");
   });
 });

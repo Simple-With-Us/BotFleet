@@ -202,6 +202,12 @@ export function VoiceSettings({
       setCustomError("Voice ID is required.");
       return;
     }
+    // Capture whether the typed id was already in the list the user saw.  The
+    // addCustomVoice server path upserts on voiceId, so a re-typed id is a
+    // no-op POST followed by a refusal that must not trigger a compensating
+    // DELETE.  Reading voices at the start of this handler is the only
+    // pre-POST list we have — state can change during the await.
+    const existedBeforePost = voices.some((voice) => voice.id === id);
     setCustomAdding(true);
     setCustomError(null);
     try {
@@ -215,9 +221,11 @@ export function VoiceSettings({
       // committed voice id and the encoded DELETE path from parsed.data.
       const parsed = CustomVoiceResponseSchema.safeParse(raw);
       if (!parsed.success) {
-        // Parse failure stops the whole flow: do not commit, do not DELETE,
-        // and surface a failure in the still-open custom-voice form so the
-        // typed id and label remain for the user to retry or correct.
+        // The POST already persisted the row server-side; refresh the list so
+        // the user can see and remove it instead of it becoming an orphan.
+        // Surface a failure in the still-open custom-voice form so the typed
+        // id and label remain for the user to retry or correct.
+        await loadVoices();
         setCustomError("Failed to add voice identifier.");
         return;
       }
@@ -227,26 +235,35 @@ export function VoiceSettings({
       }
       const addedId = parsed.data.voice.id;
       // Refuse before clearing.  A personal: id on a computer that cannot
-      // speak it must leave the typed id and label in the open form.
-      // The same refusal before capabilities arrive still needs a message:
-      // skipping it leaves the form open and silent.  Delete the row we
-      // just posted so loadVoices cannot list an id the picker will not
-      // select.  The gate is the ref after this await, so a Personal Voice
-      // that became allowed in flight is committed and kept.
+      // speak it must leave the typed id and label in the open form.  Only
+      // compensate the POST when the gate is confirmed closed (ready true,
+      // not the unresolved initial state) and the row is one we just
+      // created — a re-typed id that already lived in voices must stay.
       if (addedId && !commitVoice(addedId, false)) {
-        if (isPersonalVoice(addedId)) {
+        let cleanupFailed = false;
+        const shouldCleanup =
+          isPersonalVoice(addedId) &&
+          capabilitiesReadyRef.current &&
+          !existedBeforePost;
+        if (shouldCleanup) {
           try {
             await api(`/api/tts/custom-voice/${encodeURIComponent(addedId)}`, { method: "DELETE" });
           } catch {
-            // The id stays refused when cleanup fails.  The form still
-            // explains why it was not selected.
+            // The row is still on the server; say so instead of letting it
+            // reappear silently in the picker after loadVoices.
+            cleanupFailed = true;
           }
         }
         await loadVoices();
-        setCustomError(personalVoiceDisabledReasonFor(
+        const reason = personalVoiceDisabledReasonFor(
           capabilitiesReadyRef.current,
           capabilitiesRef.current.dictation.reasonCode,
-        ));
+        );
+        setCustomError(
+          cleanupFailed
+            ? `${reason}.  The saved voice could not be removed; remove it from the list.`
+            : reason,
+        );
         return;
       }
       await loadVoices();

@@ -261,9 +261,16 @@ describe("VoiceSettings personal voice selection guard", () => {
     expect(add).toContain("if (addedId && !commitVoice(addedId, false))");
     expect(add.indexOf("commitVoice(addedId, false)")).toBeLessThan(add.indexOf('setCustomVoiceId("")'));
     expect(add).toContain('method: "DELETE"');
-    expect(add).toContain("setCustomError(personalVoiceDisabledReasonFor(");
+    expect(add).toContain("setCustomError(");
     expect(add).toContain("capabilitiesReadyRef.current");
     expect(add).not.toContain("onPatch(");
+    // The refusal branch captures the pre-POST voices list, gates the
+    // compensating DELETE on a confirmed closed gate and a non-pre-existing
+    // id, and surfaces a cleanup-failure message when the DELETE throws.
+    expect(add).toContain("existedBeforePost");
+    expect(add).toContain("shouldCleanup");
+    expect(add).toContain("cleanupFailed");
+    expect(add).toContain("The saved voice could not be removed");
     const del = between("const handleDeleteVoice", "const handleCloneFile");
     expect(del).toContain("setPersonalVoiceDenied(false)");
     expect(clone).toContain("commitVoice(result.voiceId)");
