@@ -32,7 +32,7 @@
 // one and never a missing pointer.
 
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -195,13 +195,13 @@ async function readReleaseManifest(directory) {
  * complete.  `mkdir` first is the portable way to fail on a cross-device rename
  * with a clear error rather than an obscure one from the kernel.
  */
-export async function promoteStaging({ commit, env = process.env, renameImpl = rename } = {}) {
+export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString() } = {}) {
   const from = stagingPath(commit, env);
   const to = releasePath(commit, env);
   const manifest = {
     schemaVersion: 1,
     commit,
-    promotedAt: new Date().toISOString(),
+    promotedAt,
     // Recorded so an operator looking at a release can tell what produced it
     // without reconstructing the history of the machine.
     node: process.version,
@@ -219,13 +219,102 @@ export async function promoteStaging({ commit, env = process.env, renameImpl = r
   try {
     await renameImpl(from, to);
   } catch (error) {
-    throw new Error(
+    // Re-promoting a commit that is already a release is not a cross-device
+    // problem, and telling an operator to move a directory they did not break
+    // sends them the wrong way. ENOTEMPTY/EEXIST means it is already there.
+    if (["ENOTEMPTY", "EEXIST", "EISDIR"].includes(error?.code)) {
+      throw new ResolutionError(
+        `Commit ${commit.slice(0, 12)} is already a release at ${to}; nothing to promote.`,
+        "already-released",
+        { releasePath: to },
+      );
+    }
+    throw new ResolutionError(
       `Could not promote ${from} to ${to}: ${error?.message || error}.  ` +
         `The staging directory and the releases directory must be on the same filesystem; ` +
         `if BOTFLEET_RELEASES_ROOT points somewhere else, point it at a path on the same volume.`,
+      "promote-failed",
     );
   }
+  // ENFORCE immutability, do not just claim it.  The 0o444 above marks one file;
+  // the directory and everything in it kept the staging tree's defaults, so
+  // nothing actually stopped anything from writing into a promoted release —
+  // and the whole design rests on a release being byte-identical to the commit
+  // it names.  The release is read-only, not merely documented read-only.
+  await makeReadOnly(to);
   return to;
+}
+
+/**
+ * Drop write permission from a promoted release, and say so if it did not take.
+ *
+ * Read-only is the invariant, so a failure here is a failure to promote, not a
+ * warning to print later: an operator who believes a release is immutable and
+ * discovers otherwise has been misled by this code.
+ */
+/**
+ * Remove a promoted release, restoring write permission first.
+ *
+ * A release is read-only by construction, so unlinking one fails — and anything
+ * that removes a release (the pruner, a test fixture tearing down, an operator
+ * reclaiming disk) needs that one fact.  Keeping it in a single exported place
+ * means there is one thing to get right rather than N.
+ *
+ * Callers are responsible for having established that nothing is running from
+ * the release; this function does not check, because the pruner has already
+ * done a liveness check that a blind caller has not.
+ */
+export async function discardRelease(commit, env = process.env) {
+  const path = releasePath(commit, env);
+  await makeWritable(path);
+  await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  return path;
+}
+
+
+/**
+ * Walk a tree and set its permission bits, or report the directory mode.
+ *
+ * One walker, used in both directions, because the mistake this replaces was
+ * exactly a half-applied one: chmod-ing the top directory and assuming the
+ * contents followed.  They do not — a promoted tree kept its staging
+ * permissions, so the "immutable" release was fully writable file by file and
+ * nothing stopped anyone from editing a release in place.
+ */
+async function setTreePermission(path, { writable, readOnly }) {
+  const { chmod, readdir, stat } = await import("node:fs/promises");
+  await chmod(path, writable ? 0o755 : 0o555).catch(() => {});
+  let entries = [];
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      await setTreePermission(child, { writable, readOnly });
+    } else {
+      await chmod(child, writable ? 0o644 : readOnly).catch(() => {});
+    }
+  }
+}
+
+async function makeWritable(path) {
+  await setTreePermission(path, { writable: true, readOnly: 0o444 });
+}
+
+async function makeReadOnly(path) {
+  await setTreePermission(path, { writable: false, readOnly: 0o444 });
+  const { stat } = await import("node:fs/promises");
+  const mode = (await stat(path)).mode & 0o222;
+  if (mode !== 0) {
+    throw new ResolutionError(
+      `Promoted ${path} but it is still writable (mode ${(mode & 0o777).toString(8)}); ` +
+        `a release must be immutable, so this is not being treated as a success`,
+      "release-not-read-only",
+    );
+  }
 }
 
 /**
@@ -418,7 +507,11 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
       kept.push({ commit, reason: "held-by-a-process" });
       continue;
     }
-    await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    // A promoted release is read-only, and a read-only directory cannot be
+    // unlinked.  Pruning is the ONE place allowed to restore write permission,
+    // and only after liveness said nothing is running from it.  Making the
+    // release immutable and teaching the pruner about it are the same change.
+    await discardRelease(commit, env);
     removed.push(commit);
     onRemove?.(commit);
   }
