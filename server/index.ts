@@ -1047,12 +1047,11 @@ function dispatchHoldFor(
     // occurred.
     if (opts.count) noteDoomedSkip(bot.id, instanceId);
     const entry = doomedDispatches.peek(bot.id, instanceId);
-    return {
-      reason: `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row`,
-      hint: entry?.lastError
-        ? `Last error: ${entry.lastError}`
-        : `Check that the ${engine} CLI is installed and logged in`,
-    };
+    const hint = entry?.lastError
+      ? `Last error: ${entry.lastError}`
+      : `Check that the ${engine} CLI is installed and logged in`;
+    const reason = `${engine} could not start ${entry?.consecutiveFailures ?? DOOMED_FAILURE_THRESHOLD} times in a row — ${hint}`;
+    return { reason, hint };
   }
 
   // Off unless a ceiling is configured, and consulted only for unattended work
@@ -1076,10 +1075,9 @@ function dispatchHoldFor(
   }
 
   if (turnExternalCredentialPending(bot, instanceId, runOn)) {
-    return {
-      reason: `${engine} is waiting on a credential`,
-      hint: `Add the ${engine} credential in Settings; the run resumes on its own once it lands`,
-    };
+    const hint = `Add the ${engine} credential in Settings; the run resumes on its own once it lands`;
+    const reason = `${engine} is waiting on a credential — ${hint}`;
+    return { reason, hint };
   }
   return undefined;
 }
@@ -13172,6 +13170,11 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // GET /api/instances snapshot.quota.minimax — never one shared value
       // here, which is what let a second MiniMax connection read the
       // reserved instance's numbers.
+      // Per-request cache: each doomed entry would otherwise call
+      // instancesHeldByQueuedRuns for the same bot and re-walk the queue.
+      // Scope is this request only — a module-level cache would survive a
+      // later queue drain and report a stale set.
+      const holdsByBot = new Map<string, Set<string>>();
       return json(res, 200, {
         ok: true,
         cooldowns: quotaCooldowns.list(),
@@ -13202,10 +13205,19 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // Only a queued run's real engine.  An inactive task override, or
           // boxAgent merely because a cloud backend is configured, is not a
           // hold: nothing queued is waiting on it.  The run's own thread and
-          // destination are what dispatchHoldFor would judge.
-          const holds = Boolean(
-            bot && open && instancesHeldByQueuedRuns(bot).has(entry.instanceId),
-          );
+          // destination are what dispatchHoldFor would judge. Computed only
+          // when the entry's own gate passed (`bot && open`); outside that
+          // branch the Set is never read, so a per-bot call would be wasted
+          // work for every bot whose breaker is closed.
+          let heldForBot: Set<string> | undefined;
+          if (bot && open) {
+            heldForBot = holdsByBot.get(bot.id);
+            if (!heldForBot) {
+              heldForBot = instancesHeldByQueuedRuns(bot);
+              holdsByBot.set(bot.id, heldForBot);
+            }
+          }
+          const holds = Boolean(heldForBot?.has(entry.instanceId));
           return {
             ...entry,
             open,
