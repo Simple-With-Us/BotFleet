@@ -1,8 +1,8 @@
 # 2026-10-04 — An Immutable Release Store For The Always-On Harness
 
 repo: BotFleet | [MM] Claim: board `f1482275` (Recommendation 2, harness half), branch
-`minimax/harness-release-store`, PR #858, seat MINIMAX, Mac.  `/Users/jay/apps/AGENT-SYNC.md`
-read for the board/closeout protocol, and the matching `repo: BotFleet`-first claim posted in
+`minimax/harness-release-store`, PR #858, issue #891, board f1482275, seat MINIMAX, Mac.  the fleet coordination protocol (`AGENT-SYNC.md`)
+read for the board/closeout rules, and the matching `repo: BotFleet`-first claim posted in
 `#agent-sync` on 2026-10-04.
 
 **Recorded late, and labelled as such rather than backdated:** this lane's coordination record
@@ -13,7 +13,9 @@ the ordering, and it is recorded rather than tidied.
 
 Author: MINIMAX.
 
-## Context & Objective
+## Changes Made
+
+### Context & Objective
 
 `app.botfleet.server` runs from `~/apps/botfleet-server`, a mutable linked git
 worktree.  Every update `git checkout --detach`s that worktree and renames a
@@ -34,7 +36,7 @@ The same checkout is also a shared hazard: it has been reset to `origin/main`
 by hand three times now because a different seat's branch deleted files it
 still imported.  See board `66bc29ad`.
 
-## What It Is
+### What It Is
 
 Each commit gets an immutable directory under `~/.botfleet/releases/<commit>`,
 prepared in `~/.botfleet/staging/<commit>` and activated by moving one pointer
@@ -46,7 +48,7 @@ than an outage.
 `scripts/harness-release-store.mjs` is the store: path layout, promotion, the
 pointer swap, release listing, liveness, and retention.
 
-## What It Deliberately Does Not Do
+### What It Deliberately Does Not Do
 
 **It does not change how the desktop app updates.**  That path is
 `electron-updater`'s, guarded by the critical Kody rule
@@ -67,7 +69,9 @@ runs from its checkout.  Moving the LaunchAgent `WorkingDirectory` to
 `~/.botfleet/current` is a separate on-demand operator step that pauses for the
 owner, with a rollout and a verified rollback.
 
-## Three Decisions Worth Reviewing
+## Decisions & Trade-offs
+
+The three decisions worth reviewing:
 
 ### The pointer swap is symlink-then-rename, not `ln -sfn`
 
@@ -107,7 +111,7 @@ retained the stale one — a rollback target that is not a rollback target.  The
 new case promotes three releases in an order that defeats name-sorting, and
 reverting the comparator makes it fail.
 
-## The Launcher, And Why It Had To Change
+### The Launcher, And Why It Had To Change
 
 `scripts/botfleet-server-start.sh` wrote its "a self-heal was tried recently"
 stamp **inside `$ROOT`**, and ran `pnpm install --frozen-lockfile` inside
@@ -132,7 +136,7 @@ The heal stamp's default moved to
 `~/Library/Caches/BotFleet/server-start-heal-stamp`: it is mutable state, and
 with one harness, one budget per machine is the honest accounting.
 
-## Files
+## Files Touched
 
 - `scripts/harness-release-store.mjs` — path layout, promotion, pointer swap,
   listing, liveness, retention.
@@ -142,7 +146,7 @@ with one harness, one budget per machine is the honest accounting.
   self-heal, stamp relocation.
 - `scripts/botfleet-server-start.node-test.mjs` — 4 release cases appended to
   the 7 pre-existing launcher tests.
-- `/Users/jay/apps/MAC-LOCAL-PROCESSES.md` and the pinned **Background Jobs
+- `MAC-LOCAL-PROCESSES.md` (owner-local inventory) and the pinned **Background Jobs
   Master List** Apple Note — updated in the same change, both stating that the
   live helper is unchanged and the store is not activated.
 
@@ -163,7 +167,7 @@ with one harness, one budget per machine is the honest accounting.
 - Two of these were caught only by hosted Windows CI after being green locally,
   which is the point: neither the code nor a Mac-only run would have found them.
 
-## Next Steps
+## Follow-ups
 
 1. Add `scripts/harness-release-store.mjs` to the updater's bootstrap archive
    list in `scripts/update-botfleet.sh`, and stage/promote/swap in the install
