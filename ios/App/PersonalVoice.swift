@@ -105,11 +105,17 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
     /// on-device utterance size limits, synthesizing each chunk with per-chunk
     /// retry and smooth prosody transitions between chunks.
     func speak(text: String, voiceId: String) async throws {
+        // stop() invalidates any in-flight invocation, including one parked
+        // in the retry backoff where no continuation is installed.
         stop()
+        let generation = turnGuard.beginInvocation()
 
         if authorizationStatus == .notDetermined {
             _ = await requestAuthorization()
         }
+        // A second speak() can pass this await (AgentProfileView preview
+        // never calls Session.stopVoice()) and must not share this turn.
+        guard turnGuard.ownsInvocation(generation) else { return }
 
         guard let targetVoice = resolveVoice(for: voiceId) ?? personalVoices.first else {
             throw APIError.transport("Apple Personal Voice '\(voiceId)' is not available or authorized.")
@@ -120,49 +126,66 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
         let chunks = PersonalVoiceChunker.chunk(text: trimmed)
         guard !chunks.isEmpty else { return }
+        guard turnGuard.ownsInvocation(generation) else { return }
 
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         try audioSession.setActive(true)
+        guard turnGuard.ownsInvocation(generation) else { return }
 
         isSpeaking = true
         currentUtteranceText = trimmed
 
-        for chunk in chunks {
-            guard isSpeaking else { break }
+        chunkLoop: for chunk in chunks {
+            guard isSpeaking, turnGuard.ownsInvocation(generation) else { break }
 
             var attempts = 0
             let maxAttempts = 2
             var chunkSuccess = false
 
-            while attempts < maxAttempts && !chunkSuccess && isSpeaking {
+            while attempts < maxAttempts && !chunkSuccess && isSpeaking && turnGuard.ownsInvocation(generation) {
                 attempts += 1
                 let utterance = AVSpeechUtterance(string: chunk)
                 utterance.voice = targetVoice
                 utterance.rate = AVSpeechUtteranceDefaultSpeechRate
                 utterance.postUtteranceDelay = 0.05
 
-                let outcome = await speakChunkUtterance(utterance)
+                let outcome = await speakChunkUtterance(utterance, generation: generation)
                 switch outcome {
                 case .finished:
                     chunkSuccess = true
                 case .cancelled:
-                    // If isSpeaking was flipped to false (explicit stop), exit immediately.
-                    if !isSpeaking { break }
-                    // Otherwise, an internal synthesizer error occurred; retry once before continuing.
+                    // Stopping supersedes this turn.  `break` alone would
+                    // leave only the switch, and the loop would retry.
+                    if !isSpeaking || !turnGuard.ownsInvocation(generation) {
+                        break chunkLoop
+                    }
                     if attempts < maxAttempts {
                         try? await Task.sleep(nanoseconds: 50_000_000)
                     }
                 }
+                if !isSpeaking || !turnGuard.ownsInvocation(generation) {
+                    break chunkLoop
+                }
             }
         }
 
+        // A newer speak() may already be the owner.  Clearing here would
+        // mark that turn idle while its audio is still queued.
+        guard turnGuard.ownsInvocation(generation) else { return }
         isSpeaking = false
         currentUtteranceText = nil
     }
 
-    private func speakChunkUtterance(_ utterance: AVSpeechUtterance) async -> ChunkOutcome {
+    private func speakChunkUtterance(_ utterance: AVSpeechUtterance, generation: UInt64) async -> ChunkOutcome {
         await withCheckedContinuation { continuation in
+            // Do not overwrite a live continuation.  The previous model
+            // stored one slot for every speak(), so a superseded call
+            // resumed the new turn's waiter early or left it hanging.
+            guard self.turnGuard.ownsInvocation(generation), self.chunkContinuation == nil else {
+                continuation.resume(returning: .cancelled)
+                return
+            }
             self.chunkContinuation = continuation
             self.turnGuard.begin(utterance: utterance)
             self.synthesizer.speak(utterance)
@@ -171,10 +194,10 @@ final class PersonalVoiceService: NSObject, ObservableObject, AVSpeechSynthesize
 
     /// Stop ongoing speech playback immediately.
     func stop() {
+        turnGuard.supersedeInvocation()
         if synthesizer.isSpeaking {
             synthesizer.stopSpeaking(at: .immediate)
         }
-        turnGuard.stop()
         isSpeaking = false
         currentUtteranceText = nil
         let cont = chunkContinuation

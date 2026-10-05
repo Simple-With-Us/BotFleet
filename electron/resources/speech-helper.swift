@@ -198,6 +198,10 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
     var attempts = 0
     var voice: AVSpeechSynthesisVoice?
     var isStopped = false
+    /// UTF-16 index of the range AVSpeechSynthesizer is about to speak.
+    /// Ranges before this have already been spoken.  A cancel retries from
+    /// here instead of from the start of the chunk.
+    var nextRangeUTF16 = 0
 
     static func chunkText(_ text: String, maxCharacters: Int = 750) -> [String] {
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -278,6 +282,17 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       return result
     }
 
+    /// Retry text after didCancel.  `nextRangeLocation` is the UTF-16 start
+    /// of the range that was about to be spoken.  Zero means nothing audible
+    /// was committed, so the whole chunk is retried.  The in-progress range
+    /// may be repeated once; ranges before it are not.
+    static func remainderAfterCancel(chunk: String, nextRangeLocation: Int) -> String {
+      let ns = chunk as NSString
+      let location = min(max(nextRangeLocation, 0), ns.length)
+      if location == 0 { return chunk }
+      return ns.substring(from: location)
+    }
+
     func speak(voice: AVSpeechSynthesisVoice, text: String) {
       synth.delegate = self
       self.voice = voice
@@ -289,6 +304,7 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       self.currentChunkIndex = 0
       self.attempts = 0
       self.isStopped = false
+      self.nextRangeUTF16 = 0
       speakCurrentChunk()
     }
 
@@ -297,6 +313,7 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
         emit(["finished": true])
         exit(0)
       }
+      nextRangeUTF16 = 0
       let utterance = AVSpeechUtterance(string: chunks[currentChunkIndex])
       utterance.voice = voice
       utterance.rate = AVSpeechUtteranceDefaultSpeechRate
@@ -304,12 +321,16 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       synth.speak(utterance)
     }
 
-    func stop() {
-      isStopped = true
-      synth.stopSpeaking(at: .immediate)
+    func speechSynthesizer(
+      _ synthesizer: AVSpeechSynthesizer,
+      willSpeakRangeOfSpeechString characterRange: NSRange,
+      utterance: AVSpeechUtterance
+    ) {
+      nextRangeUTF16 = characterRange.location
     }
 
-    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+    func advanceAfterChunk() {
+      nextRangeUTF16 = 0
       currentChunkIndex += 1
       attempts = 0
       if currentChunkIndex >= chunks.count {
@@ -320,23 +341,36 @@ if CommandLine.arguments.contains("--speak-personal-voice") {
       }
     }
 
+    func stop() {
+      isStopped = true
+      synth.stopSpeaking(at: .immediate)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+      advanceAfterChunk()
+    }
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
       if isStopped {
         exit(0)
       }
-      // Internal synthesis drop/error: retry chunk once before skipping.
+      // Internal synthesis drop/error: retry once, but not from character 0
+      // when part of this chunk was already spoken.
       attempts += 1
       if attempts < 2 {
-        speakCurrentChunk()
-      } else {
-        currentChunkIndex += 1
-        attempts = 0
-        if currentChunkIndex >= chunks.count {
-          emit(["finished": true])
-          exit(0)
+        let remainder = Self.remainderAfterCancel(
+          chunk: chunks[currentChunkIndex],
+          nextRangeLocation: nextRangeUTF16
+        )
+        nextRangeUTF16 = 0
+        if remainder.isEmpty {
+          advanceAfterChunk()
         } else {
+          chunks[currentChunkIndex] = remainder
           speakCurrentChunk()
         }
+      } else {
+        advanceAfterChunk()
       }
     }
   }
