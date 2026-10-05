@@ -613,9 +613,14 @@ test("updateConfigFile refuses to overwrite an unusable file it cannot set aside
       // outcome it did produce rather than returning silently: a lock that was not released, or a
       // staged file left behind, would otherwise pass here.  POSIX takes the branch below on
       // every run.
-      const moved = join(dir, `config.json.corrupt-${"9".repeat(400)}`);
-      assert.ok(existsSync(moved), "the unusable file was moved aside under the long name");
-      assert.equal(readFileSync(moved, "utf8"), "{ not json", "the moved file is byte for byte");
+      //
+      // Find the moved file by listing the directory rather than existsSync on a constructed
+      // path.  GitHub's windows-latest lies on existsSync of a > 255-char component, so a path
+      // built from "9".repeat(400) cannot prove the rename landed; readdir returns the names
+      // the directory actually holds, which is the honest evidence.
+      const moved = readdirSync(dir).find((name) => name.startsWith("config.json.corrupt-"));
+      assert.ok(moved, "the unusable file was moved aside");
+      assert.equal(readFileSync(join(dir, moved), "utf8"), "{ not json", "the moved file is byte for byte");
       assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { fresh: true });
       assert.equal(existsSync(lockPathFor(path)), false, "the lock is released");
       assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), [], "no staged file is left behind");
