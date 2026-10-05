@@ -539,7 +539,30 @@ export function ComputerPanel({
     const shoot = () => {
       pendingCapture.current ??= (async () => {
         try {
-          return await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+          const frame = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+          if (captureFailures.current > 0) {
+            captureFailures.current = 0;
+            setCaptureProblem(null);
+          }
+          return frame;
+        } catch (e) {
+          /* Counted ONCE, here, and not once per awaiter.  The busy cadence is
+           * 4s against a ~17s capture, so five apply() calls can be awaiting
+           * this same promise; counting in the callers turned a single
+           * transient failure into five and raised the banner for a box that
+           * had simply been mid-command.  The previous per-generation guard
+           * tolerated that by construction, and sharing the promise took that
+           * tolerance away.
+           * A box mid-command fails transiently and retries next tick.  One
+           * that fails every tick is not slow, it is broken, and saying so
+           * beats an eternal "Waiting for the first frame…". */
+          captureFailures.current += 1;
+          if (panelLive.current && captureFailureIsActionable(captureFailures.current)) {
+            setCaptureProblem(
+              `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          throw e;
         } finally {
           pendingCapture.current = null;
         }
@@ -550,17 +573,8 @@ export function ComputerPanel({
       let frame: { png: string; format: string; capturedAt?: number };
       try {
         frame = await shoot();
-      } catch (e) {
-        /* A box mid-command or asleep fails transiently and retries next tick.
-         * One that fails every tick is not slow, it is broken, and saying so
-         * beats an eternal "Waiting for the first frame…". */
-        if (!panelLive.current) return;
-        captureFailures.current += 1;
-        if (captureFailureIsActionable(captureFailures.current)) {
-          setCaptureProblem(
-            `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
-          );
-        }
+      } catch {
+        // Already counted and reported by `shoot`, once per capture.
         return;
       }
       if (!panelLive.current) return;
@@ -569,10 +583,6 @@ export function ComputerPanel({
       // both sources.  The browser clock is a fallback for a harness too old
       // to stamp its own frames.
       setPolledAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
-      if (captureFailures.current > 0) {
-        captureFailures.current = 0;
-        setCaptureProblem(null);
-      }
     };
     void apply();
     const timer = setInterval(() => void apply(), preview.intervalMs);
