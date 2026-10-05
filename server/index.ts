@@ -1089,6 +1089,21 @@ function dispatchHoldFor(
  *  read, so a later tick (or an unpaired lookup) always re-evaluates. */
 let pendingDispatchHold: { key: string; hold: DispatchHold | undefined } | undefined;
 
+/** Whether the rolling 5-hour spend ceiling is currently holding.  Only ever
+ *  consulted for work nobody is watching, so a cap can stop background
+ *  automation without silently refusing a message the owner is waiting on.
+ *  Kept for the jobs registry / wake coordinator, which ask only about spend
+ *  — not the full dispatch hold.  Routine canStart goes through dispatchHoldFor. */
+function spendBlockedForUnattendedWork(runOn: RoutineRunOn): boolean {
+  if (runOn !== "bot") return false;
+  const decision = spendCeilingDecision(rollingSpendTracker.getWindow(), {
+    ceilingUsd: cfg.usage?.spendCeilingUsd,
+    minPricedShare: cfg.usage?.spendCeilingMinPricedShare,
+  });
+  if (decision.blocked) console.warn(`[spend] refusing unattended work: ${decision.reason}`);
+  return decision.blocked;
+}
+
 /** Comms grants minted per turn, bound to the bot they were issued for.
  *
  *  The boot token above is a front door, and it was the only door: every bot
