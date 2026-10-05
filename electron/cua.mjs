@@ -15,7 +15,7 @@
 // <userData>/cua-connection.json for the harness server to hand to drivers.
 
 import { app, ipcMain } from "electron";
-import { spawnSync } from "node:child_process";
+import { nativeProbeFailureMessage, probeNativeSync } from "../scripts/native-version-probe.mjs";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
@@ -158,7 +158,19 @@ async function attachStandalone() {
     // Launch CuaDriver.app through LaunchServices so Accessibility /
     // Screen Recording stay on com.trycua.driver — the identity this
     // machine already granted — instead of the freshly signed BotFleet.
-    spawnSync("open", ["-a", "CuaDriver"], { timeout: 8000 });
+    const launchProbe = probeNativeSync("open", {
+      args: ["-a", "CuaDriver"],
+      timeoutMs: 8_000,
+      attempts: 1,
+      matchVersion: () => "launched",
+      probeLabel: "CuaDriver launch probe",
+    });
+    if (!launchProbe.ok && launchProbe.reason === "timeout") {
+      console.warn(
+        "[cua]",
+        nativeProbeFailureMessage("Launching CuaDriver.app did not complete", launchProbe),
+      );
+    }
     for (let i = 0; i < 25; i++) {
       if (await socketAlive(STANDALONE_SOCKET)) break;
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -254,15 +266,32 @@ export async function startCua() {
 export function cuaPermissionsStatus() {
   const binary = resolveDriverBinary();
   if (!binary) return { available: false };
-  const out = spawnSync(binary, ["permissions", "status", "--json"], {
-    encoding: "utf8",
-    timeout: 5000,
-    env: { ...process.env, ...CUA_ENV },
+  const probe = probeNativeSync(binary, {
+    args: ["permissions", "status", "--json"],
+    spawnOptions: { env: { ...process.env, ...CUA_ENV } },
+    matchVersion: (output) => {
+      try {
+        JSON.parse(output);
+        return "ok";
+      } catch {
+        return null;
+      }
+    },
+    probeLabel: "CUA permissions probe",
   });
+  if (!probe.ok) {
+    if (probe.reason === "timeout") {
+      return {
+        available: false,
+        reason: nativeProbeFailureMessage("cua-driver permissions status did not complete", probe),
+      };
+    }
+  }
+  const stdout = probe.result?.stdout ?? "";
   try {
-    return { available: true, ...JSON.parse(out.stdout) };
+    return { available: true, ...JSON.parse(stdout) };
   } catch {
-    return { available: true, raw: out.stdout?.trim() };
+    return { available: true, raw: stdout.trim() };
   }
 }
 

@@ -9,6 +9,7 @@ import {
   classifyNativeProbe,
   nativeProbeFailureMessage,
   oneLine,
+  probeNativeSync,
   probeNativeVersion,
 } from "./native-version-probe.mjs";
 import {
@@ -117,6 +118,21 @@ describe("the shared native version probe", () => {
       causes: { version: () => "it ran but did not report the pinned version" },
     });
     expect(message).toContain("it ran but did not report the pinned version");
+  });
+
+  it("exposes the sync entry point under the name execFileSync call sites expect", () => {
+    expect(probeNativeSync).toBe(probeNativeVersion);
+  });
+
+  it("forwards spawnOptions such as env into the child", () => {
+    const { spawn, calls } = fakeSpawn([probeResult({ stdout: "cua-driver 1.2.3\n" })]);
+    probeNativeVersion("/staged/binary", {
+      spawn,
+      matchVersion: matchCua,
+      spawnOptions: { env: { LANG: "C" } },
+      ...quiet,
+    });
+    expect(calls[0].options.env).toEqual({ LANG: "C" });
   });
 
   it("announces the retry so a stalled build says why it paused", () => {

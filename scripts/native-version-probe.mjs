@@ -71,9 +71,11 @@ export function probeNativeVersion(binary, options = {}) {
     args = ["version"],
     matchVersion,
     spawn = spawnSync,
+    spawnOptions = {},
     timeoutMs = NATIVE_PROBE_TIMEOUT_MS,
     attempts = NATIVE_PROBE_ATTEMPTS,
     log = console.error,
+    probeLabel = "version probe",
   } = options;
   if (typeof matchVersion !== "function") {
     throw new TypeError("probeNativeVersion requires a matchVersion function");
@@ -84,17 +86,22 @@ export function probeNativeVersion(binary, options = {}) {
       encoding: "utf8",
       windowsHide: true,
       timeout: timeoutMs,
+      ...spawnOptions,
     });
     last = { ...classifyNativeProbe(result, matchVersion), result, attempt, attempts, timeoutMs };
     if (last.ok) return last;
     if (last.reason !== "timeout" || attempt === attempts) break;
     log(
-      `version probe for ${binary} timed out after ${Math.round(timeoutMs / 1000)}s — retrying ` +
+      `${probeLabel} for ${binary} timed out after ${Math.round(timeoutMs / 1000)}s — retrying ` +
         `(attempt ${attempt + 1} of ${attempts})`,
     );
   }
   return last;
 }
+
+/** Same retry and classification rules as `probeNativeVersion`, exposed under the
+ * name call sites use when replacing `execFileSync` / `spawnSync` directly. */
+export const probeNativeSync = probeNativeVersion;
 
 const CAUSES = {
   timeout: (probe) =>
