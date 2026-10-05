@@ -7,7 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { augmentedPath, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
+import { augmentedPath, findCliCandidates, resetPathCache, resetPathCacheForTests, splitCliString } from "./env-path.ts";
 import { resolveCli } from "./procs.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
@@ -233,6 +233,53 @@ describe("augmentedPath", () => {
       // system dir — hoisting only closes the gap to the farm.
       expect(installer).toBeLessThan(system);
       expect(installer).toBeLessThan(symlinks);
+      // Pin the exact order rather than the two inequalities above.  Those
+      // also admit [installerDir, symlinkFarm, systemDir], which hoisting
+      // across the system dir would produce; the tuple pins the whole
+      // relative order, so a relocation anywhere in the first three fails.
+      expect(parts.slice(0, 3)).toEqual([installerDir, systemDir, symlinkFarm]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("resolves the canonical mcode ahead of the ~/.local/bin one", async () => {
+    // The reason any of the ordering above matters.  Every ordering assertion
+    // in this file is an index comparison, and an index comparison cannot see
+    // a swap of two real files: both dirs sit in the merged PATH either way
+    // and only their order decides which one a bare `mcode` executes.  This
+    // asserts the resolved binary instead, over two shims that print
+    // different content, and then runs the winner to prove it.
+    //
+    // The inherited PATH carries the symlink farm and no canonical dir —
+    // the GUI-launch shape, and the case knownDirs() ordering alone loses,
+    // since the farm arrives ahead of every known dir in the merge.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    mkdirSync(installerDir, { recursive: true });
+    mkdirSync(symlinkFarm, { recursive: true });
+    const canonical = join(installerDir, "mcode");
+    const farmCopy = join(symlinkFarm, "mcode");
+    writeFileSync(canonical, "#!/bin/sh\necho canonical\n");
+    writeFileSync(farmCopy, "#!/bin/sh\necho farm\n");
+    chmodSync(canonical, 0o755);
+    chmodSync(farmCopy, 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      // The first candidate is what a bare `mcode` runs: the canonical copy,
+      // not the symlink farm's.  dedupeByInode keeps both, because the two
+      // are distinct files rather than two names for one.
+      const candidates = findCliCandidates("mcode");
+      expect(candidates[0]).toBe(canonical);
+      expect(candidates).toContain(farmCopy);
+      const stdout = await new Promise<string>((resolve, reject) => {
+        execFile("mcode", [], { env: { PATH: augmentedPath() } }, (err, out) => (err ? reject(err) : resolve(out)));
+      });
+      expect(stdout.trim()).toBe("canonical");
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;

@@ -164,6 +164,16 @@ function promoteCanonicalDirs(parts: string[]): string[] {
       // that already sits ahead of the farm keeps its position, so the
       // move never crosses entries that outranked the farm and no other
       // CLI's resolution changes.
+      //
+      // `parts.indexOf(dir) > farmIndex` reads like a duplicate of `!seen`:
+      // hoist() only fires at the farm index, where every earlier part is
+      // already in `seen`, so on any dir the merged list CARRIES the two
+      // spellings agree.  The index test is still load-bearing for a dir
+      // the list does not carry — indexOf is -1, which no farm index beats,
+      // and it is what stops a canonical dir that is absent from PATH
+      // (uninstalled, or filtered out by knownDirs' existsSync) from being
+      // injected at the farm.  Dropping it appends ~/.kimi-code/bin to the
+      // PATH of a machine that has no kimi install.
       if (!seen.has(dir) && parts.indexOf(dir) > farmIndex) {
         out.push(dir);
         seen.add(dir);
