@@ -188,9 +188,17 @@ export function museAuthenticated(env: Record<string, string | undefined>): bool
 
 /** The sign-in sentence the harness shows when this engine is not authenticated.
  *  Exported so a test can hold it to `museAuthenticated` — the bug this encodes
- *  was the two drifting apart. */
+ *  was the two drifting apart.
+ *
+ *  The trailing instruction is not decoration.  `muse auth set --api-key-stdin`
+ *  reads the key from stdin, which is what keeps it out of shell history, and
+ *  it therefore **blocks until it gets one**.  The setup surfaces say "paste
+ *  the command and press Enter" and nothing more, so a user who followed them
+ *  exactly sat in a terminal that looked hung:  no key, no EOF, no stored
+ *  credential, and a card that never cleared.  Naming the key and the Ctrl-D
+ *  is the difference between a command that works and one that appears frozen. */
 export const MUSE_LOGIN_NOTE =
-  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it";
+  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
 
 const support: AcpSupport = {
   driverKind: "museAgent",

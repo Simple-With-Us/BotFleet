@@ -186,5 +186,11 @@ describe("Muse Code driver", () => {
     expect(signIn).toBe("muse auth set --provider meta --api-key-stdin");
     expect(signIn).not.toContain("--cli login");
     expect(MUSE_LOGIN_NOTE).toContain("API key");
+    // The command reads the key from stdin, so it BLOCKS.  Without the key and
+    // the EOF named in the note, a user following the setup card sits in a
+    // terminal that looks hung and the card never clears.
+    expect(MUSE_LOGIN_NOTE).toContain("--api-key-stdin");
+    expect(MUSE_LOGIN_NOTE).toMatch(/paste the key/i);
+    expect(MUSE_LOGIN_NOTE).toMatch(/ctrl-d/i);
   });
 });
