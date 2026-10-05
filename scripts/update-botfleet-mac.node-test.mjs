@@ -1057,7 +1057,7 @@ test("quiesce treats a process that exits between verification and SIGTERM as st
   assert.deepEqual(strict.signals, [[501, "SIGTERM"]]);
 });
 
-test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", async () => {
+test("quiesce skips a process that exits while ps is describing it instead of calling it foreign", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   const { signals, deps } = processTable({
     501: { command: electronMain, cwd: "/", exitDuringPs: true },
     16529: { command: checkoutHarness, cwd: quiesceConfig.checkout },
@@ -1069,7 +1069,7 @@ test("quiesce skips a process that exits while ps is describing it instead of ca
   assert.deepEqual(signals, [[16529, "SIGTERM"]]);
 });
 
-test("quiesce re-resolves the harness when its pid changed between capture and quiesce", async () => {
+test("quiesce re-resolves the harness when its pid changed between capture and quiesce", { skip: process.platform === "win32" ? "the quiesce helpers shell out to lsof" : false }, async () => {
   // Capture recorded harness pid 233.  By quiesce that harness is gone, 233
   // names an unrelated process, and the replacement harness 16529 holds the
   // database and answers port 8799.
