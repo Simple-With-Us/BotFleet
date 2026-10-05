@@ -104,6 +104,18 @@ const liveScreenFrame = z.object({
   capturedAt: z.number().optional(),
 });
 
+/**
+ * The polled screenshot crosses an HTTP boundary and decides which picture the
+ * panel paints, so its shape is checked rather than trusted.  A malformed or
+ * truncated body must not be able to land `undefined` in `polledAt` and silently
+ * make a capture look older than a frame it actually beat.
+ */
+const cloudScreenshot = z.object({
+  png: z.string().min(1),
+  format: z.enum(["png", "jpeg"]),
+  capturedAt: z.number().int().positive(),
+});
+
 export function ComputerPanel({
   bot,
   onOpenVmWorkspace,
@@ -522,7 +534,11 @@ export function ComputerPanel({
   // `poll: false`, so this must not take down a live VM error.
   useEffect(() => {
     if (!cloudCaptureErrorIsStale(phase, preview.poll)) return;
+    // Both counters, not just the cloud one: clearing the banner while the VM
+    // counter is still pinned at the limit means the next transient VM blip
+    // re-raises an error the person has already been shown is stale.
     captureFailures.current = 0;
+    vmFailures.current = 0;
     setCaptureProblem(null);
   }, [phase, preview.poll]);
   // When the polled capture landed, so `newestPreview` can compare ages.
@@ -538,7 +554,7 @@ export function ComputerPanel({
   // the one already running instead of starting a second.  Clearing the ref in
   // the cleanup instead would let two full-frame SSH captures hit the box at
   // once, which is the opposite of what this is for.
-  const pendingCapture = useRef<Promise<{ png: string; format: string; capturedAt?: number }> | null>(null);
+  const pendingCapture = useRef<Promise<z.infer<typeof cloudScreenshot>> | null>(null);
   // Whether this panel instance is still on screen.  Guarding the RESULT on
   // this rather than on the effect generation is what lets an adopted capture
   // still paint.  `key={bot.id}` remounts per bot, so one instance is one bot.
@@ -554,7 +570,12 @@ export function ComputerPanel({
     const shoot = () => {
       pendingCapture.current ??= (async () => {
         try {
-          const frame = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
+          // Validated, not trusted: a body that does not match is a capture
+          // failure like any other, and is counted and reported as one rather
+          // than being allowed to half-apply.
+          const frame = cloudScreenshot.parse(
+            await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" }),
+          );
           if (captureFailures.current > 0) {
             captureFailures.current = 0;
             setCaptureProblem(null);
@@ -585,7 +606,7 @@ export function ComputerPanel({
       return pendingCapture.current;
     };
     const apply = async () => {
-      let frame: { png: string; format: string; capturedAt?: number };
+      let frame: z.infer<typeof cloudScreenshot>;
       try {
         frame = await shoot();
       } catch {
@@ -595,9 +616,10 @@ export function ComputerPanel({
       if (!panelLive.current) return;
       setPolledFrame({ png: frame.png, mime: frame.format === "jpeg" ? "image/jpeg" : "image/png" });
       // Compare PICTURE age, not arrival age, and in the harness's clock for
-      // both sources.  The browser clock is a fallback for a harness too old
-      // to stamp its own frames.
-      setPolledAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
+      // both sources.  The schema makes `capturedAt` required precisely so the
+      // browser clock is never silently substituted here — that substitution
+      // is what put two clock domains in the comparison in the first place.
+      setPolledAt(frame.capturedAt);
     };
     void apply();
     const timer = setInterval(() => void apply(), preview.intervalMs);
