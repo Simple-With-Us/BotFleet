@@ -376,3 +376,39 @@ test("a run that did not succeed is a build failure, not a GitHub outage", async
     );
   }
 });
+
+test("an entry name crafted to defeat a column parser is still checked", () => {
+  // The first version of the guard parsed `zipinfo -l` with a regex over the
+  // mode/size/version/os/flags/date/time columns.  A name containing something
+  // that broke the pattern made the WHOLE LINE unparseable, and unparseable
+  // lines were skipped — so a traversal could be hidden by being shaped to look
+  // unparseable.  The guard now takes names from `zipinfo -1`, one per line,
+  // where there are no columns to get wrong, and matches types by name.
+  const entries = [
+    { name: "BotFleet.app/Contents/MacOS/BotFleet", mode: "-rwxr-xr-x" },
+    { name: "../../../../.ssh/authorized_keys", mode: "-rw-r--r--" },
+    { name: "  leading-whitespace-evil.zip", mode: "-rw-r--r--" },
+    { name: "tabs\tand  spaces/BotFleet.app", mode: "-rw-r--r--" },
+  ];
+  // Every one of them reaches the checker, whatever their shape.
+  for (const { name } of entries) {
+    const label = JSON.stringify(name);
+    assert.throws(
+      () => assertSafeArchiveEntries(entries, { label }),
+      (error) => {
+        assert.equal(error.cause, "unsafe-archive", `${label} must be refused`);
+        assert.match(error.message, new RegExp(escapeForRegExp(label)), `${label} must be named in the refusal`);
+        return true;
+      },
+    );
+  }
+  // And the shape that must NOT be refused: an ordinary bundle with sidecars.
+  assert.doesNotThrow(() => assertSafeArchiveEntries([
+    { name: "BotFleet.app/Contents/MacOS/BotFleet", mode: "-rwxr-xr-x" },
+    { name: "__MACOSX/BotFleet.app/._BotFleet", mode: "-rw-r--r--" },
+  ], { label: "app bundle" }));
+});
+
+function escapeForRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

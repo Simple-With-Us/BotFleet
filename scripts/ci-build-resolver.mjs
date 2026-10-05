@@ -389,35 +389,115 @@ export function assertSafeArchiveEntries(entries, { label = "artifact" } = {}) {
   return entries;
 }
 
-async function listArchiveEntries(archivePath) {
-  // `zipinfo -l` lists names AND modes without extracting anything, so a hostile
-  // archive is inspected before it can touch the filesystem.  A machine without
-  // zipinfo cannot answer, which is treated as unsafe rather than as fine.
-  let stdout;
+/**
+ * Read a child process's stdout with a hard cap, failing if the cap is passed.
+ *
+ * `run` accumulates stdout into a string with no limit and, because it uses
+ * `spawn` rather than `execFile`, its `maxBuffer` option is silently ignored —
+ * so a hostile archive with a million entries would have had this resolver
+ * building an unbounded string in memory, which is a denial-of-service vector in
+ * the updater on the owner's machine.  Anything past ARCHIVE_LIST_MAX_BYTES is
+ * refused rather than truncated: a partial listing is exactly the thing that
+ * must not be used to decide an archive is safe.
+ */
+const ARCHIVE_LIST_MAX_BYTES = 32 * 1024 * 1024;
+
+async function runBoundedText(command, args, { timeoutMs = 60_000, maxBytes = ARCHIVE_LIST_MAX_BYTES } = {}) {
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const chunks = [];
+  let total = 0;
+  let overflow = false;
+  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
-    stdout = await run("zipinfo", ["-l", archivePath], { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+    await new Promise((done, fail) => {
+      child.stdout.on("data", (chunk) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          overflow = true;
+          child.kill("SIGKILL");
+          return;
+        }
+        chunks.push(chunk);
+      });
+      child.stderr.resume();
+      child.once("error", fail);
+      child.once("close", (code) => (code === 0 ? done() : fail(new Error(`${command} exited with code ${code}`))));
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (overflow) {
+    throw new ResolutionError(
+      `The hosted artifact's entry list exceeds ${maxBytes} bytes; refusing to extract an archive whose entries cannot be fully inspected`,
+      "unsafe-archive",
+    );
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Every entry in an archive, with its type, or a refusal to extract it.
+ *
+ * NAMES come from `zipinfo -1`, which prints one entry per line and nothing
+ * else.  The first version parsed `zipinfo -l` with a regex, and that was a hole
+ * exactly where it mattered: a crafted entry name could fail the pattern, so
+ * the entry was silently DROPPED and never checked — a traversal named
+ * `../..` or an absolute path could therefore slip past the guard by being
+ * shaped so the parser could not read it.  A line-oriented listing has no field
+ * boundaries to get wrong, so every name is necessarily checked.
+ *
+ * TYPES come from `zipinfo -l` and are matched by name.  If that listing cannot
+ * be read, the archive is refused: we would not know which entries are symlinks,
+ * and a symlink entry is a Zip Slip that survives extraction.
+ */
+async function listArchiveEntries(archivePath) {
+  let nameList;
+  let typeList;
+  try {
+    [nameList, typeList] = await Promise.all([
+      runBoundedText("zipinfo", ["-1", archivePath]),
+      runBoundedText("zipinfo", ["-l", archivePath]),
+    ]);
   } catch (error) {
     throw new ResolutionError(
       `Could not list the hosted artifact's entries before extracting it (${error?.message || error}); refusing to extract an archive that cannot be inspected`,
       "unsafe-archive",
     );
   }
-  const entries = [];
-  for (const line of String(stdout).split("\n")) {
-    // Mode string, size, version, os, flags, date, time, then the name.
-    const match = line.match(/^([-dlbcps][-rwxSsTt]{9})\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$/);
-    if (match) entries.push({ name: match[2].trim(), mode: match[1] });
-  }
-  if (entries.length === 0) {
+
+  const names = nameList.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (names.length === 0) {
     throw new ResolutionError(
-      `Could not parse the hosted artifact's entry list, so its names cannot be checked; refusing to extract it`,
+      `The hosted artifact's entry list came back empty, so its names cannot be checked; refusing to extract it`,
       "unsafe-archive",
     );
   }
-  return entries;
-}
 
-/**
+  // The permission string's first character is the type: d directory,
+  // l symlink, - regular file.  The first character alone is matched, so a
+  // name that contains spaces or odd characters cannot shift the columns and
+  // make a line unparseable — which was the original hole.
+  const symlinks = new Set();
+  let typedLines = 0;
+  for (const line of typeList.split("\n")) {
+    const match = line.match(/^([-dlbcps])[-rwxsStT]{9}\s+(.*)$/);
+    if (!match) continue;
+    typedLines += 1;
+    if (match[1] === "l") symlinks.add(match[2].trim());
+  }
+  // Zero PARSED type lines means the format is not what we expect, so we cannot
+  // tell a symlink from a regular file and must refuse.  A parsed listing with
+  // no symlinks in it is an ordinary archive and is fine — that distinction is
+  // the whole point, and conflating them would refuse every real build.
+  if (typedLines === 0) {
+    throw new ResolutionError(
+      `Could not read the hosted artifact's entry types, so its symlink entries cannot be ruled out; refusing to extract it`,
+      "unsafe-archive",
+    );
+  }
+
+  return names.map((name) => ({ name, mode: symlinks.has(name) ? "lrwxrwxrwx" : "-rw-r--r--" }));
+}/**
  * Unpack the artifact zip, verify it, and leave a real `.app` directory.
  *
  * The outer zip is GitHub's artifact wrapper; the inner one is the bundle the
