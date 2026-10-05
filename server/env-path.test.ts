@@ -123,6 +123,26 @@ describe("augmentedPath", () => {
 
   const posixIt2 = it.skipIf(process.platform === "win32");
 
+  // Hoisting is gated on the farm really shadowing the CLI, so the tests that
+  // expect a hoist plant the shim in both dirs, the shape the MiniMax Code
+  // installer leaves behind.
+  const plantShims = (installerDir: string, symlinkFarm: string, name = "mcode"): void => {
+    for (const dir of [installerDir, symlinkFarm]) {
+      const file = join(dir, name);
+      writeFileSync(file, "#!/bin/sh\nexit 0\n");
+      chmodSync(file, 0o755);
+    }
+  };
+
+  // setup.ts shares one throwaway home across this file, so shims an earlier
+  // test planted would otherwise still be there for the gating tests below.
+  const freshDirs = (...dirs: string[]): void => {
+    for (const d of dirs) {
+      rmSync(d, { recursive: true, force: true });
+      mkdirSync(d, { recursive: true });
+    }
+  };
+
   posixIt2("puts a canonical installer dir ahead of the ~/.local/bin symlink farm", () => {
     // The MiniMax Code installer drops a ~/.local/bin/mcode symlink to a
     // launcher that is not symlink-safe: it resolves its data dir from the
@@ -156,6 +176,7 @@ describe("augmentedPath", () => {
     const symlinkFarm = join(homedir(), ".local", "bin");
     mkdirSync(installerDir, { recursive: true });
     mkdirSync(symlinkFarm, { recursive: true });
+    plantShims(installerDir, symlinkFarm);
     const previous = process.env.PATH;
     try {
       process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
@@ -187,6 +208,7 @@ describe("augmentedPath", () => {
     const symlinkFarm = join(homedir(), ".local", "bin");
     mkdirSync(installerDir, { recursive: true });
     mkdirSync(symlinkFarm, { recursive: true });
+    plantShims(installerDir, symlinkFarm);
     const previous = process.env.PATH;
     try {
       process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
@@ -238,6 +260,81 @@ describe("augmentedPath", () => {
       // across the system dir would produce; the tuple pins the whole
       // relative order, so a relocation anywhere in the first three fails.
       expect(parts.slice(0, 3)).toEqual([installerDir, systemDir, symlinkFarm]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("leaves the merged PATH order alone when the farm carries no shim", () => {
+    // Kody #759: the GUI-launch shape puts the farm at index 0, so an
+    // unconditional hoist moved ~/.minimax-code/bin ahead of /usr/bin and
+    // every other inherited entry, changing resolution for any binary the
+    // canonical dir shares with them.  With no ~/.local/bin/mcode to shadow,
+    // there is nothing to fix and the order must be exactly the merge order.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, symlinkFarm, systemDir);
+    // The canonical dir has the real CLI; only the farm's shim is missing.
+    writeFileSync(join(installerDir, "mcode"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(installerDir, "mcode"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, installerDir, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 3)).toEqual([symlinkFarm, systemDir, installerDir]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("does not hoist a canonical dir that lacks the CLI the farm shadows", () => {
+    // A farm shim with no canonical copy behind it gains nothing from the
+    // move, so the dir stays where the merge put it.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, symlinkFarm, systemDir);
+    writeFileSync(join(symlinkFarm, "mcode"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(symlinkFarm, "mcode"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, installerDir, ...(previous ?? "").split(delimiter)].join(delimiter);
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 3)).toEqual([symlinkFarm, systemDir, installerDir]);
+    } finally {
+      if (previous === undefined) delete process.env.PATH;
+      else process.env.PATH = previous;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt2("hoists only the installer whose CLI the farm shadows", () => {
+    // Each canonical dir is gated on its own shim: a farm carrying only
+    // `mcode` moves ~/.minimax-code/bin and leaves ~/.kimi-code/bin in place.
+    const installerDir = join(homedir(), ".minimax-code", "bin");
+    const kimiDir = join(homedir(), ".kimi-code", "bin");
+    const symlinkFarm = join(homedir(), ".local", "bin");
+    const systemDir = join(homedir(), ".system-bin");
+    freshDirs(installerDir, kimiDir, symlinkFarm, systemDir);
+    plantShims(installerDir, symlinkFarm);
+    writeFileSync(join(kimiDir, "kimi"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(kimiDir, "kimi"), 0o755);
+    const previous = process.env.PATH;
+    try {
+      process.env.PATH = [symlinkFarm, systemDir, kimiDir, installerDir, ...(previous ?? "").split(delimiter)].join(
+        delimiter,
+      );
+      resetPathCacheForTests();
+      const parts = augmentedPath().split(delimiter);
+      expect(parts.slice(0, 4)).toEqual([installerDir, symlinkFarm, systemDir, kimiDir]);
+      expect(new Set(parts).size).toBe(parts.length);
     } finally {
       if (previous === undefined) delete process.env.PATH;
       else process.env.PATH = previous;
