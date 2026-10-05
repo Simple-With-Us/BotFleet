@@ -65,11 +65,17 @@ let fakeSlowProbeStarted: string;
 let fakeRecallCli: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  init?: { signal?: AbortSignal },
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: init?.signal,
   });
   return { status: res.status, body: await res.json() };
 };
@@ -89,29 +95,31 @@ const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutM
  *
  *  The Windows runner is roughly a third slower than the others and its test
  *  files overlap more, so anything that asserts a settled instance state or a
- *  write landing *immediately* is a coin flip there and a certainty here.  Both
- *  call sites below passed on macOS and ubuntu across many runs, which is
- *  exactly the shape of a flake that only ever reports itself on one platform.
+ *  write landing *immediately* is a coin flip there and a certainty here.
  *
- *  `expect.poll` rather than a hand-rolled loop: it owns the deadline, its own
- *  backoff, and the failure message, so a bounded wait is bounded by the runner
- *  rather than by how long a single `await` happens to hang.  `read` must NOT
- *  pass `fresh=1` — that re-probes every engine in the fleet on each tick, and
- *  hammering the registry is the last thing a test waiting on a slow runner
- *  should be doing.
+ *  `expect.poll` owns the deadline, backoff, and failure message.  `signal` is
+ *  aborted when the overall timeout elapses so a stalled `api()` fetch is
+ *  abandoned instead of consuming the caller's test budget.
  */
 const settlesWithin = async (
-  read: () => Promise<boolean>,
+  read: (opts: { signal: AbortSignal }) => Promise<boolean>,
   timeoutMs: number,
+  intervalMs: number,
   what: string,
 ): Promise<void> => {
-  await expect
-    .poll(read, {
-      timeout: timeoutMs,
-      interval: 200,
-      message: `${what} did not settle within ${timeoutMs}ms`,
-    })
-    .toBe(true);
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    await expect
+      .poll(async () => await read({ signal: abort.signal }), {
+        timeout: timeoutMs,
+        interval: intervalMs,
+        message: `${what} did not settle within ${timeoutMs}ms`,
+      })
+      .toBe(true);
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
@@ -3095,26 +3103,21 @@ describe("harness HTTP API", () => {
         await api("POST", `/api/bots/${bot.id}/interrupt`, {});
         await api("DELETE", `/api/bots/${bot.id}`);
       }
-      // The endpoint answers 409 while a previous overlapping write is still
-      // draining — which is the documented behaviour, and exactly what a
-      // cleanup racing its own test produces on a slow runner.  Assert 200 on
-      // the first attempt anyway and the cleanup fails the test it is trying
-      // to protect, leaving the instance disabled for whatever runs next.
-      //
-      // 2s each, and the six of them share it.  A drain takes about a second,
-      // so 2s is twice the thing being waited on; at 4s each this block could
-      // eat 24s of a 40s budget and trade a flaky assertion for a timeout.
+      let next = 0;
       await settlesWithin(
-        async () => {
-          for (const instanceId of otherInstances) {
-            if ((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status !== 200) return false;
+        async ({ signal }) => {
+          for (; next < otherInstances.length; next++) {
+            if ((await api("PATCH", `/api/instances/${otherInstances[next]}`, { enabled: true }, { signal })).status !== 200) {
+              return false;
+            }
           }
           for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
-            if ((await api("PATCH", path, { enabled: false, fullAuto: false })).status !== 200) return false;
+            if ((await api("PATCH", path, { enabled: false, fullAuto: false }, { signal })).status !== 200) return false;
           }
           return true;
         },
         6_000,
+        200,
         "instance cleanup writes",
       );
     }
@@ -5558,27 +5561,19 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      // An engine that a neighbouring test left reloading is still settling;
-      // `unavailable` here means "asked too early", not "broken".  Poll for
-      // the settled state and keep the assertion, so a genuinely unavailable
-      // engine still fails here rather than being retried past.
-      // `fresh=1` ONCE, to force the describe that re-probes; every poll after
-      // it omits the flag and reads the cached snapshot.  Polling WITH it would
-      // re-probe the entire engine fleet on each tick — and a test that is
-      // waiting out a slow runner should not be the thing making it slow.
-      await api("GET", "/api/instances?fresh=1");
       // An engine a neighbouring test left reloading is still settling;
       // `unavailable` here means "asked too early", not "broken".  3s of this
-      // test's 20s budget, because a genuinely dead engine must fail at this
-      // line rather than being waited out.
+      // test's 20s budget — poll `fresh=1` on a coarse interval so each tick is
+      // a real re-probe without storming the fleet every 200ms.
       await settlesWithin(
-        async () => {
-          const instances = (await api("GET", "/api/instances")).body.instances;
+        async ({ signal }) => {
+          const instances = (await api("GET", "/api/instances?fresh=1", undefined, { signal })).body.instances;
           return instances.find(
             (instance: { instanceId: string }) => instance.instanceId === "claude",
           )?.snapshot?.state === "available";
         },
         3_000,
+        1_000,
         "the claude engine reaching available",
       );
       const claude = (await api("GET", "/api/instances")).body.instances.find(
