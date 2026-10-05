@@ -1023,6 +1023,7 @@ function processTable(entries) {
       if (entry.exitDuringLsof) entry.alive = false;
       return entry.cwd;
     },
+    txtPathsOf: async () => [],
     kill: (pid, signal) => {
       const entry = table.get(pid);
       if (entry?.killError) throw entry.killError;

@@ -1422,7 +1422,7 @@ export function isRecoverableResolutionFailure(error) {
   return false;
 }
 
-export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
+export async function isExpectedBotFleetProcess(command, cwd, config, pid, txtPathsOf = processTxtPaths) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
     return true;
@@ -1434,7 +1434,7 @@ export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
     return true;
   }
   if (pid) {
-    const txtPaths = await processTxtPaths(pid);
+    const txtPaths = await txtPathsOf(pid);
     const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
     if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
       return true;
@@ -1711,6 +1711,7 @@ export async function terminateVerified(pids, previous, config, {
   isAlive = processIsAlive,
   commandOf = processCommand,
   cwdOf = processCwd,
+  txtPathsOf = processTxtPaths,
   kill,
   wait = sleep,
   now = Date.now,
@@ -1724,7 +1725,7 @@ export async function terminateVerified(pids, previous, config, {
     const cwd = await cwdOf(pid);
     const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
       previous.processCwds?.[pid] === cwd;
-    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
+    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid, txtPathsOf))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
       if (!isAlive(pid)) continue;
