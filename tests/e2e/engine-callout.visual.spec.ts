@@ -47,20 +47,27 @@ test('visual: engine callout with two provider marks (Clutch)', async ({ page })
   await expect(clutch.getByTitle('MiniMax models')).toBeVisible();
 
   // The label and the headline must be one inline run:  no flex gap may land
-  // between them.  A gap of 6px or a 0-width join both fail this.
-  const joined = await clutch.evaluate((root) => {
-    const strong = Array.from(root.querySelectorAll('strong')).find((n) => n.textContent?.trim() === 'Why This Engine?');
-    if (!strong || !strong.parentElement) return null;
-    const parent = strong.parentElement;
-    // The text node after <strong> inside the SAME element is the space that
-    // separates the label from the headline.  If flex broke them apart the
-    // whitespace would have moved out here and the parent would be the <p>.
-    const range = document.createRange();
-    range.setStartAfter(strong);
-    range.setEnd(strong.parentElement === parent ? parent.childNodes[Array.from(parent.childNodes).indexOf(strong) + 1]! : parent, 0);
-    return { sameParent: strong.parentElement === parent.parentElement, html: parent.innerHTML.slice(0, 120) };
+  // between them, and the headline may not become a separate flex item that
+  // wrapping can strand on its own line.  The encoding is structural — the
+  // <strong> sits inside a <span> that also holds the headline text — because
+  // a pixel diff would not tell you which of the two broke.
+  const shape = await clutch.evaluate((root) => {
+    const strong = Array.from(root.querySelectorAll('strong')).find(
+      (node) => node.textContent?.trim() === 'Why This Engine?',
+    );
+    const parent = strong?.parentElement;
+    if (!parent) return null;
+    return {
+      tag: parent.tagName,
+      // The headline is a text node inside that same parent.
+      holdsHeadline: (parent.textContent ?? '').includes(
+        'DeepSeek models over the Clutch ACP bridge',
+      ),
+    };
   });
-  expect(joined?.sameParent, 'label and headline share one inline parent').toBe(true);
+  expect(shape, 'the label must sit inside an inline wrapper').not.toBeNull();
+  expect(shape?.tag, 'label and headline share one inline box, not two flex items').toBe('SPAN');
+  expect(shape?.holdsHeadline, 'that box also contains the headline text').toBe(true);
 
   await expect(clutch).toHaveScreenshot('engine-callout-two-marks.png', stableShot);
 });
