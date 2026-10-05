@@ -1412,11 +1412,23 @@ describe("ProviderRegistry describe: single flight and last-known-good", () => {
     const deferred = await registry.describe({ maxAgeMs: 15_000, staleWhileRevalidate: true });
     expect(fake.snapshotCalls).toBe(1);
     expect(deferred[0].snapshot.version).toBe("v1");
-    expect(registry.describeWasStale(deferred)).toBe(true);
+    expect(registry.describeWasStale()).toBe(true);
 
     hot = false;
     await registry.describe({ force: true });
     expect(fake.snapshotCalls).toBe(2);
+  });
+
+  it("does not mark engine-health describe callers stale while the host is hot", async () => {
+    const fake = makeFakeDriver({
+      snapshotImpl: async (_input, call) => ({ state: "available", version: `v${call}` }),
+    });
+    const registry = new ProviderRegistry([fake.driver], { hostHot: () => true });
+    await registry.load({ a: { driver: "fake" } });
+    await registry.describe();
+    await registry.describe({ maxAgeMs: 15_000 });
+    expect(fake.snapshotCalls).toBe(1);
+    expect(registry.describeWasStale()).toBe(false);
   });
 
   it("still probes on an explicit refresh while the host is hot", async () => {

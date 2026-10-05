@@ -1451,7 +1451,7 @@ function instancesPayload(described: DescribedInstance[]) {
   return {
     instances: presentInstances(described),
     describedAt: registry.describedAtOf(described),
-    ...(registry.describeWasStale(described) ? { stale: true } : {}),
+    ...(registry.describeWasStale() ? { stale: true } : {}),
   };
 }
 

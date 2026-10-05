@@ -275,8 +275,8 @@ export class ProviderRegistry {
   private readonly entryDeadlineMs: number;
   private readonly transientRecheckMs: number;
   private readonly hostHot: () => boolean;
-  /** Set when a describe() answers from cache because the host is hot. */
-  private describeStale = new WeakMap<DescribedInstance[], boolean>();
+  /** Set when the latest describe() answered from cache because the host was hot. */
+  private lastDescribeStale = false;
 
   constructor(drivers: readonly AnyProviderDriver[], options: ProviderRegistryOptions = {}) {
     this.driversByKind = new Map(drivers.map((d) => [d.driverKind, d]));
@@ -293,18 +293,13 @@ export class ProviderRegistry {
     return this.probeConcurrency;
   }
 
-  private isForcedDescribe(opts?: DescribeOptions): boolean {
-    if (opts === undefined) return true;
-    return opts.force === true;
+  private markDescribeStale(): void {
+    this.lastDescribeStale = true;
   }
 
-  private markDescribeStale(result: DescribedInstance[]): void {
-    this.describeStale.set(result, true);
-  }
-
-  /** Whether `result` was served from cache while the host was hot. */
-  describeWasStale(result: DescribedInstance[]): boolean {
-    return this.describeStale.get(result) === true;
+  /** Whether the most recent describe() was served from cache while the host was hot. */
+  describeWasStale(): boolean {
+    return this.lastDescribeStale;
   }
 
   private async loadEntry(instanceId: InstanceId, entry: InstanceConfig): Promise<ProviderInstance | null> {
@@ -622,8 +617,8 @@ export class ProviderRegistry {
   }
 
   async describe(opts?: DescribeOptions): Promise<DescribedInstance[]> {
+    this.lastDescribeStale = false;
     const maxAge = opts?.maxAgeMs ?? 0;
-    const forced = this.isForcedDescribe(opts);
     const hot = this.hostHot();
     // Ages are read on both clocks (see procs.ts elapsedSince): a stamp can
     // run ahead of the wall clock after it is corrected backwards, and plain
@@ -631,13 +626,6 @@ export class ProviderRegistry {
     // correction on top of maxAge itself.
     const clock = readClock();
     const done = this.lastDone;
-    // Under swap/load thrash, spawning six CLIs at once makes every probe miss
-    // its deadline.  Passive callers get the last answer, flagged stale, until
-    // the host cools; explicit refreshes still probe (at reduced concurrency).
-    if (hot && !forced && done) {
-      this.markDescribeStale(done.result);
-      return done.result;
-    }
     // A sweep already running that started after the last completed one is
     // the newest answer there is, and a caller that decides something from
     // engine health (the automatic fallback walk) must see it rather than an
@@ -655,7 +643,10 @@ export class ProviderRegistry {
         return running.promise;
       }
     }
-    if (maxAge > 0 && done && elapsedSince(done.born, clock) <= maxAge) return done.result;
+    if (maxAge > 0 && done && elapsedSince(done.born, clock) <= maxAge) {
+      if (hot && opts?.staleWhileRevalidate) this.markDescribeStale();
+      return done.result;
+    }
 
     // A caller that can live with a slightly old answer gets the last
     // completed one immediately while a new probe runs behind it.  Probing
@@ -664,7 +655,8 @@ export class ProviderRegistry {
     // making every caller block on it is what makes the model picker look
     // empty rather than slow.
     if (opts?.staleWhileRevalidate && done) {
-      if (!hot) void this.ensureSweep().catch(() => {});
+      if (hot) this.markDescribeStale();
+      else void this.ensureSweep().catch(() => {});
       return done.result;
     }
 
@@ -796,7 +788,6 @@ export class ProviderRegistry {
    * every engine has answered. */
   private scheduleRecheck(result: DescribedInstance[]): void {
     if (this.transientRecheckMs <= 0 || this.disposed) return;
-    if (this.hostHot()) return;
     const waiting = result.some((info) => info.snapshot.transient && !info.snapshot.hidden);
     if (!waiting) {
       this.recheckDelayMs = this.transientRecheckMs;
@@ -817,6 +808,10 @@ export class ProviderRegistry {
   /** Probe only the engines the last describe left as "Checking", one at a
    * time — a busy Mac is why they did not answer. */
   private async recheckTransient(): Promise<void> {
+    if (this.hostHot()) {
+      if (this.lastDone) this.scheduleRecheck(this.lastDone.result);
+      return;
+    }
     const done = this.lastDone;
     if (!done) return;
     for (const info of done.result) {
