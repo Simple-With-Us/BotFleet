@@ -13,11 +13,15 @@
 // The host API you receive is frozen.  You cannot mutate BotFleet
 // state from inside a plugin.  See docs/plugins/DESIGN.md for the
 // full host API surface.
+//
+// Your plugin runs in its own sandboxed process.  host.log() text stays
+// in that process; BotFleet records only the level and the length.
+// Keep log messages constant anyway: never log user input or bot data.
 
 export function getCardData({ cardId, host }) {
   if (cardId !== "example") return { result: null };
   const bots = host.getBots();
-  host.log("info", `rendering example card with ${bots.length} bots`);
+  host.log("info", "example card rendered");
   return { result: { a: bots.length, b: bots.length * 2 } };
 }
 

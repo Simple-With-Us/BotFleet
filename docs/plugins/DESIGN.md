@@ -29,9 +29,10 @@ A plugin system is a wide surface.  v1 deliberately keeps it small.
 *   No raw UI from plugins.  Plugins contribute data; the host renders it.
     No React from a plugin lands in the webview.
 *   No hot-reload of plugin code beyond an explicit reload endpoint.
-*   No subprocess isolation.  v1 plugin code runs in-process on the
-    server.  The trust model (imports land disabled; the user enables
-    them after reading the manifest) mirrors skills.
+*   No plugin code in the server process.  Each enabled plugin runs in
+    its own sandboxed child process (see § Trust Model).  The trust
+    model on top of that (imports land disabled; the user enables them
+    after reading the manifest) mirrors skills.
 *   No new `process.env` reads.  Plugin state is user data; it lives in
     the registry directory under `DATA_DIR`.
 
@@ -172,7 +173,7 @@ state across plugins.
       "updatedAt": "2026-10-04T12:00:00.000Z",
       "source": {
         "kind": "folder",           // "folder" | "git"
-        "path": "/path/to/fleet-overview-plugin",
+        "path": "<plugin-folder>",
         "ref": null
       },
       "warnings": []                // reserved for the future scan pass
@@ -206,15 +207,19 @@ sits next to `SKILL.md` rather than living in `config.json`.
 
 ## Host API
 
-Plugins never receive BotFleet internals.  They receive a single frozen
-`PluginHost` object created once per registry boot.
+Plugins never receive BotFleet internals.  They receive a frozen
+`PluginHost` object built inside their sandbox process for each call,
+from a snapshot the server has already filtered through the declared
+capabilities and the secret-key redaction.
 
 ```ts
 interface PluginHost {
   /** Host API version.  Plugins gate themselves on this. */
   readonly version: 1;
 
-  /** Scoped logger; messages are prefixed with the plugin name. */
+  /** Plugin-local logger.  The message text stays inside the sandbox;
+   *  the server records only the level, the length, and a hashed plugin
+   *  id, so a plugin cannot write arbitrary text into the host logs. */
   log(level: "info" | "warn" | "error", message: string): void;
 
   /** Read access to the bot store.  Returns a plain summary, not the
@@ -296,9 +301,12 @@ export async function runCommand({ args, host }) {
 ### What plugins cannot do in v1
 
 *   Render React or HTML.
-*   Mutate the bot store, registry, or filesystem outside their own
-    directory.
-*   Open network sockets.  `host.log` is the only side effect.
+*   Mutate the bot store, registry, or filesystem.  The sandbox grants
+    read access to the plugin's own directory and nothing else, and no
+    write access at all.
+*   Spawn processes, start worker threads, or load native addons.
+*   Open network sockets.  This is an authoring rule, not yet an
+    enforced one: see open question 1.
 *   Register hooks, listeners, or timers that outlive the command
     invocation.  Commands are synchronous, awaited in line.
 *   Read secrets, tokens, or credentials from the host.
@@ -402,10 +410,20 @@ The plugin model mirrors skills:
     empty result and a warning.
 3.  The host API is read-only and frozen.  A plugin cannot smuggle a
     reference back into BotFleet through reassignment.
-4.  The plugin module is loaded with `import()`.  ESM modules are
-    evaluated in the same process as the server; a plugin that wants
-    to do harm can read anything the server can read.  This is the
-    trade-off acknowledged in open question 1.
+4.  The plugin module never runs in the server process.  The loader
+    (`server/plugin-loader.ts`) spawns one child per enabled plugin
+    (`server/plugin-sandbox-child.ts`) with an empty environment, the
+    Node permission model (read access to the child script and the
+    plugin's own directory only; no filesystem writes, no child
+    processes, no worker threads, no native addons), a capped heap, and
+    a per-call deadline that kills the child when a handler overruns.
+    The child imports the plugin, reports which handlers it exports,
+    and answers host calls from the per-call snapshot.  Every message
+    the child sends back is parsed with a strict zod schema; anything
+    else kills the child.  Plugin log text and thrown error messages
+    never cross back; the server sees levels, lengths, and stable
+    reason codes.  If the running Node build has no permission model,
+    the loader refuses to run plugin code at all.
 
 ## Verification
 
@@ -422,11 +440,13 @@ The plugin model mirrors skills:
 
 ## Open Questions For The Owner
 
-1.  **In-process execution.**  Plugin code is `import()`-ed on the
-    server.  Disabled-by-default + the host-API boundary is the v1
-    trust gate.  Should v1 be declarative-only (manifest contributions,
-    no JS at all) or stay this way?  Subprocess isolation is a much
-    bigger change — out of v1 scope either way.
+1.  **Outbound network from the sandbox.**  Node's permission model
+    does not restrict outbound sockets, so a plugin can still open a
+    connection.  It has no credentials, no environment, and nothing
+    readable outside its own directory to send, but blocking egress
+    needs an OS-level mechanism (a network namespace on Linux, a
+    sandbox profile on macOS).  Should v1 ship with that, or should v1
+    be declarative-only (manifest contributions, no JS at all)?
 2.  **Plugin UI ceiling.**  Is host-rendered cards + slash commands
     the permanent ceiling, or will plugins eventually contribute raw
     UI (their own React)?
@@ -449,6 +469,12 @@ server/plugins.test.ts                    NEW
 server/plugin-manifest.test.ts            NEW  (or shared/plugin-manifest.test.ts)
 server/plugin-registry.test.ts            NEW
 server/plugin-loader.test.ts              NEW
+server/plugin-sandbox-child.ts            NEW  (sandboxed child process)
+server/plugin-sandbox-protocol.ts         NEW  (zod IPC schemas)
+server/plugin-sandbox.test.ts             NEW
+server/proxy-paths.ts                     CHANGED  (sandbox child path)
+scripts/bundle-server.mjs                 CHANGED  (bundle sandbox child)
+tests/e2e/visual.spec.ts                  CHANGED  (plugin manager screenshot)
 server/index.ts                           CHANGED  (route dispatch)
 src/components/PluginsManagerView.tsx     NEW
 src/components/CardRenderer.tsx           NEW

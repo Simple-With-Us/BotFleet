@@ -70,33 +70,75 @@ export function parseGitPluginSource(input: string): PluginSourceInput {
   return { ok: false, error: "that does not look like a GitHub repository or folder URL" };
 }
 
-const CONTENT_ENTRY = z.object({
-  type: z.string(),
-  name: z.string(),
-  path: z.string(),
-  download_url: z.string().nullable().optional(),
-}).strip();
-type ContentEntry = z.infer<typeof CONTENT_ENTRY>;
+/** Stable failure codes for a git fetch.  The message is for the API
+ *  caller; the code is what logs and callers branch on. */
+export type PluginFetchFailure =
+  | "github_http_error"
+  | "github_listing_invalid"
+  | "manifest_missing"
+  | "download_failed"
+  | "file_too_large";
 
-const CONTENT_LISTING = z.array(CONTENT_ENTRY);
+/** The only error fetchPluginFromGit throws.  A malformed upstream payload
+ *  surfaces as one of these, never as an empty listing. */
+export class PluginFetchError extends Error {
+  readonly code: PluginFetchFailure;
+
+  constructor(code: PluginFetchFailure, message: string) {
+    super(message);
+    this.name = "PluginFetchError";
+    this.code = code;
+  }
+}
+
+/** One GitHub contents API entry, reduced to the fields the installer
+ *  reads.  Unused GitHub fields (sha, size, url, html_url, git_url,
+ *  _links, ...) are stripped explicitly.  An entry with a missing or
+ *  mistyped field fails the whole listing. */
+export const CONTENT_ENTRY = z.object({
+  type: z.enum(["file", "dir", "symlink", "submodule"]),
+  name: z.string().min(1).max(255),
+  path: z.string().max(4096),
+  download_url: z.url({ protocol: /^https$/ }).nullable(),
+}).strip();
+export type ContentEntry = z.infer<typeof CONTENT_ENTRY>;
+
+/** The listing is an array built from the concrete entry schema.  A
+ *  non-array payload or any bad element rejects the whole response. */
+export const CONTENT_LISTING = z.array(CONTENT_ENTRY);
+
+/** A file entry the installer can download. */
+type DownloadableEntry = ContentEntry & { type: "file"; download_url: string };
+
+function isDownloadable(entry: ContentEntry): entry is DownloadableEntry {
+  return entry.type === "file" && entry.download_url !== null;
+}
 
 async function fetchListing(url: string, fetcher: typeof fetch): Promise<ContentEntry[]> {
   const response = await fetcher(url, {
     headers: { accept: "application/vnd.github+json", "user-agent": "BotFleet-plugins" },
   });
-  if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
-  const parsed = CONTENT_LISTING.safeParse(await response.json());
+  if (!response.ok) throw new PluginFetchError("github_http_error", `GitHub API returned ${response.status}`);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new PluginFetchError("github_listing_invalid", "GitHub listing did not match the contents schema");
+  }
+  const parsed = CONTENT_LISTING.safeParse(body);
   if (!parsed.success) {
-    throw new Error(`GitHub listing for ${url} did not match the contents schema`);
+    throw new PluginFetchError("github_listing_invalid", "GitHub listing did not match the contents schema");
   }
   return parsed.data;
 }
 
 async function fetchText(url: string, fetcher: typeof fetch): Promise<string> {
   const response = await fetcher(url, { headers: { "user-agent": "BotFleet-plugins" } });
-  if (!response.ok) throw new Error(`download failed (${response.status})`);
+  if (!response.ok) throw new PluginFetchError("download_failed", `download failed (${response.status})`);
   const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) throw new Error("file is larger than the 256KB import cap");
+  if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) {
+    throw new PluginFetchError("file_too_large", "file is larger than the 256KB import cap");
+  }
   return text;
 }
 
@@ -112,25 +154,23 @@ export async function fetchPluginFromGit(
   source: GitPluginSource,
   fetcher: typeof fetch = fetch,
 ): Promise<FetchedPlugin> {
-  const entries = await listDir(source, source.path, fetcher);
-  const manifestEntry = entries.find(
-    (entry) => entry.type === "file" && entry.name === "botfleet-plugin.json",
-  );
-  if (!manifestEntry || !manifestEntry.download_url) {
-    throw new Error(`no botfleet-plugin.json in ${source.path || "the repository root"}`);
+  const entries = (await listDir(source, source.path, fetcher)).filter(isDownloadable);
+  const manifestEntry = entries.find((entry) => entry.name === "botfleet-plugin.json");
+  if (!manifestEntry) {
+    throw new PluginFetchError("manifest_missing", `no botfleet-plugin.json in ${source.path || "the repository root"}`);
   }
 
   const manifestText = await fetchText(manifestEntry.download_url, fetcher);
 
   const plugins = entries
-    .filter((entry) => entry.type === "file" && entry.name !== "botfleet-plugin.json" && entry.download_url)
+    .filter((entry) => entry.name !== "botfleet-plugin.json")
     .filter((entry) => /\.(?:mjs|cjs|js|json)$/i.test(entry.name))
     .slice(0, MAX_FILES);
 
   const files = await Promise.all(
     plugins.map(async (entry) => ({
       path: entry.name,
-      content: await fetchText(entry.download_url!, fetcher),
+      content: await fetchText(entry.download_url, fetcher),
     })),
   );
 

@@ -64,7 +64,7 @@ initPluginRuntime({
   ],
   listConfigKeys: () => ["appearance.theme"],
   readConfig: (_key) => undefined,
-  logger: (_level, _name, _message) => {},
+  logger: (_event) => {},
 });
 
 console.log("plugin smoke: install");

@@ -1,8 +1,9 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { PluginRegistrySchema } from "./plugin-types.ts";
 import {
   buildEntry,
   clearPluginsDir,
@@ -38,6 +39,32 @@ describe("plugin registry", () => {
     const registry = readRegistry(baseDir);
     expect(registry.plugins.demo?.name).toBe("demo");
     expect(registry.plugins.demo?.enabled).toBe(false);
+  });
+
+  it("rejects and quarantines a registry whose entries fail the schema", () => {
+    // Top-level shape is right; the entry under `plugins` is not.  The old
+    // top-level-only predicate accepted this file.
+    writeFileSync(join(baseDir, "registry.json"), JSON.stringify({
+      version: 1,
+      plugins: { demo: { name: "demo", enabled: "yes" } },
+    }));
+    const registry = readRegistry(baseDir);
+    expect(registry.plugins).toEqual({});
+    const files = readdirSync(baseDir);
+    expect(files.includes("registry.json")).toBe(false);
+    expect(files.some((file) => file.startsWith("registry.json.invalid-"))).toBe(true);
+  });
+
+  it("rejects a registry entry stored under a different key than its name", () => {
+    const entry = buildEntry({ name: "demo", version: "1.0.0", source: { kind: "folder", path: "/tmp/demo" }, warnings: [] });
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { other: entry } }).success).toBe(false);
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: entry } }).success).toBe(true);
+  });
+
+  it("rejects a registry entry with an unknown field or source kind", () => {
+    const entry = buildEntry({ name: "demo", version: "1.0.0", source: { kind: "folder", path: "/tmp/demo" }, warnings: [] });
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, extra: 1 } } }).success).toBe(false);
+    expect(PluginRegistrySchema.safeParse({ version: 1, plugins: { demo: { ...entry, source: { kind: "ftp", path: "x" } } } }).success).toBe(false);
   });
 
   it("writes the plugin tree and reads it back through listingFor", () => {

@@ -848,6 +848,14 @@ bus.subscribe((event: RuntimeEvent) => observeRuntimeEvent(event));
 // disabled, and runs in the server process.  Wire it after observability
 // so a plugin's logger can route through the same Sentry path; wire it
 // after registry.load so a plugin's getBots() sees the live fleet.
+// Request schemas for the /api/plugins routes.  Bodies and path params
+// are untrusted input; the lifecycle only ever sees parsed values.
+const PLUGIN_INSTALL_BODY = z.object({ source: z.string().trim().min(1).max(4096) }).strip();
+const PLUGIN_COMMAND_BODY = z.object({ args: z.string().max(8192).default("") }).strip();
+const PLUGIN_SLUG = z.string().min(1).max(64).regex(/^[\w][\w-]*$/);
+const PLUGIN_PATH_PARAMS = z.tuple([PLUGIN_SLUG]);
+const PLUGIN_ITEM_PATH_PARAMS = z.tuple([PLUGIN_SLUG, PLUGIN_SLUG]);
+
 pluginsModule.initPluginRuntime({
   listBots: () => store.bots.map((bot) => ({
     id: bot.id,
@@ -867,11 +875,15 @@ pluginsModule.initPluginRuntime({
     // SAFETY: `key` was confirmed as an own property of the resolved AppConfig.  redactPluginConfig copies the value and drops secret-looking fields; the caller names T.
     return redactPluginConfig(cfg[key as keyof typeof cfg]) as T | undefined;
   },
-  logger: (level, name, message) => {
-    const tag = `[plugin:${name}]`;
-    if (level === "error") console.error(tag, message);
-    else if (level === "warn") console.warn(tag, message);
-    else console.log(tag, message);
+  // Plugin events are allow-listed structures from plugin-loader.ts: an
+  // event name, a level, a hashed plugin id, and a length or stable code.
+  // Plugin-supplied text (log messages, error messages, names from the
+  // manifest) never reaches this sink.
+  logger: (event) => {
+    const line = JSON.stringify(event);
+    if (event.level === "error") console.error(line);
+    else if (event.level === "warn") console.warn(line);
+    else console.log(line);
   },
 });
 await pluginsModule.bootPluginRuntime();
@@ -14944,37 +14956,28 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     // trust model, and uses the same route dispatch style as the rest of
     // this file.  Validation errors return { error, issues: [...] } so
     // the UI can render one row per problem.
-    // `readBody` returns `any`, so this guard narrows unparsed JSON input to
-    // a real string without relying on `typeof`.
-    function isString(value: unknown): value is string {
-      return Object.prototype.toString.call(value) === "[object String]";
-    }
-    function isJsonRecord(value: unknown): value is Record<string, unknown> {
-      if (value === null || Array.isArray(value)) return false;
-      return Object.prototype.toString.call(value) === "[object Object]";
-    }
+    // Every body and path parameter is parsed with a zod schema before it
+    // reaches the plugin lifecycle; a parse failure is a 400.
     if (method === "GET" && path === "/api/plugins") {
       return json(res, 200, { plugins: pluginsModule.listPlugins() });
     }
     if (method === "POST" && path === "/api/plugins/install") {
-      const body: unknown = await readBody(req);
-      if (!isJsonRecord(body)) return json(res, 400, { error: "source is required" });
-      const source = isString(body.source) ? body.source : "";
-      if (!source.trim()) return json(res, 400, { error: "source is required" });
-      const result = await pluginsModule.installPlugin(source);
+      const body = PLUGIN_INSTALL_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "source is required" });
+      const result = await pluginsModule.installPlugin(body.data.source);
       if ("error" in result) {
         return json(res, 400, result.issues ? { error: result.error, issues: result.issues } : { error: result.error });
       }
       return json(res, 200, result);
     }
-    m = path.match(/^\/api\/plugins\/([\w][\w-]*)$/);
-    if (m && method === "GET") {
-      const result = pluginsModule.getPlugin(m[1]!);
+    const pluginPath = PLUGIN_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)$/)?.slice(1));
+    if (pluginPath.success && method === "GET") {
+      const result = pluginsModule.getPlugin(pluginPath.data[0]);
       if ("error" in result) return json(res, 404, { error: result.error });
       return json(res, 200, result);
     }
-    if (m && method === "DELETE") {
-      const result = await pluginsModule.removePlugin(m[1]!);
+    if (pluginPath.success && method === "DELETE") {
+      const result = await pluginsModule.removePlugin(pluginPath.data[0]);
       if ("error" in result) return json(res, 404, { error: result.error });
       return json(res, 200, result);
     }
@@ -14995,18 +14998,17 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       return json(res, 200, result);
     }
-    const cardMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/);
-    if (cardMatch && method === "GET") {
-      const result = await pluginsModule.getPluginCardData(cardMatch[1]!, cardMatch[2]!);
+    const cardPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/cards\/([\w][\w-]*)$/)?.slice(1));
+    if (cardPath.success && method === "GET") {
+      const result = await pluginsModule.getPluginCardData(cardPath.data[0], cardPath.data[1]);
       if ("error" in result) return json(res, 409, { error: result.error });
       return json(res, 200, { data: result.data });
     }
-    const cmdMatch = path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/);
-    if (cmdMatch && method === "POST") {
-      const body: unknown = await readBody(req);
-      if (!isJsonRecord(body)) return json(res, 400, { error: "expected a JSON object" });
-      const args = isString(body.args) ? body.args : "";
-      const result = await pluginsModule.runPluginCommand(cmdMatch[1]!, cmdMatch[2]!, args);
+    const cmdPath = PLUGIN_ITEM_PATH_PARAMS.safeParse(path.match(/^\/api\/plugins\/([\w][\w-]*)\/commands\/([\w][\w-]*)$/)?.slice(1));
+    if (cmdPath.success && method === "POST") {
+      const body = PLUGIN_COMMAND_BODY.safeParse(await readBody(req));
+      if (!body.success) return json(res, 400, { error: "expected a JSON object with an optional string `args`" });
+      const result = await pluginsModule.runPluginCommand(cmdPath.data[0], cmdPath.data[1], body.data.args);
       if ("error" in result) return json(res, 409, { error: result.error });
       return json(res, 200, result);
     }

@@ -24,12 +24,15 @@ The manifest declares:
 
 ## Authoring Rules
 
-*   **No network.**  v1 plugins cannot open sockets.  If you need data,
-    the host API must expose it.  v1 does not.
-*   **No files outside the plugin directory.**  The loader will not
-    write or read anywhere else.
-*   **No host state mutation.**  `host` is frozen with `Object.freeze`
-    and the only side effect is `host.log()`.
+*   **No network.**  Do not open sockets.  If you need data, the host
+    API must expose it.  v1 does not.  The sandbox does not block
+    outbound sockets yet, so this rule is on you.
+*   **No files outside the plugin directory.**  Your plugin runs in its
+    own sandboxed process that can read only its own directory and
+    cannot write anywhere.
+*   **No host state mutation.**  `host` is frozen and the only side
+    effect is `host.log()`.  Log text stays inside your plugin's
+    process; BotFleet records only the level and length.
 *   **Return data, not UI.**  The host renders cards.  Plugins return
     JSON values; the host shapes the UI around them.
 

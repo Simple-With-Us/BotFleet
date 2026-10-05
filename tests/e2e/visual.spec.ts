@@ -83,3 +83,58 @@ test('visual: settings modal (General section)', async ({ page }) => {
   await expect(dialog.getByText('Profile', { exact: true })).toBeVisible();
   await expect(dialog).toHaveScreenshot('settings-general.png', stableShot);
 });
+
+test('visual: plugins manager with installed plugins', async ({ page }) => {
+  // Same no-server shell as above, with the one endpoint the manager reads
+  // answered from a fixed fixture: one enabled plugin with capabilities and
+  // contributions, one disabled git plugin.  Nothing in the view polls, and
+  // every value below is static, so the screenshot is deterministic.
+  test.setTimeout(120_000);
+  const plugins = [
+    {
+      name: 'fleet-overview',
+      version: '1.0.0',
+      description: 'Dashboard card with bot counts by status and a /fleet slash command that summarizes the fleet.',
+      author: 'BotFleet',
+      license: 'Apache-2.0',
+      botfleet: '>=1',
+      entry: 'plugin.mjs',
+      enabled: true,
+      installedAt: '2026-10-04T12:00:00.000Z',
+      updatedAt: '2026-10-04T12:00:00.000Z',
+      source: { kind: 'folder', path: '<plugin-folder>' },
+      warnings: [],
+      capabilities: ['read.bots', 'read.status'],
+      contributes: {
+        cards: [{ id: 'fleet-overview', title: 'Fleet Overview', layout: 'stat-grid' }],
+        commands: [{ name: 'fleet', description: 'Summarize the fleet.' }],
+      },
+    },
+    {
+      name: 'example-widget',
+      version: '0.3.1',
+      description: 'An example plugin installed from a git source.',
+      botfleet: '>=1',
+      entry: 'plugin.mjs',
+      enabled: false,
+      installedAt: '2026-10-04T12:00:00.000Z',
+      updatedAt: '2026-10-04T12:00:00.000Z',
+      source: { kind: 'git', url: 'example.invalid/acme/widget', ref: 'v0.3.1', path: '' },
+      warnings: [],
+      capabilities: ['read.bots'],
+    },
+  ];
+  await page.route('**/api/plugins', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ plugins }) }),
+  );
+  await page.addInitScript(() => localStorage.setItem('omb-email-gate', 'skipped'));
+  await page.goto('/');
+  await pinFonts(page);
+  await page.getByRole('button', { name: 'Plugins', exact: true }).click();
+  const heading = page.getByRole('heading', { name: 'Plugins', level: 1 });
+  await expect(heading).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'fleet-overview' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'example-widget' })).toBeVisible();
+  const view = page.locator('div.bg-app.p-6').filter({ has: heading });
+  await expect(view).toHaveScreenshot('plugins-manager.png', stableShot);
+});

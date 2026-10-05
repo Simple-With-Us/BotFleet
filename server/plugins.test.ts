@@ -21,15 +21,22 @@ import {
   _resetForTests,
 } from "./plugins.ts";
 import { clearPluginsDir, readRegistry, setPluginEntry } from "./plugin-registry.ts";
-import { satisfiesBotfleetVersion, HOST_API_VERSION, type PluginManifest } from "../shared/plugin-manifest.ts";
+import type { PluginLogEvent } from "./plugin-loader.ts";
+import { z } from "zod";
+
+import { satisfiesBotfleetVersion, HOST_API_VERSION, pluginManifestSchema } from "../shared/plugin-manifest.ts";
 
 const FIXTURE = join(process.cwd(), "tests", "fixtures", "example-plugin");
 
-interface CardData {
-  total: number;
-  running: number;
-  stopped: number;
-  errored: number;
+// The fixture's card payload, parsed rather than cast: plugin output is
+// boundary data even in a test.
+const CardDataSchema = z.object({
+  result: z.object({ total: z.number(), running: z.number(), stopped: z.number(), errored: z.number() }).strict(),
+}).strict();
+
+/** Read a manifest written to disk by the test, through the real schema. */
+function readManifest(path: string) {
+  return pluginManifestSchema.parse(JSON.parse(readFileSync(path, "utf8")));
 }
 
 let baseDir: string;
@@ -43,7 +50,7 @@ function makeRuntimeInputs() {
     ],
     listConfigKeys: () => ["appearance.theme"],
     readConfig: <T = unknown>(_key: string): T | undefined => undefined,
-    logger: (_level: "info" | "warn" | "error", _name: string, _message: string) => {
+    logger: (_event: PluginLogEvent) => {
       // Keep the test output clean.  Real callers wire this to console.
     },
   };
@@ -89,8 +96,7 @@ describe("plugin lifecycle", () => {
     await enablePlugin("fleet-overview", baseDir);
     const card = await getPluginCardData("fleet-overview", "fleet-overview", baseDir);
     if ("error" in card) throw new Error(card.error);
-    // SAFETY: the fixture plugin returns { result: counts }; the test knows the shape because it wrote the fixture.
-    const data = (card.data as { result: CardData }).result;
+    const data = CardDataSchema.parse(card.data).result;
     expect(data.total).toBe(3);
     expect(data.running).toBe(1);
     expect(data.stopped).toBe(1);
@@ -137,8 +143,7 @@ describe("plugin lifecycle", () => {
       await installPlugin(sourceDir, baseDir);
       await enablePlugin("fleet-overview", baseDir);
       const manifestPath = join(sourceDir, "botfleet-plugin.json");
-      // SAFETY: this test owns the manifest it just wrote, so the JSON.parse result has exactly the shape we wrote — a one-key object — and we only read `version`.
-      const original = JSON.parse(readFileSync(manifestPath, "utf8")) as { version: string };
+      const original = readManifest(manifestPath);
       original.version = "1.1.0";
       writeFileSync(manifestPath, JSON.stringify(original, null, 2));
       const updated = await updatePlugin("fleet-overview", baseDir);
@@ -210,8 +215,7 @@ describe("host API version gate", () => {
     // the next line restores it so the test never leaves stale state on disk.
     setPluginEntry({ ...entry, enabled: false }, baseDir);
     const manifestPath = join(baseDir, "fleet-overview", "botfleet-plugin.json");
-    // SAFETY: this test mutates the on-disk manifest it just wrote; the fixture is the canonical example-plugin and ParsePluginManifest validates every field against the PluginManifest schema, so the cast to PluginManifest downcasts to the schema's documented shape.
-    const manifestRaw = JSON.parse(readFileSync(manifestPath, "utf8")) as PluginManifest;
+    const manifestRaw = readManifest(manifestPath);
     writeFileSync(
       manifestPath,
       JSON.stringify({
@@ -413,7 +417,7 @@ describe("install failures the UI can render", () => {
     await installPlugin(FIXTURE, baseDir);
     await enablePlugin("fleet-overview", baseDir);
     const manifestPath = join(baseDir, "fleet-overview", "botfleet-plugin.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as PluginManifest;
+    const manifest = readManifest(manifestPath);
     writeFileSync(manifestPath, JSON.stringify({ ...manifest, botfleet: ">=2" }));
     const result = await runPluginCommand("fleet-overview", "fleet", "", baseDir);
     if (!("error" in result)) throw new Error("expected the command to fail");

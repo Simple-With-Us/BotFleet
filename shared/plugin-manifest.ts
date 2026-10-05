@@ -57,11 +57,6 @@ export const PLUGIN_CAPABILITIES = [
 ] as const;
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number];
 
-function isPluginCapability(value: string): value is PluginCapability {
-  // SAFETY: PLUGIN_CAPABILITIES is a readonly tuple of string literals; widening it to `readonly string[]` is the only way to call Array.prototype.includes on a tuple in TypeScript.
-  return (PLUGIN_CAPABILITIES as readonly string[]).includes(value);
-}
-
 export const PLUGIN_CARD_LAYOUTS = ["stat-grid", "key-value", "list"] as const;
 export type PluginCardLayout = typeof PLUGIN_CARD_LAYOUTS[number];
 
@@ -85,7 +80,7 @@ const cardContribution = z.object({
   description: z.string().max(PLUGIN_DESCRIPTION_MAX).optional(),
   layout: z.enum(PLUGIN_CARD_LAYOUTS),
   fields: z.array(z.string().min(1).max(64)).max(16).optional(),
-});
+}).strict();
 
 const commandContribution = z.object({
   name: z.string().min(1).max(32)
@@ -94,13 +89,14 @@ const commandContribution = z.object({
     }),
   description: z.string().min(1).max(PLUGIN_DESCRIPTION_MAX),
   args: z.array(z.string().min(1).max(64)).max(8).optional(),
-});
+}).strict();
 
 const contributes = z
   .object({
     cards: z.array(cardContribution).max(16).optional(),
     commands: z.array(commandContribution).max(16).optional(),
   })
+  .strict()
   .superRefine((value, ctx) => {
     const seen = new Set<string>();
     for (const card of value.cards ?? []) {
@@ -127,49 +123,16 @@ const contributes = z
   })
   .optional();
 
+/** Each capability must be one of PLUGIN_CAPABILITIES.  The enum is the
+ *  validator, so the parsed array is already typed as PluginCapability[]
+ *  with no cast.  An absent list parses as []. */
 const capabilities = z
-  .array(z.string().min(1).max(64))
+  .array(z.enum(PLUGIN_CAPABILITIES, {
+    error: (issue) => `unknown capability "${String(issue.input)}"; allowed: ${PLUGIN_CAPABILITIES.join(", ")}`,
+  }))
   .max(16)
   .optional()
-  .superRefine((value, ctx) => {
-    for (const [index, entry] of (value ?? []).entries()) {
-      if (!isPluginCapability(entry)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [index],
-          message:
-            `unknown capability "${entry}"; allowed: ${PLUGIN_CAPABILITIES.join(", ")}`,
-        });
-      }
-    }
-  });
-
-/** The full manifest as the host sees it after parsing.  Every field is
- *  exactly what zod produced; consumer code can rely on the shape. */
-export interface PluginManifest {
-  name: string;
-  version: string;
-  description: string;
-  author?: string;
-  license?: string;
-  botfleet: string;
-  entry: string;
-  capabilities: PluginCapability[];
-  contributes?: {
-    cards?: Array<{
-      id: string;
-      title: string;
-      description?: string;
-      layout: PluginCardLayout;
-      fields?: string[];
-    }>;
-    commands?: Array<{
-      name: string;
-      description: string;
-      args?: string[];
-    }>;
-  };
-}
+  .default([]);
 
 export const pluginManifestSchema = z
   .object({
@@ -194,17 +157,11 @@ export const pluginManifestSchema = z
     capabilities,
     contributes,
   })
-  .superRefine((value, ctx) => {
-    // entry must not be absolute; the relative-path regex already covers it,
-    // but double-check for paranoia's sake.
-    if (value.entry.startsWith("/")) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["entry"],
-        message: "entry must be a relative path inside the plugin directory",
-      });
-    }
-  });
+  .strict();
+
+/** The full manifest as the host sees it after parsing.  Inferred from
+ *  the schema, so consumer code relies on exactly what zod produced. */
+export type PluginManifest = z.output<typeof pluginManifestSchema>;
 
 export interface PluginManifestIssue {
   field: string;
@@ -218,26 +175,12 @@ export type PluginManifestParseResult =
 /** Parse a JSON value (already loaded from disk or buffer) into a
  *  manifest.  Returns the typed issues so the UI can render them
  *  one row at a time.  Accepts `unknown` because callers reach this
- *  function with a `JSON.parse` result that has no narrower type. */
-export function parsePluginManifest(value: JsonValue | unknown): PluginManifestParseResult {
+ *  function with a `JSON.parse` result that has no narrower type; the
+ *  zod schema is the only thing that narrows it. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters
+export function parsePluginManifest(value: unknown): PluginManifestParseResult {
   const result = pluginManifestSchema.safeParse(value);
-  if (result.success) {
-    return {
-      ok: true,
-      manifest: {
-        name: result.data.name,
-        version: result.data.version,
-        description: result.data.description,
-        author: result.data.author,
-        license: result.data.license,
-        botfleet: result.data.botfleet,
-        entry: result.data.entry,
-        // SAFETY: the zod schema validates each capability against PLUGIN_CAPABILITIES before this point, so the array is already narrowed to that union.
-        capabilities: (result.data.capabilities ?? []) as PluginCapability[],
-        contributes: result.data.contributes,
-      },
-    };
-  }
+  if (result.success) return { ok: true, manifest: result.data };
   const issues: PluginManifestIssue[] = result.error.issues.map((issue) => ({
     field: issue.path.length ? issue.path.join(".") : "(root)",
     message: issue.message,
@@ -250,7 +193,6 @@ export function parsePluginManifest(value: JsonValue | unknown): PluginManifestP
 export function parsePluginManifestJson(text: string): PluginManifestParseResult {
   let value: unknown;
   try {
-    // SAFETY: JSON.parse returns `any`; we pass it straight to zod's safeParse which accepts unknown, so the cast does not narrow in any meaningful way and the unknown alias below is the type the caller will see.
     value = JSON.parse(text);
   } catch (error) {
     return {
@@ -258,14 +200,12 @@ export function parsePluginManifestJson(text: string): PluginManifestParseResult
       issues: [
         {
           field: "(root)",
-          // SAFETY: JSON.parse only throws SyntaxError, which has a `message` string property — every catch from a JSON.parse failure carries that shape.
-          message: `manifest is not valid JSON: ${(error as Error).message}`,
+          message: error instanceof SyntaxError ? `manifest is not valid JSON: ${error.message}` : "manifest is not valid JSON",
         },
       ],
     };
   }
-  // SAFETY: JSON.parse returns a JSON-compatible value (string, number, boolean, null, array, or plain object); JsonValue is the closed union of those shapes, so the cast downcasts to the parser's documented input type.
-  return parsePluginManifest(value as JsonValue);
+  return parsePluginManifest(value);
 }
 
 /** A conservative semver comparison that handles the four operators

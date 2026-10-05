@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CONTENT_LISTING,
+  PluginFetchError,
   parseGitPluginSource,
   fetchPluginFromGit,
   type GitPluginSource,
@@ -100,6 +102,41 @@ describe("fetchPluginFromGit", () => {
       "https://api.github.com/repos/acme/widget/contents/": { kind: "json", value: { message: "not a listing" } },
     });
     await expect(() => fetchPluginFromGit(source, fetcher)).rejects.toThrow(/contents schema/);
+  });
+
+  it("rejects the whole listing when one element is malformed instead of dropping it", async () => {
+    const source: GitPluginSource = {
+      kind: "git",
+      url: "github.com/acme/widget",
+      ref: null,
+      owner: "acme",
+      repo: "widget",
+      path: "",
+    };
+    const fetcher = makeFakeFetcher({
+      "https://api.github.com/repos/acme/widget/contents/": { kind: "json", value: [
+        { type: "file", name: "botfleet-plugin.json", path: "botfleet-plugin.json", download_url: "https://example/manifest" },
+        { type: 7, name: "plugin.mjs", path: "plugin.mjs", download_url: "https://example/plugin" },
+      ] },
+    });
+    await expect(fetchPluginFromGit(source, fetcher)).rejects.toBeInstanceOf(PluginFetchError);
+    await expect(fetchPluginFromGit(source, fetcher)).rejects.toMatchObject({ code: "github_listing_invalid" });
+  });
+
+  it("rejects an empty-object or null listing rather than treating it as empty", () => {
+    expect(CONTENT_LISTING.safeParse({}).success).toBe(false);
+    expect(CONTENT_LISTING.safeParse(null).success).toBe(false);
+    expect(CONTENT_LISTING.safeParse([]).success).toBe(true);
+  });
+
+  it("rejects non-https download URLs and strips unused GitHub fields", () => {
+    expect(CONTENT_LISTING.safeParse([
+      { type: "file", name: "a.mjs", path: "a.mjs", download_url: "file:///etc/passwd" },
+    ]).success).toBe(false);
+    const parsed = CONTENT_LISTING.parse([
+      { type: "file", name: "a.mjs", path: "a.mjs", download_url: "https://example/a", sha: "abc", size: 3, _links: {} },
+    ]);
+    expect(parsed).toEqual([{ type: "file", name: "a.mjs", path: "a.mjs", download_url: "https://example/a" }]);
   });
 });
 

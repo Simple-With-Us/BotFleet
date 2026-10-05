@@ -21,6 +21,8 @@ import { rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import { z } from "zod";
+
 import {
   HOST_API_VERSION,
   parsePluginManifestJson,
@@ -41,15 +43,20 @@ import {
 } from "./plugin-registry.ts";
 
 import { readPluginFolder } from "./plugin-folder.ts";
-import { fetchPluginFromGit, parseGitPluginSource } from "./plugin-fetch.ts";
+import { fetchPluginFromGit, parseGitPluginSource, PluginFetchError } from "./plugin-fetch.ts";
 import {
+  invokePlugin,
   loadPlugin,
+  pluginLogId,
   type LoadedPlugin,
   type PluginHostBotSummary,
   type PluginHostInputs,
+  type PluginLogEvent,
 } from "./plugin-loader.ts";
+import { PluginCardResultSchema, PluginCommandResultSchema } from "./plugin-sandbox-protocol.ts";
 
 import type {
+  FetchedPlugin,
   PluginListing,
   PluginRegistryEntry,
   PluginSource,
@@ -61,13 +68,17 @@ export interface PluginRuntimeInputs {
   listBots(): PluginHostBotSummary[];
   listConfigKeys(): readonly string[];
   readConfig<T = unknown>(key: string): T | undefined;
-  logger(level: "info" | "warn" | "error", name: string, message: string): void;
+  /** Receives allow-listed structured events only.  No event carries
+   *  plugin-supplied text; see PluginLogEvent. */
+  logger(event: PluginLogEvent): void;
 }
 
 let runtimeInputs: PluginRuntimeInputs | null = null;
 const loaded = new Map<string, LoadedPlugin>();
 
-export type PluginAction = "enable" | "disable" | "update" | "reload";
+const PluginActionSchema = z.enum(["enable", "disable", "update", "reload"]);
+export type PluginAction = z.infer<typeof PluginActionSchema>;
+const PluginActionRouteSchema = z.tuple([z.string().min(1).max(64), PluginActionSchema]);
 
 /** Pure route matcher for plugin action endpoints.  Lives in server/
  *  plugins.ts so server/index.ts can dispatch through it without taking
@@ -76,10 +87,12 @@ export type PluginAction = "enable" | "disable" | "update" | "reload";
  *  exactly; every other shape returns null.  Anchored with `$` so a
  *  path like `/api/plugins/foo/enable/extra` does not match. */
 export function matchPluginActionRoute(path: string): { name: string; action: PluginAction } | null {
-  const m = path.match(/^\/api\/plugins\/([\w][\w-]*)\/(enable|disable|update|reload)$/);
-  if (!m) return null;
-  // SAFETY: the regex group's capture set is the literal `enable|disable|update|reload`, so any match group [2] is one of those strings.  The cast to PluginAction narrows the union.
-  return { name: m[1]!, action: m[2]! as PluginAction };
+  const parsed = PluginActionRouteSchema.safeParse(
+    path.match(/^\/api\/plugins\/([\w][\w-]*)\/(enable|disable|update|reload)$/)?.slice(1),
+  );
+  if (!parsed.success) return null;
+  const [name, action] = parsed.data;
+  return { name, action };
 }
 
 /** Bootstrap the plugin runtime with host-side inputs.  Called once at
@@ -94,9 +107,40 @@ function inputsOrThrow(): PluginHostInputs {
     listBots: () => runtimeInputs!.listBots(),
     listConfigKeys: () => runtimeInputs!.listConfigKeys(),
     readConfig: <T>(key: string) => runtimeInputs!.readConfig<T>(key),
-    logger: (level, name, message) => runtimeInputs!.logger(level, name, message),
+    logger: (event) => runtimeInputs!.logger(event),
   };
 }
+
+/** Stop a plugin's sandbox process and forget it.  Every path that drops
+ *  a plugin from the cache goes through here so no child is orphaned. */
+function dropLoaded(name: string): void {
+  const plugin = loaded.get(name);
+  if (!plugin) return;
+  loaded.delete(name);
+  plugin.sandbox.dispose();
+}
+
+/** The cached sandbox for an enabled plugin, respawned when the previous
+ *  child exited (crash, timeout kill, or protocol violation). */
+async function liveSandbox(listing: PluginListing, baseDir: string): Promise<LoadedPlugin | { error: string }> {
+  const cached = loaded.get(listing.name);
+  if (cached?.sandbox.isAlive()) return cached;
+  dropLoaded(listing.name);
+  const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
+  if ("error" in result) return result;
+  loaded.set(listing.name, result);
+  return result;
+}
+
+/** One structured boot/listing warning.  `reason` is a stable code. */
+function warnPluginEvent(event: string, name: string, reason: string): void {
+  console.warn(JSON.stringify({ event, reason, pluginId: pluginLogId(name) }));
+}
+
+/** User-facing text for a network-level fetch failure.  PluginFetchError
+ *  messages are written by plugin-fetch.ts and carry no upstream payload;
+ *  anything else gets this fixed message. */
+const FETCH_FAILED = "the plugin could not be downloaded";
 
 /** Manifest and other lifecycle failures.  `issues` is set only when
  *  zod rejected the manifest, one row per field. */
@@ -195,13 +239,11 @@ export async function installPlugin(
   const parsed = parseGitPluginSource(trimmed);
   if (!parsed.ok) return { error: parsed.error };
 
-  let fetched;
+  let fetched: FetchedPlugin;
   try {
     fetched = await fetchPluginFromGit(parsed.source, fetcher);
   } catch (error) {
-    // SAFETY: fetchPluginFromGit throws plain `Error` instances; the catch clause here only sees that shape.
-    const detail = (error as Error).message;
-    return { error: detail };
+    return { error: error instanceof PluginFetchError ? error.message : FETCH_FAILED };
   }
 
   const pluginSource: PluginSource = {
@@ -266,7 +308,7 @@ export async function disablePlugin(
   const listing = listingOrError(name, baseDir);
   if ("error" in listing) return listing;
 
-  loaded.delete(name);
+  dropLoaded(name);
   const registry = readRegistry(baseDir);
   const entry = registry.plugins[name];
   if (entry) setPluginEntry({ ...entry, enabled: false }, baseDir);
@@ -284,7 +326,7 @@ export async function updatePlugin(
   const entry = registry.plugins[name];
   if (!entry) return { error: `no plugin named "${name}"` };
 
-  let fetched;
+  let fetched: FetchedPlugin;
   try {
     if (entry.source.kind === "folder") {
       const read = readPluginFolder(entry.source.path);
@@ -301,9 +343,7 @@ export async function updatePlugin(
       fetched = await fetchPluginFromGit(source, fetcher);
     }
   } catch (error) {
-    // SAFETY: the read/fetch paths only throw `Error` instances; the catch here sees that shape.
-    const detail = (error as Error).message;
-    return { error: detail };
+    return { error: error instanceof PluginFetchError ? error.message : FETCH_FAILED };
   }
 
   const parsed = parsePluginManifestJson(fetched.manifestText);
@@ -339,7 +379,7 @@ export async function updatePlugin(
 
   // Reload the module if it was enabled.
   if (loaded.has(name)) {
-    loaded.delete(name);
+    dropLoaded(name);
     if (entry.enabled) {
       const refreshed = listingOrError(name, baseDir);
       if (!("error" in refreshed)) {
@@ -361,7 +401,7 @@ export async function removePlugin(
   const registry = readRegistry(baseDir);
   if (!registry.plugins[name]) return { error: `no plugin named "${name}"` };
 
-  loaded.delete(name);
+  dropLoaded(name);
   removePluginEntry(name, baseDir);
   rmSync(join(baseDir, name), { recursive: true, force: true });
   return { removed: true };
@@ -374,7 +414,7 @@ export async function reloadPlugin(
 ): Promise<PluginListing | { error: string }> {
   const listing = listingOrError(name, baseDir);
   if ("error" in listing) return listing;
-  loaded.delete(name);
+  dropLoaded(name);
   const registry = readRegistry(baseDir);
   if (registry.plugins[name]?.enabled) {
     const loaded_ = await loadPlugin(listing, inputsOrThrow(), baseDir);
@@ -414,26 +454,19 @@ export async function runPluginCommand(
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
   const mismatch = hostVersionError(listing);
   if (mismatch) {
-    loaded.delete(name);
+    dropLoaded(name);
     return mismatch;
   }
 
-  let plugin = loaded.get(name);
-  if (!plugin) {
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
-    if ("error" in result) return { error: result.error };
-    loaded.set(name, result);
-    plugin = result;
-  }
-  if (!plugin.module.runCommand) return { error: `plugin "${name}" does not implement runCommand` };
-  try {
-    const text = await plugin.module.runCommand({ command, args, host: plugin.host });
-    return { text: String(text ?? "") };
-  } catch (error) {
-    // SAFETY: plugin authors throw plain `Error` objects; the host has no other handler to consult.
-    const detail = (error as Error).message;
-    return { error: `plugin "${name}" command failed: ${detail}` };
-  }
+  const plugin = await liveSandbox(listing, baseDir);
+  if ("error" in plugin) return { error: plugin.error };
+  if (!plugin.sandbox.exports.runCommand) return { error: `plugin "${name}" does not implement runCommand` };
+  const result = await invokePlugin(plugin, { handler: "runCommand", command, args }, inputsOrThrow());
+  if (!result.ok) return { error: `plugin "${name}" command failed (${result.reason})` };
+  // The child is untrusted: its reply must be text, not whatever it sent.
+  const text = PluginCommandResultSchema.safeParse(result.value);
+  if (!text.success) return { error: `plugin "${name}" command failed (invalid_result)` };
+  return { text: text.data };
 }
 
 /** Fetch a plugin's card data. */
@@ -448,26 +481,19 @@ export async function getPluginCardData(
   if (!registry.plugins[name]?.enabled) return { error: `plugin "${name}" is disabled` };
   const mismatch = hostVersionError(listing);
   if (mismatch) {
-    loaded.delete(name);
+    dropLoaded(name);
     return mismatch;
   }
 
-  let plugin = loaded.get(name);
-  if (!plugin) {
-    const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
-    if ("error" in result) return { error: result.error };
-    loaded.set(name, result);
-    plugin = result;
-  }
-  if (!plugin.module.getCardData) return { error: `plugin "${name}" has no card data handler` };
-  try {
-    const data = await plugin.module.getCardData({ cardId, host: plugin.host });
-    return { data };
-  } catch (error) {
-    // SAFETY: plugin authors throw plain `Error` objects; the host has no other handler to consult.
-    const detail = (error as Error).message;
-    return { error: `plugin "${name}" card failed: ${detail}` };
-  }
+  const plugin = await liveSandbox(listing, baseDir);
+  if ("error" in plugin) return { error: plugin.error };
+  if (!plugin.sandbox.exports.getCardData) return { error: `plugin "${name}" has no card data handler` };
+  const result = await invokePlugin(plugin, { handler: "getCardData", cardId }, inputsOrThrow());
+  if (!result.ok) return { error: `plugin "${name}" card failed (${result.reason})` };
+  // The child is untrusted: the reply must be `{ result: <JSON> }`.
+  const data = PluginCardResultSchema.safeParse(result.value);
+  if (!data.success) return { error: `plugin "${name}" card failed (invalid_result)` };
+  return { data: data.data };
 }
 
 /** Boot-time loader: walk every enabled plugin and import its module.
@@ -480,19 +506,18 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
     if (!entry?.enabled) continue;
     const listing = listingFor(name, baseDir);
     if ("error" in listing) {
-      console.warn(`[plugins] boot: ${listing.error}`);
+      warnPluginEvent("plugins.boot.skipped", name, listing.reason);
       continue;
     }
     if (!satisfiesBotfleetVersion(listing.botfleet, HOST_API_VERSION)) {
-      console.warn(
-        `[plugins] boot: ${name} requires botfleet ${listing.botfleet}, host is ${HOST_API_VERSION} — leaving disabled`,
-      );
+      warnPluginEvent("plugins.boot.disabled", name, "host_version_mismatch");
       setPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
     const result = await loadPlugin(listing, inputsOrThrow(), baseDir);
     if ("error" in result) {
-      console.warn(`[plugins] boot: ${result.error}`);
+      // loadPlugin already logged the sandbox's stable reason code.
+      warnPluginEvent("plugins.boot.disabled", name, "load_failed");
       setPluginEntry({ ...entry, enabled: false }, baseDir);
       continue;
     }
@@ -502,7 +527,7 @@ export async function bootPluginRuntime(baseDir: string = PLUGINS_DIR): Promise<
 
 /** Test-only: drop all loaded modules and the runtime inputs. */
 export function _resetForTests(): void {
-  loaded.clear();
+  for (const name of loaded.keys()) dropLoaded(name);
   runtimeInputs = null;
 }
 

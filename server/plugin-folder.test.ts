@@ -11,9 +11,9 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "botfleet-plugin-folder-"));
 });
 
-function errorFrom(result: { error: string } | unknown): string {
-  // SAFETY: every code path that returns a `{ error }` object is built in plugin-folder.ts; the tests assert against the union shape.
-  return (result as { error: string }).error;
+function errorFrom(result: ReturnType<typeof readPluginFolder>): string {
+  if (!("error" in result)) throw new Error("expected readPluginFolder to fail");
+  return result.error;
 }
 
 describe("readPluginFolder", () => {
