@@ -172,6 +172,38 @@ const RedundantChainSchema = z.object({
 
 const RedundantChainArraySchema = z.array(RedundantChainSchema);
 
+/** Trust-boundary schema for the same route's `doomed` pairs.  The array check
+ *  this replaced validated only the container, and `heldPairs` below reads
+ *  `holds`/`open` to decide which pairs are actually holding a bot — a string
+ *  `"true"` landing there reads as truthy and reports a healthy engine as held.
+ *
+ *  Strict on purpose: the route spreads one `DoomedEntry` and adds `open` and
+ *  `holds`, so an unknown key means the payload is not what this panel was
+ *  written against.  Rejected rather than coerced, because the two failure
+ *  directions are not equal: an over-warning costs a glance, while dropping a
+ *  real hold loses the one stop the operator needed to see. */
+const DoomedPairSchema = z.object({
+  botId: z.string(),
+  instanceId: z.string(),
+  // A count the server increments by one, so a fraction means the payload is
+  // not this shape.  Timestamps stay plain numbers: they are formatted, never
+  // compared, so an unexpected value there costs nothing worth a strict gate.
+  consecutiveFailures: z.number().int(),
+  openedAt: z.number(),
+  lastFailureAt: z.number(),
+  lastError: z.string().optional(),
+  open: z.boolean().optional(),
+  holds: z.boolean().optional(),
+}).strict();
+
+/** The same route's `doomed` pairs once parsed, or nothing at all.  A payload
+ *  that does not parse leaves the previous answer in state rather than
+ *  clearing the list: the two failure directions are not equal, because an
+ *  over-warning costs a glance while a dropped hold loses the one stop the
+ *  operator needed to see.  That is why the caller checks `.success` and skips
+ *  the update instead of writing an empty list. */
+export const DoomedPairArraySchema = z.array(DoomedPairSchema);
+
 /** Whether an engine row has enough to be worth showing.
  *
  *  Dollars OR unpriced turns.  An engine that settled work but reported no
@@ -389,7 +421,8 @@ export function UsageSection({ highlightClass }: { highlightClass?: (domId: stri
           if (data?.engineSpend && typeof data.engineSpend === "object") {
             setEngineSpend(data.engineSpend);
           }
-          if (Array.isArray(data?.doomed)) setDoomed(data.doomed);
+          const parsedDoomed = DoomedPairArraySchema.safeParse(data?.doomed);
+          if (parsedDoomed.success) setDoomed(parsedDoomed.data);
           const parsedChains = RedundantChainArraySchema.safeParse(data?.fallbackChains);
           if (parsedChains.success) setRedundantChains(parsedChains.data);
         })
