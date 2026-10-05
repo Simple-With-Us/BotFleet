@@ -25,10 +25,34 @@ describe("KanbanCommandCenter", () => {
     expect(html).toContain("Filter tasks, bots, or apps...");
   });
 
-  it("sanitizes avatar URLs rejecting non-https and embedded credentials", () => {
+  it("sanitizes avatar URLs to app-owned attachments only", () => {
     expect(safeAvatarUrl("http://evil.com/pic.png")).toBeNull();
     expect(safeAvatarUrl("https://user:pass@evil.com/pic.png")).toBeNull();
     expect(safeAvatarUrl("javascript:alert(1)")).toBeNull();
-    expect(safeAvatarUrl("https://images.example.com/avatar.png")).toBe("https://images.example.com/avatar.png");
+    // Unapproved remote host — must not become a tracking pixel.
+    expect(safeAvatarUrl("https://images.example.com/avatar.png")).toBeNull();
+    // App-owned attachment path is the only allowed origin.
+    expect(
+      safeAvatarUrl("/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp"),
+    ).toBe("/api/attachments/123e4567-e89b-12d3-a456-426614174000.webp");
+  });
+
+  it("accepts onSelectBotInApp without crashing and renders the columns", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        StoreProvider,
+        null,
+        createElement(KanbanCommandCenter, {
+          onSelectApp: () => {},
+          onSelectBot: () => {},
+          onSelectBotInApp: () => {},
+          onOpenAppRoom: () => {},
+          filterAppId: null,
+        }),
+      ),
+    );
+
+    expect(html).toContain("Attention Queue");
+    expect(html).toContain("Filter tasks, bots, or apps...");
   });
 });

@@ -13,15 +13,19 @@ import {
 } from "lucide-react";
 import { getRoomTerminology, useStore } from "@/state/store";
 import type { RoutineRun } from "@/lib/routines";
+import { botAvatarUrlSchema } from "../../shared/bot-avatar";
 
 interface KanbanCommandCenterProps {
   onSelectApp: (appId: string) => void;
   onSelectBot: (botId: string) => void;
+  onSelectBotInApp?: (botId: string, appId: string) => void;
   onOpenAppRoom: (appId: string) => void;
   filterAppId?: string | null;
 }
 
 export type KanbanColumnId = "attention" | "in_progress" | "ready" | "completed";
+
+export const COMPLETED_VISIBLE_CAP = 15;
 
 export interface KanbanCardItem {
   id: string;
@@ -44,20 +48,18 @@ export interface KanbanCardItem {
 
 export function safeAvatarUrl(url?: string | null): string | null {
   if (!url) return null;
-  try {
-    if (!URL.canParse(url)) return null;
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") return null;
-    if (parsed.username || parsed.password) return null;
-    return parsed.href;
-  } catch {
-    return null;
-  }
+  // Only app-owned attachment paths are approved avatar origins.  This mirrors
+  // botAvatarUrlSchema / server bot-profile so a kanban card cannot become an
+  // external tracking pixel.  Arbitrary HTTPS hosts (CDN or otherwise) are
+  // rejected unless they are already stored as /api/attachments/...
+  const parsed = botAvatarUrlSchema.safeParse(url);
+  return parsed.success ? parsed.data : null;
 }
 
 export function KanbanCommandCenter({
   onSelectApp,
   onSelectBot,
+  onSelectBotInApp,
   onOpenAppRoom,
   filterAppId,
 }: KanbanCommandCenterProps) {
@@ -83,6 +85,7 @@ export function KanbanCommandCenter({
   const botMap = useMemo(() => {
     const map = new Map<string, (typeof state.bots)[0]>();
     for (const b of state.bots) {
+      if (b.hidden) continue;
       map.set(b.id, b);
     }
     return map;
@@ -92,14 +95,24 @@ export function KanbanCommandCenter({
     const items: KanbanCardItem[] = [];
     const now = Date.now();
 
+    // Precompute a botId -> apps index once per memo run so the inner
+    // bot+routine loops stay O(bots + runs) rather than re-scanning the
+    // app map on every card.
+    type AppEntry = { id: string; name: string; avatarUrl?: string | null; memberIds: string[] };
+    const appsByBotId = new Map<string, AppEntry[]>();
+    for (const app of appMap.values()) {
+      for (const memberId of app.memberIds) {
+        const list = appsByBotId.get(memberId) ?? [];
+        list.push(app);
+        appsByBotId.set(memberId, list);
+      }
+    }
+
     // 1. Synthesize cards from Bot states
     for (const bot of state.bots) {
       if (bot.hidden) continue;
 
-      // Find apps this bot belongs to
-      const assignedApps = Array.from(appMap.values()).filter((a) =>
-        a.memberIds.includes(bot.id)
-      );
+      const assignedApps = appsByBotId.get(bot.id) ?? [];
 
       const primaryApp = assignedApps[0];
       if (filterAppId && !assignedApps.some((a) => a.id === filterAppId)) {
@@ -145,6 +158,28 @@ export function KanbanCommandCenter({
           timestamp: botTimestamp,
           unblockValue: 100,
         });
+      } else if (bot.activity === "no-signal") {
+        // Mirrors the `dead` branch so a bot that has dropped off the
+        // harness is surfaced on the attention queue, matching the way
+        // team-map and attention-index already classify no-signal as
+        // a danger state.
+        items.push({
+          id: `bot-nosignal-${bot.id}`,
+          column: "attention",
+          title: `${bot.name} lost signal`,
+          subtitle: "The harness stopped reporting activity for this bot.",
+          appId: primaryApp?.id,
+          appName: primaryApp?.name,
+          appAvatar: primaryApp?.avatarUrl,
+          botId: bot.id,
+          botName: bot.name,
+          botAvatar: bot.avatarUrl,
+          statusText: "No Signal",
+          statusKind: "danger",
+          waitingMs: now - botTimestamp > 0 ? now - botTimestamp : 120000,
+          timestamp: botTimestamp,
+          unblockValue: 95,
+        });
       } else if (bot.activity === "working") {
         items.push({
           id: `bot-working-${bot.id}`,
@@ -185,9 +220,8 @@ export function KanbanCommandCenter({
     // 2. Synthesize cards from Routine Runs
     for (const run of state.routineRuns || []) {
       const assignedBot = botMap.get(run.botId);
-      const assignedApps = assignedBot
-        ? Array.from(appMap.values()).filter((a) => a.memberIds.includes(assignedBot.id))
-        : [];
+      if (!assignedBot) continue; // hidden / unknown bot — skip the run
+      const assignedApps = appsByBotId.get(assignedBot.id) ?? [];
       const primaryApp = assignedApps[0];
 
       if (filterAppId && !assignedApps.some((a) => a.id === filterAppId)) {
@@ -286,6 +320,32 @@ export function KanbanCommandCenter({
           unblockValue: 5,
           rawRun: run,
         });
+      } else if (run.status === "missed") {
+        // Missed runs never dispatched — treat as danger / attention, matching
+        // RoutinesPage (text-danger) and WebhooksPanel so the Attention Queue
+        // cannot report "All clear" while a missed run is outstanding.
+        items.push({
+          id: `run-${run.id}`,
+          column: "attention",
+          title: run.routineName || "Missed Routine Run",
+          subtitle: run.error || "Scheduled run never dispatched.",
+          appId: primaryApp?.id,
+          appName: primaryApp?.name,
+          appAvatar: primaryApp?.avatarUrl,
+          botId: assignedBot?.id,
+          botName: assignedBot?.name || "Routine Bot",
+          botAvatar: assignedBot?.avatarUrl,
+          statusText: "Missed",
+          statusKind: "danger",
+          waitingMs: now - (run.finishedAt || run.scheduledFor),
+          timestamp: run.finishedAt || run.scheduledFor,
+          unblockValue: 75,
+          rawRun: run,
+        });
+      } else if (run.status === "cancelled") {
+        // Intentionally omitted: cancelled runs are not queued for operator
+        // attention and must not appear on any column.
+        continue;
       }
     }
 
@@ -347,6 +407,16 @@ export function KanbanCommandCenter({
   };
 
   const handleCardClick = (card: KanbanCardItem) => {
+    // Prefer the single-app-scoped navigation the Matrix Grid already uses
+    // (FleetMatrixView calls `onSelectBotInApp(botId, appId)` for the same
+    // (app, bot) pair).  openBotInApp pins viewedThreadId to the app-scoped
+    // task thread and dispatches switchTask, so the operator lands on the
+    // correct thread instead of the bot's default one.  Fall back to the
+    // dual `select` path when only one of the ids is present.
+    if (card.appId && card.botId && onSelectBotInApp) {
+      onSelectBotInApp(card.botId, card.appId);
+      return;
+    }
     if (card.appId) {
       onSelectApp(card.appId);
     }
@@ -609,7 +679,8 @@ export function KanbanCommandCenter({
               <h3 className="text-[13px] font-semibold text-ink">Completed</h3>
             </div>
             <span className="rounded-full bg-raised px-2 py-0.5 text-[11px] font-semibold text-ink-secondary">
-              {columns.completed.length}
+              {Math.min(columns.completed.length, COMPLETED_VISIBLE_CAP)}
+              {columns.completed.length > COMPLETED_VISIBLE_CAP ? "+" : ""}
             </span>
           </div>
 
@@ -619,7 +690,7 @@ export function KanbanCommandCenter({
                 <span className="text-[12px]">Finished routine runs will appear here with output receipts.</span>
               </div>
             ) : (
-              columns.completed.slice(0, 15).map((card) => (
+              columns.completed.slice(0, COMPLETED_VISIBLE_CAP).map((card) => (
                 <div
                   key={card.id}
                   onClick={() => handleCardClick(card)}
@@ -647,9 +718,15 @@ export function KanbanCommandCenter({
                 </div>
               ))
             )}
+            {columns.completed.length > COMPLETED_VISIBLE_CAP && (
+              <div className="pt-1 text-center text-[10px] text-ink-tertiary">
+                +{columns.completed.length - COMPLETED_VISIBLE_CAP} more completed runs
+              </div>
+            )}
           </div>
         </div>
       </div>
     </div>
   );
 }
+

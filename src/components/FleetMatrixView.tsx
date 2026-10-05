@@ -9,6 +9,7 @@ import {
   MessageSquare,
   Bot as BotIcon,
 } from "lucide-react";
+import { z } from "zod";
 import { cn } from "@/lib/cn";
 import {
   getRoomTerminology,
@@ -26,6 +27,7 @@ interface FleetMatrixViewProps {
   onSelectBot: (botId: string) => void;
   onOpenAppRoom: (appId: string) => void;
   onSelectBotInApp: (botId: string, appId: string) => void;
+  filterAppId?: string | null;
 }
 
 export function FleetMatrixView({
@@ -33,6 +35,7 @@ export function FleetMatrixView({
   onSelectBot,
   onOpenAppRoom,
   onSelectBotInApp,
+  filterAppId = null,
 }: FleetMatrixViewProps) {
   const { state } = useStore();
   const terminology = getRoomTerminology(state.config);
@@ -40,7 +43,8 @@ export function FleetMatrixView({
   const [viewMode, setViewMode] = useState<"matrix" | "kanban">(() => {
     try {
       const saved = globalThis.localStorage?.getItem("botfleet.matrix_view_mode");
-      if (saved === "kanban" || saved === "matrix") return saved;
+      const parsedViewMode = z.enum(["matrix", "kanban"]).safeParse(saved);
+      if (parsedViewMode.success) return parsedViewMode.data;
     } catch {
       // Ignore storage errors in SSR or restricted environments
     }
@@ -188,7 +192,9 @@ export function FleetMatrixView({
           <KanbanCommandCenter
             onSelectApp={onSelectApp}
             onSelectBot={onSelectBot}
+            onSelectBotInApp={onSelectBotInApp}
             onOpenAppRoom={onOpenAppRoom}
+            filterAppId={filterAppId}
           />
         </div>
       ) : (
