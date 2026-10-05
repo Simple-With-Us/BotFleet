@@ -91,15 +91,25 @@ const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutM
   }
 };
 
+/** Abort in-flight `api()` fetches slightly before `expect.poll`'s deadline so
+ *  a slow tick surfaces as the configured settle message instead of AbortError. */
+const SETTLE_ABORT_SKEW_MS = 75;
+
 /** Polls `read` until it satisfies, using vitest's own primitive.
  *
  *  The Windows runner is roughly a third slower than the others and its test
  *  files overlap more, so anything that asserts a settled instance state or a
  *  write landing *immediately* is a coin flip there and a certainty here.
  *
- *  `expect.poll` owns the deadline, backoff, and failure message.  `signal` is
- *  aborted when the overall timeout elapses so a stalled `api()` fetch is
- *  abandoned instead of consuming the caller's test budget.
+ *  `expect.poll`'s `interval` is a minimum gap between attempts, not an
+ *  observation count: the runner keeps trying until `timeoutMs` elapses, and
+ *  each `read()` can take arbitrarily long (a `GET /api/instances?fresh=1` on a
+ *  busy fleet can consume the whole window on one tick).  Do not pass `fresh=1`
+ *  on every tick — request it once before polling if a single re-probe is
+ *  needed, then read the memoized snapshot.
+ *
+ *  `signal` is aborted `SETTLE_ABORT_SKEW_MS` before the poll deadline so a
+ *  hung fetch is abandoned without racing Vitest's failure message.
  */
 const settlesWithin = async (
   read: (opts: { signal: AbortSignal }) => Promise<boolean>,
@@ -108,14 +118,22 @@ const settlesWithin = async (
   what: string,
 ): Promise<void> => {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  const abortAtMs = Math.max(0, timeoutMs - SETTLE_ABORT_SKEW_MS);
+  const timer = setTimeout(() => abort.abort(), abortAtMs);
+  const message = `${what} did not settle within ${timeoutMs}ms`;
   try {
     await expect
-      .poll(async () => await read({ signal: abort.signal }), {
-        timeout: timeoutMs,
-        interval: intervalMs,
-        message: `${what} did not settle within ${timeoutMs}ms`,
-      })
+      .poll(
+        async () => {
+          try {
+            return await read({ signal: abort.signal });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return false;
+            throw error;
+          }
+        },
+        { timeout: timeoutMs, interval: intervalMs, message },
+      )
       .toBe(true);
   } finally {
     clearTimeout(timer);
@@ -5562,18 +5580,31 @@ describe("instance CLI override API", () => {
     let roomThreadId = "";
     try {
       // An engine a neighbouring test left reloading is still settling;
-      // `unavailable` here means "asked too early", not "broken".  3s of this
-      // test's 20s budget — poll `fresh=1` on a coarse interval so each tick is
-      // a real re-probe without storming the fleet every 200ms.
+      // `unavailable` here means "asked too early", not "broken".  Poll the
+      // memoized snapshot between occasional `fresh=1` fleet probes so a 15s
+      // describe memo cannot freeze an early `unavailable` for the whole wait.
+      // Full re-probes are capped at one per 2s, not every 200ms tick.
+      const fleetReprobeMs = 2_000;
+      let lastFleetProbeAt = -fleetReprobeMs;
       await settlesWithin(
         async ({ signal }) => {
-          const instances = (await api("GET", "/api/instances?fresh=1", undefined, { signal })).body.instances;
+          const now = Date.now();
+          const probeFleet = now - lastFleetProbeAt >= fleetReprobeMs;
+          if (probeFleet) lastFleetProbeAt = now;
+          const instances = (
+            await api(
+              "GET",
+              probeFleet ? "/api/instances?fresh=1" : "/api/instances",
+              undefined,
+              { signal },
+            )
+          ).body.instances;
           return instances.find(
             (instance: { instanceId: string }) => instance.instanceId === "claude",
           )?.snapshot?.state === "available";
         },
-        3_000,
-        1_000,
+        8_000,
+        200,
         "the claude engine reaching available",
       );
       const claude = (await api("GET", "/api/instances")).body.instances.find(
