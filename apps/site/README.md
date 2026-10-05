@@ -6,7 +6,7 @@ The marketing / status site for **[BotFleet.app](https://botfleet.app)**.  A sta
 
 This directory (`apps/site` in the `Simple-With-Us/BotFleet` monorepo) is the **only** deploy source for `botfleet.app`.  Builds (`npm run build` → `node build.mjs`) trigger on push to `main` — whatever is committed here is what ships, gated by `vercel-ignore-hourly.sh` (skips previews, skips commits that did not touch site files, production at most once per three hours unless forced).  Hosting credentials and project settings live in the private operations inventory and deployment environment.
 
-A legacy standalone site repo previously also deployed to the same domain and the two fought over which build won.  That repo no longer exists, leaving this monorepo directory as the single source of truth.
+This directory is the single source of truth for the site.  Deployment history — including a retired standalone site repository that once deployed to the same domain and fought this build for which version won — is recorded in the private operations inventory rather than here.
 
 ## Stack
 
