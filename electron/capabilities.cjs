@@ -60,7 +60,7 @@ function linuxLocalControlSupport(platform, env) {
       session,
       reasonCode: "linux-wayland-seat-safety-blocked",
       message:
-        "Local control is not available on Wayland yet. Sign out and choose Ubuntu on Xorg to use This computer.",
+        "Local control is not available on Wayland yet. Sign out and choose Ubuntu on Xorg to use This Computer.",
     });
   }
   return Object.freeze({

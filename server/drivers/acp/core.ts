@@ -523,6 +523,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
+  /** Resolved ONCE, at registration, because the capability matrix reads it
+   *  statically.  Both answers are a pure function of `support`, so deriving
+   *  them here and reading them from `metadata.channelWiring` cannot disagree
+   *  with the per-instance block below, which reads these same two values. */
+  const mountsMcpServers = support.mcpServers !== false;
+  const acceptsImages = support.images !== false;
   // Experimental V2 driver rollout gate — when this flips to `true` the V2
   // session runtime in `acp/core.v2.ts` will be wired in here.  Today the
   // flag is `false` and the branch is a single boot-time log line so the
@@ -539,6 +545,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       displayName: support.displayName,
       supportsMultipleInstances: true,
       access: support.access ?? "subscription",
+      // Static mirror of the flags below that the runtime resolves
+      // mechanically, published so a consumer that cannot afford to create an
+      // instance (the capability-matrix test) can check a claim against the
+      // driver instead of against a comment.  The ACP core answers every MCP
+      // flag from one question, so these four are all the same boolean.
+      channelWiring: {
+        agentsMcp: mountsMcpServers,
+        computerMcp: mountsMcpServers,
+        composioMcp: mountsMcpServers,
+        localComputerMcp: mountsMcpServers,
+        images: acceptsImages,
+      },
     },
     install: support.install,
     models: withModelCapabilities(support.models, support),
@@ -1744,8 +1762,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
       };
 
-      const mountsMcpServers = support.mcpServers !== false;
-
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -1767,7 +1783,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
-            images: support.images !== false,
+            images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
             // Jobs matrix: native jobs die when the turn settles, and BotFleet

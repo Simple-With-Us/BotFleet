@@ -750,12 +750,39 @@ export interface ProviderInstance {
  *  `custom` — no subscription catalog; Custom is the product. */
 export type EngineAccess = "subscription" | "custom";
 
+/** The channel wiring a driver declares, resolved ONCE at registration so a
+ *  static consumer can read it without creating an instance.  Each field is
+ *  the exact counterpart of one cell the capability matrix can therefore
+ *  never overclaim, because a "yes" requires the driver to say yes here:
+ *
+ *    composioMcp       -> connectedApps
+ *    localComputerMcp  -> thisComputer
+ *    computerMcp       -> computerUse
+ *    agentsMcp         -> crossBotCoordination
+ *    images            -> imageAttachments
+ *
+ *  Deliberately per-channel rather than one `mcpServers` boolean: a driver
+ *  can mount a local-computer channel and no Composio bridge, which is exactly
+ *  the MiniMax engine's shape, and a single boolean would have to lie about
+ *  one half of it.  The remaining matrix cells — files, terminal, web access,
+ *  rooms, voice, long context, live research — are product judgments rather
+ *  than flags the runtime resolves, so they stay prose.  See
+ *  `engine-capabilities.drivers.test.ts`. */
+export interface EngineChannelWiring {
+  agentsMcp: boolean;
+  computerMcp: boolean;
+  composioMcp: boolean;
+  localComputerMcp: boolean;
+  images: boolean;
+}
+
 export interface ProviderDriver<Config = unknown> {
   readonly driverKind: DriverKind;
   readonly metadata: {
     displayName: string;
     supportsMultipleInstances?: boolean;
     access?: EngineAccess;
+    channelWiring?: EngineChannelWiring;
   };
   /** How to get this engine installed. Omit for engines that need no local
    * binary (API-key drivers), which is what makes it optional. */

@@ -122,6 +122,14 @@ describe("configuration boundaries", () => {
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
   });
 
+  it("accepts localVm shareCliCredentials and allowHostTerminal patches", () => {
+    expect(
+      parseConfigPatch({ localVm: { shareCliCredentials: true, allowHostTerminal: true } }),
+    ).toEqual({
+      localVm: { shareCliCredentials: true, allowHostTerminal: true },
+    });
+  });
+
   it("keeps experimental features off by default and accepts an explicit opt-in", () => {
     expect(skillRecorderEnabled({})).toBe(false);
     expect(parseConfigPatch({ features: { skillRecorder: true } })).toEqual({

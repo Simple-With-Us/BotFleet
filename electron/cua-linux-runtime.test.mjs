@@ -211,7 +211,7 @@ describe("unavailable Linux CUA runtime", () => {
       enabled: false,
       status: "unavailable",
       reasonCode: "bundled-driver-invalid",
-      message: "The bundled Cua Driver failed integrity validation.",
+      message: "The bundled CUA Driver failed integrity validation.",
       driverPath: undefined,
       driverVersion: undefined,
       driverSource: undefined,
@@ -544,7 +544,7 @@ describe.skipIf(process.platform === "win32")("Linux CUA opt-in and lifecycle", 
       runtimeOptions: {
         healthCheckIntervalMs: 30_000,
         healthProbe: vi.fn(async () => {
-          throw Object.assign(new Error("The Cua WinRects helper is no longer active."), {
+          throw Object.assign(new Error("The CUA WinRects helper is no longer active."), {
             code: "wayland-helper-required",
           });
         }),

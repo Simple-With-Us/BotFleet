@@ -64,7 +64,11 @@ describe("Personal Voice desktop call support", () => {
     expect(SRC).toMatch(/configured && \(isPersonalSpeakable \|\| !voices\.some\(\(voice\) => isPersonalVoiceId\(voice\)\)\)/);
   });
 
-  it("explains Personal Voice needs Apple devices on unsupported platforms", () => {
+  it("reads requires-macos-14 instead of telling a Mac user they need a Mac", () => {
+    expect(SRC).toMatch(/capabilities\.dictation\.reasonCode === "requires-macos-14"/);
+    expect(SRC).toMatch(/Personal Voice needs macOS 14 or later, or an iPhone/);
+    expect(SRC).toMatch(/Apple Personal Voice needs macOS 14 or later, or an iPhone/);
+    // A non-Apple computer may still be told the feature is Mac or iPhone.
     expect(SRC).toMatch(/Personal Voice needs a Mac or iPhone/);
     expect(SRC).toMatch(/Apple Personal Voice speaks on Apple devices \(Mac and iPhone\)/);
   });

@@ -31,6 +31,7 @@ vi.mock("@/state/store", async (importOriginal) => {
 });
 
 let mockPersonalVoice = false;
+let mockCapabilitiesReady = true;
 vi.mock("./DesktopCapabilities", () => ({
   useDesktopCapabilities: () => ({
     capabilities: {
@@ -42,14 +43,18 @@ vi.mock("./DesktopCapabilities", () => ({
         engine: "apple-speech",
         onDevice: true,
         personalVoice: mockPersonalVoice,
+        // A Mac that cannot speak Personal Voice is the version gate, not
+        // "not a Mac".  The disabled control has to read that code.
+        reasonCode: mockPersonalVoice ? undefined : "requires-macos-14",
       },
       localComputer: { available: false, support: "unsupported", enabled: false, status: "unavailable" },
     },
-    ready: true,
+    ready: mockCapabilitiesReady,
   }),
 }));
 
 import { VoiceSettings } from "./VoiceSettings";
+import { personalVoiceDesktopBridge } from "./VoiceSettingsVisualFixture";
 import type { Bot, ConfigStatus } from "@/state/store";
 
 describe("VoiceSettings", () => {
@@ -57,10 +62,17 @@ describe("VoiceSettings", () => {
     id: "bot-1",
     name: "Assistant",
     threadId: "t1",
+    title: "",
+    description: "",
+    notifications: false,
+    color: "blue",
+    unread: false,
+    modelSelection: { instanceId: "fixture", model: "default" },
+    messages: [],
     voice,
-  } as unknown as Bot);
+  });
 
-  it("renders Apple Personal Voice label and Mac / iOS helper note when configured on bot", () => {
+  it("does not claim on-device synthesis when Personal Voice is off", () => {
     const html = renderToStaticMarkup(
       createElement(VoiceSettings, {
         bot: sampleBot("personal:com.apple.speech.voice.Jay"),
@@ -68,24 +80,44 @@ describe("VoiceSettings", () => {
       })
     );
 
-    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
-    expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
+    // Gate is off (requires-macos-14).  Naming on-device Mac / iOS is false.
+    expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay");
+    expect(html).not.toContain("On-device Mac / iOS");
+    expect(html).not.toContain("Synthesis runs on-device on your authorized Mac or iPhone");
+    expect(html).toContain("This bot uses an Apple Personal Voice.");
+    expect(html).toContain("Personal Voices need macOS 14 or later, or an iPhone");
     // In plain environment without window.ogb.personalVoice.speak, the button explains device requirement
-    expect(html).toContain("title=\"Personal Voices play on-device on a Mac or iPhone\"");
-    expect(html).toContain("aria-label=\"Personal Voices play on-device on a Mac or iPhone\"");
+    expect(html).toContain("title=\"Personal Voices need macOS 14 or later, or an iPhone\"");
+    expect(html).toContain("aria-label=\"Personal Voices need macOS 14 or later, or an iPhone\"");
+    expect(html).not.toContain("Personal Voices play on-device on a Mac or iPhone");
+  });
+
+  it("names on-device Mac / iOS only when Personal Voice can speak", () => {
+    mockPersonalVoice = true;
+    try {
+      vi.stubGlobal("window", {
+        ogb: personalVoiceDesktopBridge({ speak: () => Promise.resolve() }),
+      });
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: sampleBot("personal:com.apple.speech.voice.Jay"),
+          onPatch: () => {},
+        })
+      );
+      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay (On-device Mac / iOS)");
+      expect(html).toContain("This bot uses an Apple Personal Voice.\u00A0 Synthesis runs on-device on your authorized Mac or iPhone.");
+    } finally {
+      mockPersonalVoice = false;
+      vi.unstubAllGlobals();
+    }
   });
 
   it("enables Try button when desktop personalVoice speak bridge is available", () => {
     mockPersonalVoice = true;
-    const origWindow = globalThis.window;
     try {
-      globalThis.window = {
-        ogb: {
-          personalVoice: {
-            speak: vi.fn(),
-          } as unknown as NonNullable<Window["ogb"]>["personalVoice"],
-        } as unknown as Window["ogb"],
-      } as unknown as Window & typeof globalThis;
+      vi.stubGlobal("window", {
+        ogb: personalVoiceDesktopBridge({ speak: () => Promise.resolve() }),
+      });
       const html = renderToStaticMarkup(
         createElement(VoiceSettings, {
           bot: sampleBot("personal:com.apple.speech.voice.Jay"),
@@ -96,7 +128,30 @@ describe("VoiceSettings", () => {
       expect(html).toContain("aria-label=\"Hear this Apple Personal Voice\"");
     } finally {
       mockPersonalVoice = false;
-      globalThis.window = origWindow;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not claim on-device while capabilities are still unknown", () => {
+    mockPersonalVoice = false;
+    mockCapabilitiesReady = false;
+    try {
+      const html = renderToStaticMarkup(
+        createElement(VoiceSettings, {
+          bot: sampleBot("personal:com.apple.speech.voice.Jay"),
+          onPatch: () => {},
+        })
+      );
+      // Optimistic personalVoice:false is not a confirmed denial, and it is
+      // also not permission.  The suffix is an on-device claim, so it waits
+      // until personalVoiceAllowed.  The checking sentence still shows.
+      expect(html).toContain("Apple Personal Voice: com.apple.speech.voice.Jay");
+      expect(html).not.toContain("On-device Mac / iOS");
+      expect(html).toContain("Checking Personal Voice availability");
+      expect(html).not.toContain("Personal Voices need macOS 14 or later, or an iPhone");
+    } finally {
+      mockPersonalVoice = false;
+      mockCapabilitiesReady = true;
     }
   });
 
@@ -147,12 +202,85 @@ describe("VoiceSettings voice loading", () => {
     expect(loader).toContain("parsePersonalVoiceList(personal)");
     expect(loader).toContain("parseTtsVoicesResponse(raw)");
     expect(loader).toContain("setVoices([...personalEntries, ...apiVoices])");
+    // Listing must wait on the macOS 14 Personal Voice gate, not appleSpeech alone.
+    expect(loader).toContain("personalVoiceAllowedRef.current");
+    expect(loader).toContain("allowPersonal && window.ogb?.personalVoice?.list");
+    expect(loader.match(/if \(requestId !== loadRequestRef\.current\) return;/g)).toHaveLength(2);
+    expect(loader).toContain("if (requestId === loadRequestRef.current) setLoadingVoices(false);");
+    expect(SRC).toContain("capabilities.dictation.personalVoice === true");
+    expect(SRC).toContain("const allowed = personalVoiceAllowedRef.current");
+    expect(SRC).toContain("if (isPersonalVoice(next) && !allowed)");
+    expect(SRC).toContain("if (ready && reportDenial) setPersonalVoiceDenied(true);");
+    // The on-device suffix is claimed only when the gate is open.  Hiding it
+    // solely for a confirmed denial still shows it while capabilities are
+    // the optimistic personalVoice:false.
+    const option = SRC.slice(SRC.indexOf("isSelectedPersonal"), SRC.indexOf("voices.map"));
+    expect(option).toContain("personalVoiceAllowed");
+    expect(option).toContain("(On-device Mac / iOS)");
+    expect(option).not.toContain("capabilitiesReady && !personalVoiceAllowed");
   });
 
   it("has the mount effect call that loader instead of fetching on its own", () => {
-    expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured\]\);/);
+    expect(SRC).toMatch(/useEffect\(\(\) => \{\s*void loadVoices\(\);\s*\}, \[configured, personalVoiceAllowed\]\);/);
+    expect(SRC).toContain("if (personalVoiceAllowed) setPersonalVoiceDenied(false);");
     // A second, effect-local fetch is exactly what dropped the personal entries.
     expect(SRC.match(/api\("\/api\/tts\/voices"\)/g)).toHaveLength(1);
   });
 });
 
+
+/**
+ * A typed custom id and a clone result used to call onPatch directly.
+ * Either id can start with personal: or apple-personal:, which the server
+ * treats as Personal Voice and then refuses to synthesize. Those saves have
+ * to take the same refusal as the picker.
+ */
+describe("VoiceSettings personal voice selection guard", () => {
+  const SRC = readFileSync(join(__dirname, "VoiceSettings.tsx"), "utf8");
+  const between = (start: string, end: string) => {
+    const from = SRC.indexOf(start);
+    const to = SRC.indexOf(end, from + start.length);
+    if (from < 0 || to < 0) throw new Error(`missing slice ${start} -> ${end}`);
+    return SRC.slice(from, to);
+  };
+
+  it("routes add and clone through the select guard", () => {
+    const guard = between("const commitVoice", "const loadVoices");
+    const add = between("const handleAddCustomVoice", "const handleDeleteVoice");
+    const clone = between("const handleClone =", "if (!tts) return null");
+
+    expect(guard).toContain("personalVoiceAllowedRef.current");
+    expect(guard).toContain("capabilitiesReadyRef.current");
+    expect(guard).toContain("if (isPersonalVoice(next) && !allowed)");
+    expect(guard).toContain("if (ready && reportDenial) setPersonalVoiceDenied(true);");
+    expect(guard).not.toContain("current === personalVoiceDisabledReason");
+    expect(guard).toContain("onPatch({ voice: next })");
+
+    // The typed id is cleared only after commitVoice accepts.  A refusal
+    // returns first and leaves the form fields alone.
+    expect(add).toContain("if (addedId && !commitVoice(addedId, false))");
+    expect(add.indexOf("commitVoice(addedId, false)")).toBeLessThan(add.indexOf('setCustomVoiceId("")'));
+    expect(add).toContain('method: "DELETE"');
+    expect(add).toContain("setCustomError(");
+    expect(add).toContain("capabilitiesReadyRef.current");
+    expect(add).not.toContain("onPatch(");
+    // The refusal branch captures the pre-POST voices list, gates the
+    // compensating DELETE on a confirmed closed gate and a non-pre-existing
+    // id, and surfaces a cleanup-failure message when the DELETE throws.
+    expect(add).toContain("existedBeforePost");
+    expect(add).toContain("shouldCleanup");
+    expect(add).toContain("cleanupFailed");
+    expect(add).toContain("The saved voice could not be removed");
+    const del = between("const handleDeleteVoice", "const handleCloneFile");
+    expect(del).toContain("setPersonalVoiceDenied(false)");
+    expect(clone).toContain("commitVoice(result.voiceId)");
+    expect(clone).not.toContain("onPatch(");
+    expect(SRC).toContain("commitVoice(e.target.value)");
+
+    // Clearing a deleted voice is not a Personal Voice selection.
+    expect(SRC.match(/onPatch\(\{ voice: [^}]+\}\)/g)).toEqual([
+      "onPatch({ voice: next })",
+      'onPatch({ voice: "" })',
+    ]);
+  });
+});

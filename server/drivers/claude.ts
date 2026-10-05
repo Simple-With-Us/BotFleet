@@ -830,7 +830,14 @@ function modelRejectionMessage(cliText: string, requested: string | null | undef
 
 export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Claude", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Claude",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block the instance publishes below, so the
+    // capability matrix can check its cell against the driver rather than
+    // against the comment above that block.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   // npm on all three: the one recipe that is genuinely cross-platform. The
   // native installers differ per OS and would need verifying separately.
   install: {

@@ -466,6 +466,69 @@ function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: s
   return a.instanceId === b.instanceId && a.model === b.model;
 }
 
+/** The identity `sameEngine` compares on, in one place so a key built here and
+ *  a comparison there cannot drift. */
+sameEngine.key = (v: { instanceId: string; model: string }) => `${v.instanceId}\u0000${v.model}`;
+
+/** One configured chain entry the runtime will never reach. */
+export interface RedundantFallback {
+  instanceId: string;
+  model: string;
+  /** Why it is dead weight.  Both cases are `sameEngine` skipping it. */
+  reason: "same-as-primary" | "duplicate";
+}
+
+/** What a bot's fallback chain actually amounts to, as opposed to what
+ *  Settings shows.
+ *
+ *  `selectTurnFallback` skips any candidate that is `sameEngine` as the engine
+ *  that just failed (line 615) — and nothing else, so only an ADJACENT repeat
+ *  is unreachable.  A chain of `primary → f1 → primary` is three entries in the
+ *  picker and three real tiers; a chain of `primary → f1 → f1` is three entries
+ *  and two.  The settings panel counts what was typed, not what will happen.
+ *
+ *  Reported rather than corrected: the owner may reasonably WANT a primary
+ *  repeated at the end of its own chain (it costs nothing and documents the
+ *  intent), so silently dropping the entry would be a product decision made
+ *  here.  This makes the difference visible instead.
+ *
+ *  Different model on the same engine is a real tier, not a duplicate: it is
+ *  a genuinely different thing to fail over to, and the runtime keeps it. */
+export function effectiveFallbackTiers(
+  primary: { instanceId: string; model: string },
+  fallbacks: readonly { instanceId: string; model: string }[] | null | undefined,
+): { total: number; effective: number; redundant: RedundantFallback[] } {
+  const redundant: RedundantFallback[] = [];
+  // `previous` is the engine the runtime would have just failed, which is the
+  // only thing `selectTurnFallback` compares against. It is NOT everything seen
+  // so far: an earlier, global dedup reported A -> B -> A as two tiers when the
+  // runtime walks all three.  `selectTurnFallback` compares on the REWRITTEN id,
+  // so a retired id and its live replacement collapse to a single tier; we do
+  // the same rewrite here on a local copy so the stored model string is left
+  // alone (redundant[].model stays configured, not migrated).
+  let previous = primary;
+  let effective = 1;
+  for (const candidate of fallbacks ?? []) {
+    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model) };
+    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model) };
+    if (sameEngine(prevKey, candKey)) {
+      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model) };
+      redundant.push({
+        instanceId: candidate.instanceId,
+        model: candidate.model,
+        reason: sameEngine(primaryKey, candKey) ? "same-as-primary" : "duplicate",
+      });
+      // `previous` deliberately does NOT advance: a skipped entry was never a
+      // hop, so the next candidate is still being weighed against the engine
+      // that actually failed.
+      continue;
+    }
+    previous = candidate;
+    effective++;
+  }
+  return { total: (fallbacks?.length ?? 0) + 1, effective, redundant };
+}
+
 // ── structured provider-error codes (chat-completions/errors.ts) ────────
 // A chat-completions driver's loop (server/drivers/chat-completions/loop.ts)
 // classifies an HTTP failure onto a ProviderErrorCode and reports it as an

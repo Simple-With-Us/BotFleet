@@ -649,7 +649,12 @@ export function antigravityTurnErrorMessage(result: AntigravityTurnResult): stri
 
 export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "Antigravity", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "Antigravity",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below.
+    channelWiring: { agentsMcp: true, computerMcp: true, composioMcp: true, localComputerMcp: true, images: true },
+  },
   install: {
     command: {
       darwin: "curl -fsSL https://antigravity.google/cli/install.sh | bash",

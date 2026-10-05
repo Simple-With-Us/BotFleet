@@ -209,6 +209,7 @@ const CALLOUT_DRIVER_KINDS = new Set([
   "grokAgent",
   "claudeAgent",
   "mcodeAgent",
+  "museAgent",
 ]);
 
 function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNode {

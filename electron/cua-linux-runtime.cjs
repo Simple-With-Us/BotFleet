@@ -193,7 +193,7 @@ function requestSocket(socketPath, request, { timeoutMs = 1_000, maxBytes = 256 
     socket.once("connect", () => socket.write(`${JSON.stringify(request)}\n`));
     socket.on("data", (chunk) => {
       if (data.length + chunk.length > maxBytes) {
-        finish(reject, Object.assign(new Error("Cua Driver handshake was too large."), { code: "handshake-too-large" }));
+        finish(reject, Object.assign(new Error("CUA Driver handshake was too large."), { code: "handshake-too-large" }));
         return;
       }
       data = Buffer.concat([data, chunk]);
@@ -202,12 +202,12 @@ function requestSocket(socketPath, request, { timeoutMs = 1_000, maxBytes = 256 
       try {
         finish(resolve, JSON.parse(data.subarray(0, newline).toString("utf8")));
       } catch {
-        finish(reject, Object.assign(new Error("Cua Driver returned an invalid handshake."), { code: "invalid-handshake" }));
+        finish(reject, Object.assign(new Error("CUA Driver returned an invalid handshake."), { code: "invalid-handshake" }));
       }
     });
     socket.once("error", (error) => finish(reject, error));
     const timer = setTimeout(
-      () => finish(reject, Object.assign(new Error("Cua Driver handshake timed out."), { code: "handshake-timeout" })),
+      () => finish(reject, Object.assign(new Error("CUA Driver handshake timed out."), { code: "handshake-timeout" })),
       timeoutMs,
     );
     timer.unref?.();
@@ -217,7 +217,7 @@ function requestSocket(socketPath, request, { timeoutMs = 1_000, maxBytes = 256 
 function validateDaemonMetadata(response, { childPid } = {}) {
   const metadata = response?.ok === true ? response.result : null;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
-    throw Object.assign(new Error("Cua Driver daemon identity could not be verified."), {
+    throw Object.assign(new Error("CUA Driver daemon identity could not be verified."), {
       code: "invalid-daemon-metadata",
     });
   }
@@ -232,13 +232,13 @@ function validateDaemonMetadata(response, { childPid } = {}) {
   };
   for (const [key, value] of Object.entries(expected)) {
     if (metadata[key] !== value) {
-      throw Object.assign(new Error(`Cua Driver daemon reported an incompatible ${key}.`), {
+      throw Object.assign(new Error(`CUA Driver daemon reported an incompatible ${key}.`), {
         code: "incompatible-daemon",
       });
     }
   }
   if (!Number.isInteger(metadata.pid) || metadata.pid <= 0 || (childPid && metadata.pid !== childPid)) {
-    throw Object.assign(new Error("Cua Driver daemon PID does not match the owned process."), {
+    throw Object.assign(new Error("CUA Driver daemon PID does not match the owned process."), {
       code: "invalid-daemon-metadata",
     });
   }
@@ -255,7 +255,7 @@ function validateToolSurface(response) {
     manifest.capability_version !== CERTIFIED_CAPABILITY_VERSION ||
     !Array.isArray(manifest.tools)
   ) {
-    throw Object.assign(new Error("Cua Driver tool surface could not be verified."), {
+    throw Object.assign(new Error("CUA Driver tool surface could not be verified."), {
       code: "invalid-tool-surface",
     });
   }
@@ -263,7 +263,7 @@ function validateToolSurface(response) {
   const names = new Set(tools.map((tool) => tool?.name).filter((name) => typeof name === "string"));
   const missing = REQUIRED_TOOLS.filter((name) => !names.has(name));
   if (missing.length) {
-    throw Object.assign(new Error(`Cua Driver is missing required tools: ${missing.join(", ")}.`), {
+    throw Object.assign(new Error(`CUA Driver is missing required tools: ${missing.join(", ")}.`), {
       code: "incompatible-tool-surface",
     });
   }
@@ -274,19 +274,19 @@ function healthFailure(check) {
   const detail = `${check?.message ?? ""} ${check?.hint ?? ""}`.toLowerCase();
   if (check?.name === "ax_capability") {
     return Object.assign(
-      new Error("Cua Driver could not reach the AT-SPI accessibility bus in this Wayland session."),
+      new Error("CUA Driver could not reach the AT-SPI accessibility bus in this Wayland session."),
       { code: "at-spi-unavailable" },
     );
   }
   if (check?.name === "screen_capture_capability") {
     return Object.assign(
-      new Error("Cua Driver could not reach a supported screen capture backend in this Wayland session."),
+      new Error("CUA Driver could not reach a supported screen capture backend in this Wayland session."),
       { code: "wayland-capture-unavailable" },
     );
   }
   if (detail.includes("winrects") || detail.includes("target-activation")) {
     return Object.assign(
-      new Error("The Cua WinRects helper is not active. Install it, then sign out and back in once."),
+      new Error("The CUA WinRects helper is not active. Install it, then sign out and back in once."),
       { code: "wayland-helper-required" },
     );
   }
@@ -297,7 +297,7 @@ function healthFailure(check) {
     );
   }
   return Object.assign(
-    new Error("Cua Driver could not verify the GNOME Wayland control backend."),
+    new Error("CUA Driver could not verify the GNOME Wayland control backend."),
     { code: "wayland-health-failed" },
   );
 }
@@ -315,7 +315,7 @@ function validateWaylandHealthReport(response) {
     !["ok", "degraded", "failed"].includes(report.overall) ||
     !Array.isArray(report.checks)
   ) {
-    throw Object.assign(new Error("Cua Driver returned an invalid Wayland health report."), {
+    throw Object.assign(new Error("CUA Driver returned an invalid Wayland health report."), {
       code: "invalid-health-report",
     });
   }
@@ -331,7 +331,7 @@ function validateWaylandHealthReport(response) {
       (check.status === "fail" && typeof check.hint !== "string") ||
       checks.has(check.name)
     ) {
-      throw Object.assign(new Error("Cua Driver returned an invalid Wayland health check."), {
+      throw Object.assign(new Error("CUA Driver returned an invalid Wayland health check."), {
         code: "invalid-health-report",
       });
     }
@@ -381,7 +381,7 @@ async function probePrivateDaemon(socketPath, {
       await new Promise((resolve) => setTimeout(resolve, 75));
     }
   }
-  throw Object.assign(new Error(lastError?.message ?? "Cua Driver daemon did not become ready."), {
+  throw Object.assign(new Error(lastError?.message ?? "CUA Driver daemon did not become ready."), {
     code: lastError?.code ?? "daemon-start-timeout",
   });
 }
@@ -447,7 +447,7 @@ function createUnavailableLinuxRuntime({
   onChange = () => {},
   processId = process.pid,
   reasonCode = "bundled-driver-invalid",
-  message = "The bundled Cua Driver failed integrity validation.",
+  message = "The bundled CUA Driver failed integrity validation.",
 } = {}) {
   if (clearPreference) {
     try {
@@ -605,7 +605,7 @@ function createLinuxCuaRuntime({
     unavailable(
       "error",
       "daemon-exited",
-      "Cua Driver stopped unexpectedly. Try again before using this computer.",
+      "CUA Driver stopped unexpectedly. Try again before using this computer.",
       { generation: owned.generation, exitCode: code, exitSignal: signal },
     );
   };
@@ -654,7 +654,7 @@ function createLinuxCuaRuntime({
     if (startPromise) return startPromise;
 
     startPromise = (async () => {
-      unavailable("checking", "checking-driver", "Checking Cua Driver and the desktop session…");
+      unavailable("checking", "checking-driver", "Checking CUA Driver and the desktop session…");
       let inspected;
       try {
         inspected = await inspect({ platform, arch, env, bundledDriverPath });
@@ -662,7 +662,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "driver-inspection-failed",
-          "Cua Driver could not be inspected. Check the installation and try again.",
+          "CUA Driver could not be inspected. Check the installation and try again.",
         );
       }
       if (inspected.status !== "ready") {
@@ -687,7 +687,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           "socket-path-too-long",
-          "The private Cua Driver socket path is too long for this Linux installation.",
+          "The private CUA Driver socket path is too long for this Linux installation.",
         );
       }
 
@@ -724,7 +724,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           "driver-changed",
-          "Cua Driver changed after validation. Check the installation and try again.",
+          "CUA Driver changed after validation. Check the installation and try again.",
         );
       }
       const child = spawnProcess(inspected.path, args, {
@@ -748,7 +748,7 @@ function createLinuxCuaRuntime({
       child.stderr?.on("data", () => {});
       child.once("exit", (code, signal) => markUnexpectedExit(owned, code, signal));
       child.once("error", (error) => markUnexpectedExit(owned, null, error?.code ?? "spawn-error"));
-      unavailable("starting", "starting-daemon", "Starting the private Cua Driver runtime…", {
+      unavailable("starting", "starting-daemon", "Starting the private CUA Driver runtime…", {
         generation,
         driver: { path: inspected.path, version: inspected.driverVersion },
       });
@@ -822,7 +822,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "daemon-start-failed",
-          error?.message ?? "Cua Driver could not start.",
+          error?.message ?? "CUA Driver could not start.",
           { generation, driver: { path: inspected.path, version: inspected.driverVersion } },
         );
       }
@@ -832,7 +832,7 @@ function createLinuxCuaRuntime({
         return unavailable(
           "error",
           error?.code ?? "runtime-start-failed",
-          "The private Cua Driver runtime could not start. Check the installation and try again.",
+          "The private CUA Driver runtime could not start. Check the installation and try again.",
         );
       })
       .finally(() => {

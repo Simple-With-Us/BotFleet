@@ -989,7 +989,12 @@ async function processCwd(pid) {
   return result.code === 0 ? result.stdout.split("\n").find((line) => line.startsWith("n"))?.slice(1) || "" : "";
 }
 
-export function isExpectedBotFleetProcess(command, cwd, config) {
+async function processTxtPaths(pid) {
+  const result = await run("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"], { allowFailure: true });
+  return result.code === 0 ? result.stdout.split("\n").filter((line) => line.startsWith("n")).map(line => line.slice(1)) : [];
+}
+
+export async function isExpectedBotFleetProcess(command, cwd, config, pid) {
   const appExecutable = join(config.appPath, "Contents/MacOS/BotFleet");
   if (command === appExecutable || command.startsWith(`${appExecutable} `) || command.startsWith(`${config.appPath}/Contents/`)) {
     return true;
@@ -997,7 +1002,17 @@ export function isExpectedBotFleetProcess(command, cwd, config) {
   const executable = command.trim().split(/\s+/)[0] || "";
   const isNode = ["node", "nodejs"].includes(basename(executable));
   const serverArgument = command.split(/\s+/).some((argument) => argument === "server/index.ts" || argument === join(config.checkout, "server/index.ts"));
-  return isNode && serverArgument && cwd === config.checkout;
+  if (isNode && serverArgument && cwd === config.checkout) {
+    return true;
+  }
+  if (pid) {
+    const txtPaths = await processTxtPaths(pid);
+    const helperPrefix = join(config.appPath, "Contents/Frameworks/BotFleet Helper");
+    if (txtPaths.includes(appExecutable) || txtPaths.some((p) => p.startsWith(helperPrefix))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function stableApplicationProcessError(firstPids, secondPids, openApplication) {
@@ -1281,7 +1296,7 @@ export async function terminateVerified(pids, previous, config, {
     const cwd = await cwdOf(pid);
     const sameAsCaptured = Boolean(previous.processCommands?.[pid]) && previous.processCommands[pid] === command &&
       previous.processCwds?.[pid] === cwd;
-    if (!sameAsCaptured && !isExpectedBotFleetProcess(command, cwd, config)) {
+    if (!sameAsCaptured && !(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
       // Exited while ps and lsof were still describing it: there was no
       // process left to describe, so its identity came back empty.
       if (!isAlive(pid)) continue;
@@ -1791,7 +1806,7 @@ function createOperations(config) {
       for (const pid of new Set([...runtimePids, ...appPids])) {
         const command = await processCommand(pid);
         const cwd = await processCwd(pid);
-        if (!isExpectedBotFleetProcess(command, cwd, config)) {
+        if (!(await isExpectedBotFleetProcess(command, cwd, config, pid))) {
           throw new Error(`Process ${pid} owns BotFleet state but does not match an expected BotFleet executable and working directory`);
         }
         processCommands[pid] = command;
@@ -1997,26 +2012,34 @@ function createOperations(config) {
     },
 
     verifySingleOwner: async (prepared, previous) => {
-      let firstAppPids = [];
-      let secondAppPids = [];
       if (config.parsed.openApplication !== false) {
-        await sleep(2_000);
-        firstAppPids = await exactAppPids(config.appPath);
-        await sleep(1_000);
-        secondAppPids = await exactAppPids(config.appPath);
+        const deadline = Date.now() + config.startupTimeoutMs;
+        let appError = "Timeout waiting for application to stabilize";
+        let attachmentError = "Timeout waiting for UI attachment";
+        while (Date.now() < deadline) {
+          const firstAppPids = await exactAppPids(config.appPath);
+          await sleep(1_000);
+          const secondAppPids = await exactAppPids(config.appPath);
+          
+          appError = stableApplicationProcessError(firstAppPids, secondAppPids, true);
+          if (!appError) {
+            const snapshot = await runtimeIdentityPreflight(config, prepared);
+            if (!snapshot.safe || snapshot.mode !== "authenticated") {
+              attachmentError = snapshot.reason || "Updated application did not attach to the authenticated single data owner";
+            } else {
+              attachmentError = applicationAttachmentError(snapshot, true);
+            }
+            if (!attachmentError) break;
+          }
+        }
+        if (appError) throw new Error(appError);
+        if (attachmentError) throw new Error(attachmentError);
+      } else {
+        const snapshot = await runtimeIdentityPreflight(config, prepared);
+        if (!snapshot.safe || snapshot.mode !== "authenticated") {
+          throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
+        }
       }
-      const appError = stableApplicationProcessError(
-        firstAppPids,
-        secondAppPids,
-        config.parsed.openApplication !== false,
-      );
-      if (appError) throw new Error(appError);
-      const snapshot = await runtimeIdentityPreflight(config, prepared);
-      if (!snapshot.safe || snapshot.mode !== "authenticated") {
-        throw new Error(snapshot.reason || "Updated application did not attach to the authenticated single data owner");
-      }
-      const attachmentError = applicationAttachmentError(snapshot, config.parsed.openApplication !== false);
-      if (attachmentError) throw new Error(attachmentError);
       const survivors = await bundleProcessPids(previous.rollbackPath);
       const survivingError = survivingRollbackProcessError(survivors, previous.rollbackPath);
       if (survivingError) throw new Error(survivingError);

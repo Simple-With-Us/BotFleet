@@ -43,6 +43,12 @@ export const CliWrapperDriver: ProviderDriver<CliWrapperConfig> = {
   metadata: {
     displayName: "Generic CLI Wrapper",
     supportsMultipleInstances: true,
+    // The wrapper's `capabilities` block declares no channel and no image
+    // input, and its `respondToRequest` returns "unavailable" outright — this
+    // engine has no asks to answer because BotFleet never hands it one.  So
+    // every derivable matrix cell is a genuine "no" here rather than an
+    // unknown, and the row can say that.
+    channelWiring: { agentsMcp: false, computerMcp: false, composioMcp: false, localComputerMcp: false, images: false },
   },
   models: {
     default: "default",

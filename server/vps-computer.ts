@@ -17,6 +17,9 @@ import {
   IMAGE as CUA_IMAGE,
   cuaExecArgs,
   dockerSecurityIsHardened,
+  healCuaShimsExecArgs,
+  redactSecrets,
+  shouldHealCuaShims,
   imageLabelsMatch,
   managedImageDockerfile,
   wholeScreenshot,
@@ -157,6 +160,51 @@ const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
 /** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
 const botSessionLocks = new Map<string, Promise<void>>();
+/** Concurrent shared-mode provisions of the one container coalesce into a
+ * single flight.  Provision is the idempotent turn-start path: when N bots
+ * start turns together, serialising N inspections behind a 5 s acquire timeout
+ * made the later bots fail with a spurious "VPS is being prepared" 409. */
+const provisionFlights = new Map<string, Promise<VpsComputerStatus>>();
+/** Automatic CLI credential sync is rate-limited: it runs at most once per
+ * container id per TTL, concurrent callers share one in-flight sync, and a
+ * failure backs off briefly rather than retrying on every bot turn.  The
+ * manual Sync button calls vpsSyncCliCredentials directly and is never gated. */
+const CLI_SYNC_TTL_MS = 10 * 60_000;
+const CLI_SYNC_FAILURE_BACKOFF_MS = 60_000;
+const cliSyncState = new Map<string, { containerId: string; until: number }>();
+const cliSyncFlights = new Map<string, Promise<void>>();
+
+export function resetVpsCliSyncThrottle(): void {
+  cliSyncState.clear();
+  cliSyncFlights.clear();
+  provisionFlights.clear();
+}
+
+async function autoSyncCliCredentials(
+  cfg: AppConfig,
+  target: VpsTarget,
+  containerId: string,
+  runner: VpsCommandRunner,
+): Promise<void> {
+  const key = `${vpsSshAlias(cfg) ?? ""}:${target.containerName}`;
+  const known = cliSyncState.get(key);
+  if (known && known.containerId === containerId && Date.now() < known.until) return;
+  const flight = cliSyncFlights.get(key);
+  if (flight) return flight;
+  const started = vpsSyncCliCredentials(cfg, target, runner).then(
+    () => {
+      cliSyncState.set(key, { containerId, until: Date.now() + CLI_SYNC_TTL_MS });
+    },
+    (err) => {
+      cliSyncState.set(key, { containerId, until: Date.now() + CLI_SYNC_FAILURE_BACKOFF_MS });
+      console.warn(`[vps] automatic CLI credentials sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    },
+  ).finally(() => {
+    cliSyncFlights.delete(key);
+  });
+  cliSyncFlights.set(key, started);
+  return started;
+}
 // A held lock means a lifecycle mutation (worst case: a 10-minute image
 // build) is running. Waiting it out would wedge Sleep and the screenshot
 // poll behind it, so acquisition fails fast instead.
@@ -409,7 +457,7 @@ export function defaultRunner(args: string[], options: VpsCommandOptions = {}): 
       }
       settle(() => {
         if (code === 0) return resolve({ stdout: stdout.text(), stderr: stderr.text() });
-        const detail = stderr.text().trim().slice(-1000);
+        const detail = redactSecrets(stderr.text().trim().slice(-1000));
         reject(new Error(detail || `Docker-over-SSH exited ${code ?? signal ?? "without a status"}`));
       });
     });
@@ -506,7 +554,7 @@ function hasNoPublishedPorts(config: {
 function statusProblem(status: VpsComputerStatus): string | null {
   if (!status.configured) return "Configure a VPS SSH alias in App Settings → Connections";
   if (!status.daemonUp) return "Docker over SSH could not reach the VPS; check the SSH alias and Docker on the VPS";
-  if (!status.image) return `Prepare the pinned BotFleet Cua image on the VPS (Driver ${CUA_DRIVER_VERSION})`;
+  if (!status.image) return `Prepare the pinned BotFleet CUA image on the VPS (Driver ${CUA_DRIVER_VERSION})`;
   if (status.container === "missing") return "No BotFleet container exists for this bot on the VPS";
   if (!status.imageMatches) return "The VPS container uses an incompatible or untrusted BotFleet image";
   if (!status.managed) return "The VPS container name is occupied by a container BotFleet did not create";
@@ -514,8 +562,8 @@ function statusProblem(status: VpsComputerStatus): string | null {
   if (status.mounts === "unsafe") return "The VPS container has host mounts; refusing to use it";
   if (status.security === "unsafe") return "The VPS container is missing BotFleet safety limits";
   if (status.container === "stopped") return "The BotFleet VPS container is stopped";
-  if (status.desktop_error) return `The VPS Cua desktop failed to start: ${status.desktop_error}`;
-  if (!status.desktopReady) return "The VPS container started, but Cua Driver is not ready yet";
+  if (status.desktop_error) return `The VPS CUA desktop failed to start: ${status.desktop_error}`;
+  if (!status.desktopReady) return "The VPS container started, but CUA Driver is not ready yet";
   return null;
 }
 
@@ -546,6 +594,13 @@ async function ensureSharedVpsBotSession(
   const session = vpsSharedBotSession(botId);
   const sessionKey = vpsBotSessionLockKey(cfg, botId);
   const runEnsure = async () => {
+    // Best effort and throttled: containers built before the image gained the
+    // PATH symlinks are repaired in place rather than replaced under the bots.
+    if (shouldHealCuaShims(`${alias}:${containerRef}`)) {
+      await runner(vpsDockerArgs(alias, healCuaShimsExecArgs(containerRef)), { timeoutMs: 20_000 }).catch(
+        () => undefined,
+      );
+    }
     await runner(vpsDockerArgs(alias, ensureSharedVpsSessionExecArgs(containerRef, session)), {
       timeoutMs: 90_000,
     });
@@ -679,7 +734,7 @@ async function computeVpsComputerStatus(
     if (canProbe && containerRef) {
       try {
         const version = await run(cuaExecArgs(["--version"], { container: containerRef }));
-        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected Cua Driver version");
+        if (version.stdout.trim() !== `cua-driver ${CUA_DRIVER_VERSION}`) throw new Error("unexpected CUA Driver version");
         await run(cuaExecArgs(["status", "--socket", CUA_SOCKET], { container: containerRef }));
         const health = await run(
           cuaExecArgs(["call", "health_report", "{}", "--socket", CUA_SOCKET], { container: containerRef }),
@@ -695,7 +750,7 @@ async function computeVpsComputerStatus(
           !Array.isArray(report.checks) ||
           (report.overall !== "ok" && report.overall !== "degraded")
         ) {
-          throw new Error(`Cua health report is ${report.overall ?? "invalid"}`);
+          throw new Error(`CUA health report is ${report.overall ?? "invalid"}`);
         }
         // The desktop must ANSWER, not render: get_desktop_state succeeding
         // is the readiness proof. The Local VM also pulls a pixel-validated
@@ -1021,11 +1076,29 @@ export async function vpsComputerAction(
       statusCache.delete(key);
     }
   };
-  const after = await withVpsLifecycleLock(key, operation);
+  let after: VpsComputerStatus;
+  if (action === "provision" && isSharedVpsMode(cfg)) {
+    // Every bot's turn-start provision targets the same container and is
+    // idempotent, so concurrent ones share one flight instead of queueing.
+    let flight = provisionFlights.get(key);
+    if (!flight) {
+      flight = withVpsLifecycleLock(key, operation).finally(() => {
+        provisionFlights.delete(key);
+      });
+      provisionFlights.set(key, flight);
+    }
+    after = await flight;
+  } else {
+    after = await withVpsLifecycleLock(key, operation);
+  }
   if (isSharedVpsMode(cfg) && after.ready && (after.container_id ?? after.container_name)) {
     await ensureSharedVpsBotSession(cfg, botId, after.container_id ?? after.container_name, runner);
   }
+  if (cfg.localVm?.shareCliCredentials && after.ready && (action === "provision" || action === "start")) {
+    await autoSyncCliCredentials(cfg, target, after.container_id ?? after.container_name, runner);
+  }
   return after;
+
 }
 
 export interface VpsSyncCredentialsResult {
@@ -1038,7 +1111,7 @@ export async function vpsSyncCliCredentials(
   cfg: AppConfig,
   target: VpsTarget = SHARED_VPS_TARGET,
   runner: VpsCommandRunner = defaultRunner,
-  homeDir = homedir(),
+  homeDir = process.env.HOME || process.env.USERPROFILE || homedir(),
 ): Promise<VpsSyncCredentialsResult> {
   const alias = vpsSshAlias(cfg);
   if (!alias) {
@@ -1306,7 +1379,7 @@ export async function vpsComputerScreenshot(
   cfg: AppConfig,
   botId: string,
   runner: VpsCommandRunner = defaultRunner,
-): Promise<{ png: string; format: "png" | "jpeg" }> {
+): Promise<{ png: string; format: "png" | "jpeg"; capturedAt: number }> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
   const target = vpsTargetFor(cfg, botId);
@@ -1356,8 +1429,13 @@ export async function vpsComputerScreenshot(
       screenshotPath,
     ]), { timeoutMs: 30_000 })).stdout.trim();
     const checked = wholeScreenshot(Buffer.from(encoded, "base64"));
-    if (!checked.ok) throw Object.assign(new Error("Cua Driver returned an incomplete VPS screenshot"), { status: 502 });
-    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png" };
+    if (!checked.ok) throw Object.assign(new Error("CUA Driver returned an incomplete VPS screenshot"), { status: 502 });
+    // Stamped here, between the pixels landing on the box and this returning,
+    // rather than left to the client to stamp on receipt.  Everything before
+    // this line — status check, lifecycle lock, SSH, the capture, the base64
+    // read-back — is latency the client would otherwise charge to the picture
+    // and use to decide it is newer than a streamed frame that beat it.
+    return { png: encoded, format: checked.mime === "image/jpeg" ? "jpeg" : "png", capturedAt: Date.now() };
   } catch (error) {
     if (cacheable) statusCache.delete(key);
     throw error;

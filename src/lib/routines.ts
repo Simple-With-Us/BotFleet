@@ -56,6 +56,10 @@ export interface RoutineRun {
   createdAt: number;
   seenAt?: number;
   coalescedInto?: string;
+  /** Why this run is sitting QUEUED instead of dispatching.  Absent when the run
+   *  is simply not due, or when nothing is holding it — a queued run with no
+   *  explanation is indistinguishable from a stuck scheduler. */
+  holdReason?: string;
   outcomeCode?: RoutineOutcomeCode;
   failurePhase?: RoutineFailurePhase;
   engineId?: string;

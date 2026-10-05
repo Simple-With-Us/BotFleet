@@ -25,7 +25,7 @@ const controlToken = process.env.OMB_CONTROL_TOKEN ?? "";
 runMcpBridge({
   command: "docker",
   args,
-  label: "VPS Cua Driver",
+  label: "VPS CUA Driver",
   // The probe checks the TRANSPORT (SSH + daemon), deliberately not the
   // driver: a busy desktop mid-tool-call must never look dead, while an
   // unreachable VPS must, and `docker version` distinguishes exactly that.

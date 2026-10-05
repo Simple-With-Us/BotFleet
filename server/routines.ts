@@ -1,4 +1,5 @@
 import { boundStalePromptSnapshots, retainRoutineRuns } from "../shared/routine-retention.ts";
+import type { BotDispatchState } from "../shared/bot-profile.ts";
 import { ROUTINE_ATTENTION_STATUSES } from "../shared/routine-outcomes.ts";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -140,6 +141,10 @@ export interface RoutineRun {
    *  way.  Carried on the run so it survives from the `runtime.error` to the
    *  `turn.completed` that closes it. */
   setupFailed?: boolean;
+  /** Why this run is sitting QUEUED instead of dispatching.  Set by the
+   *  scheduler when `canStart` refuses the dispatch (see `dispatchHoldReason`);
+   *  cleared on dispatch and on any skip path that bypasses `canStart`. */
+  holdReason?: string;
   engineId?: string;
   driver?: string;
   model?: string;
@@ -209,7 +214,7 @@ export interface RoutineManagerOptions {
   /** Keyed frames only: every payload on this bus is `{ kind, … }`, which
    * is what lets the server number and replay them. */
   emit?: (payload: Record<string, unknown>) => void;
-  botState: (botId: string) => "ready" | "busy" | "missing";
+  botState: (botId: string) => BotDispatchState;
   /** Synchronous admission fence used during an update boundary. */
   admit?: () => boolean;
   /** True when the host is too hot for a new unattended webhook wake.
@@ -220,6 +225,10 @@ export interface RoutineManagerOptions {
   /** Per-run readiness gate.  False leaves the durable run queued; callers
    * invoke tick() again when the missing runtime prerequisite arrives. */
   canStart?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => boolean;
+  /** Why this bot's work is being held, for a run that stays QUEUED rather
+   *  than being dispatched or failed.  Optional: without it a held run says
+   *  only that its engine is unavailable, which is true and useless. */
+  dispatchHoldReason?: (botId: string, threadId: string | undefined, runOn: RoutineRunOn) => string | undefined;
   /** Minutes this run's trigger must stay quiet after it activates.  Absent
    * or 0 runs every delivery as it lands. */
   minGapMinutes?: (run: RoutineRun) => number | undefined;
@@ -570,7 +579,7 @@ export class RoutineManager {
     const cancelled: RoutineRun[] = [];
     for (const run of this.runs) {
       if (!run.coalescedInto && run.botId === botId && ["queued", "running", "waiting"].includes(run.status)) {
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.outcomeCode = "cancelled";
         run.failurePhase = "lifecycle";
         run.finishedAt = this.now();
@@ -723,7 +732,7 @@ export class RoutineManager {
       if (patch.enabled === false) {
         for (const run of this.runs) {
           if (run.routineId !== routine.id || run.status !== "queued") continue;
-          run.status = "cancelled";
+          this.leaveQueued(run, "cancelled");
           run.finishedAt = this.now();
           run.error = "The routine was paused before this run started";
           cancelledRuns.push(run);
@@ -750,7 +759,7 @@ export class RoutineManager {
       this.routines.splice(at, 1);
       for (const run of this.runs) {
         if (run.routineId !== id || run.status !== "queued") continue;
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.finishedAt = this.now();
         cancelledRuns.push(run);
       }
@@ -773,7 +782,7 @@ export class RoutineManager {
     }
     for (const run of this.runs) {
       if (run.botId !== botId || !["queued", "running", "waiting"].includes(run.status)) continue;
-      run.status = "cancelled";
+      this.leaveQueued(run, "cancelled");
       run.finishedAt = this.now();
       run.error = "The assigned Bot was deleted";
       this.emitRun(run);
@@ -963,7 +972,7 @@ export class RoutineManager {
     let changed = false;
     for (const run of this.runs) {
       if (run.webhookId !== webhookId || run.status !== "queued") continue;
-      run.status = "cancelled";
+      this.leaveQueued(run, "cancelled");
       run.finishedAt = this.now();
       run.error = message.slice(0, 500);
       this.emitRun(run);
@@ -976,7 +985,7 @@ export class RoutineManager {
     let run = this.runs.find((r) => r.id === id);
     if (run?.coalescedInto) run = this.runs.find((r) => r.id === run!.coalescedInto);
     if (!run || !["queued", "running", "waiting"].includes(run.status)) return null;
-    run.status = "cancelled";
+    this.leaveQueued(run, "cancelled");
     run.outcomeCode = "cancelled";
     run.failurePhase = "lifecycle";
     run.finishedAt = this.now();
@@ -1107,9 +1116,22 @@ export class RoutineManager {
 
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
-        if (this.isBotSnoozed(run.botId)) continue;
+        // `holdReason` is a cached verdict from the last time canStart ran, and
+        // the gates below can `continue` without ever re-deriving it. A manual
+        // snooze can outlast the engine coming back, leaving a receipt that
+        // claims it is waiting on a dead engine when it is not. Clearing on
+        // every skip keeps the field meaning "verified on the most recent
+        // attempt" rather than "true at some point in the past"; the next tick
+        // that reaches canStart sets it again if it still holds.
+        if (this.isBotSnoozed(run.botId)) {
+          this.clearHoldReason(run);
+          continue;
+        }
         const state = this.options.botState(run.botId);
-        if (state === "busy") continue;
+        if (state === "busy") {
+          this.clearHoldReason(run);
+          continue;
+        }
         if (state === "missing") {
           this.failRun(run, "The assigned Bot no longer exists");
           continue;
@@ -1119,7 +1141,13 @@ export class RoutineManager {
         // webhook wake and leaves the receipt queued.  The 10s scheduler
         // tick tries again.  In-flight runs are not in this loop's queued
         // set, and resource wakes still start so Housekeeper can run.
-        if (run.triggerSource === "webhook" && this.options.hostHot?.()) continue;
+        if (run.triggerSource === "webhook" && this.options.hostHot?.()) {
+          // Same as snooze, busy, and the min-gap skip below.  A hot host is
+          // a deferral, not a hold, and a reason verified while the engine
+          // was dead must not keep rendering for the whole shed window.
+          this.clearHoldReason(run);
+          continue;
+        }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
         // and the whole batch goes into one turn when the gap closes, which
@@ -1132,6 +1160,9 @@ export class RoutineManager {
           if (withinGap(lastStartedAt, this.now(), gapMinutes)) {
             const opensAt = gapEndsAt(lastStartedAt, gapMinutes);
             if (opensAt !== null) this.scheduleGapWake(opensAt);
+            // Same as the skip paths above: the gap is a quiet cooldown, not
+            // a hold, so a stale reason must not render for the whole window.
+            this.clearHoldReason(run);
             continue;
           }
         }
@@ -1220,7 +1251,33 @@ export class RoutineManager {
         // Gate before creating, activating, or stamping a task.  A missing
         // runtime credential may take many scheduler ticks to arrive; those
         // retries must not mint duplicate empty tasks as a side effect.
-        if (this.options.canStart?.(run.botId, threadId, run.runOn) === false) continue;
+        if (this.options.canStart?.(run.botId, threadId, run.runOn) === false) {
+          // Held, not failed.  The engine that refused is the bot's own problem,
+          // not this run's: a missing CLI will still be missing in fifteen
+          // minutes, and failing the run would throw away work that is one good
+          // tick from landing.  The reason goes on the run, and is saved and
+          // emitted so the receipt can say why it is waiting — a run that sits
+          // QUEUED with no explanation is indistinguishable from a stuck
+          // scheduler, which is the whole reason this exists.
+          //
+          //  Evaluated HERE rather than from `botState` because that call has
+          //  no thread and no destination, so judging a hold there put the
+          //  local spend ceiling and the local credential gate in front of
+          //  CLOUD runs.
+          const reason = this.options.dispatchHoldReason?.(run.botId, threadId, run.runOn)
+            ?? "Its engine is not available right now";
+          // Persist and emit only on a CHANGE. The scheduler ticks every ten
+          // seconds, so an unchanged hold was writing the whole state file and
+          // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
+          // writes a day for one sustained hold, scaling with queue depth.
+          // A client that already has this run is already showing this reason.
+          if (reason !== run.holdReason) {
+            run.holdReason = reason;
+            this.save();
+            this.emitRun(run);
+          }
+          continue;
+        }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
         if (!threadId) {
           const task = this.options.createTask(
@@ -1253,6 +1310,7 @@ export class RoutineManager {
         run.threadId = threadId;
         run.startedAt = this.now();
         run.status = "running";
+        run.holdReason = undefined;
         this.lastStartedByKey.set(key, run.startedAt);
         // A genuine recurring firing, not "Run now" or a webhook/resource
         // trigger riding the same dispatch path — those have no calendar
@@ -1277,6 +1335,11 @@ export class RoutineManager {
         for (const folded of waiting) {
           folded.status = "running";
           folded.coalescedInto = run.id;
+          // This child is about to run on the owner's turn, so a hold reason
+          // left on it would be a lie by the time its receipt says
+          // "completed" — and `copyCombinedOutcome` does not overwrite the
+          // field. Cleared where the fold happens.
+          folded.holdReason = undefined;
           folded.threadId = threadId;
           folded.startedAt = run.startedAt;
           folded.finishedAt = undefined;
@@ -1357,7 +1420,7 @@ export class RoutineManager {
       const reason = event.stopReason ?? run.error;
       const code = routineFailureCode(reason, run.setupFailed === true, Boolean(event.denials?.length));
       if (code === "cancelled") {
-        run.status = "cancelled";
+        this.leaveQueued(run, "cancelled");
         run.outcomeCode = "cancelled";
         run.failurePhase = "lifecycle";
         run.finishedAt = this.now();
@@ -1414,8 +1477,35 @@ export class RoutineManager {
     return orphaned;
   }
 
+  /** Drop a stale hold reason and PUBLISH that, which is the whole point.
+   *
+   *  Clearing the field in memory leaves the persisted receipt and every
+   *  attached client showing the obsolete reason for as long as the skip lasts
+   *  — which is the symptom this exists to remove, just with a quieter
+   *  mechanism.  A no-op when there was nothing to clear, so a run that was
+   *  never held does not emit on every tick. */
+  private clearHoldReason(run: RoutineRun): void {
+    if (run.holdReason === undefined) return;
+    run.holdReason = undefined;
+    this.save();
+    this.emitRun(run);
+  }
+
+  /** Move a run out of `queued` and drop the reason it was being held.
+   *
+   *  The reason is only true while the run is waiting. Every terminal path —
+   *  cancelled by a user, a sweep, a deleted bot or a schedule edit, or failed
+   *  by `failRun` — has to clear it, or a persisted receipt ends up claiming
+   *  "cancelled" and "waiting because its engine is dead" at the same time.
+   *  Centralised because there are seven cancel sites and forgetting one is
+   *  silent. */
+  private leaveQueued(run: RoutineRun, status: "cancelled" | "failed"): void {
+    run.status = status;
+    run.holdReason = undefined;
+  }
+
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {
-    run.status = "failed";
+    this.leaveQueued(run, "failed");
     run.error = message.slice(0, 500);
     run.outcomeCode = code;
     run.failurePhase = routineFailurePhase(code);
