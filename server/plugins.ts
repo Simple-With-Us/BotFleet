@@ -393,15 +393,17 @@ export async function updatePlugin(
     };
   }
 
-  // DESIGN.md: semver check (warn on downgrade).  Still apply the update
-  // so a deliberate republish of an older tag is not silently blocked,
-  // but surface the warning on the listing for the install review UI.
-  const warnings = [...sourceWarnings];
+  // Refuse downgrades before unload/overwrite.  UI does not surface
+  // warnings, and continuing past detect left the install half-replaced.
+  // Roll back deliberately with remove + reinstall.
   if (compareSemver(parsed.manifest.version, entry.version) < 0) {
-    warnings.push(
-      `update would downgrade ${name} from ${entry.version} to ${parsed.manifest.version}`,
-    );
+    return {
+      error:
+        `update would downgrade ${name} from ${entry.version} to ${parsed.manifest.version} — remove and reinstall to roll back`,
+    };
   }
+
+  const warnings = [...sourceWarnings];
 
   // Dispose before rewriting the tree.  On Windows the child holds open
   // handles under the plugin dir; rmSync fails with EPERM until exit.

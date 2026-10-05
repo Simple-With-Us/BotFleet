@@ -457,8 +457,8 @@ describe("install folder skipped warnings", () => {
   });
 });
 
-describe("update downgrade warning", () => {
-  it("warns when an update would downgrade the installed version", async () => {
+describe("update downgrade refusal", () => {
+  it("refuses a downgrade before unload or overwrite", async () => {
     const sourceDir = mkdtempSync(join(tmpdir(), "botfleet-plugin-downgrade-"));
     try {
       const fixtureFiles = readdirSync(FIXTURE);
@@ -466,21 +466,39 @@ describe("update downgrade warning", () => {
         copyFileSync(join(FIXTURE, name), join(sourceDir, name));
       }
       await installPlugin(sourceDir, baseDir);
+      const enabled = await enablePlugin("fleet-overview", baseDir);
+      if ("error" in enabled) throw new Error(enabled.error);
+      expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
+
       const manifestPath = join(sourceDir, "botfleet-plugin.json");
       const original = readManifest(manifestPath);
-      // Bump first so we have room to downgrade.
+      // Bump first so we have room to attempt a downgrade.
       original.version = "1.2.0";
       writeFileSync(manifestPath, JSON.stringify(original, null, 2));
       const bumped = await updatePlugin("fleet-overview", baseDir);
       if ("error" in bumped) throw new Error(bumped.error);
       expect(bumped.version).toBe("1.2.0");
+      expect(bumped.enabled).toBe(true);
+      expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
+
+      const installedManifestBefore = readManifest(join(baseDir, "fleet-overview", "botfleet-plugin.json"));
+      expect(installedManifestBefore.version).toBe("1.2.0");
 
       original.version = "1.0.0";
       writeFileSync(manifestPath, JSON.stringify(original, null, 2));
-      const downgraded = await updatePlugin("fleet-overview", baseDir);
-      if ("error" in downgraded) throw new Error(downgraded.error);
-      expect(downgraded.version).toBe("1.0.0");
-      expect(downgraded.warnings.some((w) => /downgrade.*1\.2\.0.*1\.0\.0/.test(w))).toBe(true);
+      const refused = await updatePlugin("fleet-overview", baseDir);
+      expect("error" in refused).toBe(true);
+      if (!("error" in refused)) throw new Error("expected downgrade refusal");
+      expect(refused.error).toMatch(/downgrade.*1\.2\.0.*1\.0\.0.*remove and reinstall/);
+
+      // Installed version, tree, and load state must be unchanged.
+      const still = getPlugin("fleet-overview", baseDir);
+      if ("error" in still) throw new Error(still.error);
+      expect(still.version).toBe("1.2.0");
+      expect(still.enabled).toBe(true);
+      expect(_loadedNames().includes("fleet-overview")).toBeTruthy();
+      const installedManifestAfter = readManifest(join(baseDir, "fleet-overview", "botfleet-plugin.json"));
+      expect(installedManifestAfter.version).toBe("1.2.0");
     } finally {
       rmSync(sourceDir, { recursive: true, force: true });
     }
