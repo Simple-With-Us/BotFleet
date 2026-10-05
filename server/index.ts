@@ -12663,17 +12663,26 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
 
       return { ok: true, approvedCount };
     };
-    m = path.match(/^\/api\/bots\/([\w-]+)\/approve-all$/);
+    m = path.match(/^\/api\/bots\/([^/]+)\/approve-all$/);
     if (m && method === "POST") {
-      const bot = store.bot(m[1]);
+      const botIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedBotId = botIdSchema.safeParse(m[1]);
+      if (!parsedBotId.success) {
+        return json(res, 400, { error: "invalid bot id" });
+      }
+      const bot = store.bot(parsedBotId.data);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const result = await approveAllForThread(bot.threadId);
       return json(res, 200, result);
     }
-    m = path.match(/^\/api\/threads\/([\w-]+)\/approve-all$/);
+    m = path.match(/^\/api\/threads\/([^/]+)\/approve-all$/);
     if (m && method === "POST") {
-      const threadId = m[1];
-      const result = await approveAllForThread(threadId);
+      const threadIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedThreadId = threadIdSchema.safeParse(m[1]);
+      if (!parsedThreadId.success) {
+        return json(res, 400, { error: "invalid thread id" });
+      }
+      const result = await approveAllForThread(parsedThreadId.data);
       return json(res, 200, result);
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/interrupt$/);

@@ -127,7 +127,6 @@
 - **2026-10-04 - MINIMAX - IN_PROGRESS - [BF] P1: the Mac updater is refused right now — an untracked file in the always-on checkout, and it is the one pm2 botfleet-mcp points at.** <!-- wb-agent-report:3fbd48d8898941db8c7d1e1055c78efb -->
 - **2026-10-04 - AG - IN_PROGRESS - Standardize CUA casing across computer settings and audit settings copy/UX.** <!-- wb-agent-report:291cf8d41f0f4ea39feb24e636ef0df7 -->
 - **2026-10-04 - AG - IN_PROGRESS - [BF][AG] Fleet Matrix Kanban Command Center & attention-ranked task board.** <!-- wb-agent-report:f0455258c2004b6f85f576c99870f522 -->
-- **2026-10-04 — AG — IN PROGRESS — [BF][AG] Strict turn-level worktree lease engine for concurrent multi-bot repository isolation (board `dc2f5d13`; branch `ag/strict-worktree-leases`, worktree `~/apps/botfleet-ag-worktree-leases`).**  Implementing Option C strict worktree lease manager (`server/worktree-leases.ts`) with turn-scoped leases (`~/.botfleet/worktrees/<repo-hash>/bot-<id>-thread-<id>`), automated branch isolation, git index conflict prevention, and turn lifecycle cleanup.  Coordination: claimed board `dc2f5d13`, posted pre-work claim to `#agent-sync`.
 
 ## Planned / Reserved
 
