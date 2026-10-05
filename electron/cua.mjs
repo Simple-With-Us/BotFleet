@@ -15,6 +15,7 @@
 // <userData>/cua-connection.json for the harness server to hand to drivers.
 
 import { app, ipcMain } from "electron";
+import { parseCuaPermissionsStdout } from "./cua-permissions-status.mjs";
 import { nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
 import { createRequire } from "node:module";
 import fs from "node:fs";
@@ -269,30 +270,22 @@ export function cuaPermissionsStatus() {
   const probe = probeNativeSync(binary, {
     args: ["permissions", "status", "--json"],
     spawnOptions: { env: { ...process.env, ...CUA_ENV } },
-    matchVersion: (output) => {
-      try {
-        JSON.parse(output);
-        return "ok";
-      } catch {
-        return null;
-      }
-    },
+    timeoutMs: 15_000,
+    attempts: 1,
+    matchVersion: (stdout) => (parseCuaPermissionsStdout(stdout).ok ? "ok" : null),
     probeLabel: "CUA permissions probe",
   });
   if (!probe.ok) {
-    if (probe.reason === "timeout") {
-      return {
-        available: false,
-        reason: nativeProbeFailureMessage("cua-driver permissions status did not complete", probe),
-      };
-    }
+    return {
+      available: false,
+      reason: nativeProbeFailureMessage("cua-driver permissions status did not complete", probe),
+    };
   }
-  const stdout = probe.result?.stdout ?? "";
-  try {
-    return { available: true, ...JSON.parse(stdout) };
-  } catch {
-    return { available: true, raw: stdout.trim() };
+  const parsed = parseCuaPermissionsStdout(probe.result?.stdout ?? "");
+  if (!parsed.ok) {
+    return { available: false, reason: "invalid CUA permissions status" };
   }
+  return { available: true, ...parsed.data };
 }
 
 export async function stopCua() {

@@ -40,14 +40,14 @@ export function oneLine(value, limit = PROBE_DETAIL_LIMIT) {
  * `status` is null and `signal` is set -- none of which a single boolean can
  * tell apart from a genuine mismatch. */
 export function classifyNativeProbe(result = {}, matchVersion) {
-  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  const stdout = String(result.stdout ?? "");
   if (result.error) {
     const message = String(result.error.message ?? result.error);
     const timedOut = result.error.code === "ETIMEDOUT" || /ETIMEDOUT/i.test(message);
     return { ok: false, reason: timedOut ? "timeout" : "spawn", version: null };
   }
   if (result.status === 0) {
-    const version = matchVersion(output);
+    const version = matchVersion(stdout);
     return version
       ? { ok: true, reason: "version", version }
       : { ok: false, reason: "version", version: null };

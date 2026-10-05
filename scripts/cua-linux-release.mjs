@@ -267,7 +267,10 @@ function linuxCuaSpawnOptions() {
 }
 
 export function matchLinuxCuaDriverVersionLine(output) {
-  const line = String(output ?? "").trim();
+  const line = String(output ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith("cua-driver "));
   return line === `cua-driver ${LINUX_CUA_RELEASE.version}` ? LINUX_CUA_RELEASE.version : null;
 }
 

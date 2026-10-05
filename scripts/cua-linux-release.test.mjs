@@ -96,6 +96,11 @@ describe("Linux CUA native probes", () => {
     expect(matchLinuxCuaDriverVersionLine("cua-driver 0.1.0\n")).toBeNull();
   });
 
+  it("ignores stderr noise when matching the version line", () => {
+    const output = `warning: glibc locale\n\ncua-driver ${LINUX_CUA_RELEASE.version}\n`;
+    expect(matchLinuxCuaDriverVersionLine(output)).toBe(LINUX_CUA_RELEASE.version);
+  });
+
   it("names a timeout instead of a version mismatch on a starved host", () => {
     const spawn = vi.fn()
       .mockReturnValueOnce(timedOutProbe())
