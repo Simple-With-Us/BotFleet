@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, win32 } from "node:path";
+import { basename, dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -649,8 +649,17 @@ test("promoting preserves each file's mode and only removes write bits", async (
 
   const release = releasePath(commit, env);
   const modeOf = async (name) => (await stat(join(release, name))).mode & 0o777;
-  assert.equal(await modeOf("tool.sh"), 0o555, "an executable stays executable, minus write");
-  assert.equal(await modeOf("restricted"), 0o440, "a 0640 file keeps its group read and loses group write");
+  const toolMode = await modeOf("tool.sh");
+  const restrictedMode = await modeOf("restricted");
+  if (process.platform === "win32") {
+    // Windows chmod only toggles the read-only attribute; POSIX execute and group
+    // bits are not preserved the way they are on macOS and Linux.
+    assert.equal(toolMode & 0o222, 0, "write bits must be cleared on Windows");
+    assert.equal(restrictedMode & 0o222, 0, "write bits must be cleared on Windows");
+  } else {
+    assert.equal(toolMode, 0o555, "an executable stays executable, minus write");
+    assert.equal(restrictedMode, 0o440, "a 0640 file keeps its group read and loses group write");
+  }
 
   // And the round trip back to writable does not invent permissions either.
   await discardRelease(commit, env);
@@ -696,7 +705,7 @@ test("re-promoting an already-released commit says so, not 'check your filesyste
   await stage(env, A, "payload-again");
   const { rename: realRename } = await import("node:fs/promises");
   const collision = async (from, to) => {
-    if (to.endsWith(`/${A}`)) {
+    if (basename(to) === A) {
       const error = new Error("directory not empty");
       error.code = "ENOTEMPTY";
       throw error;
