@@ -4,10 +4,11 @@ PR #831 (`ag/fix-acp-wedged-lock`).  Close the recycled-pgid kill window when an
 
 ## Pre-work Claim
 
-- `AGENT-SYNC.md` (`/Users/jay/apps/AGENT-SYNC.md`) was read before claiming this work.
-- The #agent-sync claim was posted to `#agent-sync` (`C0BEZDJDNKV`) with `repo: BotFleet` as its first body field.  Seat `BF-FIXER`, claimed Mon, Oct 5, 2026, state WIP.
-- Claim reference:  ts `1791237243.397089`, permalink https://simple-with-us.slack.com/archives/C0BEZDJDNKV/p1791237243397089
-- Claimed scope:  `ag/fix-acp-wedged-lock` `server/procs.ts` `server/procs-group.test.ts` `server/drivers/acp/**` (PR #831 at tip `26acb0b7`).
+- AGENT-SYNC protocol was read before claiming this work.
+- A pre-work claim was posted with `repo: BotFleet` as its first body field.
+- Seat `BF-FIXER`, claimed Mon, Oct 5, 2026, state WIP / tip-fix.
+- Claimed scope:  `ag/fix-acp-wedged-lock` `server/procs.ts` `server/procs-group.test.ts` `server/drivers/acp/**` (PR #831).
+- Triple reservation:  THE BOARD `82fb5d0da98342cdb7554ef357d0f2fe`, GitHub issue #890, PR #831.
 
 ## Context & Objective
 
@@ -54,4 +55,4 @@ Commands run on the Linux tip-fix box (America/Chicago), in the repo's mandated 
 
 The ownership-reuse residual above is already encoded in the `trackCliGroup` comment and restated under Decisions so the handoff does not invent a follow-up that needs no code yet.
 
-Recall closeout: BF-FIXER contributed the process-group ownership lesson via fleet-recall (category `lesson`, app `botfleet`) — retain group ownership until an empty-group probe disowns it, re-probe before every delayed signal, document residual PID-reuse windows, and never treat a pid file's existence alone as ready (parse to a positive safe integer before any cleanup kill).  Result: `status: ok`, `id: 460c350c-fd9e-5bd8-b803-4f794bf4ee83`, `doc_id: contrib/BF-FIXER/2026-10-05/7eee4629`.
+No additional fleet-recall contribution; ownership lesson lives in this note's Context/Decisions.
