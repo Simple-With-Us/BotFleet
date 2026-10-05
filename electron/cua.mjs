@@ -21,6 +21,7 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { isFunction } from "node:util/types";
 import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -102,7 +103,7 @@ function ensureLinuxRuntime() {
 }
 
 export function setCuaStateListener(listener) {
-  stateListener = typeof listener === "function" ? listener : () => {};
+  stateListener = isFunction(listener) ? listener : () => {};
 }
 
 function persistAndNotify(next) {

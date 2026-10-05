@@ -62,7 +62,7 @@ function verifyAppImageLauncher(appRun) {
   const launcher = readFileSync(appRun, "utf8");
   for (const variable of ["LD_LIBRARY_PATH", "PATH", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR"]) {
     const safeExpansion = `\${${variable}:+:\${${variable}}}`;
-    if (!launcher.includes(safeExpansion) || launcher.includes(`:\${${variable}}\"`)) {
+    if (!launcher.includes(safeExpansion) || launcher.includes(`:\${${variable}}"`)) {
       fail(`AppRun does not guard the ${variable} separator when the variable is unset`);
     }
   }
@@ -140,7 +140,7 @@ function verifyCompliance(licenses, label) {
   const componentRefs = new Set();
   for (const component of components) {
     const reference = component["bom-ref"];
-    if (typeof reference !== "string" || reference.length === 0) {
+    if (reference == null || String(reference).length === 0) {
       fail(`${label} SBOM component has no bom-ref: ${component.name ?? "unknown"}`);
     }
     if (componentRefs.has(reference)) fail(`${label} SBOM repeats bom-ref ${reference}`);
@@ -176,7 +176,7 @@ function verifyCompliance(licenses, label) {
     const packageId = component.properties?.find(
       (property) => property.name === "botfleet:cargo:package-id",
     )?.value;
-    if (typeof packageId !== "string" || !packageId.startsWith("registry+")) {
+    if (packageId == null || !String(packageId).startsWith("registry+")) {
       fail(`${label} SBOM registry component has no exact Cargo package ID`);
     }
     if (registryIds.has(packageId)) fail(`${label} SBOM repeats ${packageId}`);

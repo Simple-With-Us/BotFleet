@@ -207,8 +207,8 @@ function matchCloudflaredVersionLine(output) {
 }
 
 export function classifyVersionProbe(result = {}) {
-  const { version, ...classification } = classifyNativeProbe(result, matchCloudflaredVersionLine);
-  return classification;
+  const probe = classifyNativeProbe(result, matchCloudflaredVersionLine);
+  return { ok: probe.ok, reason: probe.reason };
 }
 
 /** Ask the staged executable for its version, retrying only a timeout.  A
@@ -261,11 +261,13 @@ function extractionFailure(result) {
 /** A network failure a person can act on: "timed out" and "getaddrinfo
  * ENOTFOUND" are different problems with different fixes. */
 export function describeDownloadFailure(error, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
-  const name = error && typeof error === "object" && "name" in error ? String(error.name) : "";
-  if (name === "TimeoutError" || name === "AbortError") {
-    return `the download timed out after ${Math.round(timeoutMs / 1000)}s`;
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") {
+      return `the download timed out after ${Math.round(timeoutMs / 1000)}s`;
+    }
+    return error.message || "the download failed";
   }
-  const message = error && typeof error === "object" && "message" in error ? String(error.message) : String(error);
+  const message = String(error ?? "");
   return message || "the download failed";
 }
 

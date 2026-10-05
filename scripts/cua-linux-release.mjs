@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import {
   chmod,
@@ -15,11 +14,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { gunzipSync } from "node:zlib";
 import { nativeProbeFailureMessage, probeNativeVersion } from "./native-version-probe.mjs";
 
-const run = promisify(execFile);
 const KIB = 1024;
 const MIB = KIB * KIB;
 const TAR_BLOCK_SIZE = 512;
@@ -300,9 +297,10 @@ export function matchLinuxCuaDriverManifest(output, driverRealpath) {
   }
   const invocationCommand = manifest.mcp_invocation?.command;
   let invocationPath = null;
-  if (typeof invocationCommand === "string" && invocationCommand.length > 0) {
+  const commandText = invocationCommand == null ? "" : String(invocationCommand);
+  if (commandText.length > 0) {
     try {
-      invocationPath = realpathSync(invocationCommand);
+      invocationPath = realpathSync(commandText);
     } catch {
       invocationPath = null;
     }
