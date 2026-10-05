@@ -34,7 +34,7 @@
     "dev:desktop": "node scripts/prepare-cloudflared.mjs --current && electron .",
     "build": "tsc -b && tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
-    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start",
+    "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:updater && pnpm test:mac-updater && pnpm test:config-lock && pnpm test:credential-patch && pnpm test:desktop-viewer && pnpm test:package-link && pnpm test:save-file && pnpm test:server-boot-probe && pnpm test:packaged-server && pnpm test:ios-ship && pnpm test:ci-scope && pnpm test:lint-gate && pnpm test:infisical-fetch && pnpm test:release-workflow && pnpm test:board-audit && pnpm test:cred-sync && pnpm test:server-start && pnpm test:kody-autofix",
     "test:ci-scope": "node --test scripts/ci-change-scope.node-test.mjs",
     "test:lint-gate": "node --test scripts/lint-pr-gate.node-test.mjs",
     "test:e2e": "playwright test",
@@ -88,7 +88,8 @@
     "test:board-audit": "node --test scripts/audit-effort-board.node-test.mjs",
     "test:server-start": "node --test scripts/botfleet-server-start.node-test.mjs",
     "postinstall": "node scripts/compile-clutch-dep.mjs",
-    "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs"
+    "test:cred-sync": "node --test scripts/sync-cli-credentials.node-test.mjs",
+    "test:kody-autofix": "node --test .github/autofix/kody-pilot.node-test.mjs"
   },
   "dependencies": {
     "@openfeature/server-sdk": "^1.23.0",

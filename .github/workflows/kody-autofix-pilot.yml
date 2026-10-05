@@ -1,0 +1,121 @@
+name: Kody DeepSeek Fix Pilot
+
+# No review/comment/push trigger.  Merging this file alone does not enable paid work.
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Open, human-authored, same-repository PR targeting main'
+        required: true
+        type: string
+      expected_head:
+        description: 'Exact 40-character SHA reviewed by Kody'
+        required: true
+        type: string
+      approve_paid_attempt:
+        description: 'Approve sending selected code/findings to DeepSeek for one bounded paid attempt'
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+concurrency:
+  group: kody-fix-pilot-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  PR_NUMBER: ${{ inputs.pr_number }}
+  EXPECTED_HEAD: ${{ inputs.expected_head }}
+
+jobs:
+  prepare:
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      github.run_attempt == 1 && inputs.approve_paid_attempt &&
+      vars.BOTFLEET_KODY_FIX_PILOT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/autofix
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node .github/autofix/kody-pilot.mjs prepare "$RUNNER_TEMP/pilot"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kody-pilot-context
+          path: ${{ runner.temp }}/pilot/snapshot.json
+          if-no-files-found: error
+          retention-days: 1
+
+  generate:
+    needs: prepare
+    environment: kody-autofix-pilot
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/autofix
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-pilot-context
+          path: ${{ runner.temp }}/pilot
+      # Fixed official package, outside the target PR.  No project install/hooks.
+      - name: Install Pinned Claude Code
+        run: npm install --global @anthropic-ai/claude-code@2.1.289
+      - name: Make One Bounded Proposal
+        run: node .github/autofix/kody-pilot.mjs generate "$RUNNER_TEMP/pilot"
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.KODY_DEEPSEEK_API_KEY }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kody-pilot-answer
+          path: ${{ runner.temp }}/pilot/answer.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [prepare, generate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/autofix
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-pilot-context
+          path: ${{ runner.temp }}/pilot
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kody-pilot-answer
+          path: ${{ runner.temp }}/pilot
+      - name: Revalidate And Create Draft Proposal
+        run: node .github/autofix/kody-pilot.mjs publish "$RUNNER_TEMP/pilot"
+        env:
+          GH_TOKEN: ${{ github.token }}
