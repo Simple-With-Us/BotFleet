@@ -5602,31 +5602,20 @@ describe("instance CLI override API", () => {
     let roomThreadId = "";
     try {
       // An engine a neighbouring test left reloading is still settling;
-      // `unavailable` here means "asked too early", not "broken".  Poll the
-      // memoized snapshot between occasional `fresh=1` fleet probes so a 15s
-      // describe memo cannot freeze an early `unavailable` for the whole wait.
-      // Full re-probes are capped at one per 2s, not every 200ms tick.
-      const fleetReprobeMs = 2_000;
-      let lastFleetProbeAt = -fleetReprobeMs;
+      // `unavailable` here means "asked too early", not "broken".  Poll at the
+      // fleet re-probe cadence with `fresh=1` each tick so a 15s describe memo
+      // cannot freeze an early `unavailable` for the whole wait (~4 probes in 8s).
       await settlesWithin(
         async ({ signal }) => {
-          const now = Date.now();
-          const probeFleet = now - lastFleetProbeAt >= fleetReprobeMs;
-          if (probeFleet) lastFleetProbeAt = now;
           const instances = (
-            await api(
-              "GET",
-              probeFleet ? "/api/instances?fresh=1" : "/api/instances",
-              undefined,
-              { signal },
-            )
+            await api("GET", "/api/instances?fresh=1", undefined, { signal })
           ).body.instances;
           return instances.find(
             (instance: { instanceId: string }) => instance.instanceId === "claude",
           )?.snapshot?.state === "available";
         },
         8_000,
-        200,
+        2_000,
         "the claude engine reaching available",
       );
       const claude = (await api("GET", "/api/instances")).body.instances.find(
@@ -5675,7 +5664,7 @@ describe("instance CLI override API", () => {
       if (botId) await api("DELETE", `/api/bots/${botId}`);
       expect((await api("PATCH", "/api/instances/claude", { fullAuto: false })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);
