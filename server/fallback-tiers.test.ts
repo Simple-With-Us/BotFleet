@@ -75,4 +75,20 @@ describe("effectiveFallbackTiers", () => {
     effectiveFallbackTiers(primary, chain);
     expect(JSON.stringify(chain)).toBe(before);
   });
+
+  it("collapses a retired id to its live replacement on the same engine", () => {
+    // The primary is the retired id and the fallback is its already-rewritten
+    // replacement. selectTurnFallback rewrites both sides before comparing, so
+    // they are the same engine from the runtime's point of view; the chain has
+    // no real second tier. The redundant entry still names the configured
+    // (unrewritten) model string, not whatever rewriteRetiredModelId would map
+    // it onto, so Settings shows the owner what they actually typed.
+    const primary = at("dsh", "MiniMax-M3");
+    const chain = [at("dsh", "MiniMax-M3.1-Flash-Preview")];
+    expect(effectiveFallbackTiers(primary, chain)).toMatchObject({
+      total: 2,
+      effective: 1,
+      redundant: [{ instanceId: "dsh", model: "MiniMax-M3.1-Flash-Preview", reason: "same-as-primary" }],
+    });
+  });
 });

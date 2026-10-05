@@ -502,15 +502,21 @@ export function effectiveFallbackTiers(
   // `previous` is the engine the runtime would have just failed, which is the
   // only thing `selectTurnFallback` compares against. It is NOT everything seen
   // so far: an earlier, global dedup reported A -> B -> A as two tiers when the
-  // runtime walks all three.
+  // runtime walks all three.  `selectTurnFallback` compares on the REWRITTEN id,
+  // so a retired id and its live replacement collapse to a single tier; we do
+  // the same rewrite here on a local copy so the stored model string is left
+  // alone (redundant[].model stays configured, not migrated).
   let previous = primary;
   let effective = 1;
   for (const candidate of fallbacks ?? []) {
-    if (sameEngine(previous, candidate)) {
+    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model) };
+    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model) };
+    if (sameEngine(prevKey, candKey)) {
+      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model) };
       redundant.push({
         instanceId: candidate.instanceId,
         model: candidate.model,
-        reason: sameEngine(primary, candidate) ? "same-as-primary" : "duplicate",
+        reason: sameEngine(primaryKey, candKey) ? "same-as-primary" : "duplicate",
       });
       // `previous` deliberately does NOT advance: a skipped entry was never a
       // hop, so the next candidate is still being weighed against the engine
