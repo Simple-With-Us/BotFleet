@@ -109,33 +109,53 @@ describe("vm CLI manifest install", () => {
   // and got "rustup could not choose a version of cargo to run".  Reproduced
   // in the base image: `cargo --version` succeeds with RUSTUP_HOME set and
   // fails without it.
-  it("bakes RUSTUP_HOME and CARGO_HOME into the image, not just the recipe", () => {
+  it("bakes RUSTUP_HOME into the image, so the shims outlive the recipe", () => {
     const run = renderDockerfileCliInstallRun("local-vm");
     expect(run).toContain("ENV RUSTUP_HOME=/usr/local/rustup");
-    expect(run).toContain("ENV CARGO_HOME=/usr/local/cargo");
     // ENV only reaches later layers when it is its own instruction.
     expect(run).toMatch(/BOTFLEET_VM_CLI_INSTALL\nENV RUSTUP_HOME=/);
   });
 
-  it("omits the rust env when no rust tool is requested", () => {
-    const run = renderDockerfileCliInstallRun("cloud");
-    // The cloud manifest still ships rustup, so assert the positive direction
-    // on the helper instead of guessing which environment omits it.
-    expect(run.includes("ENV RUSTUP_HOME=")).toBe(
-      vmCliToolsForEnvironment("cloud").some((tool) => tool.recipe === "rustup"),
-    );
+  it("does NOT bake CARGO_HOME, which would hide the synced cargo credentials", () => {
+    // Kody review on #911, and correct: cargo resolves config.toml and
+    // credentials.toml *under* CARGO_HOME rather than extending $HOME/.cargo,
+    // and the manifest syncs cargo's credentialPaths to /home/cua/.cargo.
+    // Overriding it points the lookup at a root-owned directory, so
+    // private-registry tokens are ignored and `cargo login` fails as cua.
+    const run = renderDockerfileCliInstallRun("local-vm");
+    expect(run).not.toContain("ENV CARGO_HOME=");
   });
 
-  // Regression, 2026-10-06: Debian bookworm split scp and sftp out of
-  // openssh-client, so `apt-get install openssh-client` succeeds and leaves
-  // both binaries missing.  Confirmed against the pinned base image with
-  // `dpkg -L openssh-client`.
-  it("installs scp and sftp as their own Debian packages", () => {
-    for (const tool of loadVmCliManifest().tools) {
-      if (tool.name !== "scp" && tool.name !== "sftp") continue;
-      expect(tool.apt, `${tool.name} needs its own package on Debian bookworm`).toContain(
-        tool.name,
-      );
+  // Regression, 2026-10-06: the v6 build reported
+  //   missing VM CLIs: scp sftp cargo rustc
+  // scp and sftp were installed the whole time.  openssh-client ships both
+  // binaries; the manifest verified them with `-V`, which neither supports, so
+  // the check ran a usage error that exits 1 and read as "missing".  ssh uses
+  // the same `-V` and genuinely supports it, which is why ssh was never
+  // reported — the only clue that the flag, not the package, was at fault.
+  // Verified on the pinned base image: ssh -V exits 0, scp -V and sftp -V exit
+  // 1, and `command -v` succeeds for all three.
+  it("verifies scp and sftp with a presence check, not a flag they lack", () => {
+    const script = renderVerifyScript("local-vm");
+    for (const name of ["scp", "sftp"]) {
+      const tool = loadVmCliManifest().tools.find((t) => t.name === name);
+      expect(tool?.verify?.command, `${name} must not be probed with -V`).toBe("command");
+      expect(tool?.verify?.args).toEqual(["-v", name]);
+      // Args are shell-quoted by the renderer, so match the real output.
+      expect(script).toContain(`command '-v' '${name}'`);
+      expect(script).not.toContain(`${name} -V`);
+    }
+    // ssh genuinely supports -V, so it must keep using it.
+    expect(script).toContain("ssh '-V'");
+  });
+
+  it("keeps scp and sftp on openssh-client, which ships both binaries", () => {
+    // There is no binary package named `scp` in bookworm: `apt-cache show scp`
+    // finds nothing, so naming one aborts the whole install RUN under
+    // `set -euo pipefail`.  Kody review on #911 caught that in the first draft.
+    for (const name of ["scp", "sftp"]) {
+      const tool = loadVmCliManifest().tools.find((t) => t.name === name);
+      expect(tool?.apt).toEqual(["openssh-client"]);
     }
   });
 

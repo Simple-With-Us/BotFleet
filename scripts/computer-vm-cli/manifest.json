@@ -222,14 +222,15 @@
       ],
       "version": "apt",
       "verify": {
-        "command": "scp",
+        "command": "command",
         "args": [
-          "-V"
+          "-v",
+          "scp"
         ]
       },
       "apt": [
         "openssh-client"
-      , "scp"]
+      ]
     },
     {
       "name": "sftp",
@@ -238,14 +239,15 @@
       ],
       "version": "apt",
       "verify": {
-        "command": "sftp",
+        "command": "command",
         "args": [
-          "-V"
+          "-v",
+          "sftp"
         ]
       },
       "apt": [
         "openssh-client"
-      , "sftp"]
+      ]
     },
     {
       "name": "awk",
