@@ -1058,10 +1058,14 @@ emit_sentry_deployment_receipt() {
     echo "::warning::No confirmed TestFlight readiness; Sentry deployment was not recorded."
     return 0
   fi
-  SENTRY_ARCHIVE_PATH="$ARCHIVE_PATH" SENTRY_READY_FILE="${LOG_DIR}/ensure-tf-ready.json" \
+  if ! SENTRY_ARCHIVE_PATH="$ARCHIVE_PATH" SENTRY_READY_FILE="${LOG_DIR}/ensure-tf-ready.json" \
   SENTRY_REPO_ROOT="$REPO_ROOT" SENTRY_ARCHIVE_COMMIT="$SENTRY_ARCHIVE_COMMIT" \
   SENTRY_BUNDLE_ID="$BUNDLE_ID" SENTRY_MARKETING_VERSION="$MARKETING" SENTRY_BUILD_NUMBER="$BUILD_NUM" \
-    node "${REPO_ROOT}/scripts/sentry-testflight-receipt.mjs"
+    node "${REPO_ROOT}/scripts/sentry-testflight-receipt.mjs"; then
+    # Preserve the successful ship result.  The separate reporting job fails
+    # visibly on this output before it loads any Sentry credential.
+    echo "sentry_receipt_error=true" >> "$GITHUB_OUTPUT"
+  fi
 }
 
 acquire_archive_lock

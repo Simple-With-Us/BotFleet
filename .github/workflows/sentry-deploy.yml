@@ -8,8 +8,14 @@ on:
     inputs:
       receipt:
         description: Verified TestFlight distribution receipt from ios-ship
-        required: true
+        required: false
+        default: ""
         type: string
+      receipt_error:
+        description: The ship succeeded but its deployment receipt could not be verified
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,9 +36,11 @@ jobs:
       - name: Validate the distribution receipt before loading credentials
         env:
           SENTRY_DEPLOY_RECEIPT: ${{ inputs.receipt }}
+          SENTRY_RECEIPT_ERROR: ${{ inputs.receipt_error }}
         run: |
           node --input-type=module -e '
             import { validateReceipt } from "./scripts/sentry-testflight-receipt.mjs";
+            if (process.env.SENTRY_RECEIPT_ERROR === "true") throw new Error("The upload succeeded but receipt verification failed; deployment reporting is blocked");
             const receipt = validateReceipt(JSON.parse(process.env.SENTRY_DEPLOY_RECEIPT));
             if (receipt.sourceCommit !== process.env.GITHUB_SHA) throw new Error("Receipt source does not match the ship workflow");
           '

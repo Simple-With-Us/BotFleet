@@ -98,11 +98,12 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
   const dir=mkdtempSync(join(tmpdir(),'sentry-testflight-'));
   try {
-    for (const status of [0,2,3,4]) {
-      const out=join(dir,`out-${status}`); writeFileSync(out,'');
-      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
+    for (const [status, receiptStatus] of [[0,0],[0,1],[2,0],[3,0],[4,0]]) {
+      const out=join(dir,`out-${status}-${receiptStatus}`); writeFileSync(out,'');
+      const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; elif [[ ${receiptStatus} == 1 ]]; then return 1; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
       const result=spawnSync('bash',['-c',script],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
-      assert.equal(result.status,0,result.stderr); assert.equal(readFileSync(out,'utf8'),status===0?'emitted\n':'');
+      assert.equal(result.status,0,result.stderr);
+      assert.equal(readFileSync(out,'utf8'),status!==0?'':receiptStatus===0?'emitted\n':'sentry_receipt_error=true\n');
     }
   } finally { rmSync(dir,{recursive:true,force:true}); }
   assert.equal((source.match(/record_successful_ship\n\s*emit_sentry_deployment_receipt/g)||[]).length,2);
@@ -111,8 +112,10 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
   assert.match(workflow,/workflow_call:/); assert.doesNotMatch(workflow,/workflow_run:|workflow_dispatch:|continue-on-error|exit 0/);
   assert.match(workflow,/required: SENTRY_AUTH_TOKEN/);
   assert.match(workflow,/receipt.sourceCommit !== process.env.GITHUB_SHA/);
+  assert.match(workflow,/SENTRY_RECEIPT_ERROR === "true"\) throw new Error/);
   const ship=read('.github/workflows/ios-ship.yml');
   assert.match(ship,/needs.ship.outputs.sentry_receipt != ''/);
+  assert.match(ship,/needs.ship.outputs.sentry_receipt_error == 'true'/);
   assert.match(ship,/uses: .\/.github\/workflows\/sentry-deploy.yml/);
   assert.doesNotMatch(ship,/--force-ship/);
 });
@@ -132,4 +135,35 @@ test('CLI malformed JSON error does not echo provided input or token', () => {
     env:{PATH:process.env.PATH,SENTRY_DEPLOY_RECEIPT:`{${secret}`,SENTRY_AUTH_TOKEN:secret,GITHUB_RUN_ID:'123'},encoding:'utf8'});
   assert.equal(result.status,1); assert.match(result.stderr,/Invalid TestFlight receipt JSON/);
   assert.ok(!`${result.stdout}${result.stderr}`.includes(secret));
+});
+
+test('a confirmed upload survives receipt failure and the same source is not uploaded again', () => {
+  const source=read('scripts/ios-fleet/ship-testflight.sh');
+  const stateFunctions=source.slice(source.indexOf('ship_state_path() {'),source.indexOf('\nwhile [[ $# -gt 0 ]]'));
+  const ensure=source.slice(source.indexOf('TF_READY_CONFIRMED=0'),source.indexOf('SENTRY_ARCHIVE_COMMIT="$(repo_head_sha)"'));
+  const emit=source.slice(source.indexOf('emit_sentry_deployment_receipt() {'),source.indexOf('\nacquire_archive_lock\nlog "archiving..."'));
+  const dir=mkdtempSync(join(tmpdir(),'sentry-ship-state-'));
+  const out=join(dir,'outputs'); writeFileSync(out,'');
+  try {
+    // Only local fixture builtins replace time/permissions/publication; the
+    // production state writer, duplicate-upload gate, and receipt guard run.
+    const script=`set -euo pipefail\nlog(){ :; }\njson_get(){ :; }\ndate(){ echo 1791280000; }\nmkdir(){ :; }\nchmod(){ :; }\nbash(){ return 1; }\n${stateFunctions}\nrepo_head_sha(){ echo ${sha}; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; else return 1; fi; }\n${ensure}\n${emit}\nprintf uploaded > "$STATE_DIR/uploaded"\nensure_tf_ready\nrecord_successful_ship\nemit_sentry_deployment_receipt\nevaluate_ship_gate\nprintf '%s' "$SHIP_GATE_DECISION"\n`;
+    const result=spawnSync('bash',['-c',script],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),STATE_DIR:shellPath(dir),FORCE_SHIP:'0',EXPORT_ONLY:'0',DEFAULT_MIN_INTERVAL_SEC:'3600',BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:'',DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+    assert.equal(result.status,0,result.stderr);
+    assert.equal(result.stdout,'skip');
+    assert.equal(readFileSync(join(dir,'uploaded'),'utf8'),'uploaded');
+    assert.match(readFileSync(join(dir,'last-ship-botfleet.txt'),'utf8'),new RegExp(`^1791280000 ${sha}\\n$`));
+    assert.equal(readFileSync(out,'utf8'),'sentry_receipt_error=true\n');
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('the actual reporting validation fails the explicit error indicator before credential loading', () => {
+  const workflow=read('.github/workflows/sentry-deploy.yml');
+  const js=workflow.match(/node --input-type=module -e '\n([\s\S]*?)\n          '/)?.[1];
+  assert.ok(js);
+  const result=spawnSync(process.execPath,['--input-type=module','-e',js],{
+    cwd:fileURLToPath(root),env:{PATH:process.env.PATH,SENTRY_RECEIPT_ERROR:'true',GITHUB_SHA:sha},encoding:'utf8'});
+  assert.equal(result.status,1);
+  assert.match(result.stderr,/upload succeeded but receipt verification failed/);
+  assert.ok(workflow.indexOf('Validate the distribution receipt') < workflow.indexOf('Load the required Sentry auth token'));
 });
