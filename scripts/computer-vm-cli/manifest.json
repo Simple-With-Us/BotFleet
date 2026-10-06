@@ -222,9 +222,10 @@
       ],
       "version": "apt",
       "verify": {
-        "command": "scp",
+        "command": "command",
         "args": [
-          "-V"
+          "-v",
+          "scp"
         ]
       },
       "apt": [
@@ -238,9 +239,10 @@
       ],
       "version": "apt",
       "verify": {
-        "command": "sftp",
+        "command": "command",
         "args": [
-          "-V"
+          "-v",
+          "sftp"
         ]
       },
       "apt": [

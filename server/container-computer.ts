@@ -49,7 +49,20 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/botfleet/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "6";
+// BUMP THIS WHENEVER THE MANAGED IMAGE CONTENTS CHANGE.  `imageLabelsMatch`
+// decides whether an existing container still matches, so a content change
+// without a bump is invisible: an already-provisioned image is accepted and
+// never rebuilt, and the fix only ever reaches newly created Dockerfiles.
+//
+// v7 (2026-10-06): the VM CLI layer now bakes `ENV RUSTUP_HOME` so the rustup
+// shims survive past the RUN that installed them.  Kody review on #911 caught
+// that v6 alone would leave every pre-existing container with shims that
+// cannot resolve a toolchain.  Safe to bump here because no v6 image has ever
+// built — the CLI layer's first three builds all failed at verify — so there
+// are no running containers to replace.  Note the contrast with CUA_PATH_SHIMS
+// below, which heals in place precisely because bumping there *would* replace
+// live containers.
+export const IMAGE_LAYER_VERSION = "7";
 export const IMAGE_LAYER_LABEL = "com.botfleet.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export function sanitizeContainerSuffix(name: string): string {

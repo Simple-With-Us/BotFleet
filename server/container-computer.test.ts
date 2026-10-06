@@ -1474,4 +1474,15 @@ describe("PATH driver symlink repair", () => {
       expect(script).toContain(`readlink ${shim}`);
     }
   });
+  // Kody review on #911.  `imageLabelsMatch` treats the layer label as the
+  // compatibility check, so an image-content change that does not bump
+  // IMAGE_LAYER_VERSION is invisible: already-provisioned containers keep the
+  // broken layer and never rebuild.  This tripwire fails if the bump that
+  // carries `ENV RUSTUP_HOME` is reverted while the ENV stays.
+  it("bumps the image layer whenever the CLI layer bakes image-level ENV", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(dockerfile).toContain("ENV RUSTUP_HOME=/usr/local/rustup");
+    expect(IMAGE_LAYER_VERSION).not.toBe("6");
+  });
+
 });
