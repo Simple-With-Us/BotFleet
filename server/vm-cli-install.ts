@@ -313,7 +313,13 @@ export function vmCliManifestDigest(): string {
 }
 
 export function renderDockerfileVerifyArtifacts(environment: VmCliEnvironment): string {
-  const verifyBody = renderVerifyScript(environment).replace(/^#!.*\n/, "");
+  // Keep the shebang here, unlike the install body above.  The install script is
+  // piped to an explicit `/bin/bash`, so its shebang would only be a comment.
+  // This one is written to a file and executed directly, and with the shebang
+  // gone the kernel falls back to /bin/sh, which is dash on Debian and rejects
+  // `set -o pipefail`.  That failed the image build at the verify step on
+  // 2026-10-06, after every CLI had already installed correctly.
+  const verifyBody = renderVerifyScript(environment);
   return `RUN mkdir -p /etc/botfleet && printf '%s' '${manifestPayloadBase64()}' | base64 -d > /etc/botfleet/vm-cli-manifest.json
 RUN <<'BOTFLEET_VM_CLI_VERIFY_BIN' cat > /usr/local/bin/botfleet-vm-cli-verify
 ${verifyBody}BOTFLEET_VM_CLI_VERIFY_BIN
