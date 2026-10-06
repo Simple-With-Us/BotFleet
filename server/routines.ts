@@ -32,6 +32,11 @@ export type { RoutineRunOn } from "../shared/run-on.ts";
 
 export type RoutineRunTrigger = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
 
+/** Bucket numeric telemetry in hold reasons so load drift does not rewrite state. */
+function holdReasonBucket(reason: string): string {
+  return reason.replace(/\d+(?:\.\d+)?/g, "#");
+}
+
 /** One shared task per bot for incoming events, one for calendar work. */
 export type AutomationLane = "trigger" | "schedule";
 
@@ -153,6 +158,9 @@ export interface RoutineRun {
    *  defers a webhook.  Cleared on dispatch and on any skip that is not
    *  itself a hold. */
   holdReason?: string;
+  /** When this webhook was first parked on a hot host; the max deferral age
+   *  is measured from here, not from `createdAt`. */
+  hotDeferredAt?: number;
   engineId?: string;
   driver?: string;
   model?: string;
@@ -463,6 +471,8 @@ export class RoutineManager {
   /** When a user manually interrupts/stops a bot, automated runs for that bot
    * are snoozed so background webhooks and routines do not restart it. */
   private readonly botSnoozeUntil = new Map<string, number>();
+  /** Coarse hold-reason signatures already persisted and broadcast. */
+  private readonly publishedHoldBuckets = new Map<string, string>();
 
   constructor(options: RoutineManagerOptions) {
     this.options = options;
@@ -1170,7 +1180,10 @@ export class RoutineManager {
 
       // One reading for the whole tick.  Every queued webhook shares it, and
       // a person's turn never asks: this loop only admits routine receipts.
-      const hostHotReason = this.options.hostHot?.() ?? null;
+      // Read lazily so an idle harness never pays for the host probe.
+      let hostHotReason: string | null | undefined;
+      const readHostHot = (): string | null =>
+        (hostHotReason ??= this.options.hostHot?.() ?? null);
       for (const run of [...this.runs].reverse()) {
         if (run.status !== "queued") continue;
         // `holdReason` is a cached verdict from the last time canStart ran, and
@@ -1202,15 +1215,23 @@ export class RoutineManager {
         // runs are not in this loop's queued set.  Resource, schedule, and
         // manual runs still start, and a person's turn is not in this loop.
         let hotDeferExpiredReason: string | undefined;
-        if (run.triggerSource === "webhook" && hostHotReason) {
-          const ageMs = this.now() - run.createdAt;
-          if (Number.isFinite(ageMs) && ageMs < this.webhookHotDeferMaxMs()) {
-            // Replaces a stale engine reason.  The host is why this tick is
-            // waiting, and the receipt should say that.
-            this.setHoldReason(run, hostHotReason);
-            continue;
+        if (run.triggerSource === "webhook") {
+          const hotReason = readHostHot();
+          if (hotReason) {
+            // Measured from the tick that first parked this run on the host, not
+            // from createdAt: a receipt that already waited on a busy bot or a
+            // dead engine must still get its own full shed window.
+            const hotSince = run.hotDeferredAt ?? this.now();
+            run.hotDeferredAt = hotSince;
+            const hotAgeMs = this.now() - hotSince;
+            if (Number.isFinite(hotAgeMs) && hotAgeMs < this.webhookHotDeferMaxMs()) {
+              // Replaces a stale engine reason.  The host is why this tick is
+              // waiting, and the receipt should say that.
+              this.setHoldReason(run, hotReason);
+              continue;
+            }
+            hotDeferExpiredReason = hotReason;
           }
-          hotDeferExpiredReason = hostHotReason;
         }
         // A trigger with a minimum gap stays quiet after it runs.  The
         // deliveries that arrive meanwhile are not dropped: they stay queued
@@ -1392,8 +1413,11 @@ export class RoutineManager {
         run.startedAt = this.now();
         run.status = "running";
         run.holdReason = undefined;
+        run.hotDeferredAt = undefined;
+        this.publishedHoldBuckets.delete(run.id);
         if (hotDeferExpiredReason) {
-          const waitedMin = Math.max(0, Math.round((this.now() - run.createdAt) / 60_000));
+          const hotSince = run.hotDeferredAt ?? run.createdAt;
+          const waitedMin = Math.max(0, Math.round((this.now() - hotSince) / 60_000));
           this.writeLog(
             `[routines] webhook "${run.routineName}" (${run.id}) waited ${waitedMin} min for a busy host and is dispatching anyway.  ${hotDeferExpiredReason}`,
           );
@@ -1608,6 +1632,7 @@ export class RoutineManager {
   private clearHoldReason(run: RoutineRun): void {
     if (run.holdReason === undefined) return;
     run.holdReason = undefined;
+    this.publishedHoldBuckets.delete(run.id);
     this.save();
     this.emitRun(run);
   }
@@ -1615,7 +1640,13 @@ export class RoutineManager {
   /** Publish a hold reason only when it changed.  The scheduler ticks every
    *  ten seconds, so an unchanged reason must not rewrite the state file. */
   private setHoldReason(run: RoutineRun, reason: string): void {
-    if (reason === run.holdReason) return;
+    const bucket = holdReasonBucket(reason);
+    const seen = this.publishedHoldBuckets.get(run.id);
+    if (seen === bucket) {
+      if (run.holdReason !== reason) run.holdReason = reason;
+      return;
+    }
+    this.publishedHoldBuckets.set(run.id, bucket);
     run.holdReason = reason;
     this.save();
     this.emitRun(run);
@@ -1642,6 +1673,8 @@ export class RoutineManager {
   private leaveQueued(run: RoutineRun, status: "cancelled" | "failed"): void {
     run.status = status;
     run.holdReason = undefined;
+    run.hotDeferredAt = undefined;
+    this.publishedHoldBuckets.delete(run.id);
   }
 
   private failRun(run: RoutineRun, message: string, code = routineFailureCode(message)) {

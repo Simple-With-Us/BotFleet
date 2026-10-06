@@ -327,6 +327,55 @@ describe("RoutineManager", () => {
     expect(h.triggerSources).toEqual([]);
   });
 
+  it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
+    const h = harness();
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    const capMs = 5 * 60_000;
+    h.options.webhookHotDeferMaxMs = () => capMs;
+    h.options.hostHot = () => hostReason;
+    let busy = true;
+    h.options.botState = () => (busy ? "busy" : "ready");
+    const t0 = h.options.now!();
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-hot-since",
+      receivedAt: t0,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.started).toHaveLength(0);
+
+    const hotAt = t0 + 10 * 60_000;
+    h.setNow(hotAt);
+    busy = false;
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.hotDeferredAt).toBe(hotAt);
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs - 1);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs);
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["webhook"]);
+  });
+
+  it("does not probe the host while no webhook is queued", async () => {
+    const h = harness();
+    let probeCalls = 0;
+    h.options.hostHot = () => {
+      probeCalls += 1;
+      return "Host is busy (load 4 per core, swap 90%)";
+    };
+    await h.manager.tick();
+    expect(probeCalls).toBe(0);
+  });
+
   it("dispatches a hot-deferred webhook after the max age, logs once, and clears the reason", async () => {
     const h = harness();
     const logs: string[] = [];
