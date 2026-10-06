@@ -9,7 +9,7 @@ const MULTI_WORD_APPS = POPULAR_APPS
   .join("|");
 
 export const MENTION_REGEX = new RegExp(
-  `(?:^|(?<=[\\s(\\[\\\"'“‘]))([@#](?:${MULTI_WORD_APPS}|"[^"\\n]+"|'[^'\\n]+'|[“‘][^”’\\n]+[”’]|\\[[^\\]\\n]+\\]|[a-zA-Z0-9_\\-\\.]+))(?=$|[\\s)\\]\\\"'”’.,:;!?])`,
+  `(?:^|(?<=[\\s(\\["'“‘]))([@#](?:${MULTI_WORD_APPS}|"[^"\\n]+"|'[^'\\n]+'|[“‘][^”’\\n]+[”’]|\\[[^\\]\\n]+\\]|[a-zA-Z0-9_\\-\\.]+))(?=$|[\\s)\\]"'”’.,:;!?])`,
   "g"
 );
 
@@ -18,7 +18,7 @@ export const MENTION_TOKEN_REGEX = new RegExp(
 );
 
 export function isMentionToken(token: string): boolean {
-  return typeof token === "string" && MENTION_TOKEN_REGEX.test(token);
+  return MENTION_TOKEN_REGEX.test(token);
 }
 
 export const MENTION_CLASS = "font-bold text-[1.05em] text-accent inline-block align-baseline";
@@ -34,7 +34,7 @@ export function remarkMentions() {
       if (!node || !node.children) return;
       for (let i = 0; i < node.children.length; i++) {
         const child = node.children[i];
-        if (child.type === "text" && typeof child.value === "string") {
+        if (child.type === "text" && Object.prototype.toString.call(child.value) === "[object String]") {
           const parts = child.value.split(MENTION_REGEX);
           if (parts.length > 1) {
             const newChildren = parts

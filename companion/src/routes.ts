@@ -18,6 +18,8 @@
 // calls. Adding a feature to the phone means adding its route here, on
 // purpose, in a diff someone can read. That cost is the feature.
 
+import type { JsonObject } from "./json.ts";
+
 /** A refusal to send back, or null to let the request through. */
 export interface Denial {
   status: number;
@@ -69,7 +71,7 @@ export function isCompanionProfilePatch(method: string, path: string): boolean {
 /** Validate the paired-device field boundary before a profile body reaches
  * the broader loopback harness route.  Reject the whole request rather than
  * silently stripping a field the person expected to save. */
-export function companionProfilePatchDenial(body: Record<string, unknown>): Denial | null {
+export function companionProfilePatchDenial(body: JsonObject): Denial | null {
   const unsupported = Object.keys(body).find((field) => !COMPANION_PROFILE_PATCH_FIELD_SET.has(field));
   return unsupported
     ? { status: 403, error: `${unsupported} can only be changed in BotFleet on your computer` }
@@ -147,6 +149,7 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/messages\/[\w-]+\/reactions$/ },
   { method: "GET", path: /^\/api\/threads\/[\w-]+\/export$/ },
   { method: "POST", path: /^\/api\/threads\/[\w-]+\/respond$/ },
+  { method: "POST", path: /^\/api\/threads\/[\w-]+\/approve-all$/ },
   { method: "GET", path: /^\/api\/search$/ },
 
   // App-owned profile images. Upload is image-only and capped at 10 MB by

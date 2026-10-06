@@ -23,6 +23,7 @@ import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 import { toolFields } from "../tool-fields.ts";
 import { captureInput } from "../../shared/item-io.ts";
+import { isFiniteJsonNumber, isJsonObject, type JsonObject, type JsonValue } from "../schema.ts";
 
 const DRIVER_KIND = "boxAgent";
 const BOX_API = "https://ascii.dev/api/box/v1";
@@ -43,8 +44,9 @@ export interface BoxAgentConfig {
 }
 
 function decodeConfig(raw: unknown): BoxAgentConfig {
-  const o = (raw ?? {}) as Record<string, unknown>;
-  return { pollMs: typeof o.pollMs === "number" ? o.pollMs : 2500 };
+  const parsed = raw as JsonValue;
+  const o: JsonObject = isJsonObject(parsed) ? parsed : {};
+  return { pollMs: isFiniteJsonNumber(o.pollMs) ? o.pollMs : 2500 };
 }
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {

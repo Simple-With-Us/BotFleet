@@ -17,7 +17,10 @@ import { createProxyHandler } from "../src/proxy.ts";
 
 const listen = (server: Server): Promise<number> =>
   new Promise((resolve) =>
-    server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port)),
+    server.listen(0, "127.0.0.1", () => {
+      // SAFETY: listen(0) on 127.0.0.1 always yields AddressInfo with a port.
+      resolve((server.address() as { port: number }).port);
+    }),
   );
 
 const close = (server: Server): Promise<void> =>
@@ -86,6 +89,7 @@ describe("an upstream that fails mid-stream", () => {
       try {
         // read until the stream dies — the point is that it dies here and
         // not in the sidecar's process
+        // SAFETY: fetch in Node exposes the body as a web ReadableStream of bytes.
         for await (const _chunk of res.body as unknown as AsyncIterable<Uint8Array>) void _chunk;
       } catch {
         /* a destroyed connection is exactly what this is provoking */
@@ -153,6 +157,7 @@ describe("an upstream that fails mid-stream", () => {
     const escaped = await watchingForCrashes(async () => {
       const res = await fetch(`${base}/api/health`, { headers: { authorization: "Bearer omb_x" } });
       expect(res.status).toBe(502);
+      // SAFETY: the sidecar's 502 health response is always `{ error: string }`.
       expect((await res.json()) as { error: string }).toEqual({
         error: "BotFleet is not running on this computer",
       });

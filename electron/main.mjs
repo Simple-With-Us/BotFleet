@@ -913,6 +913,7 @@ async function startServerOn(port) {
     OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
+    OMB_BOTS_DIR: path.join(process.resourcesPath, "bots"),
     OMB_PORT: String(port),
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey

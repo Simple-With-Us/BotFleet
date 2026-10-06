@@ -364,6 +364,7 @@ import {
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
+  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -425,6 +426,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
+import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -1658,6 +1660,7 @@ type ComputerGrantSubject = {
   /** The pre-array spelling some stored bots still carry. */
   computer?: unknown;
   autoApprove?: boolean;
+  bypassPermissions?: boolean;
   modelSelection?: ModelSelection;
 };
 
@@ -1799,7 +1802,7 @@ function localAutoAcknowledgementError(
   // A bot that ALREADY holds the pair keeps it: the warning was answered
   // once, and re-saving an unrelated field must not demand it again.
   const capability = botLocalAutoCapability(existing);
-  const alreadyGranted = existing?.autoApprove === true && requiresLocalAutoConsent(
+  const alreadyGranted = (existing?.autoApprove === true || existing?.bypassPermissions === true) && requiresLocalAutoConsent(
     storedComputerGrants(existing),
     context.currentDefault,
     context.currentAllowed,
@@ -3241,7 +3244,7 @@ function releaseTurnWorktreeLease(threadId: string, botId: string, dispatchId?: 
 }
 
 async function applyTurnWorktreeAdmission(
-  bot: NonNullable<ReturnType<typeof store.bot>>,
+  bot: BotRecord,
   threadId: string,
   dispatchId: number,
   cwd: string | null | undefined,
@@ -5441,8 +5444,10 @@ async function startTurn(
       // changed them, and the rest stays the stable prefix a warm CLI or a
       // provider cache is keyed on (docs/prompt-prefix.md).
       const promptFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
+      const fleetSeat = fleetSeatPromptPart(bot);
       const prompt = buildSystemPrompt([
         { id: "persona", label: "Identity", text: persona },
+        ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
         {
           id: "computer",
@@ -7591,8 +7596,10 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
+    ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
     { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
     // Same sentence the 1:1 lane sends, in the same position: a computer the
     // bot is never told about is one it reaches for by accident.
@@ -8332,10 +8339,18 @@ async function localVmPayload(target: LocalVmTarget) {
   };
 }
 
-function localComputerActionError(error: unknown): { status: number; error: string } {
-  const status = typeof (error as { status?: unknown }).status === "number"
-    ? (error as { status: number }).status
-    : 500;
+type LocalComputerActionFailure = { status: number; error: string };
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- computer routes throw at the handler boundary
+function localComputerActionError(error: unknown): LocalComputerActionFailure {
+  // SAFETY: computer proxy failures may attach a numeric HTTP status on a plain object.
+  const statusField = (error as { status?: unknown }).status;
+  const status =
+    statusField === undefined
+      ? 500
+      : Number.isFinite(Number(statusField))
+        ? Number(statusField)
+        : 500;
   const raw = error instanceof Error ? error.message : String(error);
   return { status, error: redactSecrets(raw) };
 }
@@ -11914,7 +11929,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.autoApprove = body.autoApprove;
       }
       if (body.gitWorktreeLeases !== undefined) {
-        if (typeof body.gitWorktreeLeases !== "boolean") {
+        if (body.gitWorktreeLeases !== true && body.gitWorktreeLeases !== false) {
           return json(res, 400, { error: "gitWorktreeLeases must be true or false" });
         }
         patch.gitWorktreeLeases = body.gitWorktreeLeases;
@@ -11931,7 +11946,9 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         : body.computer !== undefined
           ? (body.computer === "off" ? [] : [body.computer])
           : storedComputerGrants(existingBot);
-      const wantsAuto = body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true;
+      const wantsAuto =
+        (body.autoApprove !== undefined ? body.autoApprove : existingBot?.autoApprove === true) ||
+        (body.bypassPermissions !== undefined ? body.bypassPermissions : existingBot?.bypassPermissions === true);
       const ackError = localAutoAcknowledgementError(
         existingBot,
         wantsComputers,
@@ -12583,6 +12600,99 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!owner && !pending) return json(res, 404, { error: "nothing is waiting on an answer in this conversation" });
       const outcome = await answerRequest(threadId, owner?.modelSelection.instanceId ?? "", requestId, behavior, body.message, owner ? { id: owner.id, name: owner.name } : undefined);
       return json(res, 200, { ok: true, outcome });
+    }
+    const approveAllForThread = async (
+      targetThreadId: string,
+    ): Promise<{ ok: boolean; approvedCount: number }> => {
+      const pending = store.messagesFor(targetThreadId).filter(
+        (message) =>
+          message.kind === "options" &&
+          message.card?.requestId &&
+          message.card.tool &&
+          !message.card.answered &&
+          !message.card.dismissed,
+      );
+
+      let approvedCount = 0;
+      for (const message of pending) {
+        const card = message.card;
+        if (!card?.requestId) continue;
+        const requestId = card.requestId;
+
+        if (card.routineRequest) {
+          const routineBotId = message.from?.botId ?? store.botByThread(targetThreadId)?.id;
+          if (routineBotId) {
+            const routineOwner = store.bot(routineBotId);
+            const result = routineRequests.resolve({
+              botId: routineBotId,
+              threadId: targetThreadId,
+              requestId,
+              behavior: "allow",
+            });
+            if (result.claimed && (result.state === "applied" || result.state === "denied")) {
+              appendDecision(DATA_DIR, {
+                threadId: targetThreadId,
+                requestId,
+                botId: routineBotId,
+                botName: routineOwner?.name,
+                tool: card.tool,
+                summary: card.subtitle,
+                decision: result.state === "applied" ? "user-approved" : "user-denied",
+                source: "user",
+              });
+            }
+            approvedCount++;
+          }
+          continue;
+        }
+
+        if (resolvePeerComms(approvalBus, requestId, "allow", targetThreadId)) {
+          approvedCount++;
+          continue;
+        }
+
+        const group = store.groupByThread(targetThreadId);
+        const owner = group
+          ? (group.busyBotId ? store.bot(group.busyBotId) : undefined) ??
+            (message.from ? store.bot(message.from.botId) : undefined)
+          : store.botByThread(targetThreadId);
+
+        const outcome = await answerRequest(
+          targetThreadId,
+          owner?.modelSelection.instanceId ?? "",
+          requestId,
+          "allow",
+          undefined,
+          owner ? { id: owner.id, name: owner.name } : undefined,
+        );
+        if (outcome !== "unavailable") {
+          approvedCount++;
+        }
+      }
+
+      return { ok: true, approvedCount };
+    };
+    m = path.match(/^\/api\/bots\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const botIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedBotId = botIdSchema.safeParse(m[1]);
+      if (!parsedBotId.success) {
+        return json(res, 400, { error: "invalid bot id" });
+      }
+      const bot = store.bot(parsedBotId.data);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      const result = await approveAllForThread(bot.threadId);
+      return json(res, 200, result);
+    }
+    m = path.match(/^\/api\/threads\/([^/]+)\/approve-all$/);
+    if (m && method === "POST") {
+      const threadIdSchema = z.string().regex(/^[A-Za-z0-9_-]+$/);
+      const parsedThreadId = threadIdSchema.safeParse(m[1]);
+      if (!parsedThreadId.success) {
+        return json(res, 400, { error: "invalid thread id" });
+      }
+      const result = await approveAllForThread(parsedThreadId.data);
+      return json(res, 200, result);
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/interrupt$/);
     if (m && method === "POST") {

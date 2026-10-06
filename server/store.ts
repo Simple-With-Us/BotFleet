@@ -608,6 +608,9 @@ export interface BotRecord {
    * working instead of stopping to ask. Questions it asks YOU still come
    * through, and a short list of destructive commands still stops it. */
   autoApprove?: boolean;
+  /** Permission bypass mode: automatically approve all tools, commands,
+   * and routines without halting for approval cards or unattended blocks. */
+  bypassPermissions?: boolean;
   /** Optional model review of otherwise undecided, attended approval cards.
    * Unknown persisted values are treated as off by the review boundary. */
   autoReview?: "off" | "shadow" | "enforce";

@@ -26,6 +26,7 @@ export const BOT_PROFILE_PATCH_FIELDS = [
   "chiefOfStaff",
   "approvePeerComms",
   "autoApprove",
+  "bypassPermissions",
   "autoReview",
   "composio",
   "connectorTools",
@@ -116,6 +117,7 @@ const profilePatchSchema = z.object({
   chiefOfStaff: z.boolean({ error: "chiefOfStaff must be true or false" }).optional(),
   approvePeerComms: z.boolean({ error: "approvePeerComms must be true or false" }).optional(),
   autoApprove: z.boolean({ error: "autoApprove must be true or false" }).optional(),
+  bypassPermissions: z.boolean({ error: "bypassPermissions must be true or false" }).optional(),
   autoReview: z.enum(["off", "shadow", "enforce"], { error: "autoReview must be off, shadow, or enforce" }).optional(),
   composio: z.boolean({ error: "composio must be true or false" }).optional(),
   connectorTools: z.union([connectorToolsSchema, z.null()]).optional(),
@@ -149,6 +151,7 @@ export type BotProfilePatch = Partial<
     | "chiefOfStaff"
     | "approvePeerComms"
     | "autoApprove"
+    | "bypassPermissions"
     | "autoReview"
     | "composio"
     | "connectorTools"
@@ -187,6 +190,10 @@ export function parseBotProfilePatch(input: BotProfilePatchInput, strict = false
       return { ok: false, error: "avatarCrop must be mascot, circle, rounded, or square" };
     }
     return { ok: false, error: issue?.message ?? "invalid profile patch" };
+  }
+
+  if (strict && Object.prototype.hasOwnProperty.call(parsed.data, "bypassPermissions")) {
+    return { ok: false, error: "unsupported profile field: bypassPermissions" };
   }
 
   const { avatarUrl, cwd, connectorTools, maxToolRounds: _maxToolRounds, ...fields } = parsed.data;
