@@ -39,6 +39,7 @@ struct ChatView: View {
     @State private var pickingFile = false
     @State private var sending = false
     @State private var shareFile: ShareFile?
+    @State private var composerFocusAfterPlusDismiss = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = SpeechDictation()
 
@@ -208,8 +209,16 @@ struct ChatView: View {
         .onChange(of: showingProfile) { _, shown in
             if shown { dictation.stop() }
         }
-        .onChange(of: showingPlus) { _, shown in
+        .onChange(of: showingPlus) { wasShowing, shown in
             if shown { dictation.stop() }
+            if ComposerSendRecovery.shouldReassertComposerFocusAfterPlusDismisses(
+                wasShowingPlus: wasShowing,
+                isShowingPlus: shown,
+                focusAfterDismiss: composerFocusAfterPlusDismiss
+            ) {
+                composerFocusAfterPlusDismiss = false
+                composerFocused = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { note in
             let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey]
@@ -571,8 +580,8 @@ struct ChatView: View {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
                 showCommandHUD = true
             }
-            if !draft.hasPrefix("/") { draft = "/" }
-            composerFocused = true
+            draft = ComposerSendRecovery.slashCommandDraft(from: draft)
+            composerFocusAfterPlusDismiss = true
         })
         if current.busy, case .bot = current {
             out.append(PlusAction(
@@ -709,16 +718,29 @@ struct ChatView: View {
         showCommandHUD = false
         SoundEffects.playSent()
         Haptics.impact(.medium)
+        let threadId = current.threadId
+        let priorUserMessageIDs = Set(
+            session.state.transcript(forThread: threadId)
+                .filter { $0.role == .user }
+                .map(\.id)
+        )
+        let sentText = text
         sending = true
         Task {
-            let ok = await session.send(text, to: current, attachments: outgoing, recording: recording)
+            let outcome = await session.send(sentText, to: current, attachments: outgoing, recording: recording)
             sending = false
-            if !ok {
-                if draft.isEmpty { draft = text }
-                if pendingAttachments.isEmpty { pendingAttachments = outgoing }
-                if let recording, dictation.recordedWAV == nil {
-                    dictation.restoreRecording(recording.data, transcript: recording.transcript)
-                }
+            let transcript = session.state.transcript(forThread: threadId)
+            guard ComposerSendRecovery.shouldRestoreClearedDraft(
+                sendSucceeded: outcome.ok,
+                clientNonce: outcome.clientNonce,
+                sentText: sentText,
+                priorUserMessageIDs: priorUserMessageIDs,
+                transcript: transcript
+            ) else { return }
+            if draft.isEmpty { draft = sentText }
+            if pendingAttachments.isEmpty { pendingAttachments = outgoing }
+            if let recording, dictation.recordedWAV == nil {
+                dictation.restoreRecording(recording.data, transcript: recording.transcript)
             }
         }
     }
