@@ -13,7 +13,6 @@ import {
   isHeld,
   isReleaseDirectory,
   listReleases,
-  listReleasesDeps,
   promoteStaging,
   pruneReleases,
   releasePath,
@@ -367,16 +366,16 @@ test("listReleases skips a release that vanishes before stat", async (t) => {
     await promoteStaging({ commit, env });
   }
   const pathA = releasePath(A, env);
-  const realStat = listReleasesDeps.statForListReleases;
-  t.mock.method(listReleasesDeps, "statForListReleases", async (path) => {
-    if (path === pathA) {
-      const error = new Error(`ENOENT: no such file or directory, stat '${path}'`);
-      error.code = "ENOENT";
-      throw error;
-    }
-    return realStat(path);
+  const listed = await listReleases(env, {
+    statImpl: async (path) => {
+      if (path === pathA) {
+        const error = new Error(`ENOENT: no such file or directory, stat '${path}'`);
+        error.code = "ENOENT";
+        throw error;
+      }
+      return stat(path);
+    },
   });
-  const listed = await listReleases(env);
   assert.ok(listed.includes(B), "listing must complete and still see surviving releases");
   assert.deepEqual(listed, [B], "a release that vanished before stat is skipped instead of rejecting the listing");
 });
@@ -386,17 +385,16 @@ test("listReleases surfaces stat failures other than a vanished release", async 
   await stage(env, A, A);
   await promoteStaging({ commit: A, env });
   const pathA = releasePath(A, env);
-  const realStat = listReleasesDeps.statForListReleases;
-  t.mock.method(listReleasesDeps, "statForListReleases", async (path) => {
+  const statImpl = async (path) => {
     if (path === pathA) {
       const error = new Error(`EACCES: permission denied, stat '${path}'`);
       error.code = "EACCES";
       throw error;
     }
-    return realStat(path);
-  });
+    return stat(path);
+  };
   await assert.rejects(
-    () => listReleases(env),
+    () => listReleases(env, { statImpl }),
     (error) => error.code === "EACCES",
     "tree permission errors must not drop a release from retention ordering",
   );

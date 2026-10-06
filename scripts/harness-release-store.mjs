@@ -555,13 +555,7 @@ export async function swapCurrent({ commit, env = process.env, renameImpl = rena
  * manifest cannot be read falls back to its mtime, and then to the name, so an
  * unreadable release sorts predictably instead of vanishing from the list.
  */
-export const listReleasesDeps = {
-  statForListReleases(path) {
-    return stat(path);
-  },
-};
-
-export async function listReleases(env = process.env) {
+export async function listReleases(env = process.env, { statImpl = stat } = {}) {
   let entries;
   try {
     entries = await readdir(releasesRoot(env), { withFileTypes: true });
@@ -576,7 +570,7 @@ export async function listReleases(env = process.env) {
     if (manifest && manifest.commit !== entry.name) continue;
     let statResult;
     try {
-      statResult = await listReleasesDeps.statForListReleases(path);
+      statResult = await statImpl(path);
     } catch (error) {
       // Only a release that is genuinely gone may vanish from the listing; any
       // other failure still has to be ordered (and therefore reported as a
@@ -657,10 +651,10 @@ async function defaultLivenessProbe(path) {
   return probeReleaseLiveness(path);
 }
 
-export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = defaultLivenessProbe, onRemove } = {}) {
+export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = defaultLivenessProbe, statImpl = stat, onRemove } = {}) {
   const live = await currentCommit(env);
   const livePhysical = live ? null : await resolveCurrent(env);
-  const releases = await listReleases(env);
+  const releases = await listReleases(env, { statImpl });
   const candidates = releases.filter((commit) => commit !== live);
   const removed = [];
   const kept = [];
