@@ -600,11 +600,9 @@ export function isSentryDeliveryReady(): boolean {
   if (!initialized || killed) return false;
   const sdk = sentrySdk;
   if (!sdk) return false;
-  const canProbe =
-    typeof sdk.isEnabled === "function" || typeof sdk.getClient === "function";
-  if (!canProbe) return true;
+  if (sdk.isEnabled === undefined && sdk.getClient === undefined) return true;
   try {
-    if (typeof sdk.isEnabled === "function") return sdk.isEnabled();
+    if (sdk.isEnabled !== undefined) return sdk.isEnabled();
     const client = sdk.getClient?.();
     if (!client) return false;
     if (client.getOptions?.().enabled === false) return false;
