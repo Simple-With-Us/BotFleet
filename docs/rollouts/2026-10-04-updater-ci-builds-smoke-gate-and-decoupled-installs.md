@@ -170,7 +170,7 @@ declarations.
 
 **Rec 2 (board `f1482275`) is deliberately scoped to the harness**, and the
 reason is a critical standing rule rather than a preference.  The Kody rule
-`do-not-change-sparkle-feed-url-dcf0e5b2` guards the auto-update contract, and
+`do-not-change-sparkle-feed-url-dcf0e5b2` (in [`Simple-With-Us/Kodus-Config`](https://github.com/Simple-With-Us/Kodus-Config) `.kody-rules/review/`) guards the auto-update contract, and
 that contract is real here: `electron-updater` is vendored at
 `electron/vendor/electron-updater.cjs`, `electron/updater.mjs` drives the in-app
 updater, and `.github/workflows/release.yml` publishes a real feed to
