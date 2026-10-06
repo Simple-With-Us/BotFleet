@@ -223,6 +223,7 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
   shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
   /** Optional ceilings for the Local VM container.  Absent means "request about
    * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
@@ -540,6 +541,7 @@ export interface AppConfig {
     mode?: "shared" | "per-bot";
     maxInstances?: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
     cpus?: number;
     memoryGib?: number;

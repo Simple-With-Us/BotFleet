@@ -4029,6 +4029,7 @@ describe("harness HTTP API", () => {
       mode: "shared",
       maxInstances: 2,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
@@ -4044,6 +4045,7 @@ describe("harness HTTP API", () => {
       mode: "per-bot",
       maxInstances: 3,
       shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
       allowHostTerminal: false,
     });
 
@@ -4074,24 +4076,45 @@ describe("harness HTTP API", () => {
     // credentials into a container.
     try {
       const saved = await api("PUT", "/api/config", {
-        localVm: { shareCliCredentials: true, allowHostTerminal: true },
+        localVm: { shareCliCredentials: true, shareGpgPrivateKeys: true, allowHostTerminal: true },
       });
       expect(saved.status).toBe(200);
-      expect(saved.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+      expect(saved.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
 
       const reread = await api("GET", "/api/config");
-      expect(reread.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: true });
+      expect(reread.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const status = await api("GET", "/api/config");
+      expect(status.body.localVm).toMatchObject({ shareGpgPrivateKeys: true });
 
       // Turning one off must not disturb the other.
       const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
-      expect(half.body.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+      expect(half.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
 
       // The in-memory status above is served from the same `cfg` the PUT
       // wrote, so only the file on disk proves the save round trip.
       const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
-      expect(disk.localVm).toMatchObject({ shareCliCredentials: true, allowHostTerminal: false });
+      expect(disk.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
     } finally {
-      await api("PUT", "/api/config", { localVm: { shareCliCredentials: false, allowHostTerminal: false } });
+      await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: false, shareGpgPrivateKeys: false, allowHostTerminal: false },
+      });
     }
   });
 

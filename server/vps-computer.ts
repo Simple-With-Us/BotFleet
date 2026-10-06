@@ -2,15 +2,12 @@
 // transport reaches the user's daemon and the official Cua MCP server stays
 // inside one managed container per bot.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createConnection, createServer, type AddressInfo } from "node:net";
 
 import {
   BASE_IMAGE,
-  CLI_CREDENTIAL_CANDIDATES,
   CUA_DRIVER_VERSION,
   CUA_SOCKET,
   DISPLAY,
@@ -52,6 +49,12 @@ import {
   type AppConfig,
 } from "./config.ts";
 import { augmentedPath } from "./env-path.ts";
+import {
+  credentialPermissionHardeningShell,
+  packageCredentialArchive,
+  prepareCredentialSyncWorkspace,
+  type CredentialSyncResult,
+} from "./vm-cli-credentials.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 
 /** The per-desktop budget for one managed VPS container.  The run arguments
@@ -1101,12 +1104,14 @@ export async function vpsComputerAction(
 
 }
 
-export interface VpsSyncCredentialsResult {
-  ok: boolean;
-  synced: string[];
+export interface VpsSyncCredentialsResult extends CredentialSyncResult {
   containerName: string;
 }
 
+/** Manifest-driven host → cloud VPS credential sync for every target
+ * (shared cloud container and per-bot VPS containers). Settings and
+ * per-bot Computer panels call this with `SHARED_VPS_TARGET` or
+ * `vpsTargetFor(cfg, botId)`; auto-sync on provision/start uses the same path. */
 export async function vpsSyncCliCredentials(
   cfg: AppConfig,
   target: VpsTarget = SHARED_VPS_TARGET,
@@ -1141,72 +1146,38 @@ export async function vpsSyncCliCredentials(
     throw Object.assign(new Error(`The VPS container ${target.containerName} is not running`), { status: 409 });
   }
 
-  const existingPaths: string[] = [];
-  const syncedLabels: string[] = [];
-  for (const candidate of CLI_CREDENTIAL_CANDIDATES) {
-    const fullPath = join(homeDir, ...candidate.relPath);
-    if (existsSync(fullPath)) {
-      existingPaths.push(candidate.relPath.join("/"));
-      syncedLabels.push(candidate.relPath[0]);
+  const shareGpgPrivateKeys = Boolean(cfg.localVm?.shareGpgPrivateKeys);
+  const { plan, cleanup } = await prepareCredentialSyncWorkspace(homeDir, { shareGpgPrivateKeys });
+  try {
+    const tarArchive = await packageCredentialArchive(homeDir, plan);
+    if (!tarArchive) {
+      return {
+        ok: true,
+        syncedTools: [],
+        skippedTools: plan.skippedTools,
+        containerName: target.containerName,
+      };
     }
-  }
 
-  const uniqueSynced = Array.from(new Set(syncedLabels));
-  if (existingPaths.length === 0) {
-    return { ok: true, synced: [], containerName: target.containerName };
-  }
-
-  const tarArchive = await new Promise<Buffer>((resolve, reject) => {
-    const tar = spawn(
-      "tar",
-      [
-        "--format=ustar",
-        "-C",
-        homeDir,
-        "--no-xattrs",
-        "--exclude=*/virtenv*",
-        "--exclude=*/agent/*",
-        "--exclude=*.sock",
-        "--exclude=*cm-*",
-        "--exclude=*.DS_Store",
-        "-cf",
-        "-",
-        ...existingPaths,
-      ],
-      {
-        env: { ...process.env, COPYFILE_DISABLE: "1" },
-      },
+    await run(
+      ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
+      60_000,
+      tarArchive,
     );
-    const chunks: Buffer[] = [];
-    tar.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-    tar.on("error", reject);
-    tar.on("close", (code) => {
-      if (code === 0) resolve(Buffer.concat(chunks));
-      else reject(new Error(`tar packaging failed with code ${code}`));
-    });
-  });
 
-  await run(
-    ["exec", "-i", "-u", "cua", target.containerName, "tar", "-xf", "-", "-C", "/home/cua"],
-    60_000,
-    tarArchive,
-  );
+    await run(["exec", "-u", "cua", target.containerName, "sh", "-c", credentialPermissionHardeningShell()], 15_000).catch(
+      () => {},
+    );
 
-  await run([
-    "exec",
-    "-u",
-    "cua",
-    target.containerName,
-    "sh",
-    "-c",
-    'for d in .ssh .infisical .aws .config .azure .oci .kube .cargo; do [ -d "/home/cua/$d" ] && chmod 700 "/home/cua/$d" 2>/dev/null || true; done; [ -d "/home/cua/.ssh" ] && chmod 600 /home/cua/.ssh/id_* /home/cua/.ssh/known_hosts* /home/cua/.ssh/config 2>/dev/null || true',
-  ], 15_000).catch(() => {});
-
-  return {
-    ok: true,
-    synced: uniqueSynced,
-    containerName: target.containerName,
-  };
+    return {
+      ok: true,
+      syncedTools: plan.syncedTools,
+      skippedTools: plan.skippedTools,
+      containerName: target.containerName,
+    };
+  } finally {
+    await cleanup();
+  }
 }
 
 /** Auto is intentionally read-only: it can attach only to an existing ready

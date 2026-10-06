@@ -10,7 +10,7 @@ import { Card } from "./SettingsPrimitives";
 import { redactCommandSecrets } from "@/lib/redact-command-secrets";
 import { PersistentActionErrorCard } from "./PersistentActionErrorCard";
 
-type VmToggle = "shareCliCredentials" | "allowHostTerminal";
+type VmToggle = "shareCliCredentials" | "shareGpgPrivateKeys" | "allowHostTerminal";
 
 export function HostCliIntegrationCard() {
   const { state, dispatch } = useStore();
@@ -37,9 +37,16 @@ export function HostCliIntegrationCard() {
       key: "shareCliCredentials",
       title: "Share Host CLI Credentials with Local & Cloud VMs",
       body:
-        "Makes your host CLI credentials (~/.infisical, ~/.ssh, ~/.docker, ~/.gitconfig, ~/.config/gh, ~/.aws, ~/.config/gcloud, ~/.npmrc, etc.) available read-only, so tools run inside a VM are signed into your accounts.\u00a0 " +
+        "Makes manifest-listed host CLI login files available read-only inside Local and Shared VPS VMs (Infisical, SSH, Git, cloud CLIs, registries, kubectl, turso, vercel, and more).\u00a0 " +
         "The Shared VPS is synced automatically when a bot starts a turn, at most once every ten minutes.\u00a0 " +
         "A Local VM mounts them when it is created, so recreate an existing Local VM to pick this up.",
+    },
+    {
+      key: "shareGpgPrivateKeys",
+      title: "Include GPG Private Keys in VM Credential Sync",
+      body:
+        "When enabled, GPG private keys under ~/.gnupg/private-keys-v1.d are included in VPS sync and Local VM mounts.\u00a0 " +
+        "Public GPG configuration is always synced; private keys stay on the host unless you opt in here.",
     },
     {
       key: "allowHostTerminal",

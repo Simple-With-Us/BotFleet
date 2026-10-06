@@ -1,4 +1,5 @@
 // Shared provisioning and shell contract for the cloud computer's Cua Driver.
+import { renderLinuxInstallScript, renderVerifyScript, vmCliManifestDigest } from "./vm-cli-install.ts";
 // The box command API is the transport boundary: the daemon stays loopback-only
 // inside the VM and BotFleet never exposes another inbound port.
 
@@ -92,6 +93,25 @@ socket.close();`;
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 
+function remoteVmCliBootstrapFragment(): string {
+  const digest = vmCliManifestDigest().slice(0, 16);
+  const marker = `/opt/ogb/vm-cli-${digest}-ready`;
+  const installPayload = Buffer.from(renderLinuxInstallScript("cloud")).toString("base64");
+  const verifyPayload = Buffer.from(renderVerifyScript("cloud")).toString("base64");
+  const installScript = [
+    "sudo mkdir -p /opt/ogb",
+    `printf %s ${shellQuote(installPayload)} | base64 -d | sudo bash`,
+    `printf %s ${shellQuote(verifyPayload)} | base64 -d | sudo tee /opt/ogb/botfleet-vm-cli-verify >/dev/null`,
+    "sudo chmod 0755 /opt/ogb/botfleet-vm-cli-verify",
+    `touch ${marker}`,
+  ].join(" && ");
+  return [
+    `[ -f ${marker} ] || {`,
+    `  nohup bash -c ${shellQuote(installScript)} > /tmp/ogb-vm-cli-install.log 2>&1 &`,
+    "}",
+  ].join("\n");
+}
+
 /** Start the already-installed daemon after a box resume. This is cheap when
  * it is healthy and intentionally does not install anything on the hot path. */
 export function ensureRemoteCuaCommand(): string {
@@ -133,6 +153,7 @@ export function remoteComputerBootstrapCommand(botName: string): string {
   return [
     "if ! command -v xdotool >/dev/null || ! command -v convert >/dev/null || ! command -v curl >/dev/null || ! command -v python3 >/dev/null; then sudo apt-get update -qq || true; sudo apt-get install -y -qq ca-certificates curl python3 gnome-screenshot xclip wmctrl xdotool imagemagick scrot >/dev/null 2>&1 || true; fi",
     "sudo mkdir -p /opt/ogb/run",
+    remoteVmCliBootstrapFragment(),
     `printf %s ${shellQuote(helper)} | base64 -d | sudo tee ${REMOTE_CDP_HELPER} >/dev/null`,
     `sudo chmod 0755 ${REMOTE_CDP_HELPER}`,
     'pkill -f "^/opt/ogb/venv/bin/python -m computer_server( |$)" >/dev/null 2>&1 || true',
