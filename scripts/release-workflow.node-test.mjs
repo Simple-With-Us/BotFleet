@@ -168,8 +168,11 @@ test("release workflow defaults to artifacts and requires explicit release mutat
   const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 
   assert.equal(pkg.version, VERSION);
-  assert.match(pkg.scripts["package:mac:release"], /electron-builder --mac --arm64 --x64 --publish never/);
-  assert.match(workflow, /Package both architectures\n\s+run: pnpm package:mac:release/);
+  assert.match(pkg.scripts["package:mac:arm64:release"], /electron-builder --mac --arm64 --publish never/);
+  assert.match(pkg.scripts["package:mac:x64:release"], /electron-builder --mac --x64 --publish never/);
+  assert.match(workflow, /fail-fast: false/);
+  assert.match(workflow, /name: mac-release-\$\{\{ matrix\.arch \}\}/);
+  assert.match(workflow, /mac-merge:/);
   assert.match(workflow, /draft:\n\s+description:[^\n]+\n\s+required: false\n\s+type: boolean\n\s+default: false/);
   assert.match(workflow, /publish:\n\s+description:[^\n]+\n\s+required: false\n\s+type: boolean\n\s+default: false/);
   assert.match(workflow, /Publish \(only when asked to\)[\s\S]*?if: \$\{\{ inputs\.publish \}\}/);

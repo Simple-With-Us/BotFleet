@@ -80,10 +80,22 @@ jobs:
           fi
 
   mac:
-    name: macOS arm64 + x64 (sign, notarize, staple)
+    name: macOS ${{ matrix.arch }} (sign, notarize, staple)
     needs: prepare
     runs-on: macos-14
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            app: release/mac-arm64/BotFleet.app
+            package_script: package:mac:arm64:release
+            cloudflared_arch: arm64
+          - arch: x64
+            app: release/mac/BotFleet.app
+            package_script: package:mac:x64:release
+            cloudflared_arch: x86_64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -168,36 +180,38 @@ jobs:
             echo "::warning::SENTRY_DSN and VITE_SENTRY_DSN are both empty after the Infisical prod export and the GitHub secret fallback.  This build packages with Sentry inert."
           fi
 
-      - name: Package both architectures
-        run: pnpm package:mac:release
+      - name: Package ${{ matrix.arch }}
+        run: pnpm ${{ matrix.package_script }}
 
       - name: "Gate: the signature must verify BEFORE notarization"
         run: |
-          for app in release/mac-arm64/BotFleet.app release/mac/BotFleet.app; do
-            codesign --verify --deep --strict "$app"
-            bin="$app/Contents/Resources/cloudflared/cloudflared"
-            test -x "$bin" || { echo "::error::missing executable $bin"; exit 1; }
-            test -f "$app/Contents/Resources/licenses/cloudflared-LICENSE.txt" \
-              || { echo "::error::missing cloudflared license in $app"; exit 1; }
-            test -f "$app/Contents/Resources/licenses/cloudflared-README.md" \
-              || { echo "::error::missing cloudflared provenance in $app"; exit 1; }
-            codesign --verify --strict "$bin"
-            app_team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-            bin_team=$(codesign -dv --verbose=4 "$bin" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-            test -n "$app_team" && test "$bin_team" = "$app_team" || {
-              echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
-            echo "ok: $app"
-          done
+          app="${{ matrix.app }}"
+          codesign --verify --deep --strict "$app"
+          bin="$app/Contents/Resources/cloudflared/cloudflared"
+          test -x "$bin" || { echo "::error::missing executable $bin"; exit 1; }
+          test -f "$app/Contents/Resources/licenses/cloudflared-LICENSE.txt" \
+            || { echo "::error::missing cloudflared license in $app"; exit 1; }
+          test -f "$app/Contents/Resources/licenses/cloudflared-README.md" \
+            || { echo "::error::missing cloudflared provenance in $app"; exit 1; }
+          codesign --verify --strict "$bin"
+          app_team=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          bin_team=$(codesign -dv --verbose=4 "$bin" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+          test -n "$app_team" && test "$bin_team" = "$app_team" || {
+            echo "::error::cloudflared is not signed by the app's Developer ID team in $app"; exit 1; }
+          echo "ok: $app"
 
-      - name: "Gate: both packaged servers start and every helper path resolves"
+      - name: "Gate: the packaged server starts and every helper path resolves"
+        env:
+          MAC_APP: ${{ matrix.app }}
+          CLOUDFLARED_ARCH: ${{ matrix.cloudflared_arch }}
         run: |
-          for app in release/mac-arm64/BotFleet.app release/mac/BotFleet.app; do
-            res="$app/Contents/Resources"
-            # the server tree is plain JS — runnable on the runner's node
-            # regardless of the app binary's arch
-            OMB_SMOKE_DIST="$res/server" node scripts/smoke-packaged-server.mjs \
-              || { echo "::error::packaged server in $app failed to start"; exit 1; }
-            node --input-type=module - "$res/server" <<'EOF'
+          app="$MAC_APP"
+          res="$app/Contents/Resources"
+          # the server tree is plain JS — runnable on the runner's node
+          # regardless of the app binary's arch
+          OMB_SMOKE_DIST="$res/server" node scripts/smoke-packaged-server.mjs \
+            || { echo "::error::packaged server in $app failed to start"; exit 1; }
+          node --input-type=module - "$res/server" <<'EOF'
           import { existsSync } from "node:fs";
           import { pathToFileURL } from "node:url";
           const server = process.argv[2];
@@ -209,20 +223,18 @@ jobs:
           }
           console.log(`ok: ${Object.keys(SPAWNED_PROXIES).length} proxies resolve in ${server}`);
           EOF
-            for bin in "$res/cua-driver" "$res/BotFleet Speech.app/Contents/MacOS/speech-helper"; do
-              lipo -archs "$bin" | grep -q "x86_64" || { echo "::error::$bin lacks x86_64"; exit 1; }
-              lipo -archs "$bin" | grep -q "arm64" || { echo "::error::$bin lacks arm64"; exit 1; }
-            done
-            cloudflared="$res/cloudflared/cloudflared"
-            expected_arch=x86_64
-            case "$app" in *mac-arm64*) expected_arch=arm64 ;; esac
-            test "$(lipo -archs "$cloudflared")" = "$expected_arch" || {
-              echo "::error::$cloudflared is not the expected $expected_arch executable"; exit 1; }
-            if [ "$(uname -m)" = "$expected_arch" ]; then
-              "$cloudflared" version | grep -Fq "cloudflared version 2026.8.2 " || {
-                echo "::error::$cloudflared has the wrong version"; exit 1; }
-            fi
+          for bin in "$res/cua-driver" "$res/BotFleet Speech.app/Contents/MacOS/speech-helper"; do
+            lipo -archs "$bin" | grep -q "x86_64" || { echo "::error::$bin lacks x86_64"; exit 1; }
+            lipo -archs "$bin" | grep -q "arm64" || { echo "::error::$bin lacks arm64"; exit 1; }
           done
+          cloudflared="$res/cloudflared/cloudflared"
+          expected_arch="$CLOUDFLARED_ARCH"
+          test "$(lipo -archs "$cloudflared")" = "$expected_arch" || {
+            echo "::error::$cloudflared is not the expected $expected_arch executable"; exit 1; }
+          if [ "$(uname -m)" = "$expected_arch" ]; then
+            "$cloudflared" version | grep -Fq "cloudflared version 2026.8.2 " || {
+              echo "::error::$cloudflared has the wrong version"; exit 1; }
+          fi
 
       # All three names are required -- with GH_FALLBACK_* covering the
       # cutover while the vault copies are confirmed (orchestrator step 3).
@@ -239,14 +251,16 @@ jobs:
           GH_FALLBACK_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           GH_FALLBACK_APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
-      - name: Notarize all four artifacts
+      - name: Notarize this architecture's DMG and ZIP
         env:
+          MAC_ARCH: ${{ matrix.arch }}
           APPLE_API_KEY_P8_BASE64: ${{ env.APPLE_API_KEY_P8_BASE64 }}
           APPLE_API_KEY_ID: ${{ env.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ env.APPLE_API_ISSUER_ID }}
         run: |
           echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          for f in release/*.dmg release/*.zip; do
+          v=$(node -p "require('./package.json').version")
+          for f in "release/BotFleet-$v-$MAC_ARCH.dmg" "release/BotFleet-$v-$MAC_ARCH.zip"; do
             out=$(xcrun notarytool submit "$f" \
               --key "$RUNNER_TEMP/notary.p8" \
               --key-id "$APPLE_API_KEY_ID" \
@@ -257,37 +271,91 @@ jobs:
           done
           rm "$RUNNER_TEMP/notary.p8"
 
-      - name: Staple, re-zip, regenerate blockmaps and the feed
+      - name: Staple, re-zip, and regenerate blockmaps
+        env:
+          MAC_APP: ${{ matrix.app }}
+          MAC_ARCH: ${{ matrix.arch }}
         run: |
-          xcrun stapler staple release/BotFleet-*-arm64.dmg
-          xcrun stapler staple release/BotFleet-*-x64.dmg
-          xcrun stapler staple release/mac-arm64/BotFleet.app
-          xcrun stapler staple release/mac/BotFleet.app
           v=$(node -p "require('./package.json').version")
-          rm -f "release/BotFleet-$v-arm64.zip" "release/BotFleet-$v-x64.zip"
-          ditto -c -k --sequesterRsrc --keepParent release/mac-arm64/BotFleet.app "release/BotFleet-$v-arm64.zip"
-          ditto -c -k --sequesterRsrc --keepParent release/mac/BotFleet.app "release/BotFleet-$v-x64.zip"
+          xcrun stapler staple "release/BotFleet-$v-$MAC_ARCH.dmg"
+          xcrun stapler staple "$MAC_APP"
+          rm -f "release/BotFleet-$v-$MAC_ARCH.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$MAC_APP" "release/BotFleet-$v-$MAC_ARCH.zip"
           node scripts/regenerate-blockmaps.mjs \
-            "release/BotFleet-$v-arm64.zip" "release/BotFleet-$v-x64.zip" \
-            "release/BotFleet-$v-arm64.dmg" "release/BotFleet-$v-x64.dmg"
-          # refreshes every hash from the post-staple bytes and refuses to
-          # finish unless the feed matches the files on disk
-          node scripts/regenerate-mac-feed.mjs
-
-      - name: Stable-named copies for the README's /latest/download links
-        run: |
-          v=$(node -p "require('./package.json').version")
-          cp "release/BotFleet-$v-arm64.dmg" release/BotFleet.dmg
-          cp "release/BotFleet-$v-x64.dmg" release/BotFleet-intel.dmg
+            "release/BotFleet-$v-$MAC_ARCH.zip" "release/BotFleet-$v-$MAC_ARCH.dmg"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mac-release
+          name: mac-release-${{ matrix.arch }}
           path: |
-            release/*.dmg
-            release/*.zip
-            release/*.blockmap
-            release/latest-mac.yml
+            release/BotFleet-*-${{ matrix.arch }}.dmg
+            release/BotFleet-*-${{ matrix.arch }}.zip
+            release/BotFleet-*-${{ matrix.arch }}.dmg.blockmap
+            release/BotFleet-*-${{ matrix.arch }}.zip.blockmap
+          if-no-files-found: error
+          retention-days: 7
+
+  mac-merge:
+    name: macOS updater feed and stable aliases
+    needs: [prepare, mac]
+    if: always() && !cancelled() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: mac-release-arm64
+          path: release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: mac-release-x64
+          path: release
+      - name: Require at least one signed mac artifact set
+        run: |
+          shopt -s nullglob
+          files=(release/BotFleet-*.dmg)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no mac release artifacts were produced"
+            exit 1
+          fi
+          echo "mac artifacts: ${files[*]}"
+      - name: Regenerate latest-mac.yml when both architectures built
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ -f "release/BotFleet-$v-arm64.dmg" ] && [ -f "release/BotFleet-$v-x64.dmg" ]; then
+            node scripts/regenerate-mac-feed.mjs release/latest-mac.yml
+          else
+            echo "::warning::skipping latest-mac.yml — not every mac architecture built"
+          fi
+      - name: Stable-named copies for the README's /latest/download links
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ -f "release/BotFleet-$v-arm64.dmg" ]; then
+            cp "release/BotFleet-$v-arm64.dmg" release/BotFleet.dmg
+          fi
+          if [ -f "release/BotFleet-$v-x64.dmg" ]; then
+            cp "release/BotFleet-$v-x64.dmg" release/BotFleet-intel.dmg
+          fi
+      - name: Stage merged mac artifacts for upload
+        run: |
+          mkdir -p mac-upload
+          shopt -s nullglob
+          for f in release/BotFleet-*.dmg release/BotFleet-*.zip release/BotFleet-*.blockmap \
+            release/BotFleet.dmg release/BotFleet-intel.dmg release/latest-mac.yml; do
+            [ -e "$f" ] && cp "$f" mac-upload/
+          done
+          ls -la mac-upload/
+          test "$(find mac-upload -type f | wc -l)" -gt 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-release
+          path: mac-upload/
           if-no-files-found: error
           retention-days: 7
 
@@ -497,7 +565,7 @@ jobs:
 
   assemble:
     name: Assemble and verify every feed
-    needs: [prepare, mac, windows, linux]
+    needs: [prepare, mac-merge, windows, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
