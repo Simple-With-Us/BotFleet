@@ -5,7 +5,7 @@
 // The single exception to that transparency is the who-is-driving gate
 // (opt-in via `gate`). While the person holds control of this computer in
 // the app, a `tools/call` from the agent is answered with a refusal HERE,
-// on the near side, and never forwarded — Cua Driver on the far side has
+// on the near side, and never forwarded — CUA Driver on the far side has
 // no concept of a person holding the wheel, so the refusal cannot come
 // from anywhere else. Everything that is not a tools/call still passes
 // through untouched, and with no gate configured the bridge remains the
@@ -125,7 +125,7 @@ export function createInactivityWatchdog(options: {
 export interface BridgeOptions {
   command: string;
   args: string[];
-  /** Names the far end in stderr messages, e.g. "Cua Driver". */
+  /** Names the far end in stderr messages, e.g. "CUA Driver". */
   label: string;
   /** Enables the dead-transport watchdog. Omitted for the Local VM, whose
    * runtime CLI talks to a local daemon and fails fast on its own. */

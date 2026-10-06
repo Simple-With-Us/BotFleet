@@ -7446,7 +7446,7 @@ async function runGroupMemberTurn(
   ) ?? cwd;
   // The same computers as a 1:1 turn, through the same helper.  A room used
   // to resolve none of this: `integrations.computer` / `computers` /
-  // `localComputer` were never set here, so a bot holding Cua, a Box, a Local
+  // `localComputer` were never set here, so a bot holding CUA, a Box, a Local
   // VM or a VPS in a direct chat lost every one of them the moment it spoke
   // in a room — while the HTTP lane in that same room kept host tools through
   // `hasHostComputer` below.  A room is a different conversation, not a

@@ -353,7 +353,7 @@ export interface SendTurnInput {
       gatewayUrl?: string;
       control?: { url: string; token: string };
     };
-    /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
+    /** Direct stdio connection to a CUA Driver MCP server (host, sandbox, or
      * VPS). `scope` is set only for the user's host desktop; isolated and
      * remote computers intentionally omit it so host-only approval rules
      * cannot change their semantics. */

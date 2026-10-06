@@ -17,7 +17,7 @@ afterEach(async () => {
 // bridge remains portable; only this byte-for-byte process fixture is gated.
 const posixOnly = describe.skipIf(process.platform === "win32");
 
-posixOnly("Local VM Cua MCP bridge", () => {
+posixOnly("Local VM CUA MCP bridge", () => {
   it("passes MCP bytes unchanged to cua-driver mcp over the container runtime", async () => {
     const bin = await mkdtemp(join(tmpdir(), "botfleet-container-mcp-"));
     temporary.push(bin);

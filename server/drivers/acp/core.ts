@@ -106,8 +106,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {

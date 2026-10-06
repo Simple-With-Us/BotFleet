@@ -178,7 +178,7 @@ describe("computerSystemPrompt", () => {
   });
 
   it("describes the host as a desktop only to an engine that is handed one", () => {
-    // An MCP engine mounts the Cua Driver server and really can see and click
+    // An MCP engine mounts the CUA Driver server and really can see and click
     // the desktop.  A driver-loop engine mounts no MCP server at all: its
     // host surface is the harness's own bash and file tools, and that
     // registry holds no screenshot, click or desktop-state tool.  Telling it

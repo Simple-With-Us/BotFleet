@@ -1,5 +1,5 @@
 // BYO Linux VPS computer. The agent process stays local; Docker's own SSH
-// transport reaches the user's daemon and the official Cua MCP server stays
+// transport reaches the user's daemon and the official CUA MCP server stays
 // inside one managed container per bot.
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -161,7 +161,7 @@ const PIDS_LIMIT = 512;
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
-/** Per-bot shared-session setup (Xvfb + Cua serve) — not the container lock. */
+/** Per-bot shared-session setup (Xvfb + CUA serve) — not the container lock. */
 const botSessionLocks = new Map<string, Promise<void>>();
 /** Concurrent shared-mode provisions of the one container coalesce into a
  * single flight.  Provision is the idempotent turn-start path: when N bots

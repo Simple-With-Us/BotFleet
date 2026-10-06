@@ -612,7 +612,7 @@ describe("containerComputerStatus", () => {
   });
 });
 
-describe("Cua integration", () => {
+describe("CUA integration", () => {
   it("points the box proxy at the harness gateway instead of the account's Box API", () => {
     // Repinned: the proxy used to receive the account-wide API key and talk
     // to ascii.dev itself.  It now receives a per-mount grant and the
@@ -766,7 +766,7 @@ describe("Cua integration", () => {
     expect(status.ready).toBe(true);
   });
 
-  it("mounts the official Cua MCP server for Local VM turns", () => {
+  it("mounts the official CUA MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.at(-3)).toBe("podman");
@@ -775,7 +775,7 @@ describe("Cua integration", () => {
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
   });
 
-  it("builds an exact, checksum-verified Cua Driver 0.20.0 image", () => {
+  it("builds an exact, checksum-verified CUA Driver 0.20.0 image", () => {
     const dockerfile = managedImageDockerfile();
     expect(dockerfile.startsWith("# syntax=docker/dockerfile:1\n")).toBe(true);
     expect(BASE_IMAGE).toMatch(/@sha256:[a-f0-9]{64}$/);
@@ -816,7 +816,7 @@ describe("Cua integration", () => {
     expect(fetch).toBeGreaterThan(gate);
   });
 
-  it("captures the preview through Cua Driver rather than xdotool or VNC", async () => {
+  it("captures the preview through CUA Driver rather than xdotool or VNC", async () => {
     const screenshotCall =
       `${driverExec} call get_desktop_state {} --socket ${CUA_SOCKET} ` +
       "--screenshot-out-file /tmp/botfleet-preview.png";

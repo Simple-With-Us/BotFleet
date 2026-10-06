@@ -38,7 +38,7 @@ function runBridge(bin: string, input: string) {
   });
 }
 
-describe.skipIf(process.platform === "win32")("VPS Cua MCP bridge", () => {
+describe.skipIf(process.platform === "win32")("VPS CUA MCP bridge", () => {
   it("passes MCP bytes unchanged to docker exec over the validated SSH target", async () => {
     const bin = await mkdtemp(join(tmpdir(), "botfleet-vps-mcp-"));
     temporary.push(bin);

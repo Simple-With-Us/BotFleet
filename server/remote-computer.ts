@@ -1,4 +1,4 @@
-// Shared provisioning and shell contract for the cloud computer's Cua Driver.
+// Shared provisioning and shell contract for the cloud computer's CUA Driver.
 import { renderLinuxInstallScript, renderVerifyScript, vmCliManifestDigest } from "./vm-cli-install.ts";
 // The box command API is the transport boundary: the daemon stays loopback-only
 // inside the VM and BotFleet never exposes another inbound port.

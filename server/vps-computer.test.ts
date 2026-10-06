@@ -288,7 +288,7 @@ describe("VPS computer", () => {
     for (const probe of probes) expect(probe.options?.timeoutMs).toBe(30_000);
   });
 
-  it("reports a ready container only when image, labels, limits, mounts, network, and Cua pass", async () => {
+  it("reports a ready container only when image, labels, limits, mounts, network, and CUA pass", async () => {
     const fake = fixture();
     const status = await vpsComputerStatus(CONFIG, BOT_ID, fake.runner);
     expect(status).toMatchObject({
@@ -476,7 +476,7 @@ describe("VPS computer", () => {
     expect(fake.calls.filter(({ args }) => args[2] === "run")).toHaveLength(1);
   });
 
-  it("mounts the official Cua MCP server through the tiny remote exec bridge", () => {
+  it("mounts the official CUA MCP server through the tiny remote exec bridge", () => {
     const connection = vpsComputerMcp(CONFIG, BOT_ID);
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.slice(1, 3)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
@@ -506,7 +506,7 @@ describe("VPS computer", () => {
     ]);
   });
 
-  it("captures screenshots through Cua Driver and validates the returned image", async () => {
+  it("captures screenshots through CUA Driver and validates the returned image", async () => {
     const fake = fixture();
     const frame = await vpsComputerScreenshot(CONFIG, BOT_ID, fake.runner);
     expect(frame).toMatchObject({ png: screenshot.toString("base64"), format: "png" });

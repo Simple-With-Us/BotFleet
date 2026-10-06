@@ -333,7 +333,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             });
           } else if (mount.stdio) {
             // The host daemon, the isolated Local VM, and a VPS desktop all
-            // arrive as a direct Cua Driver stdio MCP server.
+            // arrive as a direct CUA Driver stdio MCP server.
             mountMcpServer(appServerArgs, env, mount.name, mount.stdio);
           }
         }
