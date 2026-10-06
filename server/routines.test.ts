@@ -433,6 +433,7 @@ describe("RoutineManager", () => {
       deliveryId: "wh-default",
       receivedAt: queuedAt,
     });
+    await h.manager.tick();
     h.setNow(queuedAt + 19 * 60_000);
     await h.manager.tick();
     expect(h.started).toHaveLength(0);
