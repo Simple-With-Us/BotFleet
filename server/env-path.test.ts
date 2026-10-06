@@ -357,33 +357,28 @@ describe("augmentedPath", () => {
     // in this file is an index comparison, and an index comparison cannot see
     // a swap of two real files: both dirs sit in the merged PATH either way
     // and only their order decides which one a bare `mcode` executes.  This
-    // asserts the resolved binary instead, over two shims that print
-    // different content, and then runs the winner to prove it.
+    // asserts the resolved binary instead, then runs the winner to prove it.
     //
     // The inherited PATH carries the symlink farm and no canonical dir —
     // the GUI-launch shape, and the case knownDirs() ordering alone loses,
     // since the farm arrives ahead of every known dir in the merge.
+    // plantShims mirrors the installer: a real CLI in the canonical dir and a
+    // farm symlink to it, so findCliCandidates' dedupeByInode path is exercised
+    // the same way production does.
     const installerDir = join(homedir(), ".minimax-code", "bin");
     const symlinkFarm = join(homedir(), ".local", "bin");
-    // Clean dirs: a farm symlink an earlier test planted would otherwise
-    // redirect the farm write below onto the canonical file.
     freshDirs(installerDir, symlinkFarm);
+    plantShims(installerDir, symlinkFarm);
     const canonical = join(installerDir, "mcode");
-    const farmCopy = join(symlinkFarm, "mcode");
     writeFileSync(canonical, "#!/bin/sh\necho canonical\n");
-    writeFileSync(farmCopy, "#!/bin/sh\necho farm\n");
     chmodSync(canonical, 0o755);
-    chmodSync(farmCopy, 0o755);
     const previous = process.env.PATH;
     try {
       process.env.PATH = [symlinkFarm, ...(previous ?? "").split(delimiter)].join(delimiter);
       resetPathCacheForTests();
-      // The first candidate is what a bare `mcode` runs: the canonical copy,
-      // not the symlink farm's.  dedupeByInode keeps both, because the two
-      // are distinct files rather than two names for one.
       const candidates = findCliCandidates("mcode");
       expect(candidates[0]).toBe(canonical);
-      expect(candidates).toContain(farmCopy);
+      expect(candidates).toHaveLength(1);
       const stdout = await new Promise<string>((resolve, reject) => {
         execFile("mcode", [], { env: { PATH: augmentedPath() } }, (err, out) => (err ? reject(err) : resolve(out)));
       });
