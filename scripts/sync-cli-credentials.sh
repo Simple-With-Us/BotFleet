@@ -155,7 +155,9 @@ cleanup_staging() {
     rm -rf "$TAR_ROOT"
   fi
 }
-trap cleanup_staging EXIT INT TERM
+trap cleanup_staging EXIT
+trap 'cleanup_staging; exit 130' INT
+trap 'cleanup_staging; exit 143' TERM
 
 while IFS= read -r rel; do
   [ -n "$rel" ] && FOUND+=("$rel")
