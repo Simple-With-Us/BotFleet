@@ -32,7 +32,7 @@
 // one and never a missing pointer.
 
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
@@ -167,14 +167,15 @@ export async function currentCommit(env = process.env) {
   // and a prune landing between the two made the second read throw out of a
   // function documented to return null — so a caller doing the documented null
   // check still crashed, on the exact path where a release is being deleted.
-  const manifest = validateReleaseManifest(await readReleaseManifest(physical));
-  if (manifest) return manifest.commit;
-  // A pointer aimed at something that is not a release (a legacy checkout, or a
-  // half-built directory) still tells the caller which commit is live, by name.
-  // Split on the platform's separator: a hard-coded "/" would make every path
-  // look like one segment on Windows and silently answer null there.
   const name = physical.split(sep).pop();
-  return FULL_COMMIT.test(name) ? name : null;
+  if (!FULL_COMMIT.test(name)) return null;
+  const manifest = validateReleaseManifest(await readReleaseManifest(physical));
+  // listReleases and pruneReleases key releases by DIRECTORY NAME.  A manifest
+  // that claims a different commit must not redefine the live identity — that
+  // mismatch made the live tree a prune candidate and discardRelease deleted
+  // the harness still running from it.
+  if (manifest && manifest.commit !== name) return null;
+  return name;
 }
 
 /** Read a release manifest, returning null rather than throwing on anything. */
@@ -198,6 +199,23 @@ async function readReleaseManifest(directory) {
 export async function promoteStaging({ commit, env = process.env, renameImpl = rename, promotedAt = new Date().toISOString() } = {}) {
   const from = stagingPath(commit, env);
   const to = releasePath(commit, env);
+  try {
+    const fromStat = await stat(from);
+    if (!fromStat.isDirectory()) {
+      throw new ResolutionError(
+        `No staging tree at ${from}: not a directory.  Stage that commit before promoting it.`,
+        "staging-missing",
+        { stagingPath: from },
+      );
+    }
+  } catch (error) {
+    if (error instanceof ResolutionError) throw error;
+    throw new ResolutionError(
+      `No staging tree at ${from}: ${error?.message || error}.  Stage that commit before promoting it.`,
+      "staging-missing",
+      { stagingPath: from },
+    );
+  }
   const manifest = {
     schemaVersion: 1,
     commit,
@@ -313,8 +331,33 @@ export async function discardRelease(commit, env = process.env) {
  * permissions, so the "immutable" release was fully writable file by file and
  * nothing stopped anyone from editing a release in place.
  */
-async function setTreePermission(path, { writable, readOnly, errors = [] }) {
+const PERM_WALK_CONCURRENCY = 32;
+
+async function forEachConcurrent(items, concurrency, fn) {
+  if (items.length === 0) return;
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function permissionBits(mode, writable) {
+  const type = mode & 0o7000;
+  const perm = writable ? (mode & 0o777) | 0o200 : (mode & 0o777) & ~0o222;
+  return type | perm;
+}
+
+async function setTreePermission(path, { writable, errors = [] }) {
   try {
+    const root = await lstat(path);
+    if (root.isSymbolicLink()) {
+      errors.push({ path, error: new Error("refusing to chmod through a symlink") });
+      return errors;
+    }
     // Adjust the WRITE bits and leave the rest alone.  Substituting a constant
     // mode flattened two things that matter: the execute bit (so a promoted
     // release containing an executable came out non-runnable) and the group and
@@ -322,9 +365,7 @@ async function setTreePermission(path, { writable, readOnly, errors = [] }) {
     // "Read-only" and "writable" are statements about who may write, not about
     // what every file's mode should be.
     const { mode } = await stat(path);
-    const type = mode & 0o7000;
-    const perm = writable ? (mode & 0o777) | 0o200 : (mode & 0o777) & ~0o222;
-    await chmod(path, type | perm);
+    await chmod(path, permissionBits(mode, writable));
   } catch (err) {
     errors.push({ path, error: err });
   }
@@ -335,35 +376,31 @@ async function setTreePermission(path, { writable, readOnly, errors = [] }) {
     errors.push({ path, error: err });
     return errors;
   }
-  // Concurrent rather than one awaited syscall at a time: a release tree is
-  // thousands of files and this ran serially, so the walk dominated the prune.
-  await Promise.all(
-    entries.map(async (entry) => {
-      const child = join(path, entry.name);
-      if (entry.isDirectory()) {
-        await setTreePermission(child, { writable, readOnly, errors });
-      } else if (!entry.isSymbolicLink()) {
-        // chmod follows symlinks; a link in the tree would chmod its target outside the release
-        try {
-          const { mode } = await stat(child);
-          const type = mode & 0o7000;
-          const perm = writable ? (mode & 0o777) | 0o200 : (mode & 0o777) & ~0o222;
-          await chmod(child, type | perm);
-        } catch (err) {
-          errors.push({ path: child, error: err });
-        }
+  // Bounded concurrency: an unbounded Promise.all over node_modules queues
+  // hundreds of thousands of fs work items on promote and prune.
+  await forEachConcurrent(entries, PERM_WALK_CONCURRENCY, async (entry) => {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      await setTreePermission(child, { writable, errors });
+    } else if (!entry.isSymbolicLink()) {
+      // chmod follows symlinks; a link in the tree would chmod its target outside the release
+      try {
+        const { mode } = await stat(child);
+        await chmod(child, permissionBits(mode, writable));
+      } catch (err) {
+        errors.push({ path: child, error: err });
       }
-    }),
-  );
+    }
+  });
   return errors;
 }
 
 async function makeWritable(path) {
-  await setTreePermission(path, { writable: true, readOnly: 0o444 });
+  await setTreePermission(path, { writable: true });
 }
 
 async function makeReadOnly(path) {
-  const errors = await setTreePermission(path, { writable: false, readOnly: 0o444 });
+  const errors = await setTreePermission(path, { writable: false });
   if (errors.length > 0) {
     const failedPaths = errors.slice(0, 3).map((e) => e.path).join(", ");
     throw new ResolutionError(
@@ -456,7 +493,16 @@ export async function swapCurrent({ commit, env = process.env, renameImpl = rena
       // resolves the pointer and a missing one means no harness at all.  A stale
       // pointer is recoverable; a missing one is an outage.
       const displaced = previous ? await createPointerAt(link, previous, linkType) : null;
-      await rm(link, { recursive: true, force: true });
+      try {
+        await rm(link, { recursive: true, force: true });
+      } catch (rmError) {
+        if (displaced) await rm(displaced, { recursive: true, force: true }).catch(() => {});
+        throw new ResolutionError(
+          `Could not clear the release pointer at ${link}: ${rmError?.message || rmError}`,
+          "swap-pointer-clear-failed",
+          { link },
+        );
+      }
       try {
         await renameImpl(staged, link);
         // The retry succeeded, so the spare has served its purpose: `previous`
@@ -520,10 +566,15 @@ export async function listReleases(env = process.env) {
   for (const entry of entries) {
     if (!entry.isDirectory() || !FULL_COMMIT.test(entry.name)) continue;
     const path = join(releasesRoot(env), entry.name);
+    const manifest = validateReleaseManifest(await readReleaseManifest(path));
+    if (manifest && manifest.commit !== entry.name) continue;
     const promotedAt = await promotedAtOf(path);
-    releases.push({ commit: entry.name, promotedAt });
+    const { mtimeMs } = await stat(path);
+    releases.push({ commit: entry.name, promotedAt, mtimeMs });
   }
-  return releases.sort((a, b) => a.promotedAt - b.promotedAt || a.commit.localeCompare(b.commit)).map((r) => r.commit);
+  return releases
+    .sort((a, b) => a.promotedAt - b.promotedAt || a.mtimeMs - b.mtimeMs)
+    .map((r) => r.commit);
 }
 
 async function promotedAtOf(path) {
@@ -563,7 +614,7 @@ async function promotedAtOf(path) {
  * for a deletion gate.  So: judge on the OUTPUT, and treat "no output and a
  * non-zero status" as cannot-answer rather than as free.
  */
-export async function isHeld(directory, { timeoutMs = 25_000 } = {}) {
+export async function probeReleaseLiveness(directory, { timeoutMs = 25_000 } = {}) {
   let stdout = "";
   // "Did lsof run to completion?"  Its exit status answers a different question
   // — whether it warned — so it cannot be used for this, but the two are not the
@@ -578,14 +629,24 @@ export async function isHeld(directory, { timeoutMs = 25_000 } = {}) {
     // as a numeric code and a failure to execute as a string like ENOENT, or as
     // killed/signal on a timeout.
     stdout = String(error?.stdout || "");
-    ranToCompletion = Number.isInteger(error?.code);
+    if (error?.killed || error?.signal) {
+      ranToCompletion = false;
+    } else {
+      ranToCompletion = Number.isInteger(error?.code);
+    }
   }
-  if (/(^|\n)p\d+/.test(stdout)) return true; // something is holding files here
+  if (/(^|\n)p\d+/.test(stdout)) return "held";
   // lsof on an empty or untouched directory exits 1 with no output at all, so
   // "ran and printed nothing" genuinely means free.  Treating a non-zero status
   // as unanswerable instead would make every release permanently unprunable,
   // since +D routinely warns.
-  return !ranToCompletion; // could not run, or timed out: not permission to delete
+  if (ranToCompletion) return "free";
+  return "unknown";
+}
+
+export async function isHeld(directory, options = {}) {
+  const state = await probeReleaseLiveness(directory, options);
+  return state !== "free";
 }
 
 /**
@@ -597,8 +658,13 @@ export async function isHeld(directory, { timeoutMs = 25_000 } = {}) {
  * wasted disk at worst — but the same mistake aimed the other way is an outage,
  * and that is not a trade this makes.
  */
-export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = isHeld, onRemove } = {}) {
+async function defaultLivenessProbe(path) {
+  return probeReleaseLiveness(path);
+}
+
+export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEPT, minAgeMs = DEFAULT_MIN_AGE_MS, now = Date.now(), isHeldImpl = defaultLivenessProbe, onRemove } = {}) {
   const live = await currentCommit(env);
+  const livePhysical = live ? null : await resolveCurrent(env);
   const releases = await listReleases(env);
   const candidates = releases.filter((commit) => commit !== live);
   const doomed = candidates.slice(0, Math.max(0, candidates.length - Math.max(0, keep)));
@@ -612,12 +678,27 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
     } catch {
       continue;
     }
+    if (livePhysical) {
+      try {
+        if ((await realpath(path)) === (await realpath(livePhysical))) {
+          kept.push({ commit, reason: "live-release" });
+          continue;
+        }
+      } catch {
+        // not comparable; fall through to the normal gates
+      }
+    }
     if (now - stat.mtimeMs < minAgeMs) {
       kept.push({ commit, reason: "too-young" });
       continue;
     }
-    if (await isHeldImpl(path)) {
+    const liveness = await isHeldImpl(path);
+    if (liveness === true || liveness === "held") {
       kept.push({ commit, reason: "held-by-a-process" });
+      continue;
+    }
+    if (liveness !== false && liveness !== "free") {
+      kept.push({ commit, reason: "liveness-unknown" });
       continue;
     }
     // A promoted release is read-only, and a read-only directory cannot be

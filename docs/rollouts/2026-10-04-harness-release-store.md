@@ -1,15 +1,15 @@
 # 2026-10-04 — An Immutable Release Store For The Always-On Harness
 
 repo: BotFleet | [MM] Claim: board `f1482275` (Recommendation 2, harness half), branch
-`minimax/harness-release-store`, PR #858, issue #891, board f1482275, seat MINIMAX, Mac.  the fleet coordination protocol (`AGENT-SYNC.md`)
-read for the board/closeout rules, and the matching `repo: BotFleet`-first claim posted in
-`#agent-sync` on 2026-10-04.
+`minimax/harness-release-store`, PR #858, issue #891, board f1482275, seat MINIMAX, Mac.
 
-**Recorded late, and labelled as such rather than backdated:** this lane's coordination record
-was assembled during the review rounds, after the board row existed and after the `#agent-sync`
-post had gone out under the same repo-first format.  The board reservation was live before the
-first commit; the `#agent-sync` announcement followed the PR rather than preceding it.  That is
-the ordering, and it is recorded rather than tidied.
+**Coordination exception (historical, not retroactive compliance):** the first commits on this
+lane landed before a `repo: BotFleet`-first `#agent-sync` post.  The board row was live first;
+the Slack claim and this rollout header were written during review, and that ordering is stated
+here rather than rewritten as if it had been compliant from minute zero.
+
+**2026-10-06 [CURSOR] sync:** `repo: BotFleet` — clearing the remaining Kody review threads on
+PR #858 (`minimax/harness-release-store`); no new scope beyond review fixes and verification.
 
 Author: MINIMAX.
 
@@ -17,8 +17,8 @@ Author: MINIMAX.
 
 ### Context & Objective
 
-`app.botfleet.server` runs from `~/apps/botfleet-server`, a mutable linked git
-worktree.  Every update `git checkout --detach`s that worktree and renames a
+The always-on harness LaunchAgent runs from a mutable linked deployment checkout
+on the operator Mac.  Every update `git checkout --detach`s that worktree and renames a
 fresh `node_modules` into place **under a live Node process that is serving HTTP
 and holding SQLite writes**.  There is no rollback if the new tree is wrong: the
 old one has already been renamed away.
@@ -38,9 +38,9 @@ still imported.  See board `66bc29ad`.
 
 ### What It Is
 
-Each commit gets an immutable directory under `~/.botfleet/releases/<commit>`,
-prepared in `~/.botfleet/staging/<commit>` and activated by moving one pointer
-at `~/.botfleet/current`.  Preparing a new version cannot damage the running
+Each commit gets an immutable directory under the BotFleet release store
+(`releases/<commit>` beneath the store root), prepared in `staging/<commit>` and
+activated by moving one pointer at `current`.  Preparing a new version cannot damage the running
 one, because it happens somewhere else entirely, and the previous release is
 still on disk afterwards — so an unverified new version costs a rename rather
 than an outage.
@@ -63,11 +63,11 @@ from.  That is the owner's decision, not an agent's.
 This work touches no update-feed surface and resolves none of the two-updater
 ambiguity, because it involves neither updater.
 
-**It does not activate anything on this Mac.**  The live
-`~/apps/botfleet-server-start.sh` is unchanged and `app.botfleet.server` still
-runs from its checkout.  Moving the LaunchAgent `WorkingDirectory` to
-`~/.botfleet/current` is a separate on-demand operator step that pauses for the
-owner, with a rollout and a verified rollback.
+**It does not activate anything on the operator Mac.**  The live harness start
+script is unchanged and the LaunchAgent still runs from its deployment checkout.
+Moving the LaunchAgent `WorkingDirectory` to the store's `current` pointer is a
+separate on-demand operator step that pauses for the owner, with a rollout and a
+verified rollback.
 
 ## Decisions & Trade-offs
 
@@ -152,27 +152,38 @@ with one harness, one budget per machine is the honest accounting.
 
 ## Verification
 
-- 17 release-store cases: a live process holding a file inside a tree, a real
-  cross-device rename injected to pin the `EXDEV` message, the pointer-nesting
-  failure, the non-atomic swap fallback driven by an injected `EPERM` (so the
-  Windows path is covered on every platform, not only on Windows), retention
-  ordering, and manifest rejection for a number, a branch name, a short SHA, a
-  trailing non-hex character, a missing commit, and unparseable JSON.
-- 11 launcher cases running the real script: a release with no `node_modules`
-  does not invoke pnpm — observed with a stub that records the call — and names
-  the commit and the alternative, while an ordinary checkout with the same fault
-  still reinstalls.  The seven pre-existing launcher tests pass unchanged,
-  including the restart-storm behaviour.
-- `pnpm lint` passes at the existing baseline rather than raising it.
-- Two of these were caught only by hosted Windows CI after being green locally,
-  which is the point: neither the code nor a Mac-only run would have found them.
+Commands run on 2026-10-06 (cloud seat, branch `minimax/harness-release-store`):
+
+| Command | Result |
+|---|---|
+| `node --test scripts/harness-release-store.node-test.mjs` | pass (release-store cases below) |
+| `node --test scripts/botfleet-server-start.node-test.mjs` | pass (11 launcher cases) |
+| `pnpm exec oxlint scripts/harness-release-store.mjs scripts/harness-release-store.node-test.mjs scripts/botfleet-server-start.sh` | pass at existing baseline |
+| `git fetch origin main && pnpm exec oxlint …` (same paths) vs `origin/main` | no new violations vs baseline |
+
+Release-store coverage includes: a live process holding a file inside a tree, a real
+cross-device rename injected to pin the `EXDEV` message, the pointer-nesting
+failure, the non-atomic swap fallback driven by an injected `EPERM` (so the
+Windows path is covered on every platform, not only on Windows), retention
+ordering and mtime tie-breaks, manifest/directory identity guards, staging-missing
+`ResolutionError`, and manifest rejection for a number, a branch name, a short SHA, a
+trailing non-hex character, a missing commit, and unparseable JSON.
+
+Launcher coverage runs the real script: a release with no `node_modules`
+does not invoke pnpm — observed with a stub that records the call — and names
+the commit and the alternative, while an ordinary checkout with the same fault
+still reinstalls.  The seven pre-existing launcher tests pass unchanged,
+including the restart-storm behaviour.
+
+Two Windows-only failures were caught only by hosted CI after being green locally,
+which is the point: neither the code nor a Mac-only run would have found them.
 
 ## Follow-ups
 
 1. Add `scripts/harness-release-store.mjs` to the updater's bootstrap archive
    list in `scripts/update-botfleet.sh`, and stage/promote/swap in the install
    path.  Until then the store is not reachable from `ubf`.
-2. Point the LaunchAgent `WorkingDirectory` at `~/.botfleet/current`, with the
+2. Point the LaunchAgent `WorkingDirectory` at the store `current` pointer, with the
    updater resolving it physically for fingerprinting.  **This pauses for the
    owner**: it relocates an always-on process.
 3. Add the strict release-manifest schema Kody asked for.  The reason it is not
@@ -183,7 +194,7 @@ with one harness, one budget per machine is the honest accounting.
 
 ## Zero-Code Findings
 
-- The repo has no tracked copy of the `app.botfleet.server` LaunchAgent plist;
+- The repo has no tracked copy of the always-on harness LaunchAgent plist;
   only the start script is tracked.  A launchd entry that governs an always-on
   process, with no template in version control, is a gap worth closing before
   the `WorkingDirectory` move.
@@ -191,3 +202,8 @@ with one harness, one budget per machine is the honest accounting.
   work, by a one-character mistake in an append helper.  See board
   `a90e1f15` and PRs #846 and #850.  Two of the three rebases this branch needed
   afterwards were conflict-free only because `merge=union` was added.
+- **Fleet recall (2026-10-06):** searched `harness release store immutable pointer prune lsof`
+  before closeout; closest hit was board `f1482275` (isHeld output-vs-exit semantics).  **New
+  lesson contributed:** release identity for prune/retention must be the `releases/<commit>`
+  directory name; a manifest whose `commit` field disagrees with that name must not redefine
+  `currentCommit` or enter `listReleases`, or the live tree becomes a prune candidate.

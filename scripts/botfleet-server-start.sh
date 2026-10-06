@@ -188,7 +188,16 @@ looks_like_missing_module() {
 # build a NEW release and swap the pointer, which is the updater's job, not this
 # script's.
 is_immutable_release() {
-  [ -f "$ROOT/.botfleet-release.json" ]
+  # The store validates the manifest before treating a directory as a release
+  # (unknown keys, a non-SHA commit, and an unparseable promotedAt are all
+  # rejected).  A bare existence test is weaker than that contract: a truncated
+  # manifest would permanently disable the in-place self-heal for an ordinary
+  # checkout and print an empty commit to the operator.  Require the commit field
+  # to be a full lowercase SHA, the part that is actually load-bearing.
+  [ -f "$ROOT/.botfleet-release.json" ] || return 1
+  local commit
+  commit="$(manifest_commit)"
+  printf '%s' "$commit" | grep -Eq '^[a-f0-9]{40}$'
 }
 
 run_install_once() {

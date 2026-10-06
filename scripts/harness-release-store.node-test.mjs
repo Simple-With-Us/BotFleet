@@ -21,6 +21,7 @@ import {
   stagingPath,
   stagingRoot,
   validateReleaseManifest,
+  ResolutionError,
   storeRoot,
   swapCurrent,
 } from "./harness-release-store.mjs";
@@ -69,7 +70,7 @@ function awaitOpenDescriptor(child, timeoutMs = 10_000) {
  * leaves state behind that makes the NEXT test lie.  Test-side only: the module
  * exports discardRelease for production disposal.
  */
-async function forceRemove(dir) {
+async function chmodWritableTree(dir) {
   const { chmod, readdir } = await import("node:fs/promises");
   let entries = [];
   try {
@@ -80,13 +81,16 @@ async function forceRemove(dir) {
   for (const entry of entries) {
     const child = join(dir, entry.name);
     if (entry.isDirectory()) {
-      await chmod(child, 0o755).catch(() => {});
-      await forceRemove(child);
+      await chmodWritableTree(child);
     } else {
       await chmod(child, 0o644).catch(() => {});
     }
   }
   await chmod(dir, 0o755).catch(() => {});
+}
+
+async function forceRemove(dir) {
+  await chmodWritableTree(dir);
   await rm(dir, { recursive: true, force: true, maxRetries: 5 }).catch(() => {});
 }
 
@@ -318,9 +322,10 @@ test("pruning leaves a release alone when lsof cannot answer", async (t) => {
   await swapCurrent({ commit: C, env });
   const now = Date.now() + 7 * 24 * 60 * 60 * 1000;
 
-  const result = await pruneReleases({ env, keep: 0, minAgeMs: 0, now, isHeldImpl: async () => true });
+  const result = await pruneReleases({ env, keep: 0, minAgeMs: 0, now, isHeldImpl: async () => "unknown" });
   assert.deepEqual(result.removed, [], "an unanswerable liveness question is not permission to delete");
   assert.equal(result.kept.length, 2);
+  assert.ok(result.kept.every((entry) => entry.reason === "liveness-unknown"), "unknown liveness must not be reported as held-by-a-process");
   assert.deepEqual(await listReleases(env), [A, B, C]);
 });
 
@@ -414,7 +419,7 @@ test("the commit is read from a path with the platform's own separator", () => {
   // path look like a single segment — so currentCommit answered null for a
   // perfectly valid pointer, and did so silently.  Pinned here with a Windows
   // path so the bug cannot come back even on a machine whose tests all pass.
-  const windowsPointer = "C:\\Users\\jay\\.botfleet\\releases\\" + A;
+  const windowsPointer = "C:\\Users\\example\\releases\\" + A;
   assert.equal(windowsPointer.split(win32.sep).pop(), A, "the last segment must be recoverable on Windows");
   assert.equal(windowsPointer.split("/").pop(), windowsPointer, "which is exactly what the hard-coded split returned");
 });
@@ -723,4 +728,45 @@ test("re-promoting an already-released commit says so, not 'check your filesyste
       return true;
     },
   );
+});
+
+test("promoting without a staging tree raises staging-missing before writing a manifest", async (t) => {
+  const { env } = await store(t);
+  await assert.rejects(
+    promoteStaging({ commit: A, env }),
+    (error) => {
+      assert.ok(error instanceof ResolutionError);
+      assert.equal(error.cause, "staging-missing");
+      return true;
+    },
+  );
+  await assert.rejects(stat(join(stagingPath(A, env), ".botfleet-release.json")), (error) => error.code === "ENOENT");
+});
+
+test("a manifest whose commit disagrees with its directory name is not live identity", async (t) => {
+  const { env } = await store(t);
+  await stage(env, A, "x");
+  await promoteStaging({ commit: A, env });
+  await swapCurrent({ commit: A, env });
+  const manifestPath = join(releasePath(A, env), ".botfleet-release.json");
+  await chmodWritableTree(releasePath(A, env));
+  await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, commit: B, promotedAt: "2026-10-04T00:00:00.000Z" }, null, 2)}\n`);
+  assert.equal(await currentCommit(env), null, "a mismatched manifest must not redefine the live commit");
+  assert.deepEqual(await listReleases(env), [], "mismatched releases are excluded from retention ordering");
+});
+
+test("retention breaks ties on directory mtime, not commit name", async (t) => {
+  const { env } = await store(t);
+  const when = "2026-10-04T12:00:00.000Z";
+  const { utimes } = await import("node:fs/promises");
+  let mtime = Date.UTC(2026, 9, 4, 12, 0, 0);
+  for (const commit of [B, A]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env, promotedAt: when });
+    mtime += 1000;
+    await utimes(releasePath(commit, env), mtime / 1000, mtime / 1000);
+  }
+  await swapCurrent({ commit: A, env });
+  const listed = await listReleases(env);
+  assert.deepEqual(listed, [B, A], "same promotedAt must order by mtime, not SHA");
 });
