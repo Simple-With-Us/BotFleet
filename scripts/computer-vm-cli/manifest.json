@@ -229,7 +229,7 @@
       },
       "apt": [
         "openssh-client"
-      ]
+      , "scp"]
     },
     {
       "name": "sftp",
@@ -245,7 +245,7 @@
       },
       "apt": [
         "openssh-client"
-      ]
+      , "sftp"]
     },
     {
       "name": "awk",

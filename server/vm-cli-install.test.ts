@@ -101,6 +101,44 @@ describe("vm CLI manifest install", () => {
     );
   });
 
+  // Regression, 2026-10-06: the image build reported
+  //   missing VM CLIs: scp sftp cargo rustc
+  // rustup's shims resolve the toolchain through RUSTUP_HOME, and the recipe
+  // exported it for the length of the recipe only.  The verify layer is a
+  // separate RUN, so it — and every shell in the container — saw no RUSTUP_HOME
+  // and got "rustup could not choose a version of cargo to run".  Reproduced
+  // in the base image: `cargo --version` succeeds with RUSTUP_HOME set and
+  // fails without it.
+  it("bakes RUSTUP_HOME and CARGO_HOME into the image, not just the recipe", () => {
+    const run = renderDockerfileCliInstallRun("local-vm");
+    expect(run).toContain("ENV RUSTUP_HOME=/usr/local/rustup");
+    expect(run).toContain("ENV CARGO_HOME=/usr/local/cargo");
+    // ENV only reaches later layers when it is its own instruction.
+    expect(run).toMatch(/BOTFLEET_VM_CLI_INSTALL\nENV RUSTUP_HOME=/);
+  });
+
+  it("omits the rust env when no rust tool is requested", () => {
+    const run = renderDockerfileCliInstallRun("cloud");
+    // The cloud manifest still ships rustup, so assert the positive direction
+    // on the helper instead of guessing which environment omits it.
+    expect(run.includes("ENV RUSTUP_HOME=")).toBe(
+      vmCliToolsForEnvironment("cloud").some((tool) => tool.recipe === "rustup"),
+    );
+  });
+
+  // Regression, 2026-10-06: Debian bookworm split scp and sftp out of
+  // openssh-client, so `apt-get install openssh-client` succeeds and leaves
+  // both binaries missing.  Confirmed against the pinned base image with
+  // `dpkg -L openssh-client`.
+  it("installs scp and sftp as their own Debian packages", () => {
+    for (const tool of loadVmCliManifest().tools) {
+      if (tool.name !== "scp" && tool.name !== "sftp") continue;
+      expect(tool.apt, `${tool.name} needs its own package on Debian bookworm`).toContain(
+        tool.name,
+      );
+    }
+  });
+
   it("renders verify checks for every installable tool", () => {
     const script = renderVerifyScript("cloud");
     for (const tool of vmCliInstallableTools("cloud")) {

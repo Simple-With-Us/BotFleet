@@ -15,6 +15,10 @@ const GH_VERSION = "2.63.2";
 const KUBECTL_VERSION = "1.32.0";
 const DOCKER_CLI_VERSION = "27.4.1";
 const DENO_VERSION = "2.2.0";
+const RUSTUP_HOME_KEY = "RUSTUP_HOME";
+const CARGO_HOME_KEY = "CARGO_HOME";
+const RUSTUP_HOME_DIR = "/usr/local/rustup";
+const CARGO_HOME_DIR = "/usr/local/cargo";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -192,8 +196,8 @@ botfleet_install_deno() {
   if (recipes.has("rustup")) {
     blocks.push(`
 botfleet_install_rustup() {
-  export RUSTUP_HOME=/usr/local/rustup
-  export CARGO_HOME=/usr/local/cargo
+  export RUSTUP_HOME=${RUSTUP_HOME_DIR}
+  export CARGO_HOME=${CARGO_HOME_DIR}
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
   ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo
   ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc
@@ -277,7 +281,22 @@ ${recipeCalls}
 
 export function renderDockerfileCliInstallRun(environment: VmCliEnvironment): string {
   const body = renderLinuxInstallScript(environment).replace(/^#!.*\n/, "");
-  return `RUN <<'BOTFLEET_VM_CLI_INSTALL' /bin/bash\n${body}BOTFLEET_VM_CLI_INSTALL\n`;
+  const run = `RUN <<'BOTFLEET_VM_CLI_INSTALL' /bin/bash\n${body}BOTFLEET_VM_CLI_INSTALL\n`;
+  return `${run}${rustupImageEnv(environment)}`;
+}
+
+/** rustup's shims resolve the active toolchain through RUSTUP_HOME.  The
+ * install recipe exports it, but only for the length of that recipe, so a
+ * later image layer — and every shell in the running container — inherited
+ * nothing and `cargo --version` answered "rustup could not choose a version
+ * of cargo to run".  Baking it into the image with ENV is what makes the
+ * install persist past the RUN that performed it. */
+function rustupImageEnv(environment: VmCliEnvironment): string {
+  const recipes = new Set(
+    vmCliToolsForEnvironment(environment).map((tool) => tool.recipe).filter(Boolean),
+  );
+  if (!recipes.has("rustup")) return "";
+  return `ENV ${RUSTUP_HOME_KEY}=${RUSTUP_HOME_DIR}\nENV ${CARGO_HOME_KEY}=${CARGO_HOME_DIR}\n`;
 }
 
 export function manifestPayloadBase64(): string {
