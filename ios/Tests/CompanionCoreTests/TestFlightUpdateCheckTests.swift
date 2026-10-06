@@ -2,7 +2,7 @@
 // comparison against the running build, and the once-an-hour throttle.
 // None of this touches the paired Mac, so none of it needs a `Connection` —
 // only the manifest shape, captured 2026-09-13 from the real
-// https://simple-with-us.github.io/ai-fleet-coordinator/ios-versions.json.
+// https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json.
 import XCTest
 @testable import CompanionCore
 

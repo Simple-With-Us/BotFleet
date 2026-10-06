@@ -12,6 +12,9 @@
 # The AFC site is GitHub Pages from the main branch, so a single
 # `commit + push` on main is enough — the fleet-activity-site.yml workflow
 # picks the change up on its every-six-hours schedule and on the next push.
+# Pages serves the manifest at the mixed-case path (case-sensitive):
+#   https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json
+# iOS TestFlightUpdateCheck must use that URL until infra renames the site path.
 # This script NEVER pushes anywhere else; it commits only `site/ios-versions.json`
 # on the AFC main branch and only after a clean tree, so a concurrent edit
 # in another worktree (digest refresh, calendar regen) surfaces as a non-fatal
