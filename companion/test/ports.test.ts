@@ -33,15 +33,14 @@ const ENTRY = join(HERE, "..", "src", "index.ts");
  * where the child writes. */
 const start = (env: Record<string, string>): Promise<{ code: number | null; err: string }> =>
   new Promise((resolve) => {
+    const childEnv: Record<string, string> = { ...env };
+    if (process.env.PATH) childEnv.PATH = process.env.PATH;
+    if (process.env.SystemRoot) childEnv.SystemRoot = process.env.SystemRoot;
+    if (process.env.HOME) childEnv.HOME = process.env.HOME;
+    if (process.env.USERPROFILE) childEnv.USERPROFILE = process.env.USERPROFILE;
+    if (process.env.OMB_COMPANION_DIR) childEnv.OMB_COMPANION_DIR = process.env.OMB_COMPANION_DIR;
     const child = spawn(process.execPath, [ENTRY], {
-      env: {
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-        ...(process.env.USERPROFILE ? { USERPROFILE: process.env.USERPROFILE } : {}),
-        ...(process.env.OMB_COMPANION_DIR ? { OMB_COMPANION_DIR: process.env.OMB_COMPANION_DIR } : {}),
-        ...env,
-      },
+      env: childEnv,
       stdio: ["ignore", "ignore", "pipe"],
     });
     let err = "";

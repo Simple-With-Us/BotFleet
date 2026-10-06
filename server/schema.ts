@@ -6,6 +6,23 @@ export interface JsonObject {
 }
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 
+export function isJsonObject(value: JsonValue | undefined): value is JsonObject {
+  if (value === null || value === undefined || Array.isArray(value)) return false;
+  return Object.prototype.toString.call(value) === "[object Object]";
+}
+
+export function isJsonString(value: JsonValue | undefined): value is string {
+  return Object.prototype.toString.call(value) === "[object String]";
+}
+
+export function isJsonBoolean(value: JsonValue | undefined): value is boolean {
+  return value === true || value === false;
+}
+
+export function isFiniteJsonNumber(value: JsonValue | undefined): value is number {
+  return Number.isFinite(value);
+}
+
 /** JSON.parse without a reviver can only produce JSON-compatible values. */
 export function parseJson(text: string): JsonValue {
   return JSON.parse(text);
