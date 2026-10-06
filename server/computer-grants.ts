@@ -25,7 +25,7 @@ import type { AppConfig } from "./config.ts";
 
 /** One computer granted to a bot for one turn. Exactly one of `box` / `stdio`
  * is set: the cloud box speaks through BotFleet's REST-to-MCP adapter, while
- * host, sandbox, and VPS computers expose Cua Driver's own MCP server. */
+ * host, sandbox, and VPS computers expose CUA Driver's own MCP server. */
 export interface ComputerMount {
   /** MCP server name, and therefore the agent's tool prefix. */
   name: string;
@@ -102,15 +102,15 @@ export function isHostMount(mount: ComputerMount): boolean {
 }
 
 const SINGLE_PROMPTS = {
-  vm: " You have a shared Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. That workspace is the only host folder mounted into the VM, and the VM has outbound internet access like any other computer, so treat it as your own machine rather than as a sealed sandbox. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
+  vm: " You have a shared CUA sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. That workspace is the only host folder mounted into the VM, and the VM has outbound internet access like any other computer, so treat it as your own machine rather than as a sealed sandbox. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully.",
   box: " You have your own cloud computer. In Chrome, prefer browser_snapshot with browser_click/browser_fill for semantic, trusted actions; use screenshot/click/type_text for visual or non-browser UI, open_url for navigation, and computer_exec for Linux tasks. Every action already returns the resulting screen, so don't follow it with screenshot; batch predictable pixel actions with computer_batch.",
-  vps: " You have your own self-hosted remote Linux computer through the official Cua tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
+  vps: " You have your own self-hosted remote Linux computer through the official CUA tools. Its filesystem is disposable: everything on it is wiped whenever its container is recreated, so keep long-lived work somewhere durable — push it to a remote, or hand the results back in chat — instead of leaving it only on that computer. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and act carefully.",
   local: " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully.",
 } satisfies Record<ComputerKind, string>;
 
 /** What a host grant actually puts in the engine's hands.
  *
- * An MCP engine mounts the Cua Driver server and really can see and click the
+ * An MCP engine mounts the CUA Driver server and really can see and click the
  * desktop.  A toolLoop engine mounts no MCP server at all: its host surface is
  * the harness's own `bash`, `read_file`, `write_file` and `edit_file` behind
  * the `workspaceOrHostComputer` gate in server/tools/registry.ts, and that
@@ -388,11 +388,11 @@ export function cloudRunUsesBoxAgent(
  * Everything above answers "what was this bot granted".  What follows answers
  * "what can it actually hold for THIS turn", which is the half that has to
  * talk to the world: a Local VM has to be claimed, a VPS provisioned, a cloud
- * box woken, host control read off Cua Driver's descriptor.
+ * box woken, host control read off CUA Driver's descriptor.
  *
  * It lives here rather than inline in the dispatcher because there are two
  * dispatchers.  `startTurn` resolved all of this and a room turn resolved none
- * of it, so a bot holding Cua, a Box, a Local VM or a VPS in a direct chat
+ * of it, so a bot holding CUA, a Box, a Local VM or a VPS in a direct chat
  * lost every one of them the moment it spoke in a room — while the HTTP lane
  * in that same room kept host `bash` through `hasHostComputer`.  A room is a
  * different conversation, not a different bot, so both lanes call this.
@@ -421,7 +421,7 @@ export interface TurnComputerEngine {
    * rule lives in `server/contracts.ts`, and it is the only thing that makes
    * mounting the person's own desktop honest. */
   localComputerMcp: boolean;
-  /** Runs the harness tool loop itself, so it has host tools without Cua. */
+  /** Runs the harness tool loop itself, so it has host tools without CUA. */
   toolLoop: boolean;
 }
 
@@ -445,7 +445,7 @@ interface RemoteComputerStatus {
  * lease handle, inferred from whatever pool the dispatcher passes. */
 export interface TurnComputerDeps<Lease = unknown> {
   hostPlatform: NodeJS.Platform;
-  /** Cua Driver's already-running connection descriptor, or null. */
+  /** CUA Driver's already-running connection descriptor, or null. */
   readHostConnection(): ComputerMount["stdio"] | null;
   /** Claim the Local VM for this turn, or throw the reason it cannot be had.
    * The lease, the lifecycle busy flags and the idle backstop are the
@@ -507,7 +507,7 @@ export interface TurnComputerMounts<Lease = unknown> {
   /** `wantsLocal && localComputerMcp` — the host-tool gate both lanes hand to
    * `buildTurnTools`, kept here so the two dispatchers cannot drift.
    * Deliberately independent of `mounts`: a toolLoop engine has host tools
-   * through the harness executor whether or not Cua Driver is running. */
+   * through the harness executor whether or not CUA Driver is running. */
   hasHostComputer: boolean;
 }
 

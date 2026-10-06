@@ -1,8 +1,8 @@
-// Cua-backed Local VM lifecycle and health checks.
+// CUA-backed Local VM lifecycle and health checks.
 //
 // BotFleet owns only the sandbox boundary: image preparation, container
 // lifecycle, resource limits, loopback viewer, and target-scoped lease in the
-// harness. Desktop automation itself is Cua Driver. Agents connect directly to
+// harness. Desktop automation itself is CUA Driver. Agents connect directly to
 // `cua-driver mcp` inside the container; this module never reimplements clicks,
 // typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
@@ -40,10 +40,10 @@ export type CommandRunner = (
 
 export const CUA_DRIVER_VERSION = "0.20.0";
 export const BASE_IMAGE_REPOSITORY = "docker.io/trycua/xfce-cua";
-// Official multi-architecture Cua XFCE 0.1.0 manifest (amd64 + arm64).
+// Official multi-architecture CUA XFCE 0.1.0 manifest (amd64 + arm64).
 export const BASE_IMAGE_DIGEST = "sha256:274eb636f5cf3fc58f705916ee72b7a701270b3877369d08533a385c5325be9b";
 export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
-// This tag is built locally from the pinned Cua base. The explicit localhost
+// This tag is built locally from the pinned CUA base. The explicit localhost
 // registry is required by Podman: it prepends localhost to unqualified build
 // tags, then may otherwise resolve the same name to Docker Hub when running it.
 // Image and container labels below remain the authoritative compatibility
@@ -362,7 +362,7 @@ const LINUX_WHEELS = {
   },
 } as const;
 
-/** Reproducible, multi-architecture derivative of Cua's sandbox desktop.
+/** Reproducible, multi-architecture derivative of CUA's sandbox desktop.
  * Both Linux wheels are exact-version and SHA-256 verified. Supervisor owns
  * the daemon so it starts, restarts, and stops with the desktop container.
  *
@@ -513,7 +513,7 @@ export interface ContainerRuntimeStatus {
 }
 
 /** Inspect only the host runtime. Unlike a full Local VM status check, this
- * never opens a container, calls Cua, or reads a desktop screenshot. */
+ * never opens a container, calls CUA, or reads a desktop screenshot. */
 export async function containerRuntimeStatus(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
@@ -947,7 +947,7 @@ export async function containerComputerStatus(
       }
       status.desktopReady = true;
     } catch (error) {
-      // An empty log means XFCE and the supervisor-owned Cua daemon are
+      // An empty log means XFCE and the supervisor-owned CUA daemon are
       // probably still starting. A real startup failure should be actionable
       // in the panel instead of looking like an endless readiness wait.
       status.desktop_error = error instanceof Error ? error.message.slice(0, 320) : null;
@@ -1679,7 +1679,7 @@ const screenshotStatusCache = new Map<
 const containerMcpPath = SPAWNED_PROXIES.containerMcp;
 
 /** Spawn contract handed directly to agent runtimes. The tiny host wrapper
- * only preserves stdio through the container CLI; Cua Driver owns the MCP
+ * only preserves stdio through the container CLI; CUA Driver owns the MCP
  * protocol and every computer tool. */
 type ContainerMcpLaunch = {
   command: string;
@@ -1917,7 +1917,7 @@ export async function handleBoxGatewayRequest(
 }
 
 /** Cloud boxes still use BotFleet's high-latency REST adapter. Local VMs
- * bypass it and mount Cua Driver's official MCP server through
+ * bypass it and mount CUA Driver's official MCP server through
  * containerComputerMcp().
  *
  * `OGB_BOX_TOKEN` is the mount's gateway grant, never the account-wide Box
