@@ -364,6 +364,7 @@ import {
   type GroupRecord,
   type GroupTaskRecord,
   type Message,
+  type BotRecord,
   type TaskRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
@@ -425,6 +426,7 @@ import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import { accessTokenState, hasAccessServiceToken } from "./recall-access.ts";
 import { recallPromptFor } from "./recall-prompt.ts";
+import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
@@ -3241,7 +3243,7 @@ function releaseTurnWorktreeLease(threadId: string, botId: string, dispatchId?: 
 }
 
 async function applyTurnWorktreeAdmission(
-  bot: NonNullable<ReturnType<typeof store.bot>>,
+  bot: BotRecord,
   threadId: string,
   dispatchId: number,
   cwd: string | null | undefined,
@@ -5441,8 +5443,10 @@ async function startTurn(
       // changed them, and the rest stays the stable prefix a warm CLI or a
       // provider cache is keyed on (docs/prompt-prefix.md).
       const promptFileTools = hasFileTools(worksInWorkspace, httpOnlyToolSurface, hasHostComputer);
+      const fleetSeat = fleetSeatPromptPart(bot);
       const prompt = buildSystemPrompt([
         { id: "persona", label: "Identity", text: persona },
+        ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
         { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
         {
           id: "computer",
@@ -7591,8 +7595,10 @@ async function runGroupMemberTurn(
     hasHostComputer &&
     instance.adapter.capabilities.backgroundJobs === "emulated" &&
     jobSettings().enabled;
+  const fleetSeat = fleetSeatPromptPart(bot);
   const roomSystem = buildSystemPrompt([
     { id: "persona", label: "Identity", text: system },
+    ...(fleetSeat ? [{ id: "fleet-seat", label: "Fleet seat", text: fleetSeat.text }] : []),
     { id: "voice-summary", label: "Speech-friendly summaries", text: cfg.tts?.optimizedSummary ? VOICE_SUMMARY_PROMPT : "" },
     // Same sentence the 1:1 lane sends, in the same position: a computer the
     // bot is never told about is one it reaches for by accident.
@@ -8332,10 +8338,18 @@ async function localVmPayload(target: LocalVmTarget) {
   };
 }
 
-function localComputerActionError(error: unknown): { status: number; error: string } {
-  const status = typeof (error as { status?: unknown }).status === "number"
-    ? (error as { status: number }).status
-    : 500;
+type LocalComputerActionFailure = { status: number; error: string };
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- computer routes throw at the handler boundary
+function localComputerActionError(error: unknown): LocalComputerActionFailure {
+  // SAFETY: computer proxy failures may attach a numeric HTTP status on a plain object.
+  const statusField = (error as { status?: unknown }).status;
+  const status =
+    statusField === undefined
+      ? 500
+      : Number.isFinite(Number(statusField))
+        ? Number(statusField)
+        : 500;
   const raw = error instanceof Error ? error.message : String(error);
   return { status, error: redactSecrets(raw) };
 }
@@ -11914,7 +11928,7 @@ handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.autoApprove = body.autoApprove;
       }
       if (body.gitWorktreeLeases !== undefined) {
-        if (typeof body.gitWorktreeLeases !== "boolean") {
+        if (body.gitWorktreeLeases !== true && body.gitWorktreeLeases !== false) {
           return json(res, 400, { error: "gitWorktreeLeases must be true or false" });
         }
         patch.gitWorktreeLeases = body.gitWorktreeLeases;

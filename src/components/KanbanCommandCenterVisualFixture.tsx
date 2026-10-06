@@ -22,6 +22,8 @@ import { StoreContext, initialState, type Action, type Bot, type Group } from "@
 import { KanbanCommandCenter } from "./KanbanCommandCenter";
 import type { RoutineRun } from "@/lib/routines";
 
+const noopDispatch: Dispatch<Action> = () => {};
+
 // The URL query value crosses the application trust boundary, so validate
 // it with zod at the boundary instead of casting.  z.infer keeps the type
 // definition next to the runtime guard.
@@ -170,7 +172,7 @@ export default function KanbanCommandCenterVisualFixture() {
     if (state === "empty") {
       return {
         state: { ...base, bots: [], groups: [], routineRuns: [] },
-        dispatch: (() => {}) as Dispatch<Action>,
+        dispatch: noopDispatch,
         flushBotPatches: async () => {},
         refreshInstances: async () => {},
       };
@@ -179,7 +181,7 @@ export default function KanbanCommandCenterVisualFixture() {
     const populated = populatedState();
     return {
       state: { ...base, ...populated },
-      dispatch: (() => {}) as Dispatch<Action>,
+      dispatch: noopDispatch,
       flushBotPatches: async () => {},
       refreshInstances: async () => {},
     };

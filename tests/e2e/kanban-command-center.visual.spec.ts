@@ -48,6 +48,7 @@ async function pinNow(page: Page): Promise<void> {
         return now;
       }
     }
+    // SAFETY: Playwright test-only hook; the page is discarded after each run.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (globalThis as any).Date = FrozenDate;
   }, PINNED_NOW);
