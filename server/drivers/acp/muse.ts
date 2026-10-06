@@ -28,7 +28,7 @@
 // installer) and the adapter (`npm`).  `needsNode` is what lets the setup UI
 // say so instead of handing a user a `npm` line that cannot run.
 
-import { existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -61,24 +61,31 @@ import { createAcpDriver, type AcpSupport } from "./core.ts";
  *  supported rung, which makes it a poor fit for a flat list anyway. */
 export const MUSE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 
-/** The only model this driver offers, and it is the CLI's own documented
- *  default rather than the best model on the card.
+/** The only model this driver names, and the honest reason it names just one.
  *
  *  Muse Spark ships `muse-spark-1.3`, `muse-spark-1.2`, and `muse-spark-1.1`,
- *  all on a 1,048,576-token window, and `1.3` is the one "tuned for agentic
- *  workflows".  The CLI's default is `muse-spark-1.2` (the API defaults to
- *  `1.3`, which is a different surface with a different default).
+ *  all on a 1,048,576-token window.  Two separate things stopped this listing
+ *  more than one model.
  *
- *  This catalog lists `1.2` alone on purpose.  The adapter is verified to
- *  support model switching **at idle**, but its documented ACP config-option
- *  ids are `mode`, `nativeApprovalPolicy`, `sandbox`, `sandboxNetwork`,
- *  `workspaceWrite`, and `shell` — there is no `model` among them, and
- *  BotFleet's `selectModel` hook negotiates through exactly that
- *  `session/set_config_option` channel.  So no model switch is wired here,
- *  and listing `1.3` would put a row in the picker that a user can select and
- *  cannot get.  A single honest row beats three hopeful ones; the fix is a
- *  `selectModel` hook once the adapter exposes model as a config option, and
- *  the ACP core stops reporting `sessionModelSwitch: "unsupported"`. */
+ *  **We cannot switch.**  The adapter is verified to support model switching at
+ *  idle, but its documented ACP config-option ids are `mode`,
+ *  `nativeApprovalPolicy`, `sandbox`, `sandboxNetwork`, `workspaceWrite`, and
+ *  `shell` — there is no `model` among them, and BotFleet's `selectModel` hook
+ *  negotiates through exactly that `session/set_config_option` channel.  So no
+ *  model switch is wired, and listing `1.3` would put a row in the picker a
+ *  user can select and cannot get.
+ *
+ *  **And the model that actually runs is the account's choice, not ours.**
+ *  A live run on 2026-10-05 reported `run.model.configured` with `model_id:
+ *  "muse-spark-1.3-contributor"`, `provider_id: "meta"`, `profile_id: "tbh"`,
+ *  `source: "startup"` — so the runtime model came from the account's startup
+ *  profile, and on that account it was a 1.3 *Contributor* tier rather than the
+ *  1.2 the docs describe as the CLI default.  This entry therefore names the
+ *  model we can point at, while the matrix row says plainly that the model a
+ *  turn actually uses is the account's startup default until a switch is
+ *  wired.  Reporting one confident model id when the engine may run a
+ *  different tier would be the same overclaim as the `max` effort rung, one
+ *  level up. */
 export const STATIC_MUSE_MODELS: ModelCatalog = {
   default: "muse-spark-1.2",
   options: [
@@ -95,14 +102,18 @@ export const STATIC_MUSE_MODELS: ModelCatalog = {
   ],
 };
 
-/** Where the launcher keeps a browser/device-code session, when one has been
- *  stored.  CAVEAT: this path comes from the `muse` launcher script
- *  (`MUSE_AUTH_PATH`, defaulting to `$XDG_CONFIG_HOME/muse/auth.json`, else
- *  `$HOME/.config/muse/auth.json`), NOT from the CLI documentation — no Meta
- *  page states where the CLI stores credentials.  It is used only as a
- *  best-effort second signal, and the comment above it is the reason this
- *  function returns a boolean instead of a confidence. */
-function museAuthPath(env: Record<string, string | undefined>): string {
+/** Where the launcher keeps its credential index, when one has been stored.
+ *
+ *  This file is NOT a credential store, and treating it as one was the original
+ *  bug.  A live run on 2026-10-05 found `~/.config/muse/auth.json` present on a
+ *  signed-in account containing only an index:  `schema_version`, and a
+ *  `providers.meta` block with `mechanism: "oauth"`, `storage: "keychain"`,
+ *  `obtained_via: "device_code"`, `api_base_url`, and the user's name, email,
+ *  and avatar URL.  No key, no token.
+ *
+ *  So the existence of this file proves nothing, and neither does its absence.
+ *  What it does carry is the discriminator that matters:  `storage`. */
+function museAuthIndexPath(env: Record<string, string | undefined>): string {
   const fromEnv = env.MUSE_AUTH_PATH?.trim();
   if (fromEnv) return fromEnv;
   const xdg = env.XDG_CONFIG_HOME?.trim();
@@ -110,15 +121,84 @@ function museAuthPath(env: Record<string, string | undefined>): string {
   return join(xdg && xdg.length > 0 ? xdg : join(home, ".config"), "muse", "auth.json");
 }
 
-/** Is Muse Code signed in?  An API key always wins over a browser session —
- *  "Muse Code uses `META_API_KEY` if set, then a stored key, and only then a
- *  stored browser session" — so that env var is the one trustworthy signal.
- *  A stored auth file is a weaker second: see `museAuthPath`.  The value is
- *  never read, only tested for existence, so no credential reaches a log. */
+/** The credential backend the CLI recorded, or null when there is no index.
+ *
+ *  `file` and friends mean the credential is in this very file and any client
+ *  can read it.  `keychain` means the token was handed to the OS keychain
+ *  instead, which is the one case this engine cannot use — see
+ *  `museAuthenticated`. */
+function museCredentialStorage(env: Record<string, string | undefined>): string | null {
+  const path = museAuthIndexPath(env);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null; // no index: not signed in, or not this CLI's index
+  }
+  try {
+    const parsed = JSON.parse(raw) as {
+      providers?: Record<string, { storage?: unknown } | undefined>;
+    };
+    for (const provider of Object.values(parsed.providers ?? {})) {
+      const storage = provider?.storage;
+      if (typeof storage === "string" && storage.length > 0) return storage;
+    }
+    return null;
+  } catch {
+    // A malformed index is not evidence of a credential, and must never throw
+    // out of a snapshot path.
+    return null;
+  }
+}
+
+/** Is Muse Code signed in *for this driver*?
+ *
+ *  Two tiers, and the distinction is the whole point.
+ *
+ *  **An API key, or a file-backed stored credential, is signed in.**  Muse Code
+ *  resolves credentials as `META_API_KEY` first, then a stored key, and only
+ *  then a stored browser session — so `META_API_KEY` and a `storage` of
+ *  anything other than `keychain` are both credentials a client can read.  On
+ *  Linux and Windows there is no macOS Keychain, so a file-backed credential is
+ *  the normal case there and treating it as "not signed in" would strand every
+ *  user on those platforms.
+ *
+ *  **A keychain-backed session is reported as unproven, not signed in.**  This
+ *  is the case that produced the original bug.  The credential is real and the
+ *  CLI uses it happily — `muse exec` works on that account — but the community
+ *  adapter we spawn bundles `@muse-code/sdk@1.3.0`, which predates the
+ *  Keychain move and answers "not logged in".  Counting it would put a
+ *  setup-complete badge over an engine that fails every turn.
+ *
+ *  Why "unproven" has to be a real answer rather than an aside:  the live
+ *  consumers of this value are the setup card and the failover chain at
+ *  `server/safety/turn-safety.ts`, which skips an instance whose
+ *  `authenticated` is `false`.  `muse` sets neither
+ *  `requireAuthenticationBeforeSpawn` nor `authFailure: "fail"`, so nothing
+ *  blocks a turn on it — which means a wrong `false` is not cosmetic.  It
+ *  strands the card and the failover chain for a user who did everything right,
+ *  so `loginNote` and `signInCommand` name the API key as the path, and a test
+ *  holds them to this function so the two cannot drift apart again.
+ */
 export function museAuthenticated(env: Record<string, string | undefined>): boolean {
   if (env.META_API_KEY?.trim()) return true;
-  return existsSync(museAuthPath(env));
+  const storage = museCredentialStorage(env);
+  return storage !== null && storage !== "keychain";
 }
+
+/** The sign-in sentence the harness shows when this engine is not authenticated.
+ *  Exported so a test can hold it to `museAuthenticated` — the bug this encodes
+ *  was the two drifting apart.
+ *
+ *  The trailing instruction is not decoration.  `muse auth set --api-key-stdin`
+ *  reads the key from stdin, which is what keeps it out of shell history, and
+ *  it therefore **blocks until it gets one**.  The setup surfaces say "paste
+ *  the command and press Enter" and nothing more, so a user who followed them
+ *  exactly sat in a terminal that looked hung:  no key, no EOF, no stored
+ *  credential, and a card that never cleared.  Naming the key and the Ctrl-D
+ *  is the difference between a command that works and one that appears frozen. */
+export const MUSE_LOGIN_NOTE =
+  "Muse Code needs an API key for BotFleet — a browser session signed into the Mac keychain works in the terminal but this engine cannot read it.  To sign in, run `muse auth set --provider meta --api-key-stdin`, paste the key when it prompts, then press Ctrl-D and Enter";
 
 const support: AcpSupport = {
   driverKind: "museAgent",
@@ -147,7 +227,14 @@ const support: AcpSupport = {
   mcpServers: true,
   defaultCli: "muse-code-acp",
   nativeSource: "muse.acp",
-  loginNote: "Muse Code is not signed in — run `muse-code-acp --cli login` in a terminal, or set META_API_KEY",
+  // Must name the ONLY sign-in path that produces a credential this driver can
+  // see.  It previously said `muse-code-acp --cli login`, which completes a
+  // device-code OAuth session into the Keychain — a credential the adapter's
+  // SDK cannot read — so a user who followed the card exactly stayed
+  // `authenticated: false` forever, with the setup card never clearing and the
+  // instance permanently outside the failover chain.  This has to match
+  // `museAuthenticated` exactly; the two drifting apart is what that bug was.
+  loginNote: MUSE_LOGIN_NOTE,
   install: {
     command: {
       // Two steps: the `muse` binary, then the adapter that fronts it.  The
@@ -160,10 +247,13 @@ const support: AcpSupport = {
       win32: "irm https://dev.meta.ai/install.ps1 | iex; npm install -g @bex-co/muse-code-acp",
     },
     docsUrl: "https://dev.meta.ai/docs/muse-code",
-    // The adapter owns the login surface, not `muse login`: it wraps both
-    // behind `--cli`, so `muse login` alone would leave the engine unsigned
-    // as far as this driver is concerned.
-    signInCommand: "muse-code-acp --cli login",
+    // The API key path, matching `museAuthenticated` and `loginNote`.  Not
+    // `muse-code-acp --cli login`:  that completes a device-code OAuth session
+    // into the Keychain, which this engine's adapter cannot read, so it would
+    // walk a user through setup and leave them signed out from BotFleet's
+    // point of view.  `auth set` reads the key from stdin, so it never lands in
+    // a shell history either.  The env-var alternative is `META_API_KEY`.
+    signInCommand: "muse auth set --provider meta --api-key-stdin",
     // `npm install -g` needs Node; the setup UI surfaces that instead of
     // offering a command that cannot run.
     needsNode: true,
