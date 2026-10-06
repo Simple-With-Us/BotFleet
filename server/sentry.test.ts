@@ -39,6 +39,38 @@ describe("server Sentry init", () => {
     );
   });
 
+  it("survives a synchronous throw from sdk.close during re-init", async () => {
+    const sdk = {
+      init() {},
+      close() {
+        throw new Error("close blew up synchronously");
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      isEnabled: () => true,
+      getClient: () => ({
+        getDsn: () => ({}),
+        getOptions: () => ({ enabled: true }),
+        getTransport: () => ({}),
+      }),
+    } as unknown as typeof import("@sentry/node");
+    setSentryLoaderForTests(async () => sdk);
+    const base = {
+      dsn: "https://abc123@o0.ingest.sentry.io/1",
+      enabled: true,
+      environment: "test",
+      tracesSampleRate: 0.2,
+      logsEnabled: true,
+      source: "config" as const,
+    };
+    await applySentryConfig(base);
+    await expect(applySentryConfig({ ...base, tracesSampleRate: 0.1 })).resolves.toMatchObject({
+      active: true,
+    });
+  });
+
   it("does not call init until the previous client has finished closing", async () => {
     let closing = false;
     let initWhileClosing = false;

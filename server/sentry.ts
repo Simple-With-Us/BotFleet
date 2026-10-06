@@ -227,13 +227,15 @@ async function closeRunningClient(options?: { awaitFlush?: boolean }): Promise<v
   initialized = false;
   activeFingerprint = null;
   if (!sdk) return;
-  const close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
+  let close: Promise<unknown>;
+  try {
+    close = Promise.resolve(sdk.close(SENTRY_CLIENT_CLOSE_MS)).catch(() => {});
+  } catch {
+    /* an SDK that cannot close must not take the harness down with it */
+    return;
+  }
   if (options?.awaitFlush) {
-    try {
-      await close;
-    } catch {
-      /* an SDK that cannot close must not take the harness down with it */
-    }
+    await close;
     return;
   }
   void close;
