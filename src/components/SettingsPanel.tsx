@@ -986,8 +986,10 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       open={bypassWarningOpen}
       onCancel={() => setBypassWarningOpen(false)}
       onConfirm={() => {
-        const holdsLocal = (bot.computers ?? []).includes("local");
-        patch({ bypassPermissions: true, ...(holdsLocal ? { acknowledgeLocalAuto: true } : {}) });
+        patch({
+          bypassPermissions: true,
+          ...(autoWouldUseLocal ? { acknowledgeLocalAuto: true } : {}),
+        });
         setBypassWarningOpen(false);
       }}
       botName={bot.name}

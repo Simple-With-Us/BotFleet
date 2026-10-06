@@ -151,6 +151,7 @@ export type BotProfilePatch = Partial<
     | "chiefOfStaff"
     | "approvePeerComms"
     | "autoApprove"
+    | "bypassPermissions"
     | "autoReview"
     | "composio"
     | "connectorTools"
