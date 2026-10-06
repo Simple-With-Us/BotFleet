@@ -1,6 +1,6 @@
 # BotFleet iOS, macOS, Engines, And Integrations Audit
 
-Review date: September 9, 2026, Central Time.  Source baseline: [`121cb85a`](https://github.com/Simple-With-Us/BotFleet/commit/121cb85aa3ebb85cb2d5b9233bc69838979a88f7).  Parent: [#263](https://github.com/Simple-With-Us/BotFleet/issues/263).  Audit board: `55bff4ee` on [THE BOARD](https://mac.jays.services/board).
+Review date: September 9, 2026, Central Time.  Source baseline: `121cb85a`.  Parent: [#263].  Audit board: `55bff4ee` on [THE BOARD](https://mac.jays.services/board).
 
 ## Assessment
 
@@ -118,41 +118,41 @@ The 35 findings map to 34 distinct GitHub issues: 32 newly created follow-up iss
 
 | ID | Priority | Finding | GitHub | Mac Board |
 | --- | --- | --- | --- | --- |
-| D1 | P1 | Packaged fallback can create a second harness against the shared data root | [#264](https://github.com/Simple-With-Us/BotFleet/issues/264) | `f781c56d` |
-| D2 | P2 | Static harness attachment has no build or API compatibility check | [#265](https://github.com/Simple-With-Us/BotFleet/issues/265) | `e4190ce1` |
-| D3 | P2 | Initial renderer hydration swallows all REST failures | [#266](https://github.com/Simple-With-Us/BotFleet/issues/266) | `62a56733` |
-| D4 | P2 | Automatic-update setting gives no failed-save or HTTP-status feedback | [#267](https://github.com/Simple-With-Us/BotFleet/issues/267) | `1ca6cb49` |
-| D5 | P3 | Validate desktop reconnect cleanup and accessible failure announcements | [#268](https://github.com/Simple-With-Us/BotFleet/issues/268) | `5ee62380` |
-| R1 | P1 | Repair PagerDuty delivery to the authenticated webhook ingress | [#269](https://github.com/Simple-With-Us/BotFleet/issues/269) | `0dd2ce22` |
-| R2 | P1 | Restore Composio connectivity and report configured versus usable status separately | [#270](https://github.com/Simple-With-Us/BotFleet/issues/270) | `0ade868c` |
-| R3 | P1 | Bound fleet RAG fallback and honor explicitly selected service routes | [#271](https://github.com/Simple-With-Us/BotFleet/issues/271) | `2d627f55` |
-| R4 | P2 | Do not report RAG ready when backend or protected-route checks fail | [#272](https://github.com/Simple-With-Us/BotFleet/issues/272) | `432930fc` |
-| R5 | P3 | Validate Sentry redelivery identity and preserve existing PagerDuty deduplication | [#273](https://github.com/Simple-With-Us/BotFleet/issues/273) | `d141ec97` |
-| R6 | P2 | Add an operator acceptance matrix for builds engines and integration health | [#274](https://github.com/Simple-With-Us/BotFleet/issues/274) | `7e582b82` |
-| EN-01 | P1 | Fallback outcomes mutate the primary engine's cooldown and attribution | [#275](https://github.com/Simple-With-Us/BotFleet/issues/275) | `46f08797` |
-| EN-02 | P1 | Stall cancellation targets the original engine after failover | [#276](https://github.com/Simple-With-Us/BotFleet/issues/276) | `fbef84b2` |
-| EN-03 | P1 | Automatic failover is ordered, not healthy | [#277](https://github.com/Simple-With-Us/BotFleet/issues/277) | `adae362e` |
-| EN-04 | P1 | Claude silently grants every globally configured MCP server to every bot | [#278](https://github.com/Simple-With-Us/BotFleet/issues/278) | `5344a983` |
-| EN-05 | P1 | Grok API duplicates the entire request context | [#279](https://github.com/Simple-With-Us/BotFleet/issues/279) | `93839dda` |
-| EN-06 | P2 | Failed ACP or Codex resume silently drops conversation history | [#280](https://github.com/Simple-With-Us/BotFleet/issues/280) | `89a63172` |
-| EN-07 | P2 | ACP prompts have no driver-level deadline | [#281](https://github.com/Simple-With-Us/BotFleet/issues/281) | `689d0f4e` |
-| EN-08 | P2 | Cost telemetry treats subscription-equivalent Claude cost as actual spend | [#282](https://github.com/Simple-With-Us/BotFleet/issues/282) | `ad5536b6` |
-| EN-09 | P1 | DSH is first-class in defaults but source main cannot launch its ACP backend | [#188](https://github.com/Simple-With-Us/BotFleet/issues/188) | `2784c3c7` |
-| EN-10 | P1 | Antigravity quota keys cannot drive catalog-level routing | [#283](https://github.com/Simple-With-Us/BotFleet/issues/283) | `09d689cb` |
-| R7 | P1 | Investigate routine failures and expose reliable execution outcomes | [#284](https://github.com/Simple-With-Us/BotFleet/issues/284) | `c0f364ea` |
-| R8 | P2 | Restore a complete macOS updater feed and reconcile shipped build identities | [#285](https://github.com/Simple-With-Us/BotFleet/issues/285) | `5a2b2e02` |
-| R9 | P2 | Reconcile duplicate and stale board effort rows without losing ownership | [#286](https://github.com/Simple-With-Us/BotFleet/issues/286) | `66958de4` |
-| BF-IOS-001 | P1 | Paired profile PATCH crosses its documented trust boundary | [#93](https://github.com/Simple-With-Us/BotFleet/issues/93) | `6ff6f355` |
-| BF-IOS-002 | P2 | Always Allow is offered by iOS but denied by the sidecar | [#93](https://github.com/Simple-With-Us/BotFleet/issues/93) | `9af28de9` |
-| BF-IOS-003 | P1 | Background APNs delivery navigates and can switch the Mac task without a tap | [#287](https://github.com/Simple-With-Us/BotFleet/issues/287) | `39f7be5c` |
-| BF-IOS-004 | P2 | Background fetch reports completion before reconnect or hydration completes | [#288](https://github.com/Simple-With-Us/BotFleet/issues/288) | `18341d8c` |
-| BF-IOS-005 | P1 | Send and Stop omit the server task-binding guard | [#289](https://github.com/Simple-With-Us/BotFleet/issues/289) | `118caef5` |
-| BF-IOS-006 | P1 | iOS does not use the server send idempotency contract | [#290](https://github.com/Simple-With-Us/BotFleet/issues/290) | `4505f828` |
-| BF-IOS-007 | P2 | Accepted image formats cannot be read through the companion route | [#291](https://github.com/Simple-With-Us/BotFleet/issues/291) | `ced11b51` |
-| BF-IOS-008 | P2 | Editing an engine selection silently clears reasoning effort | [#292](https://github.com/Simple-With-Us/BotFleet/issues/292) | `1e36bd92` |
-| BF-IOS-009 | P2 | Bot Settings dismisses after a failed save | [#293](https://github.com/Simple-With-Us/BotFleet/issues/293) | `f16194b9` |
-| BF-IOS-010 | P3 | Live Activities are explicitly stale while the app is suspended | [#294](https://github.com/Simple-With-Us/BotFleet/issues/294) | `699ea1ae` |
-| R10 | P2 | Remediate vulnerable Electron packaging dependencies and verify generated artifacts | [#296](https://github.com/Simple-With-Us/BotFleet/issues/296) | `2c27a635` |
+| D1 | P1 | Packaged fallback can create a second harness against the shared data root | [#264] | `f781c56d` |
+| D2 | P2 | Static harness attachment has no build or API compatibility check | [#265] | `e4190ce1` |
+| D3 | P2 | Initial renderer hydration swallows all REST failures | [#266] | `62a56733` |
+| D4 | P2 | Automatic-update setting gives no failed-save or HTTP-status feedback | [#267] | `1ca6cb49` |
+| D5 | P3 | Validate desktop reconnect cleanup and accessible failure announcements | [#268] | `5ee62380` |
+| R1 | P1 | Repair PagerDuty delivery to the authenticated webhook ingress | [#269] | `0dd2ce22` |
+| R2 | P1 | Restore Composio connectivity and report configured versus usable status separately | [#270] | `0ade868c` |
+| R3 | P1 | Bound fleet RAG fallback and honor explicitly selected service routes | [#271] | `2d627f55` |
+| R4 | P2 | Do not report RAG ready when backend or protected-route checks fail | [#272] | `432930fc` |
+| R5 | P3 | Validate Sentry redelivery identity and preserve existing PagerDuty deduplication | [#273] | `d141ec97` |
+| R6 | P2 | Add an operator acceptance matrix for builds engines and integration health | [#274] | `7e582b82` |
+| EN-01 | P1 | Fallback outcomes mutate the primary engine's cooldown and attribution | [#275] | `46f08797` |
+| EN-02 | P1 | Stall cancellation targets the original engine after failover | [#276] | `fbef84b2` |
+| EN-03 | P1 | Automatic failover is ordered, not healthy | [#277] | `adae362e` |
+| EN-04 | P1 | Claude silently grants every globally configured MCP server to every bot | [#278] | `5344a983` |
+| EN-05 | P1 | Grok API duplicates the entire request context | [#279] | `93839dda` |
+| EN-06 | P2 | Failed ACP or Codex resume silently drops conversation history | [#280] | `89a63172` |
+| EN-07 | P2 | ACP prompts have no driver-level deadline | [#281] | `689d0f4e` |
+| EN-08 | P2 | Cost telemetry treats subscription-equivalent Claude cost as actual spend | [#282] | `ad5536b6` |
+| EN-09 | P1 | DSH is first-class in defaults but source main cannot launch its ACP backend | [#188] | `2784c3c7` |
+| EN-10 | P1 | Antigravity quota keys cannot drive catalog-level routing | [#283] | `09d689cb` |
+| R7 | P1 | Investigate routine failures and expose reliable execution outcomes | [#284] | `c0f364ea` |
+| R8 | P2 | Restore a complete macOS updater feed and reconcile shipped build identities | [#285] | `5a2b2e02` |
+| R9 | P2 | Reconcile duplicate and stale board effort rows without losing ownership | [#286] | `66958de4` |
+| BF-IOS-001 | P1 | Paired profile PATCH crosses its documented trust boundary | [#93] | `6ff6f355` |
+| BF-IOS-002 | P2 | Always Allow is offered by iOS but denied by the sidecar | [#93] | `9af28de9` |
+| BF-IOS-003 | P1 | Background APNs delivery navigates and can switch the Mac task without a tap | [#287] | `39f7be5c` |
+| BF-IOS-004 | P2 | Background fetch reports completion before reconnect or hydration completes | [#288] | `18341d8c` |
+| BF-IOS-005 | P1 | Send and Stop omit the server task-binding guard | [#289] | `118caef5` |
+| BF-IOS-006 | P1 | iOS does not use the server send idempotency contract | [#290] | `4505f828` |
+| BF-IOS-007 | P2 | Accepted image formats cannot be read through the companion route | [#291] | `ced11b51` |
+| BF-IOS-008 | P2 | Editing an engine selection silently clears reasoning effort | [#292] | `1e36bd92` |
+| BF-IOS-009 | P2 | Bot Settings dismisses after a failed save | [#293] | `f16194b9` |
+| BF-IOS-010 | P3 | Live Activities are explicitly stale while the app is suspended | [#294] | `699ea1ae` |
+| R10 | P2 | Remediate vulnerable Electron packaging dependencies and verify generated artifacts | [#296] | `2c27a635` |
 
 The accompanying [structured finding ledger](2026-09-09-findings.json) contains descriptions, evidence, confidence, acceptance criteria, and crosslinks.  The ledger records the reviewed baseline, not an assurance that every issue remains unfixed after publication.
 
@@ -197,6 +197,6 @@ Additional acceptance work belongs to R6 rather than a separate ticket for every
 - `swift test --scratch-path /tmp/botfleet-audit-swift`: 234 CompanionCore tests passed, zero failures, using Swift 6.3.3.  This does not exercise SwiftUI/UIKit, APNs, ActivityKit, or a physical phone.
 - Dependency setup used an isolated copy from a peer tree with an identical lockfile after network installation failed; the peer tree and shared integration checkout were not modified.
 
-- Unsigned Xcode builds were attempted for both generic iOS Simulator and generic iOS device destinations after successful XcodeGen and Swift package resolution.  Both exited 70 before compilation because Xcode reported the iOS 26.5 destination/platform as unavailable.  The SDK is listed, but no usable iOS Simulator runtime or generic iOS device destination platform is available.  No local app artifact, launch, screenshot, or full app compilation was obtained; this environment gap is included in R6 acceptance tracking.  Hosted CI at audit commit `6cab38ff` subsequently passed the full unsigned iOS app build and Swift tests ([job evidence](https://github.com/Simple-With-Us/BotFleet/actions/runs/34334853491/job/102411798216)); no iOS source changed in the documentation follow-up.
+- Unsigned Xcode builds were attempted for both generic iOS Simulator and generic iOS device destinations after successful XcodeGen and Swift package resolution.  Both exited 70 before compilation because Xcode reported the iOS 26.5 destination/platform as unavailable.  The SDK is listed, but no usable iOS Simulator runtime or generic iOS device destination platform is available.  No local app artifact, launch, screenshot, or full app compilation was obtained; this environment gap is included in R6 acceptance tracking.  Hosted CI at audit commit `6cab38ff` subsequently passed the full unsigned iOS app build and Swift tests (job evidence (hosted CI run 34334853491)); no iOS source changed in the documentation follow-up.
 
 No live inference, tool execution, paid connector call, destructive failure injection, production restart, TestFlight upload, or full physical-device acceptance was performed.  Authenticated metadata is weaker evidence than a completed bot turn.  Fresh provider acceptance should follow repair of the duplicate execution-state owners.  The report intentionally leaves those acceptance gaps visible and tracked.

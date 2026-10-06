@@ -60,8 +60,8 @@ Status column is versus **HEAD `10bfbf6`**, with the docx `b34ac909` state in pa
 | NEW-ATS | P1 | NEW | `NSAllowsArbitraryLoads` true.  Other seat. |
 | C1 | P1 | THIS PR | Composio `REGISTRATION_MODE=closed` in prod vars. |
 | C2 | P1 | THIS PR | Session upgrade flag persisted on existing D1 `installations` row. |
-| C6 | P2 | THIS PR | README is a fork of `milind-soni/OpenMausBot`.  Downloads point at `botfleet-releases` latest. |
-| C7 | P1 | THIS PR | Site Download CTA → `Simple-With-Us/botfleet-releases` latest DMG. |
+| C6 | P2 | THIS PR | README is a fork of `milind-soni/OpenMausBot`.  Downloads point at the current release location. |
+| C7 | P1 | THIS PR | Site Download CTA and previous-builds link point at the current release location. |
 | C8 | P2 | THIS PR | `--ink-muted` defined. |
 | D2 | P2 | OPEN | ACP `--mcp` argv spaces / name mismatch. |
 | D3 | P1 | OPEN | DeepSeek UI vs billing 10× apart. |
@@ -94,7 +94,7 @@ Loopback Host/Origin gate.  Write-only API-key UI.  Device tokens hashed.  iOS K
 
 - Owner docx: `/Users/jay/Desktop/BotFleet-Delta-Audit-2026-09-01.docx`
 - Baseline: `docs/audits/2026-08-31-full-stack-audit.md` and issue #22
-- Canonical source: `github.com/Simple-With-Us/BotFleet`
+- Canonical source: maintained in the private operations record
 - Upstream: `milind-soni/OpenMausBot`
-- Releases: `Simple-With-Us/botfleet-releases`
+- Releases: current release location (private operations record)
 - TestFlight: `testflight.apple.com/join/ER6sPNMh`

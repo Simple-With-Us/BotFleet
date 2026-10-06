@@ -14,12 +14,12 @@ Production-ready animated TV-head robot emoji / avatar pack for Discord, Telegra
 
 **Google Drive:** https://drive.google.com/drive/folders/18yY5nLXou1tmCmlBjN_SXcFWPUTxQ83C
 
-**GitHub release:** https://github.com/Simple-With-Us/botfleet-tv-face/releases
+**GitHub release:** current tv-face release archive (canonical source: maintained in the private operations record)
 
 ## What this repository contains
 
-This directory contains the 21 tracked files imported from `Simple-With-Us/botfleet-tv-face`. It does not contain the GIFs, PNG stills, or
-skins themselves. Those ship in the [release archive](https://github.com/Simple-With-Us/botfleet-tv-face/releases)
+This directory contains the 21 tracked files imported from the tv-face release repository. It does not contain the GIFs, PNG stills, or
+skins themselves. Those ship in the release archive (canonical source: maintained in the private operations record)
 and the [Google Drive folder](https://drive.google.com/drive/folders/18yY5nLXou1tmCmlBjN_SXcFWPUTxQ83C).
 
 ```
