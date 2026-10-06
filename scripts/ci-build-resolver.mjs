@@ -281,6 +281,7 @@ export function maskedKeyPreview(headers = {}) {
  * an untrusted response without checking its shape — is met explicitly; adding
  * zod would break updater bootstrap on every Mac.
  */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written GitHub Actions boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
 function assertWorkflowRun(value) {
   const conclusion = value?.conclusion;
   if (typeof value?.id !== "number" ||
@@ -302,6 +303,7 @@ function assertArtifact(value) {
   }
   return value;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 /** The newest attempt at this commit, for diagnosis when none succeeded. */
 function anyRunForCommit(runs, commit) {
@@ -348,6 +350,7 @@ export function verifyManifest(manifest, { commit, bytes }) {
       "checksum-mismatch",
     );
   }
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- manifest field boundary parse (same bootstrap constraint as assertWorkflowRun).
   if (typeof manifest.artifact !== "string" || !manifest.artifact.endsWith(".zip")) {
     throw new ResolutionError(`Hosted build manifest names no zip artifact: ${manifest.artifact}`, "bad-manifest");
   }
@@ -390,6 +393,7 @@ function run(command, args, options) {
  */
 export function manifestArtifactName(manifest) {
   const name = manifest?.artifact;
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- manifest field boundary parse (same bootstrap constraint as assertWorkflowRun).
   if (typeof name !== "string" || !/^[\w.-]+\.zip$/.test(name)) {
     throw new ResolutionError(`Hosted build manifest names no zip artifact: ${name}`, "bad-manifest");
   }
