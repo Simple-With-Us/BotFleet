@@ -13,7 +13,13 @@
 // stay, even when they alone are already over the budget.
 import { z } from "zod";
 
-import { ROOM_REPLY_PREFIX, TURN_REPLY_CUE } from "../../turn-context.ts";
+import {
+  FRESH_PREAMBLE,
+  OMITTED_HISTORY,
+  REWOUND_PREAMBLE,
+  ROOM_REPLY_PREFIX,
+  TURN_REPLY_CUE,
+} from "../../turn-context.ts";
 
 /** UTF-8 ceiling used when an instance does not set one.  128 KiB is the
  *  same order as the inline-replay cap: a normal system prompt (tens of
@@ -73,6 +79,13 @@ interface Piece {
   text: string;
 }
 
+interface SplitHistory {
+  /** Non-trimmable harness text before replayed turns (inline preambles). */
+  userStablePrefix: string;
+  history: Piece[];
+  current: string;
+}
+
 function utf8(text: string): number {
   return Buffer.byteLength(text, "utf8");
 }
@@ -90,7 +103,11 @@ function shrinks(text: string): boolean {
   return utf8(omittedReplacement(text)) < utf8(text);
 }
 
-function measure(system: readonly Piece[], history: readonly Piece[]): AcpPromptBytes {
+function measure(
+  system: readonly Piece[],
+  history: readonly Piece[],
+  userStablePrefix: string,
+): AcpPromptBytes {
   let stable = 0;
   let volatile = 0;
   for (const piece of system) {
@@ -98,16 +115,39 @@ function measure(system: readonly Piece[], history: readonly Piece[]): AcpPrompt
     if (piece.kind === "stable") stable += bytes;
     else volatile += bytes;
   }
+  volatile += utf8(userStablePrefix);
   // The newline join is part of the replay the model reads, so it counts.
   volatile += utf8(history.map((piece) => piece.text).join("\n"));
   return { stable, volatile };
 }
 
-function render(system: readonly Piece[], history: readonly Piece[], current: string): string {
+function renderUserText(userStablePrefix: string, history: readonly Piece[], current: string): string {
+  const historyText = history.map((piece) => piece.text).join("\n");
+  return userStablePrefix + historyText + current;
+}
+
+function render(
+  system: readonly Piece[],
+  history: readonly Piece[],
+  current: string,
+  userStablePrefix = "",
+): string {
   const systemText = system.map((piece) => piece.text).join("");
-  const userText = history.map((piece) => piece.text).join("\n") + current;
+  const userText = renderUserText(userStablePrefix, history, current);
   if (systemText && userText) return `${systemText}\n\n${userText}`;
   return systemText || userText;
+}
+
+function composedBytes(
+  system: readonly Piece[],
+  history: readonly Piece[],
+  current: string,
+  userStablePrefix: string,
+): number {
+  const systemText = system.map((piece) => piece.text).join("");
+  const userText = renderUserText(userStablePrefix, history, current);
+  if (systemText && userText) return utf8(systemText) + 2 + utf8(userText);
+  return utf8(systemText || userText);
 }
 
 /** The system prefix of a `${system}\n\n${userText}` composition, or ""
@@ -131,6 +171,8 @@ const ROOM_REPLY_BOUNDARY_RE = new RegExp(
   `\\n\\n${ROOM_REPLY_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\\n]+\\.\\)`,
   "g",
 );
+const INLINE_TURN_SPLIT = /\n(?=(?:User|Assistant): )/;
+const ROOM_MESSAGE_SPLIT = /\n(?=[^:\n]+: )/;
 
 function lastRoomReplyBoundaryAt(userText: string): number {
   const re = ROOM_REPLY_BOUNDARY_RE;
@@ -142,34 +184,64 @@ function lastRoomReplyBoundaryAt(userText: string): number {
   return boundaryAt;
 }
 
-function splitInlineReplay(userText: string): { history: Piece[]; current: string } | null {
+/** Preamble and omission markers from `buildTurnContext` — not trimmable. */
+function peelInlineHarnessPrefix(region: string): { prefix: string; body: string } {
+  const preamble =
+    region.startsWith(REWOUND_PREAMBLE) ? REWOUND_PREAMBLE
+    : region.startsWith(FRESH_PREAMBLE) ? FRESH_PREAMBLE
+    : null;
+  if (!preamble) return { prefix: "", body: region };
+  let pos = preamble.length;
+  if (region[pos] === "\n") pos++;
+  if (region.slice(pos).startsWith(OMITTED_HISTORY)) {
+    pos += OMITTED_HISTORY.length;
+    if (region[pos] === "\n") pos++;
+  }
+  if (region[pos] === "\n") pos++;
+  return { prefix: region.slice(0, pos), body: region.slice(pos) };
+}
+
+function splitInlineReplay(userText: string): SplitHistory | null {
   const boundaryAt = userText.lastIndexOf(INLINE_REPLY_BOUNDARY);
   if (boundaryAt < 0) return null;
   const region = userText.slice(0, boundaryAt);
   if (!INLINE_REPLAY_LINE.test(region)) return null;
-  const parts = region.split(/\n(?=(?:User|Assistant): )/);
+  const { prefix, body } = peelInlineHarnessPrefix(region);
+  if (!INLINE_REPLAY_LINE.test(body)) return null;
+  const parts = body.split(INLINE_TURN_SPLIT);
   return {
+    userStablePrefix: prefix,
     history: parts.map((text) => ({ kind: "history" as const, text })),
     current: userText.slice(boundaryAt),
   };
 }
 
-function splitRoomReplay(userText: string): { history: Piece[]; current: string } | null {
+function splitRoomReplay(userText: string): SplitHistory | null {
   const boundaryAt = lastRoomReplyBoundaryAt(userText);
   if (boundaryAt < 0) return null;
   const region = userText.slice(0, boundaryAt);
   if (!ROOM_CONTEXT_LINE.test(region)) return null;
-  const lines = region.split("\n").filter((line) => line.length > 0);
+  const messages = region.split(ROOM_MESSAGE_SPLIT);
+  if (messages.length === 0) {
+    return { userStablePrefix: "", history: [], current: userText.slice(boundaryAt) };
+  }
+  const newest = messages.pop()!;
+  const historyJoin = messages.length > 0 ? "\n" : "";
   return {
-    history: lines.map((text) => ({ kind: "history" as const, text })),
-    current: userText.slice(boundaryAt),
+    userStablePrefix: "",
+    history: messages.map((text) => ({ kind: "history" as const, text })),
+    current: `${historyJoin}${newest}${userText.slice(boundaryAt)}`,
   };
 }
 
 /** Prior turns inside a replayed user message.  Without a harness boundary
  *  the whole user text is the current message and is not split. */
-function splitHistory(userText: string): { history: Piece[]; current: string } {
-  return splitInlineReplay(userText) ?? splitRoomReplay(userText) ?? { history: [], current: userText };
+function splitHistory(userText: string): SplitHistory {
+  return (
+    splitInlineReplay(userText)
+    ?? splitRoomReplay(userText)
+    ?? { userStablePrefix: "", history: [], current: userText }
+  );
 }
 
 function systemPieces(systemText: string, sections: readonly AcpPromptSection[] | undefined): Piece[] {
@@ -206,8 +278,8 @@ export function applyAcpPromptBudget(input: {
   }
 
   const system = systemPieces(systemText, input.sections);
-  const { history, current } = splitHistory(input.userText);
-  const before = measure(system, history);
+  const { userStablePrefix, history, current } = splitHistory(input.userText);
+  const before = measure(system, history, userStablePrefix);
   const unchanged = (): AcpPromptBudgetResult => ({
     text: input.composed,
     before,
@@ -215,43 +287,53 @@ export function applyAcpPromptBudget(input: {
     trimmed: false,
   });
 
-  if (render(system, history, current) !== input.composed) return unchanged();
+  if (render(system, history, current, userStablePrefix) !== input.composed) return unchanged();
   const budget = input.budgetBytes;
   if (budget == null || budget <= 0 || utf8(input.composed) <= budget) return unchanged();
 
   const nextSystem = system.map((piece) => ({ ...piece }));
   const nextHistory = history.map((piece) => ({ ...piece }));
+  const finalizedHistory = new Set<number>();
   let trimmed = false;
 
-  const size = () => utf8(render(nextSystem, nextHistory, current));
-  while (size() > budget) {
+  let totalBytes = composedBytes(nextSystem, nextHistory, current, userStablePrefix);
+  while (totalBytes > budget) {
     const historyIndex = nextHistory.findIndex(
-      (piece) => piece.text.length > 0 && !piece.text.includes(ACP_PROMPT_SECTION_OMITTED),
+      (piece, index) => piece.text.length > 0 && !finalizedHistory.has(index),
     );
     if (historyIndex >= 0) {
       const piece = nextHistory[historyIndex]!;
+      const oldBytes = utf8(piece.text);
       if (shrinks(piece.text)) {
-        nextHistory[historyIndex] = { kind: "history", text: omittedReplacement(piece.text) };
+        const replacement = omittedReplacement(piece.text);
+        nextHistory[historyIndex] = { kind: "history", text: replacement };
+        totalBytes += utf8(replacement) - oldBytes;
+        finalizedHistory.add(historyIndex);
       } else {
+        const joinOverhead = nextHistory.length > 1 ? 1 : 0;
         nextHistory.splice(historyIndex, 1);
+        totalBytes -= oldBytes + joinOverhead;
       }
       trimmed = true;
       continue;
     }
     const volatileIndex = nextSystem.findIndex((piece) => piece.kind === "volatile" && shrinks(piece.text));
     if (volatileIndex < 0) break;
+    const oldBytes = utf8(nextSystem[volatileIndex].text);
+    const replacement = omittedReplacement(nextSystem[volatileIndex].text);
     nextSystem[volatileIndex] = {
       kind: "volatile",
-      text: omittedReplacement(nextSystem[volatileIndex].text),
+      text: replacement,
     };
+    totalBytes += utf8(replacement) - oldBytes;
     trimmed = true;
   }
 
   if (!trimmed) return unchanged();
   return {
-    text: render(nextSystem, nextHistory, current),
+    text: render(nextSystem, nextHistory, current, userStablePrefix),
     before,
-    after: measure(nextSystem, nextHistory),
+    after: measure(nextSystem, nextHistory, userStablePrefix),
     trimmed: true,
   };
 }

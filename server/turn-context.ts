@@ -39,9 +39,9 @@ export function engineIsFresh(input: {
   return !(cursorIds.length === 1 && cursorIds[0] === instanceId);
 }
 
-const REWOUND_PREAMBLE =
+export const REWOUND_PREAMBLE =
   "[The user rewound this conversation (edited a message or switched to another version). Everything before this point was replaced by the following history:]";
-const FRESH_PREAMBLE =
+export const FRESH_PREAMBLE =
   "[You are joining this conversation mid-thread (the user switched this bot over to you). The conversation so far:]";
 
 /** The line between replayed history and the message the person just sent.
@@ -55,7 +55,7 @@ export const TURN_REPLY_CUE = "[Now reply to the user's latest message:]";
 export const ROOM_REPLY_PREFIX = "(Reply to the conversation above as ";
 
 const MAX_REPLAY_BYTES = 128 * 1024;
-const OMITTED_HISTORY = "[Earlier conversation omitted for length]";
+export const OMITTED_HISTORY = "[Earlier conversation omitted for length]";
 
 /** Chat-completions drivers resend this history on every request and tool round.
  * Keep its newest complete turns within a byte budget; one oversized newest

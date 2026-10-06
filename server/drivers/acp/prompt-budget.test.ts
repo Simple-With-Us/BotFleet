@@ -274,6 +274,66 @@ describe("applyAcpPromptBudget", () => {
     expect(result.text).toContain(harnessLine);
   });
 
+  it("preserves blank lines in room context so render matches the composed prompt", () => {
+    const listed: AcpPromptSection[] = [{ id: "persona", text: stable, volatile: false }];
+    const userText = `Jay: first\n\nBot: second\n\n${ROOM_REPLY_PREFIX}Scout.)`;
+    const composed = compose(stable, userText);
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: DEFAULT_ACP_PROMPT_BUDGET_BYTES,
+    });
+    expect(result.text).toBe(composed);
+    expect(result.trimmed).toBe(false);
+  });
+
+  it("does not trim harness preambles or OMITTED_HISTORY; only User and Assistant turns are history", () => {
+    const listed = sections();
+    const system = listed.map((section) => section.text).join("");
+    const { turnText } = buildTurnContext({
+      text: "what is my dog called?",
+      transcript: [
+        { role: "user", text: "my dog is named Biscuit" },
+        { role: "assistant", text: "Noted — Biscuit." },
+      ],
+      rewound: false,
+      fresh: true,
+      replaysNatively: false,
+    });
+    const composed = compose(system, turnText);
+    const dropOldestOnly = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText: turnText,
+      budgetBytes: bytes(composed) - bytes("User: my dog is named Biscuit\n"),
+    });
+    expect(dropOldestOnly.trimmed).toBe(true);
+    expect(dropOldestOnly.text).toContain("joining this conversation mid-thread");
+    expect(dropOldestOnly.text).not.toMatch(/joining.*omitted/s);
+    expect(dropOldestOnly.text).not.toContain("my dog is named Biscuit");
+    expect(dropOldestOnly.text).toContain("Noted — Biscuit");
+    expect(dropOldestOnly.text.endsWith("what is my dog called?")).toBe(true);
+  });
+
+  it("keeps the newest room line in the protected current suffix, not trimmable history", () => {
+    const listed: AcpPromptSection[] = [{ id: "persona", text: stable, volatile: false }];
+    const oldLine = `Jay: ${"ancient ".repeat(300)}`;
+    const recentLine = "Bot: recent";
+    const userText = `${oldLine}\n${recentLine}\n\n${ROOM_REPLY_PREFIX}Scout.)`;
+    const composed = compose(stable, userText);
+    const result = applyAcpPromptBudget({
+      composed,
+      sections: listed,
+      userText,
+      budgetBytes: 1,
+    });
+    expect(result.trimmed).toBe(true);
+    expect(result.text).toContain(recentLine);
+    expect(result.text).not.toContain("ancient");
+    expect(result.text).toContain(`${ROOM_REPLY_PREFIX}Scout.)`);
+  });
+
   it("trims the oldest room context line before volatile sections", () => {
     const listed: AcpPromptSection[] = [{ id: "persona", text: stable, volatile: false }];
     const oldLine = `Jay: ${"ancient ".repeat(300)}`;
