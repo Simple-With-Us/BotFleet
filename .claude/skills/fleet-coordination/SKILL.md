@@ -25,7 +25,7 @@ Use these canonical acronyms in Apple Notes titles (`[APP, Agent] topic`), commi
 
 | Acronym | App / Scope | Repository |
 | :--- | :--- | :--- |
-| **`ST`** | Socratic.Trade | `Simple-With-Us/Socratic.Trade` |
+| **`ST`** | Socratic.Trade | `Simple-With-Us/Socratic-Trade` |
 | **`CT`** | Congress.Trade | `Simple-With-Us/Congress.Trade` |
 | **`UM`** | Usage-Monitor | `Simple-With-Us/Usage-Monitor` |
 | **`DD`** | DealDex | `Simple-With-Us/DealDex` |

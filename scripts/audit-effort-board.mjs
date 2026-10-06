@@ -2,7 +2,6 @@ import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const OPEN = new Set(["open", "in_progress"]);
-const REPO = "Simple-With-Us/BotFleet";
 // The former owner still appears in `external_uid` on board rows created
 // before the rename, and in historical effort-log PR URLs.  Hard-matching the
 // current owner alone would flag every pre-rename root row as missing its

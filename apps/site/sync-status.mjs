@@ -34,14 +34,18 @@ const prSchema = z.object({
   state: z.string(),
   merged_at: z.string().nullable(),
 });
-const provSchema = z
-  .object({
-    type: z.string(),
-    prs: z.array(z.number().int()).optional(),
+const provSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("pr"),
+    prs: z.array(z.number().int()).min(1),
     state: z.string().optional(),
     note: z.string().optional(),
-  })
-  .passthrough();
+  }),
+  z.object({
+    type: z.enum(["host", "main"]),
+    note: z.string().optional(),
+  }),
+]);
 
 const featureSchema = z
   .object({
@@ -72,7 +76,7 @@ const featuresSchema = z
  * badges and descriptions — committed as if it were the truth.  Validation is a
  * gate here, never an edit.
  */
-function assertShape(label, schema, value) {
+function assertSchemaMatch(label, schema, value) {
   const result = schema.safeParse(value);
   if (result.success) return;
   const where = result.error.issues
@@ -83,14 +87,14 @@ function assertShape(label, schema, value) {
 }
 
 const data = JSON.parse(readFileSync(path, "utf8"));
-assertShape("features.json", featuresSchema, data);
+assertSchemaMatch("features.json", featuresSchema, data);
 const prs = JSON.parse(
   execFileSync("gh", ["api", "repos/Simple-With-Us/BotFleet/pulls?state=all&per_page=100", "--jq", PR_FIELDS], {
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
   }),
 );
-assertShape("the GitHub pulls response", z.array(prSchema), prs);
+assertSchemaMatch("the GitHub pulls response", z.array(prSchema), prs);
 const stateOf = new Map(prs.map((p) => [p.number, p.merged_at ? "merged" : p.state]));
 
 let changed = 0;
