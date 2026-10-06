@@ -25,8 +25,6 @@ import {
 const run = promisify(execFile);
 const COMMIT = "a".repeat(40);
 const OTHER = "b".repeat(40);
-const REPO = "jaywedgeworth22/BotFleet";
-
 function json(body, status = 200) {
   return async () => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 }

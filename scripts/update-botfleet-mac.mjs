@@ -1000,6 +1000,7 @@ export function smokeTestEnabled(env = process.env) {
  * checking its shape" — adding zod here would break updater bootstrap on every
  * Mac, which is a far worse failure than a longer predicate.
  */
+/* oxlint-disable anti-slop/no-runtime-typeof -- hand-written health body boundary parse; zod is unavailable in the updater bootstrap graph (see comment above). */
 export function parseHealthBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   // The health contract is an object with an explicit boolean `ready` and an app
@@ -1007,6 +1008,7 @@ export function parseHealthBody(body) {
   if (typeof body.ready !== "boolean" || typeof body.app !== "string") return false;
   return body.ready;
 }
+/* oxlint-enable anti-slop/no-runtime-typeof */
 
 export function classifySmokeFailure({ exitCode, signal, spawnError, spawnTimedOut } = {}) {
   if (spawnError) return "spawn-failed";
@@ -1025,7 +1027,7 @@ const SMOKE_CAUSES = {
   "owner-mismatch": "wrote an owner record naming a different process",
 };
 
-export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath }) {
+export function smokeFailureMessage({ cause, exitCode, signal, spawnError, targetCommit, output, bundlePath: _bundlePath }) {
   const summary = SMOKE_CAUSES[cause] || cause;
   const detail = [];
   if (exitCode !== null && exitCode !== undefined) detail.push(`exit=${exitCode}`);
@@ -1150,7 +1152,7 @@ async function freeLoopbackPort() {
     probe.on("error", rejectPort);
     probe.listen(0, "127.0.0.1", () => {
       const address = probe.address();
-      const chosen = typeof address === "object" && address ? address.port : 0;
+      const chosen = address?.port ?? 0;
       probe.close(() => resolvePort(chosen));
     });
   });

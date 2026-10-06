@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, win32 } from "node:path";
 import { promisify } from "node:util";
@@ -274,7 +274,7 @@ test("lsof exiting non-zero while printing a match still means held", async (t) 
     exitedNonZero = error.code !== undefined;
   }
   assert.equal(await isHeld(inner), true, "a held tree is held regardless of the exit status");
-  assert.equal(typeof exitedNonZero, "boolean");
+  assert.ok(exitedNonZero === true || exitedNonZero === false);
 });
 
 test("pruning keeps the live release, the recent ones, and anything held", async (t) => {
@@ -350,11 +350,11 @@ test("the swap reports whether it was atomic, and is atomic where the platform a
   }
 
   const first = await swapCurrent({ commit: A, env });
-  assert.equal(typeof first.atomic, "boolean", "every swap must report its atomicity");
+  assert.ok(first.atomic === true || first.atomic === false, "every swap must report its atomicity");
   // A SECOND swap is what exercises the non-atomic path: the first one has no
   // existing pointer to collide with, so it never reaches the fallback.
   const second = await swapCurrent({ commit: B, env });
-  assert.equal(typeof second.atomic, "boolean", "every swap must report its atomicity");
+  assert.ok(second.atomic === true || second.atomic === false, "every swap must report its atomicity");
 
   if (process.platform !== "win32") {
     assert.equal(first.atomic, true, "the atomic path is the one macOS and Linux take");
@@ -521,7 +521,9 @@ test("a manifest whose commit is not a full SHA is not a release", async (t) => 
   const dir = await mkdtemp(join(tmpdir(), "botfleet-manifest-"));
   t.after(() => forceRemove(dir));
   const write = async (body) => {
-    await writeFile(join(dir, ".botfleet-release.json"), typeof body === "string" ? body : JSON.stringify(body));
+    const text =
+      body != null && Object.getPrototypeOf(body) === Object.prototype ? JSON.stringify(body) : String(body);
+    await writeFile(join(dir, ".botfleet-release.json"), text);
     return isReleaseDirectory(dir);
   };
   assert.equal(await write({ schemaVersion: 1, commit: A, promotedAt: "2026-10-01T00:00:00.000Z" }), true);
