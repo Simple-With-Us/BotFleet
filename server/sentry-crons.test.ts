@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { applySentryConfig, isSentryActive, resetSentryForTests, setSentryLoaderForTests } from "./sentry.ts";
+import {
+  applySentryConfig,
+  isSentryActive,
+  resetSentryForTests,
+  setSentryLoaderForTests,
+  type SentryNode,
+} from "./sentry.ts";
 import {
   checkInRoutineFinish,
   checkInRoutineStart,
@@ -8,7 +14,21 @@ import {
 } from "./sentry-crons.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 
-type SentryNode = typeof import("@sentry/node");
+interface FakeSentryClient {
+  getDsn(): unknown;
+  getOptions(): { enabled: boolean };
+  getTransport(): undefined;
+}
+
+interface FakeSentrySdk {
+  init(): void;
+  close(): Promise<boolean>;
+  addIntegration(): void;
+  consoleLoggingIntegration(): { name: string };
+  captureCheckIn(checkIn: unknown, monitorConfig?: unknown): string;
+  isEnabled?(): boolean;
+  getClient?(): FakeSentryClient;
+}
 
 function routine(over: Partial<Routine> = {}): Routine {
   return {
@@ -98,7 +118,8 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
 
   async function activateFakeSentry() {
     const checkIns: Array<{ checkIn: unknown; monitorConfig?: unknown }> = [];
-    const sdk = {
+    // SAFETY: empty object shell — runtime only calls the members stamped below.
+    const sdk = Object.assign({} as FakeSentrySdk, {
       init() {},
       close() {
         return Promise.resolve(true);
@@ -111,8 +132,8 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
         checkIns.push({ checkIn, monitorConfig });
         return "check-in-id-1";
       },
-    } as unknown as typeof import("@sentry/node");
-    setSentryLoaderForTests(async () => sdk);
+    });
+    setSentryLoaderForTests(async () => sdk as SentryNode);
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -160,7 +181,7 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
 
   it("returns undefined when captureCheckIn would fabricate an id on a disabled client", async () => {
     // SAFETY: empty object shell — runtime only calls the members stamped below.
-    const sdk = Object.assign({} as SentryNode, {
+    const sdk = Object.assign({} as FakeSentrySdk, {
       init() {},
       close() {
         return Promise.resolve(true);
@@ -179,7 +200,7 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
         return "fabricated-check-in-id";
       },
     });
-    setSentryLoaderForTests(async () => sdk);
+    setSentryLoaderForTests(async () => sdk as SentryNode);
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
@@ -193,21 +214,20 @@ describe("checkInRoutineStart / checkInRoutineFinish", () => {
   });
 
   it("never throws when the SDK call itself throws", async () => {
-    setSentryLoaderForTests(async () =>
-      ({
-        init() {},
-        close() {
-          return Promise.resolve(true);
-        },
-        addIntegration() {},
-        consoleLoggingIntegration() {
-          return { name: "ConsoleLogs" };
-        },
-        captureCheckIn() {
-          throw new Error("ingest unreachable");
-        },
-      }) as unknown as typeof import("@sentry/node"),
-    );
+    const sdk = Object.assign({} as FakeSentrySdk, {
+      init() {},
+      close() {
+        return Promise.resolve(true);
+      },
+      addIntegration() {},
+      consoleLoggingIntegration() {
+        return { name: "ConsoleLogs" };
+      },
+      captureCheckIn() {
+        throw new Error("ingest unreachable");
+      },
+    });
+    setSentryLoaderForTests(async () => sdk as SentryNode);
     await applySentryConfig({
       dsn: "https://abc123@o0.ingest.sentry.io/1",
       enabled: true,
