@@ -202,8 +202,11 @@ export const VERSION_PROBE_ATTEMPTS = NATIVE_PROBE_ATTEMPTS;
  * purpose: it is a constant for cloudflared, so returning it would only give
  * callers a second way to spell the answer already carried by `ok`. */
 function matchCloudflaredVersionLine(output) {
-  const line = String(output ?? "");
-  return line.startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `) ? CLOUDFLARED_VERSION : null;
+  const line = String(output ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.startsWith(`cloudflared version ${CLOUDFLARED_VERSION} `));
+  return line ? CLOUDFLARED_VERSION : null;
 }
 
 export function classifyVersionProbe(result = {}) {

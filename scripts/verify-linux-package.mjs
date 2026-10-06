@@ -25,7 +25,6 @@ import {
 import { nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
 import {
   CLOUDFLARED_ASSETS,
-  CLOUDFLARED_VERSION,
   executableTarget,
   probePinnedVersion,
   versionProbeFailureMessage,
@@ -140,7 +139,7 @@ function verifyCompliance(licenses, label) {
   const componentRefs = new Set();
   for (const component of components) {
     const reference = component["bom-ref"];
-    if (reference == null || String(reference).length === 0) {
+    if (typeof reference !== "string" || reference.length === 0) {
       fail(`${label} SBOM component has no bom-ref: ${component.name ?? "unknown"}`);
     }
     if (componentRefs.has(reference)) fail(`${label} SBOM repeats bom-ref ${reference}`);
@@ -176,7 +175,7 @@ function verifyCompliance(licenses, label) {
     const packageId = component.properties?.find(
       (property) => property.name === "botfleet:cargo:package-id",
     )?.value;
-    if (packageId == null || !String(packageId).startsWith("registry+")) {
+    if (typeof packageId !== "string" || !packageId.startsWith("registry+")) {
       fail(`${label} SBOM registry component has no exact Cargo package ID`);
     }
     if (registryIds.has(packageId)) fail(`${label} SBOM repeats ${packageId}`);

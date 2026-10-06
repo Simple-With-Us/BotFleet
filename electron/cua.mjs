@@ -16,7 +16,8 @@
 
 import { app, ipcMain } from "electron";
 import { parseCuaPermissionsStdout } from "./cua-permissions-status.mjs";
-import { nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
+import { classifyNativeProbe, nativeProbeFailureMessage, probeNativeSync } from "./native-version-probe.mjs";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
@@ -267,25 +268,26 @@ export async function startCua() {
 export function cuaPermissionsStatus() {
   const binary = resolveDriverBinary();
   if (!binary) return { available: false };
-  const probe = probeNativeSync(binary, {
-    args: ["permissions", "status", "--json"],
-    spawnOptions: { env: { ...process.env, ...CUA_ENV } },
-    timeoutMs: 15_000,
-    attempts: 1,
-    matchVersion: (stdout) => (parseCuaPermissionsStdout(stdout).ok ? "ok" : null),
-    probeLabel: "CUA permissions probe",
+  // Parse stdout even when the driver exits non-zero for denied permissions —
+  // the JSON payload is the product, not exit status 0.
+  const result = spawnSync(binary, ["permissions", "status", "--json"], {
+    encoding: "utf8",
+    windowsHide: true,
+    env: { ...process.env, ...CUA_ENV },
+    timeout: 15_000,
   });
-  if (!probe.ok) {
+  const parsed = parseCuaPermissionsStdout(result.stdout ?? "");
+  if (parsed.ok) return { available: true, ...parsed.data };
+  if (result.error || result.signal) {
     return {
       available: false,
-      reason: nativeProbeFailureMessage("cua-driver permissions status did not complete", probe),
+      reason: nativeProbeFailureMessage(
+        "cua-driver permissions status did not complete",
+        classifyNativeProbe(result, () => null),
+      ),
     };
   }
-  const parsed = parseCuaPermissionsStdout(probe.result?.stdout ?? "");
-  if (!parsed.ok) {
-    return { available: false, reason: "invalid CUA permissions status" };
-  }
-  return { available: true, ...parsed.data };
+  return { available: false, reason: "invalid CUA permissions status" };
 }
 
 export async function stopCua() {
