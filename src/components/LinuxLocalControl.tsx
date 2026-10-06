@@ -54,7 +54,7 @@ export function LinuxLocalControl() {
             Local Control
           </div>
           <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">
-            Beta · Ubuntu 24.04 GNOME/{wayland ? "Wayland" : "Xorg"} · Computer Driver 0.20.0
+            Beta · Ubuntu 24.04 GNOME/{wayland ? "Wayland" : "Xorg"} · Computer Driver {local.driverVersion ?? "0.19.3"}
           </div>
         </div>
         <span
