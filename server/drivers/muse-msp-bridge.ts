@@ -93,9 +93,24 @@ interface PermissionOutcome {
   optionId?: string;
 }
 
+/** One server-minted menu entry.  `choiceId` is what `approval/decide` must
+ *  echo; `id` is the older fixture spelling of the same field. */
 interface ApprovalChoice {
   id?: string;
+  choiceId?: string;
+  decision?: string;
+  label?: string;
+  scope?: string;
 }
+
+/** MSP stage token.  The wire sends `{ approvalId, sourceIndex }`.  A plain
+ *  string is accepted so a fixture can name a stage without the object. */
+interface RequirementRef {
+  approvalId: string;
+  sourceIndex: number;
+}
+
+type RequirementId = string | RequirementRef;
 
 /** Fields the two translators read.  Optional because each method carries a
  *  different slice; a missing field is "this method did not send it". */
@@ -117,8 +132,8 @@ interface RpcParams {
   delta?: string;
   error?: { code: number; message: string } | null;
   approvalId?: string;
-  currentRequirementId?: string;
-  requirementId?: string;
+  currentRequirementId?: RequirementId;
+  requirementId?: RequirementId;
   choiceId?: string;
   feedback?: string;
   turnId?: string;
@@ -156,13 +171,26 @@ type JsonRpcMessage = {
 interface PendingApproval {
   approvalId: string;
   /** The requirement in force when we presented this to the human.  A decision
-   *  computed against a different one is refused by MSP, which then re-presents
-   *  — so we invalidate rather than send something we know is stale. */
-  requirementId: string;
+   *  is sent only against this value.  MSP refuses a decide aimed at a later
+   *  stage, and adopting that stage here would approve a requirement the human
+   *  was not shown. */
+  requirementId: RequirementId;
+  /** Set when `approval/updated` moved the stage after presentation.  The
+   *  human's answer to the old presentation is re-asked, not forwarded. */
+  supersededRequirement: RequirementId | null;
   /** MSP's own ids, so a refusal can be mapped back to the human's choice. */
   availableChoices: ApprovalChoice[];
   /** Titles we showed, so `approval/resolved` can close the right tool call. */
   toolCallId: string;
+  title: string;
+  sessionId: string;
+  rawArgs?: { command?: string };
+  /** 0 is the first presentation.  A re-ask bumps it so the new ACP request id
+   *  does not collide with the one the human already answered. */
+  generation: number;
+  /** Recorded when the human answers the presentation currently shown.
+   *  `approval/resolved` reads it to close the tool call. */
+  decisionStatus: "completed" | "failed" | null;
 }
 
 let nextCommandId = 1;
@@ -213,6 +241,112 @@ const approvals = new Map<string, PendingApproval>();
 const acpIdForMsq = new Map<string | number, string | number>();
 
 let child: ReturnType<typeof spawn> | null = null;
+
+/** Stable identity for a stage token.  Strings and `{ approvalId, sourceIndex }`
+ *  objects both survive `JSON.stringify`, and a key-order mismatch fails closed
+ *  (the human is asked again) rather than treating two stages as one. */
+function requirementToken(value: RequirementId | undefined): string {
+  if (value === undefined) return "";
+  return JSON.stringify(value);
+}
+
+function sameRequirement(left: RequirementId | undefined, right: RequirementId | undefined): boolean {
+  return requirementToken(left) === requirementToken(right);
+}
+
+function choiceIdOf(choice: ApprovalChoice): string {
+  return choice.choiceId ?? choice.id ?? "";
+}
+
+function isDenyChoice(choice: ApprovalChoice): boolean {
+  const decision = choice.decision ?? "";
+  const id = choiceIdOf(choice);
+  if (decision === "denied" || decision === "deniedPolicyAmendment" || decision === "abort") return true;
+  if (id === "deny" || id === "reject") return true;
+  if (id.startsWith("deny") || id.startsWith("reject")) return true;
+  return false;
+}
+
+function isAllowChoice(choice: ApprovalChoice): boolean {
+  if (isDenyChoice(choice)) return false;
+  const decision = choice.decision ?? "";
+  const id = choiceIdOf(choice);
+  if (decision.startsWith("approved")) return true;
+  if (id === "allow" || id.startsWith("allow")) return true;
+  return false;
+}
+
+function isBroadAllow(choice: ApprovalChoice): boolean {
+  if (!isAllowChoice(choice)) return false;
+  const id = choiceIdOf(choice);
+  const scope = choice.scope ?? "";
+  const decision = choice.decision ?? "";
+  if (scope === "session" || scope === "localPersistent") return true;
+  if (decision === "approvedForSession" || decision === "approvedPolicyAmendment") return true;
+  if (id.includes("always") || id.includes("session") || id.includes("policy")) return true;
+  return false;
+}
+
+function isOnceAllow(choice: ApprovalChoice): boolean {
+  if (!isAllowChoice(choice)) return false;
+  const id = choiceIdOf(choice);
+  const scope = choice.scope ?? "";
+  const decision = choice.decision ?? "";
+  if (scope === "once" || decision === "approved") return true;
+  if (id === "allow" || id.includes("once")) return true;
+  return false;
+}
+
+/** ACP mints `allow` / `allow-always` / `reject`.  MSP accepts only a `choiceId`
+ *  from the server menu, and a constructed id is refused.  Map the human's
+ *  option onto that menu, and fall back to the nearest safe entry on it. */
+function mspChoiceIdForAcpOption(optionId: string, choices: ApprovalChoice[]): string {
+  const denies = choices.filter((choice) => isDenyChoice(choice) && choiceIdOf(choice).length > 0);
+  const allows = choices.filter((choice) => isAllowChoice(choice) && choiceIdOf(choice).length > 0);
+  if (optionId === "reject" || optionId.startsWith("reject")) {
+    const chosen = denies[0];
+    // No deny on the menu: do not substitute an allow.  MSP refuses an unknown
+    // id, which leaves the tool pending instead of granting it.
+    return chosen ? choiceIdOf(chosen) : "deny";
+  }
+  if (optionId === "allow-always") {
+    const chosen = allows.find(isBroadAllow) ?? allows[0];
+    return chosen ? choiceIdOf(chosen) : "allow";
+  }
+  const chosen = allows.find(isOnceAllow) ?? allows[0];
+  return chosen ? choiceIdOf(chosen) : "allow";
+}
+
+function acpPermissionOptions(): PermissionOption[] {
+  return [
+    { optionId: "allow", name: "Allow", kind: "allow_once" },
+    { optionId: "allow-always", name: "Always allow", kind: "allow_always" },
+    { optionId: "reject", name: "Reject", kind: "reject_once" },
+  ];
+}
+
+function permissionWireId(pending: PendingApproval): string {
+  if (pending.generation === 0) return `perm-${pending.approvalId}`;
+  return `perm-${pending.approvalId}#${pending.generation}`;
+}
+
+function permissionRequestMessage(pending: PendingApproval): JsonRpcMessage {
+  return {
+    jsonrpc: "2.0",
+    id: permissionWireId(pending),
+    method: "session/request_permission",
+    params: {
+      sessionId: pending.sessionId,
+      toolCall: {
+        toolCallId: pending.toolCallId,
+        title: pending.title,
+        kind: "other",
+        rawInput: pending.rawArgs,
+      },
+      options: acpPermissionOptions(),
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Outward:  ACP in, MSP out
@@ -347,9 +481,8 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
   const method = message.method;
   const params = message.params ?? {};
 
-  // A response to something we asked inward is relayed by
-  //  `acknowledgePermission`, which owns the id mapping.  The translator never
-  //  sees one.
+  // A response to something we asked inward is relayed by `consumeMspMessage`,
+  // which owns the id mapping.  The translator never sees one.
   if (message.id !== undefined && message.id !== null && method === undefined) {
     return [];
   }
@@ -371,7 +504,10 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
       const field = params.field ?? "";
       const text = params.delta ?? "";
       if (!text) return [];
-      const sessionId = currentSessionId ?? params.sessionId;
+      // The notification's own session wins.  `currentSessionId` only fills in
+      // when the frame omitted one, which is how a relayed `session/start`
+      // result becomes usable for later frames.
+      const sessionId = params.sessionId ?? currentSessionId;
       if (!sessionId) return [];
       const update: SessionUpdate =
         field === "thinking" || field === "reasoning"
@@ -386,20 +522,26 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
       const choices = params.availableChoices ?? [];
       const toolName = String(params.toolName ?? params.subject ?? "tool");
       const toolCallId = String(params.toolCallId ?? approvalId);
-      const requirementId = String(params.currentRequirementId ?? "");
+      const requirementId = params.currentRequirementId ?? "";
+      const title = String(params.subject ?? toolName).slice(0, 200);
 
-      approvals.set(approvalId, { approvalId, requirementId, availableChoices: choices, toolCallId });
+      const pending: PendingApproval = {
+        approvalId,
+        requirementId,
+        supersededRequirement: null,
+        availableChoices: choices,
+        toolCallId,
+        title,
+        sessionId,
+        rawArgs: params.rawArgs,
+        generation: 0,
+        decisionStatus: null,
+      };
+      approvals.set(approvalId, pending);
 
       // ACP options carry a `kind` the core matches on a prefix:  it looks for
       //  `allow*` and `reject*` and refuses to guess otherwise, so both are
       //  always offered and the chosen id maps back to MSP's own choice.
-      const options = [
-        { optionId: "allow", name: "Allow", kind: "allow_once" },
-        { optionId: "allow-always", name: "Always allow", kind: "allow_always" },
-        { optionId: "reject", name: "Reject", kind: "reject_once" },
-      ];
-
-      const title = String(params.subject ?? toolName).slice(0, 200);
       return [
         {
           jsonrpc: "2.0",
@@ -416,30 +558,23 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
             } satisfies SessionUpdate,
           },
         },
-        {
-          jsonrpc: "2.0",
-          id: `perm-${approvalId}`,
-          method: "session/request_permission",
-          params: {
-            sessionId,
-            toolCall: { toolCallId, title, kind: "other", rawInput: params.rawArgs },
-            options,
-          },
-        },
+        permissionRequestMessage(pending),
       ];
     }
 
-    // The refresh path.  A stage advanced while the human was deciding, so the
-    //  requirement in force has moved:  mark it and let the next decision be
-    //  made against the new one rather than sending a known-stale answer.
+    // The refresh path.  A stage that moved after we asked the human stays
+    // recorded against the presentation.  The presented requirement is not
+    // replaced:  their answer must not become `approval/decide` for the new one.
     case "approval/updated": {
       const approvalId = String(params.approvalId ?? "");
       const pending = approvals.get(approvalId);
       const requirementId = params.currentRequirementId;
-      if (pending && requirementId !== undefined) {
-        pending.requirementId = requirementId;
-        if (params.availableChoices) pending.availableChoices = params.availableChoices;
-        log(`approval ${approvalId} refreshed to requirement ${pending.requirementId}`);
+      if (pending && params.availableChoices) pending.availableChoices = params.availableChoices;
+      if (pending && requirementId !== undefined && !sameRequirement(requirementId, pending.requirementId)) {
+        pending.supersededRequirement = requirementId;
+        log(
+          `approval ${approvalId} moved to requirement ${requirementToken(requirementId)} while presented under ${requirementToken(pending.requirementId)}`,
+        );
       }
       return [];
     }
@@ -449,18 +584,19 @@ export function translateMspToAcp(message: JsonRpcMessage): JsonRpcMessage[] {
       const pending = approvals.get(approvalId);
       approvals.delete(approvalId);
       if (!pending) return [];
-      // Prefer the session we are on, but the notification carries its own id,
-      //  so a resolve never depends on module state having been populated by an
-      //  earlier round trip.
-      const sessionId = currentSessionId ?? String(params.sessionId ?? "");
+      // The notification's own session wins, so a resolve does not depend on
+      // the relay having populated module state.  The status is the one the
+      // human recorded; a resolve that arrived without an answer stays completed.
+      const sessionId = params.sessionId ?? currentSessionId ?? pending.sessionId;
       if (!sessionId) return [];
+      const status = pending.decisionStatus ?? "completed";
       return [
         {
           jsonrpc: "2.0",
           method: "session/update",
           params: {
             sessionId,
-            update: { sessionUpdate: "tool_call_update", toolCallId: pending.toolCallId, status: "completed" } satisfies SessionUpdate,
+            update: { sessionUpdate: "tool_call_update", toolCallId: pending.toolCallId, status } satisfies SessionUpdate,
           },
         },
       ];
@@ -487,49 +623,91 @@ function sendToMcp(message: JsonRpcMessage): void {
   child.stdin.write(`${JSON.stringify(message)}\n`);
 }
 
-/** An ACP `session/request_permission` answer became an MSP decision. */
-function handlePermissionAnswer(id: string, message: JsonRpcMessage): void {
-  const approvalId = id.replace(/^perm-/, "");
+interface PermissionAnswerEffect {
+  toMsp: JsonRpcMessage[];
+  toAcp: JsonRpcMessage[];
+}
+
+/** The human answered a permission we posed.
+ *
+ *  The approval stays in `approvals` until `approval/resolved`, so that
+ *  notification can still close the tool call.  A stage that moved after we
+ *  asked is not decided:  the new requirement is presented instead. */
+export function translatePermissionAnswer(approvalId: string, message: JsonRpcMessage): PermissionAnswerEffect {
   const pending = approvals.get(approvalId);
-  if (!pending) {
-    // Already resolved, or never known:  answering nothing is correct here,
-    //  because the ACP side has already been released by the receipt path.
-    return;
+  if (!pending) return { toMsp: [], toAcp: [] };
+  if (pending.supersededRequirement !== null) {
+    pending.requirementId = pending.supersededRequirement;
+    pending.supersededRequirement = null;
+    pending.generation += 1;
+    pending.decisionStatus = null;
+    return { toMsp: [], toAcp: [permissionRequestMessage(pending)] };
   }
+  if (pending.decisionStatus) return { toMsp: [], toAcp: [] };
+
   const outcome = message.result?.outcome;
-  if (!outcome || outcome.outcome !== "selected") {
-    approvals.delete(approvalId);
-    sendToMcp({
-      jsonrpc: "2.0",
-      id: null,
-      method: "approval/decide",
-      params: {
-        commandId: commandId(),
-        approvalId,
-        requirementId: pending.requirementId,
-        sessionId: currentSessionId ?? "",
-        choiceId: "deny",
-        feedback: "declined",
+  const optionId = !outcome || outcome.outcome !== "selected" ? "reject" : String(outcome.optionId ?? "allow");
+  const choiceId = mspChoiceIdForAcpOption(optionId, pending.availableChoices);
+  const rejected = optionId === "reject" || optionId.startsWith("reject");
+  pending.decisionStatus = rejected ? "failed" : "completed";
+  const sessionId = pending.sessionId || currentSessionId || "";
+  return {
+    toMsp: [
+      {
+        jsonrpc: "2.0",
+        id: null,
+        method: "approval/decide",
+        params: {
+          commandId: commandId(),
+          approvalId,
+          // Always the requirement this decision was granted under.
+          requirementId: pending.requirementId,
+          sessionId,
+          choiceId,
+          feedback: rejected ? "declined" : "allowed",
+        },
       },
-    });
-    return;
+    ],
+    toAcp: [],
+  };
+}
+
+/** An ACP `session/request_permission` answer became an MSP decision. */
+function handlePermissionAnswer(approvalId: string, message: JsonRpcMessage): void {
+  const effect = translatePermissionAnswer(approvalId, message);
+  for (const outbound of effect.toMsp) sendToMcp(outbound);
+  for (const outbound of effect.toAcp) out(outbound);
+}
+
+/** A response to something we asked MSP, turned into the ACP message the
+ *  caller is blocked on.  Also learns the session id. */
+function relayMspResponse(message: JsonRpcMessage): JsonRpcMessage[] {
+  const rawId = message.id;
+  if (rawId === undefined || rawId === null) return [];
+  const acpId = acpIdForMsq.get(rawId);
+  if (acpId === undefined) return [];
+  acpIdForMsq.delete(rawId);
+
+  const result = message.result;
+  // Learn the session id as soon as it exists:  every later outward message
+  // needs it, and `turn/completed` arrives after the prompt is already open.
+  if (result?.session?.sessionId) currentSessionId = result.session.sessionId;
+
+  if (message.error) return [{ jsonrpc: "2.0", id: acpId, error: message.error }];
+
+  const sessionId = result?.session?.sessionId ?? result?.sessionId;
+  if (sessionId !== undefined) return [{ jsonrpc: "2.0", id: acpId, result: { sessionId } }];
+  return [{ jsonrpc: "2.0", id: acpId, result }];
+}
+
+/** One frame from `muse serve`.  Responses to our own requests are relayed;
+ *  notifications go through the translator.  The read loop calls this and
+ *  nothing else — `translateMspToAcp` drops a response on purpose. */
+export function consumeMspMessage(message: JsonRpcMessage): JsonRpcMessage[] {
+  if (message.method === undefined && message.id !== undefined && message.id !== null) {
+    return relayMspResponse(message);
   }
-  const choiceId = String(outcome.optionId ?? "allow");
-  approvals.delete(approvalId);
-  sendToMcp({
-    jsonrpc: "2.0",
-    id: null,
-    method: "approval/decide",
-    params: {
-      commandId: commandId(),
-      approvalId,
-      // Always the requirement this decision was granted under.
-      requirementId: pending.requirementId,
-      sessionId: currentSessionId ?? "",
-      choiceId,
-      feedback: choiceId.startsWith("allow") ? "allowed" : "declined",
-    },
-  });
+  return translateMspToAcp(message);
 }
 
 /** An inbound MSP response, or BotFleet's answer to a permission we posed. */
@@ -537,44 +715,37 @@ function acknowledgePermission(message: JsonRpcMessage): void {
   const rawId = message.id;
 
   // BotFleet answering one of OUR permission presentations:  an ACP response
-  //  with an id we minted as `perm-<approvalId>`.
+  // with an id we minted as `perm-<approvalId>`.
   const permissionId = permissionRequestId(rawId);
   if (permissionId !== undefined) {
     handlePermissionAnswer(permissionId, message);
     return;
   }
 
-  // A response to something we asked MSP, relayed to the ACP caller.
-  if (rawId === undefined || rawId === null) return;
-  const acpId = acpIdForMsq.get(rawId);
-  if (acpId === undefined) return; // a response to a fire-and-forget call
-  acpIdForMsq.delete(rawId);
-
-  const result = message.result;
-
-  // Learn the session id as soon as it exists:  every later outward message
-  //  needs it, and `turn/completed` arrives after the prompt is already open.
-  if (result?.session?.sessionId) currentSessionId = result.session.sessionId;
-
-  if (message.error) {
-    out({ jsonrpc: "2.0", id: acpId, error: message.error });
-    return;
-  }
-
-  const sessionId = result?.session?.sessionId ?? result?.sessionId;
-  if (sessionId !== undefined) {
-    out({ jsonrpc: "2.0", id: acpId, result: { sessionId } });
-    return;
-  }
-  out({ jsonrpc: "2.0", id: acpId, result });
+  for (const outbound of relayMspResponse(message)) out(outbound);
 }
 
 /** BotFleet's answer to a permission we posed uses an id minted as `perm-<approvalId>`.
- *  Numeric ACP ids are someone else's request and must not be read as one. */
+ *  A re-ask appends `#<generation>`.  Numeric ACP ids are someone else's request
+ *  and must not be read as one.  Returns the approval id. */
 function permissionRequestId(id: string | number | null | undefined): string | undefined {
   if (id === undefined || id === null) return undefined;
   const text = id.toString();
-  return text.startsWith("perm-") ? text : undefined;
+  if (!text.startsWith("perm-")) return undefined;
+  const body = text.slice("perm-".length);
+  const mark = body.lastIndexOf("#");
+  return mark === -1 ? body : body.slice(0, mark);
+}
+
+/** How the bridge should die when `muse serve` does.  A signal is a crash
+ *  (OOM, SIGKILL) and must not be reported as exit code 0.  Code 3 is MSP's
+ *  "cannot load settings or credentials", which the driver reads as auth. */
+export function childExitAction(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): { kind: "signal"; signal: NodeJS.Signals } | { kind: "exit"; code: number } {
+  if (signal) return { kind: "signal", signal };
+  return { kind: "exit", code: code ?? 1 };
 }
 
 function main(): void {
@@ -589,10 +760,16 @@ function main(): void {
 
   child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
   child.on("exit", (code, signal) => {
-    // 3 is MSP's "cannot load settings or credentials", which the driver reads
-    //  as an auth problem rather than a crash.
     log(`muse serve exited code=${code} signal=${signal}`);
-    process.exit(code ?? 0);
+    const action = childExitAction(code, signal);
+    if (action.kind === "signal") {
+      // Die the same way the engine did.  Drop our own handler first so the
+      // re-raise does not loop.
+      process.removeAllListeners(action.signal);
+      process.kill(process.pid, action.signal);
+      return;
+    }
+    process.exit(action.code);
   });
   child.on("error", (err) => {
     log(`spawn failed: ${err.message}`);
@@ -633,7 +810,7 @@ function main(): void {
     } catch {
       return;
     }
-    for (const outbound of translateMspToAcp(parsed)) out(outbound);
+    for (const outbound of consumeMspMessage(parsed)) out(outbound);
   });
 }
 

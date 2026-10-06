@@ -16,7 +16,13 @@
 //      when the human was asked.
 import { describe, expect, it } from "vitest";
 
-import { translateAcpToMsp, translateMspToAcp } from "./muse-msp-bridge.ts";
+import {
+  childExitAction,
+  consumeMspMessage,
+  translateAcpToMsp,
+  translateMspToAcp,
+  translatePermissionAnswer,
+} from "./muse-msp-bridge.ts";
 
 const acpPrompt = (id: number | string, sessionId = "sess-1") => ({
   jsonrpc: "2.0",
@@ -183,9 +189,9 @@ describe("MSP to ACP", () => {
   });
 
   it("treats an approval refresh as new information rather than a new request", () => {
-    // The multi-stage trap:  MSP 1.2.1 REFRESHES a pending approval instead of
-    //  re-issuing `approval/request`, so a client waiting for a fresh request
-    //  per stage hangs forever.  A refresh must NOT re-ask the human.
+    // The multi-stage trap:  MSP REFRESHES a pending approval instead of
+    // re-issuing `approval/request`, so a client waiting for a fresh request
+    // per stage hangs forever.  The notification itself must not re-ask.
     const [, request] = translateMspToAcp({
       jsonrpc: "2.0",
       method: "approval/request",
@@ -205,8 +211,171 @@ describe("MSP to ACP", () => {
       method: "approval/updated",
       params: { sessionId: "s", approvalId: "ap-2", currentRequirementId: "req-2", availableChoices: [{ id: "allow" }, { id: "allow_always" }] },
     });
-    // No second request to the human; the outstanding one is now against req-2.
     expect(refreshed).toEqual([]);
+  });
+
+  it("refuses to decide a requirement the human was not shown", () => {
+    // The human was asked under req-1.  MSP then advanced the stage.  Their
+    // answer must not be forwarded as approval/decide for req-2.
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/request",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-stale",
+        currentRequirementId: "req-1",
+        itemId: "it",
+        rawArgs: {},
+        toolName: "shell",
+        availableChoices: [{ id: "allow" }, { id: "deny" }],
+      },
+    });
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/updated",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-stale",
+        currentRequirementId: "req-2",
+        availableChoices: [{ id: "allow" }, { id: "allow_always" }, { id: "deny" }],
+      },
+    });
+    const first = translatePermissionAnswer("ap-stale", {
+      jsonrpc: "2.0",
+      id: "perm-ap-stale",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    expect(first.toMsp).toEqual([]);
+    expect(first.toAcp[0]?.method).toBe("session/request_permission");
+    expect(first.toAcp[0]?.id).toBe("perm-ap-stale#1");
+
+    const second = translatePermissionAnswer("ap-stale", {
+      jsonrpc: "2.0",
+      id: "perm-ap-stale#1",
+      result: { outcome: { outcome: "selected", optionId: "allow-always" } },
+    });
+    expect(second.toAcp).toEqual([]);
+    expect(second.toMsp[0]?.method).toBe("approval/decide");
+    expect(second.toMsp[0]?.params?.requirementId).toBe("req-2");
+    expect(second.toMsp[0]?.params?.choiceId).toBe("allow_always");
+  });
+
+  it("keeps an object requirement id and will not satisfy the next stage with it", () => {
+    const presented = { approvalId: "ap-obj", sourceIndex: 0 };
+    const advanced = { approvalId: "ap-obj", sourceIndex: 1 };
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/request",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-obj",
+        currentRequirementId: presented,
+        itemId: "it",
+        rawArgs: {},
+        toolName: "shell",
+        availableChoices: [
+          { choiceId: "allow_once", decision: "approved", scope: "once" },
+          { choiceId: "deny", decision: "denied", scope: "once" },
+        ],
+      },
+    });
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/updated",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-obj",
+        currentRequirementId: advanced,
+        availableChoices: [
+          { choiceId: "allow_once", decision: "approved", scope: "once" },
+          { choiceId: "deny", decision: "denied", scope: "once" },
+        ],
+      },
+    });
+    const stale = translatePermissionAnswer("ap-obj", {
+      jsonrpc: "2.0",
+      id: "perm-ap-obj",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    expect(stale.toMsp).toEqual([]);
+    const decided = translatePermissionAnswer("ap-obj", {
+      jsonrpc: "2.0",
+      id: "perm-ap-obj#1",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    expect(decided.toMsp[0]?.params?.requirementId).toEqual(advanced);
+    expect(decided.toMsp[0]?.params?.choiceId).toBe("allow_once");
+  });
+
+  it("maps the human's option onto the server's choice id", () => {
+    const choices = [
+      { choiceId: "allow_once", decision: "approved", scope: "once", label: "Allow once" },
+      { choiceId: "allow_session", decision: "approvedForSession", scope: "session", label: "Always" },
+      { choiceId: "deny", decision: "denied", scope: "once", label: "Deny" },
+    ];
+    const ask = (approvalId: string) => {
+      translateMspToAcp({
+        jsonrpc: "2.0",
+        method: "approval/request",
+        params: {
+          sessionId: "s",
+          approvalId,
+          currentRequirementId: "req-1",
+          itemId: "it",
+          rawArgs: {},
+          toolName: "shell",
+          availableChoices: choices,
+        },
+      });
+    };
+    const answer = (approvalId: string, optionId: string) =>
+      translatePermissionAnswer(approvalId, {
+        jsonrpc: "2.0",
+        id: `perm-${approvalId}`,
+        result: { outcome: { outcome: "selected", optionId } },
+      });
+
+    ask("ap-once");
+    expect(answer("ap-once", "allow").toMsp[0]?.params?.choiceId).toBe("allow_once");
+    ask("ap-always");
+    expect(answer("ap-always", "allow-always").toMsp[0]?.params?.choiceId).toBe("allow_session");
+    ask("ap-deny");
+    expect(answer("ap-deny", "reject").toMsp[0]?.params?.choiceId).toBe("deny");
+  });
+
+  it("still decides when a refresh repeats the requirement the human was shown", () => {
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/request",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-same",
+        currentRequirementId: "req-1",
+        itemId: "it",
+        rawArgs: {},
+        toolName: "shell",
+        availableChoices: [{ id: "allow" }, { id: "deny" }],
+      },
+    });
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/updated",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-same",
+        currentRequirementId: "req-1",
+        availableChoices: [{ id: "allow" }, { id: "deny" }],
+      },
+    });
+    const effect = translatePermissionAnswer("ap-same", {
+      jsonrpc: "2.0",
+      id: "perm-ap-same",
+      result: { outcome: { outcome: "selected", optionId: "allow" } },
+    });
+    expect(effect.toAcp).toEqual([]);
+    expect(effect.toMsp[0]?.params?.requirementId).toBe("req-1");
+    expect(effect.toMsp[0]?.params?.choiceId).toBe("allow");
+    expect(effect.toMsp[0]?.params?.sessionId).toBe("s");
   });
 
   it("closes the tool call when the approval resolves", () => {
@@ -234,8 +403,76 @@ describe("MSP to ACP", () => {
     );
   });
 
+  it("keeps the approval after the human answers so approval/resolved can close it", () => {
+    translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/request",
+      params: {
+        sessionId: "s",
+        approvalId: "ap-held",
+        currentRequirementId: "req-1",
+        itemId: "it",
+        rawArgs: {},
+        toolName: "shell",
+        availableChoices: [{ choiceId: "allow_once", decision: "approved", scope: "once" }, { choiceId: "deny", decision: "denied", scope: "once" }],
+      },
+    });
+    const decided = translatePermissionAnswer("ap-held", {
+      jsonrpc: "2.0",
+      id: "perm-ap-held",
+      result: { outcome: { outcome: "selected", optionId: "reject" } },
+    });
+    expect(decided.toMsp[0]?.method).toBe("approval/decide");
+    const [resolved] = translateMspToAcp({
+      jsonrpc: "2.0",
+      method: "approval/resolved",
+      params: { sessionId: "s", approvalId: "ap-held" },
+    });
+    expect(resolved.params?.update?.sessionUpdate).toBe("tool_call_update");
+    expect(resolved.params?.update && "status" in resolved.params.update ? resolved.params.update.status : "").toBe(
+      "failed",
+    );
+  });
+
+  it("relays an MSP response to the ACP request that asked for it", () => {
+    // The read loop used to hand every muse serve line to the translator,
+    // which drops a response.  session/start then never reaches BotFleet.
+    const [started] = translateAcpToMsp({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "session/new",
+      params: { cwd: "/tmp/project", mcpServers: [] },
+    });
+    const [relayed] = consumeMspMessage({
+      jsonrpc: "2.0",
+      id: started.id,
+      result: { session: { sessionId: "sess-relay" } },
+    });
+    expect(relayed?.id).toBe(41);
+    expect(relayed?.result?.sessionId).toBe("sess-relay");
+    expect(consumeMspMessage({ jsonrpc: "2.0", id: started.id, result: { session: { sessionId: "other" } } })).toEqual(
+      [],
+    );
+
+    const [delta] = consumeMspMessage({
+      jsonrpc: "2.0",
+      method: "item/delta",
+      params: { field: "text", delta: "hi" },
+    });
+    expect(delta?.params?.sessionId).toBe("sess-relay");
+  });
+
   it("ignores MSP traffic it does not translate", () => {
     expect(translateMspToAcp({ jsonrpc: "2.0", method: "session/contextUsage", params: {} })).toEqual([]);
     expect(translateMspToAcp({ jsonrpc: "2.0", method: "workflow/childControl", params: {} })).toEqual([]);
+  });
+});
+
+describe("child exit", () => {
+  it("re-raises a signal and does not report a signal death as code 0", () => {
+    expect(childExitAction(null, "SIGKILL")).toEqual({ kind: "signal", signal: "SIGKILL" });
+    expect(childExitAction(null, null)).toEqual({ kind: "exit", code: 1 });
+    expect(childExitAction(3, null)).toEqual({ kind: "exit", code: 3 });
+    expect(childExitAction(0, null)).toEqual({ kind: "exit", code: 0 });
   });
 });
