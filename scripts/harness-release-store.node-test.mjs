@@ -329,6 +329,53 @@ test("pruning leaves a release alone when lsof cannot answer", async (t) => {
   assert.deepEqual(await listReleases(env), [A, B, C]);
 });
 
+test("retention still converges when an oldest candidate is exempt", async (t) => {
+  // With keep=2 and live C, candidates are [A,B,D,E].  Pre-slicing doomed to
+  // [A,B] meant a held B blocked every later pass from ever probing D or E.
+  const D = "d".repeat(40);
+  const E = "e".repeat(40);
+  const { env } = await store(t);
+  for (const commit of [A, B, C, D, E]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env });
+  }
+  await swapCurrent({ commit: C, env });
+  const now = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  let holdB = true;
+  const first = await pruneReleases({
+    env,
+    keep: 2,
+    minAgeMs: 0,
+    now,
+    isHeldImpl: async (path) => holdB && path.endsWith(B),
+  });
+  assert.deepEqual(first.removed, [A], "A is pruned even when B is held");
+  assert.deepEqual(first.kept.map((k) => [k.commit, k.reason]), [[B, "held-by-a-process"]]);
+  assert.deepEqual(await listReleases(env), [B, C, D, E]);
+
+  holdB = false;
+  const second = await pruneReleases({ env, keep: 2, minAgeMs: 0, now, isHeldImpl: async () => false });
+  assert.deepEqual(second.removed, [B], "once B is free it is pruned and younger releases were never stuck");
+  assert.deepEqual(await listReleases(env), [C, D, E]);
+});
+
+test("listReleases skips a release that vanishes before stat", async (t) => {
+  const { env } = await store(t);
+  for (const commit of [A, B]) {
+    await stage(env, commit, commit);
+    await promoteStaging({ commit, env });
+  }
+  await chmodWritableTree(releasePath(A, env));
+  const listing = listReleases(env);
+  await new Promise((resolve) => setImmediate(resolve));
+  await forceRemove(releasePath(A, env));
+  const listed = await listing;
+  assert.ok(listed.includes(B), "listing must complete and still see surviving releases");
+  if (!listed.includes(A)) {
+    assert.deepEqual(listed, [B], "when the race wins, the vanished release is skipped instead of rejecting the listing");
+  }
+});
+
 test("pruning leaves a young release alone", async (t) => {
   const { env } = await store(t);
   for (const commit of [A, B]) {

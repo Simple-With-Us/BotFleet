@@ -568,34 +568,15 @@ export async function listReleases(env = process.env) {
     const path = join(releasesRoot(env), entry.name);
     const manifest = validateReleaseManifest(await readReleaseManifest(path));
     if (manifest && manifest.commit !== entry.name) continue;
-    const promotedAt = await promotedAtOf(path);
-    const { mtimeMs } = await stat(path);
-    releases.push({ commit: entry.name, promotedAt, mtimeMs });
+    const statResult = await stat(path).catch(() => null);
+    if (!statResult) continue;
+    const parsed = manifest ? Date.parse(manifest.promotedAt) : Number.NaN;
+    const promotedAt = Number.isFinite(parsed) ? parsed : statResult.mtimeMs;
+    releases.push({ commit: entry.name, promotedAt, mtimeMs: statResult.mtimeMs });
   }
   return releases
     .sort((a, b) => a.promotedAt - b.promotedAt || a.mtimeMs - b.mtimeMs)
     .map((r) => r.commit);
-}
-
-async function promotedAtOf(path) {
-  try {
-    const manifest = validateReleaseManifest(JSON.parse(await readFile(join(path, MANIFEST), "utf8")));
-    const when = manifest ? Date.parse(manifest.promotedAt) : Number.NaN;
-    if (Number.isFinite(when)) return when;
-  } catch {
-    // fall through to the filesystem
-  }
-  try {
-    // Awaited inside the try, never returned from it.  A promise RETURNED from
-    // a try block is not covered by that block's catch, so a stat() failure would
-    // escape as an unhandled rejection instead of falling back to 0 — and this
-    // runs once per release inside a retention pass that is about to delete
-    // things, which is the worst possible place for an unhandled rejection.
-    const { stat } = await import("node:fs/promises");
-    return (await stat(path)).mtimeMs;
-  } catch {
-    return 0;
-  }
 }
 
 /**
@@ -667,10 +648,16 @@ export async function pruneReleases({ env = process.env, keep = MIN_RELEASES_KEP
   const livePhysical = live ? null : await resolveCurrent(env);
   const releases = await listReleases(env);
   const candidates = releases.filter((commit) => commit !== live);
-  const doomed = candidates.slice(0, Math.max(0, candidates.length - Math.max(0, keep)));
   const removed = [];
   const kept = [];
-  for (const commit of doomed) {
+  const keepBudget = Math.max(0, keep);
+  for (let i = 0; i < candidates.length; i++) {
+    const commit = candidates[i];
+    // The newest `keep` non-live releases are never deletion candidates.  Slicing
+    // a "doomed" prefix up front was wrong: a gate that kept an oldest candidate
+    // still consumed a slot, so younger releases were never examined and
+    // retention could stall forever with held or exempt trees in that prefix.
+    if (candidates.length - i <= keepBudget) continue;
     const path = releasePath(commit, env);
     let stat;
     try {
