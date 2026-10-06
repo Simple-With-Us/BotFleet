@@ -1,3 +1,6 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:103cc9c4d05a733385a8a677823c5ea733f72e9704990dce20a233b102a09769
-size 94
+{
+  "color": "pink",
+  "stills": 45,
+  "gifs": 54,
+  "contract": "TVFACE_TRANSITION_MS=1000"
+}

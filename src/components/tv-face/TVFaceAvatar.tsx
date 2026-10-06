@@ -300,6 +300,7 @@ export function TVFaceAvatar({
   // already holds the destination, and re-planning from it would collapse the
   // plan to a bare hold (see `replanInFlight`).
   const inFlight = useRef<{ origin: TVFaceExpression; steps: FrameStep[]; index: number } | null>(null);
+  const planStartedAtRef = useRef(Date.now());
 
   const getAssetPath = (expr: TVFaceExpression, type: "enter" | "hold" | "return", isStill = false) =>
     tvFaceAssetPath(skinDir, expr, type, animated, isStill);
@@ -331,6 +332,7 @@ export function TVFaceAvatar({
       const step = plan.steps[from];
       if (!step) return;
       plan.index = from;
+      planStartedAtRef.current = Date.now();
       const src = pathForStep(step);
       if (step.kind === "hold") {
         holdEpochRef.current += 1;
@@ -363,10 +365,9 @@ export function TVFaceAvatar({
       );
       inFlight.current = { origin: inFlight.current.origin, steps, index: resumeIndex };
       if (resumeIndex + 1 < steps.length) {
-        timeoutRef.current = setTimeout(
-          () => playFrom(resumeIndex + 1),
-          steps[resumeIndex].delayAfterMs,
-        );
+        const elapsed = Date.now() - planStartedAtRef.current;
+        const remaining = Math.max(0, steps[resumeIndex].delayAfterMs - elapsed);
+        timeoutRef.current = setTimeout(() => playFrom(resumeIndex + 1), remaining);
       }
     } else if (!currentGif) {
       holdEpochRef.current += 1;

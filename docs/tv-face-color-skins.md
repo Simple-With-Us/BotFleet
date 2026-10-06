@@ -13,15 +13,15 @@ Bookend contract: first frame of every `*_enter.gif` and last frame of every `*_
 
 Green uses **red** face glyphs so shell green does not collide with green chroma keying.
 
-## Player logic (`TVFaceAvatar.tsx`)
+## Player Logic (`TVFaceAvatar.tsx`)
 
 - Rest → expression: play enter, then hold (hold loops in the browser).
 - Expression → rest: play return, then resting still.
 - Expression → expression: cut to new hold (enter is resting-anchored; playing it would pop).
-- **Urgent** expressions (`alerting`, `crash`, `angry`, `scared`, `notifying`, `celebrate`, `excited`): cut straight to hold from anywhere — no 1–4s enter wait.  Any in-flight enter/return is cancelled on state change.
+- **Urgent** expressions (`alerting`, `crash`, `angry`, `scared`, `notifying` — see `TVFACE_URGENT`): cut straight to hold from anywhere — no 1–4s enter wait.  Any in-flight enter/return is cancelled on state change.
 - `transitionSpeed` shortens the *wait* before swapping enter→hold (does not re-encode).  For true faster/slower pixel animation, retime frame delays offline.
 
-## GIF speed (no Cloudinary required)
+## GIF Speed (No Cloudinary Required)
 
 GIF speed is the per-frame delay field.  Re-encode locally:
 
@@ -32,7 +32,7 @@ python3 scripts/tv-face-retime-gifs.py --factor 2 path/to/clip.gif
 
 Cloudinary `e_accelerate` works on hosted URLs, but BotFleet stays offline-first with assets in the repo.  No third-party service is required.
 
-## Building color packs
+## Building Color Packs
 
 ```bash
 python3 scripts/tv-face-build-color-skins.py public/tv-face/skins/default public/tv-face/skins blue green …
@@ -40,7 +40,7 @@ python3 scripts/tv-face-build-color-skins.py public/tv-face/skins/default public
 
 Skips truncated junk (`speaking_hold_preview.png`).
 
-## Shipping color packs without a 600 MB git push
+## Shipping Color Packs Without a 600 MB Git Push
 
 1. Build packs locally:
 
@@ -50,7 +50,7 @@ Skips truncated junk (`speaking_hold_preview.png`).
      blue green purple pink red cyan yellow teal coral
    ```
 
-2. Upload to FleetLink as `TV-Face/botfleet-skins/{color}/…` (see upload script).
+2. Publish approved color packs through the standard BotFleet asset-delivery process (same channel used for other shipped TV-Face art).
 
 3. On a machine that needs them:
 

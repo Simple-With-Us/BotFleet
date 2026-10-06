@@ -26,6 +26,12 @@ def retime(path: Path, factor: float | None, target_ms: int | None) -> None:
         durs.append(int(fr.info.get("duration", 40) or 40))
     total = sum(durs) or 1
     if target_ms is not None:
+        floor_ms = 20 * len(frames)
+        if target_ms < floor_ms:
+            raise SystemExit(
+                f"{path}: --target-ms {target_ms} is below the {floor_ms} ms floor "
+                f"for {len(frames)} frames at 20 ms each; drop frames or raise the target.",
+            )
         factor = total / max(1, target_ms)
     assert factor is not None and factor > 0
     new_durs = [max(20, int(round(d / factor))) for d in durs]  # GIF min ~20ms practical
@@ -37,18 +43,19 @@ def retime(path: Path, factor: float | None, target_ms: int | None) -> None:
         # fix remainder on last frame
         drift = target_ms - sum(new_durs)
         new_durs[-1] = max(20, new_durs[-1] + drift)
-    loop = im.info.get("loop", 0)
-    if loop is None:
-        loop = 0
-    frames[0].save(
-        path,
-        save_all=True,
-        append_images=frames[1:],
-        duration=new_durs,
-        loop=loop,
-        disposal=2,
-        optimize=False,
-    )
+    # None = play once; only *_hold.gif loops forever. Defaulting a missing
+    # NETSCAPE loop block to 0 turns one-shot enter/return into endless loops.
+    loop = 0 if path.stem.endswith("_hold") else im.info.get("loop")
+    save_kwargs: dict = {
+        "save_all": True,
+        "append_images": frames[1:],
+        "duration": new_durs,
+        "disposal": 2,
+        "optimize": False,
+    }
+    if loop is not None:
+        save_kwargs["loop"] = loop
+    frames[0].save(path, **save_kwargs)
     print(f"{path.name}: {total}ms -> {sum(new_durs)}ms (factor~{factor:.2f})")
 
 def main():

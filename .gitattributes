@@ -6,12 +6,21 @@
 # have written by hand is what git does automatically.  A duplicate row is harmless and visible;
 # a missing row is not.
 docs/EFFORT-LOG.md merge=union
-public/tv-face/skins/blue/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/green/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/purple/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/pink/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/red/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/cyan/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/yellow/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/teal/** filter=lfs diff=lfs merge=lfs -text
-public/tv-face/skins/coral/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/blue/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/blue/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/green/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/green/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/purple/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/purple/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/pink/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/pink/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/red/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/red/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/cyan/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/cyan/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/yellow/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/yellow/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/teal/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/teal/gifs/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/coral/stills/** filter=lfs diff=lfs merge=lfs -text
+public/tv-face/skins/coral/gifs/** filter=lfs diff=lfs merge=lfs -text
