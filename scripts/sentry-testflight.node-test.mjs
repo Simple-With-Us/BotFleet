@@ -3,6 +3,7 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createReceipt, validateReceipt } from './sentry-testflight-receipt.mjs';
 import { reportTestFlight } from './sentry-report-testflight.mjs';
@@ -12,7 +13,10 @@ const fixture = () => ({ archive: { bundleId:'app.botfleet', marketingVersion:'1
   sourceCommit:sha,expectedCommit:sha,bundleId:'app.botfleet',marketingVersion:'1.0.79',buildNumber:'202610060212',now:new Date('2026-10-06T02:30:00.000Z') });
 const receipt = () => createReceipt(fixture());
 const root = new URL('../', import.meta.url);
-const read = path => readFileSync(new URL(path,root),'utf8');
+// Git checks shell sources out with CRLF on Windows.  Extract the same shell
+// functions on every host instead of accidentally including the script tail.
+const read = path => readFileSync(new URL(path,root),'utf8').replace(/\r\n/g,'\n');
+const shellPath = path => path.replaceAll('\\', '/');
 
 test('receipt matches Cocoa SDK identity and exact archive, source, ASC build', () => {
   assert.equal(receipt().release, 'app.botfleet@1.0.79+202610060212');
@@ -97,7 +101,7 @@ test('ship receipt follows recorded success only after exact ASC readiness; skip
     for (const status of [0,2,3,4]) {
       const out=join(dir,`out-${status}`); writeFileSync(out,'');
       const script=`set -euo pipefail\nlog(){ :; }\nnode(){ if [[ "$1" == *asc-api.mjs ]]; then printf '{"ok":true}'; return ${status}; else echo emitted >> "$GITHUB_OUTPUT"; fi; }\n${ensure}\n${emit}\nensure_tf_ready\nemit_sentry_deployment_receipt\n`;
-      const result=spawnSync('bash',['-c',script],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:out,BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:dir,PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:dir,LOG_DIR:dir,ARCHIVE_PATH:dir,SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
+      const result=spawnSync('bash',['-c',script],{env:{PATH:process.env.PATH,APP_KEY:'botfleet',GITHUB_OUTPUT:shellPath(out),BUNDLE_ID:'app.botfleet',BUILD_NUM:'202610060212',MARKETING:'1.0.79',REPO_ROOT:shellPath(dir),PREV_SHIP_SHA:sha,DISPLAY_NAME:'BotFleet',IOS_PATH_PREFIX:'ios',FLEET_DIR:shellPath(dir),LOG_DIR:shellPath(dir),ARCHIVE_PATH:shellPath(dir),SENTRY_ARCHIVE_COMMIT:sha},encoding:'utf8'});
       assert.equal(result.status,0,result.stderr); assert.equal(readFileSync(out,'utf8'),status===0?'emitted\n':'');
     }
   } finally { rmSync(dir,{recursive:true,force:true}); }
@@ -124,7 +128,7 @@ test('wrong-project releases and malformed API payloads cannot produce deploymen
 
 test('CLI malformed JSON error does not echo provided input or token', () => {
   const secret=['synthetic','private','fixture'].join('-');
-  const result=spawnSync(process.execPath,[new URL('./sentry-report-testflight.mjs',import.meta.url).pathname],{
+  const result=spawnSync(process.execPath,[fileURLToPath(new URL('./sentry-report-testflight.mjs',import.meta.url))],{
     env:{PATH:process.env.PATH,SENTRY_DEPLOY_RECEIPT:`{${secret}`,SENTRY_AUTH_TOKEN:secret,GITHUB_RUN_ID:'123'},encoding:'utf8'});
   assert.equal(result.status,1); assert.match(result.stderr,/Invalid TestFlight receipt JSON/);
   assert.ok(!`${result.stdout}${result.stderr}`.includes(secret));
