@@ -37,6 +37,12 @@ function holdReasonBucket(reason: string): string {
   return reason.replace(/\d+(?:\.\d+)?/g, "#");
 }
 
+/** Dedup key for hold-reason publishes.  Failure counts stay exact; telemetry buckets. */
+function holdReasonDedupKey(reason: string): string {
+  if (reason.includes(" times in a row")) return reason;
+  return holdReasonBucket(reason);
+}
+
 /** One shared task per bot for incoming events, one for calendar work. */
 export type AutomationLane = "trigger" | "schedule";
 
@@ -1201,11 +1207,13 @@ export class RoutineManager {
         // that reaches canStart sets it again if it still holds.
         if (this.isBotSnoozed(run.botId)) {
           this.clearHoldReason(run);
+          run.hotDeferredAt = undefined;
           continue;
         }
         const state = this.options.botState(run.botId);
         if (state === "busy") {
           this.clearHoldReason(run);
+          run.hotDeferredAt = undefined;
           continue;
         }
         if (state === "missing") {
@@ -1256,6 +1264,7 @@ export class RoutineManager {
             // Same as the skip paths above: the gap is a quiet cooldown, not
             // a hold, so a stale reason must not render for the whole window.
             this.clearHoldReason(run);
+            run.hotDeferredAt = undefined;
             continue;
           }
         }
@@ -1364,7 +1373,7 @@ export class RoutineManager {
           // pushing duplicate SSE and replay frames on every tick — 8,640 no-op
           // writes a day for one sustained hold, scaling with queue depth.
           // A client that already has this run is already showing this reason.
-          this.setHoldReason(run, reason, { bucket: false });
+          this.setHoldReason(run, reason);
           continue;
         }
         if (stampResolvedThread && threadId) this.options.stampKey?.(run.botId, threadId, key);
@@ -1640,9 +1649,8 @@ export class RoutineManager {
    *  mechanism.  A no-op when there was nothing to clear, so a run that was
    *  never held does not emit on every tick. */
   private clearHoldReason(run: RoutineRun): void {
-    if (run.holdReason === undefined && run.hotDeferredAt === undefined) return;
+    if (run.holdReason === undefined) return;
     run.holdReason = undefined;
-    run.hotDeferredAt = undefined;
     this.publishedHoldBuckets.delete(run.id);
     this.save();
     this.emitRun(run);
@@ -1650,19 +1658,14 @@ export class RoutineManager {
 
   /** Publish a hold reason only when it changed.  The scheduler ticks every
    *  ten seconds, so an unchanged reason must not rewrite the state file. */
-  private setHoldReason(run: RoutineRun, reason: string, options?: { bucket?: boolean }): void {
-    const useBucket = options?.bucket !== false;
-    if (useBucket) {
-      const bucket = holdReasonBucket(reason);
-      const seen = this.publishedHoldBuckets.get(run.id);
-      if (seen === bucket) {
-        if (run.holdReason !== reason) run.holdReason = reason;
-        return;
-      }
-      this.publishedHoldBuckets.set(run.id, bucket);
-    } else if (reason === run.holdReason) {
+  private setHoldReason(run: RoutineRun, reason: string): void {
+    const key = holdReasonDedupKey(reason);
+    const seen = this.publishedHoldBuckets.get(run.id);
+    if (seen === key) {
+      if (run.holdReason !== reason) run.holdReason = reason;
       return;
     }
+    this.publishedHoldBuckets.set(run.id, key);
     run.holdReason = reason;
     this.save();
     this.emitRun(run);
