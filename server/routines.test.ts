@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeEvent } from "./contracts.ts";
-import { BUSY_DEFER_NOTE, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn } from "./routines.ts";
+import { BUSY_DEFER_NOTE, DEFAULT_WEBHOOK_HOT_DEFER_MS, nextOccurrence, RoutineManager, type RoutineManagerOptions, type RoutineRunOn } from "./routines.ts";
 
 type TurnCompletedEvent = Extract<RuntimeEvent, { type: "turn.completed" }>;
 
@@ -263,7 +263,7 @@ describe("RoutineManager", () => {
   it("defers a queued webhook while the host is hot and still starts a resource wake", async () => {
     const h = harness();
     let hot = true;
-    h.options.hostHot = () => hot;
+    h.options.hostHot = () => (hot ? "Host is busy (load 4 per core, swap 90%)" : null);
     const webhook = h.manager.enqueueWebhook({
       webhookId: "compile-gates",
       webhookName: "Compile gates",
@@ -285,20 +285,24 @@ describe("RoutineManager", () => {
     await h.manager.tick();
     expect(h.triggerSources).toEqual(["resource"]);
     expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason)
+      .toBe("Host is busy (load 4 per core, swap 90%)");
     hot = false;
     await h.manager.tick();
     expect(h.triggerSources).toEqual(["resource", "webhook"]);
-    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("running");
+    const dispatched = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(dispatched?.status).toBe("running");
+    expect(dispatched?.holdReason).toBeUndefined();
   });
 
-  it("clears a stale hold reason when a hot host defers a webhook", async () => {
-    // The other skip paths (snooze, busy, min-gap) drop a reason they will
-    // not re-check.  A hot-host defer is the same kind of skip: the engine
-    // may have recovered, and the receipt must not keep naming a dead CLI
-    // for as long as the host stays hot.
+  it("replaces a stale engine hold with the hot-host reason", async () => {
+    // The engine may have recovered.  While the host is what is parking the
+    // webhook, the receipt names the host, through the same hold-reason
+    // field a dead CLI uses.
     const h = harness();
     let hot = false;
-    h.options.hostHot = () => hot;
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    h.options.hostHot = () => (hot ? hostReason : null);
     h.setCanStart(false);
     h.options.dispatchHoldReason = () => "DeepSeek Harness could not start 3 times in a row";
     const webhook = h.manager.enqueueWebhook({
@@ -318,14 +322,150 @@ describe("RoutineManager", () => {
     await h.manager.tick();
     const deferred = h.manager.listRuns().find((run) => run.id === webhook.id);
     expect(deferred?.status).toBe("queued");
-    expect(deferred?.holdReason).toBeUndefined();
+    expect(deferred?.holdReason).toBe(hostReason);
+    expect(h.emitted.some((event) => event.run?.holdReason === hostReason)).toBe(true);
     expect(h.triggerSources).toEqual([]);
+  });
+
+  it("measures hot-host defer cap from the first hot tick, not enqueue time", async () => {
+    const h = harness();
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    const capMs = 5 * 60_000;
+    h.options.webhookHotDeferMaxMs = () => capMs;
+    h.options.hostHot = () => hostReason;
+    let busy = true;
+    h.options.botState = () => (busy ? "busy" : "ready");
+    const t0 = h.options.now!();
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-hot-since",
+      receivedAt: t0,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.started).toHaveLength(0);
+
+    const hotAt = t0 + 10 * 60_000;
+    h.setNow(hotAt);
+    busy = false;
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.hotDeferredAt).toBe(hotAt);
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs - 1);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(hotAt + capMs);
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["webhook"]);
+  });
+
+  it("does not probe the host while no webhook is queued", async () => {
+    const h = harness();
+    let probeCalls = 0;
+    h.options.hostHot = () => {
+      probeCalls += 1;
+      return "Host is busy (load 4 per core, swap 90%)";
+    };
+    await h.manager.tick();
+    expect(probeCalls).toBe(0);
+  });
+
+  it("dispatches a hot-deferred webhook after the max age, logs once, and clears the reason", async () => {
+    const h = harness();
+    const logs: string[] = [];
+    const hostReason = "Host is busy (load 12 per core, swap 91%)";
+    const capMs = 5 * 60_000;
+    h.options.log = (line) => logs.push(line);
+    h.options.webhookHotDeferMaxMs = () => capMs;
+    h.options.hostHot = () => hostReason;
+    const queuedAt = h.options.now!();
+    const webhook = h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-age",
+      receivedAt: queuedAt,
+    });
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason).toBe(hostReason);
+    expect(h.started).toHaveLength(0);
+
+    h.setNow(queuedAt + capMs - 1);
+    await h.manager.tick();
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.status).toBe("queued");
+    expect(h.manager.listRuns().find((run) => run.id === webhook.id)?.holdReason).toBe(hostReason);
+    expect(logs).toEqual([]);
+
+    h.setNow(queuedAt + capMs);
+    await h.manager.tick();
+    const dispatched = h.manager.listRuns().find((run) => run.id === webhook.id);
+    expect(dispatched?.status).toBe("running");
+    expect(dispatched?.holdReason).toBeUndefined();
+    expect(h.triggerSources).toEqual(["webhook"]);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("waited 5 min");
+    expect(logs[0]).toContain("dispatching anyway");
+    expect(logs[0]).toContain(hostReason);
+    expect(logs[0]).toContain(webhook.id);
+    await h.manager.tick();
+    expect(logs).toHaveLength(1);
+  });
+
+  it("uses the 20 minute default when no deferral cap is configured", async () => {
+    const h = harness();
+    h.options.log = () => {};
+    h.options.hostHot = () => "Host is busy (load 8 per core, swap 99%)";
+    const queuedAt = h.options.now!();
+    h.manager.enqueueWebhook({
+      webhookId: "compile-gates",
+      webhookName: "Compile gates",
+      prompt: "classify this",
+      botId: "maus-1",
+      runOn: "bot",
+      deliveryId: "wh-default",
+      receivedAt: queuedAt,
+    });
+    await h.manager.tick();
+    h.setNow(queuedAt + 19 * 60_000);
+    await h.manager.tick();
+    expect(h.started).toHaveLength(0);
+    h.setNow(queuedAt + DEFAULT_WEBHOOK_HOT_DEFER_MS);
+    await h.manager.tick();
+    expect(h.triggerSources).toEqual(["webhook"]);
+    expect(DEFAULT_WEBHOOK_HOT_DEFER_MS).toBe(20 * 60_000);
+  });
+
+  it("still starts a scheduled run while the host is hot", async () => {
+    const h = harness();
+    const logs: string[] = [];
+    h.options.log = (line) => logs.push(line);
+    h.options.hostHot = () => "Host is busy (load 40 per core, swap 99%)";
+    const lateAt = new Date(2026, 7, 17, 7, 55, 0).getTime();
+    h.manager.create({
+      name: "Late check",
+      prompt: "Do the late thing",
+      botId: "maus-7",
+      schedule: { type: "once", at: lateAt },
+    });
+    await h.manager.tick();
+    expect(h.started).toHaveLength(1);
+    expect(h.triggerSources).toEqual(["schedule"]);
+    expect(h.manager.listRuns()[0]?.holdReason).toBeUndefined();
+    expect(logs).toEqual([]);
   });
 
   it("does not cancel an in-flight webhook when the host turns hot", async () => {
     const h = harness();
     let hot = false;
-    h.options.hostHot = () => hot;
+    h.options.hostHot = () => (hot ? "Host is busy (load 4 per core, swap 90%)" : null);
     h.manager.enqueueWebhook({
       webhookId: "compile-gates",
       webhookName: "Compile gates",

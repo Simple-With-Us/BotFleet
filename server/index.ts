@@ -430,7 +430,7 @@ import { fleetSeatPromptPart } from "./seat-prompt.ts";
 import { findRecallCli, recallAvailableForTurn, recallStatus } from "./recall-transport.ts";
 import * as vps from "./vps-computer.ts";
 import { isSharedVpsMode } from "./vps-shared-session.ts";
-import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { DEFAULT_WEBHOOK_HOT_DEFER_MS, RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import {
   automationRolloverCaps,
   shouldRolloverAutomationThread,
@@ -450,7 +450,7 @@ import { bindLinqChatToTurn, deliverLinqOutboundIfNeeded, releaseLinqChat, stopL
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { ResourceTriggerManager } from "./resource-triggers.ts";
-import { readHostDispatchHot } from "./host-dispatch-hot.ts";
+import { readHostDispatchHoldReason, readHostDispatchHot } from "./host-dispatch-hot.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -5820,10 +5820,18 @@ routines = new RoutineManager({
   // queued routine receipts durable while the registry is being rebuilt,
   // then tick them after the authenticated credential has landed.
   admit: () => !runtimeQuiescing && !providerConfigBusy,
-  // Defer new webhook wakes while the host is hot.  The probe is the jobs
-  // admission swap cache (non-blocking) plus the ACP init load reading.
-  // Resource wakes are not shed: that is how Housekeeper still runs.
-  hostHot: readHostDispatchHot,
+  // Defer new webhook wakes while the host is hot, and say so on the
+  // receipt.  The probe is the jobs admission swap cache (non-blocking)
+  // plus the ACP init load reading.  Resource wakes are not shed: that is
+  // how Housekeeper still runs.  A person's turn never consults this.
+  hostHot: readHostDispatchHoldReason,
+  // Live read so an Infisical refresh of jobs.webhookHotDeferMinutes
+  // applies on the next tick.  Absent keeps the 20 minute default.
+  webhookHotDeferMaxMs: () => {
+    const minutes = cfg.jobs?.webhookHotDeferMinutes;
+    if (minutes === undefined || !Number.isFinite(minutes) || minutes <= 0) return DEFAULT_WEBHOOK_HOT_DEFER_MS;
+    return minutes * 60_000;
+  },
   canStart: (botId, threadId, runOn) => {
     const hold = dispatchHoldFor(botId, threadId, runOn, { count: true });
     // The scheduler asks for the reason immediately after a `false` here, for
