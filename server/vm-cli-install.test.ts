@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { loadVmCliManifest, vmCliInstallableTools, vmCliToolsForEnvironment } from "./vm-cli-manifest.ts";
 import {
   renderDockerfileCliInstallRun,
+  renderDockerfileVerifyArtifacts,
   renderLinuxInstallScript,
   renderVerifyScript,
   vmCliManifestDigest,
@@ -72,6 +73,32 @@ describe("vm CLI manifest install", () => {
     expect(dockerfile).toContain("botfleet-vm-cli-verify");
     expect(dockerfile).toContain(renderDockerfileCliInstallRun("local-vm").trim());
     expect(vmCliManifestDigest()).toHaveLength(64);
+  });
+
+  // Regression, 2026-10-06: the verify artifact stripped its shebang before
+  // writing it to /usr/local/bin/botfleet-vm-cli-verify and then executed that
+  // file directly.  With no shebang the kernel used /bin/sh, which is dash on
+  // Debian, and `set -euo pipefail` died with "Illegal option -o pipefail".
+  // The image build failed at the last step even though every CLI had already
+  // installed.  Nothing caught it because CI runs these unit tests and never
+  // builds the image, so the assertion has to be here.
+  it("gives the verify script a shebang, because the image executes it directly", () => {
+    const artifacts = renderDockerfileVerifyArtifacts("local-vm");
+    const written = artifacts.match(
+      /cat > \/usr\/local\/bin\/botfleet-vm-cli-verify\n([\s\S]*?)\nBOTFLEET_VM_CLI_VERIFY_BIN/,
+    );
+    expect(written).not.toBeNull();
+    const body = (written as RegExpMatchArray)[1];
+    expect(body.split("\n")[0]).toBe("#!/usr/bin/env bash");
+    // dash rejects this outright, so it is the specific thing the shebang buys.
+    expect(body).toContain("set -euo pipefail");
+  });
+
+  it("runs the verify script rather than piping it to an interpreter", () => {
+    const artifacts = renderDockerfileVerifyArtifacts("local-vm");
+    expect(artifacts).toContain(
+      "RUN chmod 0755 /usr/local/bin/botfleet-vm-cli-verify && /usr/local/bin/botfleet-vm-cli-verify",
+    );
   });
 
   it("renders verify checks for every installable tool", () => {
