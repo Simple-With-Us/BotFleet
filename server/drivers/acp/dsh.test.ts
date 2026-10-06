@@ -28,7 +28,7 @@ import {
 } from "./dsh.ts";
 import { resolveInitDeadline } from "./init-deadline.ts";
 import type { AcpStdioMcpServer } from "./core.ts";
-import { dshMcpPatchYaml, isStockDshCli, writeDshMcpPatch } from "./dsh-mcp.ts";
+import { dshMcpPatchYaml, isDshEngineCli, writeDshMcpPatch } from "./dsh-mcp.ts";
 
 const FAKE_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fake-acp-cli.ts");
 
@@ -112,9 +112,12 @@ describe("DshAgentDriver config", () => {
     expect(byId.get("MiniMax-M2.7-highspeed")?.contextWindow).toBe(204_800);
   });
 
-  it("encodes the ACP model option with its provider while preserving the picker id", () => {
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro")).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
-    expect(dshModelIdFromOptionValue('["deepseek-official","DeepSeek-V4.1-Pro"]')).toBe("DeepSeek-V4.1-Pro");
+  it("encodes DeepSeek picker ids onto preferred stock wire ids; MiniMax stays identity", () => {
+    // Clutch empty-advertisement fallback maps picker display ids onto the
+    // stock wire ids dsh actually declares.  MiniMax has no alias fold.
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4.1-Flash")).toBe('["deepseek-official","deepseek-flash"]');
+    expect(dshModelIdFromOptionValue('["deepseek-official","deepseek-v4-pro"]')).toBe("deepseek-v4-pro");
     expect(dshModelOptionValue("MiniMax-M3.1-Flash-Preview")).toBe('["minimax","MiniMax-M3.1-Flash-Preview"]');
     expect(dshModelIdFromOptionValue('["minimax","MiniMax-M3.1-Flash-Preview"]')).toBe("MiniMax-M3.1-Flash-Preview");
     expect(dshModelIdFromOptionValue('["other-provider","DeepSeek-V4.1-Pro"]')).toBeNull();
@@ -128,16 +131,19 @@ describe("DshAgentDriver config", () => {
     // catalog rather than two hand-picked ids means a future model added to
     // STATIC_DSH_MODELS is covered the day it lands.
     //
-    // Checked directly because the risk was live: dshProviderForModel is prefix
-    // based (`MiniMax-` -> minimax), so the newer M3.1 Flash Preview and M2.7
-    // highspeed ids do encode, but nothing in the suite proved it.
+    // DeepSeek picker ids translate to preferred stock wire ids on encode
+    // (wire-only; picker ids stay stable).  MiniMax stays an identity round trip.
+    const expectedWire: Record<string, string> = {
+      "DeepSeek-V4.1-Flash": "deepseek-flash",
+      "DeepSeek-V4.1-Pro": "deepseek-v4-pro",
+    };
     for (const option of STATIC_DSH_MODELS.options) {
       const encoded = dshModelOptionValue(option.id);
       expect(encoded, `${option.id} must encode to an ACP model option`).toBeTruthy();
       expect(
         dshModelIdFromOptionValue(encoded!),
         `${option.id} must survive the encode/decode round trip`,
-      ).toBe(option.id);
+      ).toBe(expectedWire[option.id] ?? option.id);
     }
   });
 
@@ -204,7 +210,7 @@ describe("native DSH ACP turns", () => {
   const create = async () => {
     instance = await DshAgentDriver.create({
       instanceId: "dsh-native-test",
-      displayName: "Harness",
+      displayName: "Clutch",
       environment: {},
       enabled: true,
       config: { cli: FAKE_CLI, fullAuto: false },
@@ -247,7 +253,7 @@ describe("native DSH ACP turns", () => {
   });
 
   it("sends the advertised wire value for a picker id the install declares differently", async () => {
-    // Harness #54 through BotFleet's ACP core: stock dsh declares
+    // Clutch #54 through BotFleet's ACP core: stock dsh declares
     // `deepseek-flash` (display name DeepSeek-V4.1-Flash), so the constructed
     // value `["deepseek-official","DeepSeek-V4.1-Flash"]` would be refused.
     // The resolver must send the advertised tuple, and the session must still
@@ -319,7 +325,10 @@ describe("native DSH ACP turns", () => {
     expect(methods).not.toContain("session/new");
   });
 
-  it("reports the picker model id when a turn accepts the native session default", async () => {
+  it("reports the session's declared wire model id when a turn accepts the native default", async () => {
+    // No model on the turn: core reads the session's currentValue.  That value
+    // is the stock wire id (deepseek-flash), not the picker display id — the
+    // Clutch empty-advertisement / stock-wire fold made them diverge.
     const flash = dshModelOptionValue("DeepSeek-V4.1-Flash");
     process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flash]);
     await create();
@@ -331,7 +340,7 @@ describe("native DSH ACP turns", () => {
     await recorder!.until((event) => event.type === "turn.completed");
 
     expect(recorder!.events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "session.started", model: "DeepSeek-V4.1-Flash" }),
+      expect.objectContaining({ type: "session.started", model: "deepseek-flash" }),
     ]));
   });
 
@@ -352,8 +361,11 @@ describe("native DSH ACP turns", () => {
     const done = await recorder!.until((event) => event.type === "turn.completed");
 
     expect(done).toMatchObject({ ok: false });
+    // Engine-neutral wording: this row is DeepSeek today, but the same error
+    // reaches MiniMax rows, and the retired "DeepSeek Harness" name must not
+    // come back on a user-visible message.
     expect(recorder!.events.find((event) => event.type === "runtime.error")?.message).toMatch(
-      /did not switch reasoning effort to max/,
+      /^Engine did not switch reasoning effort to max \(still /,
     );
     const methods = JSON.parse(readFileSync(rpcDump, "utf8")) as string[];
     expect(methods).not.toContain("session/prompt");
@@ -392,11 +404,11 @@ describe("dsh MCP delivery", () => {
   };
 
   it("treats stock dsh binaries as the published CLI that needs the ACP bridge", () => {
-    expect(isStockDshCli("dsh")).toBe(true);
-    expect(isStockDshCli("/Users/jay/apps/dsh-runtime/dsh")).toBe(true);
-    expect(isStockDshCli("/Users/jay/apps/dsh-runtime/dsh.sh")).toBe(true);
-    expect(isStockDshCli(FAKE_CLI)).toBe(false);
-    expect(isStockDshCli("/opt/dsh-wrapper")).toBe(false);
+    expect(isDshEngineCli("dsh")).toBe(true);
+    expect(isDshEngineCli("/Users/jay/apps/dsh-runtime/dsh")).toBe(true);
+    expect(isDshEngineCli("/Users/jay/apps/dsh-runtime/dsh.sh")).toBe(true);
+    expect(isDshEngineCli(FAKE_CLI)).toBe(false);
+    expect(isDshEngineCli("/opt/dsh-wrapper")).toBe(false);
   });
 
   it("renders BotFleet stdio mounts as dsh-mcp-client --patch rows", () => {
@@ -494,7 +506,7 @@ describe("dsh capability honesty", () => {
   it("advertises only the controls implemented by the native ACP profile", async () => {
     const instance = await DshAgentDriver.create({
       instanceId: "dsh-capabilities",
-      displayName: "Harness",
+      displayName: "Clutch",
       environment: {},
       enabled: true,
       config: DshAgentDriver.defaultConfig(),
@@ -507,7 +519,7 @@ describe("dsh capability honesty", () => {
         phoneMcp: true,
         qdrantMcp: true,
         localComputerMcp: true,
-        images: false,
+        images: true,
         effortLevels: ["none", "high", "max"],
       });
     } finally {
@@ -573,7 +585,7 @@ describe("dsh authentication and credentials", () => {
   });
 });
 
-// The DSH engine's catalog comes from the Harness install's own settings file
+// The DSH engine's catalog comes from the installed engine's own settings file
 // so a new profile model shows up without a BotFleet release.  The static
 // catalog is the floor, and because a DSH profile is *partial* (it often
 // configures only the minimax provider) the live read unions rather than
@@ -760,10 +772,11 @@ describe("readDshModelCatalog", () => {
   it("honors DSH_HOME over HOME", () => {
     const alt = mkdtempSync(join(tmpdir(), "dsh-alt-home-"));
     try {
-      // DSH_HOME is a home dir, so settings.yaml lives under its .dsh/.
-      mkdirSync(join(alt, "elsewhere", ".dsh"), { recursive: true });
+      // DSH_HOME is dsh's engine home itself (the same directory that holds
+      // .credentials.yaml), so settings.yaml sits directly inside it.
+      mkdirSync(join(alt, "elsewhere"), { recursive: true });
       writeFileSync(
-        join(alt, "elsewhere", ".dsh", "settings.yaml"),
+        join(alt, "elsewhere", "settings.yaml"),
         "llm-pi-ai:\n  providers:\n    minimax:\n      models:\n        - id: MiniMax-M9\n",
         "utf8",
       );
@@ -783,7 +796,7 @@ describe("readDshModelCatalog", () => {
   });
 });
 
-describe("dsh model option resolution (Harness #54 consumer)", () => {
+describe("dsh model option resolution (Clutch #54 consumer)", () => {
   // What stock dsh 0.1.5-rc.x advertises at session/new: opaque route tuples
   // whose ids are NOT the picker ids.
   const STOCK_ADVERTISED = [
@@ -822,12 +835,16 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
     );
   });
 
-  it("builds the value from the picker id exactly as before when nothing is advertised", () => {
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", undefined)).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
-    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [])).toBe('["deepseek-official","DeepSeek-V4.1-Pro"]');
+  it("maps DeepSeek picker ids onto preferred stock wire ids when nothing is advertised", () => {
+    // Clutch fix: empty-advertisement fallback used to send the picker display
+    // id and produce unknown model option on stock dsh.  Preferred wire ids now.
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", undefined)).toBe('["deepseek-official","deepseek-v4-pro"]');
+    expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [])).toBe('["deepseek-official","deepseek-v4-pro"]');
     expect(dshModelOptionValue("DeepSeek-V4.1-Pro", [{ id: "model", options: [] }])).toBe(
-      '["deepseek-official","DeepSeek-V4.1-Pro"]',
+      '["deepseek-official","deepseek-v4-pro"]',
     );
+    expect(dshModelOptionValue("DeepSeek-V4.1-Flash", undefined)).toBe('["deepseek-official","deepseek-flash"]');
+    expect(dshModelOptionValue("deepseek-pro")).toBe('["deepseek-official","deepseek-v4-pro"]');
   });
 
   it("refuses a retired MiniMax id instead of silently substituting another model", () => {
@@ -854,7 +871,7 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
   });
 
   it("names the provider route of a refused model, so a wrong-route pick does not read as a contradiction", () => {
-    // Harness #56: a model declared only under another provider stays refused
+    // Clutch #56: a model declared only under another provider stays refused
     // (a different route has its own credentials and billing), and the error
     // now lists offers as provider/id and says where the model is declared.
     let thrown: unknown;
@@ -877,5 +894,239 @@ describe("dsh model option resolution (Harness #54 consumer)", () => {
     expect(error.offered).toContain("minimax-cn/MiniMax-M3.1-Flash-Preview");
     expect(error.message).toContain("MiniMax-M3.1-Flash-Preview is declared only under minimax-cn");
     expect(dshSupport.classifyError?.(error)).toBe("model_catalog_outage");
+  });
+});
+
+// Clutch publishes per-model effort levels for MiniMax M3.1 on DSH, which
+// exist only when the install's settings.yaml entry declares
+// `reasoningEfforts` (stock dsh does not catalog M3.1).  The live catalog
+// gates the picker on that entry, and configureSession is Clutch's.
+describe("DSH MiniMax M3.1 reasoning effort", () => {
+  const M31 = "MiniMax-M3.1-Flash-Preview";
+  const M31_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+  const m31Entry = (extra = "") =>
+    `llm-pi-ai:\n  providers:\n    minimax:\n      apiKeyEnv: MINIMAX_API_KEY\n      models:\n` +
+    `        - id: MiniMax-M2.7-highspeed\n` +
+    `        - id: ${M31}\n          contextWindow: 1000000\n${extra}`;
+  const CONFIGURED =
+    "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n" +
+    "          compat: { forceAdaptiveThinking: true }\n";
+  const ADAPTIVE = "          compat: { forceAdaptiveThinking: true }\n";
+
+  describe("live catalog", () => {
+    let home: string;
+    const catalogWith = (yaml: string | null) => {
+      if (yaml !== null) {
+        mkdirSync(join(home, ".dsh"), { recursive: true });
+        writeFileSync(join(home, ".dsh", "settings.yaml"), yaml, "utf8");
+      }
+      return readDshModelCatalog({ HOME: home });
+    };
+    const levelsOf = (catalog: ReturnType<typeof readDshModelCatalog>, id: string) =>
+      catalog.options.find((option) => option.id === id)?.effortLevels;
+
+    beforeEach(() => {
+      home = mkdtempSync(join(tmpdir(), "dsh-m31-effort-"));
+    });
+
+    afterEach(() => {
+      removeTempDir(home);
+    });
+
+    it("offers M3.1's levels, xhigh included, when the settings entry declares them", () => {
+      const catalog = catalogWith(m31Entry(CONFIGURED));
+      expect(levelsOf(catalog, M31)).toEqual(M31_LEVELS);
+      // Every other row keeps no levels of its own: DeepSeek takes the
+      // engine-wide list, and the client's DSH MiniMax rule hides M2.7.
+      for (const id of ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Pro", "MiniMax-M2.7-highspeed"]) {
+        expect(levelsOf(catalog, id)).toBeUndefined();
+      }
+    });
+
+    it("offers no M3.1 level when the entry has no reasoningEfforts, so dsh never refuses a pick", () => {
+      // The adaptive flag is set in both, so reasoningEfforts is what is missing.
+      expect(levelsOf(catalogWith(m31Entry(ADAPTIVE)), M31)).toEqual([]);
+      expect(levelsOf(catalogWith(m31Entry(`          reasoningEfforts: false\n${ADAPTIVE}`)), M31)).toEqual([]);
+    });
+
+    it("offers no M3.1 level unless the entry forces adaptive thinking", () => {
+      // Without compat.forceAdaptiveThinking pi-ai sends fixed budgets, clamps
+      // xhigh and max to high, and sends no output_config.effort, so most of
+      // the levels would run the same request.
+      const efforts = "          reasoningEfforts: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }\n";
+      expect(levelsOf(catalogWith(m31Entry(efforts)), M31)).toEqual([]);
+      expect(
+        levelsOf(catalogWith(m31Entry(`${efforts}          compat: { forceAdaptiveThinking: false }\n`)), M31),
+      ).toEqual([]);
+    });
+
+    it("offers no M3.1 level without a settings file", () => {
+      expect(levelsOf(catalogWith(null), M31)).toEqual([]);
+    });
+
+    it("reads the entry from the engine home when DSH_HOME is set", () => {
+      // DSH_HOME is dsh's engine home itself, with no .dsh folder inside it.
+      const engineHome = join(home, "engine-home");
+      mkdirSync(engineHome, { recursive: true });
+      writeFileSync(join(engineHome, "settings.yaml"), m31Entry(CONFIGURED), "utf8");
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: engineHome }), M31)).toEqual(M31_LEVELS);
+      // The old lookup went one .dsh too deep and found nothing.
+      expect(levelsOf(readDshModelCatalog({ HOME: home, DSH_HOME: join(home, "missing") }), M31)).toEqual([]);
+    });
+
+    it("keeps only the levels the entry maps", () => {
+      const subset = "          reasoningEfforts: { high: high, max: max }\n";
+      expect(levelsOf(catalogWith(m31Entry(subset + ADAPTIVE)), M31)).toEqual(["high", "max"]);
+    });
+  });
+
+  it("passes the Clutch per-model map through as a fallback for the static catalog", () => {
+    expect(dshSupport.perModelEffortLevels?.[M31]).toEqual(M31_LEVELS);
+    expect(dshSupport.effortLevels).toEqual(["none", "high", "max"]);
+  });
+
+  describe("configureSession", () => {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const request = async (method: string, params: unknown) => {
+      calls.push({ method, params });
+      return { configOptions: [{ id: "reasoning_effort", currentValue: (params as { value: string }).value }] };
+    };
+
+    beforeEach(() => {
+      calls.length = 0;
+    });
+
+    const configure = (turn: { model?: string; effort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" }) =>
+      dshSupport.configureSession({
+        request,
+        sessionId: "s1",
+        config: { cli: "dsh" } as never,
+        turn: { threadId: "t1", text: "hi", ...turn },
+        sessionModels: [],
+      });
+
+    it("sends xhigh for M3.1", async () => {
+      await configure({ model: M31, effort: "xhigh" });
+      expect(calls).toEqual([
+        { method: "session/set_config_option", params: { sessionId: "s1", configId: "reasoning_effort", value: "xhigh" } },
+      ]);
+    });
+
+    it("clears a sticky M3.1 level to dsh's provider default when the turn picks Default", async () => {
+      await configure({ model: M31 });
+      expect(calls).toEqual([
+        { method: "session/set_config_option", params: { sessionId: "s1", configId: "reasoning_effort", value: "" } },
+      ]);
+    });
+
+    it("swallows only dsh's invalid-params refusal of the provider default", async () => {
+      const refuse = Object.assign(new Error("Invalid params: unknown reasoning effort"), { code: -32602 });
+      const failing = (error: Error) =>
+        dshSupport.configureSession({
+          request: async (method: string, params: unknown) => {
+            calls.push({ method, params });
+            throw error;
+          },
+          sessionId: "s1",
+          config: { cli: "dsh" } as never,
+          turn: { threadId: "t1", text: "hi", model: M31 },
+          sessionModels: [],
+        });
+      await expect(failing(refuse)).resolves.toBeUndefined();
+      // A timeout carries no wire code and an internal error carries -32603: neither is a refusal.
+      const timeout = new Error("session/set_config_option timed out after 20 s");
+      await expect(failing(timeout)).rejects.toBe(timeout);
+      const internal = Object.assign(new Error("Internal error"), { code: -32603 });
+      await expect(failing(internal)).rejects.toBe(internal);
+      expect(calls).toHaveLength(3);
+    });
+
+    it("still sends nothing for Default on DeepSeek and on DSH MiniMax rows without levels", async () => {
+      await configure({ model: "DeepSeek-V4.1-Pro" });
+      await configure({ model: "MiniMax-M2.7-highspeed" });
+      expect(calls).toEqual([]);
+    });
+
+    it("still maps none to off for DeepSeek", async () => {
+      await configure({ model: "DeepSeek-V4.1-Flash", effort: "none" });
+      expect(calls).toEqual([
+        { method: "session/set_config_option", params: { sessionId: "s1", configId: "reasoning_effort", value: "off" } },
+      ]);
+    });
+  });
+
+  describe("native turns", () => {
+    let instance: ProviderInstance | undefined;
+    let recorder: EventRecorder | undefined;
+    let scratch: string;
+    const m31Value = '["minimax","MiniMax-M3.1-Flash-Preview"]';
+    const flashValue = '["deepseek-official","deepseek-flash"]';
+
+    beforeEach(() => {
+      ensureDirs();
+      chmodSync(FAKE_CLI, 0o755);
+      scratch = mkdtempSync(join(tmpdir(), "botfleet-dsh-m31-"));
+      process.env.FAKE_ACP_DUMP = join(scratch, "dsh.json");
+      process.env.FAKE_ACP_MODELS_JSON = JSON.stringify([flashValue, m31Value]);
+      // dsh's M3.1 offer, minus the provider-default "" the fake cannot list.
+      process.env.FAKE_ACP_REASONING_EFFORTS = M31_LEVELS.join(",");
+    });
+
+    afterEach(async () => {
+      delete process.env.FAKE_ACP_DUMP;
+      delete process.env.FAKE_ACP_MODELS_JSON;
+      delete process.env.FAKE_ACP_REASONING_EFFORTS;
+      recorder?.stop();
+      await instance?.dispose();
+      await removeTempDir(scratch);
+    });
+
+    const run = async (threadId: string, effort?: "xhigh") => {
+      instance = await DshAgentDriver.create({
+        instanceId: "dsh-m31-test",
+        displayName: "Clutch",
+        environment: { HOME: scratch },
+        enabled: true,
+        config: { cli: FAKE_CLI, fullAuto: false },
+      });
+      recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn({ threadId, text: "think hard", model: M31, ...(effort ? { effort } : {}) });
+      return recorder.until((event) => event.type === "turn.completed");
+    };
+    const configCalls = () => JSON.parse(readFileSync(`${process.env.FAKE_ACP_DUMP}.config.json`, "utf8"));
+
+    it("switches to M3.1 and sets xhigh before prompting", async () => {
+      const done = await run("dsh-m31-xhigh", "xhigh");
+      expect(done).toMatchObject({ ok: true });
+      expect(configCalls()).toEqual([
+        { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: m31Value } },
+        { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "reasoning_effort", value: "xhigh" } },
+      ]);
+    });
+
+    it("never fails a Default turn when dsh refuses the provider-default value", async () => {
+      // The fake refuses "" (it is not in its list), the shape of a route that
+      // declares its own default effort.  Default is best effort, so the turn
+      // runs at the session's level instead of failing.
+      const rpcDump = join(scratch, "rpc.json");
+      process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+      try {
+        const done = await run("dsh-m31-default");
+        expect(done).toMatchObject({ ok: true });
+      } finally {
+        delete process.env.FAKE_ACP_RPC_DUMP;
+      }
+      // The fake's config dump only records accepted sets, so a turn that
+      // never sent "" would look identical there.  The RPC dump records every
+      // request: the model switch and then the refused "" both arrive, before
+      // the prompt.
+      const methods = JSON.parse(readFileSync(rpcDump, "utf8")) as string[];
+      const sets = methods.flatMap((method, index) => (method === "session/set_config_option" ? [index] : []));
+      expect(sets).toHaveLength(2);
+      expect(sets[1]).toBeLessThan(methods.indexOf("session/prompt"));
+      expect(configCalls()).toEqual([
+        { method: "session/set_config_option", params: { sessionId: "fake-acp-session", configId: "model", value: m31Value } },
+      ]);
+    });
   });
 });

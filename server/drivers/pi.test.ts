@@ -5,7 +5,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly; spawnCli
 // resolves it to `node <script>`, so these run everywhere.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,7 +130,7 @@ describe("buildMcpServers", () => {
     });
   });
 
-  it("passes a local computer (Cua/VPS) through as a direct stdio server", () => {
+  it("passes a local computer (CUA/VPS) through as a direct stdio server", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",
@@ -828,6 +828,68 @@ describe("applyPiLocalCatalog", () => {
     expect(catalog.options.some((o) => o.id === "omlx/MiniMax-M3-4bit")).toBe(false);
     expect(catalog.options.some((o) => o.id === "openai/gpt-4o")).toBe(true);
   });
+});
+
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash).  Lets a test take an engine from
+ *  working to broken between two snapshots without any real engine. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("PiDriver version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-pi-switch-"));
+      const cli = switchableCli(dir);
+      const home = mkdtempSync(join(tmpdir(), "omb-pi-switch-home-"));
+      const instance = await PiDriver.create({
+        instanceId: `pi-switch-${mode}`,
+        displayName: undefined,
+        environment: { HOME: home, USERPROFILE: home },
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: false },
+      });
+      cli.setWorking(true);
+      const first = await instance.snapshot();
+      expect(first.state).toBe("available");
+      expect(first.version).toBe("9.9.9");
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
 });
 
 describe("PiDriver snapshot", () => {

@@ -10,7 +10,7 @@ import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { botSupportsImageAttachments } from "@/lib/model-images";
 import { cn } from "@/lib/cn";
-import { useComposerDraft } from "@/lib/drafts";
+import { foldSentDrafts, useComposerDraft, useFailedSendRestore, type SentDraft } from "@/lib/drafts";
 import { BotMascot } from "./Avatar";
 import { ComposerAttachments, pathForFile } from "./ComposerAttachments";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
@@ -144,6 +144,7 @@ export function Composer({
   onEditLast,
   replyTo,
   onClearReply,
+  onRestoreReply,
   locked = false,
 }: {
   bot?: Bot;
@@ -152,6 +153,8 @@ export function Composer({
   onEditLast?: () => void;
   replyTo?: Message | null;
   onClearReply?: () => void;
+  /** A send the server refused: put the message it replied to back. */
+  onRestoreReply?: (message: Message) => void;
   /** New rooms keep the composer inert until their setup is saved or skipped. */
   locked?: boolean;
 }) {
@@ -187,9 +190,11 @@ export function Composer({
     : (bot?.name ?? "The bot");
   // Per-thread draft: switching bots unmounts this component, so both the
   // text and its attachment chips have to outlive it (see lib/drafts).
-  const [text, setText, attachments, setAttachments] = useComposerDraft(
-    group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`,
-  );
+  const draftId = group ? `group:${group.id}:${group.threadId}` : `bot:${bot?.id ?? ""}`;
+  const [text, setText, attachments, setAttachments] = useComposerDraft(draftId);
+  // The composer clears the moment a message goes out; a send the server
+  // refuses, or cannot be reached for, hands it all back through this.
+  const restoreFailedSend = useFailedSendRestore<Message>(threadId, onRestoreReply);
   const addAttachments = useCallback(
     (next: Attachment[]) => setAttachments((prev) => [...prev, ...next]),
     [setAttachments],
@@ -294,7 +299,7 @@ export function Composer({
   // the moment the room settles. 1:1 mid-turn sends still POST (the harness
   // queue), but stay off the transcript until drain — the chip here is the
   // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<{ text: string; replyToId?: string } | null>(null);
+  const [queued, setQueued] = useState<{ text: string; replyToId?: string; sent: SentDraft<Message> } | null>(null);
   const pendingChip = group
     ? queued?.text
     : (bot ? state.pendingQueued?.[bot.threadId]?.at(-1)?.text : undefined);
@@ -351,12 +356,18 @@ export function Composer({
     }
     const t = composeMessage(text, attachments);
     if (!t) return;
+    const sent: SentDraft<Message> = { draftId, threadId, text, attachments, reply: replyTo ?? undefined };
+    const onError = () => restoreFailedSend(sent);
     if (busy && group) {
       if (opts?.steerNow) {
         dispatch({ type: "interruptGroup", groupId: group.id });
-        dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
+        dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       } else {
-        setQueued({ text: t, replyToId: replyTo?.id });
+        // one message is held at a time: a second joins it, never replaces it
+        setQueued((held) => {
+          const merged = held ? foldSentDrafts(held.sent, sent) : sent;
+          return { text: composeMessage(merged.text, merged.attachments), replyToId: merged.reply?.id, sent: merged };
+        });
       }
       setText("");
       setAttachments([]);
@@ -364,10 +375,10 @@ export function Composer({
       return;
     }
     if (group) {
-      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
+      dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id, onError });
       track("message_sent", { room: true });
     } else if (bot) {
-      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id });
+      dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id, onError });
       if (busy && opts?.steerNow) {
         dispatch({ type: "interrupt", botId: bot.id });
       }
@@ -382,14 +393,21 @@ export function Composer({
     if (group) {
       if (queued.text.includes("<attached-image ") && !imageTargetsSupport(queued.text)) {
         dispatch({ type: "error", message: "The selected responder does not support image attachments." });
+        restoreFailedSend(queued.sent);
         setQueued(null);
         return;
       }
-      dispatch({ type: "sendGroup", groupId: group.id, text: queued.text, replyToId: queued.replyToId });
+      dispatch({
+        type: "sendGroup",
+        groupId: group.id,
+        text: queued.text,
+        replyToId: queued.replyToId,
+        onError: () => restoreFailedSend(queued.sent),
+      });
       track("message_sent", { room: true, queued: true });
     }
     setQueued(null);
-  }, [busy, queued, group, members, state.instances, dispatch]);
+  }, [busy, queued, group, members, state.instances, dispatch, restoreFailedSend]);
 
   // native dictation: partials stream into the input while the Swift
   // helper runs; the final transcript stays in the box, ready to edit/send
@@ -698,11 +716,17 @@ export function Composer({
             can type again, so a waiting bot is impossible to miss. */}
         {approval && (
           <div className="mb-2 overflow-hidden rounded-2xl border border-accent/40 bg-card">
-            <PendingApprovalPanel pending={approval} count={approvals.length} index={0} />
+            <PendingApprovalPanel
+              pending={approval}
+              count={approvals.length}
+              index={0}
+              bypassActive={Boolean(approvalBot?.bypassPermissions)}
+            />
             <PendingApprovalActions
               pending={approval}
               threadId={threadId}
               bot={approvalBot}
+              totalCount={approvals.length}
               onCancelTurn={() => {
                 if (group) dispatch({ type: "interruptGroup", groupId: group.id });
                 else if (bot) dispatch({ type: "interrupt", botId: bot.id });

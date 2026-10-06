@@ -14,6 +14,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { z } from "zod";
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { AccessTokenState } from "../../server/recall-access.ts";
 import type { ComputerReach } from "../../server/computer-capability.ts";
@@ -23,6 +24,9 @@ import type { ConnectorToolGrant } from "../../shared/connector-tools";
 import type { RoutineRequestCardData } from "../../shared/routine-request";
 import { publishRuntimeEvent, publishRuntimeGap } from "@/lib/runtime-feed";
 import type { ToolKind } from "../../shared/tool-activity";
+import type { ContextInjectionRef } from "../../shared/context-injection";
+import { taskWorkspaceContextsMatch, type TaskAppRef, type TaskWorkspaceContext } from "../../shared/task-workspace-context";
+import { eligibleTaskApps } from "@/lib/task-app-context";
 import {
   DEFAULT_ROOM_TERMINOLOGY,
   resolveRoomLabels,
@@ -30,6 +34,7 @@ import {
   type RoomTerminology,
 } from "../../shared/terminology";
 import {
+  allowsMultipleBotThreads,
   parseConversationMode,
   type ConversationMode,
 } from "../../shared/conversation-mode";
@@ -96,12 +101,15 @@ export interface Message {
    * RoutineRunTrigger, inlined so this module does not depend on it.  Lets
    * the UI show an accurate subtitle instead of a generic "Routine" label
    * for every non-webhook/imessage system message. */
-  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+  automationSource?: "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret";
+  /** A "Job Finished" row: a background job of the bot's ended. */
+  job?: import("../../shared/jobs").JobRowData;
   text?: string;
   /** The model that actually generated this reply; absent on legacy rows. */
   modelSelection?: { instanceId: string; model: string };
   audio?: Array<{ path: string; mime: string }>;
+  voiceText?: string;
   recording?: { path: string; mime: "audio/wav"; transcript: string; engine: "apple-on-device" };
   recordingReview?: { correction?: string; comment?: string; updatedAt: number };
   translation?: { language: string; text: string; provider: string };
@@ -128,7 +136,23 @@ export interface Message {
     detail?: string;
     /** wall time from start to completion, milliseconds */
     durationMs?: number;
+    /** the keys that find this step's full input and output in the harness's
+     * side store (`GET /api/threads/:id/items/:itemId/io`).  Absent on rows
+     * recorded before that store existed; the row then says so. */
+    itemId?: string;
+    turnId?: string;
+    /** The helper (native subagent) step this one ran inside: the parent
+     * row's `itemId`.  The chat nests the row under that parent instead of
+     * interleaving parallel helpers' steps with the bot's own. */
+    parentItemId?: string;
   };
+  /** What the harness put in front of the model for THIS turn that the person
+   * did not type — memory, selected skills, a quoted reply, a replayed
+   * conversation (shared/context-injection.ts).  One short record each: a
+   * source, a redacted one-line preview and a size.  The full text lives in the
+   * side store and is fetched when a row opens.  Set on the user message that
+   * started the turn, so the chat can show the rows right under it. */
+  contextInjections?: ContextInjectionRef[];
   /** user messages sent into a running turn — the model saw it mid-turn */
   steered?: boolean;
   /** screen messages: a frame of the bot's computer (base64) */
@@ -215,12 +239,18 @@ export interface GroupTask {
   lastActivity?: number;
   pinnedCwd?: string | null;
   pinnedMessageId?: string;
+  workspaceContext?: TaskWorkspaceContext;
 }
 
 export interface ModelSelection {
   instanceId: string;
+  /** Always the real slug that runs, also for a "Latest <Class>" entry. */
   model: string;
   effort?: EffortLevel;
+  /** The model class this entry floats on ("sonnet" = Latest Sonnet); see
+   *  shared/model-lineage.ts.  The picker sends `null` when a person picks
+   *  a pinned model, so the harness does not carry an older float forward. */
+  latest?: string | null;
   fallbacks?: ModelSelection[];
 }
 
@@ -243,9 +273,10 @@ export interface Task {
    *  connection;  `byModel` splits the bucket per model that ran.
    *  Absent on older records. */
   usageByInstance?: Record<string, TaskUsage & { engineId?: string; byModel?: Record<string, TaskUsage> }>;
-  /** folder this task's turns run in, pinned on its first turn; null =
+  /** Folder selected at creation or pinned on the first turn; null =
    * legacy home-folder session; absent = not pinned yet */
   cwd?: string | null;
+  workspaceContext?: TaskWorkspaceContext;
   /** Optional engine for this conversation.  Absent means the bot's own
    * modelSelection.  Used in Projects mode so a thread is not a named bot. */
   modelSelection?: ModelSelection;
@@ -326,6 +357,8 @@ export interface Bot {
   cwd?: string;
   /** auto mode: the bot approves its own tool permissions */
   autoApprove?: boolean;
+  /** permission bypass mode: automatically approve all tools, commands, and routines without halting */
+  bypassPermissions?: boolean;
   /** optional model review for otherwise undecided, attended approvals */
   autoReview?: "off" | "shadow" | "enforce";
   /** tools this bot may always use without asking */
@@ -339,6 +372,9 @@ export interface Bot {
   speechDevices?: Array<"mac" | "iphone">;
   /** this bot's own voice id (falls back to the app-wide one) */
   voice?: string;
+  /** Whether to post-process bot answers with DeepSeek V4.1 Flash for TTS.
+   * "on_demand" runs only on manual speak; "always" runs on every turn; "off" uses raw answer. */
+  voiceSummaryMode?: "off" | "on_demand" | "always";
   pinned?: boolean;
   hidden?: boolean;
   /** Sidebar section this bot renders under; absent = unsectioned. */
@@ -478,6 +514,7 @@ export interface ConfigStatus {
     mode: "shared" | "per-bot";
     maxInstances: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
   };
   opencodeGo?: { configured: boolean };
@@ -672,6 +709,13 @@ export interface InstanceInfo {
   snapshot: {
     state: "available" | "unavailable";
     reason?: string;
+    /** The probe gave no answer (timeout) — show "Checking", not a setup
+     *  problem.  See server/contracts.ts ProviderSnapshot.transient. */
+    transient?: boolean;
+    /** Optional integration not set up (the ASCII.dev Box engine with no Box token): kept
+     *  out of engine lists until it is. */
+    hidden?: boolean;
+    /** Undefined when the auth probe could not tell. */
     authenticated?: boolean;
     version?: string | null;
     /** a reported cost on a subscription is notional; the UI says so */
@@ -706,6 +750,9 @@ export interface InstanceInfo {
   };
   models: {
     default: string;
+    /** Set when the provider itself just listed this catalog, so a saved id
+     *  missing from it can honestly be called "Not in catalog". */
+    live?: boolean;
     options: Array<{
       id: string;
       label: string;
@@ -724,6 +771,7 @@ export interface InstanceInfo {
       supportsEffort?: boolean;
       /** Absent inherits the instance-wide image capability. */
       images?: boolean;
+      contextWindow?: number;
     }>;
   };
   capabilities?: {
@@ -780,10 +828,21 @@ export type AppSettingsSection =
 export interface AppState {
   bots: Bot[];
   groups: Group[];
+  /** Background jobs per thread, as the harness's last `jobs` frame (or the
+   *  hydrate's `GET /api/jobs`) gave them: running first, then finished. */
+  jobsByThread: Record<string, import("../../shared/jobs").JobSnapshot[]>;
   instances: InstanceInfo[];
+  /** When the server produced `instances` (its `describedAt`), so an older
+   *  answer arriving late — a slow GET, the hydrate racing the `instances`
+   *  push, a PATCH response — never replaces a newer one. */
+  instancesDescribedAt: number;
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Explicitly selected thread for the active bot (e.g., from App Matrix). Null follows bot.threadId. */
+  viewedThreadId: string | null;
+  /** Local task-creation dialog; never changes the bot's running thread. */
+  taskCreationBotId: string | null;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   selectedRoutineId?: string | null;
   routines: Routine[];
@@ -881,6 +940,10 @@ function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string
 export type BotAnnouncement = Omit<Bot, "messages"> & { messages?: Message[] };
 
 export type Action =
+  /** Every job the harness knows, from `GET /api/jobs` at hydrate. */
+  | { type: "jobsHydrated"; jobs: import("../../shared/jobs").JobSnapshot[] }
+  /** One thread's full set, from a `jobs` frame. */
+  | { type: "jobsFrame"; threadId: string; jobs: import("../../shared/jobs").JobSnapshot[] }
   | {
       type: "hydrate";
       bots: Bot[];
@@ -918,7 +981,16 @@ export type Action =
   | { type: "groupPatched"; group: Partial<Group> & { id: string } }
   | { type: "groupDeleted"; groupId: string }
   | { type: "createGroup"; memberIds: string[]; name?: string; section?: string }
-  | { type: "sendGroup"; groupId: string; text: string; replyToId?: string }
+  | {
+      type: "sendGroup";
+      groupId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | {
       type: "patchGroup";
       groupId: string;
@@ -936,10 +1008,23 @@ export type Action =
   | { type: "deleteGroupTask"; groupId: string; threadId: string }
   | { type: "toggleReaction"; threadId: string; messageId: string; emoji: string }
   | { type: "interruptGroup"; groupId: string }
-  | { type: "instances"; instances: InstanceInfo[] }
+  | { type: "instances"; instances: InstanceInfo[]; describedAt?: number }
+  /** The stream could not resume, so the harness may be a new process whose
+   *  `describedAt` clock owes nothing to the last one's: forget the mark (not
+   *  the list) so the next answer is not judged against it. */
+  | { type: "instancesOrderReset" }
   | { type: "configStatus"; config: ConfigStatus }
-  | { type: "select"; id: string }
-  | { type: "send"; botId: string; text: string; replyToId?: string }
+  | { type: "select"; id: string; viewedThreadId?: string | null }
+  | {
+      type: "send";
+      botId: string;
+      text: string;
+      replyToId?: string;
+      /** The server refused the send or could not be reached.  Called with the
+       * reason, after the error banner is set, so a caller that cleared its
+       * input can put it back. */
+      onError?: (message: string) => void;
+    }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string; at?: number }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
   | { type: "cancelQueued"; botId: string; queueId: string }
@@ -961,9 +1046,18 @@ export type Action =
       /** Local UI recovery hook for voice flows. Never sent to the server. */
       onError?: (message: string) => void;
     }
-  | { type: "newTask"; botId: string }
+  | {
+      type: "approveAllRequests";
+      threadId: string;
+      onError?: (message: string) => void;
+    }
+  | { type: "requestNewTask"; botId: string }
+  | { type: "cancelNewTask" }
+  | { type: "newTask"; botId: string; appRef?: TaskAppRef }
   | { type: "switchTask"; botId: string; threadId: string }
-  | { type: "taskSwitched"; bot: Bot }
+  // `messages` is optional: the pre-send switch asks for `?messages=0`
+  // and must not be typed as a full transcript replace.
+  | { type: "taskSwitched"; bot: Pick<Bot, "id" | "threadId"> & Partial<Omit<Bot, "id" | "threadId">> }
   | { type: "renameTask"; botId: string; threadId: string; title: string }
   /** Put one thread to sleep, or wake it.  `null` is the wake — an omitted
    * field means "leave it alone" on the harness route, and `0` is the real
@@ -1142,12 +1236,33 @@ export function prependEarlier(current: Message[], earlier: Message[]): Message[
   return fresh.length ? [...fresh, ...current] : current;
 }
 
+/** Transcript to apply from a bot frame, or undefined to keep the current one.
+ * A switch frame with messages always wins. A later snapshot for the same
+ * thread replaces only when it shares no ids with the transcript on screen.
+ * An empty snapshot is authoritative (the thread really is empty), and a
+ * non-empty snapshot replaces an empty client transcript. Either length used
+ * to return undefined, which left the previous conversation under the new
+ * header after a `?messages=0` ack, or left the chat blank. */
+function transcriptFromBotFrame(
+  beforeMessages: Message[],
+  incoming: Message[] | undefined,
+  switchedThread: boolean,
+): Message[] | undefined {
+  if (!incoming) return undefined;
+  if (switchedThread) return incoming;
+  const currentIds = new Set(beforeMessages.map((message) => message.id));
+  return incoming.every((message) => !currentIds.has(message.id)) ? incoming : undefined;
+}
+
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "hydrate": {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
       const selectedId =
         state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
+      // A pin belongs to the selection.  Falling through to another bot must
+      // not keep showing the previous thread.
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
       return {
         ...state,
         bots: mergeHydrateBots(
@@ -1165,6 +1280,7 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
         computerControl: action.computerControl,
         selectedId,
+        viewedThreadId,
         error: isHarnessUnreachableError(state.error) ? null : state.error,
         // a fresh hydrate replaces the whole picture, scrollback included:
         // carrying the old flags over would leave a pill promising a page
@@ -1271,6 +1387,13 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     case "resourceTriggersHydrated":
       return { ...state, resourceTriggers: action.triggers };
+    case "jobsHydrated": {
+      const jobsByThread: AppState["jobsByThread"] = {};
+      for (const job of action.jobs) (jobsByThread[job.threadId] ??= []).push(job);
+      return { ...state, jobsByThread };
+    }
+    case "jobsFrame":
+      return { ...state, jobsByThread: { ...state.jobsByThread, [action.threadId]: action.jobs } };
     case "resourceTriggerPatched": {
       const exists = state.resourceTriggers.some((trigger) => trigger.id === action.trigger.id);
       return {
@@ -1298,14 +1421,25 @@ export function reducer(state: AppState, action: Action): AppState {
     case "groupDeleted": {
       const groups = state.groups.filter((g) => g.id !== action.groupId);
       const selectedId = state.selectedId === action.groupId ? (state.bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, groups, selectedId };
+      const viewedThreadId = selectedId === state.selectedId ? state.viewedThreadId : null;
+      return { ...state, groups, selectedId, viewedThreadId };
     }
-    case "instances":
-      return { ...state, instances: action.instances };
+    case "instances": {
+      // Every response carries the server's describedAt; drop one older than
+      // what is already shown.  A payload without one (an older server) is
+      // applied as before.
+      const at = typeof action.describedAt === "number" ? action.describedAt : undefined;
+      if (at !== undefined && at < state.instancesDescribedAt) return state;
+      return { ...state, instances: action.instances, instancesDescribedAt: at ?? state.instancesDescribedAt };
+    }
+    case "instancesOrderReset":
+      return state.instancesDescribedAt === 0 ? state : { ...state, instancesDescribedAt: 0 };
     case "configStatus":
       return {
         ...state,
         config: action.config,
+        taskCreationBotId: allowsMultipleBotThreads(getConversationMode(action.config))
+          ? state.taskCreationBotId : null,
         activeView:
           state.activeView === "skill-recorder" && !skillRecorderEnabled(action.config)
             ? "chat"
@@ -1318,13 +1452,16 @@ export function reducer(state: AppState, action: Action): AppState {
           ...state,
           activeView: "chat",
           selectedId: action.id,
+          // A group is not the bot the pin belongs to.  Leaving it set would
+          // show the next bot the previous thread.
+          viewedThreadId: null,
           groups: state.groups.map((g) => (g.id === action.id ? { ...g, unread: false } : g)),
           groupEpoch: wasUnread ? bumpEpoch(state.groupEpoch, action.id) : state.groupEpoch,
         };
       }
       const wasUnread = state.bots.find((b) => b.id === action.id)?.unread;
       const next = updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, viewedThreadId: action.viewedThreadId ?? null }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -1347,21 +1484,30 @@ export function reducer(state: AppState, action: Action): AppState {
     case "dismissCard":
       return patchCard(state, action.botId, action.messageId, { dismissed: true });
     case "decideRequest":
+    case "approveAllRequests":
       return state; // the server's request.resolved patch settles the card
-    case "botAdded":
+    case "botAdded": {
+      // An HTTP create/import response and a second fold of the same bot can
+      // both dispatch. Selecting a *different* bot must not inherit the
+      // previous chat's pin; re-folding the bot already on screen is not a
+      // selection change and must leave that pin alone.
+      const viewedThreadId = action.bot.id === state.selectedId ? state.viewedThreadId : null;
       return withMascotMotion({
         ...state,
-        // An HTTP create/import response and its SSE broadcast can race. Fold
-        // both paths without ever showing the same bot twice.
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
         activeView: "chat",
         selectedId: action.bot.id,
+        viewedThreadId,
       }, action.bot.id, "arrive");
+    }
     case "deleteBot": {
       const bots = state.bots.filter((b) => b.id !== action.botId);
       const selectedId =
         state.selectedId === action.botId ? (bots.find((b) => !b.hidden)?.id ?? bots[0]?.id ?? "") : state.selectedId;
-      return { ...state, bots, selectedId };
+      // A thread pin onto the deleted bot's thread would dangle — and even
+      // without a deletion, the pin belongs to the old selection.
+      const viewedThreadId = state.selectedId === action.botId ? null : state.viewedThreadId;
+      return { ...state, bots, selectedId, viewedThreadId };
     }
     case "markUnread": {
       const next = updateBot(withMascotMotion(state, action.botId, "surprise"), action.botId, (b) => ({ ...b, unread: true }));
@@ -1400,17 +1546,19 @@ export function reducer(state: AppState, action: Action): AppState {
         : animated;
       const switchedThread =
         typeof action.bot.threadId === "string" && action.bot.threadId !== before.threadId;
+      const incomingMessages = Array.isArray(action.bot.messages) ? action.bot.messages : undefined;
+      // Ordinary bot patches omit messages and must preserve the current
+      // transcript. A task switch's full bot event carries the new transcript.
+      // The pre-send ack (`?messages=0`) advances threadId and keeps the
+      // previous transcript until that snapshot arrives on the same thread id,
+      // including when the snapshot is empty. It replaces when it shares no
+      // ids with what is on screen. A same-thread snapshot that overlaps
+      // current ids does not.
+      const replacement = transcriptFromBotFrame(before.messages, incomingMessages, switchedThread);
       return updateBot(next, action.bot.id, (b) => ({
         ...b,
         ...action.bot,
-        // Ordinary bot patches omit messages and must preserve the current
-        // transcript. A task switch is different: its full bot event carries
-        // the new transcript, which must replace the previous task before the
-        // webhook's streamed messages begin arriving.
-        messages:
-          switchedThread && Array.isArray(action.bot.messages)
-            ? action.bot.messages
-            : b.messages,
+        messages: replacement ?? b.messages,
       }));
     }
     case "messageAdded": {
@@ -1718,7 +1866,15 @@ export function reducer(state: AppState, action: Action): AppState {
       return withMascotMotion(dismissOnboardingCard(state, action.botId), action.botId, "working");
     case "editMessage":
       return withMascotMotion(state, action.botId, "working");
+    case "requestNewTask": {
+      if (!allowsMultipleBotThreads(getConversationMode(state.config))) return state;
+      const bot = state.bots.find((entry) => entry.id === action.botId);
+      if (!bot || bot.busy || eligibleTaskApps(bot.id, state.groups).length === 0) return state;
+      return { ...state, taskCreationBotId: bot.id };
+    }
+    case "cancelNewTask":
     case "newTask":
+      return { ...state, taskCreationBotId: null };
     case "switchTask":
     case "deleteTask":
     case "newGroupTask":
@@ -1766,6 +1922,7 @@ export function reducer(state: AppState, action: Action): AppState {
       // too; refusing here keeps the sidebar honest if the drop is illegal.
       const source = state.groups.find((group) => group.id === action.groupId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         groups: state.groups.map((group) => {
@@ -1807,7 +1964,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...bot,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, cwd: moving.pinnedCwd, workspaceContext: moving.workspaceContext },
                   ...(bot.tasks ?? []),
                 ],
               }
@@ -1818,6 +1975,9 @@ export function reducer(state: AppState, action: Action): AppState {
     case "mergeTasks": {
       const source = state.bots.find((bot) => bot.id === action.botId);
       if (!source || action.threadId === action.intoThreadId || (source.tasks ?? []).length < 2) return state;
+      const from = source.tasks?.find((task) => task.threadId === action.threadId);
+      const into = source.tasks?.find((task) => task.threadId === action.intoThreadId);
+      if (!taskWorkspaceContextsMatch(from?.workspaceContext, into?.workspaceContext)) return state;
       const remaining = (source.tasks ?? []).filter((task) => task.threadId !== action.threadId);
       if (remaining.length === (source.tasks ?? []).length) return state;
       if (!remaining.some((task) => task.threadId === action.intoThreadId)) return state;
@@ -1858,6 +2018,7 @@ export function reducer(state: AppState, action: Action): AppState {
       const source = state.bots.find((bot) => bot.id === action.botId);
       const moving = (source?.tasks ?? []).find((task) => task.threadId === action.threadId);
       if (!moving || !source || (source.tasks ?? []).length < 2) return state;
+      if (moving.workspaceContext && moving.workspaceContext.appRef.id !== action.toGroupId) return state;
       return {
         ...state,
         bots: state.bots.map((bot) => {
@@ -1874,7 +2035,7 @@ export function reducer(state: AppState, action: Action): AppState {
             ? {
                 ...group,
                 tasks: [
-                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt },
+                  { threadId: moving.threadId, title: moving.title, createdAt: moving.createdAt, pinnedCwd: moving.cwd, workspaceContext: moving.workspaceContext },
                   ...(group.tasks ?? []),
                 ],
               }
@@ -1882,8 +2043,19 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
     }
-    case "taskSwitched":
-      return updateBot(state, action.bot.id, (bot) => ({ ...bot, ...action.bot, messages: action.bot.messages ?? [] }));
+    case "taskSwitched": {
+      const next = updateBot(state, action.bot.id, (bot) => ({
+        ...bot,
+        ...action.bot,
+        // Omitted messages mean "this ack did not carry a transcript"
+        // (`?messages=0` on the pre-send switch). Wiping here would show
+        // an empty thread until a later frame; keep what we have.
+        messages: action.bot.messages ?? bot.messages,
+      }));
+      // The pin points at a thread; the active thread just changed, so the
+      // pin is stale.  Clearing it is a no-op when it already agreed.
+      return state.selectedId === action.bot.id ? { ...next, viewedThreadId: null } : next;
+    }
     case "newBot":
     case "duplicateBot":
     case "interrupt":
@@ -1911,9 +2083,13 @@ const MAX_KEPT_SCREEN_FRAMES = 8;
 export const initialState: AppState = {
   bots: [],
   groups: [],
+  jobsByThread: {},
   instances: [],
+  instancesDescribedAt: 0,
   config: null,
   selectedId: "",
+  viewedThreadId: null,
+  taskCreationBotId: null,
   activeView: "chat",
   selectedRoutineId: null,
   routines: [],
@@ -1943,6 +2119,56 @@ export const initialState: AppState = {
   hasMore: {},
   loadingEarlier: {},
 };
+
+// ── API response contracts ─────────────────────────────────────────────
+// These responses cross the HTTP boundary through the deliberately generic
+// API helper, so each write path narrows its raw body before using it.
+//
+// The pre-send task switch only needs proof of which thread is now active.
+// The wire bot is much larger (profile, tasks, `lastMessage`, and — unless
+// `?messages=0` — the whole transcript). Parsing that with `.passthrough()`
+// kept unknown keys and then spread them into application state. This schema
+// keeps `id` and `threadId` only; every other property is dropped before
+// dispatch. `.strict()` on the envelope still rejects a body that is not
+// `{ bot }`. A full `.strict()` bot would reject the real `wireBot` payload
+// (or force this path to model and store fields it does not use).
+const taskSwitchAckBotSchema = z.object({
+  id: z.string(),
+  threadId: z.string(),
+});
+
+export const TaskSwitchResponseSchema = z.object({
+  bot: taskSwitchAckBotSchema,
+}).strict();
+
+// Idempotent replay is `{ ...firstBody, replayed: true }` (server `replyOnce`),
+// not a body of only `{ ok, replayed }`. Each success arm therefore allows
+// that flag. `ignored: "self_echo"` is a 200 from the loop breaker and is
+// still a successful post.
+const replayedFlag = z.literal(true).optional();
+export const MessagePostResponseSchema = z.union([
+  z.object({
+    ok: z.literal(true),
+    queued: z.literal(true),
+    queueId: z.string(),
+    threadId: z.string(),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    steered: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    ignored: z.literal("self_echo"),
+    replayed: replayedFlag,
+  }).strict(),
+  z.object({
+    ok: z.literal(true),
+    replayed: replayedFlag,
+  }).strict(),
+]);
 
 // ── API client ─────────────────────────────────────────────────────────
 /** Thrown by `api()` on a non-2xx response.  Carries the parsed JSON body
@@ -2103,7 +2329,7 @@ export function useStreaming() {
   return useContext(StreamContext);
 }
 
-const StoreContext = createContext<{
+export const StoreContext = createContext<{
   state: AppState;
   dispatch: React.Dispatch<Action>;
   /** Commit any debounced profile edits before an operation reads the bot. */
@@ -2225,9 +2451,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         return bot ? openOnboardingCard(bot) : undefined;
       })();
       if (action.type === "deleteBot") botPatchQueue.cancel(action.botId);
-      // A queued message is still real until the server confirms deletion.
-      // All other actions keep their existing optimistic behavior.
-      if (action.type !== "cancelQueued") rawDispatch(action);
+      // Rejected task moves and merges must not hide the original conversation.
+      // Apply their local projection only after the server accepts the change.
+      const confirmTaskMutation = action.type === "moveGroupTask"
+        || action.type === "moveGroupTaskToBot" || action.type === "mergeTasks"
+        || action.type === "moveTaskToBot" || action.type === "moveTaskToGroup";
+      if (action.type !== "cancelQueued" && !confirmTaskMutation) rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
           api("/api/routines", { method: "POST", body: JSON.stringify(action.input) }).catch(showError);
@@ -2282,26 +2511,76 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           // Stamp before the POST so a slow 202 still shows send-time, not
           // response-receipt time (Codex P2 on #587).
           const sentAt = Date.now();
-          void api(`/api/bots/${action.botId}/messages`, {
-            method: "POST",
-            body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          })
-            .then((body) => {
-              if (
-                body?.queued &&
-                typeof body.threadId === "string" &&
-                typeof body.queueId === "string"
-              ) {
-                rawDispatch({
-                  type: "pendingQueued",
-                  threadId: body.threadId,
-                  queueId: body.queueId,
-                  text: action.text,
-                  at: sentAt,
-                });
-              }
+          const current = stateRef.current;
+          const liveBot = current.bots.find((b) => b.id === action.botId);
+          // The pin is the thread on screen.  The message route accepts only
+          // the bot's active task, so a disagreeing pin has to become active
+          // before the POST.  Otherwise the text lands on the other thread.
+          const pinnedThreadId =
+            current.selectedId === action.botId && current.viewedThreadId
+              ? current.viewedThreadId
+              : null;
+          // `threadId` is sent only after this client has just switched the
+          // server task, when the id is known to be current. On the ordinary
+          // path the snapshot in `liveBot.threadId` can already be stale — a
+          // routine, another client, or an automation may have switched — and
+          // the server then 409s instead of delivering. Omitting it lets the
+          // server use the active thread.
+          const postMessage = (threadId?: string) => {
+            void api(`/api/bots/${action.botId}/messages`, {
+              method: "POST",
+              body: JSON.stringify({
+                text: action.text,
+                replyToId: action.replyToId,
+                ...(threadId ? { threadId } : {}),
+              }),
             })
-            .catch(showError);
+              .then((body: unknown) => {
+                const parsed = MessagePostResponseSchema.safeParse(body);
+                if (!parsed.success) {
+                  throw new Error("Invalid message post response.");
+                }
+                if ("queued" in parsed.data && parsed.data.queued) {
+                  rawDispatch({
+                    type: "pendingQueued",
+                    threadId: parsed.data.threadId,
+                    queueId: parsed.data.queueId,
+                    text: action.text,
+                    at: sentAt,
+                  });
+                }
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+          };
+          if (liveBot && pinnedThreadId && pinnedThreadId !== liveBot.threadId) {
+            // `messages=0` skips the transcript. This path only checks the
+            // active thread id; the bot frame carries the new messages.
+            void api(`/api/bots/${action.botId}/tasks/${pinnedThreadId}?messages=0`, { method: "POST" })
+              .then((body: unknown) => {
+                const parsed = TaskSwitchResponseSchema.safeParse(body);
+                if (
+                  !parsed.success
+                  || parsed.data.bot.id !== action.botId
+                  || parsed.data.bot.threadId !== pinnedThreadId
+                ) {
+                  throw new Error("Could not open the thread on screen before sending.");
+                }
+                rawDispatch({
+                  type: "taskSwitched",
+                  bot: { id: parsed.data.bot.id, threadId: parsed.data.bot.threadId },
+                });
+                postMessage(pinnedThreadId);
+              })
+              .catch((error) => {
+                showError(error);
+                action.onError?.(error instanceof Error ? error.message : String(error));
+              });
+            break;
+          }
+          postMessage();
           break;
         }
         case "editMessage":
@@ -2347,6 +2626,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             break;
           }
           void respond();
+          break;
+        }
+        case "approveAllRequests": {
+          api(`/api/threads/${action.threadId}/approve-all`, {
+            method: "POST",
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         }
         case "answerCard": {
@@ -2455,7 +2743,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
             body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
-          }).catch(showError);
+          }).catch((error) => {
+            showError(error);
+            action.onError?.(error instanceof Error ? error.message : String(error));
+          });
           break;
         case "patchGroup": {
           const previous = groupBeforePatch;
@@ -2508,8 +2799,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         // tasks: the server answers with the bot AND the live transcript,
         // because switching changes which conversation is on screen
+        case "requestNewTask": {
+          const current = stateRef.current;
+          if (!allowsMultipleBotThreads(getConversationMode(current.config))) break;
+          const bot = current.bots.find((entry) => entry.id === action.botId);
+          if (bot && !bot.busy && eligibleTaskApps(bot.id, current.groups).length === 0) {
+            wrapped({ type: "newTask", botId: bot.id });
+          }
+          break;
+        }
         case "newTask":
-          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: "{}" })
+          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: JSON.stringify({ appRef: action.appRef }) })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
@@ -2560,31 +2860,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveGroupTaskToBot":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.botId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "mergeTasks":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ mergeInto: action.intoThreadId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveTaskToBot":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ botId: action.toBotId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "moveTaskToGroup":
           api(`/api/bots/${action.botId}/tasks/${action.threadId}`, {
             method: "PATCH",
             body: JSON.stringify({ groupId: action.toGroupId }),
-          }).catch(showError);
+          }).then(() => rawDispatch(action)).catch(showError);
           break;
         case "deleteGroupTask":
           api(`/api/groups/${action.groupId}/tasks/${action.threadId}`, { method: "DELETE" })
@@ -2661,7 +2961,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         {
           label: "engines",
           request: api("/api/instances")
-            .then(({ instances }) => alive && rawDispatch({ type: "instances", instances })),
+            .then(({ instances, describedAt }) => alive && rawDispatch({ type: "instances", instances, describedAt })),
         },
         {
           label: "settings",
@@ -2684,6 +2984,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           label: "resource triggers",
           request: api("/api/resource-triggers")
             .then(({ triggers }) => alive && rawDispatch({ type: "resourceTriggersHydrated", triggers: triggers ?? [] })),
+        },
+        // Background jobs: the full set, so a reconnect that could not
+        // replay the frames it missed is right again at once.
+        {
+          label: "jobs",
+          request: api("/api/jobs").then(({ jobs }) => alive && rawDispatch({ type: "jobsHydrated", jobs: jobs ?? [] })),
         },
       ];
       await runHydrationRequests(requests);
@@ -2874,6 +3180,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         case "resource-trigger.deleted":
           rawDispatch({ type: "resourceTriggerDeleted", triggerId: frame.triggerId });
           break;
+        // a thread's whole job set (debounced on the server); never output
+        case "jobs":
+          if (typeof frame.threadId === "string" && Array.isArray(frame.jobs)) {
+            rawDispatch({ type: "jobsFrame", threadId: frame.threadId, jobs: frame.jobs });
+          }
+          break;
         case "runtime": {
           const event = frame.event;
           // the Trajectory tab's door: free unless that thread's tab is open
@@ -2926,8 +3238,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             config: configStatusFromFrame(frame),
           });
           api("/api/instances")
-            .then(({ instances }) => rawDispatch({ type: "instances", instances }))
+            .then(({ instances, describedAt }) => rawDispatch({ type: "instances", instances, describedAt }))
             .catch(() => {});
+          break;
+        // A describe finished on the server (a background sweep behind a
+        // stale answer, or a slow engine's probe landing late).  Applied
+        // directly — re-fetching here would only start another sweep.
+        case "instances":
+          if (Array.isArray(frame.instances)) {
+            rawDispatch({ type: "instances", instances: frame.instances, describedAt: frame.describedAt });
+          }
           break;
       }
     };
@@ -2955,6 +3275,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           setStream(EMPTY_STREAM);
           pendingFrames.length = 0;
+          // A harness that restarted stamps from its own clock, which a
+          // backwards correction can leave below the last process's final
+          // stamp.  Keep the engine list, drop the mark, so the hydrate's
+          // fetch (and later pushes) are not discarded as "older".
+          rawDispatch({ type: "instancesOrderReset" });
         }
         if (shouldHydrateAfterHello(frame.resumed === true, hydrationFailed)) hydrate();
         return;
@@ -2983,8 +3308,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // "Check again"/"Refresh" click, or a just-saved CLI/fullAuto override.
   const refreshInstances = useCallback(async (opts?: { fresh?: boolean }) => {
     try {
-      const { instances } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
-      rawDispatch({ type: "instances", instances });
+      const { instances, describedAt } = await api(opts?.fresh ? "/api/instances?fresh=1" : "/api/instances");
+      rawDispatch({ type: "instances", instances, describedAt });
     } catch {
       /* offline or server down — the existing list stays */
     }

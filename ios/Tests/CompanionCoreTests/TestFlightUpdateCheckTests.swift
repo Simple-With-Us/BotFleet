@@ -2,7 +2,7 @@
 // comparison against the running build, and the once-an-hour throttle.
 // None of this touches the paired Mac, so none of it needs a `Connection` —
 // only the manifest shape, captured 2026-09-13 from the real
-// https://jaywedgeworth22.github.io/ai-fleet-coordinator/ios-versions.json.
+// https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json.
 import XCTest
 @testable import CompanionCore
 
@@ -10,14 +10,14 @@ final class TestFlightUpdateCheckTests: XCTestCase {
     // MARK: - Manifest decoding
 
     /// The real published manifest, verbatim, minus unrelated apps. Proves
-    /// this app's bundle id (`app.botfleet.ios`) round-trips through the shape
+    /// this app's bundle id (`app.botfleet`) round-trips through the shape
     /// the fleet actually serves, not a shape invented for this test.
     private let realManifestJSON = Data(#"""
     {
       "schemaVersion": 1,
       "updatedAt": "2026-09-04T03:58:13Z",
       "apps": {
-        "app.botfleet.ios": {
+        "app.botfleet": {
           "marketingVersion": "1.0.29",
           "build": "202609032050",
           "appleId": 6806379515,

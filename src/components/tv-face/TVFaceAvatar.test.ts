@@ -118,5 +118,24 @@ describe("planFrame", () => {
     const steps = planFrame("happy", "resting");
     expect(steps).toEqual([{ expression: "resting", kind: "still", delayAfterMs: 0 }]);
   });
+
+  it("cuts straight to hold for urgent expressions from rest — no enter dwell", () => {
+    expect(planFrame("resting", "crash")).toEqual([
+      { expression: "crash", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("skips return when leaving an urgent expression for rest", () => {
+    expect(planFrame("crash", "resting")).toEqual([
+      { expression: "resting", kind: "still", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("honors explicit interrupt: false to play enter despite urgent target", () => {
+    expect(planFrame("resting", "crash", { interrupt: false })).toEqual([
+      { expression: "crash", kind: "enter", delayAfterMs: TVFACE_TRANSITION_MS },
+      { expression: "crash", kind: "hold", delayAfterMs: 0 },
+    ]);
+  });
 });
 

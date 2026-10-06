@@ -115,6 +115,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
     displayName: "OpenAI-compatible (OpenRouter / Groq)",
     supportsMultipleInstances: true,
     access: "custom",
+    // Mirrors the `capabilities` block in `create` below: agents + this
+    // computer only, with no Composio bridge, screen channel, or image input.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
   },
   models: DEFAULT_MODELS,
   // No CLI to install — the "install" is getting a free API key.
@@ -563,7 +566,18 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         // no MCP server is mounted in this file and respondToRequest answers
         // The driver owns both transcript replay and model-to-tool rounds.
         // localComputerMcp runs host computer tools through the toolLoop host.
-        capabilities: { sessionModelSwitch: "in-session", agentsMcp: true, toolLoop: true, localComputerMcp: true, replaysTranscript: true },
+        // Jobs matrix: BotFleet's job tools join this loop in P1; helpers
+        // stay `delegate_bot`.
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          toolLoop: true,
+          localComputerMcp: true,
+          replaysTranscript: true,
+          // BotFleet's own job tools run in this loop (jobs P1).
+          backgroundJobs: "emulated",
+          helpers: "none",
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),
         sweepStuckTurns: async (olderThanMs: number) => {

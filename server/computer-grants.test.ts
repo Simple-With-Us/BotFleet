@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   computerLabel,
   resolveCloudBackend,
@@ -10,6 +10,7 @@ import {
   hostToolPrefix,
   nameMounts,
   turnComputerMounts,
+  hostShellGranted,
   type ComputerMount,
   type TurnComputerDeps,
 } from "./computer-grants.ts";
@@ -141,6 +142,23 @@ describe("computerSystemPrompt", () => {
     expect(prompt).toContain("This Mac");
   });
 
+  it("does not claim a VPS is isolated when the container is shared", () => {
+    const mounts = nameMounts([mount("vps"), mount("local")]);
+
+    // Default and per-bot both keep the historical isolated wording, so a
+    // caller that has not learned about shared mode moves nothing.
+    const perBot = computerSystemPrompt(mounts, { hostPlatform: "darwin" });
+    expect(perBot).toContain("one container per bot, not shared with the other bots");
+    expect(computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: false })).toBe(perBot);
+
+    // Shared mode hands every bot its own desktop session inside ONE container.
+    // Telling it otherwise invites a bot to assume desktop state it does not own.
+    const shared = computerSystemPrompt(mounts, { hostPlatform: "darwin", vpsShared: true });
+    expect(shared).not.toContain("not shared with the other bots");
+    expect(shared).toContain("its own desktop session");
+    expect(shared).toContain("nobody else sees or clicks your desktop");
+  });
+
   it("states the owner's selection rule: remote by default, host only when it earns it", () => {
     const prompt = computerSystemPrompt(nameMounts([mount("vps"), mount("local")]), {
       hostPlatform: "darwin",
@@ -160,7 +178,7 @@ describe("computerSystemPrompt", () => {
   });
 
   it("describes the host as a desktop only to an engine that is handed one", () => {
-    // An MCP engine mounts the Cua Driver server and really can see and click
+    // An MCP engine mounts the CUA Driver server and really can see and click
     // the desktop.  A driver-loop engine mounts no MCP server at all: its
     // host surface is the harness's own bash and file tools, and that
     // registry holds no screenshot, click or desktop-state tool.  Telling it
@@ -753,6 +771,87 @@ describe("routine failure resiliency and unattended safety", () => {
     expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
   });
 
+  describe("Local VM that cannot be acquired", () => {
+    const vmDown = (notices: string[]) => {
+      const deps = makeBaseDeps(notices);
+      deps.acquireLocalVm = async () => {
+        throw new Error("Local VM is not ready (App Settings → Local VM)");
+      };
+      return deps;
+    };
+    const turn = (computers: string[], deps: TurnComputerDeps<object>, runOn?: "cloud" | "vm" | "local") =>
+      resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: computers as ["vm"], cloudBackend: "vps" },
+        cfg: {} as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn,
+        allowed: null,
+        deps,
+      });
+
+    it("falls back to the VPS the bot was also granted, with a notice", async () => {
+      const notices: string[] = [];
+      const result = await turn(["vm", "cloud"], vmDown(notices));
+      expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+    });
+
+    it("falls back to This Computer when that was granted too", async () => {
+      const notices: string[] = [];
+      const result = await turn(["vm", "local"], vmDown(notices));
+      expect(result.mounts.map((m) => m.kind)).toEqual(["local"]);
+      expect(notices.some((n) => n.startsWith("Local VM not mounted"))).toBe(true);
+    });
+
+    it("still refuses when the Local VM is the only grant", async () => {
+      await expect(turn(["vm"], vmDown([]))).rejects.toThrow("Local VM is not ready");
+    });
+
+    it("still refuses when the turn explicitly asked to run on the Local VM", async () => {
+      await expect(turn(["vm", "local"], vmDown([]), "vm")).rejects.toThrow("Local VM is not ready");
+    });
+
+    it("never reaches a computer the bot was not granted", async () => {
+      const deps = vmDown([]);
+      const hostReads = vi.fn(() => ({ command: "/bin/cua", args: ["mcp"], env: {} }));
+      deps.readHostConnection = hostReads;
+      await expect(turn(["vm"], deps)).rejects.toThrow("Local VM is not ready");
+      expect(hostReads).not.toHaveBeenCalled();
+    });
+
+    it("fails the turn when the granted fallback is also unreachable, rather than running with no computer", async () => {
+      const deps = vmDown([]);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      await expect(turn(["vm", "cloud"], deps)).rejects.toThrow("Docker-over-SSH command timed out");
+    });
+
+    it("keeps degrading onto hybrid host shell when VM and VPS both fail but allowHostTerminal is on", async () => {
+      const notices: string[] = [];
+      const deps = vmDown(notices);
+      deps.vps.vpsComputerAction = async () => {
+        throw new Error("Docker-over-SSH command timed out");
+      };
+      const result = await resolveTurnComputerMounts({
+        bot: { id: "b1", name: "Compiler", computers: ["vm", "cloud"], cloudBackend: "vps" },
+        cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+        engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: true },
+        threadId: "t1",
+        dispatchId: 1,
+        runOn: undefined,
+        allowed: null,
+        deps,
+      });
+      expect(result.mounts).toEqual([]);
+      expect(result.hasHostComputer).toBe(true);
+      expect(notices).toContain("Local VM not mounted: Local VM is not ready (App Settings → Local VM)");
+      expect(notices).toContain("VPS computer not mounted: Docker-over-SSH command timed out");
+    });
+  });
+
   it("fails clearly when an unattended cloud-only turn cannot reach the VPS", async () => {
     const deps = makeBaseDeps();
     deps.vps.vpsComputerAction = async () => {
@@ -866,5 +965,62 @@ describe("routine failure resiliency and unattended safety", () => {
     });
     expect(result.hasHostComputer).toBe(true);
     expect(result.mounts.map((m) => m.kind)).toEqual(["vm"]);
+    const prompt = computerSystemPrompt(result.mounts, {
+      hasHostTerminal: true,
+      hostPlatform: "darwin",
+    });
+    expect(prompt).toContain("bash");
+  });
+
+  it("enables host computer tools without mounting host CUA when allowHostTerminal is set on Cloud VPS", async () => {
+    const deps = makeBaseDeps();
+    deps.vps.vpsComputerAction = async () => ({
+      container_name: "botfleet-vps-shared",
+      container_id: "c1",
+      container: "running",
+      image: true,
+      ready: true,
+      problem: null,
+      daemonUp: true,
+      managed: true,
+      network: "host",
+      security: "confined",
+      persistence: "disposable",
+      sshAlias: "coolify",
+    });
+    deps.vps.vpsComputerMcp = () => ({ command: "vps-cua", args: [], env: {} });
+    const result = await resolveTurnComputerMounts({
+      bot: { id: "b1", name: "Worker", computers: ["cloud"], cloudBackend: "vps" },
+      cfg: { localVm: { allowHostTerminal: true } } as unknown as AppConfig,
+      engine: { driverKind: "claude", computerMcp: true, localComputerMcp: true, toolLoop: false },
+      threadId: "t1",
+      dispatchId: 1,
+      runOn: undefined,
+      unattended: false,
+      allowed: null,
+      deps,
+    });
+    expect(result.hasHostComputer).toBe(true);
+    expect(result.mounts.map((m) => m.kind)).toEqual(["vps"]);
+  });
+
+  describe("hostShellGranted", () => {
+    it("grants host shell when local computer is granted", () => {
+      const cfg: AppConfig = {};
+      expect(hostShellGranted({ computers: ["local"] }, cfg, null)).toBe(true);
+    });
+
+    it("grants host shell in hybrid mode for Local VM", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["vm"] }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["vm"] }, {}, null)).toBe(false);
+    });
+
+    it("grants host shell in hybrid mode for Cloud VPS", () => {
+      const cfg: AppConfig = { localVm: { allowHostTerminal: true } };
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, cfg, null)).toBe(true);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "box" }, cfg, null)).toBe(false);
+      expect(hostShellGranted({ computers: ["cloud"], cloudBackend: "vps" }, {}, null)).toBe(false);
+    });
   });
 });

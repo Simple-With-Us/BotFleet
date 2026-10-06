@@ -18,6 +18,10 @@ import {
   MINIMAX_PRICE_PER_MILLION,
 } from "./minimax.ts";
 
+/** M3.1's reasoning-effort levels, as MiniMax's OpenAI-compatible API takes
+ *  them (https://platform.minimax.io/docs/api-reference/text-openai-api). */
+const M31_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
 /** One scripted SSE response, [DONE]-terminated. */
 const sse = (...frames: string[]) =>
   new Response(frames.map((f) => `data: ${f}\n`).join("") + "data: [DONE]\n", {
@@ -108,8 +112,13 @@ describe("MinimaxDriver", () => {
     expect(MinimaxDriver.models).toEqual({
       default: "MiniMax-M3.1-Flash-Preview",
       options: [
-        { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+        {
+          id: "MiniMax-M3.1-Flash-Preview",
+          label: "MiniMax M3.1 Flash Preview",
+          contextWindow: 1_000_000,
+          effortLevels: M31_LEVELS,
+        },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
       ],
     });
     // The retired MiniMax-M3 is neither offered nor priced: it is out of the
@@ -630,8 +639,13 @@ describe("MinimaxDriver", () => {
     expect(instance.models).toEqual({
       default: "MiniMax-M3.1-Flash-Preview",
       options: [
-        { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+        {
+          id: "MiniMax-M3.1-Flash-Preview",
+          label: "MiniMax M3.1 Flash Preview",
+          contextWindow: 1_000_000,
+          effortLevels: M31_LEVELS,
+        },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
       ],
     });
     await instance.dispose();
@@ -1865,5 +1879,211 @@ describe("MinimaxDriver", () => {
       recorder.stop();
       await instance.dispose();
     }
+  });
+
+  describe("M3.1 reasoning effort", () => {
+    const createInstance = (instanceId: string) =>
+      MinimaxDriver.create({
+        instanceId,
+        displayName: "MiniMax",
+        enabled: true,
+        config: MinimaxDriver.defaultConfig(),
+        environment: { MINIMAX_API_KEY: "secret" },
+      });
+
+    /** Stub fetch with one scripted answer per POST, recording each body. */
+    const stubChat = (rounds: Array<() => Response> = []) => {
+      const bodies: any[] = [];
+      let call = 0;
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        const make = rounds[call] ?? rounds[rounds.length - 1];
+        call += 1;
+        return make
+          ? make()
+          : sse(
+              '{"choices":[{"delta":{"content":"ok"}}]}',
+              '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+            );
+      }));
+      return bodies;
+    };
+
+    const runTurn = async (
+      instance: Awaited<ReturnType<typeof createInstance>>,
+      input: Parameters<typeof instance.adapter.sendTurn>[0],
+    ) => {
+      const recorder = recordEvents(instance.adapter);
+      await instance.adapter.sendTurn(input);
+      const completed = await recorder.until((event) => event.type === "turn.completed");
+      recorder.stop();
+      return completed;
+    };
+
+    it("sends reasoning_effort top-level for M3.1 and never a thinking field", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-xhigh");
+
+      const completed = await runTurn(instance, {
+        threadId: "thread",
+        text: "hi",
+        model: "MiniMax-M3.1-Flash-Preview",
+        effort: "xhigh",
+      });
+
+      expect(completed).toMatchObject({ ok: true });
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].reasoning_effort).toBe("xhigh");
+      // MiniMax answers 400 to `thinking: {type: "disabled"}` on M3.1, so this
+      // driver never writes a thinking field at all.
+      expect(bodies[0]).not.toHaveProperty("thinking");
+      await instance.dispose();
+    });
+
+    it("carries the same level on every round of a tool turn", async () => {
+      const bodies = stubChat([
+        () => sse(...TOOL_CALL_ROUND),
+        () => sse(
+          '{"choices":[{"delta":{"content":"here you go"}}]}',
+          '{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}',
+        ),
+      ]);
+      const instance = await createInstance("minimax-effort-tools");
+
+      const completed = await runTurn(instance, {
+        threadId: "thread",
+        text: "who is around?",
+        model: "MiniMax-M3.1-Flash-Preview",
+        effort: "xhigh",
+        tools: [{ name: "list_bots" }, { name: "ask_bot" }],
+        toolHost: answeringHost,
+      });
+
+      expect(completed).toMatchObject({ ok: true });
+      expect(bodies).toHaveLength(2);
+      expect(bodies.map((body) => body.reasoning_effort)).toEqual(["xhigh", "xhigh"]);
+      await instance.dispose();
+    });
+
+    it("omits the field for Default, which MiniMax reads as max", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-default");
+
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash-Preview" });
+
+      expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+      await instance.dispose();
+    });
+
+    it("omits the field when the turn names no model and the default is M3.1 with no effort", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-nomodel");
+
+      await runTurn(instance, { threadId: "thread", text: "hi" });
+
+      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash-Preview");
+      expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+      await instance.dispose();
+    });
+
+    it("sends the field for the default model when the turn names effort but no model", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-implicit-model");
+
+      await runTurn(instance, { threadId: "thread", text: "hi", effort: "low" });
+
+      expect(bodies[0].model).toBe("MiniMax-M3.1-Flash-Preview");
+      expect(bodies[0].reasoning_effort).toBe("low");
+      await instance.dispose();
+    });
+
+    it("sends nothing for M2.7 Highspeed, which has no effort control", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-m27");
+
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M2.7-highspeed", effort: "high" });
+
+      expect(bodies[0].model).toBe("MiniMax-M2.7-highspeed");
+      expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+      await instance.dispose();
+    });
+
+    it("never sends `none`, which MiniMax rejects with a 400", async () => {
+      const bodies = stubChat();
+      const instance = await createInstance("minimax-effort-none");
+
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-M3.1-Flash-Preview", effort: "none" });
+
+      expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+      expect(bodies[0]).not.toHaveProperty("thinking");
+      await instance.dispose();
+    });
+
+    it("keeps the field off the utility request that titles and summaries use", async () => {
+      let body: any;
+      vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        body = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({ choices: [{ message: { content: "a title" } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }));
+      const instance = await createInstance("minimax-effort-utility");
+
+      await instance.generateText?.("Summarize this thread in five words.");
+
+      expect(body.model).toBe("MiniMax-M2.7-highspeed");
+      expect(body).not.toHaveProperty("reasoning_effort");
+      await instance.dispose();
+    });
+
+    it("keeps M3.1's levels through refreshModels and gives an id it has never seen none", async () => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(
+        JSON.stringify({ data: [{ id: "MiniMax-M3.1-Flash-Preview" }, { id: "MiniMax-Next" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )));
+      const instance = await createInstance("minimax-effort-refresh");
+
+      await instance.refreshModels?.();
+
+      const byId = new Map(instance.models.options.map((option) => [option.id, option]));
+      expect(byId.get("MiniMax-M3.1-Flash-Preview")?.effortLevels).toEqual(M31_LEVELS);
+      // MiniMax documents reasoning_effort as M3.1-only, so a newly listed id
+      // must not inherit the engine-wide list.
+      expect(byId.get("MiniMax-Next")?.effortLevels).toEqual([]);
+      await instance.dispose();
+    });
+
+    it("drops the field for a model refreshModels discovered, since its row declares none", async () => {
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("/models")) {
+          return new Response(JSON.stringify({ data: [{ id: "MiniMax-Next" }] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        bodies.push(JSON.parse(String(init?.body)));
+        return sse(
+          '{"choices":[{"delta":{"content":"ok"}}]}',
+          '{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+        );
+      }));
+      const instance = await createInstance("minimax-effort-discovered");
+      await instance.refreshModels?.();
+
+      await runTurn(instance, { threadId: "thread", text: "hi", model: "MiniMax-Next", effort: "high" });
+
+      expect(bodies[0].model).toBe("MiniMax-Next");
+      expect(bodies[0]).not.toHaveProperty("reasoning_effort");
+      await instance.dispose();
+    });
+
+    it("declares the engine-wide gate as M3.1's level list", async () => {
+      const instance = await createInstance("minimax-effort-capabilities");
+
+      expect(instance.adapter.capabilities?.effortLevels).toEqual(M31_LEVELS);
+      await instance.dispose();
+    });
   });
 });

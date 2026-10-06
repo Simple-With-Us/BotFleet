@@ -39,7 +39,7 @@ const SECTIONS: Record<
   opencodeGo: { body: (v) => ({ opencodeGo: { apiKey: v } }), flag: (c) => c.opencodeGo?.configured ?? false },
   // The deepseek key lives at the user level and is used only to fetch the
   // account balance for the engine row chip — never injected into any
-  // engine's process environment, so a bot can run on the DeepSeek harness
+  // engine's process environment, so a bot can run on Clutch
   // without this key set.
   deepseek: { body: (v) => ({ deepseek: { key: v } }), flag: (c) => c.deepseek?.configured ?? false },
 };
@@ -314,7 +314,7 @@ export function VpsConnection() {
         SSH config alias for the Linux VPS. BotFleet uses your normal SSH config and agent; it does not store keys or passwords.{" "}
         See the{" "}
         <a
-          href="https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/byo-vps.md"
+          href="https://github.com/Simple-With-Us/BotFleet/blob/main/docs/byo-vps.md"
           target="_blank"
           rel="noopener noreferrer"
           className="text-accent hover:underline"

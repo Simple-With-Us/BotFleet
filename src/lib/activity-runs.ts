@@ -20,8 +20,54 @@ function foldable(message: Message): boolean {
   const tool = message.tool;
   if (message.kind !== "activity" || !tool) return false;
   if (message.comm) return false;
+  // a job's "Job Finished" row is news, not a step: never folded away
+  if (message.job) return false;
   if (tool.ok !== true) return false;
   return !tool.name.startsWith("error:");
+}
+
+/** Move each helper step (a row whose tool names a `parentItemId`) to sit
+ * right under the row that started the helper, after that helper's earlier
+ * steps.  Parallel helpers otherwise interleave their steps with each other
+ * and with the bot's own, and nothing says which helper did what.  A step
+ * whose parent row is not in the list (an older transcript, a trimmed
+ * window) stays where it was.  Order is otherwise untouched, and a list with
+ * no helper steps comes back as the same array. */
+export function nestHelperSteps(messages: Message[]): Message[] {
+  const parentIds = new Set<string>();
+  for (const message of messages) {
+    const itemId = message.kind === "activity" ? message.tool?.itemId : undefined;
+    if (itemId) parentIds.add(itemId);
+  }
+  const nested = new Map<string, Message[]>();
+  for (const message of messages) {
+    const parent = message.tool?.parentItemId;
+    if (!parent || !parentIds.has(parent)) continue;
+    const children = nested.get(parent) ?? [];
+    children.push(message);
+    nested.set(parent, children);
+  }
+  if (nested.size === 0) return messages;
+  const ordered: Message[] = [];
+  const placed = new Set<Message>();
+  const place = (message: Message) => {
+    if (placed.has(message)) return;
+    placed.add(message);
+    ordered.push(message);
+    const itemId = message.kind === "activity" ? message.tool?.itemId : undefined;
+    // depth is one level today (helpers cannot spawn helpers), but a nested
+    // helper would still land under its own parent
+    for (const child of (itemId && nested.get(itemId)) || []) place(child);
+  };
+  for (const message of messages) {
+    const parent = message.tool?.parentItemId;
+    if (parent && parentIds.has(parent)) continue;
+    place(message);
+  }
+  // A malformed chain (a row naming itself, or two naming each other) has no
+  // root to hang from: keep those rows rather than lose them.
+  for (const message of messages) place(message);
+  return ordered;
 }
 
 /** Runs shorter than this stay unfolded.

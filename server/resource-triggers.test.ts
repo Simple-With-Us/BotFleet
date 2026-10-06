@@ -3,11 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { MAX_INIT_LOAD_FACTOR } from "./drivers/acp/init-deadline.ts";
+import { DEFAULT_ADMISSION } from "./jobs/admission.ts";
 import {
   crossed,
   ResourceTriggerManager,
   sampleHost,
   valueFor,
+  webhookDispatchHoldReason,
+  webhookDispatchHot,
   type HostSample,
 } from "./resource-triggers.ts";
 
@@ -24,6 +28,59 @@ function sample(partial: Partial<HostSample> = {}): HostSample {
     ...partial,
   };
 }
+
+describe("webhookDispatchHot", () => {
+  const cores = 10;
+  const load = (load1: number) => ({ load1, cores });
+
+  it("admits when swap and load are unknown or under both ceilings", () => {
+    expect(webhookDispatchHot({ swapUsedPercent: null, load: null })).toBe(false);
+    expect(webhookDispatchHot({ swapUsedPercent: Number.NaN, load: null })).toBe(false);
+    expect(
+      webhookDispatchHot({
+        swapUsedPercent: DEFAULT_ADMISSION.maxSwapPercent - 0.1,
+        load: load(cores * MAX_INIT_LOAD_FACTOR - 0.1),
+      }),
+    ).toBe(false);
+  });
+
+  it("is hot at the jobs admission swap ceiling or the ACP init load ceiling", () => {
+    expect(
+      webhookDispatchHot({ swapUsedPercent: DEFAULT_ADMISSION.maxSwapPercent, load: null }),
+    ).toBe(true);
+    expect(
+      webhookDispatchHot({ swapUsedPercent: null, load: load(cores * MAX_INIT_LOAD_FACTOR) }),
+    ).toBe(true);
+    // Ordinary Mac swap percent is not hot.  The admission ceiling is.
+    expect(webhookDispatchHot({ swapUsedPercent: 94, load: load(cores) })).toBe(false);
+  });
+
+  it("names load per core and swap percent on the hold reason", () => {
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: 98.4,
+        load: load(35),
+      }),
+    ).toBe("Host is busy (load 3.5 per core, swap 98%)");
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: null,
+        load: load(40),
+      }),
+    ).toBe("Host is busy (load 4 per core, swap unknown)");
+    expect(
+      webhookDispatchHoldReason({
+        swapUsedPercent: 99,
+        load: null,
+      }),
+    ).toBe("Host is busy (load unknown per core, swap 99%)");
+  });
+
+  it("returns no reason when the host is cool enough to dispatch", () => {
+    expect(webhookDispatchHoldReason({ swapUsedPercent: null, load: null })).toBeNull();
+    expect(webhookDispatchHoldReason({ swapUsedPercent: 94, load: load(cores) })).toBeNull();
+  });
+});
 
 describe("resource trigger math", () => {
   it("treats below as <= and above as >=", () => {

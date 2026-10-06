@@ -8,7 +8,9 @@
 // The pinned copy of the `/api/internal/agents` body that used to live in
 // this file is gone.  It was a drift detector for a divergence that can no
 // longer happen: the host now receives the endpoint function itself.
-import { isAbsolute, resolve } from "node:path";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { RequestOutcome } from "../contracts.ts";
@@ -515,5 +517,39 @@ describe("read_file asks only when the path is a credential store", () => {
     // and on Windows that is `C:\tmp\.ssh\config`.
     expect(isAbsolute(asking.asks[0]!.summary.replace("read file ", ""))).toBe(true);
     expect(asking.asks[0]!.summary.replace(/\\/g, "/")).toBe(`read file ${resolve(cwd, "../.ssh/config").replace(/\\/g, "/")}`);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("the host's settle — lost-job detector (jobs P0)", () => {
+  it("stops a process a bash call left running when the turn settles", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "bf-host-settle-"));
+    const pidFile = join(scratch, "pid");
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let child = 0;
+    try {
+      const host = hostFor({}, { localComputer: true, cwd: scratch });
+      const outcome = await host.execute(
+        { id: "1", name: "bash", arguments: { command: `sleep 30 > /dev/null 2>&1 & echo $! > ${pidFile}` } },
+        runtime,
+      );
+      expect(outcome.kind).toBe("result");
+      child = Number(readFileSync(pidFile, "utf8").trim());
+      expect(alive(child)).toBe(true);
+
+      host.settle?.();
+      const deadline = Date.now() + 8_000;
+      while (alive(child) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+      expect(alive(child)).toBe(false);
+    } finally {
+      if (child && alive(child)) process.kill(child, "SIGKILL");
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });

@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import type {
   DriverCreateInput,
+  EffortLevel,
   ModelCatalog,
   ProviderDriver,
   ProviderInstance,
@@ -81,11 +82,30 @@ const MINIMAX_RETIRED_MODEL_IDS: readonly string[] = [
   "MiniMax-M3",
 ];
 
+/** The `reasoning_effort` values MiniMax accepts on /v1/chat/completions, for
+ *  MiniMax-M3.1-Flash-Preview only.  Source:
+ *  https://platform.minimax.io/docs/api-reference/text-openai-api.  The field
+ *  is sent top-level and never paired with a `thinking` object:
+ *   - omitting it means `max`, which is what Default sends;
+ *   - `none` returns HTTP 400, and so does `thinking: {type: "disabled"}` on
+ *     M3.1, so this driver offers no way to switch reasoning off;
+ *   - other models ignore the field, so they declare no levels.
+ *  The API has no context-window parameter: M3.1's window is a fixed 1M, and
+ *  input past 512K bills at the higher tier the price table already models. */
+const M31_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+
 const MODELS: ModelCatalog = {
   default: "MiniMax-M3.1-Flash-Preview",
   options: [
-    { id: "MiniMax-M3.1-Flash-Preview", label: "MiniMax M3.1 Flash Preview", contextWindow: 1_000_000 },
-    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+    {
+      id: "MiniMax-M3.1-Flash-Preview",
+      label: "MiniMax M3.1 Flash Preview",
+      contextWindow: 1_000_000,
+      effortLevels: [...M31_EFFORT_LEVELS],
+    },
+    // Explicit `[]`: src/lib/model-effort.ts gives a row with no list the
+    // engine-wide one, which is M3.1's.
+    { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, effortLevels: [] },
   ],
 };
 
@@ -323,7 +343,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
   // ~/.mmx/config.json (loadLocalMiniMaxConfig above), and only as one of
   // three key sources. "MiniMax CLI" told users to install and debug a
   // binary that has no bearing on whether a turn works.
-  metadata: { displayName: "MiniMax", supportsMultipleInstances: true },
+  metadata: {
+    displayName: "MiniMax",
+    supportsMultipleInstances: true,
+    // Mirrors the `capabilities` block in `create` below, including what it
+    // does NOT declare: this driver mounts agents + local-computer tools and
+    // no Composio bridge, no screen channel, and no image input.  That
+    // absence is the reason the matrix shows connected apps as unavailable
+    // here while MiniMax Code shows them as available.
+    channelWiring: { agentsMcp: true, computerMcp: false, composioMcp: false, localComputerMcp: true, images: false },
+  },
   models: MODELS,
   install: {
     docsUrl: "https://platform.minimax.io/docs/token-plan/minimax-cli",
@@ -430,6 +459,9 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         /** Raw-bytes liveness for the turn loop's idle clock
          *  (`requestIdleMs` in chat-completions/loop.ts). */
         onChunk?: () => void;
+        /** M3.1's `reasoning_effort`.  Set only for a user turn's own rounds;
+         *  the utility path (titles, summaries) never passes it. */
+        reasoningEffort?: EffortLevel;
       },
     ): Promise<{ text: string; reasoning: string; tool_calls?: any[]; usage: TurnUsage | null }> => {
       // When the caller supplies a signal it already carries the request
@@ -446,6 +478,13 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         reasoning_split: true,
         stream_options: opts.stream ? { include_usage: true } : undefined,
         ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}),
+        // Top-level `reasoning_effort`, never a `thinking` field: MiniMax
+        // answers HTTP 400 to `reasoning_effort: "none"` and to
+        // `thinking: {type: "disabled"}` on M3.1, and treats an omitted field
+        // as `max`.  Default therefore sends nothing.  Docs:
+        // https://platform.minimax.io/docs/api-reference/text-openai-api
+        // (An undefined value is dropped by JSON.stringify, so Default adds no key.)
+        reasoning_effort: opts.reasoningEffort,
       };
       const res = await fetch(`${apiUrl}/chat/completions`, {
         method: "POST",
@@ -600,6 +639,15 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       const abort = new AbortController();
       active.set(threadId, { abort, turnId, startedAt: Date.now() });
       const model = turn.model || models.default;
+      // Effort rides every round of the turn, and only when the picked level is
+      // one this model's catalog row declares: M2.7 Highspeed declares none,
+      // `none` is not a level MiniMax takes, and an unknown id (discovered
+      // from GET /models) gets `[]`.  No level means the field is omitted.
+      const row = models.options.find((option) => option.id === model);
+      const reasoningEffort =
+        turn.effort && turn.effort !== "none" && row?.effortLevels?.includes(turn.effort)
+          ? turn.effort
+          : undefined;
       // Round 1's prefix.  The loop owns this array from here and only ever
       // APPENDS to it, so rounds 2..N re-send a byte-identical prefix.
       // The transcript is byte-capped and entry-count-capped first so a
@@ -684,6 +732,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
               // unnoticed for a long time — see STREAM_IDLE_TIMEOUT_MS and
               // the `budget` comment on this turn's runTurnLoop call.
               idleTimeoutMs: turn.unattended ? STREAM_IDLE_TIMEOUT_MS : undefined,
+              reasoningEffort,
               // Every raw chunk feeds the loop's idle clock, which is what
               // bounds silence on the interactive path now that its hard
               // ceiling is the loop's default rather than 180s.
@@ -872,7 +921,15 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
         // already knows about; a genuinely new model gets its id as the
         // label rather than nothing.
         const known = MODELS.options.find((m) => m.id === id);
-        options.push({ id, label: known?.label ?? id, contextWindow: known?.contextWindow });
+        // `effortLevels` is always explicit: an id MODELS has never heard of
+        // gets `[]`, because MiniMax documents `reasoning_effort` as M3.1-only
+        // and a row with no list would inherit the engine-wide one.
+        options.push({
+          id,
+          label: known?.label ?? id,
+          contextWindow: known?.contextWindow,
+          effortLevels: known?.effortLevels ?? [],
+        });
       }
       if (options.length === 0) return; // an empty or malformed list keeps the current catalog
       const keptDefault = options.find((o) => o.id === models.default)?.id;
@@ -941,6 +998,13 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
           toolLoop: true,
           replaysTranscript: true,
           localComputerMcp: true,
+          // The engine gate; each catalog row names the levels its model
+          // honours (M3.1 only).
+          effortLevels: M31_EFFORT_LEVELS,
+          // Jobs matrix: BotFleet's own job tools run in this loop (P1,
+          // server/tools/jobs.ts); helpers stay `delegate_bot`.
+          backgroundJobs: "emulated",
+          helpers: "none",
         },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.abort.abort(),

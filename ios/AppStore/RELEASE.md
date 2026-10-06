@@ -5,7 +5,7 @@ The app is native Swift and uses XcodeGen; EAS commands do not apply.
 ## One-time Apple setup
 
 1. Enrol in the Apple Developer Program.
-2. Register the bundle IDs `app.botfleet.ios` and `app.botfleet.ios.widgets` (already in `project.yml`).
+2. Register the bundle IDs in App Store Connect.  Hosted ios-ship and `ios/project.yml` today use **`app.botfleet`** and **`app.botfleet.widgets`** (live ASC app appleId `6806379515`).  Register **`app.botfleet.ios`** and **`app.botfleet.ios.widgets`** in the Developer Portal only when intentionally moving off the legacy ASC bundle IDs.
 3. Create the matching app in App Store Connect with the name **BotFleet**, primary category **Productivity**, and a unique SKU.
 4. Use the existing Apple Distribution identity (team `CC8UTF7ATG`).  Hosted ships use automatic signing and do not install a new provisioning profile.
 5. Add the review contact details in App Store Connect; do not commit private contact data or App Store Connect keys.
@@ -32,8 +32,8 @@ The Mac wrapper remains a fallback when the hosted job cannot run.  It prefers `
 - Copy the localized text from `en-US/`.
 - Use `privacy-answers.md` and verify it still matches the binary.
 - Use `review-notes.md`, adding a real review contact in App Store Connect.
-- Support URL: `https://github.com/jaywedgeworth22/BotFleet/issues`
-- Privacy policy URL: `https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/ios-privacy.md`
+- Support URL: `https://github.com/Simple-With-Us/BotFleet/issues`
+- Privacy policy URL: `https://github.com/Simple-With-Us/BotFleet/blob/main/docs/ios-privacy.md`
 - Choose manual release for 1.0; enable a phased release after the first production build is stable.
 
 The unsigned simulator CI proves compilation, not distribution signing.  Hosted TestFlight ships run from `.github/workflows/ios-ship.yml` on `macos-latest` when `ios/**` (or the ship scripts) land on `main`.  Signing uses the existing repository Actions secrets.  Hosted ships use the fleet script default interval (no extra flags).

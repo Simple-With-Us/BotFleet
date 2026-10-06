@@ -100,14 +100,20 @@ export function CallTargetButton({
   // while leaving it working for anyone who deliberately picked the built-in voices.
   const voiceProviderConfigured = configured;
   const everyTargetHasVoice = voices.length > 0 && voices.every((voice) => Boolean(voice));
-  // A Personal Voice id is non-empty, but it speaks on-device on iOS,
-  // not here - on the desktop call path it counts as no usable voice.
-  const everyTargetSpeakable = everyTargetHasVoice && voices.every((voice) => !isPersonalVoiceId(voice));
-  const fallbackSpeakable = Boolean(state.config?.tts?.ready) && !isPersonalVoiceId(state.config?.tts?.voice);
+  // Apple Personal Voices speak on-device on macOS and iOS companion devices.
+  // The main process already gates the flag on the host's macOS version, so a
+  // macOS 13 Mac is not offered a call button that can only fail.
+  const isPersonalSpeakable = capabilities.dictation.personalVoice === true;
+  const isVoiceSpeakable = (voice?: string) =>
+    Boolean(voice) && (!isPersonalVoiceId(voice) || isPersonalSpeakable);
+
+  const everyTargetSpeakable = everyTargetHasVoice && voices.every(isVoiceSpeakable);
+  const fallbackSpeakable = Boolean(state.config?.tts?.ready) &&
+    (!isPersonalVoiceId(state.config?.tts?.voice) || isPersonalSpeakable);
   const personalVoiceChosen = voices.some((voice) => isPersonalVoiceId(voice)) ||
     (!everyTargetSpeakable && isPersonalVoiceId(state.config?.tts?.voice));
   const voiceReady =
-    configured && !voices.some((voice) => isPersonalVoiceId(voice)) &&
+    configured && (isPersonalSpeakable || !voices.some((voice) => isPersonalVoiceId(voice))) &&
     (requireExplicitVoices ? everyTargetSpeakable : Boolean(fallbackSpeakable || everyTargetSpeakable));
   const unavailable = !active && (!capabilitiesReady || !supported || !voiceReady);
   const voiceSetupRequired = capabilitiesReady && supported && !voiceReady;
@@ -125,7 +131,9 @@ export function CallTargetButton({
           ? "Set up a voice in a bot profile to make calls"
           : !voiceReady
             ? personalVoiceChosen
-              ? "Personal Voice is iPhone-only"
+              ? capabilities.dictation.reasonCode === "requires-macos-14"
+                ? "Personal Voice needs macOS 14 or later, or an iPhone"
+                : "Personal Voice needs a Mac or iPhone"
               : "Pick a voice in a bot profile to make calls"
             : `Call ${targetName}`;
 
@@ -139,7 +147,9 @@ export function CallTargetButton({
         ? "Add a MiniMax API key in Settings so the bot can speak during calls."
         : !voiceReady
           ? personalVoiceChosen
-            ? "Apple Personal Voice speaks on iPhone only.\u00A0 Pick another voice to make calls on this computer."
+            ? capabilities.dictation.reasonCode === "requires-macos-14"
+              ? "Apple Personal Voice needs macOS 14 or later, or an iPhone.\u00A0 Pick another voice to make calls on this computer."
+              : "Apple Personal Voice speaks on Apple devices (Mac and iPhone).\u00A0 Pick another voice to make calls on this computer."
             : voices.length > 1
               ? "Give every channel member a voice before starting a channel call."
               : "Choose a voice before starting a call."
@@ -311,22 +321,24 @@ function Call({ bot }: { bot: Bot }) {
   /** Speak, with the microphone closed for the duration (see the header
    * comment — an open mic during playback is a feedback loop). */
   const say = useCallback(
-    async (text: string) => {
+    async (text: string, messageId?: string) => {
       if (!alive.current || currentCall() !== bot.id) return false;
       const mine = ++sayGeneration.current;
       // Move first. stopSpeech() finishes asynchronously, and its close must
       // never observe an old "listening" phase and reopen the mic.
       move("speaking");
       hush();
-      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice });
+      // A bot reply goes through the server's message audio route so the voice
+      // summary mode and clip cache apply; other prompts are spoken as written.
+      await speaker.speak(text, { botId: bot.id, voiceId: bot.voice, ...(messageId ? { messageId, threadId: bot.threadId } : {}) });
       return alive.current && currentCall() === bot.id && sayGeneration.current === mine;
     },
-    [bot.id, bot.voice, hush, move],
+    [bot.id, bot.voice, bot.threadId, hush, move],
   );
 
   const sayThenListen = useCallback(
-    async (text: string) => {
-      const stillMine = await say(text);
+    async (text: string, messageId?: string) => {
+      const stillMine = await say(text, messageId);
       if (stillMine && phaseRef.current === "speaking") listen();
     },
     [listen, say],
@@ -573,7 +585,7 @@ function Call({ bot }: { bot: Bot }) {
     for (const m of fresh) spokenIds.current.add(m.id);
 
     if (reply?.text) {
-      void sayThenListen(spokenReply(reply.text));
+      void sayThenListen(spokenReply(reply.text), reply.id);
     } else if (chip?.tool?.spoken && phase === "working") {
       void say(chip.tool.spoken).then((stillMine) => {
         if (stillMine && phaseRef.current === "speaking") move("working");

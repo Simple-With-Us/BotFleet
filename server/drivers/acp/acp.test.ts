@@ -6,7 +6,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly —
 // resolveCliSpawn turns it into `node <script>`, so these run everywhere.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ModelCatalog, ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
+import { MODEL_REJECTED_STOP_REASON } from "../../model-fallback.ts";
+import { classifyError } from "../retry.ts";
 import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpConfig, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { DshAgentDriver } from "./dsh.ts";
@@ -255,6 +257,67 @@ describe("ACP decodeConfig", () => {
   });
 });
 
+
+/** A CLI whose `--version` answers while `ok` exists and otherwise dies the
+ *  way the test asks (`mode`: exit or crash).  Lets a test take an engine from
+ *  working to broken between two snapshots without any real engine. */
+function switchableCli(dir: string): { cli: string; setWorking: (working: boolean) => void; setMode: (mode: "exit" | "crash") => void } {
+  const cli = join(dir, "switchable-cli");
+  writeFileSync(
+    cli,
+    [
+      // A node-shebang script: env-path resolves it to `node <script>` on
+      // Windows, where a `#!/bin/sh` fixture cannot run at all.
+      "#!/usr/bin/env node",
+      'const fs = require("node:fs");',
+      `const dir = ${JSON.stringify(dir)};`,
+      'if (fs.existsSync(dir + "/ok")) { console.log("9.9.9"); process.exit(0); }',
+      'if (fs.readFileSync(dir + "/mode", "utf8") === "crash") process.kill(process.pid, "SIGSEGV");',
+      "process.exit(3)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  writeFileSync(join(dir, "mode"), "exit");
+  return {
+    cli,
+    setWorking: (working) => {
+      if (working) writeFileSync(join(dir, "ok"), "");
+      else rmSync(join(dir, "ok"), { force: true });
+    },
+    setMode: (mode) => writeFileSync(join(dir, "mode"), mode),
+  };
+}
+
+describe("ACP shared core version reuse", () => {
+  // A SIGSEGV crash has no Windows equivalent: POSIX only.
+  for (const mode of (process.platform === "win32" ? (["exit"] as const) : (["exit", "crash"] as const))) {
+    it(`does not keep reporting the last version once the binary ${mode === "crash" ? "crashes" : "fails"} definitively`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-acp-switch-"));
+      const cli = switchableCli(dir);
+      const instance = await GrokAgentDriver.create({
+        instanceId: `acp-switch-${mode}`,
+        displayName: "ACP Switch",
+        environment: {},
+        enabled: true,
+        config: { cli: cli.cli, fullAuto: false },
+      });
+      cli.setWorking(true);
+      const first = await instance.snapshot();
+      expect(first.state).toBe("available");
+      expect(first.version).toBe("9.9.9");
+      cli.setWorking(false);
+      cli.setMode(mode);
+      const second = await instance.snapshot();
+      expect(second.state).toBe("unavailable");
+      expect(second.transient).toBeUndefined();
+      expect(second.version).toBeUndefined();
+      await instance.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    });
+  }
+});
+
 describe("ACP turns (fake CLI)", () => {
   let instance: ProviderInstance;
   let recorder: EventRecorder;
@@ -291,6 +354,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
     delete process.env.FAKE_ACP_MODELS;
+    delete process.env.FAKE_ACP_SESSION_MODELS;
     delete process.env.FAKE_ACP_MODEL_STICKS;
     delete process.env.FAKE_ACP_CONFIG_REPLY_BARE;
     delete process.env.FAKE_ACP_USAGE_ROOT;
@@ -298,6 +362,7 @@ describe("ACP turns (fake CLI)", () => {
     delete process.env.FAKE_ACP_COST;
     delete process.env.FAKE_ACP_TRANSIENTS;
     delete process.env.FAKE_ACP_PARTIAL_FAILS;
+    delete process.env.FAKE_ACP_LATE_INPUT_AT;
     delete process.env.FAKE_ACP_STATE;
     delete process.env.FAKE_ACP_RETRY_SCALE;
     delete process.env.FAKE_ACP_INIT_DELAY_MS;
@@ -424,7 +489,7 @@ describe("ACP turns (fake CLI)", () => {
     await instance.adapter.sendTurn({ threadId: "t-cancel-child", text: "never finishes" });
     await vi.waitFor(() => {
       expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
-    });
+    }, { timeout: 5_000 });
     const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
 
     try {
@@ -440,6 +505,112 @@ describe("ACP turns (fake CLI)", () => {
       } catch {
         // expected once the deadline cleanup has reaped it
       }
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("reaps a lingering descendant after the CLI leader has already exited", async () => {
+    // A lock is only released when every holder is gone, and killCliTree
+    // early-returns once the leader has exited.  So when an MCP descendant
+    // ignores SIGTERM and outlives its parent while still holding the session
+    // lock, stop() must reap the group itself (SIGTERM, then the 2s SIGKILL),
+    // or the wedge survives and the next run collides with the lock.  The
+    // descendant keeps the group alive, so the group id is still this CLI's.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "exit-with-lingering-child", { promptTimeoutMs: 30_000 });
+    await instance.adapter.sendTurn({ threadId: "t-lingering-child", text: "never finishes" });
+    await vi.waitFor(() => {
+      expect(() => readFileSync(descendantPidFile, "utf8")).not.toThrow();
+    }, { timeout: 5_000 });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+
+    try {
+      const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+      expect(done).toMatchObject({ ok: false, stopReason: "exit_before_result" });
+
+      // Without the already-exited group reap the descendant is never
+      // signalled again: it holds the lock forever.  With it, the
+      // SIGTERM-ignoring descendant is gone within the force-kill window.
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the leader-already-exited group kill has reaped it
+      }
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("reaps a SIGTERM-ignoring descendant that outlives a leader stopped on a normal completion", async () => {
+    // Kody #831: settle() calls stop() while the leader is alive, the leader
+    // dies on the SIGTERM within milliseconds, and the SIGTERM-ignoring
+    // descendant lives on holding the session lock.  settle() has already
+    // dropped the turn from `active`, so stopAll/dispose can never reach it:
+    // the 2s force-kill is the only thing left that can reap it, and it must
+    // not stand down just because the leader is gone.
+    const descendantPidFile = join(scratch, "descendant.pid");
+    process.env.FAKE_ACP_DESCENDANT_PID = descendantPidFile;
+    await create(GrokAgentDriver, "happy-with-lingering-child");
+    await instance.adapter.sendTurn({ threadId: "t-happy-lingering", text: "hi" });
+    const done = await recorder.until((event) => event.type === "turn.completed", 5_000);
+    expect(done).toMatchObject({ ok: true });
+    const descendantPid = Number(readFileSync(descendantPidFile, "utf8"));
+    try {
+      await vi.waitFor(() => {
+        expect(() => process.kill(descendantPid, 0)).toThrow();
+      }, { timeout: 4_000 });
+    } finally {
+      try {
+        process.kill(descendantPid, "SIGKILL");
+      } catch {
+        // expected once the force-kill has reaped it
+      }
+    }
+  });
+
+  // POSIX only: the assertion reads the negative-pid SIGTERM killCliTree sends
+  // to the CLI's process group, and Windows has no process groups (killCliTree
+  // runs taskkill /T there and never calls process.kill with a negative pid).
+  it.skipIf(process.platform === "win32")("never sends a stale process-group SIGKILL once the child has exited", async () => {
+    // stop() arms a 2s force-kill on the per-turn hot path (settle() calls
+    // stop() on every normal completion while the child is alive).  By the time
+    // that timer fires the child has usually exited on SIGTERM and, with no
+    // descendant left in its group, its pid is free for the OS to recycle, so
+    // the force-kill must stand down rather than SIGKILL an unrelated group
+    // that inherited the recycled pid (another turn's CLI, the deployer's
+    // children).
+    const kill = vi.spyOn(process, "kill");
+    try {
+      await create(GrokAgentDriver);
+      // drop anything earlier tests left behind, so the group id below is this
+      // turn's own child
+      kill.mockClear();
+      await instance.adapter.sendTurn({ threadId: "t-stale-group-kill", text: "hi" });
+      const done = await recorder.until((event) => event.type === "turn.completed", 3_000);
+      expect(done).toMatchObject({ ok: true });
+
+      // killCliTree signalled THIS child's own process group on the way out
+      // (the only negative-pid SIGTERM a settled turn sends), and that group id
+      // is the one a 2s force-kill would reuse if it fired against a pgid the
+      // OS had already recycled.  Leftover timers from earlier tests only ever
+      // send SIGKILL and belong to other groups, so scoping by it keeps them
+      // out of the assertion.
+      const pgid = kill.mock.calls.find(
+        ([pid, signal]) => typeof pid === "number" && pid < 0 && signal === "SIGTERM",
+      )?.[0];
+      expect(typeof pgid).toBe("number");
+
+      // Outlive the 2s force-kill window, then prove it never SIGKILLed the
+      // group of a child that had already exited.
+      await new Promise((resolve) => setTimeout(resolve, 2_600));
+      const staleGroupKills = kill.mock.calls.filter(
+        ([pid, signal]) => pid === pgid && signal === "SIGKILL",
+      );
+      expect(staleGroupKills).toEqual([]);
+    } finally {
+      kill.mockRestore();
     }
   });
 
@@ -485,6 +656,49 @@ describe("ACP turns (fake CLI)", () => {
     expect(recorder.events.some((event) => event.type === "runtime.error")).toBe(false);
     expect(recorder.events.some((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")).toBe(true);
     expect(recorder.events.some((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1" && "ok" in event && event.ok === true)).toBe(true);
+  });
+
+  it("files a tool call's raw input and its content for the side store, beside the clipped headline", async () => {
+    process.env.FAKE_ACP_QUIET_MS = "50";
+    await create(GrokAgentDriver, "quiet-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-tool-io", text: "build it" });
+    await recorder.until((event) => event.type === "turn.completed", 3_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "quiet-tool-1")!;
+    expect(started).toMatchObject({ title: "pnpm build", target: "pnpm build" });
+    expect(started.io?.input?.text).toBe('{\n  "command": "pnpm build"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "quiet-tool-1")!;
+    expect(done.io?.output).toEqual({ text: "built", truncated: false, length: 5 });
+  });
+
+  it("files the arguments a streaming agent sends on a later tool_call_update", async () => {
+    // announced with an empty rawInput; the real arguments settle mid-run
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    const started = recorder.events.find((event) => event.type === "item.started" && event.itemId === "late-input-1")!;
+    // an empty object is not an input worth filing
+    expect(started.io?.input).toBeUndefined();
+    const updates = recorder.events.filter((event) => event.type === "item.updated" && event.itemId === "late-input-1");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.output?.text).toBe("total 0");
+    // already filed on the update, so the completion does not file it twice
+    expect(done.io?.input).toBeUndefined();
+  });
+
+  it("files the arguments that only settle on the completing tool_call_update", async () => {
+    process.env.FAKE_ACP_LATE_INPUT_AT = "completion";
+    await create(GrokAgentDriver, "late-input-tool-call");
+    await instance.adapter.sendTurn({ threadId: "t-acp-late-input-end", text: "list it" });
+    await recorder.until((event) => event.type === "turn.completed", 15_000);
+
+    expect(recorder.events.some((event) => event.type === "item.updated" && event.itemId === "late-input-1")).toBe(false);
+    const done = recorder.events.find((event) => event.type === "item.completed" && event.itemId === "late-input-1")!;
+    expect(done.io?.input?.text).toBe('{\n  "command": "ls -la"\n}');
+    expect(done.io?.output?.text).toBe("total 0");
   });
 
   it("still enforces the hard ceiling even while the agent keeps streaming", async () => {
@@ -665,6 +879,50 @@ describe("ACP turns (fake CLI)", () => {
       args: ["/tmp/connector-proxy.js"],
       env: [{ name: "OMB_CONNECTOR_UPSTREAM_URL", value: "http://127.0.0.1:8799/api/internal/connectors/mcp" }],
     });
+  });
+
+  it("grok names what the account is offered when the CLI rejects a picked model", async () => {
+    // Composer 2.5 and Grok Build 0.1 are in the picker but only some accounts
+    // are served them.  A rejected session/set_model must end the turn with the
+    // CLI's own offered list and the command that prints it, not a version hint.
+    process.env.FAKE_ACP_MODE = "set-model-invalid-params";
+    process.env.FAKE_ACP_SESSION_MODELS = "grok-4.7|Grok 4.7,grok-4.7-build-fast|Grok 4.7 Fast,grok-4.6|Grok 4.6";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-composer", text: "go", model: "composer-2.5" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    // The turn settles with the structural rejection stop reason, which is
+    // what lets the fallback walk mark this model rejected (model-rejections.ts)
+    // instead of spawning the CLI again on every turn.
+    expect(done).toMatchObject({ ok: false, stopReason: MODEL_REJECTED_STOP_REASON });
+    const err = recorder.events.filter((e) => e.type === "runtime.error");
+    expect(err).toHaveLength(1);
+    const message = err[0]!.message as string;
+    expect(message).toContain('Grok rejected model "composer-2.5" via session/set_model');
+    // The reason rides in the RPC error's `data`; core.ts keeps it off the
+    // Error message, so the driver has to fold it back in.
+    expect(message).toContain("via session/set_model: Invalid params: unknown model id.");
+    expect(classifyError(new Error(message))).toEqual({ transient: false, reason: "unknown_model" });
+    expect(message).toContain("This account's Grok CLI offers: grok-4.7, grok-4.7-build-fast, grok-4.6.");
+    expect(message).toContain("`grok models`");
+    expect(message).not.toContain("1.0.6");
+  });
+
+  it("grok does not mark a model rejected when set_model fails for another reason", async () => {
+    // An agent that predates session/set_model answers -32601 "method not
+    // found".  That is no verdict on the model id, so the turn keeps the
+    // generic rpc_error stop reason and the model is not hidden for hours.
+    process.env.FAKE_ACP_MODE = "no-session-config";
+    await create();
+
+    await instance.adapter.sendTurn({ threadId: "t-grok-old-cli", text: "go", model: "grok-4.7" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "rpc_error" });
+    const message = recorder.events.find((e) => e.type === "runtime.error")!.message as string;
+    expect(message).toContain('Grok rejected model "grok-4.7" via session/set_model');
+    expect(message).toContain("method not found");
   });
 
   it("droid takes model and autonomy over the wire, never through argv", async () => {

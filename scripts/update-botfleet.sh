@@ -9,10 +9,17 @@
 # script is invoked.
 #
 # `ubf` is a no-op when the local BotFleet checkout is already at origin/main.
-# Override with BOTFLEET_FORCE=1 to reinstall anyway.  The transaction inside
-# update-botfleet-mac.mjs has no built-in "already current" short circuit; the
-# skip happens here so a second `ubf` an hour later is sub-second instead of a
-# 2-minute interruption.
+# Override with BOTFLEET_FORCE=1 (or --force / -f) to reinstall anyway.  The
+# transaction inside update-botfleet-mac.mjs has no built-in "already current"
+# short circuit; the skip happens here so a second `ubf` an hour later is
+# sub-second instead of a 2-minute interruption.
+#
+# WARNING:  force is not only "reinstall anyway".  The updater also treats it as
+# permission to update while work is active: it skips the idle requirement and
+# POSTs /api/runtime/quiesce?force=true, which interrupts busy bots and running
+# or queued routines.  Their work is saved to pending-update-resume.json and
+# resumed after the update, and a live room turn still refuses the forced
+# update.  Do not use it casually while bots are working.
 set -euo pipefail
 
 # Extend PATH with every place node is commonly found on macOS (Homebrew Apple
@@ -68,8 +75,9 @@ fi
 
 # Skip the close / rebuild / relaunch dance when the local BotFleet checkout is
 # already at origin/main.  Override the check with BOTFLEET_FORCE=1 or by
-# passing --force / -f.  Override the checkout location with BOTFLEET_CHECKOUT
-# (defaults to the parent of the tracked implementation).
+# passing --force / -f (which also interrupts busy bots and routines; see the
+# warning at the top of this file).  Override the checkout location with
+# BOTFLEET_CHECKOUT (defaults to the parent of the tracked implementation).
 # --force / -f mirrors the env-var override; recognised here so the documented
 # flag does what its name says.
 if [[ -z "${BOTFLEET_FORCE:-}" ]]; then
@@ -140,15 +148,93 @@ for arg in "$@"; do
 done
 [[ "$EXPECT_SHORTCUT_TARGET" == "0" ]] || UP_TO_DATE_SHORTCUT=0
 if [[ "${BOTFLEET_FORCE:-}" == "1" ]]; then
-  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main."
+  echo "WARNING:  BOTFLEET_FORCE=1 - running updater even if $BOTFLEET_CHECKOUT is already at origin/main.  This also interrupts busy bots and routines (they resume after the update)."
 elif [[ "$UP_TO_DATE_SHORTCUT" == "1" && "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin main 2>/dev/null; then
     LOCAL_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse HEAD)
     REMOTE_HEAD=$(git -C "$BOTFLEET_CHECKOUT" rev-parse origin/main)
     if [[ "$LOCAL_HEAD" == "$REMOTE_HEAD" ]]; then
-      CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
-      echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway.)"
-      exit 0
+      IS_UP_TO_DATE=1
+
+      # 1. Compare against the installed Mac app's build identity.  Absence of
+      # the manifest is "we cannot tell what is installed", not "out of date":
+      # a developer checkout, a fixture, or an uninstalled app must not block
+      # the shortcut on its own.  Only a manifest that names a different commit
+      # counts as positive evidence of a mismatch.
+      APP_MANIFEST="${BOTFLEET_APP_PATH:-/Applications/BotFleet.app}/Contents/Resources/server/build-identity.json"
+      if [[ -f "$APP_MANIFEST" ]]; then
+        INSTALLED_COMMIT=$(APP_MANIFEST_PATH="$APP_MANIFEST" "$NODE_BIN" -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.env.APP_MANIFEST_PATH, "utf8")).sourceCommit) } catch { console.log("") }' 2>/dev/null) || INSTALLED_COMMIT=""
+        if [[ "$INSTALLED_COMMIT" =~ ^[0-9a-f]{40}$ && "$INSTALLED_COMMIT" != "$LOCAL_HEAD" ]]; then
+          IS_UP_TO_DATE=0
+        fi
+      fi
+
+      # 2. Compare against the running server's runtime commit.  Absence of
+      # the owner file or an unreachable runtime is also "no live harness to
+      # ask", not "out of date": only a runtime we could authenticate against
+      # and that answered with a different commit turns the shortcut off.
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        OWNER_FILE="${BOTFLEET_DATA_DIR:-$HOME/.botfleet}/harness-owner.json"
+        if [[ -f "$OWNER_FILE" ]]; then
+          # The owner file holds a bearer secret.  Read it and perform the
+          # authenticated GET inside one Node process so the secret never
+          # crosses a process boundary as command output, argv, or a shell
+          # variable.  Only the file path is passed in (via OWNER_FILE_PATH).
+          # On any failure that process exits non-zero and writes nothing and
+          # IS_UP_TO_DATE stays 1: a missing or unreachable harness is not
+          # evidence of an outdated checkout.
+          RUNTIME_COMMIT=$(OWNER_FILE_PATH="$OWNER_FILE" "$NODE_BIN" -e '
+            const fs = require("fs");
+            const http = require("http");
+            const ownerPath = process.env.OWNER_FILE_PATH;
+            if (typeof ownerPath !== "string" || ownerPath.length === 0) process.exit(1);
+            let owner;
+            try {
+              owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+            } catch {
+              process.exit(1);
+            }
+            const port = owner && owner.port;
+            const credential = owner && owner.nonce;
+            if (typeof port !== "number" && typeof port !== "string") process.exit(1);
+            if (typeof credential !== "string" || credential.length === 0) process.exit(1);
+            const portNum = Number(port);
+            if (!Number.isInteger(portNum) || portNum <= 0 || portNum > 65535) process.exit(1);
+            const req = http.request({
+              hostname: "127.0.0.1",
+              port: portNum,
+              path: "/api/runtime",
+              method: "GET",
+              headers: { "Authorization": "Bearer " + credential },
+              timeout: 1000,
+            }, (res) => {
+              let body = "";
+              res.setEncoding("utf8");
+              res.on("data", (c) => { body += c; });
+              res.on("end", () => {
+                if (res.statusCode !== 200) process.exit(1);
+                let commit;
+                try { commit = JSON.parse(body).sourceCommit; } catch { process.exit(1); }
+                if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) process.exit(1);
+                process.stdout.write(commit);
+                process.exit(0);
+              });
+            });
+            req.on("error", () => process.exit(1));
+            req.on("timeout", () => { req.destroy(); process.exit(1); });
+            req.end();
+          ' 2>/dev/null) || RUNTIME_COMMIT=""
+          if [[ "$RUNTIME_COMMIT" =~ ^[0-9a-f]{40}$ && "$RUNTIME_COMMIT" != "$LOCAL_HEAD" ]]; then
+            IS_UP_TO_DATE=0
+          fi
+        fi
+      fi
+
+      if [[ "$IS_UP_TO_DATE" == "1" ]]; then
+        CURRENT=$(git -C "$BOTFLEET_CHECKOUT" log --oneline -1)
+        echo "OK: Already at $CURRENT.  Nothing to update.  (Set BOTFLEET_FORCE=1 or pass --force to reinstall anyway; that also interrupts busy bots and routines.)"
+        exit 0
+      fi
     fi
   else
     echo "WARNING:  Could not fetch origin/main from $BOTFLEET_CHECKOUT; running updater anyway."
@@ -251,6 +337,17 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
   BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/botfleet-updater.XXXXXX")"
   cleanup_bootstrap() { rm -rf "$BOOTSTRAP_DIR"; }
   trap cleanup_bootstrap EXIT
+  # Canonicalize the directory.  On macOS TMPDIR is under /var/folders and /var
+  # is a symlink to /private/var, so the unresolved path differs from the one
+  # Node's ESM loader reports for the entry module.  The updater compares
+  # physical paths itself, but hand it the physical one anyway.  The trap above
+  # is already armed, so a failure here still removes the directory.
+  if BOOTSTRAP_PHYSICAL="$(cd "$BOOTSTRAP_DIR" && pwd -P)" && [[ -n "$BOOTSTRAP_PHYSICAL" ]]; then
+    BOOTSTRAP_DIR="$BOOTSTRAP_PHYSICAL"
+  else
+    echo "BotFleet updater: could not resolve the bootstrap directory $BOOTSTRAP_DIR." >&2
+    exit 1
+  fi
   if git -C "$BOTFLEET_CHECKOUT" fetch --quiet origin "$BOOTSTRAP_FETCH_REF" 2>/dev/null; then
     # Enforce resolveTarget()'s origin/main ancestry rule BEFORE any code from
     # the target is archived or executed: an unmerged ref must never supply
@@ -278,6 +375,8 @@ if [[ "$BOTFLEET_CHECKOUT_IS_GIT" == "1" ]]; then
           scripts/update-botfleet-mac.mjs \
           scripts/mac-update-transaction.mjs \
           scripts/update-progress.mjs \
+          scripts/ci-build-resolver.mjs \
+          scripts/stage-entries.mjs \
           electron/update-credential-preparation.mjs | tar -x -C "$BOOTSTRAP_DIR"; then
         PINNED_ARGS=()
         if [[ "${1:-update}" != "apply" && "${1:-update}" != "unquiesce" ]]; then

@@ -8,7 +8,7 @@ protocols:
 
 # In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
 # the NSIS .exe (Windows) from this repository's own GitHub Releases:
-# jaywedgeworth22/BotFleet, the only place BotFleet releases exist (owner
+# Simple-With-Us/BotFleet, the only place BotFleet releases exist (owner
 # rule, 2026-09-02: one repository per app; no separate releases repo).
 # The repo is public, so no token ever reaches a user's machine. Baked into
 # app-update.yml; both metadata files are emitted here even with
@@ -18,7 +18,7 @@ protocols:
 # electron-updater reads the first and a duplicate only invites drift.
 publish:
   - provider: github
-    owner: jaywedgeworth22
+    owner: Simple-With-Us
     repo: BotFleet
 
 directories:
@@ -94,6 +94,8 @@ extraResources:
     to: companion
   - from: skills
     to: skills
+  - from: bots
+    to: bots
   - from: dist-native/android-platform-tools
     to: android-platform-tools
 
@@ -137,6 +139,7 @@ mac:
   extendInfo:
     NSMicrophoneUsageDescription: BotFleet uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: BotFleet transcribes your voice on-device to type messages for you.
+    NSSpeechSynthesisUsageDescription: BotFleet uses your Apple Personal Voice to speak aloud during calls and voice replies.
     NSAccessibilityUsageDescription: BotFleet uses Accessibility when you let a bot control this Mac.
     NSScreenCaptureUsageDescription: BotFleet uses Screen Recording so bots can see this Mac before acting.
   # Notarization runs manually after the build (notarytool + staple),

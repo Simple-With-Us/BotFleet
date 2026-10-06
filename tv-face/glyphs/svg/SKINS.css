@@ -1,0 +1,23 @@
+/* TV-Face shell skin presets — apply to :root on _shell_template.svg */
+
+.skin-orange {
+  --shell: #E07030; --shell-dark: #C05820; --ear: #D06028; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-blue {
+  --shell: #3A7BD5; --shell-dark: #2A5BA8; --ear: #3A6FC0; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-green {
+  --shell: #2DB84B; --shell-dark: #1E8A35; --ear: #2AA044; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-purple {
+  --shell: #8B5CF6; --shell-dark: #6D3FD0; --ear: #7C4DE8; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-pink {
+  --shell: #EC4899; --shell-dark: #C02674; --ear: #DB3A88; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-red {
+  --shell: #EF4444; --shell-dark: #C12A2A; --ear: #DC3535; --lens: #4DB8FF; --glyph: #00E5FF;
+}
+.skin-yellow {
+  --shell: #EAB308; --shell-dark: #B88C06; --ear: #D4A00A; --lens: #4DB8FF; --glyph: #00E5FF;
+}

@@ -8,7 +8,7 @@ export type LocalComputerDestination = "cloud" | "vm" | "local";
 /** The four computer providers the operator can enable. Each maps to one or
  * more legacy `LocalComputerDestination`s (see
  * `migrateAllowedComputersToProviders`). `localMac` is the host running the
- * app ("This Computer"); `localVm` is a containerized Cua desktop the
+ * app ("This Computer"); `localVm` is a containerized CUA desktop the
  * operator has prepared on this machine; `asciiBox` is the hosted
  * ASCII.dev Box; `selfHostedVps` is a container on the operator's own
  * server, reached over SSH. */
@@ -43,7 +43,7 @@ export const COMPUTER_PROVIDER_LABEL: Record<ComputerProviderId, string> = {
 export const COMPUTER_PROVIDER_DISABLE_IMPACT: Record<ComputerProviderId, string> = {
   asciiBox: "Turning this off blocks every bot that currently uses ASCII.dev Box.  Each affected bot would need a new computer picked manually.",
   selfHostedVps: "Turning this off stops new use of the VPS; existing containers and workspaces stay until removed.  Bots that use it lose the VPS until they get another computer.",
-  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their private or shared VM desktop.",
+  localVm: "Turning this off stops the Local VM container from starting.  Affected bots lose their VM desktop.",
   localMac: "Turning this off keeps every bot off this computer.  Bots that use This Computer lose it, and Auto approvals stop working for them.",
 };
 

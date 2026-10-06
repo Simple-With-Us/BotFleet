@@ -15,6 +15,7 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 
 import type { PushSenderHealth } from "./apns.ts";
+import { isJsonObject, isJsonString, type JsonValue } from "./json.ts";
 import type { DeviceRegistry } from "./devices.ts";
 import { companionEndpointCandidates, hostedCompanionUrl } from "./endpoints.ts";
 import { DEFAULT_LAN_POLICY, lanPolicyNote, reachableCandidates, type LanPolicy } from "./lan-policy.ts";
@@ -109,12 +110,13 @@ interface HostedEndpointPayload {
  * sidecar runs directly from its compiled output without a node_modules tree.
  * Keep this tiny wire contract dependency-free and deliberately exact: one
  * own enumerable `url` property, with no silently discarded extras. */
-const isHostedEndpointPayload = (value: unknown): value is HostedEndpointPayload => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+const parseHostedEndpoint = (value: JsonValue | undefined): HostedEndpointPayload | null => {
+  if (!isJsonObject(value)) return null;
   const keys = Object.keys(value);
-  if (keys.length !== 1 || keys[0] !== "url") return false;
-  const url = (value as { url?: unknown }).url;
-  return url === null || typeof url === "string";
+  if (keys.length !== 1 || keys[0] !== "url") return null;
+  const url = value.url;
+  if (url !== null && !isJsonString(url)) return null;
+  return { url: url === null ? null : url };
 };
 
 const readHostedEndpoint = (
@@ -135,9 +137,10 @@ const readHostedEndpoint = (
     req.on("error", reject);
     req.on("end", () => {
       try {
-        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        if (!isHostedEndpointPayload(parsed)) throw new Error("invalid shape");
-        resolve(parsed);
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonValue;
+        const payload = parseHostedEndpoint(parsed);
+        if (!payload) throw new Error("invalid shape");
+        resolve(payload);
       } catch {
         reject(new Error("invalid JSON body"));
       }

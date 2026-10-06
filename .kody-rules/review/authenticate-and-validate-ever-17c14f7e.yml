@@ -1,0 +1,30 @@
+title: Authenticate and validate every server mutation
+rule: >-
+  Every server function or route handler that reads/writes user data must (1)
+  resolve the current session with better-auth and reject unauthenticated
+  requests, (2) authorize the action against the authenticated user/tenant, and
+  (3) validate input with a zod schema before using it. Never trust a
+  client-supplied userId or tenantId.
+severity: critical
+scope: pull-request
+path: '**/*'
+examples:
+  - snippet: >-
+      export const deleteDeal = createServerFn({ method: 'POST' }).handler(async
+      ({ data }) => {
+        await db.deleteFrom('deals').where('id', '=', data.id).execute();
+      });
+    isCorrect: false
+  - snippet: |-
+      export const deleteDeal = createServerFn({ method: 'POST' })
+        .validator(z.object({ id: z.string().uuid() }))
+        .handler(async ({ data, context }) => {
+          const session = await auth.api.getSession({ headers: context.headers });
+          if (!session) throw new Error('Unauthorized');
+          await db.deleteFrom('deals').where('id', '=', data.id).where('owner_id', '=', session.user.id).execute();
+        });
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

@@ -27,6 +27,20 @@ describe("summarizeRuntime", () => {
   });
 });
 
+describe("summarizeRuntime: injected context", () => {
+  it("names the source, the size and what was injected", () => {
+    expect(
+      summarizeRuntime({ ...base, type: "context.injected", source: "memory", preview: "likes tea", bytes: 412 }),
+    ).toEqual({ summary: "context injected: memory · 412 B · likes tea", tone: "plain" });
+  });
+
+  it("copes with no preview", () => {
+    expect(summarizeRuntime({ ...base, type: "context.injected", source: "handoff", preview: "", bytes: 4300 }).summary).toBe(
+      "context injected: handoff · 4.2 KB",
+    );
+  });
+});
+
 describe("summarizeNative", () => {
   it("names JSON-RPC methods and claude stream-json messages", () => {
     expect(summarizeNative({ at: "", dir: "out", source: "acp", msg: { jsonrpc: "2.0", id: 3, method: "session/prompt" } })).toBe(

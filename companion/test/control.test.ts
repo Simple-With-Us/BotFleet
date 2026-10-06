@@ -317,12 +317,12 @@ describe("originIsLoopback", () => {
 describe("pairing page push drop lines", () => {
   /** Pull the page's own `pushDropLines` out of the served HTML and run it,
    * so the test checks the copy the browser actually renders. */
-  const loadPushDropLines = async (): Promise<(push: Record<string, unknown>) => string> => {
+  const loadPushDropLines = async (): Promise<(push: import("../src/json.ts").JsonObject) => string> => {
     const page = await ask("GET", "/");
     expect(page.status).toBe(200);
     const source = /const pushDropLines = (\(push\) => \{[\s\S]*?\n\});/.exec(String(page.body))?.[1];
     if (!source) throw new Error("pushDropLines not found in the pairing page");
-    return new Function(`return ${source};`)() as (push: Record<string, unknown>) => string;
+    return new Function(`return ${source};`)() as (push: import("../src/json.ts").JsonObject) => string;
   };
 
   it("shows a circuit-breaker hold on its own, with no queue overflow", async () => {

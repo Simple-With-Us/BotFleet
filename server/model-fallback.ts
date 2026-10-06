@@ -12,6 +12,7 @@ import { writeFileAtomic } from "./atomic.ts";
 import { doomedDispatches } from "./doomed-dispatch.ts";
 import { modelRejections, type ModelRejectionGate } from "./model-rejections.ts";
 import type { ModelSelection, ProviderErrorCode } from "./contracts.ts";
+import { rewriteModelSelection, rewriteRetiredModelId } from "./retired-model-ids.ts";
 
 /** Antigravity offers no 3.1 Flash, so a naive -pro -> -flash rewrite of
  *  gemini-3.1-pro-high/low yields ids the engine rejects.  Prefer the
@@ -104,14 +105,44 @@ export function unattendedModelDowngrade(
     /** Quota cooldowns vetted the pre-downgrade model; the rewrite must not
      *  route onto a cheaper model that is itself cooling down. */
     isCooling?: (instanceId: string, model: string) => boolean;
+    /** Webhook classify/gate may leave mcode's thinking Flash for this row.
+     *  The caller passes it only when an enabled engine's catalog actually
+     *  offers the id.  Absent means stay on the thinking id. */
+    nonThinkingFlash?: { instanceId: string; model: string };
   },
 ): ModelSelection {
   if (opts.hasExplicitSelection) return selection;
+  // A background job's wake turn is unattended — spend-ceiling accounting and
+  // the untrusted-data boundary — but keeps the bot's own model (owner
+  // ruling b, 2026-10-01): the bot is finishing work it chose, on the model
+  // it chose it with.
+  if (opts.automationSource === "job") return selection;
   const automated =
     Boolean(opts.unattended) ||
     opts.automationSource === "webhook" ||
     opts.automationSource === "resource";
   if (!automated) return selection;
+  // Webhook classify/gate seats ship on mcode's thinking Flash, the catalog
+  // default, because that CLI fails the no-variant turn.  The non-thinking
+  // id is live on other engines (DSH, the MiniMax HTTP catalog).  Only a
+  // webhook takes the move: a job keeps the model it was chosen with, a
+  // resource wake is Housekeeper, and a person typing stays on thinking.
+  // Crossing engines drops effort.  The source engine's "low" is not the
+  // target's, and DSH refuses a level its settings do not declare.
+  if (
+    opts.automationSource === "webhook" &&
+    selection.model === "MiniMax-M3.1-Flash-Preview-thinking" &&
+    opts.nonThinkingFlash?.instanceId &&
+    opts.nonThinkingFlash.model &&
+    !opts.isCooling?.(opts.nonThinkingFlash.instanceId, opts.nonThinkingFlash.model)
+  ) {
+    const target = opts.nonThinkingFlash;
+    if (target.instanceId !== selection.instanceId) {
+      const { effort: _dropped, ...rest } = selection;
+      return { ...rest, instanceId: target.instanceId, model: target.model };
+    }
+    selection = { ...selection, model: target.model };
+  }
   // Resolve the downgrade family from the driver kind so operator-added
   // instances ("claude2", "gravity") get the same cheaper-model treatment
   // as the reserved ids.  Fall back to the instance id only when no kind
@@ -164,6 +195,18 @@ export interface FallbackScanMessage {
 export interface TurnFallbackPick extends ModelSelection {
   /** Index in the saved chain to start from on the next failure. */
   nextUsed: number;
+}
+
+/** The selection a fallback pick dispatches and records as active.  A
+ *  floating pick keeps its `latest` class, so the dispatch-time reconcile
+ *  resolves it as Latest rather than as a pinned older slug. */
+export function selectionForFallbackPick(pick: ModelSelection): ModelSelection {
+  return {
+    instanceId: pick.instanceId,
+    model: pick.model,
+    effort: pick.effort,
+    ...(pick.latest ? { latest: pick.latest } : {}),
+  };
 }
 
 const SHORT_PROVIDER_ERROR =
@@ -381,7 +424,7 @@ export function shouldReplayPersistedStarter(messages: FallbackScanMessage[], tu
 
 /** Persisted trigger of an auto-delivered turn starter.  Mirrors
  * RoutineRunTrigger without importing routines.ts. */
-export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage";
+export type BootRecoveryAutomationSource = "schedule" | "manual" | "webhook" | "resource" | "delegation" | "imessage" | "job";
 
 export interface BootRecoveryResumeUser {
   role?: string;
@@ -421,6 +464,69 @@ export function bootRecoveryTurnOpts(
 
 function sameEngine(a: { instanceId: string; model: string }, b: { instanceId: string; model: string }): boolean {
   return a.instanceId === b.instanceId && a.model === b.model;
+}
+
+/** The identity `sameEngine` compares on, in one place so a key built here and
+ *  a comparison there cannot drift. */
+sameEngine.key = (v: { instanceId: string; model: string }) => `${v.instanceId}\u0000${v.model}`;
+
+/** One configured chain entry the runtime will never reach. */
+export interface RedundantFallback {
+  instanceId: string;
+  model: string;
+  /** Why it is dead weight.  Both cases are `sameEngine` skipping it. */
+  reason: "same-as-primary" | "duplicate";
+}
+
+/** What a bot's fallback chain actually amounts to, as opposed to what
+ *  Settings shows.
+ *
+ *  `selectTurnFallback` skips any candidate that is `sameEngine` as the engine
+ *  that just failed (line 615) — and nothing else, so only an ADJACENT repeat
+ *  is unreachable.  A chain of `primary → f1 → primary` is three entries in the
+ *  picker and three real tiers; a chain of `primary → f1 → f1` is three entries
+ *  and two.  The settings panel counts what was typed, not what will happen.
+ *
+ *  Reported rather than corrected: the owner may reasonably WANT a primary
+ *  repeated at the end of its own chain (it costs nothing and documents the
+ *  intent), so silently dropping the entry would be a product decision made
+ *  here.  This makes the difference visible instead.
+ *
+ *  Different model on the same engine is a real tier, not a duplicate: it is
+ *  a genuinely different thing to fail over to, and the runtime keeps it. */
+export function effectiveFallbackTiers(
+  primary: { instanceId: string; model: string },
+  fallbacks: readonly { instanceId: string; model: string }[] | null | undefined,
+): { total: number; effective: number; redundant: RedundantFallback[] } {
+  const redundant: RedundantFallback[] = [];
+  // `previous` is the engine the runtime would have just failed, which is the
+  // only thing `selectTurnFallback` compares against. It is NOT everything seen
+  // so far: an earlier, global dedup reported A -> B -> A as two tiers when the
+  // runtime walks all three.  `selectTurnFallback` compares on the REWRITTEN id,
+  // so a retired id and its live replacement collapse to a single tier; we do
+  // the same rewrite here on a local copy so the stored model string is left
+  // alone (redundant[].model stays configured, not migrated).
+  let previous = primary;
+  let effective = 1;
+  for (const candidate of fallbacks ?? []) {
+    const prevKey = { instanceId: previous.instanceId, model: rewriteRetiredModelId(previous.model) };
+    const candKey = { instanceId: candidate.instanceId, model: rewriteRetiredModelId(candidate.model) };
+    if (sameEngine(prevKey, candKey)) {
+      const primaryKey = { instanceId: primary.instanceId, model: rewriteRetiredModelId(primary.model) };
+      redundant.push({
+        instanceId: candidate.instanceId,
+        model: candidate.model,
+        reason: sameEngine(primaryKey, candKey) ? "same-as-primary" : "duplicate",
+      });
+      // `previous` deliberately does NOT advance: a skipped entry was never a
+      // hop, so the next candidate is still being weighed against the engine
+      // that actually failed.
+      continue;
+    }
+    previous = candidate;
+    effective++;
+  }
+  return { total: (fallbacks?.length ?? 0) + 1, effective, redundant };
 }
 
 // ── structured provider-error codes (chat-completions/errors.ts) ────────
@@ -555,15 +661,19 @@ export function selectTurnFallback(input: {
   for (let i = start; i < chain.length; i++) {
     const next = chain[i];
     if (!next?.instanceId) continue;
-    if (input.current && sameEngine(next, input.current)) continue;
+    // Heal retired picker ids before same-engine / rejection checks so a
+    // saved MiniMax-M3 entry cannot loop against a live Flash Preview
+    // primary or burn another unknown-model spawn.
+    const model = rewriteRetiredModelId(next.model);
+    if (input.current && sameEngine({ instanceId: next.instanceId, model }, input.current)) continue;
     // Skip in place, never re-order: the remaining entries are still the
     // owner's saved preference order, and nextUsed still points past the
     // entry that was chosen so a later failure walks the same chain.
     if (botId && isDoomed?.(botId, next.instanceId, now)) continue;
     // A model the provider already said it does not have would only spend
     // another spawn to hear it again, and end the walk there.
-    if (botId && isRejected?.(botId, next.instanceId, next.model, now)) continue;
-    return { instanceId: next.instanceId, model: next.model, effort: next.effort, nextUsed: i + 1 };
+    if (botId && isRejected?.(botId, next.instanceId, model, now)) continue;
+    return { ...selectionForFallbackPick({ ...next, model }), nextUsed: i + 1 };
   }
   return undefined;
 }
@@ -853,14 +963,17 @@ export class QuotaCooldownRegistry {
     now = Date.now(),
     opts: { isDoomed?: DoomedEngineGate; isModelRejected?: ModelRejectionGate } = {},
   ): { selection: ModelSelection; isFallback: boolean; cooldown?: BotQuotaCooldown } {
-    const cd = this.get(botId, primary.instanceId, primary.model, now);
+    // Heal retired picker ids before cooldown / rejection lookups so a
+    // bots.json still naming MiniMax-M3 never reaches the engine.
+    const rewrittenPrimary = rewriteModelSelection(primary).selection;
+    const cd = this.get(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     const isRejected = rejectionGate(opts.isModelRejected);
     // A primary the provider rejected is routed around exactly like a cooling
     // one: it would fail again before doing any work.  Unlike a cooldown it
     // leaves no row for the Usage settings to show as a quota hit.
-    const primaryRejected = isRejected(botId, primary.instanceId, primary.model, now);
+    const primaryRejected = isRejected(botId, rewrittenPrimary.instanceId, rewrittenPrimary.model, now);
     if (!cd && !primaryRejected) {
-      return { selection: primary, isFallback: false };
+      return { selection: rewrittenPrimary, isFallback: false };
     }
     // A rejected primary has no cooldown row, so the result carries none.
     const resolved = (selection: ModelSelection, isFallback: boolean) => {
@@ -868,17 +981,18 @@ export class QuotaCooldownRegistry {
       if (cd) result.cooldown = cd;
       return result;
     };
-    const fallbacks = primary.fallbacks;
+    const fallbacks = rewrittenPrimary.fallbacks;
     if (fallbacks && fallbacks.length > 0) {
       const isDoomed = doomedGate(opts.isDoomed);
       for (const fb of fallbacks) {
-        if (this.get(botId, fb.instanceId, fb.model, now)) continue;
-        if (isDoomed(botId, fb.instanceId, now)) continue;
-        if (isRejected(botId, fb.instanceId, fb.model, now)) continue;
-        return resolved(fb, true);
+        const next = rewriteModelSelection(fb).selection;
+        if (this.get(botId, next.instanceId, next.model, now)) continue;
+        if (isDoomed(botId, next.instanceId, now)) continue;
+        if (isRejected(botId, next.instanceId, next.model, now)) continue;
+        return resolved(next, true);
       }
     }
-    return resolved(primary, false);
+    return resolved(rewrittenPrimary, false);
   }
 }
 

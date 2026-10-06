@@ -9,8 +9,34 @@ import Foundation
 /// prematurely, returning from speak() while audio is still playing.
 public struct SpeechTurnGuard {
     public private(set) var activeUtteranceID: ObjectIdentifier?
+    /// Identity of the speak() invocation that currently owns the synthesizer.
+    /// stop() and the stop() at the start of a newer speak() both advance it,
+    /// so a retry that was parked with no continuation cannot resume into the
+    /// live turn or clear that turn's speaking state.
+    public private(set) var invocation: UInt64 = 0
 
     public init() {}
+
+    /// Mint the token for one speak() call.  Only that token may install a
+    /// chunk continuation or clear isSpeaking when the call returns.
+    public mutating func beginInvocation() -> UInt64 {
+        invocation &+= 1
+        return invocation
+    }
+
+    /// Drop the current invocation.  Late callbacks and a speak() that is
+    /// between chunks no longer own the turn.  Also ends the utterance
+    /// identity, matching stop().
+    @discardableResult
+    public mutating func supersedeInvocation() -> UInt64 {
+        invocation &+= 1
+        activeUtteranceID = nil
+        return invocation
+    }
+
+    public func ownsInvocation(_ token: UInt64) -> Bool {
+        token != 0 && token == invocation
+    }
 
     /// Begin a turn for `utterance`.  Any previous turn is superseded;
     /// its late callbacks are rejected by `finish(utterance:)`.

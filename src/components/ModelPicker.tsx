@@ -20,15 +20,26 @@ import {
   opensOnLocalModels,
   type LocalModelGroup,
 } from "@/lib/local-models";
-import { selectionForPick } from "@/lib/model-pick";
+import { pickedSelection, selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
+import { effortLabel } from "@/lib/model-effort";
+import type { EffortLevel } from "../../server/contracts.ts";
 import { ProviderMark } from "./ProviderIcons";
 import { EngineSetup, needsCli, needsSignIn } from "./EngineSetup";
+import { isCheckingEngine, isHiddenEngine } from "@/lib/engine-status";
 import { EngineGroupLabel } from "./EngineGroupLabel";
 import { EngineCallout } from "./EngineCallout";
 import { formatDualQuotaBadge } from "@/lib/quota-display";
 import { cn } from "@/lib/cn";
 import { COMPACT_SQUARE } from "@/lib/compact-chip";
-import { readableModelLabel } from "@/lib/model-label";
+import {
+  latestRows,
+  modelOptionLabel,
+  offeredOptions,
+  savedModelStatus,
+  selectionChipLabel,
+  type LatestRow,
+  type SavedModelStatus,
+} from "@/lib/model-lineage-view";
 
 type ModelOption = InstanceInfo["models"]["options"][number];
 const COMPACT_MODEL_COUNT = 5;
@@ -36,7 +47,153 @@ const COMPACT_MODEL_COUNT = 5;
 function modelLabel(instance: InstanceInfo | undefined, model: string): string {
   // A saved selection the latest-only picker no longer lists still gets a
   // readable chip instead of its raw id.
-  return instance?.models.options.find((option) => option.id === model)?.label ?? readableModelLabel(model);
+  return modelOptionLabel(instance, model);
+}
+
+/** "Latest Sonnet" rows: the choice that keeps a bot on the newest member
+ *  of a model class.  Each row names the model it runs right now. */
+export function LatestModelRows({
+  rows,
+  currentClass,
+  onPick,
+}: {
+  rows: LatestRow[];
+  /** The class the saved selection floats on for this engine, if any. */
+  currentClass?: string | null;
+  onPick: (row: LatestRow) => void;
+}) {
+  if (!rows.length) return null;
+  return (
+    <>
+      <EngineGroupLabel className="px-2 pb-1 pt-0.5">Latest</EngineGroupLabel>
+      {rows.map((row) => {
+        const current = currentClass === row.classKey;
+        return (
+          <button
+            key={row.classKey}
+            type="button"
+            onClick={() => onPick(row)}
+            title={`${row.label} runs ${row.resolvedLabel} now and moves to each newer version.`}
+            className={cn(
+              "flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] text-ink hover:bg-control/60",
+              current && "bg-control",
+            )}
+          >
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="min-w-0 break-words">{row.label}</span>
+              <span className="min-w-0 truncate text-[11.5px] text-ink-secondary">{row.resolvedLabel}</span>
+            </span>
+            {current && <Check size={14} className="shrink-0 text-accent" />}
+          </button>
+        );
+      })}
+      <div className="mx-2 my-1.5 border-t border-hairline/40" role="separator" />
+    </>
+  );
+}
+
+/** "Effort": how hard the selected model thinks.  Default plus the levels the
+ *  model offers, a check on the one the bot has now.  A model with no levels
+ *  gets no section at all.  The choices are plain `aria-pressed` buttons, as in
+ *  Settings' Reasoning control, so each is its own tab stop and a screen reader
+ *  announces the two controls the same way. */
+export function EffortSection({
+  levels,
+  current,
+  onPick,
+  disabled = false,
+  className,
+}: {
+  levels: readonly EffortLevel[];
+  /** The bot's saved effort; undefined is Default. */
+  current: EffortLevel | undefined;
+  onPick: (level: EffortLevel | undefined) => void;
+  /** The harness refuses a selection change while the bot is working, so the
+   *  choices are held until it stops rather than flipping and snapping back. */
+  disabled?: boolean;
+  className?: string;
+}) {
+  if (!levels.length) return null;
+  return (
+    <div
+      role="group"
+      aria-label="Effort"
+      data-effort-section
+      className={cn("shrink-0 border-t border-hairline/40 px-3 pb-3 pt-2", className)}
+    >
+      <EngineGroupLabel className="px-1 pb-1.5">Effort</EngineGroupLabel>
+      <div className="flex flex-wrap gap-1">
+        {([undefined, ...levels] as const).map((level) => {
+          const checked = current === level;
+          return (
+            <button
+              key={level ?? "default"}
+              type="button"
+              aria-pressed={checked}
+              disabled={disabled}
+              onClick={() => onPick(level)}
+              className={cn(
+                "flex items-center gap-1 rounded-full border px-2.5 py-1 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-60",
+                checked
+                  ? "border-accent/40 bg-control text-ink"
+                  : "border-hairline/40 text-ink-secondary hover:bg-control/60 hover:text-ink disabled:hover:bg-transparent disabled:hover:text-ink-secondary",
+              )}
+            >
+              {checked && <Check size={12} className="shrink-0 text-accent" />}
+              {effortLabel(level)}
+            </button>
+          );
+        })}
+      </div>
+      {disabled && <p className="px-1 pt-1.5 text-[12px] text-ink-secondary">Stop the bot to change effort.</p>}
+    </div>
+  );
+}
+
+/** Badge for a saved model the catalog no longer offers. */
+function StatusBadge({ status }: { status: SavedModelStatus }) {
+  if (!status.badge) return null;
+  return (
+    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300">
+      {status.badge}
+    </span>
+  );
+}
+
+/** One-click move off a retired or superseded saved model. */
+export function SavedModelNotice({
+  status,
+  modelName,
+  onSwitch,
+  className,
+}: {
+  status: SavedModelStatus;
+  modelName: string;
+  onSwitch: (selection: ModelSelection) => void;
+  className?: string;
+}) {
+  if (!status.badge) return null;
+  const what =
+    status.kind === "retired"
+      ? `${modelName} is retired.`
+      : status.kind === "superseded"
+        ? `${modelName} has a newer version.`
+        : `${modelName} is not in this engine's catalog.`;
+  return (
+    <div className={cn("flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-ink-secondary", className)}>
+      <StatusBadge status={status} />
+      <span>{what}</span>
+      {status.successor && status.successorLabel && (
+        <button
+          type="button"
+          onClick={() => onSwitch(status.successor!)}
+          className="rounded-md px-1.5 py-0.5 font-medium text-accent hover:bg-control/60"
+        >
+          {`Switch To ${status.successorLabel}`}
+        </button>
+      )}
+    </div>
+  );
 }
 
 const CALLOUT_DRIVER_KINDS = new Set([
@@ -52,6 +209,7 @@ const CALLOUT_DRIVER_KINDS = new Set([
   "grokAgent",
   "claudeAgent",
   "mcodeAgent",
+  "museAgent",
 ]);
 
 function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNode {
@@ -65,14 +223,59 @@ function WhyThisEngineCallout({ instance }: { instance: InstanceInfo }): ReactNo
   );
 }
 
-function engineStatus(instance: InstanceInfo): string {
+export function engineStatus(instance: InstanceInfo): string {
   if (instance.snapshot.quota?.capped) return "Quota Cap";
   const modelCaps = Object.values(instance.snapshot.quota?.models ?? {});
   if (modelCaps.some((row) => row.capped)) return "Partial quota";
   if (instance.snapshot.reason === "Disabled in settings") return "Disabled";
-  if (needsCli(instance)) return "Not installed";
+  // The last probe gave no answer: a slow Mac, not a missing CLI or a
+  // sign-out.  Never "Not installed" or "Sign-in required" for it.
+  if (isCheckingEngine(instance)) return "Checking";
+  if (needsCli(instance)) return isCliMissing(instance) ? "Not installed" : "Unavailable";
   if (needsSignIn(instance)) return "Sign-in required";
   return instance.snapshot.version ?? "Ready";
+}
+
+/** Whether the picker shows the engine's setup card instead of its models.
+ *  An engine whose probe did not answer in time is blocked too: it has no
+ *  models to list yet, and EngineSetup draws its "Checking" card rather than
+ *  leaving an empty pane. */
+export function pickerBlocked(instance: InstanceInfo, pane: "main" | "custom"): boolean {
+  if (isCheckingEngine(instance)) return true;
+  return pane === "custom" ? needsCli(instance) : needsCli(instance) || needsSignIn(instance);
+}
+
+/** Whether an unusable engine's CLI is actually absent.  One that is on this
+ *  Mac but cannot run bots yet (too old, missing a flag BotFleet needs, its
+ *  own check failed) is unavailable, not "not installed" — the reason says
+ *  what to do.  So is an engine that has no CLI at all (MiniMax,
+ *  OpenAI-compatible and other API-key engines): a missing key is not a
+ *  missing install. */
+function isCliMissing(instance: InstanceInfo): boolean {
+  if (/CLI not found/i.test(instance.snapshot.reason ?? "")) return true;
+  if (instance.cliDefault === undefined && instance.cli === undefined) return false;
+  return (instance.cliCandidates?.length ?? 0) === 0;
+}
+
+/** The engines the picker's rail offers.  The selected engine always stays
+ *  so the picker can explain it; otherwise turned-off engines, uninstalled
+ *  custom ones, and optional integrations nobody set up (the ASCII.dev Box engine with no Box
+ *  token) are left out. */
+export function railEngines(instances: InstanceInfo[], selectedInstanceId: string): InstanceInfo[] {
+  return instances.filter((i) => {
+    if (i.enabled === false) return false;
+    const selected = i.instanceId === selectedInstanceId;
+    if (isHiddenEngine(i) && !selected) return false;
+    // A configured `cli` override counts: the registry lists only copies of
+    // the default command, so an absolute override leaves candidates empty.
+    const isInstalledOrSubscription =
+      i.access !== "custom" || Boolean(i.cli) || (i.cliCandidates?.length ?? 0) > 0;
+    if (i.snapshot.state === "unavailable" && !selected && !isInstalledOrSubscription) {
+      return false;
+    }
+    if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && !selected) return false;
+    return true;
+  });
 }
 
 function ModelRow({
@@ -117,6 +320,16 @@ function ModelRow({
         )}
         {option.loaded && (
           <span className="shrink-0 rounded bg-accent/10 px-1.5 py-px text-[10px] text-accent">Loaded</span>
+        )}
+        {option.contextWindow && (
+          <span
+            className="shrink-0 rounded bg-inset px-1.5 py-px text-[10px] text-ink-secondary"
+            title={`${option.contextWindow.toLocaleString()} tokens max`}
+          >
+            {option.contextWindow >= 1000000
+              ? `${Math.floor(option.contextWindow / 1000000)}M`
+              : `${Math.floor(option.contextWindow / 1000)}K`}
+          </span>
         )}
         {option.badge && (
           <span
@@ -324,9 +537,14 @@ export function ModelPicker({
     resetList();
   };
 
-  const pick = (instance: InstanceInfo, model: string) => {
-    const nextSelection = selectionForPick(selection, instance, model);
+  /** `latest` picks a "Latest <Class>" row; a pinned pick sends `null` so
+   *  the harness does not carry an older float forward onto it. */
+  const pick = (instance: InstanceInfo, model: string, latest?: string) => {
+    commit(pickedSelection(selection, instance, model, latest));
+    setOpen(false);
+  };
 
+  function commit(nextSelection: ModelSelection) {
     if (onChange) {
        onChange(nextSelection);
     } else {
@@ -337,10 +555,27 @@ export function ModelPicker({
          patch: { modelSelection: nextSelection },
        });
     }
+  }
+
+  /** "Switch To …": the saved entry's replacement, keeping the chain. */
+  const switchSaved = (successor: ModelSelection) => {
+    const next: ModelSelection = { ...successor };
+    if (selection.fallbacks?.length) next.fallbacks = selection.fallbacks;
+    commit(next);
     setOpen(false);
   };
 
-  const official = railInstance?.models.options.filter((option) => !option.custom) ?? [];
+  /** Effort changes only the effort: the rest of the selection rides along, so
+   *  a "Latest <Class>" bot keeps floating and its fallbacks stay.  The menu
+   *  stays open so the check visibly moves.  Same save as Settings' Reasoning
+   *  control (`selectionWithEffort`). */
+  const pickEffort = (level: EffortLevel | undefined) => commit(selectionWithEffort(selection, level));
+
+  // Superseded rows are hidden: within a model class only the newest member
+  // is offered, beside the "Latest <Class>" rows.
+  const official = offeredOptions(railInstance).filter((option) => !option.custom);
+  const latest = latestRows(railInstance);
+  const savedStatus = savedModelStatus(active, selection);
   const custom = railInstance?.models.options.filter((option) => option.custom) ?? [];
   const currentModel = selection.instanceId === railInstance?.instanceId ? selection.model : undefined;
   const filteredOfficial = filterCustomModels(official, query);
@@ -354,11 +589,29 @@ export function ModelPicker({
   // in Codex, an extra from Claude's settings) stay in their own engine's list.
   // The local ones are on the Local Models entry.
   const shownOtherCustom = filterCustomModels(custom.filter((option) => !isInjectedLocalModel(option)), query);
-  const blocked = railInstance
-    ? pane === "custom"
-      ? needsCli(railInstance)
-      : needsCli(railInstance) || needsSignIn(railInstance)
-    : false;
+  const blocked = railInstance ? pickerBlocked(railInstance, pane) : false;
+  const checking = isCheckingEngine(railInstance);
+
+  // The chat picker's Effort section belongs to the model the bot is on, so
+  // it appears only on the panel that lists that model: the bot's own engine,
+  // or Local Models when the bot is on one of those.  Browsing another engine
+  // never shows the current model's effort under that engine's name.  Settings
+  // pickers (`contained`) have the Reasoning control beside them.
+  const effortLevels = contained ? [] : selectionEffortLevels(active, selection);
+  const effortApplies = localView
+    ? opensOnLocalModels(localGroups, active, selection)
+    : !blocked && railInstance?.instanceId === selection.instanceId;
+  const effortSection =
+    effortApplies && effortLevels.length > 0 ? (
+      <EffortSection
+        levels={effortLevels}
+        current={selection.effort}
+        onPick={pickEffort}
+        disabled={Boolean(bot.busy)}
+      />
+    ) : null;
+  const chipEffort =
+    !contained && selection.effort && effortLevels.includes(selection.effort) ? selection.effort : undefined;
 
   const windowsLabel =
     railInstance?.snapshot.quota?.windowsLabel ??
@@ -368,7 +621,7 @@ export function ModelPicker({
     <ModelRow
       key={option.id}
       option={option}
-      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id}
+      current={selection.instanceId === railInstance?.instanceId && selection.model === option.id && !selection.latest}
       defaultId={railInstance?.models.default ?? ""}
       onPick={() => railInstance && pick(railInstance, option.id)}
       quota={railInstance?.snapshot.quota?.models?.[option.id]}
@@ -407,12 +660,23 @@ export function ModelPicker({
         // resolved engine keeps its label — the mark is what would hide it)
         !contained && active && COMPACT_SQUARE,
       )}
-      title={active ? `${active.displayName} · ${modelLabel(active, selection.model)}` : selection.model}
+      title={
+        active
+          ? `${active.displayName} · ${selectionChipLabel(active, selection, { showLatest: true })} (${selection.model})${chipEffort ? ` · ${effortLabel(chipEffort)} effort` : ""}`
+          : selection.model
+      }
     >
       {active && <ProviderMark driverKind={activeDriverKind!} model={selection.model} size={14} />}
       <span className={cn("min-w-0 truncate", !contained && "max-w-[160px]", !contained && active && "@max-4xl/chathead:hidden")}>
-        {modelLabel(active, selection.model)}
+        {/* The chat header names the model that actually runs; settings
+            chips also say when it floats on "Latest <Class>". */}
+        {selectionChipLabel(active, selection, { showLatest: contained })}
       </span>
+      {savedStatus.badge && (
+        <span className={cn(!contained && active && "@max-4xl/chathead:hidden")}>
+          <StatusBadge status={savedStatus} />
+        </span>
+      )}
       <ChevronDown
         size={14}
         className={cn(
@@ -434,6 +698,14 @@ export function ModelPicker({
       ) : (
         trigger
       )}
+      {contained && !open && (
+        <SavedModelNotice
+          status={savedStatus}
+          modelName={modelLabel(active, selection.model)}
+          onSwitch={switchSaved}
+          className="mt-1.5"
+        />
+      )}
 
       {open && (
         <div
@@ -449,16 +721,7 @@ export function ModelPicker({
         >
           <div className="flex w-14 shrink-0 flex-col gap-1 overflow-y-auto border-r border-hairline/40 bg-panel p-2">
             {(() => {
-              const availableInstances = state.instances.filter((i) => {
-                if (i.enabled === false) return false;
-                const isInstalledOrSubscription =
-                  i.access !== "custom" || (i.cliCandidates && i.cliCandidates.length > 0);
-                if (i.snapshot.state === "unavailable" && i.instanceId !== selection.instanceId && !isInstalledOrSubscription) {
-                  return false;
-                }
-                if (i.instanceId === "kimi" && (!i.snapshot.authenticated || i.snapshot.state !== "available") && i.instanceId !== selection.instanceId) return false;
-                return true;
-              });
+              const availableInstances = railEngines(state.instances, selection.instanceId);
               const { subscription, custom: local } = splitEngineRail(availableInstances);
               const railButton = (instance: InstanceInfo) => {
                 const selected = instance.instanceId === railInstance?.instanceId;
@@ -520,13 +783,16 @@ export function ModelPicker({
 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             {localView ? (
-              <LocalModelsPanel
-                groups={localGroups}
-                selection={selection}
-                query={query}
-                onQueryChange={setQuery}
-                onPick={pick}
-              />
+              <>
+                <LocalModelsPanel
+                  groups={localGroups}
+                  selection={selection}
+                  query={query}
+                  onQueryChange={setQuery}
+                  onPick={pick}
+                />
+                {effortSection}
+              </>
             ) : railInstance ? (
               <>
                 <div className="shrink-0 px-4 pb-2 pt-3.5">
@@ -537,6 +803,8 @@ export function ModelPicker({
                         "shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium",
                         railInstance.snapshot.quota?.capped
                           ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          : checking
+                          ? "bg-inset text-ink-secondary"
                           : blocked
                           ? "bg-warning/10 text-warning"
                           : "bg-success/10 text-success",
@@ -556,6 +824,15 @@ export function ModelPicker({
                     </div>
                   )}
 
+                  {railInstance.instanceId === selection.instanceId && (
+                    <SavedModelNotice
+                      status={savedStatus}
+                      modelName={modelLabel(active, selection.model)}
+                      onSwitch={switchSaved}
+                      className="mt-2"
+                    />
+                  )}
+
                   {railInstance.driverKind === "boxAgent" && (
                     <div className="mt-2 rounded bg-warning/10 px-2 py-1.5 text-[11px] leading-relaxed text-warning-dark border border-warning/20">
                       <strong>Works Alone:</strong>
@@ -569,7 +846,9 @@ export function ModelPicker({
                     <WhyThisEngineCallout instance={railInstance} />
                     <EngineSetup instance={railInstance} intent={pane === "custom" ? "inject" : "cloud"} />
                     <p className="mt-2 text-center text-[11.5px] text-ink-secondary/70">
-                      {pane === "main" && official.length > 0
+                      {checking
+                        ? "Models will appear as soon as the check finishes."
+                        : pane === "main" && official.length > 0
                         ? `${official.length} ${official.length === 1 ? "model" : "models"} will appear after setup.`
                         : "Local models will appear as soon as the engine is installed."}
                     </p>
@@ -597,6 +876,13 @@ export function ModelPicker({
                       </div>
                       {pane === "main" ? (
                         <>
+                          {!query && (
+                            <LatestModelRows
+                              rows={latest}
+                              currentClass={selection.instanceId === railInstance.instanceId ? selection.latest : null}
+                              onPick={(row) => pick(railInstance, row.resolvedId, row.classKey)}
+                            />
+                          )}
                           <EngineGroupLabel className="px-2 pb-1 pt-0.5">
                             {query ? `${filteredOfficial.length} results` : showAll ? `All models · ${official.length}` : "Suggested"}
                           </EngineGroupLabel>
@@ -657,6 +943,7 @@ export function ModelPicker({
                         </>
                       )}
                     </div>
+                    {effortSection}
                   </>
                 )}
               </>

@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-
+import { botDesktopDigest, botDesktopDisplayFor, botDesktopSession } from "./bot-desktop-session.ts";
 import { CUA_EXECUTABLE, CUA_SOCKET, DISPLAY } from "./container-computer.ts";
 import type { AppConfig } from "./config.ts";
 
@@ -19,7 +18,7 @@ export function isSharedVpsMode(cfg: AppConfig): boolean {
 }
 
 export function perBotOccupancyKey(botId: string): string {
-  return `bot:${createHash("sha256").update(botId).digest("hex")}`;
+  return `bot:${botDesktopDigest(botId)}`;
 }
 
 /** Lease / tunnel / occupancy key for a bot's VPS turn.  Always per-bot —
@@ -33,22 +32,12 @@ export function vpsOccupancyKey(_cfg: AppConfig, botId: string): string {
  *  16-bit unsigned port maximum (65535) or fail X server launch, while
  *  remaining collision-resistant across bot ids. */
 export function vpsSharedDisplayForBot(botId: string): string {
-  const digest = createHash("sha256").update(botId).digest("hex");
-  const displayNum = 10 + (Number.parseInt(digest.slice(0, 8), 16) % 50000);
-  return `:${displayNum}`;
+  return botDesktopDisplayFor(botId);
 }
 
-/** Deterministic display + Cua socket for one bot on the shared container. */
+/** Deterministic display + CUA socket for one bot on the shared container. */
 export function vpsSharedBotSession(botId: string): VpsSharedBotSession {
-  const digest = createHash("sha256").update(botId).digest("hex");
-  const short = digest.slice(0, 12);
-  return {
-    occupancyKey: perBotOccupancyKey(botId),
-    display: vpsSharedDisplayForBot(botId),
-    socket: `/run/user/1000/botfleet-cua-${short}.sock`,
-    session: `bf-${short}`,
-    screenshotPath: `/tmp/botfleet-vps-${short}.png`,
-  };
+  return { occupancyKey: perBotOccupancyKey(botId), ...botDesktopSession(botId, "vps") };
 }
 
 export function vpsDriverSocket(cfg: AppConfig, botId: string): string {
@@ -112,7 +101,7 @@ export function ensureSharedVpsSessionExecArgs(
     `  ${CUA_EXECUTABLE} status --socket "$socket" >/dev/null 2>&1 && exit 0`,
     `  sleep 0.25`,
     `done`,
-    `echo "Cua Driver did not answer on $socket" >&2`,
+    `echo "CUA Driver did not answer on $socket" >&2`,
     `exit 1`,
   ].join("\n");
   return [

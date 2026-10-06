@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   configStatusFromFrame,
+  MessagePostResponseSchema,
+  TaskSwitchResponseSchema,
   getRoomTerminology,
   initialState,
   isHarnessUnreachableError,
@@ -18,6 +20,65 @@ import {
   type Group,
   type Message,
 } from "./store";
+
+describe("API response contracts", () => {
+  const bot = {
+    id: "bot-1",
+    threadId: "thread-1",
+    name: "Bot",
+    title: "Bot",
+    description: "A test bot",
+    notifications: true,
+    color: "blue",
+    unread: false,
+    modelSelection: { instanceId: "engine-1", model: "model-1" },
+    messages: [],
+  };
+
+  it("keeps only the task-switch thread identity and rejects a bad envelope", () => {
+    const parsed = TaskSwitchResponseSchema.safeParse({
+      bot: {
+        ...bot,
+        messages: [{ id: "m1", role: "user", kind: "text", at: 1, injected: true }],
+        unexpected: true,
+      },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.bot).toEqual({ id: "bot-1", threadId: "thread-1" });
+    expect(TaskSwitchResponseSchema.safeParse({ bot, extra: true }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { ...bot, threadId: 42 } }).success).toBe(false);
+    expect(TaskSwitchResponseSchema.safeParse({ bot: { id: "bot-1" } }).success).toBe(false);
+  });
+
+  it("accepts each message post outcome and rejects unvalidated fields", () => {
+    expect(MessagePostResponseSchema.safeParse({ ok: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "self_echo" }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: true }).success).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, steered: true, replayed: true }).success).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        ignored: "self_echo",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      MessagePostResponseSchema.safeParse({
+        ok: true,
+        queued: true,
+        queueId: "queue-1",
+        threadId: "thread-1",
+        replayed: true,
+      }).success,
+    ).toBe(true);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, queued: true, queueId: 7, threadId: "thread-1" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, extra: "unexpected" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, ignored: "other" }).success).toBe(false);
+    expect(MessagePostResponseSchema.safeParse({ ok: true, replayed: false }).success).toBe(false);
+  });
+});
 
 describe("renderer hydration recovery", () => {
   const retainedBot = {
@@ -996,5 +1057,199 @@ describe("paginated scrollback", () => {
     const fresh = reducer(stale, { type: "hydrate", bots: [bot()], groups: [], computerControl: {} });
     expect(fresh.hasMore.t1).toBe(false);
     expect(fresh.loadingEarlier).toEqual({});
+  });
+});
+
+describe("instances ordering guard", () => {
+  const engine = (version: string) => ({
+    instanceId: "claude",
+    driverKind: "claudeAgent",
+    displayName: "Claude",
+    snapshot: { state: "available" as const, version },
+    models: { default: "", options: [] },
+  });
+
+  it("drops an instances answer older than the one already shown", () => {
+    // A slow GET that started before the `instances` push must not put the
+    // older sweep back on screen.
+    const pushed = reducer(initialState, { type: "instances", instances: [engine("new")], describedAt: 2_000 });
+    const late = reducer(pushed, { type: "instances", instances: [engine("old")], describedAt: 1_000 });
+    expect(late.instances[0].snapshot.version).toBe("new");
+    expect(late.instancesDescribedAt).toBe(2_000);
+  });
+
+  it("applies a newer or equal answer, and one from a server that sends no stamp", () => {
+    const first = reducer(initialState, { type: "instances", instances: [engine("a")], describedAt: 1_000 });
+    const same = reducer(first, { type: "instances", instances: [engine("b")], describedAt: 1_000 });
+    expect(same.instances[0].snapshot.version).toBe("b");
+    const newer = reducer(same, { type: "instances", instances: [engine("c")], describedAt: 3_000 });
+    expect(newer.instances[0].snapshot.version).toBe("c");
+    const unstamped = reducer(newer, { type: "instances", instances: [engine("d")] });
+    expect(unstamped.instances[0].snapshot.version).toBe("d");
+    expect(unstamped.instancesDescribedAt).toBe(3_000);
+  });
+  it("forgets the ordering mark but keeps the engine list when the stream could not resume", () => {
+    // A restarted harness stamps from its own clock, which can sit below the
+    // last process's final stamp.  Its first answer must not be dropped as old.
+    const held = reducer(initialState, { type: "instances", instances: [engine("held")], describedAt: 9_000 });
+    const reset = reducer(held, { type: "instancesOrderReset" });
+    expect(reset.instances[0].snapshot.version).toBe("held");
+    expect(reset.instancesDescribedAt).toBe(0);
+    const restarted = reducer(reset, { type: "instances", instances: [engine("restarted")], describedAt: 4_000 });
+    expect(restarted.instances[0].snapshot.version).toBe("restarted");
+    expect(restarted.instancesDescribedAt).toBe(4_000);
+    // Ordering holds again from that stamp on.
+    const late = reducer(restarted, { type: "instances", instances: [engine("late")], describedAt: 3_000 });
+    expect(late.instances[0].snapshot.version).toBe("restarted");
+  });
+});
+
+describe("viewed thread pin stays with its selection", () => {
+  const bot = (id: string, threadId: string): Bot => ({
+    id,
+    threadId,
+    name: id,
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages: [],
+  });
+
+  const pinned = {
+    ...initialState,
+    bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+    selectedId: "a",
+    viewedThreadId: "app-thread",
+  };
+
+  it("drops the pin when botAdded selects the new bot", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("c", "thread-c") });
+    expect(next.selectedId).toBe("c");
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("keeps the pin when botAdded folds the bot that is already selected", () => {
+    const next = reducer(pinned, { type: "botAdded", bot: bot("a", "thread-a") });
+    expect(next.selectedId).toBe("a");
+    expect(next.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when the selected bot is deleted and keeps it otherwise", () => {
+    const deleted = reducer(pinned, { type: "deleteBot", botId: "a" });
+    expect(deleted.selectedId).not.toBe("a");
+    expect(deleted.viewedThreadId).toBeNull();
+    const other = reducer(pinned, { type: "deleteBot", botId: "b" });
+    expect(other.selectedId).toBe("a");
+    expect(other.viewedThreadId).toBe("app-thread");
+  });
+
+  it("drops the pin when hydrate has to move the selection, and keeps it when the bot remains", () => {
+    const moved = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(moved.selectedId).toBe("b");
+    expect(moved.viewedThreadId).toBeNull();
+    const kept = reducer(pinned, {
+      type: "hydrate",
+      bots: [bot("a", "thread-a"), bot("b", "thread-b")],
+      groups: [],
+      computerControl: {},
+    });
+    expect(kept.selectedId).toBe("a");
+    expect(kept.viewedThreadId).toBe("app-thread");
+  });
+});
+
+describe("task switch transcript", () => {
+  const message = (id: string): Message => ({ id, role: "user", kind: "text", text: id, at: 1 });
+  const bot = (threadId: string, messages: Message[]): Bot => ({
+    id: "a",
+    threadId,
+    name: "a",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "x", model: "y" },
+    messages,
+  });
+
+  it("keeps the transcript when a task switch ack omits messages", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("old-thread", [message("old")])],
+      selectedId: "a",
+      viewedThreadId: "new-thread",
+    };
+    const next = reducer(state, { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    expect(next.viewedThreadId).toBeNull();
+  });
+
+  it("replaces the transcript when a later bot frame is a different thread's snapshot", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("new-thread", [message("old")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
+  });
+
+  it("does not replace a same-thread snapshot that overlaps the current transcript", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("same", [message("keep"), message("local")])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("same", [message("keep")]), messages: [message("keep")] },
+    });
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["keep", "local"]);
+  });
+
+  it("replaces the retained transcript when the new thread snapshot is empty", () => {
+    const held = reducer(
+      {
+        ...initialState,
+        bots: [bot("old-thread", [message("old")])],
+        selectedId: "a",
+      },
+      { type: "taskSwitched", bot: { id: "a", threadId: "new-thread" } },
+    );
+    expect(held.bots[0]?.threadId).toBe("new-thread");
+    expect(held.bots[0]?.messages.map((entry) => entry.id)).toEqual(["old"]);
+    const next = reducer(held, {
+      type: "botPatched",
+      bot: { ...bot("new-thread", []), messages: [] },
+    });
+    expect(next.bots[0]?.threadId).toBe("new-thread");
+    expect(next.bots[0]?.messages).toEqual([]);
+  });
+
+  it("applies a non-empty snapshot when the client transcript is empty", () => {
+    const state = {
+      ...initialState,
+      bots: [bot("thread", [])],
+      selectedId: "a",
+    };
+    const next = reducer(state, {
+      type: "botPatched",
+      bot: { ...bot("thread", [message("fresh")]), messages: [message("fresh")] },
+    });
+    expect(next.bots[0]?.threadId).toBe("thread");
+    expect(next.bots[0]?.messages.map((entry) => entry.id)).toEqual(["fresh"]);
   });
 });

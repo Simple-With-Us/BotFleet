@@ -57,3 +57,13 @@ debug-cap.mjs
 # Editor / shell backup files (PR #218 inadvertently committed docs/EFFORT-LOG.md.bak)
 *.bak
 *.bak-*
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Playwright run output: regenerated on every failing spec run, and it is
+# never something to commit.  Without this, a `git add -A` after a local
+# playwright run sweeps error-context.md and .last-run.json into the diff.
+test-results/
+playwright-report/

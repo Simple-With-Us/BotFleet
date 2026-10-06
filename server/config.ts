@@ -10,6 +10,7 @@ import { updateConfigFile } from "../electron/config-file-lock.mjs";
 import type { InstanceConfig, InstanceConfigMap } from "./contracts.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 import { infisicalSnapshot, resolveSecretFields, stripVaultManagedValues } from "./secret-map.ts";
+import { resolveKnobFields, stripVaultManagedKnobs } from "./knob-map.ts";
 import { describeDsn } from "./sentry.ts";
 import {
   parseConversationMode,
@@ -222,7 +223,13 @@ const localVmConfigSchema = z.object({
     .max(MAX_LOCAL_VM_MAX_INSTANCES)
     .optional(),
   shareCliCredentials: z.boolean().optional(),
+  shareGpgPrivateKeys: z.boolean().optional(),
   allowHostTerminal: z.boolean().optional(),
+  /** Optional ceilings for the Local VM container.  Absent means "request about
+   * 2 CPUs and 3 GiB, then adapt to what the container runtime actually has,
+   * up to 4 CPUs / 8 GiB". */
+  cpus: z.number().int().min(1).max(4).optional(),
+  memoryGib: z.number().int().min(1).max(8).optional(),
 });
 const featureConfigSchema = z.object({
   /** Experimental desktop workflow recorder. Hidden unless explicitly enabled. */
@@ -231,6 +238,8 @@ const featureConfigSchema = z.object({
   showToolCalls: z.boolean().optional(),
   /** Summarize consecutive tool actions into an expandable live summary card. On by default. */
   summarizeToolCalls: z.boolean().optional(),
+  /** Per-turn Git worktree isolation for bots working in a shared repository. */
+  gitWorktreeLeases: z.boolean().optional(),
 });
 const instanceConfigSchema = z.object({
   driver: z.string().min(1),
@@ -377,6 +386,30 @@ const appConfigSchema = z.object({
      *  window to be trusted with stopping the fleet. */
     spendCeilingMinPricedShare: z.number().min(0).max(1).optional(),
   }).optional(),
+  // Background jobs (jobs P1, docs/plans/2026-10-01-background-jobs-and-
+  // subagents-decision.md).  On by default for HTTP-lane bots; `wake: false`
+  // is the kill switch for wake turns, and `cliLanes: false` returns the job
+  // tools to the HTTP lane only (jobs P2, which mounts them for command-line
+  // engines over MCP).  Every number is clamped again where it is used
+  // (server/jobs/registry.ts resolveJobsSettings): no setting can lift a
+  // job's run limit past 6 hours.
+  jobs: z.object({
+    enabled: z.boolean().optional(),
+    wake: z.boolean().optional(),
+    cliLanes: z.boolean().optional(),
+    defaultMinutes: z.number().int().min(1).max(360).optional(),
+    maxMinutes: z.number().int().min(1).max(360).optional(),
+    cpuCores: z.number().min(1).max(64).optional(),
+    admission: z.object({
+      maxSwapPercent: z.number().min(1).max(100).optional(),
+      minFreeDiskMb: z.number().min(0).optional(),
+    }).optional(),
+    // How long a webhook may sit queued while the host is hot before the
+    // scheduler dispatches it anyway.  Absent means 20 minutes
+    // (DEFAULT_WEBHOOK_HOT_DEFER_MINUTES).  The vault knob of the same
+    // field overrides the file.
+    webhookHotDeferMinutes: z.number().int().min(1).max(720).optional(),
+  }).optional(),
   // Error and performance reporting.  The kill switch is explicit: a DSN
   // with no `enabled` flag reports.  Only a stored `false` stops it, so an
   // upgraded install never goes quiet without saying why.
@@ -513,7 +546,10 @@ export interface AppConfig {
     mode?: "shared" | "per-bot";
     maxInstances?: number;
     shareCliCredentials?: boolean;
+    shareGpgPrivateKeys?: boolean;
     allowHostTerminal?: boolean;
+    cpus?: number;
+    memoryGib?: number;
   };
   /** Shared Qdrant Agent RAG vector database settings.  `accessClientId` /
    * `accessClientSecret` are a Cloudflare Access service token: a pair of
@@ -530,6 +566,20 @@ export interface AppConfig {
   /** Usage-monitor telemetry. `ingestUrl` is the operator's own endpoint —
    * BotFleet ships none — and `projects` classifies a turn's working
    * directory, bot name, or task title into a project slug. */
+  /** Background jobs (jobs P1).  See the schema above for what each field
+   *  means; absent is on, with the decision doc's defaults. */
+  jobs?: {
+    enabled?: boolean;
+    wake?: boolean;
+    cliLanes?: boolean;
+    defaultMinutes?: number;
+    maxMinutes?: number;
+    cpuCores?: number;
+    admission?: { maxSwapPercent?: number; minFreeDiskMb?: number };
+    /** Minutes a hot host may park a webhook before the wake dispatches
+     *  anyway.  Absent means 20. */
+    webhookHotDeferMinutes?: number;
+  };
   usage?: {
     ingestUrl?: string;
     ingestToken?: string;
@@ -582,7 +632,12 @@ export interface AppConfig {
     refreshMinutes?: number;
   };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillRecorder?: boolean; showToolCalls?: boolean; summarizeToolCalls?: boolean };
+  features?: {
+    skillRecorder?: boolean;
+    showToolCalls?: boolean;
+    summarizeToolCalls?: boolean;
+    gitWorktreeLeases?: boolean;
+  };
   /** How the roster and threads are laid out.  Absent means simple. */
   conversationMode?: ConversationMode;
   /** What this person calls a room: one of the presets, or "custom" with a
@@ -964,6 +1019,10 @@ export const DATA_DIR = process.env.OMB_DATA_DIR ?? join(homedir(), ".botfleet")
 const LEGACY_HOME_DATA_DIRS = [".openmausbot", ".opengrokbot"] as const;
 export const EVENTS_DIR = join(DATA_DIR, "events");
 export const NATIVE_DIR = join(DATA_DIR, "native");
+/** Full tool inputs and outputs, and injected context text, per thread —
+ * bounded, rotated, and fetched only when a row is opened
+ * (server/item-io-store.ts). */
+export const ITEM_IO_DIR = join(DATA_DIR, "item-io");
 
 function migrateLegacyHomeDir(current: string, legacyNames: readonly string[]): void {
   if (existsSync(current)) return;
@@ -983,7 +1042,7 @@ export function ensureDirs() {
   // one-time migration from the pre-rename data dirs — bots, transcripts,
   // config and keys all carry over. Skip when tests isolate via OMB_DATA_DIR.
   if (!process.env.OMB_DATA_DIR) migrateLegacyHomeDir(DATA_DIR, LEGACY_HOME_DATA_DIRS);
-  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR]) mkdirSync(dir, { recursive: true });
+  for (const dir of [DATA_DIR, EVENTS_DIR, NATIVE_DIR, ITEM_IO_DIR]) mkdirSync(dir, { recursive: true });
 }
 
 /** Migration: pin legacy ElevenLabs installs (tts.key set, tts.provider
@@ -1140,6 +1199,12 @@ export function loadConfig(): AppConfig {
   // mapped field is recorded for the Secrets card.  With no store configured
   // the snapshot is null and this is a no-op.
   resolveSecretFields(cfg, process.env, infisicalSnapshot());
+  // The tunable-knob twin of the line above, from `server/knob-map.ts`: for
+  // a knob name the vault holds, the vault wins over the file.  Runs after
+  // the credential overlay so both layers read the same snapshot, and both
+  // are no-ops when the store is unconfigured.  Runtime reads never consult
+  // the vault — they read this resolved `cfg` from memory.
+  resolveKnobFields(cfg, infisicalSnapshot());
   // Pin pre-MiniMax key-only installs after env and external-secret resolution.
   // Never persist the injected key to config.json in cleartext.
   migrateLegacyElevenLabsTtsProvider(cfg);
@@ -1316,6 +1381,14 @@ export function saveConfig(
     // means a caller tried to persist something the store owns.
     console.warn(`[secrets] not persisting vault-managed values: ${strippedFromDisk.join(", ")}`);
   }
+  // The tunable-knob twin: whatever the store is currently canonical for
+  // does not get baked into `~/.botfleet/config.json` either, or the file
+  // starts shadowing the store it is supposed to defer to.  Knob values are
+  // not sensitive, so this is about authority, not cleartext.
+  const strippedKnobsFromDisk = stripVaultManagedKnobs(checkedPatch as Partial<AppConfig>);
+  if (strippedKnobsFromDisk.length > 0) {
+    console.warn(`[secrets] not persisting vault-managed knobs: ${strippedKnobsFromDisk.join(", ")}`);
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   // Under the cross-process lock (electron/config-file-lock.mjs) -- the same
   // one the Electron auto-updater and boot migrations take -- so the read,
@@ -1351,8 +1424,12 @@ function mergeConfigPatch(raw: Record<string, unknown>, checkedPatch: CheckedCon
   // `deepseek` was missing for the same reason and had the same bug: the key
   // is in the schema, in the API Keys panel and in the tombstone list, but a
   // save of it never reached disk.  `infisical` is here from the start so the
-  // machine identity does not repeat it a third time.
-  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
+  // machine identity does not repeat it a third time.  `jobs` was missing
+  // too: background-job tunables (the knob table in `server/knob-map.ts`)
+  // resolve from the file when the vault is off, so a save that never
+  // reaches disk breaks the vault-over-file contract for exactly the knobs
+  // this rollout manages.
+  for (const key of ["xai", "openaiCompat", "minimax", "composio", "box", "opencodeGo", "deepseek", "tts", "callStt", "imageGen", "profile", "rooms", "jobs", "localVm", "features", "autoUpdate", "ingress", "usage", "qdrant", "observability", "infisical", "botDefaults", "imessageLinq"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
@@ -1692,6 +1769,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     antigravity: { driver: "antigravityAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     opencodeGo: { driver: "opencodeGo" },
     computer: { driver: "boxAgent" },
     openaiCompat: { driver: "openai-compat" },
@@ -1714,6 +1792,7 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     dsh: { driver: "dshAgent" },
     minimax: { driver: "minimax" },
     mcode: { driver: "mcodeAgent" },
+    muse: { driver: "museAgent" },
     ...CUSTOM_ONLY,
   } as const;
   const configured = cfg.instances && Object.keys(cfg.instances).length ? cfg.instances : null;

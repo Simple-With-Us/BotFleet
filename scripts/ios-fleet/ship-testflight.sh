@@ -174,6 +174,33 @@ load_secrets() {
     source "$SECRETS_ENV"
     set +a
   fi
+  # CI FALLBACK (2026-10-02). A GitHub-hosted macos-latest runner has no
+  # ~/.secrets directory, so ios-appstore-gm-prepare.sh normally synthesises
+  # the env file from the APPLE_API_* names it exported from Infisical. When
+  # that file is missing or its ASC_KEY_PATH points at a file that is not
+  # there, fall back to those names directly: decode the base64 p8 into a 0600
+  # file under ~/.secrets and export the ASC_* trio that altool (and
+  # asc-api.mjs) expect. Never prints a value.
+  if [[ -z "${ASC_KEY_ID:-}" || -z "${ASC_ISSUER_ID:-}" || -z "${ASC_KEY_PATH:-}" || ! -f "${ASC_KEY_PATH:-/nonexistent}" ]]; then
+    if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+      local ci_dir="${HOME}/.secrets" ci_key="${HOME}/.secrets/AuthKey.p8"
+      mkdir -p "$ci_dir"
+      chmod 700 "$ci_dir"
+      local decoded=1
+      case "$APPLE_API_KEY_P8_BASE64" in
+        *BEGIN*) printf '%s\n' "$APPLE_API_KEY_P8_BASE64" > "$ci_key" ;;
+        *) printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$ci_key" 2>/dev/null || decoded=0 ;;
+      esac
+      if [[ "$decoded" -eq 1 ]] && grep -q "BEGIN " "$ci_key" 2>/dev/null; then
+        chmod 600 "$ci_key"
+        export ASC_KEY_ID="$APPLE_API_KEY_ID"
+        export ASC_ISSUER_ID="$APPLE_API_ISSUER_ID"
+        export ASC_KEY_PATH="$ci_key"
+      else
+        logerr "ASC_KEY_* unusable and APPLE_API_KEY_P8_BASE64 did not decode to a PEM"
+      fi
+    fi
+  fi
   if [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" ]]; then
     if [[ -f "$ASC_KEY_PATH" ]]; then
       AUTH_MODE="api_key"
@@ -182,6 +209,16 @@ load_secrets() {
     log "ASC_KEY_PATH set but file missing (not printing path contents)"
   fi
   return 0
+}
+
+# Is an ASC credential obtainable AT ALL? load_secrets() has not run yet when
+# resolve_seq_floor() calls asc_latest_seq(), so this cannot rely on the
+# exported ASC_* names -- it checks each source asc-api.mjs knows about.
+asc_credential_available() {
+  [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" && -n "${ASC_KEY_PATH:-}" && -f "${ASC_KEY_PATH:-/nonexistent}" ]] && return 0
+  [[ -f "$SECRETS_ENV" ]] && return 0
+  [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" && -n "${APPLE_API_KEY_P8_BASE64:-}" ]] && return 0
+  return 1
 }
 
 # Map ship APP_KEY to Sentry project slug in org simple-with-us.
@@ -360,19 +397,35 @@ project_marketing_seq() {
 # Returns 1 (and prints nothing) when ASC cannot be consulted — the caller must
 # distinguish "no builds yet" (0) from "unknown" (failure).
 asc_latest_seq() {
-  local prefix="$1" plat="${2:-}" out rc
+  local prefix="$1" plat="${2:-}" out rc errf
   if ! command -v node >/dev/null 2>&1; then
     logerr "asc-seq: node not on PATH; cannot verify against App Store Connect"
     return 1
   fi
-  if [[ ! -f "$SECRETS_ENV" ]]; then
-    logerr "asc-seq: no ${SECRETS_ENV}; cannot verify against App Store Connect"
+  if ! asc_credential_available; then
+    logerr "asc-seq: no App Store Connect credential available; cannot verify against App Store Connect"
     return 1
   fi
+  # DO NOT discard asc-api.mjs's stderr. It used to be piped to /dev/null,
+  # which threw away the one line that says WHY -- "apps query failed (HTTP
+  # 401)" -- and turned every auth or app-resolution fault into the same
+  # contentless "query failed (rc=2)". Surfaced here so an UNVERIFIED floor is
+  # self-diagnosing in the run log.
+  errf="$(mktemp "${TMPDIR:-/tmp}/asc-seq-err.XXXXXX")"
   set +e
-  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" 2>/dev/null)
+  out=$(node "${FLEET_DIR}/asc-api.mjs" latest-build-seq "$BUNDLE_ID" "$prefix" "$plat" "${APPLE_ID:-}" 2>"$errf")
   rc=$?
   set -e
+  if [[ -s "$errf" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && logerr "asc-seq: ${line}"
+    done < "$errf"
+  fi
+  # Discard stdout as well as stderr: anything printed here would land in the
+  # command substitution that captures this function's value and corrupt the
+  # sequence number. (A `rm` wrapper that reports what it removed on stdout is
+  # enough to turn a correct 74 into an arithmetic error.)
+  rm -f "$errf" >/dev/null 2>&1 || true
   if [[ $rc -ne 0 || ! "$out" =~ ^[0-9]+$ ]]; then
     logerr "asc-seq: query failed (rc=${rc}); cannot verify against App Store Connect"
     return 1
@@ -415,7 +468,7 @@ resolve_seq_floor() {
   Shipping now would very likely reuse a build number and be rejected as a duplicate.
   Fix one of these, then re-run:
     1) restore ASC access: check ${SECRETS_ENV} and that 'node' is on PATH, then
-       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix}
+       run: node ${FLEET_DIR}/asc-api.mjs latest-build-seq ${BUNDLE_ID} ${prefix} ${PLATFORM} ${APPLE_ID}
      2) or pass the number explicitly:  --version ${prefix}.<N>   (NOT --build <N>:
         --version picks the marketing version and lets CFBundleVersion stay an
         auto UTC timestamp, which is always higher than every build already
@@ -670,6 +723,7 @@ REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 DISPLAY_NAME="$(json_get "$APP_KEY" displayName)"
 BUNDLE_ID="$(json_get "$APP_KEY" bundleId)"
+APPLE_ID="$(json_get "$APP_KEY" appleId || true)"
 PLATFORM="$(json_get "$APP_KEY" platform)"
 SCHEME="$(json_get "$APP_KEY" scheme)"
 PROJECT_REL="$(json_get "$APP_KEY" projectRel)"
@@ -691,6 +745,14 @@ if [[ "$BUNDLE_ID" == "me.grok.dealdex" ]]; then
 fi
 if [[ "$APP_KEY" == "dealdex" && "$BUNDLE_ID" != "net.dealdex" ]]; then
   die "DealDex live bundle is net.dealdex, not ${BUNDLE_ID}"
+fi
+
+# BotFleet ASC App ID for app.botfleet.ios was never created (owner action from
+# the 2026-09-22 bundle rename). Ships must stay on the live ASC record
+# app.botfleet / appleId 6806379515 or the asc-seq gate fails with rc=2
+# (observed schedule run 36839653889).
+if [[ "$APP_KEY" == "botfleet" && "$BUNDLE_ID" != "app.botfleet" ]]; then
+  die "BotFleet ASC app is app.botfleet (appleId 6806379515); refusing bundleId=${BUNDLE_ID} until that App ID exists in App Store Connect"
 fi
 
 if [[ -z "$UPLOAD_ONLY_IPA" && "$DRY_RUN" -eq 0 ]]; then
@@ -945,7 +1007,7 @@ ensure_tf_ready() {
   IOS_TF_NOTES_PREV_SHA="$PREV_SHIP_SHA" \
   IOS_TF_NOTES_APP="$DISPLAY_NAME" \
   IOS_TF_NOTES_IOS_PREFIX="$IOS_PATH_PREFIX" \
-  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" \
+  node "${FLEET_DIR}/asc-api.mjs" ensure-tf-ready "$BUNDLE_ID" "$BUILD_NUM" "$MARKETING" "${APPLE_ID:-}" \
     >"${LOG_DIR}/ensure-tf-ready.json" 2>"${LOG_DIR}/ensure-tf-ready.err"
   local rc=$?
   set -e

@@ -352,7 +352,7 @@ export function SkillRecorderPage() {
       <header className="flex h-[60px] shrink-0 items-center justify-between border-b border-hairline px-6">
         <div>
           <h1 className="text-[15px] font-semibold">Teach a Skill</h1>
-          <p className="text-[11px] text-ink-secondary">Show it once. Let every bot repeat it.</p>
+          <p className="text-[11px] text-ink-secondary">Show it once.{"\u00a0 "}Let every bot repeat it.</p>
         </div>
         {recording && (
           <button type="button" onClick={() => void stop()} className="flex items-center gap-2 rounded-full bg-danger px-4 py-2 text-[12px] font-semibold text-white shadow-sm">
@@ -478,7 +478,7 @@ export function SkillRecorderPage() {
                       </article>
                     );
                   })}
-                  {!events.length && <div className="rounded-2xl border border-dashed border-hairline p-8 text-center text-[12px] text-ink-secondary">No action steps remain. The narration can still become the skill.</div>}
+                  {!events.length && <div className="rounded-2xl border border-dashed border-hairline p-8 text-center text-[12px] text-ink-secondary">No action steps remain.{"\u00a0 "}The narration can still become the skill.</div>}
                 </section>
 
                 <aside className="h-fit rounded-2xl border border-hairline bg-panel p-5 lg:sticky lg:top-0">

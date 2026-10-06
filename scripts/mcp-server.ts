@@ -1589,6 +1589,7 @@ const activeMcpControllers = new Set<AbortController>();
 export async function processMcpMessage(
   raw: string,
   toolHandler: typeof handleToolCall = handleToolCall,
+  sessionId?: string,
 ): Promise<string | null> {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -1627,7 +1628,8 @@ export async function processMcpMessage(
       if (isRecord(params)) {
         const requestId = params.requestId;
         if (typeof requestId === "string" || typeof requestId === "number") {
-          activeMcpRequests.get(requestId)?.abort(new DOMException("Request cancelled", "AbortError"));
+          const requestKey = sessionId ? `${sessionId}:${requestId}` : requestId;
+          activeMcpRequests.get(requestKey)?.abort(new DOMException("Request cancelled", "AbortError"));
         }
       }
       return null;
@@ -1698,7 +1700,8 @@ export async function processMcpMessage(
       }
       const controller = new AbortController();
       activeMcpControllers.add(controller);
-      if (!isNotification) activeMcpRequests.set(id as string | number, controller);
+      const requestKey = sessionId ? `${sessionId}:${id}` : id;
+      if (!isNotification) activeMcpRequests.set(requestKey as string | number, controller);
       let result: unknown;
       try {
         const toolName = typeof name === "string" ? name : "tool";
@@ -1708,8 +1711,8 @@ export async function processMcpMessage(
         );
       } finally {
         activeMcpControllers.delete(controller);
-        if (!isNotification && activeMcpRequests.get(id as string | number) === controller) {
-          activeMcpRequests.delete(id as string | number);
+        if (!isNotification && activeMcpRequests.get(requestKey as string | number) === controller) {
+          activeMcpRequests.delete(requestKey as string | number);
         }
       }
       if (isNotification) return null;

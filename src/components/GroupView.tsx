@@ -36,9 +36,10 @@ import { ReactionBar, ReactionChips } from "./Reactions";
 import { CopyButton } from "./CopyButton";
 import { ApprovalCard } from "./ApprovalCard";
 import { ManageMembersPanel } from "./ManageMembersPanel";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { ToolLine } from "./ToolLine";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
@@ -290,10 +291,11 @@ const Transcript = memo(function Transcript({
   const memberOf = (id?: string) => members.find((b) => b.id === id);
   // Several bots working at once turn a room into a wall of chips; fold the
   // finished ones when summarizeToolCalls is enabled.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   const focus = state.focusMessage;
   const focusedId = focus && !focus.consumed && focus.threadId === group.threadId ? focus.messageId : null;
   return (
@@ -345,6 +347,8 @@ const Transcript = memo(function Transcript({
             <div className="flex justify-start">
               <ApprovalCard bot={memberOf(m.from?.botId)} message={m} />
             </div>
+          ) : m.kind === "activity" && m.job ? (
+            <JobFinishedRow job={m.job} />
           ) : m.kind === "activity" && m.tool ? (
             m.tool.name.startsWith("error:") ? (
               <div className="flex justify-start max-w-full">
@@ -550,7 +554,7 @@ function RoomWorkingFolder({ group }: { group: Group }) {
 
         {extraCwds.length === 0 ? (
           <div className="mt-2 text-[12px] text-ink-secondary">
-            No secondary repositories attached. Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
+            No secondary repositories attached.{"\u00a0 "}Add more folders (e.g. Fleet Ops) so channel bots have full multi-repo context.
           </div>
         ) : (
           <div className="mt-2 flex flex-col gap-1.5">
@@ -975,6 +979,14 @@ function formatHoverTime(at: number) {
 
 export function GroupView({ group }: { group: Group }) {
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const stream = useStreaming();
   const streaming = stream.streaming[group.threadId];
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1287,13 +1299,14 @@ export function GroupView({ group }: { group: Group }) {
       )}
       {/* Header: responsive container so chips fold gracefully */}
       <div
+        style={dragStyle}
         className={cn(
           "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
+        <div style={noDragStyle} className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2">
           <button
             type="button"
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
@@ -1331,7 +1344,7 @@ export function GroupView({ group }: { group: Group }) {
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="flex shrink-0 items-center gap-1.5 md:gap-2">
           <button
             type="button"
             onClick={() => setFindOpen((open) => !open)}
@@ -1345,6 +1358,8 @@ export function GroupView({ group }: { group: Group }) {
           >
             <Search size={18} />
           </button>
+          {/* Members' background jobs on this room's thread: notices only, never a wake. */}
+          <JobsMenu threadId={group.threadId} room />
           <GroupCallButton group={group} members={members} />
           {!setupPending && !group.dm && <RoomWorkingFolderChip group={group} onToggle={() => setFolderOpen((open) => !open)} />}
           {!setupPending && !group.dm && <DefaultResponderSelect group={group} members={members} />}
@@ -1627,6 +1642,7 @@ export function GroupView({ group }: { group: Group }) {
         locked={setupPending}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
       />
       </div>
       </div>

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   BASE_IMAGE,
@@ -14,6 +14,8 @@ import {
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
   MANAGED_LABEL,
+  healCuaShimsScript,
+  resetCuaShimHealGate,
 } from "./container-computer.ts";
 import { VPS_DEFAULT_CPUS, VPS_DEFAULT_MEMORY_GIB, type AppConfig } from "./config.ts";
 import {
@@ -33,7 +35,9 @@ import {
   vpsDockerArgs,
   vpsDriverError,
   vpsSshTunnelArgs,
+  perBotVpsTarget,
   vpsSyncCliCredentials,
+  resetVpsCliSyncThrottle,
   reuseVps,
   type VpsCommandRunner,
 } from "./vps-computer.ts";
@@ -76,6 +80,7 @@ function fixture({
   restartPolicyName = "unless-stopped",
   cgroupnsMode,
   imageLabelsMatch = true,
+  containerName,
 }: {
   image?: boolean;
   container?: boolean;
@@ -103,8 +108,9 @@ function fixture({
   restartPolicyName?: string;
   cgroupnsMode?: string;
   imageLabelsMatch?: boolean;
+  containerName?: string;
 } = {}) {
-  const name = vpsContainerName(BOT_ID);
+  const name = containerName ?? vpsContainerName(BOT_ID);
   const provisioningArgs = vpsContainerRunArgs(name);
   const argValue = (flag: string) => {
     const index = provisioningArgs.indexOf(flag);
@@ -282,7 +288,7 @@ describe("VPS computer", () => {
     for (const probe of probes) expect(probe.options?.timeoutMs).toBe(30_000);
   });
 
-  it("reports a ready container only when image, labels, limits, mounts, network, and Cua pass", async () => {
+  it("reports a ready container only when image, labels, limits, mounts, network, and CUA pass", async () => {
     const fake = fixture();
     const status = await vpsComputerStatus(CONFIG, BOT_ID, fake.runner);
     expect(status).toMatchObject({
@@ -470,7 +476,7 @@ describe("VPS computer", () => {
     expect(fake.calls.filter(({ args }) => args[2] === "run")).toHaveLength(1);
   });
 
-  it("mounts the official Cua MCP server through the tiny remote exec bridge", () => {
+  it("mounts the official CUA MCP server through the tiny remote exec bridge", () => {
     const connection = vpsComputerMcp(CONFIG, BOT_ID);
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.slice(1, 3)).toEqual(["production-vps", vpsContainerName(BOT_ID)]);
@@ -500,10 +506,12 @@ describe("VPS computer", () => {
     ]);
   });
 
-  it("captures screenshots through Cua Driver and validates the returned image", async () => {
+  it("captures screenshots through CUA Driver and validates the returned image", async () => {
     const fake = fixture();
     const frame = await vpsComputerScreenshot(CONFIG, BOT_ID, fake.runner);
-    expect(frame).toEqual({ png: screenshot.toString("base64"), format: "png" });
+    expect(frame).toMatchObject({ png: screenshot.toString("base64"), format: "png" });
+    expect(typeof frame.capturedAt).toBe("number");
+    expect(Number.isFinite(frame.capturedAt)).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("get_desktop_state"))).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("base64") && args.includes("-u") && args.includes("cua"))).toBe(true);
     expect(fake.calls.some(({ args }) => args.includes("rm") && args.includes("-f"))).toBe(true);
@@ -679,7 +687,7 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toEqual([]);
+        expect(result.syncedTools).toEqual([]);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
         expect(fake.calls.some(({ args }) => args.includes("tar"))).toBe(false);
       } finally {
@@ -697,8 +705,8 @@ describe("VPS computer", () => {
         const fake = fixture({ container: true, running: true });
         const result = await vpsSyncCliCredentials(CONFIG, SHARED_VPS_TARGET, fake.runner, tempDir);
         expect(result.ok).toBe(true);
-        expect(result.synced).toContain(".ssh");
-        expect(result.synced).toContain(".gitconfig");
+        expect(result.syncedTools.some((entry) => entry.name === "ssh")).toBe(true);
+        expect(result.syncedTools.some((entry) => entry.name === "git")).toBe(true);
         expect(result.containerName).toBe(SHARED_VPS_TARGET.containerName);
 
         const tarCall = fake.calls.find(({ args }) => args.includes("tar") && args.includes("-xf"));
@@ -710,6 +718,109 @@ describe("VPS computer", () => {
       } finally {
         rmSync(tempDir, { recursive: true, force: true });
       }
+    });
+
+    it("uses the per-bot container name when target is per-bot", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "vps-sync-per-bot-"));
+      const botTarget = perBotVpsTarget("bot-sync-test");
+      try {
+        const fake = fixture({ container: true, running: true, containerName: botTarget.containerName });
+        const result = await vpsSyncCliCredentials(CONFIG, botTarget, fake.runner, tempDir);
+        expect(result.containerName).toBe(botTarget.containerName);
+        const execArgs = fake.calls.flatMap(({ args }) => args);
+        expect(execArgs).toContain(botTarget.containerName);
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+  describe("concurrent shared-mode bots", () => {
+    const SHARED_CONFIG: AppConfig = {
+      vps: { sshAlias: "production-vps" },
+      botDefaults: { vpsMode: "shared" },
+      localVm: { shareCliCredentials: true },
+    };
+    let home: string;
+    let previousHome: string | undefined;
+    let previousUserProfile: string | undefined;
+
+    beforeEach(() => {
+      resetVpsCliSyncThrottle();
+      resetCuaShimHealGate();
+      home = mkdtempSync(join(tmpdir(), "vps-concurrent-home-"));
+      writeFileSync(join(home, ".gitconfig"), "[user]\n  name = Test\n");
+      previousHome = process.env.HOME;
+      previousUserProfile = process.env.USERPROFILE;
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+    });
+    afterEach(() => {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    const tarCalls = (calls: ReturnType<typeof fixture>["calls"]) =>
+      calls.filter(({ args }) => args.includes("tar") && args.includes("-xf"));
+
+    it("lets every bot's simultaneous turn-start provision succeed without a spurious 409", async () => {
+      const solo = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+      await vpsComputerAction("provision", SHARED_CONFIG, "bot-solo", solo.runner);
+      const soloImageProbes = solo.calls.filter(({ args }) => args[2] === "image").length;
+
+      resetVpsCliSyncThrottle();
+      const crowd = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+      const bots = Array.from({ length: 8 }, (_, i) => `bot-crowd-${i}`);
+      const results = await Promise.all(bots.map((bot) => vpsComputerAction("provision", SHARED_CONFIG, bot, crowd.runner)));
+      expect(results.every((status) => status.ready)).toBe(true);
+      // One flight inspected the host for all eight bots.
+      expect(crowd.calls.filter(({ args }) => args[2] === "image").length).toBe(soloImageProbes);
+    });
+
+    it("syncs CLI credentials once for many simultaneous bots, then again only for a new container", async () => {
+      const first = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+      const bots = Array.from({ length: 6 }, (_, i) => `bot-sync-${i}`);
+      await Promise.all(bots.map((bot) => vpsComputerAction("provision", SHARED_CONFIG, bot, first.runner)));
+      expect(tarCalls(first.calls)).toHaveLength(1);
+
+      await vpsComputerAction("provision", SHARED_CONFIG, "bot-sync-late", first.runner);
+      expect(tarCalls(first.calls)).toHaveLength(1);
+
+      const replaced = fixture({ containerId: "c".repeat(64), containerName: SHARED_VPS_TARGET.containerName });
+      await vpsComputerAction("provision", SHARED_CONFIG, "bot-sync-0", replaced.runner);
+      expect(tarCalls(replaced.calls)).toHaveLength(1);
+    });
+
+    it("backs off after a failed automatic sync instead of retrying on every turn", async () => {
+      const base = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+      const failing: VpsCommandRunner = async (args, options) => {
+        if (args.includes("tar") && args.includes("-xf")) {
+          base.calls.push({ args, options });
+          throw new Error("tar extract failed");
+        }
+        return base.runner(args, options);
+      };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        await vpsComputerAction("provision", SHARED_CONFIG, "bot-a", failing);
+        await vpsComputerAction("provision", SHARED_CONFIG, "bot-b", failing);
+        expect(tarCalls(base.calls)).toHaveLength(1);
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("repairs the PATH driver symlinks once per container without a root exec on every turn", async () => {
+      const fake = fixture({ containerName: SHARED_VPS_TARGET.containerName });
+      await Promise.all(
+        ["bot-h1", "bot-h2", "bot-h3"].map((bot) => vpsComputerAction("provision", SHARED_CONFIG, bot, fake.runner)),
+      );
+      await vpsComputerAction("provision", SHARED_CONFIG, "bot-h4", fake.runner);
+      const heals = fake.calls.filter(({ args }) => args.includes("root") && args.includes(healCuaShimsScript()));
+      expect(heals).toHaveLength(1);
     });
   });
 });

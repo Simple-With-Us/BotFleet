@@ -21,8 +21,155 @@ if (globalThis.window && window.matchMedia) {
   });
 }
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-);
+const rootElement = document.getElementById("root")!;
+const fixtureParam =
+  globalThis.window ? new URLSearchParams(window.location.search).get("fixture") : null;
+
+if (fixtureParam === "tv-face") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/tv-face/TVFaceAvatarVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "engine-setup") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/EngineSetupVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "engine-callout") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/EngineCalloutVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "team-map-context") {
+  void import("./components/TeamMapPage").then((mod) => {
+    const Fixture = mod.TeamMapSharedContextVisualFixture;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "computer-panel") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/ComputerPanelVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "host-cli-integration") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/HostCliIntegrationCardVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "voice-settings-personal") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.
+  void import("./components/VoiceSettingsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "routine-hold") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path. The App render below is unchanged for any
+  // other URL.
+  void import("./components/RoutineHoldVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "runtime-cards") {
+  // Visual-spec harness: mounts the real LocalVmRuntimeCard and
+  // SharedVpsRuntimeCard under a StoreContext with a hand-built
+  // ConfigStatus.  The card and state are picked via URL params (see
+  // RuntimeCardsVisualFixture.tsx).
+  void import("./components/RuntimeCardsVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "linux-local-control") {
+  // Visual-spec harness: Linux Local Control copy and casing (see
+  // LinuxLocalControlVisualFixture.tsx).
+  void import("./components/LinuxLocalControlVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "kanban-command-center") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  The App render below is unchanged for any
+  // other URL.  Drive state with ?state=populated|empty|filtered.
+  void import("./components/KanbanCommandCenterVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else if (fixtureParam === "fleet-matrix-view") {
+  // Visual-spec harness: dynamically import so the fixture chunk is not paid
+  // for in the real app boot path.  Drives the FleetMatrixView's view-mode
+  // switch (matrix grid vs kanban board) for visual coverage of both modes.
+  void import("./components/FleetMatrixViewVisualFixture").then((mod) => {
+    const Fixture = mod.default;
+    createRoot(rootElement).render(
+      <StrictMode>
+        <Fixture />
+      </StrictMode>,
+    );
+  });
+} else {
+  createRoot(rootElement).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}

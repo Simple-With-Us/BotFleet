@@ -292,7 +292,7 @@ describe("the Add Engine form's driver choice", () => {
 
   it("falls back to a humanized driver kind rather than a wrong product name", () => {
     expect(driverDisplayName("minimax")).toBe("MiniMax");
-    expect(driverDisplayName("dshAgent")).toBe("DeepSeek");
+    expect(driverDisplayName("dshAgent")).toBe("Clutch");
     expect(driverDisplayName("piAgent")).toBe("pi");
     // mcode's own product name, not the humanized "Mcode" the fallback
     // would hand back from the driver kind alone.

@@ -3,24 +3,28 @@
  * Minimal App Store Connect API client. No dependencies beyond Node's
  * built-in crypto (ES256 JWT signing) and fetch (Node 18+).
  *
- * Auth: reads ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from
- * ~/.secrets/appstore-connect.env (never prints values -- see
- * scripts/infisical-secrets-safe.sh pattern used elsewhere in the fleet).
+ * Auth: resolves ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH from the first
+ * source that is actually present (never prints values):
+ *   1. ASC_KEY_* in the environment (DealDex's ios-ship.yml exports these)
+ *   2. ~/.secrets/appstore-connect.env (the local-Mac file)
+ *   3. APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64
+ *      (the names BotFleet's ios-ship.yml exports from Infisical; the p8 is
+ *      base64, so it is decoded into a 0600 temp file and removed on exit)
  *
  * Usage:
  *   node asc-api.mjs GET /v1/apps
  *   node asc-api.mjs GET "/v1/apps?filter[bundleId]=trade.socratic.app"
  *   node asc-api.mjs PATCH /v1/betaAppReviewDetails/<id> '{"data":{...}}'
- *   node asc-api.mjs latest-build-seq <bundleId> <prefix>   # e.g. ... trade.congress.ios 1.0
+ *   node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]
  *
  * Prints the raw JSON response to stdout. Caller is responsible for not
  * echoing anything secret-shaped from the response (ASC responses don't
  * carry credentials, only app metadata, so this is safe to print as-is).
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createSign } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 function loadEnvFile(path) {
@@ -38,6 +42,99 @@ function loadEnvFile(path) {
 
 function base64url(input) {
   return Buffer.from(input).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// ---------------------------------------------------------------------------
+// CREDENTIAL RESOLUTION
+// ---------------------------------------------------------------------------
+// WHY THIS IS NOT JUST "~/.secrets/appstore-connect.env" (fixed 2026-10-02):
+// .github/workflows/ios-ship.yml runs on a GitHub-hosted macos-latest runner,
+// which has no ~/.secrets directory at all.  The credential reaches that
+// runner as THREE ENVIRONMENT VARIABLES -- APPLE_API_KEY_ID,
+// APPLE_API_ISSUER_ID and APPLE_API_KEY_P8_BASE64 -- exported into $GITHUB_ENV
+// by .github/actions/infisical-secrets.  Reading only the file meant the key
+// material could be present and correct while the client still refused to
+// authenticate, and because asc_latest_seq() in ship-testflight.sh discarded
+// this script's stderr, the resulting rc=2 was undiagnosable from the run log.
+//
+// APPLE_API_KEY_P8_BASE64 is base64, so it is decoded into a 0600 file inside a
+// 0700 temp directory and unlinked on exit.  Values are never printed; only the
+// source and the key-id LENGTH are logged.
+const TEMP_KEY_DIRS = [];
+
+function cleanupTempKeys() {
+  while (TEMP_KEY_DIRS.length) {
+    const dir = TEMP_KEY_DIRS.pop();
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+process.on("exit", cleanupTempKeys);
+
+// Accepts either a raw PEM (some callers store the .p8 body verbatim) or the
+// base64 encoding GitHub Actions + Infisical use. Returns null when the input
+// cannot be turned into a PEM, so the caller can fail with a real reason.
+function decodeP8(b64) {
+  const cleaned = String(b64 || "").trim();
+  if (!cleaned) return null;
+  if (cleaned.includes("-----BEGIN ")) return cleaned.endsWith("\n") ? cleaned : `${cleaned}\n`;
+  let pem;
+  try {
+    pem = Buffer.from(cleaned, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+  return pem.includes("-----BEGIN ") ? pem : null;
+}
+
+function materializeP8(pem) {
+  const dir = mkdtempSync(join(tmpdir(), "asc-key-"));
+  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
+  const p = join(dir, "AuthKey.p8");
+  writeFileSync(p, pem, { mode: 0o600 });
+  TEMP_KEY_DIRS.push(dir);
+  return p;
+}
+
+function fromFile(keyId, issuerId, keyPath, source) {
+  try {
+    return { keyId: keyId.trim(), issuerId: issuerId.trim(), privateKeyPem: readFileSync(keyPath, "utf8"), source };
+  } catch {
+    return null;
+  }
+}
+
+// Returns { keyId, issuerId, privateKeyPem, source } or { error } or { error: null }.
+function resolveCredential() {
+  // 1) Already-exported ASC_* (DealDex's workflow does this).
+  const envKeyId = String(process.env.ASC_KEY_ID || "").trim();
+  const envIssuer = String(process.env.ASC_ISSUER_ID || "").trim();
+  const envKeyPath = String(process.env.ASC_KEY_PATH || "").trim();
+  if (envKeyId && envIssuer && envKeyPath && existsSync(envKeyPath)) {
+    const got = fromFile(envKeyId, envIssuer, envKeyPath, "ASC_KEY_* environment");
+    if (got) return got;
+  }
+
+  // 2) The local-Mac env file.
+  const envPath = join(homedir(), ".secrets", "appstore-connect.env");
+  if (existsSync(envPath)) {
+    const fileEnv = loadEnvFile(envPath);
+    if (fileEnv.ASC_KEY_ID && fileEnv.ASC_ISSUER_ID && fileEnv.ASC_KEY_PATH && existsSync(fileEnv.ASC_KEY_PATH)) {
+      const got = fromFile(fileEnv.ASC_KEY_ID, fileEnv.ASC_ISSUER_ID, fileEnv.ASC_KEY_PATH, envPath);
+      if (got) return got;
+    }
+  }
+
+  // 3) The APPLE_API_* trio the ship workflow exports from Infisical.
+  const keyId = String(process.env.APPLE_API_KEY_ID || "").trim();
+  const issuerId = String(process.env.APPLE_API_ISSUER_ID || "").trim();
+  if (keyId && issuerId && process.env.APPLE_API_KEY_P8_BASE64) {
+    const pem = decodeP8(process.env.APPLE_API_KEY_P8_BASE64);
+    if (!pem) return { error: "APPLE_API_KEY_P8_BASE64 is set but did not decode to a PEM private key" };
+    materializeP8(pem);
+    return { keyId, issuerId, privateKeyPem: pem, source: "APPLE_API_* environment (base64 p8)" };
+  }
+
+  return { error: null };
 }
 
 function signJwt({ keyId, issuerId, privateKeyPem }) {
@@ -313,23 +410,28 @@ async function setWhatToTest({ api, buildId, appId, marketing }) {
 }
 
 async function main() {
-  const envPath = join(homedir(), ".secrets", "appstore-connect.env");
-  const env = loadEnvFile(envPath);
-  const keyId = env.ASC_KEY_ID;
-  const issuerId = env.ASC_ISSUER_ID;
-  const keyPath = env.ASC_KEY_PATH;
-  if (!keyId || !issuerId || !keyPath) {
-    console.error("Missing ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in ~/.secrets/appstore-connect.env");
+  const cred = resolveCredential();
+  if (cred.error) {
+    console.error(`asc-auth: ${cred.error}`);
     process.exit(1);
   }
-  const privateKeyPem = readFileSync(keyPath, "utf8");
-  const token = signJwt({ keyId, issuerId, privateKeyPem });
+  if (!cred.privateKeyPem) {
+    console.error(
+      "asc-auth: no App Store Connect credential found. Tried, in order:\n" +
+      "  1) ASC_KEY_ID / ASC_ISSUER_ID / ASC_KEY_PATH in the environment\n" +
+      "  2) ~/.secrets/appstore-connect.env\n" +
+      "  3) APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64 in the environment"
+    );
+    process.exit(1);
+  }
+  console.error(`asc-auth: using ${cred.source} (key id length ${cred.keyId.length})`);
+  const token = signJwt({ keyId: cred.keyId, issuerId: cred.issuerId, privateKeyPem: cred.privateKeyPem });
 
-  const [method, path, body, arg4] = process.argv.slice(2);
+  const [method, path, body, arg4, arg5] = process.argv.slice(2);
   if (!method || !path) {
     console.error("Usage: node asc-api.mjs <METHOD> <PATH> [JSON_BODY]");
-    console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion]");
-    console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix>");
+    console.error("       node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
+    console.error("       node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
     process.exit(1);
   }
 
@@ -347,6 +449,50 @@ async function main() {
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
     return { status: res.status, ok: res.ok, parsed, text };
+  }
+
+  // filter[bundleId] is a PREFIX match on Apple's side (app.botfleet also
+  // returns app.botfleet.macos), so always exact-match attributes.bundleId.
+  // When the registry bundle is not registered yet but appleId is known, fall
+  // back to GET /v1/apps/<appleId>.
+  async function resolveAscAppId(bundleId, appleIdHint, logPrefix) {
+    const hint = String(appleIdHint || process.env.ASC_APPLE_ID || "").trim();
+    let appId = null;
+
+    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=50`);
+    if (apps.ok) {
+      const exact = (apps.parsed.data || []).find(
+        (a) => a?.attributes?.bundleId === bundleId
+      );
+      if (exact) {
+        appId = exact.id;
+      } else if ((apps.parsed.data || []).length) {
+        console.error(
+          `${logPrefix}: filter[bundleId]=${bundleId} returned ${apps.parsed.data.length} row(s) but no exact match` +
+          ` (${apps.parsed.data.map((a) => a.attributes?.bundleId).join(", ")})`
+        );
+      }
+    } else {
+      console.error(`${logPrefix}: apps query failed (HTTP ${apps.status})`);
+      return { appId: null, appsStatus: apps.status };
+    }
+
+    if (!appId && hint) {
+      const byId = await api("GET", `/v1/apps/${encodeURIComponent(hint)}`);
+      if (byId.ok && byId.parsed.data?.id) {
+        appId = byId.parsed.data.id;
+        const resolvedBundle = byId.parsed.data.attributes?.bundleId || "(unknown)";
+        console.error(
+          `${logPrefix}: bundle ${bundleId} not in ASC; using appleId ${hint} (${resolvedBundle})`
+        );
+      } else {
+        console.error(
+          `${logPrefix}: appleId fallback ${hint} failed (HTTP ${byId.status})`
+        );
+      }
+    }
+
+    return { appId, appsStatus: apps.status };
   }
 
   // Highest N already used by the "<prefix>.N" MARKETING version train
@@ -379,15 +525,16 @@ async function main() {
     const bundleId = path;
     const prefix = body;
     if (!bundleId || !prefix) {
-      console.error("Usage: node asc-api.mjs latest-build-seq <bundleId> <prefix>");
+      console.error("Usage: node asc-api.mjs latest-build-seq <bundleId> <prefix> [platform] [appleId]");
       process.exit(2);
     }
-    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
-    if (!apps.ok || !apps.parsed.data?.[0]) {
-      console.error(`latest-build-seq: app not found for bundle (HTTP ${apps.status})`);
+
+    const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
+    const { appId, appsStatus } = await resolveAscAppId(bundleId, appleIdHint, "latest-build-seq");
+    if (!appId) {
+      console.error(`latest-build-seq: app not found for bundle (HTTP ${appsStatus})`);
       process.exit(2);
     }
-    const appId = apps.parsed.data[0].id;
 
     // Escape the prefix so "1.0" cannot match "120" via the regex dot.
     const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -480,8 +627,9 @@ async function main() {
     const bundleId = path;
     const wantBuildVersion = body;
     const wantMarketing = arg4;
+    const appleIdHint = String(arg5 || process.env.ASC_APPLE_ID || "").trim();
     if (!bundleId || !wantBuildVersion) {
-      console.error("Usage: node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion]");
+      console.error("Usage: node asc-api.mjs ensure-tf-ready <bundleId> <buildVersion> [marketingVersion] [appleId]");
       console.error("  <buildVersion> is CFBundleVersion (CURRENT_PROJECT_VERSION) of the build");
       console.error("  this run uploaded. It is required: without it there is no way to tell the");
       console.error("  new build from the previous ship, and ASC has no record of the new build");
@@ -498,12 +646,11 @@ async function main() {
     const POLL_MS = 15000;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    const apps = await api("GET", `/v1/apps?filter[bundleId]=${encodeURIComponent(bundleId)}&limit=1`);
-    if (!apps.ok || !apps.parsed.data?.[0]) {
-      console.error(`ensure-tf-ready: app not found for bundle (HTTP ${apps.status})`);
+    const { appId, appsStatus } = await resolveAscAppId(bundleId, appleIdHint, "ensure-tf-ready");
+    if (!appId) {
+      console.error(`ensure-tf-ready: app not found for bundle (HTTP ${appsStatus})`);
       process.exit(2);
     }
-    const appId = apps.parsed.data[0].id;
 
     // ---- Phase A: discovery. Poll until the uploaded build has an ASC record.
     let query = `/v1/builds?filter[app]=${appId}&filter[version]=${encodeURIComponent(wantBuildVersion)}`;

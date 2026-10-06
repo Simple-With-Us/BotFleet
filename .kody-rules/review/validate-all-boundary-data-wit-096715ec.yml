@@ -1,0 +1,48 @@
+title: Validate all boundary data with Zod schemas instead of type assertions
+rule: >-
+  Because this package defines the cross-app contract, runtime data (API
+  responses, webhooks, queue payloads, persisted JSON, form input) must be
+  parsed with Zod schemas exported from this package rather than trusted via
+  `as` casts, `any`, or non-validating helpers. Define schemas with
+  z.object(...).strict() (or explicit passthrough only when justified), export
+  the schema and derive the TypeScript type with z.infer so the type and runtime
+  check cannot drift. Use safeParse at call sites where failures must be handled
+  gracefully, and never silence parse errors by swallowing them. Avoid
+  z.any()/z.unknown() for fields that carry structured data; model them
+  explicitly.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: |-
+      export interface TradeRecord {
+        id: string;
+        ticker: string;
+        amount: number;
+      }
+
+      export function parseTrade(raw: unknown): TradeRecord {
+        return raw as TradeRecord;
+      }
+    isCorrect: false
+  - snippet: |-
+      import { z } from "zod";
+
+      export const TradeRecordSchema = z
+        .object({
+          id: z.string().min(1),
+          ticker: z.string().regex(/^[A-Z]{1,5}$/),
+          amount: z.number().finite().nonnegative(),
+        })
+        .strict();
+
+      export type TradeRecord = z.infer<typeof TradeRecordSchema>;
+
+      export function parseTrade(raw: unknown): TradeRecord {
+        return TradeRecordSchema.parse(raw);
+      }
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

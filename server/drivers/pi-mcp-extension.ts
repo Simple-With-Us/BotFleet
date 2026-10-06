@@ -317,7 +317,7 @@ interface JsonSchema {
   allOf?: unknown[];
   items?: unknown | unknown[];
   prefixItems?: unknown[];
-  properties?: Record<string, unknown>;
+  properties?: Record<string, JsonSchema>;
   required?: unknown;
   additionalProperties?: unknown;
   minimum?: unknown;
@@ -381,8 +381,8 @@ function withNullable(schema: TSchema, nullable: unknown): TSchema {
   return nullable === true ? Type.Union([schema, Type.Null()]) : schema;
 }
 
-function collectObjectShape(schema: JsonSchema): { properties: Record<string, unknown>; required: Set<string> } {
-  const properties: Record<string, unknown> = {};
+function collectObjectShape(schema: JsonSchema): { properties: Record<string, JsonSchema>; required: Set<string> } {
+  const properties: Record<string, JsonSchema> = {};
   const required = new Set<string>();
 
   const visit = (candidate: unknown, mode: "root" | "all" | "choice") => {

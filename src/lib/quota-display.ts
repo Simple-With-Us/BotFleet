@@ -169,7 +169,13 @@ export function quotaLinesSummary(lines: QuotaDisplayLine[]): string {
  *     user relies on this engine and needs to SEE "Unavailable: <reason>",
  *     not have the row silently vanish as if it never existed.
  *  Match only the first shape's wording, so the second keeps its row. */
-export function isEngineUnconfigured(reason: string | undefined | null): boolean {
+export function isEngineUnconfigured(
+  reasonOrSnapshot: string | { reason?: string; transient?: boolean } | undefined | null,
+): boolean {
+  // A probe that gave no answer ("Claude did not answer in time") says
+  // nothing about setup: the engine keeps its row while it is re-checked.
+  if (reasonOrSnapshot && typeof reasonOrSnapshot === "object" && reasonOrSnapshot.transient) return false;
+  const reason = typeof reasonOrSnapshot === "object" ? reasonOrSnapshot?.reason : reasonOrSnapshot;
   if (!reason) return false;
   if (/CLI not found/i.test(reason)) return true;
   if (/^no [\w .-]*\b(?:api key|token)\b/i.test(reason)) return true;
@@ -399,7 +405,7 @@ export type LocalQuotaFreshnessView = {
  *  the file is the only thing that could say otherwise.
  *
  *  CodeCaps renamed on the wire from `agent-bar` to `codecaps` on 2026-09-20
- *  (PR #22 in jaywedgeworth22/codecaps).  Both values resolve to the new
+ *  (PR #22 in Simple-With-Us/codecaps).  Both values resolve to the new
  *  brand in the UI; anything else falls through to "CodeCaps" as the
  *  assumed writer of the local handoff path. */
 export function quotaProducerLabel(producer?: string | null): string {

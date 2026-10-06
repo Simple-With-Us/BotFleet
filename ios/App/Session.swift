@@ -93,6 +93,10 @@ final class Session: ObservableObject {
     /// transient sheet dismissals and cancelled tasks so the profile model picker
     /// never empties spuriously.
     @Published private(set) var cachedInstances: [Instance] = []
+    /// The roster behind `cachedInstances` and the `describedAt` high-water mark
+    /// every fetch and push is ordered by (`InstanceRoster`).  Reset with them
+    /// on pair / sign-out: another computer's stamps share nothing with this one's.
+    private var instanceRoster = InstanceRoster()
 
     /// A notification response that should be pushed by the roster's
     /// NavigationStack after the exact detached task has been activated.
@@ -370,6 +374,7 @@ final class Session: ObservableObject {
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         cachedInstances = []
+        instanceRoster.reset()
         status = .connecting
     }
 
@@ -449,6 +454,7 @@ final class Session: ObservableObject {
         self.state = CompanionState()
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         // A fresh pairing settles any restore that was still waiting on the
         // keychain — the token is in hand, so there is nothing left to retry.
         restorePending = false
@@ -521,6 +527,7 @@ final class Session: ObservableObject {
         pushSenderHealthNotReported = false
         instanceDriverKinds = [:]
         cachedInstances = []
+        instanceRoster.reset()
         pairingGeneration += 1
         cancelPendingSettingsMutations()
         resetAvatarCache()
@@ -697,6 +704,11 @@ final class Session: ObservableObject {
                         // the request dies halfway through replay/hydration,
                         // reconnecting must still ask for the missing gap.
                         if !resumed {
+                            // A stream that cannot resume is usually a restarted
+                            // harness, whose describedAt clock owes nothing to
+                            // the last process's.  Keep the roster, drop the
+                            // mark, so the next fetch is not judged against it.
+                            instanceRoster.forgetOrder()
                             coldHydration: while true {
                                 switch try await hydrateSnapshot(using: client) {
                                 case .applied:
@@ -748,6 +760,10 @@ final class Session: ObservableObject {
                     state.advance(to: frame.seq)
                     if case .updateStatus = frame.frame {
                         pollMacUpdateWhileRunning()
+                    }
+                    if case let .instances(fetched, describedAt) = frame.frame {
+                        // A pushed roster replaces the cached one, the same as a fetch.
+                        applyInstances(fetched, describedAt: describedAt)
                     }
                 }
                 // the stream ended without an error — the harness went away
@@ -930,9 +946,15 @@ final class Session: ObservableObject {
     // frame (or 202 queueId) lands. Everything else still waits on the
     // harness so the phone does not invent a second fold.
 
+    struct MessageSendOutcome: Sendable {
+        let ok: Bool
+        let clientNonce: String
+    }
+
     @discardableResult
-    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> Bool {
-        guard let client else { return false }
+    func send(_ text: String, to chat: Chat, attachments: [PendingChatAttachment] = [], recording: (data: Data, transcript: String)? = nil) async -> MessageSendOutcome {
+        guard let client else { return MessageSendOutcome(ok: false, clientNonce: "") }
+        var clientNonce = ""
         do {
             var prompt = text
             if !attachments.isEmpty {
@@ -948,7 +970,7 @@ final class Session: ObservableObject {
                 }
                 prompt = ChatAttachments.composeMessage(text: text, attachments: uploaded)
             }
-            guard !prompt.isEmpty else { return false }
+            guard !prompt.isEmpty else { return MessageSendOutcome(ok: false, clientNonce: "") }
             let savedRecording: IncomingRecording?
             if let recording {
                 let path = try await client.uploadRecording(recording.data)
@@ -962,6 +984,7 @@ final class Session: ObservableObject {
             case let .room(room): threadId = room.threadId
             }
             let localId = UUID().uuidString
+            clientNonce = localId
             state.rememberPendingSend(threadId: threadId, id: localId, text: prompt, queued: false)
             do {
                 switch chat {
@@ -991,7 +1014,7 @@ final class Session: ObservableObject {
                         recording: savedRecording
                     )
                 }
-                return true
+                return MessageSendOutcome(ok: true, clientNonce: localId)
             } catch {
                 state.cancelPendingQueued(threadId: threadId, queueId: localId)
                 if let apiError = error as? APIError, apiError.isConflict {
@@ -1001,10 +1024,10 @@ final class Session: ObservableObject {
             }
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         } catch {
             recordActionError(error)
-            return false
+            return MessageSendOutcome(ok: false, clientNonce: clientNonce)
         }
     }
 
@@ -2456,18 +2479,27 @@ final class Session: ObservableObject {
         return outcome
     }
 
+    /// Replaces the cached roster unless the harness already described a newer
+    /// one: a slow fetch must not overwrite a fresher push, or the reverse.
+    /// Every path that installs a roster goes through here, so one high-water
+    /// mark orders them all.  An answer without a stamp (an older harness) is
+    /// applied as before.
+    @discardableResult
+    private func applyInstances(_ fetched: [Instance], describedAt: Double?) -> Bool {
+        guard instanceRoster.apply(fetched, describedAt: describedAt) else { return false }
+        cachedInstances = instanceRoster.instances
+        instanceDriverKinds = instanceRoster.driverKinds
+        return true
+    }
+
     func instances() async -> [Instance] {
         guard let client else { return [] }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
-            guard pairingGeneration == generation else { return fetched }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
-            return fetched
+            let list = try await client.instanceList()
+            guard pairingGeneration == generation else { return list.instances }
+            // A fetch older than the roster already held answers with the newer one.
+            return applyInstances(list.instances, describedAt: list.describedAt) ? list.instances : cachedInstances
         } catch {
             recordActionError(error)
             if pairingGeneration == generation && !cachedInstances.isEmpty {
@@ -2486,13 +2518,9 @@ final class Session: ObservableObject {
         guard let client else { return }
         let generation = pairingGeneration
         do {
-            let fetched = try await client.instances()
+            let list = try await client.instanceList()
             guard pairingGeneration == generation else { return }
-            cachedInstances = fetched
-            instanceDriverKinds = Dictionary(
-                fetched.map { ($0.instanceId, $0.driverKind) },
-                uniquingKeysWith: { _, latest in latest }
-            )
+            applyInstances(list.instances, describedAt: list.describedAt)
         } catch {
             // Quiet: connectivity / cancel while the roster is open.
         }

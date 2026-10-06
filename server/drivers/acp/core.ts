@@ -22,7 +22,17 @@ import { cliProbeEnvironment } from "../../cli-probe-env.ts";
 import { decodeInjectId } from "../local-inject.ts";
 import { toolFields } from "../../tool-fields.ts";
 import { describeResult } from "../../../shared/tool-activity.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import { capturePreparedBoth, capturePreparedInput, prepareInput, textSignature } from "../../../shared/item-io.ts";
+import {
+  classifyVersionProbeFailure,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  LastKnownAnswer,
+  logProbeFailure,
+  spawnCli,
+  trackCliGroup,
+} from "../../procs.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "../retry.ts";
 import {
   decodeInitTimeoutMs,
@@ -96,8 +106,8 @@ export function acpMcpServers(turn: Pick<SendTurnInput, "integrations">): AcpStd
     });
   }
   // The bot's computers, mounted exactly like the Claude driver does.
-  // Cloud boxes use the REST adapter; host, sandbox, and VPS Cua
-  // connections expose Cua Driver's official MCP server directly. Every
+  // Cloud boxes use the REST adapter; host, sandbox, and VPS CUA
+  // connections expose CUA Driver's official MCP server directly. Every
   // grant gets its own server — this was an if/else if that dropped the
   // second computer a bot had been given.
   for (const mount of turnComputerMounts(turn.integrations)) {
@@ -182,11 +192,11 @@ export interface AcpSupport {
   /** Per-model reasoning-effort budgets, keyed by model id.  A model listed
    * here gets its entry as the catalog option's `effortLevels`, which the
    * client prefers over the driver-wide list; models absent from the map
-   * fall back to `effortLevels`.  Mirrors the Harness
-   * `AcpSupport.perModelEffortLevels` shape so a Harness-published map can
+   * fall back to `effortLevels`.  Mirrors the Clutch
+   * `AcpSupport.perModelEffortLevels` shape so a Clutch-published map can
    * be passed straight through. */
   perModelEffortLevels?: Readonly<Record<string, readonly EffortLevel[]>>;
-  /** Harness's model-specific image truth; explicit catalog values take priority. */
+  /** Clutch's model-specific image truth; explicit catalog values take priority. */
   perModelImages?: Readonly<Record<string, boolean>>;
   /** Default CLI binary name if the instance config doesn't override it. */
   defaultCli: string;
@@ -271,7 +281,10 @@ export interface AcpSupport {
   authFailure: "fail" | "continue";
   /** snapshot(): can this harness actually run a turn? (env already carries the
    *  merged config). May be async for harnesses that have to ask the CLI. */
-  isAuthenticated(env: Record<string, string | undefined>, config: AcpConfig): boolean | Promise<boolean>;
+  isAuthenticated(
+    env: Record<string, string | undefined>,
+    config: AcpConfig,
+  ): boolean | undefined | Promise<boolean | undefined>;
   /** Refuse a first-party cloud turn before spawning when snapshot auth is
    * false. Local injected models deliberately bypass this subscription gate. */
   requireAuthenticationBeforeSpawn?: boolean;
@@ -301,6 +314,16 @@ export interface AcpSupport {
      * driver that only knows the argv slug cannot form a valid set_model
      * without this. Empty when the agent advertised none. */
     sessionModels: Array<{ modelId?: string; name?: string }>;
+    /** The session's `configOptions` as they stand after this turn's model
+     * selection, verbatim, for a driver that must know which options the
+     * session offers before it sets one (an older CLI may lack an option the
+     * current one has).  It is the `session/new` or `session/load` list when no
+     * model switch ran, and the switch reply's list when one did, since an
+     * option list can change with the model.  `undefined` when no current list
+     * is known, for example a switch the agent acknowledged with a bare `{}`:
+     * the earlier list predates the switch, so it is withheld rather than
+     * trusted. */
+    sessionConfigOptions?: unknown[] | undefined;
   }): Promise<void>;
 }
 
@@ -362,6 +385,20 @@ class AcpPromptIdleError extends Error {
     super(`${method} produced no output for ${describeIdleWindow(idleMs)} and was stopped as a stall.`);
     this.name = "AcpPromptIdleError";
     this.method = method;
+  }
+}
+
+/** The agent refused a session setting because it does not serve the model
+ *  id: the turn settles `unknown_model`, the structural stop reason that
+ *  model-fallback.ts reads (MODEL_REJECTED_STOP_REASON) to mark the
+ *  (bot, engine, model) rejected, so later turns and fail-overs skip it
+ *  instead of spawning the CLI to hear the same answer.  A harness opts in by
+ *  throwing this from `configureSession`, and only for a real refusal: a
+ *  timeout or a crash is not a verdict on the model. */
+export class AcpModelRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AcpModelRejectedError";
   }
 }
 
@@ -487,6 +524,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
+  /** Resolved ONCE, at registration, because the capability matrix reads it
+   *  statically.  Both answers are a pure function of `support`, so deriving
+   *  them here and reading them from `metadata.channelWiring` cannot disagree
+   *  with the per-instance block below, which reads these same two values. */
+  const mountsMcpServers = support.mcpServers !== false;
+  const acceptsImages = support.images !== false;
   // Experimental V2 driver rollout gate — when this flips to `true` the V2
   // session runtime in `acp/core.v2.ts` will be wired in here.  Today the
   // flag is `false` and the branch is a single boot-time log line so the
@@ -503,6 +546,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       displayName: support.displayName,
       supportsMultipleInstances: true,
       access: support.access ?? "subscription",
+      // Static mirror of the flags below that the runtime resolves
+      // mechanically, published so a consumer that cannot afford to create an
+      // instance (the capability-matrix test) can check a claim against the
+      // driver instead of against a comment.  The ACP core answers every MCP
+      // flag from one question, so these four are all the same boolean.
+      channelWiring: {
+        agentsMcp: mountsMcpServers,
+        computerMcp: mountsMcpServers,
+        composioMcp: mountsMcpServers,
+        localComputerMcp: mountsMcpServers,
+        images: acceptsImages,
+      },
     },
     install: support.install,
     models: withModelCapabilities(support.models, support),
@@ -570,21 +625,42 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       const emit = (event: RuntimeEvent) => {
         for (const l of [...listeners]) l(event);
       };
-      let lastKnownVersion: string | null = null;
-      const cliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
-        new Promise<string | null>((resolve) => {
+      // Expires KNOWN_VERSION_MAX_AGE_MS after the CLI last answered, so a
+      // CLI that wedges for good settles as "did not answer in time".
+      const lastKnownVersion = new LastKnownAnswer<string>();
+      /** One `--version` probe, with what went wrong when it produced no
+       * version — so a timeout can be told apart from a missing binary. */
+      const probeCliVersion = (effective: AcpConfig, env: Record<string, string | undefined>) =>
+        new Promise<{ version: string | null; error: Error | null; elapsedMs: number }>((resolve) => {
+          // Its place among overlapping probes: taken before the process starts,
+          // so a slow older probe cannot replace what a newer one remembered.
+          const order = lastKnownVersion.begin();
+          const startedAt = Date.now();
           execCli(effective.cli, ["--version"], { timeout: 20000, env: cliProbeEnvironment(env) }, (err, stdout) => {
             const trimmed = err ? null : stdout.trim();
+            const elapsedMs = Date.now() - startedAt;
             if (trimmed) {
-              lastKnownVersion = trimmed;
-              resolve(trimmed);
-            } else if (lastKnownVersion) {
-              resolve(lastKnownVersion);
+              lastKnownVersion.record(trimmed, order);
+              resolve({ version: trimmed, error: null, elapsedMs });
             } else {
-              resolve(null);
+              logProbeFailure(input.instanceId, `${effective.cli} --version`, err, elapsedMs);
+              // The last good version stands in only for a probe that gave no
+              // answer.  A missing or crashing binary is a verdict and also
+              // retires the remembered version.
+              const failure = classifyVersionProbeFailure(
+                err,
+                effective.cli,
+                input.displayName || input.instanceId,
+                elapsedMs,
+                20000,
+              );
+              if (failure.kind !== "transient") lastKnownVersion.forget(order);
+              resolve({ version: failure.kind === "transient" ? lastKnownVersion.get() : null, error: err, elapsedMs });
             }
           });
         });
+      const cliVersion = async (effective: AcpConfig, env: Record<string, string | undefined>) =>
+        (await probeCliVersion(effective, env)).version;
       const base = (threadId: string, turnId: string) => ({
         eventId: newEventId(),
         provider: DRIVER_KIND,
@@ -673,7 +749,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         }
         if (support.requireAuthenticationBeforeSpawn && !skipSubscriptionAuthForLocalInject(turn.model)) {
-          let authenticated: boolean;
+          let authenticated: boolean | undefined;
           try {
             authenticated = await support.isAuthenticated(env, turnConfig);
           } catch (error) {
@@ -682,7 +758,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
           const cancelled = cancelledBeforeDispatch();
           if (cancelled) return cancelled;
-          if (!authenticated) {
+          // Undefined is "the probe could not tell" — let the CLI itself
+          // answer rather than refusing a signed-in user on a slow probe.
+          if (authenticated === false) {
             return finishBeforeDispatch(false, "auth_required", { message: support.loginNote, setup: true });
           }
         }
@@ -723,6 +801,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           });
         }
 
+        // Armed at spawn so the group is probed in the same tick its leader
+        // is reaped: that is what lets stop() keep reaping a lingering MCP
+        // descendant after the leader has gone, without ever signalling a
+        // process-group id the OS may have handed to someone else.
+        const group = trackCliGroup(child);
+
         // `sawOutput` is the replay-safety gate, and it is PROTOCOL state, not
         // a reading of the error text: it flips the moment this child put
         // something on the bus that a relaunch would duplicate or contradict —
@@ -746,6 +830,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // A long quiet build is work, not a wedge — the idle guard consults
         // this the same way it consults `asks`.
         const openToolCalls = new Set<string>();
+        // A fingerprint of the input each open call last had recorded.  A
+        // streaming agent announces a call with an empty or partial `rawInput`
+        // and sends the whole of it on a later `tool_call_update`, so the
+        // update has to be compared with what is already filed.  Only the
+        // fingerprint is held (never the text, which can be a whole file), and
+        // it is dropped as the call ends.
+        const toolInputs = new Map<string, string>();
         let nextId = 1;
         let sessionId: string | null = null;
         let interruptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -835,17 +926,63 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        // One force-kill per child, however many paths call stop().
+        let forceKillArmed = false;
+        const stop = () => {
+          // SIGTERM the whole group while the leader is alive.  A no-op once
+          // the leader has exited: killCliTree early-returns then.
+          killCliTree(child);
+          const leaderAlive = child.exitCode === null && child.signalCode === null;
+          if (process.platform === "win32") {
+            // No process groups here; taskkill /T /F already forced the
+            // tree.  Keep a direct kill for a leader taskkill missed.
+            if (!leaderAlive || forceKillArmed) return;
+            forceKillArmed = true;
+            const forceTimer = setTimeout(() => {
+              if (child.exitCode !== null || child.signalCode !== null) return;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+            }, FORCE_EXIT_AFTER_MS);
+            forceTimer.unref?.();
+            return;
+          }
+          // The leader already exited before anyone asked it to stop, so
+          // killCliTree sent nothing, but an MCP descendant may still be
+          // alive in the group holding the session lock.  Ask it to go
+          // first.  `group.signal` only sends while the group id is still
+          // provably this child's (see trackCliGroup), never to a pgid the OS
+          // may have recycled.
+          if (!leaderAlive) group.signal("SIGTERM");
+          // Group already empty: a clean teardown, nothing left to force.
+          if (!group.owned || forceKillArmed) return;
+          forceKillArmed = true;
+          // Then force it.  This must NOT be gated on the leader still being
+          // alive: on a normal completion the leader dies on the SIGTERM
+          // above within milliseconds, while a SIGTERM-ignoring descendant
+          // lives on, and settle() has already dropped this turn from
+          // `active`, so stopAll/dispose can no longer reach it.  It is gated
+          // on the group instead: if the group empties first, trackCliGroup
+          // disowns it and this send is a no-op.
+          const forceTimer = setTimeout(() => group.signal("SIGKILL"), FORCE_EXIT_AFTER_MS);
+          forceTimer.unref?.();
+        };
         const stopAndWaitForExit = async () => {
           state.deadlineTerminating = true;
-          const pid = child.pid;
           const forceExit = () => {
-            try {
-              if (process.platform !== "win32" && pid) process.kill(-pid, "SIGKILL");
-              else child.kill("SIGKILL");
-            } catch {
-              // already gone
+            if (process.platform === "win32") {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // already gone
+              }
+              return;
             }
+            // Same ownership rule as stop(): reap a lingering descendant, but
+            // never signal a group id that has emptied and may be recycled.
+            group.signal("SIGKILL");
           };
           if (child.exitCode !== null || child.signalCode !== null) {
             forceExit();
@@ -1133,7 +1270,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             }
             case "tool_call": {
               state.sawOutput = true;
-              if (typeof u.toolCallId === "string") openToolCalls.add(u.toolCallId);
+              // prepared once: the same text is filed with the event and
+              // fingerprinted for the update that may follow
+              const announced = u.rawInput === undefined ? undefined : prepareInput(u.rawInput);
+              if (typeof u.toolCallId === "string") {
+                openToolCalls.add(u.toolCallId);
+                if (announced !== undefined) toolInputs.set(u.toolCallId, textSignature(announced.text));
+              }
               flushAssistantText();
               // ACP hands us `kind`, `locations` and `rawInput` alongside the
               // title.  Folding all of it into one 80-char title was what left
@@ -1150,12 +1293,20 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   locations: u.locations,
                   cwd: turn.cwd,
                 }),
+                ...capturePreparedInput(announced),
               });
               break;
             }
             case "tool_call_update": {
+              // The schema lets a call's input arrive or settle on an update,
+              // at any status: take it when it is new text for this call.
+              const settled = typeof u.toolCallId === "string" && u.rawInput !== undefined ? prepareInput(u.rawInput) : undefined;
+              const settledSignature = settled === undefined ? undefined : textSignature(settled.text);
+              const newInput = settled !== undefined && toolInputs.get(u.toolCallId) !== settledSignature ? settled : undefined;
+              if (newInput !== undefined && settledSignature !== undefined) toolInputs.set(u.toolCallId, settledSignature);
               if (u.status === "completed" || u.status === "failed") {
                 openToolCalls.delete(u.toolCallId);
+                if (typeof u.toolCallId === "string") toolInputs.delete(u.toolCallId);
                 emit({
                   ...base(threadId, turnId),
                   type: "item.completed",
@@ -1163,6 +1314,15 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   itemId: u.toolCallId,
                   ok: u.status !== "failed",
                   detail: describeResult(u.content ?? u.rawOutput),
+                  ...capturePreparedBoth(newInput, u.content ?? u.rawOutput),
+                });
+              } else if (newInput !== undefined) {
+                emit({
+                  ...base(threadId, turnId),
+                  type: "item.updated",
+                  itemType: "tool",
+                  itemId: u.toolCallId,
+                  ...capturePreparedInput(newInput),
                 });
               }
               break;
@@ -1354,11 +1514,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   // Signed-in subscription CLIs (grok.com OIDC on disk) still
                   // run off ambient login when authenticate rejects.  BOTFLEET-C
                   // paged high for "not signed in" while auth.json was valid.
-                  if (support.authFailure === "fail" && !(await support.isAuthenticated(env, turnConfig))) {
+                  if (support.authFailure === "fail" && (await support.isAuthenticated(env, turnConfig)) === false) {
                     throw new Error(support.loginNote);
                   }
                 }
-              } else if (support.authFailure === "fail" && !(await support.isAuthenticated(env, turnConfig))) {
+              } else if (support.authFailure === "fail" && (await support.isAuthenticated(env, turnConfig)) === false) {
                 throw new Error(support.loginNote);
               }
             }
@@ -1398,6 +1558,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               });
             };
 
+            // What configureSession is told the session offers.  Starts as the
+            // list session/new or session/load returned and is replaced when the
+            // model switch below changes it.
+            let currentConfigOptions: unknown[] | undefined = Array.isArray(sessionResult?.configOptions)
+              ? sessionResult.configOptions
+              : undefined;
             try {
               if (support.selectModel) {
                 const { configId, valueForModel, modelForValue } = support.selectModel;
@@ -1420,13 +1586,18 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                     : (mappedValue ?? cliTurn.model)
                   : null;
                 if (requestedValue && requestedValue !== selectedValue) {
-                  const applied = reportedValue(
-                    await request(
-                      "session/set_config_option",
-                      { sessionId, configId, value: requestedValue },
-                      INIT_TIMEOUT,
-                    ),
+                  const switchReply = await request(
+                    "session/set_config_option",
+                    { sessionId, configId, value: requestedValue },
+                    INIT_TIMEOUT,
                   );
+                  const applied = reportedValue(switchReply);
+                  // The option list can change with the model.  Only a reply
+                  // that carries one is current; a bare ACK leaves the earlier
+                  // list stale, so it is dropped rather than kept.
+                  currentConfigOptions = Array.isArray(switchReply?.configOptions)
+                    ? switchReply.configOptions
+                    : undefined;
                   // an agent that answers OK but keeps its old model is worse than
                   // one that errors: it burns a paid turn on the wrong thing.  Only
                   // a *reported* mismatch proves that, though — a bare ACK that
@@ -1456,6 +1627,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   sessionModels: Array.isArray(sessionResult?.models?.availableModels)
                     ? sessionResult.models.availableModels
                     : [],
+                  sessionConfigOptions: currentConfigOptions,
                 });
                 // initialize's currentModelId is the CLI default (grok-4.7),
                 // not the model this turn asked for. After a successful pin,
@@ -1601,11 +1773,13 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
                   ? "auth_required"
                   : e instanceof AcpResumeError
                     ? "resume_failed"
-                    : promptTimedOut
-                      ? "prompt_timeout"
-                      : promptWentIdle
-                        ? "prompt_stall"
-                        : "rpc_error",
+                    : e instanceof AcpModelRejectedError
+                      ? "unknown_model"
+                      : promptTimedOut
+                        ? "prompt_timeout"
+                        : promptWentIdle
+                          ? "prompt_stall"
+                          : "rpc_error",
               );
             }
           }
@@ -1616,20 +1790,30 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
       const snapshot = async (): Promise<ProviderSnapshot> => {
         const env = childEnv();
-        let version = await cliVersion(config, env);
+        const probed = await probeCliVersion(config, env);
+        let version = probed.version;
         if (!version) {
-          if (lastKnownVersion) {
-            version = lastKnownVersion;
-          } else {
-            return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
-          }
+          // probeCliVersion already reused the last good version for a
+          // transient failure; what reaches here is classified, not reused.
+          // Only a binary that is missing or cannot run is "not found".  A
+          // probe that ran out of time on a busy Mac is transient: the
+          // registry answers from the last good snapshot and the UI says
+          // "Checking".
+          const failure = classifyVersionProbeFailure(
+            probed.error,
+            config.cli,
+            input.displayName || input.instanceId,
+            probed.elapsedMs,
+            20000,
+          );
+          return failure.kind === "transient"
+            ? { state: "unavailable", transient: true, reason: failure.reason }
+            : { state: "unavailable", reason: failure.reason };
         }
         const incompatible = support.versionCompatibilityReason?.(version, config);
         if (incompatible) return { state: "unavailable", reason: incompatible, version };
         return { state: "available", version, authenticated: await support.isAuthenticated(env, config) };
       };
-
-      const mountsMcpServers = support.mcpServers !== false;
 
       return {
         instanceId,
@@ -1652,9 +1836,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             composioMcp: mountsMcpServers,
             phoneMcp: mountsMcpServers,
             qdrantMcp: mountsMcpServers,
-            images: support.images !== false,
+            images: acceptsImages,
             effortLevels: support.effortLevels,
             localComputerMcp: mountsMcpServers,
+            // Jobs matrix: native jobs die when the turn settles, and BotFleet
+            // jobs arrive over MCP (jobs P2) through the `agents` mount this
+            // engine already builds in `acpMcpServers`.  Truthful per engine:
+            // an engine that declares no MCP support mounts no job tools, and
+            // says so.  Named helper rows come in P3.
+            backgroundJobs: mountsMcpServers ? "emulated" : "none",
+            helpers: "none",
           },
           sendTurn,
           interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),

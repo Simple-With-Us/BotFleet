@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { createServer } from "node:net";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
+import { credentialMountStagingRoot } from "./vm-cli-credentials.ts";
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
@@ -25,7 +27,19 @@ import {
   VM_WORKSPACE_GUEST,
   VM_WORKSPACE_ROOT,
   WORKSPACE_LABEL,
+  DEFAULT_CONTAINER_LIMITS,
+  LEGACY_UNLABELED_CONTAINER_LIMITS,
+  LIMITS_LABEL,
+  adaptContainerLimits,
+  localVmHostCapacityError,
+  declaredHardening,
   authorizeBoxGateway,
+  defaultCommandRunner,
+  healCuaShimsScript,
+  limitsFromLabels,
+  redactSecrets,
+  readRuntimeHost,
+  resolveContainerLimits,
   boxGatewayUrl,
   computerProxyEnv,
   containerComputerAction,
@@ -53,6 +67,20 @@ import {
   type CommandRunner,
   type LocalVmTarget,
 } from "./container-computer.ts";
+
+function bindMountSpecs(args: string[]): string[] {
+  return args.filter((entry) => entry.startsWith("type=bind,"));
+}
+
+function expectBindMount(args: string[], guestTarget: string, sourcePath: string): void {
+  const mount = bindMountSpecs(args).find((entry) => entry.includes(`target=${guestTarget},readonly`));
+  expect(mount).toBeDefined();
+  const normalize = (value: string) =>
+    process.platform === "win32"
+      ? value.replaceAll("\\", "/").toLowerCase()
+      : value.replaceAll("\\", "/");
+  expect(normalize(mount!).includes(normalize(sourcePath))).toBe(true);
+}
 
 function runner(responses: Record<string, string | Error>) {
   const calls: string[] = [];
@@ -547,7 +575,7 @@ describe("containerComputerStatus", () => {
 
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
     expect(fake.calls).not.toContain(versionProbe);
   });
 
@@ -565,7 +593,7 @@ describe("containerComputerStatus", () => {
     expect(status.image_id).toBe("managed-image-id");
     expect(status.imageMatches).toBe(false);
     expect(status.ready).toBe(false);
-    expect(status.problem).toContain("older desktop or Cua Driver");
+    expect(status.problem).toContain("older desktop or CUA Driver");
   });
 
   it("does not treat an unlabelled image under the local tag as prepared", async () => {
@@ -580,11 +608,11 @@ describe("containerComputerStatus", () => {
     const status = await containerComputerStatus(fake.run, "linux");
 
     expect(status.image).toBe(false);
-    expect(status.problem).toContain("Prepare the Cua desktop image");
+    expect(status.problem).toContain("Prepare the CUA desktop image");
   });
 });
 
-describe("Cua integration", () => {
+describe("CUA integration", () => {
   it("points the box proxy at the harness gateway instead of the account's Box API", () => {
     // Repinned: the proxy used to receive the account-wide API key and talk
     // to ascii.dev itself.  It now receives a per-mount grant and the
@@ -687,26 +715,32 @@ describe("Cua integration", () => {
     writeFileSync(join(fakeHome, ".infisical", "infisical-config.json"), "fake infisical");
     writeFileSync(join(fakeHome, ".config", "infisical", "shared.env"), "fake shared env");
     writeFileSync(join(fakeHome, ".ssh", "config"), "fake ssh");
-    writeFileSync(join(fakeHome, ".docker", "config.json"), "fake docker");
+    writeFileSync(join(fakeHome, ".docker", "config.json"), '{"credsStore":"osxkeychain"}\n');
+
+    const stagingRoot = credentialMountStagingRoot(fakeHome);
+    const stagedDockerConfig = join(stagingRoot, ".docker", "config.json");
 
     const mounts = hostCliCredentialMounts("darwin", fakeHome);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "gh")},target=/home/cua/.config/gh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".config", "infisical")},target=/home/cua/.config/infisical,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
-    expect(mounts).toContain(`type=bind,source=${join(fakeHome, ".docker", "config.json")},target=/home/cua/.docker/config.json,readonly`);
+    expectBindMount(mounts, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(mounts, "/home/cua/.config/gh", join(fakeHome, ".config", "gh"));
+    expectBindMount(mounts, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(mounts, "/home/cua/.config/infisical", join(fakeHome, ".config", "infisical"));
+    expectBindMount(mounts, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(mounts, "/home/cua/.docker/config.json", stagedDockerConfig);
+    expect(readFileSync(stagedDockerConfig, "utf8")).not.toContain("osxkeychain");
 
     const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "darwin", {
       shareCliCredentials: true,
       homeDir: fakeHome,
     });
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".gitconfig")},target=/home/cua/.gitconfig,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".infisical")},target=/home/cua/.infisical,readonly`);
-    expect(args).toContain(`type=bind,source=${join(fakeHome, ".ssh")},target=/home/cua/.ssh,readonly`);
+    expectBindMount(args, "/home/cua/.gitconfig", join(fakeHome, ".gitconfig"));
+    expectBindMount(args, "/home/cua/.infisical", join(fakeHome, ".infisical"));
+    expectBindMount(args, "/home/cua/.ssh", join(fakeHome, ".ssh"));
+    expectBindMount(args, "/home/cua/.docker/config.json", stagedDockerConfig);
   });
 
   it("accepts containers running with read-only CLI credential mounts as safe and durable", async () => {
+    const credentialHome = mkdtempSync(join(tmpdir(), "bf-cli-inspect-home-"));
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -715,9 +749,9 @@ describe("Cua integration", () => {
       [`docker inspect ${CONTAINER}`]: readyInspect({
         Mounts: [
           { Type: "bind", Source: VM_WORKSPACE_DIR, Destination: VM_WORKSPACE_GUEST, RW: true },
-          { Type: "bind", Source: "/Users/test/.infisical", Destination: "/home/cua/.infisical", RW: false },
-          { Type: "bind", Source: "/Users/test/.ssh", Destination: "/home/cua/.ssh", RW: false },
-          { Type: "bind", Source: "/Users/test/.gitconfig", Destination: "/home/cua/.gitconfig", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".infisical"), Destination: "/home/cua/.infisical", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".ssh"), Destination: "/home/cua/.ssh", RW: false },
+          { Type: "bind", Source: join(credentialHome, ".gitconfig"), Destination: "/home/cua/.gitconfig", RW: false },
         ],
       }),
       [versionProbe]: `cua-driver ${CUA_DRIVER_VERSION}\n`,
@@ -732,7 +766,7 @@ describe("Cua integration", () => {
     expect(status.ready).toBe(true);
   });
 
-  it("mounts the official Cua MCP server for Local VM turns", () => {
+  it("mounts the official CUA MCP server for Local VM turns", () => {
     const connection = containerComputerMcp("podman");
     expect(connection.command).toBe(process.execPath);
     expect(connection.args.at(-3)).toBe("podman");
@@ -741,8 +775,9 @@ describe("Cua integration", () => {
     expect(connection.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
   });
 
-  it("builds an exact, checksum-verified Cua Driver 0.20.0 image", () => {
+  it("builds an exact, checksum-verified CUA Driver 0.20.0 image", () => {
     const dockerfile = managedImageDockerfile();
+    expect(dockerfile.startsWith("# syntax=docker/dockerfile:1\n")).toBe(true);
     expect(BASE_IMAGE).toMatch(/@sha256:[a-f0-9]{64}$/);
     expect(dockerfile).toContain(`FROM ${BASE_IMAGE}`);
     expect(dockerfile).toContain("cua_driver-0.20.0-py3-none-manylinux_2_31_x86_64.whl");
@@ -760,6 +795,8 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain("migrate_profile chromium");
     expect(dockerfile).toContain("SingletonLock");
     expect(dockerfile).toContain(`${IMAGE_LAYER_LABEL}="${IMAGE_LAYER_VERSION}"`);
+    expect(dockerfile).toContain("BOTFLEET_VM_CLI_INSTALL");
+    expect(dockerfile).toContain("botfleet-vm-cli-verify");
     expect(dockerfile).toContain("did not become ready within 45 seconds");
     expect(dockerfile).not.toContain("while ! DISPLAY=:1 xset q");
   });
@@ -779,7 +816,7 @@ describe("Cua integration", () => {
     expect(fetch).toBeGreaterThan(gate);
   });
 
-  it("captures the preview through Cua Driver rather than xdotool or VNC", async () => {
+  it("captures the preview through CUA Driver rather than xdotool or VNC", async () => {
     const screenshotCall =
       `${driverExec} call get_desktop_state {} --socket ${CUA_SOCKET} ` +
       "--screenshot-out-file /tmp/botfleet-preview.png";
@@ -835,7 +872,7 @@ describe("containerComputerAction", () => {
     });
 
     await expect(containerComputerAction("run", fake.run, "linux")).rejects.toThrow(
-      "Prepare the Cua desktop image",
+      "Prepare the CUA desktop image",
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });
@@ -867,6 +904,8 @@ describe("wakeContainerComputer", () => {
       if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
       if (key === "/usr/bin/which podman") throw new Error("missing");
       if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "8 17179869184\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "Linux\n" };
       if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
       if (key === `docker inspect ${CONTAINER}`) {
         if (phase === "running") return { stdout: readyInspect() };
@@ -940,11 +979,31 @@ describe("wakeContainerComputer", () => {
     const stopped = await containerComputerStatus(fake.run, "linux");
 
     await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
-      /could not be restarted: daemon exploded/,
+      /could not be started: daemon exploded/,
     );
     // The removal really happened (no silent skip), and no stale "stopped"
     // verdict was reused.
     expect(fake.calls).toContain(`docker rm -f ${CONTAINER}`);
+  });
+
+  it("creates a missing container on wake without calling remove first", async () => {
+    const fake = wakeFake();
+    let containerMissing = true;
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === `docker inspect ${CONTAINER}` && containerMissing) throw new Error("No such container");
+      if (key.startsWith("docker run ")) containerMissing = false;
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "4 8589934592\n" };
+      if (key === "docker info --format {{.OperatingSystem}}") return { stdout: "OrbStack\n" };
+      return fake.run(command, args);
+    };
+    const missing = await containerComputerStatus(run, "linux");
+    expect(missing.container).toBe("missing");
+
+    const woken = await wakeContainerComputer(missing, run, "linux");
+    expect(woken.container).toBe("running");
+    expect(fake.calls.filter((call) => call === `docker rm -f ${CONTAINER}`)).toHaveLength(0);
+    expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(true);
   });
 
   it("reports a remove failure without attempting a run", async () => {
@@ -952,7 +1011,7 @@ describe("wakeContainerComputer", () => {
     const stopped = await containerComputerStatus(fake.run, "linux");
 
     await expect(wakeContainerComputer(stopped, fake.run, "linux")).rejects.toThrow(
-      /could not be restarted: rm refused/,
+      /could not be started: rm refused/,
     );
     expect(fake.calls.some((call) => call.startsWith("docker run "))).toBe(false);
   });
@@ -1006,8 +1065,8 @@ describe("setupCommands", () => {
 
   it("limits resources and retains only the sandbox supervisor's identity-switch caps", () => {
     const command = setupCommands("docker", "linux").run!;
-    expect(command).toContain("--memory 8g --memory-swap 8g");
-    expect(command).toContain("--cpus 4 --pids-limit 512");
+    expect(command).toContain("--memory 3g --memory-swap 3g");
+    expect(command).toContain("--cpus 2 --pids-limit 512");
     expect(command).toContain("--ipc private --cgroupns private");
     expect(command).toContain("--cap-drop ALL --cap-add SETUID --cap-add SETGID");
     expect(command).toContain(`--label ${MANAGED_LABEL}=1`);
@@ -1041,7 +1100,7 @@ describe("setupCommands", () => {
     const commands = setupCommands("container", "darwin");
     expect(commands.runtimeStart).toBe("container system start");
     expect(commands.remove).toBe(`container rm --force ${CONTAINER}`);
-    expect(commands.run).toContain("--memory 8g --cpus 4 --cap-drop ALL");
+    expect(commands.run).toContain("--memory 3g --cpus 2 --cap-drop ALL");
     expect(commands.run).not.toContain("--memory-swap");
   });
 
@@ -1213,5 +1272,206 @@ describe("Box gateway", () => {
     expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(true);
     revokeBoxGatewayGrant(grant.token);
     expect(authorizeBoxGateway(bearer(grant.token), "box-1").ok).toBe(false);
+  });
+});
+
+describe("localVmHostCapacityError", () => {
+  it("refuses hosts below the CPU and memory floors with plain guidance", () => {
+    expect(localVmHostCapacityError({ cpus: 1, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toMatch(
+      /OrbStack has 1 CPUs.*at least 2.*Settings → System/,
+    );
+    expect(localVmHostCapacityError({ cpus: 4, memoryBytes: 1024 ** 3 }, "Docker")).toMatch(
+      /about 1 GiB.*at least 2 GiB/,
+    );
+    expect(localVmHostCapacityError({ cpus: 3, memoryBytes: 4 * 1024 ** 3 }, "OrbStack")).toBeNull();
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+  });
+});
+
+describe("adaptive container limits", () => {
+  it("requests a modest 2 CPU / 3 GiB cap on a roomy runtime", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+    expect(adaptContainerLimits(null)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("shrinks to an OrbStack-sized runtime (3 CPUs, 4 GiB) instead of failing to start", () => {
+    expect(adaptContainerLimits({ cpus: 3, memoryBytes: 4 * 1024 ** 3 })).toEqual({ cpus: 2, memoryGib: 3 });
+    expect(adaptContainerLimits({ cpus: 1, memoryBytes: 1024 ** 3 })).toEqual({ cpus: 1, memoryGib: 1 });
+  });
+
+  it("honours a configured ceiling and never exceeds 4 / 8", () => {
+    expect(adaptContainerLimits({ cpus: 16, memoryBytes: 64 * 1024 ** 3 }, { cpus: 4, memoryGib: 8 })).toEqual({
+      cpus: 4,
+      memoryGib: 8,
+    });
+    expect(adaptContainerLimits(null, { cpus: 99, memoryGib: 99 })).toEqual({ cpus: 4, memoryGib: 8 });
+  });
+
+  it("asks the runtime what it has, and falls back to the ceiling when it will not say", async () => {
+    const answering = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3 4294967296\n" });
+    expect(await resolveContainerLimits("docker", answering.run)).toEqual({ cpus: 2, memoryGib: 3 });
+    const podman = runner({ "podman info --format {{.Host.CPUs}} {{.Host.MemTotal}}": "2 8589934592\n" });
+    expect(await resolveContainerLimits("podman", podman.run)).toEqual({ cpus: 2, memoryGib: 3 });
+    const silent = runner({});
+    expect(await resolveContainerLimits("docker", silent.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("ignores malformed docker info stdout instead of trusting manual coercion", async () => {
+    const junk = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "not-a-number 4294967296\n" });
+    expect(await readRuntimeHost("docker", junk.run)).toEqual({});
+    const partial = runner({ "docker info --format {{.NCPU}} {{.MemTotal}}": "3\n" });
+    expect(await readRuntimeHost("docker", partial.run)).toEqual({});
+    expect(await resolveContainerLimits("docker", junk.run)).toEqual(DEFAULT_CONTAINER_LIMITS);
+  });
+
+  it("reads declared limits from the label and treats anything odd as the historical cap", () => {
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "3x3" })).toEqual({ cpus: 3, memoryGib: 3 });
+    expect(limitsFromLabels({})).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "64x512" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "0x0" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+    expect(limitsFromLabels({ [LIMITS_LABEL]: "junk" })).toEqual(LEGACY_UNLABELED_CONTAINER_LIMITS);
+  });
+
+  it("judges declaredHardening against safety floors and rejects self-declared sub-minimum limits", () => {
+    expect(declaredHardening({ [LIMITS_LABEL]: "3x3" })).toEqual({
+      nanoCpus: 3_000_000_000,
+      memoryBytes: 3 * 1024 ** 3,
+    });
+    expect(declaredHardening({ [LIMITS_LABEL]: "1x1" })).toEqual({
+      nanoCpus: 1_000_000_000,
+      memoryBytes: 1 * 1024 ** 3,
+    });
+    expect(declaredHardening(null)).toEqual({
+      nanoCpus: LEGACY_UNLABELED_CONTAINER_LIMITS.cpus * 1_000_000_000,
+      memoryBytes: LEGACY_UNLABELED_CONTAINER_LIMITS.memoryGib * 1024 ** 3,
+    });
+  });
+
+  it("creates the container with the adapted caps and records them in a label", () => {
+    const args = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux", { limits: { cpus: 3, memoryGib: 3 } });
+    expect(args[args.indexOf("--memory") + 1]).toBe("3g");
+    expect(args[args.indexOf("--memory-swap") + 1]).toBe("3g");
+    expect(args[args.indexOf("--cpus") + 1]).toBe("3");
+    expect(args).toContain(`${LIMITS_LABEL}=3x3`);
+    const defaults = containerRunArgs("docker", "pw", SHARED_LOCAL_VM_TARGET, "linux");
+    expect(defaults[defaults.indexOf("--memory") + 1]).toBe("3g");
+    expect(defaults[defaults.indexOf("--cpus") + 1]).toBe("2");
+  });
+
+  it("reports a container built with adapted limits as hardened, and a mismatch as unsafe", async () => {
+    const adapted = JSON.parse(readyInspect())[0];
+    adapted.Config.Labels[LIMITS_LABEL] = "3x3";
+    adapted.HostConfig.Memory = 3 * 1024 ** 3;
+    adapted.HostConfig.MemorySwap = 3 * 1024 ** 3;
+    adapted.HostConfig.NanoCpus = 3_000_000_000;
+    const status = (inspect: string) =>
+      runner({
+        "/usr/bin/which docker": "docker\n",
+        "/usr/bin/which podman": new Error("missing"),
+        "docker info --format {{.ServerVersion}}": "29\n",
+        [`docker image inspect ${IMAGE}`]: preparedImageInspect(),
+        [`docker inspect ${CONTAINER}`]: inspect,
+      });
+    expect((await containerComputerStatus(status(JSON.stringify([adapted])).run, "linux")).security).toBe("hardened");
+    // declared 3x3 but actually running with the old 8 GiB / 4 CPU limits
+    const drifted = JSON.parse(JSON.stringify(adapted));
+    drifted.HostConfig.Memory = 8 * 1024 ** 3;
+    drifted.HostConfig.MemorySwap = 8 * 1024 ** 3;
+    expect((await containerComputerStatus(status(JSON.stringify([drifted])).run, "linux")).security).toBe("unsafe");
+    // an unlabeled container is judged against the historical cap, as before
+    expect((await containerComputerStatus(status(readyInspect()).run, "linux")).security).toBe("hardened");
+  });
+});
+
+describe("secret redaction", () => {
+  it("scrubs the viewer password out of a failed docker run command line", () => {
+    const message =
+      "Command failed: docker run -d --name x -e VNC_PW=hunter2 -p 127.0.0.1:6080:6901 image\n" +
+      "docker: Error response from daemon: ports are not available";
+    const redacted = redactSecrets(message);
+    expect(redacted).not.toContain("hunter2");
+    expect(redacted).toContain("VNC_PW=<redacted>");
+    expect(redacted).toContain("ports are not available");
+  });
+
+  it("scrubs the password from the error the real command runner throws", async () => {
+    const failure = await defaultCommandRunner("/bin/sh", ["-c", "exit 3", "x", "-e", "VNC_PW=hunter2"]).catch(
+      (error: Error & { cmd?: string }) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).not.toContain("hunter2");
+    expect((failure as Error & { cmd?: string }).cmd ?? "").not.toContain("hunter2");
+  });
+
+  it("scrubs other credential-shaped variables and leaves ordinary text alone", () => {
+    expect(redactSecrets("-e API_TOKEN=abc -e DB_PASSWORD='p w' --cpus 4")).toBe(
+      "-e API_TOKEN=<redacted> -e DB_PASSWORD=<redacted> --cpus 4",
+    );
+  });
+});
+
+describe("Local VM creation on a busy host", () => {
+  const dockerHost = (runCalls: string[][]) => {
+    const run: CommandRunner = async (command, args) => {
+      const key = [command, ...args].join(" ");
+      if (key === "/usr/bin/which docker") return { stdout: "docker\n" };
+      if (key === "/usr/bin/which podman") throw new Error("missing");
+      if (key === "docker info --format {{.ServerVersion}}") return { stdout: "29\n" };
+      if (key === "docker info --format {{.NCPU}} {{.MemTotal}}") return { stdout: "3 4294967296\n" };
+      if (key === `docker image inspect ${IMAGE}`) return { stdout: preparedImageInspect() };
+      if (command === "docker" && args[0] === "run") {
+        runCalls.push(args);
+        return { stdout: "id\n" };
+      }
+      throw new Error(`no such object: ${key}`);
+    };
+    return run;
+  };
+  const tempTarget = (viewerPort: number | null): LocalVmTarget => {
+    const base = perBotLocalVmTarget("busy-port-test");
+    return { ...base, viewerPort, workspaceDir: join(mkdtempSync(join(tmpdir(), "vm-port-")), "homes", "abcd") };
+  };
+
+  it("adapts the container limits to the runtime when it is created", async () => {
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(null));
+    expect(runCalls).toHaveLength(1);
+    expect(runCalls[0]![runCalls[0]!.indexOf("--cpus") + 1]).toBe("2");
+    expect(runCalls[0]![runCalls[0]!.indexOf("--memory") + 1]).toBe("3g");
+  });
+
+  it("falls back to an ephemeral loopback viewer port when the fixed one is taken", async () => {
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const busy = (blocker.address() as { port: number }).port;
+    try {
+      const runCalls: string[][] = [];
+      await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(busy));
+      const published = runCalls[0]![runCalls[0]!.indexOf("-p") + 1];
+      expect(published).toBe("127.0.0.1::6901");
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it("keeps the fixed viewer port when it is free", async () => {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const free = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const runCalls: string[][] = [];
+    await containerComputerAction("run", dockerHost(runCalls), "linux", tempTarget(free));
+    expect(runCalls[0]![runCalls[0]!.indexOf("-p") + 1]).toBe(`127.0.0.1:${free}:6901`);
+  });
+});
+
+describe("PATH driver symlink repair", () => {
+  it("links both PATH entries to the root-owned binary, only when it exists and a link is missing", () => {
+    const script = healCuaShimsScript();
+    expect(script).toContain(`[ -x ${CUA_EXECUTABLE} ] || exit 0`);
+    for (const shim of ["/usr/local/bin/cua-driver", "/opt/venv/bin/cua-driver"]) {
+      expect(script).toContain(`ln -sf ${CUA_EXECUTABLE} ${shim}`);
+      expect(script).toContain(`readlink ${shim}`);
+    }
   });
 });

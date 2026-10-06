@@ -127,6 +127,296 @@ final class SilenceEndpointer {
   }
 }
 
+// ── Personal Voice listing and synthesis (macOS 14+) ──────────────────────
+if CommandLine.arguments.contains("--list-personal-voices") {
+  if #available(macOS 14.0, *) {
+    let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+    if status == .authorized {
+      let voices = AVSpeechSynthesisVoice.speechVoices()
+        .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+        .map { [
+          "id": "personal:\($0.identifier)",
+          "name": $0.name,
+          "locale": $0.language
+        ] }
+      emit(["status": "authorized", "voices": voices])
+      exit(0)
+    } else if status == .notDetermined {
+      AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+        if newStatus == .authorized {
+          let voices = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.voiceTraits.contains(.isPersonalVoice) }
+            .map { [
+              "id": "personal:\($0.identifier)",
+              "name": $0.name,
+              "locale": $0.language
+            ] }
+          emit(["status": "authorized", "voices": voices])
+        } else {
+          emit(["status": "denied", "voices": []])
+        }
+        exit(0)
+      }
+      RunLoop.main.run()
+    } else {
+      emit(["status": "denied", "voices": []])
+      exit(0)
+    }
+  } else {
+    emit(["status": "unsupported", "voices": []])
+    exit(0)
+  }
+}
+
+if CommandLine.arguments.contains("--speak-personal-voice") {
+  guard #available(macOS 14.0, *) else {
+    fail("unsupported-platform")
+  }
+  let args = CommandLine.arguments
+  guard let voiceIdx = args.firstIndex(of: "--voice-id"), voiceIdx + 1 < args.count else {
+    fail("missing-voice-id")
+  }
+  // The reply text arrives in a 0600 file rather than on argv: argv is
+  // world-readable through `ps`, and this text is a voice summary of the
+  // user's own messages.
+  guard let textIdx = args.firstIndex(of: "--text-file"), textIdx + 1 < args.count else {
+    fail("missing-text")
+  }
+  let requestedVoiceId = args[voiceIdx + 1]
+  let textPath = args[textIdx + 1]
+  guard let text = try? String(contentsOfFile: textPath, encoding: .utf8) else {
+    fail("missing-text")
+  }
+  let rawId = requestedVoiceId
+    .replacingOccurrences(of: "apple-personal:", with: "")
+    .replacingOccurrences(of: "personal:", with: "")
+
+  final class PersonalVoiceSpeaker: NSObject, @unchecked Sendable, AVSpeechSynthesizerDelegate {
+    let synth = AVSpeechSynthesizer()
+    var chunks: [String] = []
+    var currentChunkIndex = 0
+    var attempts = 0
+    var voice: AVSpeechSynthesisVoice?
+    var isStopped = false
+    /// UTF-16 index of the range AVSpeechSynthesizer is about to speak.
+    /// Ranges before this have already been spoken.  A cancel retries from
+    /// here instead of from the start of the chunk.
+    var nextRangeUTF16 = 0
+
+    static func chunkText(_ text: String, maxCharacters: Int = 750) -> [String] {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else { return [] }
+      guard trimmed.count > maxCharacters else { return [trimmed] }
+
+      var rawSentences: [String] = []
+      trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex, options: [.bySentences, .localized]) { substring, _, _, _ in
+        if let s = substring?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+          rawSentences.append(s)
+        }
+      }
+      if rawSentences.isEmpty { rawSentences = [trimmed] }
+
+      let delimiters: [Character] = [";", ":", "\n", "—", "–", ","]
+      var atoms: [String] = []
+      for sentence in rawSentences {
+        if sentence.count <= maxCharacters {
+          atoms.append(sentence)
+        } else {
+          var clauseParts: [String] = []
+          var cur = ""
+          for char in sentence {
+            cur.append(char)
+            if delimiters.contains(char) && cur.count >= min(200, maxCharacters / 3) {
+              let cl = cur.trimmingCharacters(in: .whitespacesAndNewlines)
+              if !cl.isEmpty { clauseParts.append(cl) }
+              cur = ""
+            }
+          }
+          let rem = cur.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !rem.isEmpty { clauseParts.append(rem) }
+
+          for part in clauseParts {
+            if part.count <= maxCharacters {
+              atoms.append(part)
+            } else {
+              let words = part.split(separator: " ").map(String.init)
+              var wChunk = ""
+              for word in words {
+                if word.count > maxCharacters {
+                  if !wChunk.isEmpty { atoms.append(wChunk); wChunk = "" }
+                  var sub = word
+                  while sub.count > maxCharacters {
+                    let idx = sub.index(sub.startIndex, offsetBy: maxCharacters)
+                    atoms.append(String(sub[..<idx]))
+                    sub = String(sub[idx...])
+                  }
+                  if !sub.isEmpty { wChunk = sub }
+                } else if wChunk.isEmpty {
+                  wChunk = word
+                } else if wChunk.count + 1 + word.count <= maxCharacters {
+                  wChunk += " " + word
+                } else {
+                  atoms.append(wChunk)
+                  wChunk = word
+                }
+              }
+              if !wChunk.isEmpty { atoms.append(wChunk) }
+            }
+          }
+        }
+      }
+
+      var result: [String] = []
+      var current = ""
+      for atom in atoms {
+        if current.isEmpty {
+          current = atom
+        } else if current.count + 1 + atom.count <= maxCharacters {
+          current += " " + atom
+        } else {
+          result.append(current)
+          current = atom
+        }
+      }
+      if !current.isEmpty { result.append(current) }
+      return result
+    }
+
+    /// Retry text after didCancel.  `nextRangeLocation` is the UTF-16 start
+    /// of the range that was about to be spoken.  Zero means nothing audible
+    /// was committed, so the whole chunk is retried.  The in-progress range
+    /// may be repeated once; ranges before it are not.
+    static func remainderAfterCancel(chunk: String, nextRangeLocation: Int) -> String {
+      let ns = chunk as NSString
+      let location = min(max(nextRangeLocation, 0), ns.length)
+      if location == 0 { return chunk }
+      return ns.substring(from: location)
+    }
+
+    func speak(voice: AVSpeechSynthesisVoice, text: String) {
+      synth.delegate = self
+      self.voice = voice
+      self.chunks = Self.chunkText(text)
+      guard !chunks.isEmpty else {
+        emit(["finished": true])
+        exit(0)
+      }
+      self.currentChunkIndex = 0
+      self.attempts = 0
+      self.isStopped = false
+      self.nextRangeUTF16 = 0
+      speakCurrentChunk()
+    }
+
+    func speakCurrentChunk() {
+      guard !isStopped, let voice = self.voice, currentChunkIndex < chunks.count else {
+        emit(["finished": true])
+        exit(0)
+      }
+      nextRangeUTF16 = 0
+      let utterance = AVSpeechUtterance(string: chunks[currentChunkIndex])
+      utterance.voice = voice
+      utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+      utterance.postUtteranceDelay = 0.05
+      synth.speak(utterance)
+    }
+
+    func speechSynthesizer(
+      _ synthesizer: AVSpeechSynthesizer,
+      willSpeakRangeOfSpeechString characterRange: NSRange,
+      utterance: AVSpeechUtterance
+    ) {
+      nextRangeUTF16 = characterRange.location
+    }
+
+    func advanceAfterChunk() {
+      nextRangeUTF16 = 0
+      currentChunkIndex += 1
+      attempts = 0
+      if currentChunkIndex >= chunks.count {
+        emit(["finished": true])
+        exit(0)
+      } else {
+        speakCurrentChunk()
+      }
+    }
+
+    func stop() {
+      isStopped = true
+      synth.stopSpeaking(at: .immediate)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+      advanceAfterChunk()
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+      if isStopped {
+        exit(0)
+      }
+      // Internal synthesis drop/error: retry once, but not from character 0
+      // when part of this chunk was already spoken.
+      attempts += 1
+      if attempts < 2 {
+        let remainder = Self.remainderAfterCancel(
+          chunk: chunks[currentChunkIndex],
+          nextRangeLocation: nextRangeUTF16
+        )
+        nextRangeUTF16 = 0
+        if remainder.isEmpty {
+          advanceAfterChunk()
+        } else {
+          chunks[currentChunkIndex] = remainder
+          speakCurrentChunk()
+        }
+      } else {
+        advanceAfterChunk()
+      }
+    }
+  }
+
+  let speaker = PersonalVoiceSpeaker()
+
+  let doSpeak = {
+    let allVoices = AVSpeechSynthesisVoice.speechVoices()
+    let matched = allVoices.first(where: {
+      $0.identifier == rawId || $0.name == rawId ||
+      "personal:\($0.identifier)" == requestedVoiceId ||
+      "apple-personal:\($0.identifier)" == requestedVoiceId
+    })
+    // Guess only when the caller named no voice at all. A named-but-absent
+    // voice — one not synced to this Mac — must fail loudly rather than be
+    // replaced by a different Personal Voice speaking the user's words.
+    let voice = matched ?? (rawId.isEmpty
+      ? allVoices.first(where: { $0.voiceTraits.contains(.isPersonalVoice) })
+      : nil)
+
+    guard let selectedVoice = voice else {
+      fail("voice-not-found")
+    }
+
+    speaker.speak(voice: selectedVoice, text: text)
+  }
+
+  let status = AVSpeechSynthesizer.personalVoiceAuthorizationStatus
+  if status == .authorized {
+    doSpeak()
+  } else if status == .notDetermined {
+    AVSpeechSynthesizer.requestPersonalVoiceAuthorization { newStatus in
+      if newStatus == .authorized {
+        DispatchQueue.main.async { doSpeak() }
+      } else {
+        fail("personal-voice-not-authorized")
+      }
+    }
+  } else {
+    fail("personal-voice-not-authorized")
+  }
+
+  RunLoop.main.run()
+}
+
+// ── Speech-to-text dictation (Speech framework) ──────────────────────────
 SFSpeechRecognizer.requestAuthorization { status in
   guard status == .authorized else { fail("speech-not-authorized") }
   // Recognize in the user's language: a hardcoded en-US recognizer

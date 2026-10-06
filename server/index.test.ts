@@ -47,6 +47,8 @@ let fakeRejectCli: string;
 let fakeQuotaProseCli: string;
 /** happy CLI whose canned reply carries a fake API key - drives the SSE secret-redaction test */
 let fakeSecretEchoCli: string;
+/** happy CLI whose tool step carries real arguments and a real (secret-bearing) result */
+let fakeToolIoCli: string;
 /** successful subscription CLI that reports an API-equivalent cost */
 let fakePricedClaudeCli: string;
 /** quota CLI held behind a file gate so work can queue before completion */
@@ -63,13 +65,79 @@ let fakeSlowProbeStarted: string;
 let fakeRecallCli: string;
 let stderr = "";
 
-const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
+const api = async (
+  method: string,
+  path: string,
+  body?: unknown,
+  init?: { signal?: AbortSignal },
+): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
+    signal: init?.signal,
   });
   return { status: res.status, body: await res.json() };
+};
+
+/** Poll `read` until `ok` accepts what it returned (the event log is written
+ * off the publish path, so it trails the stream by a moment). */
+const vi_waitFor = async <T,>(read: () => T, ok: (value: T) => boolean, timeoutMs = 10_000): Promise<T> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (ok(value) || Date.now() > deadline) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+};
+
+/** Abort in-flight `api()` fetches slightly before `expect.poll`'s deadline so
+ *  a slow tick surfaces as the configured settle message instead of AbortError. */
+const SETTLE_ABORT_SKEW_MS = 75;
+
+/** Polls `read` until it satisfies, using vitest's own primitive.
+ *
+ *  The Windows runner is roughly a third slower than the others and its test
+ *  files overlap more, so anything that asserts a settled instance state or a
+ *  write landing *immediately* is a coin flip there and a certainty here.
+ *
+ *  `expect.poll`'s `interval` is a minimum gap between attempts, not an
+ *  observation count: the runner keeps trying until `timeoutMs` elapses, and
+ *  each `read()` can take arbitrarily long (a `GET /api/instances?fresh=1` on a
+ *  busy fleet can consume the whole window on one tick).  Do not pass `fresh=1`
+ *  on every tick — request it once before polling if a single re-probe is
+ *  needed, then read the memoized snapshot.
+ *
+ *  `signal` is aborted `SETTLE_ABORT_SKEW_MS` before the poll deadline so a
+ *  hung fetch is abandoned without racing Vitest's failure message.
+ */
+const settlesWithin = async (
+  read: (opts: { signal: AbortSignal }) => Promise<boolean>,
+  timeoutMs: number,
+  intervalMs: number,
+  what: string,
+): Promise<void> => {
+  const abort = new AbortController();
+  const abortAtMs = Math.max(0, timeoutMs - SETTLE_ABORT_SKEW_MS);
+  const timer = setTimeout(() => abort.abort(), abortAtMs);
+  const message = `${what} did not settle within ${timeoutMs}ms`;
+  try {
+    await expect
+      .poll(
+        async () => {
+          try {
+            return await read({ signal: abort.signal });
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") return false;
+            throw error;
+          }
+        },
+        { timeout: timeoutMs, interval: intervalMs, message },
+      )
+      .toBe(true);
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
@@ -118,7 +186,7 @@ const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
 const writeFakeClaudeWrapper = (
   file: string,
   mode: "exit-early" | "hang" | "happy" | "quota" | "model-not-found",
-  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string } = {},
+  options: { keepDump?: boolean; quotaGate?: string; launchLog?: string; replyText?: string; toolIo?: boolean } = {},
 ): string => {
   const lines = [
     "#!/usr/bin/env node",
@@ -137,6 +205,7 @@ const writeFakeClaudeWrapper = (
   if (options.replyText) {
     lines.push(`process.env.FAKE_CLAUDE_REPLY = ${JSON.stringify(options.replyText)};`);
   }
+  if (options.toolIo) lines.push('process.env.FAKE_CLAUDE_TOOL_IO = "1";');
   lines.push(`await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`, "");
   writeFileSync(file, lines.join("\n"), { mode: 0o755 });
   return file;
@@ -162,6 +231,7 @@ beforeAll(async () => {
   fakeSecretEchoCli = writeFakeClaudeWrapper(join(home, "fake-claude-secret-echo"), "happy", {
     replyText: "the key is api_key=ak9999999999999999999999999999999 as requested",
   });
+  fakeToolIoCli = writeFakeClaudeWrapper(join(home, "fake-claude-tool-io"), "happy", { toolIo: true });
   fakePricedClaudeCli = join(home, "fake-claude-priced");
   writeFileSync(
     fakePricedClaudeCli,
@@ -254,6 +324,7 @@ beforeAll(async () => {
         rejector: { driver: "claudeAgent", displayName: "Fixture Rejector", enabled: false, config: { cli: fakeRejectCli } },
         quotaProse: { driver: "claudeAgent", displayName: "Fixture Quota Prose", enabled: false, config: { cli: fakeQuotaProseCli } },
         secretEcho: { driver: "claudeAgent", displayName: "Fixture Secret Echo", enabled: false, config: { cli: fakeSecretEchoCli } },
+        toolIo: { driver: "claudeAgent", displayName: "Fixture Tool IO", enabled: false, config: { cli: fakeToolIoCli } },
         pricedClaude: { driver: "claudeAgent", displayName: "Fixture Priced Claude", enabled: false, config: { cli: fakePricedClaudeCli } },
         gatedQuota: { driver: "claudeAgent", displayName: "Fixture Gated Quota", enabled: false, config: { cli: fakeGatedQuotaCli } },
         slowProbe: { driver: "claudeAgent", displayName: "Fixture Slow Probe", enabled: false, config: { cli: fakeSlowProbeCli } },
@@ -2103,6 +2174,79 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("migrates a retired fallback before judging availability on a strict write", async () => {
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const strict = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-3-7-sonnet" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(strict.status).toBe(200);
+      const saved = strict.body.bot.modelSelection.fallbacks;
+      expect(saved).toHaveLength(1);
+      // Moved forward to the current Sonnet, not left on the retired id.
+      expect(saved[0].model).toBe(claude.models.default);
+
+      // A fallback that is neither retired nor offered is still refused, after reconciliation.
+      const unknown = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "not-a-real-model" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(unknown.status).toBe(400);
+      expect(unknown.body.error).toMatch(/not offered/i);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("judges a strict write against the catalog the detected CLI can run, not the registry's full one", async () => {
+    // The fixture Claude CLI reports 2.1.232, older than the 2.1.280 that
+    // Opus 5.5 needs: the picker does not list it, so an MCP-style strict
+    // write must not persist it either, on the primary or on a fallback.
+    const instances = (await api("GET", "/api/instances")).body.instances;
+    const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
+    expect(claude.models.options.map((option: { id: string }) => option.id)).not.toContain("claude-opus-5-5");
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const primary = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5-5" },
+        requireAvailableModel: true,
+      });
+      expect(primary.status).toBe(400);
+      expect(primary.body.error).toMatch(/"claude-opus-5-5" is not offered by instance "claude"/);
+
+      const fallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-opus-5",
+          fallbacks: [{ instanceId: "claude", model: "claude-opus-5-5" }],
+        },
+        requireAvailableModel: true,
+      });
+      expect(fallback.status).toBe(400);
+      expect(fallback.body.error).toMatch(/not offered/);
+
+      // General writes stay free-form, and the model the CLI does list saves.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+        requireAvailableModel: true,
+      })).status).toBe(200);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("rejects incomplete model selections instead of persisting a broken bot", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
     try {
@@ -2368,6 +2512,12 @@ describe("harness HTTP API", () => {
     // on the dead entry, with every later engine in the chain never reached.
     // Now the apology is an error row, the walk moves on, and the rejected
     // (bot, engine, model) is remembered so the next turn skips it.
+    //
+    // The rejected id is a fixture name the model lineage neither classifies
+    // nor retires (shared/model-lineage.ts).  A real retired id such as
+    // claude-3-7-sonnet is rewritten to Latest Sonnet when it is saved, so it
+    // would never reach the CLI; the fake CLI rejects whatever model it gets.
+    const rejected = "claude-fixture-rejected";
     expect((await api("PATCH", "/api/instances/rejector", { enabled: true })).status).toBe(200);
     const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
     const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
@@ -2384,7 +2534,7 @@ describe("harness HTTP API", () => {
           instanceId: "crasher",
           model: claude.models.default,
           fallbacks: [
-            { instanceId: "rejector", model: "claude-3-7-sonnet" },
+            { instanceId: "rejector", model: rejected },
             { instanceId: "claude", model: claude.models.default },
           ],
         },
@@ -2400,10 +2550,10 @@ describe("harness HTTP API", () => {
       }, { timeout: 30_000 }).toBe("claude");
 
       const rows = await transcript();
-      expect(await chips("Fell over to claude-3-7-sonnet")).toHaveLength(1);
+      expect(await chips(`Fell over to ${rejected}`)).toHaveLength(1);
       expect(await chips(`Fell over to ${claude.models.default}`)).toHaveLength(1);
       // the rejection is an error row the person can read, never bot text
-      expect(await chips("error: Claude can't use the model claude-3-7-sonnet")).toHaveLength(1);
+      expect(await chips(`error: Claude can't use the model ${rejected}`)).toHaveLength(1);
       expect(rows.some((message) => message.kind === "text" && /issue with the selected model/i.test(message.text ?? ""))).toBe(false);
 
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
@@ -2418,8 +2568,8 @@ describe("harness HTTP API", () => {
       // time walks straight past the entry the provider already rejected.
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "again" })).status).toBe(202);
       await expect.poll(async () => (await chips(`Fell over to ${claude.models.default}`)).length, { timeout: 30_000 }).toBe(2);
-      expect(await chips("Fell over to claude-3-7-sonnet")).toHaveLength(1);
-      expect(await chips("error: Claude can't use the model claude-3-7-sonnet")).toHaveLength(1);
+      expect(await chips(`Fell over to ${rejected}`)).toHaveLength(1);
+      expect(await chips(`error: Claude can't use the model ${rejected}`)).toHaveLength(1);
     } finally {
       await api("POST", `/api/bots/${bot.id}/interrupt`, {});
       await api("DELETE", `/api/bots/${bot.id}`);
@@ -2971,11 +3121,23 @@ describe("harness HTTP API", () => {
         await api("POST", `/api/bots/${bot.id}/interrupt`, {});
         await api("DELETE", `/api/bots/${bot.id}`);
       }
-      for (const instanceId of otherInstances) {
-        expect((await api("PATCH", `/api/instances/${instanceId}`, { enabled: true })).status).toBe(200);
-      }
-      expect((await api("PATCH", "/api/instances/gatedQuota", { enabled: false, fullAuto: false })).status).toBe(200);
-      expect((await api("PATCH", "/api/instances/slowProbe", { enabled: false, fullAuto: false })).status).toBe(200);
+      let next = 0;
+      await settlesWithin(
+        async ({ signal }) => {
+          for (; next < otherInstances.length; next++) {
+            if ((await api("PATCH", `/api/instances/${otherInstances[next]}`, { enabled: true }, { signal })).status !== 200) {
+              return false;
+            }
+          }
+          for (const path of ["/api/instances/gatedQuota", "/api/instances/slowProbe"]) {
+            if ((await api("PATCH", path, { enabled: false, fullAuto: false }, { signal })).status !== 200) return false;
+          }
+          return true;
+        },
+        6_000,
+        200,
+        "instance cleanup writes",
+      );
     }
   }, 40_000);
 
@@ -3306,6 +3468,31 @@ describe("harness HTTP API", () => {
       behavior: "allow",
     });
     expect(nothing.status).toBe(404);
+  });
+
+  it("approves all pending approvals for a thread or bot", async () => {
+    const listRes = await api("GET", "/api/bots");
+    const bot = listRes.body.bots[0];
+
+    // non-existent bot returns 404
+    const notFound = await api("POST", "/api/bots/non-existent-bot-id/approve-all");
+    expect(notFound.status).toBe(404);
+
+    // bot with no pending approvals returns ok with approvedCount: 0
+    const emptyApprove = await api("POST", `/api/bots/${bot.id}/approve-all`);
+    expect(emptyApprove.status).toBe(200);
+    expect(emptyApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // thread approve-all endpoint
+    const threadApprove = await api("POST", `/api/threads/${bot.threadId}/approve-all`);
+    expect(threadApprove.status).toBe(200);
+    expect(threadApprove.body).toEqual({ ok: true, approvedCount: 0 });
+
+    // invalid route parameters return 400
+    const invalidBot = await api("POST", "/api/bots/bad%20bot%20id/approve-all");
+    expect(invalidBot.status).toBe(400);
+    const invalidThread = await api("POST", "/api/threads/bad%20thread%20id/approve-all");
+    expect(invalidThread.status).toBe(400);
   });
 
   it("closes the approvals a cancelled turn can no longer answer", async () => {
@@ -3836,7 +4023,15 @@ describe("harness HTTP API", () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
     const before = await api("GET", "/api/config");
-    expect(before.body.localVm).toEqual({ mode: "shared", maxInstances: 2 });
+    // The Host & CLI Integration booleans ride in the same section: a status
+    // that omitted them made the Settings checkboxes snap back after a save.
+    expect(before.body.localVm).toEqual({
+      mode: "shared",
+      maxInstances: 2,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const shared = await api("GET", `/api/bots/${first.id}/local-computer`);
     expect(shared.status).toBe(200);
@@ -3846,7 +4041,13 @@ describe("harness HTTP API", () => {
       localVm: { mode: "per-bot", maxInstances: 3 },
     });
     expect(saved.status).toBe(200);
-    expect(saved.body.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
+    expect(saved.body.localVm).toEqual({
+      mode: "per-bot",
+      maxInstances: 3,
+      shareCliCredentials: false,
+      shareGpgPrivateKeys: false,
+      allowHostTerminal: false,
+    });
 
     const [firstStatus, secondStatus] = await Promise.all([
       api("GET", `/api/bots/${first.id}/local-computer`),
@@ -3865,6 +4066,56 @@ describe("harness HTTP API", () => {
     const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
     expect(disk.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
     await api("PATCH", "/api/config", { localVm: { mode: "shared", maxInstances: 2 } });
+  });
+
+  it("persists the Host & CLI Integration toggles across a save and a fresh read", async () => {
+    // The Settings checkboxes are controlled inputs bound to this response.
+    // They used to snap back because the status dropped both flags.
+    // Restored in `finally`: both flags are process-global, and a leaked
+    // `shareCliCredentials` would let a later VPS test mount real host
+    // credentials into a container.
+    try {
+      const saved = await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: true, shareGpgPrivateKeys: true, allowHostTerminal: true },
+      });
+      expect(saved.status).toBe(200);
+      expect(saved.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const reread = await api("GET", "/api/config");
+      expect(reread.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: true,
+      });
+
+      const status = await api("GET", "/api/config");
+      expect(status.body.localVm).toMatchObject({ shareGpgPrivateKeys: true });
+
+      // Turning one off must not disturb the other.
+      const half = await api("PUT", "/api/config", { localVm: { allowHostTerminal: false } });
+      expect(half.body.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+
+      // The in-memory status above is served from the same `cfg` the PUT
+      // wrote, so only the file on disk proves the save round trip.
+      const disk = JSON.parse(readFileSync(join(home, ".botfleet", "config.json"), "utf8"));
+      expect(disk.localVm).toMatchObject({
+        shareCliCredentials: true,
+        shareGpgPrivateKeys: true,
+        allowHostTerminal: false,
+      });
+    } finally {
+      await api("PUT", "/api/config", {
+        localVm: { shareCliCredentials: false, shareGpgPrivateKeys: false, allowHostTerminal: false },
+      });
+    }
   });
 
   it("keeps an active turn alive when only the room timeout changes", async () => {
@@ -4532,11 +4783,16 @@ describe("harness HTTP API", () => {
       });
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
-      // and the same on the wire, not just in the HTTP responses
+      // and the same on the wire, not just in the HTTP responses.  Wait for
+      // hello before the unread nudge — every other SSE test in this file does
+      // the same, and under windows-latest parallel suite load the unread PATCH
+      // can otherwise land before the client has proved it can receive frames
+      // (seen as a bare 20s vitest timeout rather than until's own message).
       const stream = await openSse(`${BASE}/api/events`);
       try {
+        await stream.until((f) => f.kind === "hello");
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
-        const frame = await stream.until((f) => f.kind === "bot");
+        const frame = await stream.until((f) => f.kind === "bot" && f.bot?.id === botId);
         expect(frame.bot).not.toHaveProperty("resumeCursors");
         expect(JSON.stringify(frame)).not.toContain("resumeCursors");
       } finally {
@@ -4545,7 +4801,9 @@ describe("harness HTTP API", () => {
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
     }
-  });
+    // Bot create + task + SSE + delete; windows-latest is about a third slower
+    // and overlaps its files more, so the default 20s budget is a coin flip.
+  }, 30_000);
 
   it("validates the event inspector limit at the HTTP boundary", async () => {
     const bot = (await api("GET", "/api/bots")).body.bots[0];
@@ -4586,7 +4844,7 @@ describe("harness HTTP API", () => {
 describe("transcript logs on delete", () => {
   /** Both generations plus a killed trim's leftovers, for one thread. */
   const logFiles = (threadId: string) =>
-    ["events", "native"].flatMap((dir) => [
+    ["events", "native", "item-io"].flatMap((dir) => [
       join(home, ".botfleet", dir, `${threadId}.ndjson`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.1`),
       join(home, ".botfleet", dir, `${threadId}.ndjson.4242.123e4567-e89b-42d3-a456-426614174000.tmp`),
@@ -5186,7 +5444,7 @@ describe("resumable event stream", () => {
   });
 
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
-    for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
+    for (const cursor of ["deadbeef:1", "12345678:999999"]) {
       const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
       try {
         const hello = await stream.until((f) => f.kind === "hello");
@@ -5197,6 +5455,12 @@ describe("resumable event stream", () => {
         stream.close();
       }
     }
+  });
+
+  it("rejects a malformed cursor with HTTP 400", async () => {
+    const res = await fetch(`${BASE}/api/events?since=not-a-cursor`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, error: "invalid_cursor" });
   });
 });
 
@@ -5362,28 +5626,50 @@ describe("instance CLI override API", () => {
       boxTurnGate = null;
       releaseBoxTurnGate = null;
 
-      const persistedTask = () => {
-        const bots = JSON.parse(readFileSync(join(home, ".botfleet", "bots.json"), "utf8")) as Array<{
+      const botsJsonPath = join(home, ".botfleet", "bots.json");
+      const readSuccessorPersistence = () => {
+        const bots = JSON.parse(readFileSync(botsJsonPath, "utf8")) as Array<{
           id: string;
           tasks: Array<{ threadId: string; lastInstanceId?: string; resumeCursors: Record<string, unknown> }>;
         }>;
-        return bots.find((candidate) => candidate.id === bot.id)?.tasks.find((task) => task.threadId === bot.threadId);
-      };
-      await expect.poll(() => ({
-        launches: existsSync(launchLog)
+        const task = bots
+          .find((candidate) => candidate.id === bot.id)
+          ?.tasks.find((candidate) => candidate.threadId === bot.threadId);
+        const launches = existsSync(launchLog)
           ? readFileSync(launchLog, "utf8").split("\n").filter(Boolean).length
-          : 0,
-        lastInstanceId: persistedTask()?.lastInstanceId,
-        cursor: persistedTask()?.resumeCursors.claude,
-      }), { timeout: 5_000 }).toEqual({
+          : 0;
+        return { launches, task };
+      };
+      // Gate release unblocks the box and the hanging CLI; on Windows the
+      // successor dispatch, markTaskDispatched, and debounced bots.json flush
+      // can land several seconds later.  Read the files fresh each tick — do
+      // not memoize a task snapshot — and abort in-flight bot polls before the
+      // settle deadline so a hung tick cannot eat the whole window.
+      await settlesWithin(
+        async ({ signal }) => {
+          const { launches, task } = readSuccessorPersistence();
+          const cursor = task?.resumeCursors?.claude;
+          if (launches !== 1) return false;
+          if (task?.lastInstanceId !== "claude" || typeof cursor !== "string" || cursor.length === 0) return false;
+          const live = (await api("GET", "/api/bots?messages=0", undefined, { signal })).body.bots.find(
+            (candidate: { id: string }) => candidate.id === bot.id,
+          );
+          return live?.busy === true;
+        },
+        10_000,
+        200,
+        "successor dispatch persisting lastInstanceId and claude resume cursor without a stale launch",
+      );
+      const settled = readSuccessorPersistence();
+      expect({
+        launches: settled.launches,
+        lastInstanceId: settled.task?.lastInstanceId,
+        cursor: settled.task?.resumeCursors.claude,
+      }).toEqual({
         launches: 1,
         lastInstanceId: "claude",
         cursor: expect.any(String),
       });
-      const live = (await api("GET", "/api/bots?messages=0")).body.bots.find(
-        (candidate: { id: string }) => candidate.id === bot.id,
-      );
-      expect(live?.busy).toBe(true);
     } finally {
       releaseBoxTurnGate?.();
       boxTurnGate = null;
@@ -5395,7 +5681,7 @@ describe("instance CLI override API", () => {
       expect((await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI, fullAuto: false })).status).toBe(200);
       expect((await api("PUT", "/api/config", { box: { token: "" } })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
@@ -5411,8 +5697,26 @@ describe("instance CLI override API", () => {
     let roomId = "";
     let roomThreadId = "";
     try {
-      const instances = (await api("GET", "/api/instances?fresh=1")).body.instances;
-      const claude = instances.find((instance: { instanceId: string }) => instance.instanceId === "claude");
+      // An engine a neighbouring test left reloading is still settling;
+      // `unavailable` here means "asked too early", not "broken".  Poll at the
+      // fleet re-probe cadence with `fresh=1` each tick so a 15s describe memo
+      // cannot freeze an early `unavailable` for the whole wait (~4 probes in 8s).
+      await settlesWithin(
+        async ({ signal }) => {
+          const instances = (
+            await api("GET", "/api/instances?fresh=1", undefined, { signal })
+          ).body.instances;
+          return instances.find(
+            (instance: { instanceId: string }) => instance.instanceId === "claude",
+          )?.snapshot?.state === "available";
+        },
+        8_000,
+        2_000,
+        "the claude engine reaching available",
+      );
+      const claude = (await api("GET", "/api/instances")).body.instances.find(
+        (instance: { instanceId: string }) => instance.instanceId === "claude",
+      );
       expect(claude?.snapshot.state).toBe("available");
 
       const bot = (await api("POST", "/api/bots")).body.bot as { id: string; threadId: string };
@@ -5456,7 +5760,7 @@ describe("instance CLI override API", () => {
       if (botId) await api("DELETE", `/api/bots/${botId}`);
       expect((await api("PATCH", "/api/instances/claude", { fullAuto: false })).status).toBe(200);
     }
-  }, 20_000);
+  }, 30_000);
 
   it("creates, describes, and deletes a custom OpenAI-compatible engine", async () => {
     expect((await api("POST", "/api/instances", { name: "" })).status).toBe(400);
@@ -7503,6 +7807,16 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
     expect(missing.status).toBe(400);
   });
 
+  it("rejects a malformed latest instead of silently dropping it", async () => {
+    for (const latest of [5, true, {}, "Not A Class", ""]) {
+      const res = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "fake", model: "after", latest } },
+      });
+      expect(res.status, JSON.stringify(latest)).toBe(400);
+      expect(res.body.error).toMatch(/latest/);
+    }
+  });
+
   it("leaves a bot that is mid-turn on its own model, and names it in the response", async () => {
     // The per-bot PATCH answers 409 here.  This route validated each slot
     // once with no bot in hand, and checkedModelSelection only raises the
@@ -7551,6 +7865,259 @@ describe("POST /api/bots/apply-model-defaults (set all bots to default models)",
   });
 });
 
+describe("model lineage over HTTP: saved selections move forward, never aliased", () => {
+  type Saved = { instanceId: string; model: string; latest?: string; fallbacks?: Saved[] };
+  // A describe records each engine's CLI version; until the Claude CLI has
+  // reported one, nothing on a Claude engine is moved.  The fixture CLI
+  // reports 2.1.232, older than the 2.1.280 that Opus 5.5 needs.
+  beforeAll(async () => {
+    await api("GET", "/api/instances");
+  });
+  const selectionOf = async (id: string): Promise<Saved | undefined> =>
+    (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id)?.modelSelection;
+  const withBot = async (name: string, run: (bot: { id: string; threadId: string }) => Promise<void>) => {
+    const bot = (await api("POST", "/api/bots", { name })).body.bot;
+    try {
+      await run(bot);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  };
+
+  it("hides superseded rows from /api/instances, and keeps Opus 5 for a CLI too old for Opus 5.5", async () => {
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    expect(claude.snapshot.version).toMatch(/^2\.1\.232/);
+    const ids = claude.models.options.map((option: { id: string }) => option.id);
+    expect(ids).toEqual(expect.arrayContaining(["claude-sonnet-5-5", "claude-opus-5"]));
+    expect(ids).not.toContain("claude-sonnet-5");
+    expect(ids).not.toContain("claude-opus-5-5");
+  });
+
+  it("never moves a pinned Opus 5 onto Opus 5.5 for a CLI too old to run it", async () => {
+    await withBot("Lineage Old CLI", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5" },
+      })).status).toBe(200);
+      await api("GET", "/api/instances?fresh=1");
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-opus-5" });
+      expect((await selectionOf(bot.id))?.latest).toBeUndefined();
+    });
+  });
+
+  it("moves an idle bot forward in the same answer when an engine PATCH changes what it offers", async () => {
+    // claude2 runs the fixture CLI (2.1.232, too old for Opus 5.5).  Pointed
+    // at a CLI that reports 2.1.284 it offers Opus 5.5, and the PATCH that
+    // made that change moves the pinned Opus 5 forward before it answers.
+    const newerCli = join(home, "fake-claude-newer");
+    writeFileSync(
+      newerCli,
+      [
+        "#!/usr/bin/env node",
+        'process.env.FAKE_CLAUDE_VERSION = "2.1.284 (Claude Code)";',
+        "delete process.env.FAKE_CLAUDE_DUMP;",
+        `await import(${JSON.stringify(pathToFileURL(FAKE_CLAUDE_CLI).href)});`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    await withBot("Lineage Engine Patch", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude2", model: "claude-opus-5" },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5" });
+      try {
+        const patched = await api("PATCH", "/api/instances/claude2", { cli: newerCli });
+        expect(patched.status).toBe(200);
+        const claude2 = patched.body.instances.find(
+          (instance: { instanceId: string }) => instance.instanceId === "claude2",
+        );
+        expect(claude2.models.options.map((option: { id: string }) => option.id)).toContain("claude-opus-5-5");
+        // No GET /api/instances in between: the PATCH itself reconciled.
+        expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude2", model: "claude-opus-5-5" });
+      } finally {
+        await api("PATCH", "/api/instances/claude2", { cli: FAKE_CLAUDE_CLI });
+      }
+    });
+  });
+
+  it("saves a retired id as Latest of its successor class, with the real slug in model", async () => {
+    await withBot("Lineage Retired", async (bot) => {
+      const saved = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-3-7-sonnet" },
+      });
+      expect(saved.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" });
+    });
+  });
+
+  it("resolves a Latest pick, pins on latest: null, and refuses a malformed class", async () => {
+    await withBot("Lineage Latest", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", latest: "sonnet" },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: null },
+      })).status).toBe(200);
+      const pinned = await selectionOf(bot.id);
+      expect(pinned?.model).toBe("claude-sonnet-5-5");
+      expect(pinned?.latest).toBeUndefined();
+
+      const bad = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "Not A Class!" },
+      });
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toMatch(/latest/);
+    });
+  });
+
+  it("refuses a Latest class that does not exist or does not fit the model, instead of saving it pinned", async () => {
+    await withBot("Lineage Bad Class", async (bot) => {
+      const before = await selectionOf(bot.id);
+      const typo = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(typo.status).toBe(400);
+      expect(typo.body.error).toMatch(/latest "sonnett" in primary is not a model class/);
+
+      const mismatch = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-opus-5", latest: "sonnet" },
+      });
+      expect(mismatch.status).toBe(400);
+      expect(mismatch.body.error).toMatch(/does not match model "claude-opus-5"/);
+
+      // Fallbacks and tasks go through the same check.
+      const inFallback = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnett" }],
+        },
+      });
+      expect(inFallback.status).toBe(400);
+      expect(inFallback.body.error).toMatch(/in fallback 1/);
+      const onTask = await api("PATCH", `/api/bots/${bot.id}/tasks/${bot.threadId}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" },
+      });
+      expect(onTask.status).toBe(400);
+      const apply = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnett" } },
+      });
+      expect(apply.status).toBe(400);
+
+      expect(await selectionOf(bot.id)).toEqual(before);
+    });
+  });
+
+  it("keeps a float when an older client writes back the slug it read before the float moved on", async () => {
+    await withBot("Lineage Stale Write", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+      })).status).toBe(200);
+      // The shipped iOS app read `claude-sonnet-5` while the float pointed
+      // there, the harness has since moved it to 5.5, and the app writes its
+      // copy back with no `latest`.
+      const stale = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5", effort: "high" },
+      });
+      expect(stale.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        latest: "sonnet",
+        effort: "high",
+      });
+    });
+  });
+
+  it("refuses a retired id with no successor that the write introduces", async () => {
+    await withBot("Lineage No Successor", async (bot) => {
+      // deadCli is a Grok CLI engine; grok-3-mini left xAI with nothing in
+      // its place.
+      const refused = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "deadCli", model: "grok-3-mini" }],
+        },
+      });
+      expect(refused.status).toBe(400);
+      expect(refused.body.error).toMatch(/retired model "grok-3-mini" in fallback 1/);
+    });
+  });
+
+  it("keeps a float when an older client re-sends without latest, on the bot and on a task", async () => {
+    await withBot("Lineage Carry", async (bot) => {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          latest: "sonnet",
+          fallbacks: [
+            { instanceId: "claude2", model: "claude-opus-5-5" },
+            { instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" },
+          ],
+        },
+      })).status).toBe(200);
+      // What the shipped iOS app sends after removing Fallback 1: no
+      // `latest` anywhere, and the floating Fallback 2 shifted into place 1.
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: "claude-sonnet-5-5",
+          fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5" }],
+        },
+      })).status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        latest: "sonnet",
+        fallbacks: [{ instanceId: "claude2", model: "claude-sonnet-5-5", latest: "sonnet" }],
+      });
+
+      const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
+      const floated = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5", latest: "sonnet" },
+      });
+      expect(floated.status).toBe(200);
+      expect(floated.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+      const resent = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "claude2", model: "claude-sonnet-5-5" },
+      });
+      expect(resent.status).toBe(200);
+      expect(resent.body.task.modelSelection).toMatchObject({ model: "claude-sonnet-5-5", latest: "sonnet" });
+    });
+  });
+
+  it("Apply to All Bots floats a Latest slot on every bot, and a pinned slot pins", async () => {
+    await withBot("Lineage Apply", async (bot) => {
+      const floating = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: {
+          primary: { instanceId: "claude", model: "claude-sonnet-5-5", latest: "sonnet" },
+          fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }, null, null],
+        },
+      });
+      expect(floating.status).toBe(200);
+      expect(await selectionOf(bot.id)).toMatchObject({
+        instanceId: "claude",
+        model: "claude-sonnet-5-5",
+        latest: "sonnet",
+        fallbacks: [{ instanceId: "claude2", model: "claude-haiku-4-5", latest: "haiku" }],
+      });
+
+      const pinned = await api("POST", "/api/bots/apply-model-defaults", {
+        slots: { primary: { instanceId: "claude", model: "claude-sonnet-5-5" } },
+      });
+      expect(pinned.status).toBe(200);
+      const after = await selectionOf(bot.id);
+      expect(after?.latest).toBeUndefined();
+      // The fallback place the request left empty keeps its float.
+      expect(after?.fallbacks?.[0]?.latest).toBe("haiku");
+    });
+  });
+});
+
 describe("fallback cap: at most three, growth refused, existing chains left alone", () => {
   const fallback = (model: string) => ({ instanceId: "fake", model });
   const chain = (...models: string[]) => models.map(fallback);
@@ -7558,6 +8125,33 @@ describe("fallback cap: at most three, growth refused, existing chains left alon
     const bot = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === id);
     return (bot.modelSelection.fallbacks ?? []).map((f: { model: string }) => f.model);
   };
+
+  it("refuses a fallback that carries fallbacks of its own, and accepts an empty list there", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Nested Gate" })).body.bot;
+    const claude = (await api("GET", "/api/instances")).body.instances.find(
+      (instance: { instanceId: string }) => instance.instanceId === "claude",
+    );
+    const good = { instanceId: "claude", model: claude.models.default };
+    try {
+      const nested = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [good] }] },
+      });
+      expect(nested.status).toBe(400);
+      expect(nested.body.error).toMatch(/cannot have fallbacks of its own/);
+      expect(await fallbacksOf(bot.id)).toEqual([]);
+
+      // A client that serializes an empty list on every entry still saves.
+      const empty = await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { ...good, fallbacks: [{ ...good, fallbacks: [] }] },
+      });
+      expect(empty.status).toBe(200);
+      const saved = (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id);
+      expect(saved.modelSelection.fallbacks).toHaveLength(1);
+      expect(saved.modelSelection.fallbacks[0].fallbacks).toBeUndefined();
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
 
   it("accepts a chain of three and refuses a fourth", async () => {
     const bot = (await api("POST", "/api/bots", { name: "Cap Three" })).body.bot;
@@ -7611,6 +8205,28 @@ describe("fallback cap: at most three, growth refused, existing chains left alon
         modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
       });
       expect(grow.status).toBe(400);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("holds a task override to the cap too: a task with none of its own gets no grandfathering", async () => {
+    const bot = (await api("POST", "/api/bots", { name: "Cap Task" })).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      })).status).toBe(200);
+      const taskPath = `/api/bots/${bot.id}/tasks/${bot.threadId}`;
+      const four = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c", "d") },
+      });
+      expect(four.status).toBe(400);
+      expect(four.body.error).toMatch(/at most 3 fallback/);
+      const three = await api("PATCH", taskPath, {
+        modelSelection: { instanceId: "fake", model: "p", fallbacks: chain("a", "b", "c") },
+      });
+      expect(three.status).toBe(200);
+      expect(three.body.task.modelSelection.fallbacks).toHaveLength(3);
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
@@ -8027,6 +8643,223 @@ describe("trust boundaries: phone-originated room folders, coarse always-allow, 
       await api("PATCH", "/api/instances/secretEcho", { enabled: false });
     }
   });
+});
+
+describe("a step's full input and output, and injected context, over HTTP", () => {
+  type Tool = { name: string; itemId?: string; turnId?: string; detail?: string; target?: string };
+  type Msg = { id: string; role: string; kind: string; text?: string; tool?: Tool; contextInjections?: Array<{ id: string; source: string; preview: string; bytes: number }> };
+  const transcript = async (threadId: string) =>
+    (await api("GET", `/api/threads/${threadId}/messages?limit=200`)).body.messages as Msg[];
+  const eventsLog = (threadId: string) => {
+    const file = join(home, ".botfleet", "events", `${threadId}.ndjson`);
+    return existsSync(file) ? readFileSync(file, "utf8") : "";
+  };
+  const SECRET = "ak9999999999999999999999999999999"; // the fake CLI prints it inside its tool result
+
+  /** One bot on the tool-IO engine, one finished turn, and the thread's ids. */
+  const runTurn = async (text: string, bot: { id: string }, extra: Record<string, unknown> = {}) => {
+    const sse = await openSse(`${BASE}/api/events`);
+    try {
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text, ...extra })).status).toBe(202);
+      await sse.until((f: any) => f.kind === "runtime" && f.event?.type === "turn.completed", 20_000);
+      return sse.frames;
+    } finally {
+      sse.close();
+    }
+  };
+  const selectToolIoEngine = async (botId: string) => {
+    expect((await api("PATCH", "/api/instances/toolIo", { enabled: true })).status).toBe(200);
+    const instance = (await api("GET", "/api/instances")).body.instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+    const patch = await api("PATCH", `/api/bots/${botId}`, { modelSelection: { instanceId: "toolIo", model: instance?.models?.default }, computers: [] });
+    expect(patch.status).toBe(200);
+  };
+
+  it("serves a step's whole input and output on demand, redacted, and keeps them off the wire, the event log and the transcript", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const frames = await runTurn("run the thing", bot);
+
+      // the transcript row carries the keys and the clipped headline, never the payload
+      const messages = await transcript(bot.threadId);
+      const row = messages.find((m) => m.tool?.name === "Bash")!;
+      expect(row.tool?.itemId).toBe("tu-1");
+      expect(typeof row.tool?.turnId).toBe("string");
+      expect(row.tool?.target).toBe("echo hi");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(messages)).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // the wire never carries an `io` capture or the tail of a result
+      expect(JSON.stringify(frames)).not.toContain("TAIL-INPUT-MARKER");
+      expect(JSON.stringify(frames)).not.toContain("TAIL-OUTPUT-MARKER");
+      expect(frames.some((f: any) => f.kind === "runtime" && "io" in (f.event ?? {}))).toBe(false);
+      // nor does the canonical event log
+      const logged = await vi_waitFor(() => eventsLog(bot.threadId), (log) => log.includes('"type":"turn.completed"'));
+      expect(logged).toContain("tu-1");
+      expect(logged).not.toContain("TAIL-INPUT-MARKER");
+      expect(logged).not.toContain("TAIL-OUTPUT-MARKER");
+
+      // opening the row reads the whole thing
+      const turnId = row.tool!.turnId!;
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=${turnId}`);
+      expect(io.status).toBe(200);
+      expect(io.body.itemId).toBe("tu-1");
+      expect(io.body.input.text).toBe('{\n  "command": "echo hi",\n  "stdin": "TAIL-INPUT-MARKER"\n}');
+      expect(io.body.output.text).toContain("TAIL-OUTPUT-MARKER");
+      expect(io.body.output.text).toContain("p".repeat(400));
+      expect(io.body.output.truncated).toBe(false);
+      // redacted with the wire's own pass, at write and at read
+      expect(io.body.output.text).toContain("redacted");
+      expect(JSON.stringify(io.body)).not.toContain(SECRET);
+      // the side store on disk never held it either
+      const stored = readFileSync(join(home, ".botfleet", "item-io", `${bot.threadId}.ndjson`), "utf8");
+      expect(stored).not.toContain(SECRET);
+
+      // an id shared across turns narrows by turn; a different turn finds nothing
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io`)).status).toBe(200);
+      expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=some-other-turn`)).status).toBe(404);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 40_000);
+
+  it("holds the route to the events route's gate and validates what it is given", async () => {
+    const bot = (await api("GET", "/api/bots")).body.bots[0];
+    const unknownThread = await api("GET", "/api/threads/not-a-thread/items/tu-1/io");
+    expect(unknownThread.status).toBe(404);
+    expect(unknownThread.body.error).toBe("no such thread");
+    // a step that was never recorded is a 404 that says so, not an empty 200
+    const missing = await api("GET", `/api/threads/${bot.threadId}/items/never-ran/io`);
+    expect(missing.status).toBe(404);
+    expect(missing.body.error).toContain("no input or output was recorded");
+    // a malformed id or turn is refused before any file is opened
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/%E0%A4%A/io`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/tu-1/io?turnId=a%20b`)).status).toBe(400);
+    expect((await api("GET", `/api/threads/${bot.threadId}/items/${"i".repeat(300)}/io`)).status).toBe(400);
+    // read-only
+    expect((await api("POST", `/api/threads/${bot.threadId}/items/tu-1/io`, {})).status).not.toBe(200);
+    // a path that tries to leave the thread's folder is not a thread id
+    expect((await api("GET", "/api/threads/..%2F..%2Fconfig/items/tu-1/io")).status).toBe(404);
+  });
+
+  it("records what the harness injected into a turn, without putting its text on the message", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      const memoryFile = join(home, ".botfleet", "workspaces", bot.id, "MEMORY.md");
+      mkdirSync(dirname(memoryFile), { recursive: true });
+      writeFileSync(memoryFile, `likes tea\nhates meetings\n${"m".repeat(300)}\nINJECTED-TAIL-MARKER\n`);
+
+      const frames = await runTurn("hello", bot);
+      const first = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      const memory = first.contextInjections?.find((c) => c.source === "memory");
+      expect(memory).toBeDefined();
+      expect(memory!.preview.startsWith("likes tea hates meetings")).toBe(true);
+      expect(memory!.preview.length).toBeLessThanOrEqual(160);
+      expect(memory!.bytes).toBeGreaterThan(300);
+      // the message holds a one-line preview and a size, never the text
+      expect(JSON.stringify(first)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // the Trajectory's door: a runtime event with the preview and no full text
+      const event = frames.find((f: any) => f.kind === "runtime" && f.event?.type === "context.injected")?.event;
+      expect(event).toMatchObject({ source: "memory", itemId: memory!.id, bytes: memory!.bytes });
+      expect(JSON.stringify(frames)).not.toContain("INJECTED-TAIL-MARKER");
+      expect(eventsLog(bot.threadId)).toContain('"type":"context.injected"');
+      expect(eventsLog(bot.threadId)).not.toContain("INJECTED-TAIL-MARKER");
+
+      // and it survives the trip back: a reload reads history from the events
+      // route, and both the Trajectory read and the Inspector read must return it
+      for (const query of ["view=trajectory&limit=200", "limit=200"]) {
+        const history = await api("GET", `/api/threads/${bot.threadId}/events?${query}`);
+        expect(history.status).toBe(200);
+        const injected = history.body.entries.find(
+          (entry: any) => entry.kind === "runtime" && entry.data?.type === "context.injected" && entry.data.itemId === memory!.id,
+        );
+        expect(injected?.data).toMatchObject({ source: "memory", bytes: memory!.bytes });
+        // the runtime records hold the preview only.  The Inspector read also
+        // carries the provider's own native tee, which is the real prompt.
+        const runtimeOnly = history.body.entries.filter((entry: { kind: string }) => entry.kind === "runtime");
+        expect(JSON.stringify(runtimeOnly)).not.toContain("INJECTED-TAIL-MARKER");
+      }
+
+      // opening the row reads the full text the model was given
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${memory!.id}/io`);
+      expect(io.status).toBe(200);
+      expect(io.body.text.text).toContain("INJECTED-TAIL-MARKER");
+      expect(io.body.text.text.startsWith("likes tea\nhates meetings")).toBe(true);
+
+      // memory that has not changed is not re-announced on every message...
+      await runTurn("and again", bot);
+      const second = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      expect(second.contextInjections?.some((c) => c.source === "memory") ?? false).toBe(false);
+      // ...but is when it changes
+      writeFileSync(memoryFile, "likes coffee now\n");
+      await runTurn("once more", bot);
+      const third = (await transcript(bot.threadId)).filter((m) => m.role === "user")[2]!;
+      expect(third.contextInjections?.find((c) => c.source === "memory")?.preview).toBe("likes coffee now");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records the quoted message a reply adds to the prompt", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      await runTurn("the launch is on Friday", bot);
+      const earlier = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      await runTurn("are you sure?", bot, { replyToId: earlier.id });
+      const reply = (await transcript(bot.threadId)).filter((m) => m.role === "user")[1]!;
+      const quote = reply.contextInjections?.find((c) => c.source === "reply");
+      expect(quote).toBeDefined();
+      const io = await api("GET", `/api/threads/${bot.threadId}/items/${quote!.id}/io`);
+      expect(io.body.text.text).toContain("the launch is on Friday");
+      // what the person typed is not part of what was injected
+      expect(io.body.text.text).not.toContain("are you sure?");
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 60_000);
+
+  it("records a message's injections once when a model fallback dispatches it again", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    try {
+      await selectToolIoEngine(bot.id);
+      // the primary crashes before it says anything, so the same message is
+      // dispatched again on the fallback and its prompt is assembled a second
+      // time — selecting the same skill, which a trigger term in the text picks
+      const instances = (await api("GET", "/api/instances")).body.instances;
+      const crasher = instances.find((i: { instanceId: string }) => i.instanceId === "crasher");
+      const toolIo = instances.find((i: { instanceId: string }) => i.instanceId === "toolIo");
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "crasher",
+          model: crasher.models.default,
+          fallbacks: [{ instanceId: "toolIo", model: toolIo.models.default }],
+        },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "use adb on my phone to list the apps" })).status).toBe(202);
+      await expect.poll(async () =>
+        (await transcript(bot.threadId)).some((m) => typeof m.tool?.name === "string" && m.tool.name.startsWith("Fell over to")), { timeout: 30_000 }).toBe(true);
+      await expect.poll(async () =>
+        (await api("GET", "/api/bots?messages=0")).body.bots.find((b: { id: string }) => b.id === bot.id)?.busy, { timeout: 30_000 }).toBe(false);
+
+      const sent = (await transcript(bot.threadId)).find((m) => m.role === "user")!;
+      expect(sent.contextInjections?.filter((c) => c.source === "skill")).toHaveLength(1);
+      // and the Trajectory's history lists the step once as well
+      const history = await api("GET", `/api/threads/${bot.threadId}/events?view=trajectory&limit=500`);
+      const injected = history.body.entries.filter(
+        (entry: any) => entry.data?.type === "context.injected" && entry.data.source === "skill",
+      );
+      expect(injected).toHaveLength(1);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PATCH", "/api/instances/toolIo", { enabled: false });
+    }
+  }, 90_000);
 });
 
 describe("CSRF security hardening", () => {

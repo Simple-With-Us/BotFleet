@@ -22,6 +22,9 @@ export default defineConfig({
     fileParallelism: false,
     testTimeout: 20_000,
     hookTimeout: 30_000,
+    // Prevent vitest-worker RPC teardown race ('Closing rpc while onUserConsoleLog was pending').
+    // With console interception disabled, logs stream directly to stdout/stderr without RPC wrapping.
+    disableConsoleIntercept: true,
   },
   resolve: {
     alias: {

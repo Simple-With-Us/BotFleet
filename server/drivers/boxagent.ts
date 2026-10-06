@@ -22,6 +22,8 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
 import { toolFields } from "../tool-fields.ts";
+import { captureInput } from "../../shared/item-io.ts";
+import { isFiniteJsonNumber, isJsonObject, type JsonObject, type JsonValue } from "../schema.ts";
 
 const DRIVER_KIND = "boxAgent";
 const BOX_API = "https://ascii.dev/api/box/v1";
@@ -42,13 +44,22 @@ export interface BoxAgentConfig {
 }
 
 function decodeConfig(raw: unknown): BoxAgentConfig {
-  const o = (raw ?? {}) as Record<string, unknown>;
-  return { pollMs: typeof o.pollMs === "number" ? o.pollMs : 2500 };
+  const parsed = raw as JsonValue;
+  const o: JsonObject = isJsonObject(parsed) ? parsed : {};
+  return { pollMs: isFiniteJsonNumber(o.pollMs) ? o.pollMs : 2500 };
 }
 
 export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
   driverKind: DRIVER_KIND,
-  metadata: { displayName: "ASCII.dev Box", supportsMultipleInstances: false },
+  metadata: {
+    displayName: "ASCII.dev Box",
+    supportsMultipleInstances: false,
+    // The instance's `capabilities` block declares no MCP channel and no image
+    // input at all — it is a remote sandbox reached over its own API, not a
+    // CLI BotFleet can hand channels to.  Mirrored here so the capability
+    // matrix can say so with a citation instead of a shrug.
+    channelWiring: { agentsMcp: false, computerMcp: false, composioMcp: false, localComputerMcp: false, images: false },
+  },
   models: MODELS,
   decodeConfig,
   defaultConfig: () => decodeConfig({}),
@@ -210,6 +221,7 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
                     itemId: id,
                     title: String(ev.title ?? ev.command ?? kind).slice(0, 80),
                     ...toolFields(ev.title ?? kind, ev.command ?? ev.input ?? ev.args),
+                    ...captureInput(ev.command ?? ev.input ?? ev.args),
                   });
                 }
               }
@@ -278,7 +290,13 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
       if (!token) {
-        return { state: "unavailable", reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json' };
+        // Never set up: stay registered (a token added later just works) but
+        // out of every engine list until then.
+        return {
+          state: "unavailable",
+          hidden: true,
+          reason: 'no Box token — add {"box":{"token":"…"}} to ~/.botfleet/config.json',
+        };
       }
       try {
         await api("/me");
@@ -297,7 +315,9 @@ export const BoxAgentDriver: ProviderDriver<BoxAgentConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session" },
+        // Jobs matrix: remote, opaque and without MCP — neither jobs nor
+        // helpers reach this engine.
+        capabilities: { sessionModelSwitch: "in-session", backgroundJobs: "none", helpers: "none" },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.cancel(),
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer

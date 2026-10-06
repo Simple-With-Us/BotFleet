@@ -14,6 +14,9 @@ import {
   PAIRING_TTL_MS,
 } from "../src/devices.ts";
 
+/** Test-only handle to force `persist()` failures without a read-only disk. */
+type RegistryPersistHarness = { persist: () => void };
+
 const pair = (registry: DeviceRegistry, name = "iPhone") => {
   const { code } = registry.openPairing();
   const result = registry.redeem(code, name);
@@ -256,7 +259,7 @@ describe("DeviceRegistry", () => {
   it("rolls cloud desktop access back when it cannot be saved", () => {
     const registry = new DeviceRegistry();
     const { token, device } = pair(registry);
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       throw new Error("ENOSPC: no space left on device");
     };
 
@@ -377,7 +380,7 @@ describe("authenticate under a failing disk", () => {
     // it. Assigning on the instance shadows the prototype method for this
     // registry only — the failing disk is simulated where the disk is used,
     // rather than by mocking node:fs for the whole file.
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       attempted++;
       throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
     };
@@ -401,7 +404,7 @@ describe("a pairing that cannot be saved", () => {
     // SAFETY: as above — the private `persist` shadowed on this one instance,
     // which is the only way to make the write fail without a filesystem that
     // really is read-only.
-    (registry as unknown as { persist: () => void }).persist = () => {
+    (registry as unknown as RegistryPersistHarness).persist = () => {
       throw new Error("EROFS: read-only file system");
     };
 

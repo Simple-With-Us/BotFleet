@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Search,
   Square,
+  SquareTerminal,
   X,
 } from "lucide-react";
 import { formatTokens, formatUsd } from "@/lib/usage";
@@ -48,7 +49,8 @@ import { showWorkingDots } from "@/lib/turn-tail";
 import { liveActivityLabel } from "@/lib/live-activity";
 import { modelChip } from "@/lib/model-chip";
 import { ChatMarkdown } from "./ChatMarkdown";
-import { splitVoiceSummary } from "../../shared/voice-summary";
+import { splitVoiceSummary, stripVoiceSummaryTags } from "../../shared/voice-summary";
+import { useSpeech } from "@/lib/tts/useSpeech";
 import { MentionText } from "./MentionText";
 import { OptionCard, shouldHideOnboardingCard } from "./OptionCard";
 import { ApprovalCard } from "./ApprovalCard";
@@ -75,9 +77,12 @@ import { cn } from "@/lib/cn";
 import { COMPACT_BUBBLE } from "@/lib/compact-chip";
 import { BUBBLE_EDITOR_WIDTH, BUBBLE_WIDTH, bubbleRow } from "@/lib/bubble-metrics";
 import { useFocusMessage } from "@/lib/focus-message";
-import { groupActivityRuns } from "@/lib/activity-runs";
+import { groupActivityRuns, nestHelperSteps } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
+import { JobFinishedRow, JobsMenu } from "./JobsMenu";
+import { jobWakeSubtitle } from "../../shared/jobs";
 import { ToolLine } from "./ToolLine";
+import { ContextInjectionRows } from "./ContextInjectionRows";
 import { webhookMessageView } from "@/lib/webhook-message";
 import { WebhookCard } from "./WebhookCard";
 import { imessageMessageView, stripToImessagePrefix } from "../../shared/imessage-message";
@@ -94,6 +99,7 @@ import {
   tailDisplayWindowStart,
 } from "@/lib/transcript-window";
 import { timelineEvents } from "@/lib/taskTimeline";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 
 /** Long user messages collapse behind a fade so pasted walls of text don't
  * bury the conversation; bots get full markdown. */
@@ -253,6 +259,73 @@ function BubbleEditor({
   );
 }
 
+function SpokenSummaryCard({
+  messageId,
+  voiceText,
+  legacyVoice,
+}: {
+  messageId: string;
+  voiceText?: string;
+  legacyVoice?: string;
+}) {
+  const speech = useSpeech();
+  const isMine = speech.messageId === messageId && speech.status === "speaking";
+  const isPreparing = speech.messageId === messageId && speech.status === "preparing";
+  const spokenText = (isMine && speech.caption) || voiceText || legacyVoice || "";
+
+  if (!spokenText && !isMine && !isPreparing) return null;
+
+  const words = spokenText.trim().split(/\s+/).filter(Boolean);
+  const activeWordIdx = isMine ? speech.wordIndex ?? -1 : -1;
+
+  return (
+    <details
+      open={isMine || isPreparing ? true : undefined}
+      className="mt-2 border-t border-hairline/40 pt-2"
+      onClick={(event) => event.stopPropagation()}
+    >
+      <summary className="cursor-pointer text-[12px] font-medium text-ink-secondary hover:text-ink flex items-center gap-1.5 select-none">
+        <span>Spoken Summary</span>
+        {isMine && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-accent font-normal animate-pulse">
+            • Reading aloud
+          </span>
+        )}
+        {isPreparing && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-ink-secondary/70 font-normal">
+            • Preparing audio…
+          </span>
+        )}
+      </summary>
+      <div className="mt-2 text-[13px] leading-relaxed text-ink-secondary">
+        {isMine && words.length > 0 ? (
+          <p className="select-text">
+            {words.map((word, idx) => {
+              const isCurrent = idx === activeWordIdx;
+              const isPast = activeWordIdx >= 0 && idx < activeWordIdx;
+              return (
+                <span
+                  key={idx}
+                  className={cn(
+                    "transition-colors duration-75",
+                    isCurrent && "font-bold text-accent px-0.5 rounded bg-accent/15",
+                    isPast && "text-ink font-medium",
+                    !isCurrent && !isPast && "text-ink-secondary/70",
+                  )}
+                >
+                  {word}{" "}
+                </span>
+              );
+            })}
+          </p>
+        ) : (
+          <ChatMarkdown text={spokenText} />
+        )}
+      </div>
+    </details>
+  );
+}
+
 function Bubble({
   bot,
   message,
@@ -320,10 +393,11 @@ function Bubble({
   };
   const text = message.text ?? "";
   const voiceSections = message.role === "bot" && message.kind === "text" ? splitVoiceSummary(text) : null;
-  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(text) : null;
+  const cleanWritten = message.role === "bot" && message.kind === "text" ? stripVoiceSummaryTags(text) : text;
+  const toImessageBody = !humanTyped && message.role === "bot" ? stripToImessagePrefix(cleanWritten) : null;
   const attachedImages = humanTyped ? splitAttachedImages(text) : null;
-  const visibleText = attachedImages?.display ?? text;
-  const copyContent = humanTyped ? visibleText : (toImessageBody ?? text);
+  const visibleText = attachedImages?.display ?? cleanWritten;
+  const copyContent = humanTyped ? visibleText : (toImessageBody ?? cleanWritten);
   const requestId = message.card?.requestId;
   const collapsible =
     humanTyped && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
@@ -617,12 +691,13 @@ function Bubble({
               {toImessageBody !== null && (
                 <div className="mb-1 text-[11px] font-medium text-accent">To iMessage</div>
               )}
-              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? text} />
-              {voiceSections && (
-                <details className="mt-2 border-t border-hairline/40 pt-2" onClick={(event) => event.stopPropagation()}>
-                  <summary className="cursor-pointer text-[12px] text-ink-secondary">Spoken Summary</summary>
-                  <div className="mt-2 text-[13px] text-ink-secondary"><ChatMarkdown text={voiceSections.voice} /></div>
-                </details>
+              <ChatMarkdown text={voiceSections?.written ?? toImessageBody ?? cleanWritten} />
+              {message.role === "bot" && (
+                <SpokenSummaryCard
+                  messageId={message.id}
+                  voiceText={message.voiceText}
+                  legacyVoice={voiceSections?.voice}
+                />
               )}
             </MessageBoundary>
           )}
@@ -741,7 +816,7 @@ function ActivityChip({ bot, message }: { bot: Bot, message: Message }) {
   }
   // everything that is not a bot⇄bot chip is a step in the work, and a step
   // is a log line — see ToolLine for why it stopped being a card
-  return <ToolLine message={message} actor={message.from?.name ?? bot.name} />;
+  return <ToolLine message={message} actor={message.from?.name ?? bot.name} threadId={bot.threadId} />;
 }
 
 /** A frame of the bot's computer.
@@ -815,10 +890,11 @@ const MessagesList = memo(function MessagesList({
   const summarizeToolCalls = summarizeToolCallsEnabled(state.config);
   // Fold finished tool chips into runs when summarizeToolCalls is enabled, so a stretch of them cannot bury
   // what the bot actually said. If summarizeToolCalls is false, show each step individually.
-  const items = useMemo(
-    () => (summarizeToolCalls ? groupActivityRuns(messages) : messages.map((m) => ({ kind: "message" as const, message: m }))),
-    [messages, summarizeToolCalls],
-  );
+  const items = useMemo(() => {
+    // a helper's steps sit under the row that started the helper
+    const ordered = nestHelperSteps(messages);
+    return summarizeToolCalls ? groupActivityRuns(ordered) : ordered.map((m) => ({ kind: "message" as const, message: m }));
+  }, [messages, summarizeToolCalls]);
   // A search hit inside a folded run has to open it: the fold keeps the
   // row out of the DOM, and there is nothing for the scroll to land on.
   const focus = state.focusMessage;
@@ -891,6 +967,8 @@ const MessagesList = memo(function MessagesList({
                   />
                 );
               }
+              // a job's end is news, not a step: shown whatever the setting
+              if (m.job) return <JobFinishedRow job={m.job} />;
               if (!showToolCalls && !m.comm) return null;
               return <ActivityChip bot={bot} message={m} />;
             }
@@ -1002,14 +1080,23 @@ const MessagesList = memo(function MessagesList({
                 // the hardcoded "Scheduled Run" a manual Run Now or a
                 // resource alert would otherwise wear.  Subtitle is the
                 // instruction's own first line, same as before.
+                // A job's wake says how the job ended, not its id and the
+                // words addressed to the bot (those stay under Run Details).
+                const jobWake = m.automationSource === "job";
                 return withSystemChrome(
                   <WebhookCard
                     view={{
                       headline: automationSourceLabel(m.automationSource, body),
-                      subtitle: firstLine && firstLine !== "Scheduled Run" ? firstLine.slice(0, 80) : undefined,
+                      subtitle: jobWake
+                        ? jobWakeSubtitle(body)
+                        : firstLine && firstLine !== "Scheduled Run" ? firstLine.slice(0, 80) : undefined,
                       payload: body || undefined,
                     }}
-                    icon={<Clock size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />}
+                    icon={
+                      jobWake
+                        ? <SquareTerminal size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />
+                        : <Clock size={14} className="shrink-0 text-ink-secondary/70" aria-hidden="true" />
+                    }
                     detailsNoun="Run Details"
                   />,
                 );
@@ -1036,6 +1123,12 @@ const MessagesList = memo(function MessagesList({
           <div key={m.id} className="contents" data-mid={m.id}>
             {newDay && <DaySeparator at={m.at} />}
             {row}
+            {/* what the harness put in front of the model for the turn this
+                message started, as quiet rows right under it; gated with the
+                tool calls, the other "under the hood" detail */}
+            {showToolCalls && m.contextInjections?.length ? (
+              <ContextInjectionRows entries={m.contextInjections} threadId={bot.threadId} />
+            ) : null}
           </div>
         );
       })}
@@ -1101,8 +1194,26 @@ function formatHoverTime(at: number) {
   return `${date.getMonth() + 1}/${date.getDate()} ${timeStr}`;
 }
 
-export function ChatView({ bot }: { bot: Bot }) {
+export function ChatView({ bot: originalBot, explicitThreadId }: { bot: Bot; explicitThreadId?: string }) {
+  // A pin onto a different thread for App views.  Memoized so the derived
+  // object keeps a stable identity across renders and effects don't churn
+  // when the pin isn't shadowing anything.
+  const bot = useMemo(
+    () =>
+      explicitThreadId && explicitThreadId !== originalBot.threadId
+        ? { ...originalBot, threadId: explicitThreadId }
+        : originalBot,
+    [originalBot, explicitThreadId],
+  );
   const { state, dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const macInset = capabilities.windowChrome === "mac-inset";
+  const dragStyle: (React.CSSProperties & { WebkitAppRegion: "drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "drag" }
+    : undefined;
+  const noDragStyle: (React.CSSProperties & { WebkitAppRegion: "no-drag" }) | undefined = macInset
+    ? { WebkitAppRegion: "no-drag" }
+    : undefined;
   const scrollRef = useRef<HTMLDivElement>(null);
   // the open thread's task: its banked usage and timing feed the footer chips
   const activeTask = bot.tasks?.find((t) => t.threadId === bot.threadId);
@@ -1455,14 +1566,15 @@ export function ChatView({ bot }: { bot: Bot }) {
       <CallOverlay bot={bot} />
       {/* Header */}
       <div
+        style={dragStyle}
         className={cn(
           // @container so the chips on the right can fold gracefully
-          "@container/chathead flex items-center justify-between gap-3 px-5 py-3",
+          "@container/chathead flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-5 py-3",
           // Room for the drawer button, which overlays this corner below md.
           "pl-11 md:pl-5",
         )}
       >
-        <div className="flex shrink-0 min-w-0 max-w-[45%] items-center gap-2 rounded-lg px-1.5 py-1">
+        <div style={noDragStyle} className="flex w-full min-w-0 max-w-full items-center gap-2 rounded-lg px-1.5 py-1 md:w-auto md:max-w-[45%]">
           <button
             onClick={() => dispatch({ type: "toggleSettings", open: true })}
             className="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-raised/50"
@@ -1483,7 +1595,7 @@ export function ChatView({ bot }: { bot: Bot }) {
             onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
             onActivate={() => dispatch({ type: "toggleSettings", open: true })}
             showEditButton
-            className="truncate min-w-[80px] text-[15px] font-semibold text-ink"
+            className="truncate min-w-0 text-[15px] font-semibold text-ink"
             inputClassName="max-w-[220px] rounded bg-inset px-1.5 py-0.5 text-[15px] font-semibold"
           />
           {bot.chiefOfStaff && (
@@ -1494,7 +1606,7 @@ export function ChatView({ bot }: { bot: Bot }) {
           )}
           {bot.busy && <Loader2 size={14} className="shrink-0 animate-spin text-ink-secondary" />}
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 md:gap-2">
+        <div style={noDragStyle} className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-1.5 md:gap-2">
           <ThreadViewSwitch view={threadView} onChange={setThreadView} />
           {/* Always here, so the switch beside it never slides under the pointer:
               in Trajectory the same magnifier searches the steps. */}
@@ -1510,6 +1622,8 @@ export function ChatView({ bot }: { bot: Bot }) {
           >
             <Search size={18} />
           </button>
+          {/* Background jobs, left of Stop.  Stop ends the turn, never a job. */}
+          <JobsMenu threadId={bot.threadId} />
           {bot.busy && (
             <button
               onClick={() => dispatch({ type: "interrupt", botId: bot.id })}
@@ -1767,6 +1881,7 @@ export function ChatView({ bot }: { bot: Bot }) {
         bot={bot}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        onRestoreReply={(message) => setReplyTo((current) => current ?? message)}
         onEditLast={lastUserMessage && !bot.busy ? () => setEditingId(lastUserMessage.id) : undefined}
       />
       <ThreadStatsBar stats={activeTask?.stats} usage={activeTask?.usage} />

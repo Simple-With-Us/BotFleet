@@ -1,4 +1,4 @@
-import { Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
+import { AlertTriangle, Bug, ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
 import { stateForBot } from "@/lib/mascot";
@@ -17,12 +17,15 @@ import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { BotSkillsPanel } from "./BotSkillsPanel";
 import { ConnectorToolsSettings } from "./ConnectorToolsSettings";
 import { LocalComputerAutoWarning, shouldWarnBeforeAddingLocalAuto } from "./LocalComputerAutoWarning";
+import { BypassPermissionsWarning } from "./BypassPermissionsWarning";
+import { evaluateModelRiskForBypass } from "../../shared/model-safety";
 import { VoiceSettings } from "./VoiceSettings";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
 import { botCapabilityGates, toolRoundsGate } from "@/lib/bot-settings-gates";
 import { MaxToolRoundsField } from "./MaxToolRoundsField";
 import { requiresLocalAutoConsent } from "../../shared/local-auto-consent";
-import { modelEffortLevels } from "@/lib/model-effort";
+import { effortLabel } from "@/lib/model-effort";
+import { selectionEffortLevels, selectionWithEffort } from "@/lib/model-pick";
 import { CONNECTED_APPS_HEADING, connectedAppsBlurb } from "@/lib/connected-apps-copy";
 
 function Field({
@@ -276,7 +279,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
           <textarea
             className={cn(inputCls, "min-h-[160px] resize-y font-mono text-[12.5px] leading-relaxed")}
             value={text}
-            placeholder="Nothing remembered yet. The bot writes durable notes here — or add your own."
+            placeholder={"Nothing remembered yet.\u00a0 The bot writes durable notes here — or add your own."}
             aria-label="Bot memory"
             onChange={(e) => {
               setText(e.target.value);
@@ -370,9 +373,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "avatarCrop"
         | "autoApprove"
         | "autoReview"
+        | "bypassPermissions"
         | "speakReplies"
         | "speechDevices"
         | "voice"
+        | "voiceSummaryMode"
         | "chiefOfStaff"
         | "approvePeerComms"
         | "composio"
@@ -383,6 +388,8 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
+  const modelRisk = evaluateModelRiskForBypass(bot.modelSelection?.model, bot.modelSelection?.instanceId);
+  const [bypassWarningOpen, setBypassWarningOpen] = useState(false);
   // One read of the engine's capabilities for the whole panel, so a control
   // can never disagree with its neighbour about which engine this is.  See
   // lib/bot-settings-gates.ts.
@@ -601,8 +608,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           </div>
 
           {(() => {
-            const selectedOpt = engine?.models.options.find((o) => o.id === bot.modelSelection.model);
-            const effortLevels = modelEffortLevels(engine, selectedOpt, bot.modelSelection.model);
+            const effortLevels = selectionEffortLevels(engine, bot.modelSelection);
             if (!effortLevels.length && !bot.modelSelection.effort) return null;
             return (
               <div className="rounded-xl bg-card p-4">
@@ -623,23 +629,22 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                       <button
                         key={level ?? "default"}
                         aria-pressed={bot.modelSelection.effort === level}
-                        onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: level } })}
+                        onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, level) })}
                         className={cn(
-                          "flex-1 py-1.5 text-[13px] capitalize",
+                          "flex-1 py-1.5 text-[13px]",
                           i > 0 && "border-l border-hairline/40",
                           bot.modelSelection.effort === level
                             ? "bg-control text-ink"
                             : "text-ink-secondary hover:bg-control/60 hover:text-ink",
                         )}
                       >
-                        {/* the others capitalize cleanly; "xhigh" would read "X-High" */}
-                        {level === "xhigh" ? "X-High" : (level ?? "Default")}
+                        {effortLabel(level)}
                       </button>
                     ))}
                   </div>
                 ) : (
                   <button
-                    onClick={() => patch({ modelSelection: { ...bot.modelSelection, effort: undefined } })}
+                    onClick={() => patch({ modelSelection: selectionWithEffort(bot.modelSelection, undefined) })}
                     className="mt-3 rounded-lg border border-hairline/40 bg-control px-3 py-1.5 text-[13px] font-medium text-ink hover:bg-control/80"
                   >
                     Clear Saved Reasoning ({bot.modelSelection.effort})
@@ -816,11 +821,70 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           </div>
 
           <div className="rounded-xl bg-card p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[15px] font-medium text-ink">Bypass Permissions</span>
+                  {modelRisk.isDangerous && (
+                    <span className="rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-semibold text-danger">
+                      High-Risk Model
+                    </span>
+                  )}
+                  {bot.bypassPermissions && (
+                    <span className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] font-semibold text-accent">
+                      Active
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-[13px] text-ink-secondary">
+                  {bot.bypassPermissions
+                    ? "Executing tools, shell commands, and routine proposals autonomously without approval cards."
+                    : "Automatically approve all tool, command, and routine requests without stopping for manual approval cards."}
+                </div>
+              </div>
+              <button
+                role="switch"
+                aria-checked={Boolean(bot.bypassPermissions)}
+                aria-label="Bypass Permissions"
+                onClick={() => {
+                  if (bot.bypassPermissions) {
+                    patch({ bypassPermissions: false });
+                  } else {
+                    setBypassWarningOpen(true);
+                  }
+                }}
+                className={cn(
+                  "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                  bot.bypassPermissions ? "bg-accent" : "bg-control",
+                )}
+              >
+                <span
+                  className={cn(
+                    "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                    bot.bypassPermissions ? "left-[21px]" : "left-[3px]",
+                  )}
+                />
+              </button>
+            </div>
+            {modelRisk.isDangerous && (
+              <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-2.5 text-[12px] text-warning">
+                <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+                <div>
+                  <span className="font-semibold">{modelRisk.model}: </span>
+                  {modelRisk.warningBody}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-xl bg-card p-4">
             <div className="text-[15px] font-medium text-ink">Review Routine Approvals</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              {canAutoReview
+              {bot.bypassPermissions
+                ? "Permission Bypass is active: routine operations and tool calls are automatically permitted without waiting for isolated reviews or approval cards."
+                : canAutoReview
                 ? "The same engine reviews ordinary approval cards. Existing safety rules, unattended turns, local-computer access, and questions still wait for you."
-                : "This engine cannot run an isolated review safely, so approval cards continue to wait for you."}
+                : "This engine cannot run an isolated review safely. Approvals will wait for you, or you can enable Permission Bypass above for unattended routine execution."}
             </div>
             <div className="mt-3 flex gap-1 rounded-lg bg-inset p-0.5">
               {(
@@ -917,6 +981,20 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         if (localAutoWarning === "local") patch({ computers: [...(bot.computers ?? []), "local"], acknowledgeLocalAuto: true });
         setLocalAutoWarning(null);
       }}
+    />
+    <BypassPermissionsWarning
+      open={bypassWarningOpen}
+      onCancel={() => setBypassWarningOpen(false)}
+      onConfirm={() => {
+        patch({
+          bypassPermissions: true,
+          ...(autoWouldUseLocal ? { acknowledgeLocalAuto: true } : {}),
+        });
+        setBypassWarningOpen(false);
+      }}
+      botName={bot.name}
+      model={bot.modelSelection?.model ?? ""}
+      engineId={bot.modelSelection?.instanceId}
     />
     </>
   );

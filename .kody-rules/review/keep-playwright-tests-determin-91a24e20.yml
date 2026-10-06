@@ -1,0 +1,31 @@
+title: >-
+  Keep Playwright tests deterministic: web-first assertions, no sleeps, no
+  focused/skipped tests
+rule: >-
+  Do not use page.waitForTimeout(), bare setTimeout delays, or manual polling
+  loops to synchronize with the dashboard; rely on Playwright auto-waiting and
+  web-first assertions (await expect(locator).toBeVisible(), toHaveText(),
+  toHaveCount()) so the check retries until the UI settles. Do not commit
+  test.only / test.describe.only (it silently disables the rest of the suite)
+  and do not leave test.skip or test.fixme on a test without an accompanying
+  reason comment explaining why the check cannot run.
+severity: high
+scope: file
+path: '**/*'
+examples:
+  - snippet: >-
+      await page.getByRole('button', { name: 'Refresh' }).click();
+
+      await page.waitForTimeout(3000);
+
+      expect(await
+      page.locator('.metric-value').first().innerText()).toBe('12');
+    isCorrect: false
+  - snippet: |-
+      await page.getByRole('button', { name: 'Refresh' }).click();
+      await expect(page.locator('.metric-value').first()).toHaveText('12');
+    isCorrect: true
+inheritance:
+  inheritable: true
+  exclude: []
+  include: []

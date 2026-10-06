@@ -429,6 +429,81 @@ describe("buildTrajectory: context and error rows", () => {
 });
 
 // ── review findings: settled turns, stops and token figures ───────────
+describe("buildTrajectory: where a step's full payload lives", () => {
+  it("points a tool row at its item id and turn, so opening it can read the whole input and output", () => {
+    const t = buildTrajectory([turnStarted(0), toolStart(1, "toolu_1", "Bash", { target: "ls" }), toolEnd(3, "toolu_1"), turnDone(4)]);
+    const tool = t.rows.find((row) => row.kind === "tool");
+    expect(tool?.ioRef).toEqual({ itemId: "toolu_1", turnId: "t1" });
+  });
+
+  it("keeps the pointer on a completion whose start fell outside the log", () => {
+    const t = buildTrajectory([turnStarted(0), toolEnd(2, "toolu_9", true, "done"), turnDone(3)]);
+    expect(t.rows.find((row) => row.kind === "tool")?.ioRef).toEqual({ itemId: "toolu_9", turnId: "t1" });
+  });
+
+  it("gives a step with no item id no pointer rather than a made-up one", () => {
+    const t = buildTrajectory([turnStarted(0), toolStart(1, undefined as unknown as string, "Bash"), turnDone(3)]);
+    expect(t.rows.find((row) => row.kind === "tool")?.ioRef).toBeUndefined();
+  });
+});
+
+describe("buildTrajectory: injected context", () => {
+  // published before the turn exists, so it names none (`base`'s default would add one)
+  const injected = (sec: number, source: string, preview: string, bytes: number, extra: Record<string, unknown> = {}): RuntimeEvent => {
+    const { turnId: _none, ...stamp } = base(sec);
+    return { ...stamp, type: "context.injected", itemId: `ctx-${source}`, source, preview, bytes, ...extra } as RuntimeEvent;
+  };
+
+  it("makes a CONTEXT row with the source, size and preview, and a pointer to the full text", () => {
+    const t = buildTrajectory([injected(0, "memory", "likes tea and quiet", 412), turnStarted(1), turnDone(2)]);
+    const row = t.rows.find((r) => r.kind === "context");
+    expect(row).toMatchObject({
+      title: "Context injection · memory",
+      args: "412 B",
+      text: "likes tea and quiet",
+      ioRef: { itemId: "ctx-memory" },
+    });
+    expect(row?.detail.meta).toEqual([
+      ["Source", "memory"],
+      ["Size", "412 B"],
+    ]);
+    // searchable by what it said
+    expect(filterRows(t.rows, "tea")).toHaveLength(1);
+  });
+
+  it("travels with the turn that follows it — it is what began that turn", () => {
+    const t = buildTrajectory([
+      turnStarted(0),
+      turnDone(2),
+      injected(10, "skill", "Use the phone skill.", 20),
+      injected(10, "memory", "likes tea", 9),
+      turnStarted(11, "t2"),
+      said(12, "hello", "t2"),
+      turnDone(13, {}, "t2"),
+    ]);
+    const groups = groupByTurn(t.rows, t.turns);
+    const second = groups.find((group) => group.turn?.id === "t2");
+    expect(second?.rows.map((row) => row.title)).toEqual(["Context injection · skill", "Context injection · memory", "Assistant"]);
+  });
+
+  it("is not claimed by a turn that happens to still be open", () => {
+    // a cut-short earlier turn must not swallow a row published before the next one
+    const t = buildTrajectory([turnStarted(0), injected(5, "memory", "likes tea", 9), turnStarted(6, "t2"), turnDone(7, {}, "t2")]);
+    const row = t.rows.find((r) => r.kind === "context");
+    expect(row?.turnId).toBeUndefined();
+  });
+
+  it("attaches to its turn when the event names one", () => {
+    const t = buildTrajectory([turnStarted(0), injected(1, "reply", "quoted", 6, { turnId: "t1" }), turnDone(2)]);
+    expect(t.rows.find((r) => r.kind === "context")?.turnId).toBe("t1");
+  });
+
+  it("copes with an event that has no preview", () => {
+    const t = buildTrajectory([injected(0, "automation", "", 120)]);
+    expect(t.rows[0]).toMatchObject({ title: "Context injection · automation", text: undefined });
+  });
+});
+
 describe("buildTrajectory: what a settled turn keeps", () => {
   const usage = (sec: number, input: number, output?: number, turnId = "t1"): RuntimeEvent =>
     ({ ...base(sec, turnId), type: "thread.token-usage.updated", input, ...(output === undefined ? {} : { output }) }) as RuntimeEvent;

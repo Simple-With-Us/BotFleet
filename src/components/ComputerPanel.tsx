@@ -27,6 +27,14 @@ import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
 import { railAsideClass } from "@/lib/layout-rails";
 import { usePageVisible } from "@/lib/page-visible";
+import {
+  captureFailureIsActionable,
+  cloudCaptureErrorIsStale,
+  decideCloudPreview,
+  newestPreview,
+  FRAME_STALE_MS,
+  type ScreenStreamState,
+} from "@/lib/computer-preview";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
@@ -44,6 +52,7 @@ import {
 } from "@/lib/local-computer";
 import { botCloudBackend, cloudBackendInherited, cloudDestinationLabel } from "@/lib/cloud-backend";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
+import { CliCredentialSyncPanel } from "./CliCredentialSyncPanel";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -89,6 +98,23 @@ const liveScreenFrame = z.object({
   botId: z.string(),
   png: z.string(),
   mime: z.string().optional(),
+  // The harness stamps this so a streamed frame and a polled screenshot are
+  // both aged against the server's clock.  Without it the comparison would
+  // mix a host timestamp with a browser one, and any skew between them would
+  // decide which picture wins.
+  capturedAt: z.number().optional(),
+});
+
+/**
+ * The polled screenshot crosses an HTTP boundary and decides which picture the
+ * panel paints, so its shape is checked rather than trusted.  A malformed or
+ * truncated body must not be able to land `undefined` in `polledAt` and silently
+ * make a capture look older than a frame it actually beat.
+ */
+const cloudScreenshot = z.object({
+  png: z.string().min(1),
+  format: z.enum(["png", "jpeg"]),
+  capturedAt: z.number().int().positive(),
 });
 
 export function ComputerPanel({
@@ -214,6 +240,7 @@ export function ComputerPanel({
     setVpsStatus(null);
     setLocalFrame(null);
     setError(null);
+    setCaptureProblem(null);
     if ((bot.computers ?? []).length === 0) {
       setPhase("off");
       return;
@@ -329,7 +356,7 @@ export function ComputerPanel({
               setBoxState(result.container ?? null);
               if (result.ready) setPhase("ready");
               else {
-                setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+                setError(result.problem ?? "The VPS Linux desktop is not ready yet");
                 setPhase("error");
               }
             });
@@ -341,8 +368,8 @@ export function ComputerPanel({
           setBoxState(status.container ?? null);
           setError(
             bot.autoStartVps
-              ? `${status.problem ?? "No ready VPS container"}. Auto will prepare or wake it when this bot next works.`
-              : `${status.problem ?? "No ready VPS container"}. Enable Start VPS automatically below, or choose ASCII.dev Box to provision it.`,
+              ? `${status.problem ?? "No ready VPS container"}.\u00a0 Auto will prepare or wake it when this bot next works.`
+              : `${status.problem ?? "No ready VPS container"}.\u00a0 Enable Start VPS automatically below, or choose ASCII.dev Box to provision it.`,
           );
           setPhase(status.container === "stopped" ? "vps-stopped" : "vps-unconfigured");
         })
@@ -409,10 +436,46 @@ export function ComputerPanel({
   // idle bot — a drawer left open overnight must not keep shooting.
   const pageVisible = usePageVisible();
   const live = state.screens[bot.id];
-  const [screenStreamState, setScreenStreamState] = useState<"connecting" | "connected" | "failed">("connecting");
+  const [screenStreamState, setScreenStreamState] = useState<ScreenStreamState>("connecting");
+  // Has THIS turn's stream delivered a frame, and when?  The socket being
+  // open proves nothing: the server registers a screen poller inside
+  // `startTurn` and tears it down when the turn settles, so a stream can sit
+  // connected for a whole turn and never paint.  And one delivered frame
+  // proves the stream *can* deliver, not that it still is — the server's
+  // poller swallows capture errors, so a box that goes quiet mid-turn would
+  // otherwise latch the fallback off.  Hence a timestamp, not a boolean.
+  const [lastFrameAt, setLastFrameAt] = useState(0);
+  // The clock the gate compares against.  A stream that stops delivering has
+  // to re-render once, when its last frame goes stale, or the fallback never
+  // starts.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!lastFrameAt) return;
+    const remaining = FRAME_STALE_MS - (Date.now() - lastFrameAt);
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(() => setNowMs(Date.now()), remaining + 10);
+    return () => window.clearTimeout(timer);
+  }, [lastFrameAt, nowMs]);
+  // The age of the picture the store is holding.  Tracked apart from
+  // `lastFrameAt` on purpose: that one is zeroed whenever a new stream is
+  // subscribed or a turn begins, because the gate is asking "has this turn
+  // proven it streams?" — but the store's frame is never cleared, so zero
+  // there means "unproven", not "infinitely old".  Using it as the live
+  // frame's age let a leftover polled capture outrank a live frame that was
+  // genuinely on screen.  The `key={bot.id}` remount is what scopes this.
+  const [liveFrameAt, setLiveFrameAt] = useState(0);
+  const wasBusy = useRef(bot.busy);
+  useEffect(() => {
+    if (wasBusy.current === bot.busy) return;
+    wasBusy.current = bot.busy;
+    // A new turn brings its own turn-scoped poller, which has to prove itself.
+    if (bot.busy) setLastFrameAt(0);
+  }, [bot.busy]);
   useEffect(() => {
     if (phase !== "ready" || panelView !== "computer" || viewerOpen || !pageVisible) return;
     setScreenStreamState("connecting");
+    // A brand new stream has not demonstrated anything yet.
+    setLastFrameAt(0);
     const stream = new EventSource(`/api/events?screens=on&botId=${encodeURIComponent(bot.id)}`);
     let active = true;
     let failed = false;
@@ -433,6 +496,11 @@ export function ComputerPanel({
         const parsed = liveScreenFrame.safeParse(JSON.parse(event.data));
         if (parsed.success && parsed.data.botId === bot.id) {
           const frame = parsed.data;
+          // Same clock as the polled capture's stamp.  The browser clock is
+          // only a fallback for a harness too old to stamp its own frames.
+          setLiveFrameAt(typeof frame.capturedAt === "number" ? frame.capturedAt : Date.now());
+          setLastFrameAt(Date.now());
+          setNowMs(Date.now());
           dispatch({ type: "screenFrame", botId: bot.id, png: frame.png, mime: frame.mime ?? "image/png" });
         }
       } catch {
@@ -444,33 +512,127 @@ export function ComputerPanel({
       stream.close();
     };
   }, [phase, panelView, viewerOpen, pageVisible, bot.id, dispatch]);
-  const inFlight = useRef(false);
+  const preview = decideCloudPreview({
+    phase,
+    panelView,
+    botBusy: bot.busy === true,
+    lastFrameAt,
+    nowMs,
+    streamState: screenStreamState,
+    viewerOpen,
+    pageVisible,
+  });
+  const captureFailures = useRef(0);
+  const [captureProblem, setCaptureProblem] = useState<string | null>(null);
+  // A cloud capture error that outlives the capture that raised it is its own
+  // bug.  The banner is only ever cleared by the next GOOD capture, and the
+  // poll effect below is torn down the moment the gate stops asking — so a
+  // stream that resumes mid-turn leaves a red "Couldn't capture this computer's
+  // screen" banner over a preview that is streaming fine.  Resetting the
+  // counter as well as the message is what stops the next blip from re-raising
+  // an error that had already been proven untrue by the frames on screen.
+  // Scoped to the cloud path: the Local VM writes the same state and is also
+  // `poll: false`, so this must not take down a live VM error.
   useEffect(() => {
-    if (phase !== "ready" || panelView !== "computer" || (bot.busy && screenStreamState !== "failed") || viewerOpen || !pageVisible) return;
-    let alive = true;
-    const shoot = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      try {
-        const { png, format } = await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" });
-        if (alive) setPolledFrame({ png, mime: format === "jpeg" ? "image/jpeg" : "image/png" });
-      } catch {
-        /* box mid-command or asleep — next tick */
-      } finally {
-        inFlight.current = false;
-      }
-    };
-    void shoot();
-    const timer = setInterval(shoot, bot.busy ? 4000 : 30_000);
+    if (!cloudCaptureErrorIsStale(phase, preview.poll)) return;
+    // Both counters, not just the cloud one: clearing the banner while the VM
+    // counter is still pinned at the limit means the next transient VM blip
+    // re-raises an error the person has already been shown is stale.
+    captureFailures.current = 0;
+    vmFailures.current = 0;
+    setCaptureProblem(null);
+  }, [phase, preview.poll]);
+  // When the polled capture landed, so `newestPreview` can compare ages.
+  const [polledAt, setPolledAt] = useState(0);
+  // One capture at a time, SHARED across poll-effect generations.
+  //
+  // The gate changes mid-flight — including the staleness timer, every turn
+  // boundary — and a remote capture is a ~17s round trip that has already been
+  // paid for.  A per-generation guard threw that result away and then refused
+  // to replace it, because this ref was still held: the first picture of the
+  // silent-stream fallback arrived roughly 20s after the gate asked for it.
+  // So the pending capture is the shared thing, and a new generation adopts
+  // the one already running instead of starting a second.  Clearing the ref in
+  // the cleanup instead would let two full-frame SSH captures hit the box at
+  // once, which is the opposite of what this is for.
+  const pendingCapture = useRef<Promise<z.infer<typeof cloudScreenshot>> | null>(null);
+  // Whether this panel instance is still on screen.  Guarding the RESULT on
+  // this rather than on the effect generation is what lets an adopted capture
+  // still paint.  `key={bot.id}` remounts per bot, so one instance is one bot.
+  const panelLive = useRef(true);
+  useEffect(() => {
+    panelLive.current = true;
     return () => {
-      alive = false;
+      panelLive.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!preview.poll) return;
+    const shoot = () => {
+      pendingCapture.current ??= (async () => {
+        try {
+          // Validated, not trusted: a body that does not match is a capture
+          // failure like any other, and is counted and reported as one rather
+          // than being allowed to half-apply.
+          const frame = cloudScreenshot.parse(
+            await api(`/api/bots/${bot.id}/computer/screenshot`, { method: "POST" }),
+          );
+          if (captureFailures.current > 0) {
+            captureFailures.current = 0;
+            setCaptureProblem(null);
+          }
+          return frame;
+        } catch (e) {
+          /* Counted ONCE, here, and not once per awaiter.  The busy cadence is
+           * 4s against a ~17s capture, so five apply() calls can be awaiting
+           * this same promise; counting in the callers turned a single
+           * transient failure into five and raised the banner for a box that
+           * had simply been mid-command.  The previous per-generation guard
+           * tolerated that by construction, and sharing the promise took that
+           * tolerance away.
+           * A box mid-command fails transiently and retries next tick.  One
+           * that fails every tick is not slow, it is broken, and saying so
+           * beats an eternal "Waiting for the first frame…". */
+          captureFailures.current += 1;
+          if (panelLive.current && captureFailureIsActionable(captureFailures.current)) {
+            setCaptureProblem(
+              `Couldn't capture this computer's screen: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          throw e;
+        } finally {
+          pendingCapture.current = null;
+        }
+      })();
+      return pendingCapture.current;
+    };
+    const apply = async () => {
+      let frame: z.infer<typeof cloudScreenshot>;
+      try {
+        frame = await shoot();
+      } catch {
+        // Already counted and reported by `shoot`, once per capture.
+        return;
+      }
+      if (!panelLive.current) return;
+      setPolledFrame({ png: frame.png, mime: frame.format === "jpeg" ? "image/jpeg" : "image/png" });
+      // Compare PICTURE age, not arrival age, and in the harness's clock for
+      // both sources.  The schema makes `capturedAt` required precisely so the
+      // browser clock is never silently substituted here — that substitution
+      // is what put two clock domains in the comparison in the first place.
+      setPolledAt(frame.capturedAt);
+    };
+    void apply();
+    const timer = setInterval(() => void apply(), preview.intervalMs);
+    return () => {
       clearInterval(timer);
     };
-  }, [phase, panelView, screenStreamState, bot.id, viewerOpen, pageVisible, bot.busy]);
+  }, [preview.poll, preview.intervalMs, bot.id]);
 
-  // Local VM preview comes directly from Cua Driver through the harness. It
+  // Local VM preview comes directly from Computer Driver through the harness. It
   // does not use the password-protected noVNC viewer or cloud endpoints.
   const vmInFlight = useRef(false);
+  const vmFailures = useRef(0);
   useEffect(() => {
     if (phase !== "vm" || viewerOpen || !pageVisible) return;
     let alive = true;
@@ -480,8 +642,21 @@ export function ComputerPanel({
       try {
         const { image } = await api(`/api/bots/${bot.id}/local-computer/screenshot`, { method: "POST" });
         if (alive && typeof image === "string") setVmFrame(image);
+        if (vmFailures.current > 0) {
+          vmFailures.current = 0;
+          setCaptureProblem(null);
+        }
       } catch (e) {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        /* The desktop restarting mid-capture fails once and recovers.  Raise it
+         * only when it keeps failing, and let a good frame take the message
+         * back down — an error that outlives its cause is its own bug. */
+        if (!alive) return;
+        vmFailures.current += 1;
+        if (captureFailureIsActionable(vmFailures.current)) {
+          setCaptureProblem(
+            `Couldn't capture the Local VM's screen: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
       } finally {
         vmInFlight.current = false;
       }
@@ -523,7 +698,12 @@ export function ComputerPanel({
   }, [phase, isLinux, pageVisible, bot.busy]);
 
   const lastScreenMessage = [...bot.messages].reverse().find((m) => m.kind === "screen" && m.png);
-  const latestPreview = screenStreamState === "failed" ? polledFrame ?? live : live ?? polledFrame;
+  // Both sources persist: the store's `live` frame is written but never
+  // cleared, and `polledFrame` is replaced only when a capture lands.  Each
+  // carries its own capture time, because "one exists" says nothing about
+  // which is newer — preferring by nullability makes the preview jump
+  // backwards in time at a turn boundary or a staleness transition.
+  const latestPreview = newestPreview(live, polledFrame, polledAt, liveFrameAt);
   const cloudFrame =
     latestPreview ??
     (lastScreenMessage ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png" } : null);
@@ -642,7 +822,7 @@ export function ComputerPanel({
           setBoxState(result.container ?? null);
           if (result.ready) setPhase("ready");
           else {
-            setError(result.problem ?? "The VPS Cua desktop is not ready yet");
+            setError(result.problem ?? "The VPS Linux desktop is not ready yet");
             setPhase("error");
           }
         }
@@ -715,7 +895,7 @@ export function ComputerPanel({
       setVpsStatus(result);
       setBoxState(result.container ?? null);
       setPhase(result.ready ? "ready" : "error");
-      if (!result.ready) setError(result.problem ?? "The replacement VPS Cua desktop is not ready yet");
+      if (!result.ready) setError(result.problem ?? "The replacement VPS Linux desktop is not ready yet");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setPhase("error");
@@ -925,6 +1105,11 @@ export function ComputerPanel({
             {error}
           </div>
         )}
+        {captureProblem && (
+          <div className="mt-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+            {captureProblem}
+          </div>
+        )}
         {phase === "unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
@@ -939,7 +1124,7 @@ export function ComputerPanel({
         {phase === "vps-unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
-              Configure the VPS SSH alias in App Settings → Connections. Auto only reuses an existing ready container.
+              Configure the VPS SSH alias in App Settings → Connections.{"\u00a0 "}Auto only reuses an existing ready container.
             </div>
             <button
               onClick={openConnectionSettings}
@@ -1047,6 +1232,15 @@ export function ComputerPanel({
           </button>
         )}
         {/* Cloud-only actions */}
+        {phase === "ready" && cloudBackend === "vps" && vpsStatus?.container === "running" && (
+          <div className="mt-3">
+            <CliCredentialSyncPanel
+              syncUrl={`/api/bots/${bot.id}/computer/sync-credentials`}
+              description="Copy host CLI login files from the VM CLI manifest into this bot's cloud VPS container (shared or per-bot, per workspace mode)."
+              autoSyncEnabled={Boolean(state.config?.localVm?.shareCliCredentials)}
+            />
+          </div>
+        )}
         {phase === "ready" && (
           <div className="mt-3 flex gap-2">
             {!control.held && !control.helpReason && (
@@ -1097,15 +1291,15 @@ export function ComputerPanel({
               {!bot.computers &&
                 (isLinux || !localSelectable
                   ? cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
-                    : `${linuxAutoDescription()} `
+                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off.\u00a0 "
+                    : `${linuxAutoDescription()}\u00a0 `
                   : cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one exists, otherwise this computer. "
-                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer. ")}
-              Pick where this bot's computer lives. <b className="text-ink">Local VM</b> is a Cua-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop. Set it up in App
+                    ? "Auto reuses a ready VPS when one exists, otherwise this computer.\u00a0 "
+                    : "Auto uses an ASCII.dev Box when one exists, otherwise this computer.\u00a0 ")}
+              Pick where this bot's computer lives.{"\u00a0 "}<b className="text-ink">Local VM</b> is a BotFleet-controlled Linux desktop
+              in a container on this machine — free and separate from your own desktop.{"\u00a0 "}Set it up in App
               Settings → Local VM.
-          </div>
+            </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
             {(
               [
@@ -1178,7 +1372,7 @@ export function ComputerPanel({
                   <div className="min-w-0">
                     <div className="text-[13px] text-ink">Start VPS automatically</div>
                     <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                      Off by default. When enabled, Auto may create or wake this bot's managed container.
+                      Off by default.{"\u00a0 "}When enabled, Auto may create or wake this bot's managed container.
                     </div>
                   </div>
                   <button
@@ -1227,7 +1421,7 @@ export function ComputerPanel({
           {!computerDestination && (
             <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-warning">
               <Power size={13} className="mt-0.5 shrink-0" />
-              Scheduled tasks on this computer will not have desktop access while this is Off. Choose ASCII.dev Box in the schedule editor to run the whole job there.
+              Scheduled tasks on this computer will not have desktop access while this is Off.{"\u00a0 "}Choose ASCII.dev Box in the schedule editor to run the whole job there.
             </div>
           )}
           {activeRoutineRun && (

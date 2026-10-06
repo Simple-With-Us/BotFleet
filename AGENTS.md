@@ -2,7 +2,7 @@
 
 This file is the **authoritative coordination manifest for AI agent fleets** working on the BotFleet repository.  Human contributors should read [CONTRIBUTING.md](CONTRIBUTING.md) instead.  Read this file fully before touching any code.
 
-GitHub: `jaywedgeworth22/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
+GitHub: `Simple-With-Us/BotFleet`.  Integration tree: `/Users/jay/Code/BotFleet` (read-only for every seat; never a working lane).  Seat worktrees: `~/apps/botfleet-<seat>[-<lane>]`.  Slack `repo:` name: **`BotFleet`**.  Acronym: **`BF`**.
 
 Consult the private operations inventory for hosting and routing details.
 
@@ -51,7 +51,7 @@ Every claim of "it works" points at a recipe that proves it in an isolated fixtu
 
 ## No New GitHub Repositories (owner directive, 2026-09-02)
 
-**Never create a GitHub repository — no forks, no release repos, no site or docs repos, no scratch repos — unless the owner asks for that repository by name.**  One repository per app: BotFleet's releases, site, docs, and CI all live in `jaywedgeworth22/BotFleet`.  Need to send a change upstream?  Ask the owner first, and delete the fork when the PR closes.  Need a public update feed?  This repo's own Releases.  Found an extra repo no directive created?  Surface it to the owner; do not delete it yourself.  Canonical: `AGENT-SYNC.md` § Owner Directives → No new GitHub repositories.
+**Never create a GitHub repository — no forks, no release repos, no site or docs repos, no scratch repos — unless the owner asks for that repository by name.**  One repository per app: BotFleet's releases, site, docs, and CI all live in `Simple-With-Us/BotFleet`.  Need to send a change upstream?  Ask the owner first, and delete the fork when the PR closes.  Need a public update feed?  This repo's own Releases.  Found an extra repo no directive created?  Surface it to the owner; do not delete it yourself.  Canonical: `AGENT-SYNC.md` § Owner Directives → No new GitHub repositories.
 
 ## Always Commit And Land Finished Work (owner preference — ALL platforms)
 
@@ -71,7 +71,7 @@ Plans, designs, reviews, handoffs, rollouts, and completion notes also go to App
 
 ## Copy Rules (owner — ALL agents, ALL surfaces)
 
-Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Slack posts, Apple Notes, this file (`&nbsp; ` inside HTML strings).  Title Case headings.  Light theme is the first-visit default.  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.  Canonical: `/Users/jay/apps/FLEET-UI-COPY.md`.
+Two spaces between sentences in every paragraph a human reads: product UI, App Store fields, docs, PR bodies, commit messages, Slack posts, Apple Notes, this file (`&nbsp; ` inside HTML strings).  Title Case headings.  System theme is the first-visit default (follows OS appearance; marketing captures default light).  The product word is "bot", not "agent".  No agent seat names on public surfaces (botfleet.app, App Store, TestFlight notes).  Timestamps in Central Time.
 
 ## App Icon And Logo Policy: Full-Bleed Square Only, Never Squircle
 
@@ -84,6 +84,10 @@ Two spaces between sentences in every paragraph a human reads: product UI, App S
 ## Secret Handoff (owner -> agent)
 
 When the owner gives you a secret, read it from `chmod 600` files under `/Users/jay/.secrets/` and NEVER print or echo it.  Never grep `KEY=value` lines (names only: `grep -oE '^[A-Z][A-Z0-9_]*' file`).  Never read `~/.botfleet/config.json` values, plist environment blocks, or `.env*` contents into a transcript.  The product server must not read fleet handoff files; runtime secrets come from the app's own config or Infisical.
+
+## Infisical Sole Source Of Truth (owner directive, 2026-10-03)
+
+Infisical is the sole source of truth for this app's secrets, env config, and tunable settings knobs — see [INFISICAL.md](INFISICAL.md) for the policy, the key inventory, and the runtime contract.  Credentials live in the table in `server/secret-map.ts`; tunable knobs (job limits, admission thresholds, Sentry sample rates, the spend ceiling, the Infisical refresh cadence) live in the table in `server/knob-map.ts`.  One table row each — the snapshot filter, `loadConfig()` resolution, provenance, `PUT /api/config` write-through, and the status views all follow the tables.  Never add a direct `process.env` read for a setting that belongs in either table; never fetch Infisical per-request (all runtime reads come from the resolved in-memory `cfg`).  The store's own machine identity and timeouts are deliberately NOT in the vault — a lock cannot hold its own key.  Admin saves write through to Infisical first; a failed write fails the save.
 
 ## Observability
 
@@ -99,8 +103,8 @@ Naming convention `app.<name>.<platform>` for executables, `app.<name>` for the 
 | macOS Recorder helper | `app.botfleet.recorder.macos` | `electron/resources/recorder-helper-Info.plist` |
 | macOS Speech helper | `app.botfleet.speech.macos` | `electron/resources/speech-helper-Info.plist` |
 | Always-on LaunchAgent (harness) | `app.botfleet.server` | `~/Library/LaunchAgents/app.botfleet.server.plist` `Label` |
-| iOS app | `app.botfleet.ios` | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
-| iOS widgets | `app.botfleet.ios.widgets` | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
+| iOS app | `app.botfleet` (stay until ASC App ID for `.ios` exists) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `ios/Sources/CompanionCore/TestFlightUpdateCheck.swift`, `scripts/ios-fleet/apps.json` |
+| iOS widgets | `app.botfleet.widgets` (stay until ASC App ID for `.ios.widgets` exists) | `ios/project.yml` `PRODUCT_BUNDLE_IDENTIFIER`, `scripts/ios-fleet/apps.json` `extraBundleIds` |
 | App group | `group.app.botfleet` | `ios/App/BotFleet.entitlements`, `ios/Widgets/BotFleetWidgets.entitlements` |
 | Associated domain | `botfleet.app` (Universal Links + web credentials) | `ios/project.yml` `com.apple.developer.associated-domains` |
 
@@ -110,12 +114,12 @@ macOS signing uses `build/entitlements.mac.plist` for the main app and `build/en
 
 `.claude/skills/` carries the fleet skills a seat should use here: `session-start`, `board-ops`, `closeout`, `land-lane`, `deploy-verify`, `codex-triage`, `unstick-pr`, `pickup-seat`, `fleet-coordination`, `fleet-infra`, `secret-handoff`, `owner-copy`, `sentence-gap`, `apple-notes`, `dns-and-registrars`, `drive-grok-tui`, `mac-cleanup`, `windows-release`.  Load `session-start` at the beginning of a session and `closeout` at the end of a lane.
 
-## Harness package
+## Clutch Package
 
 DSH engine shape (catalog, version gate, error classifier, model-id
-round-trip, credentials) lives in `jaywedgeworth22/Harness` and is
-imported as `harness/dsh/acp`.  **Never edit that shape in
-`server/drivers/acp/dsh.ts`.**  Edit Harness, then bump the git
+round-trip, credentials) lives in `Simple-With-Us/Clutch` and is
+imported as `clutch/dsh/acp`.  **Never edit that shape in
+`server/drivers/acp/dsh.ts`.**  Edit Clutch, then bump the git
 dependency.  ACP runtime (`acp/core.ts`, `dshWrapSpawn`, the Node
 `dsh-acp-bridge`) stays in this repo.
 
@@ -127,7 +131,7 @@ Never submit, post, comment, file an issue, open a PR, create a fork,
 or otherwise initiate any communication to a third-party repository,
 organization, or service on the owner's behalf without explicit
 per-case approval from the owner.  Reading public repositories and
-pinning upstream packages is fine.  Canonical: Harness
+pinning upstream packages is fine.  Canonical: Clutch
 `docs/decisions/0003-no-external-contact-and-no-forks.md`.
 
 ### No forks of other repositories

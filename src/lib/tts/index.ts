@@ -1,4 +1,5 @@
 import { spokenReply } from "../../../shared/voice-summary";
+import { TtsAudioBodySchema } from "./schema";
 // The speaker — one voice for the whole window.
 //
 // Deliberately a singleton: two bots talking over each other is never what
@@ -24,6 +25,10 @@ export interface SpeechSnapshot {
   messageId?: string;
   /** the utterance currently audible — call mode shows it as a caption */
   caption?: string;
+  /** full voice summary text for distilled read-along */
+  voiceText?: string;
+  /** zero-based index of the currently spoken word within caption/voiceText */
+  wordIndex?: number;
   error?: string;
 }
 
@@ -74,6 +79,9 @@ export class Speaker {
     this.token += 1;
     this.request?.abort();
     this.request = null;
+    if (typeof window !== "undefined") {
+      void window.ogb?.personalVoice?.stop?.();
+    }
     // Pausing/removing an <audio> source does not reliably fire `ended` or
     // `error`. Resolve the play promise ourselves so every interrupted
     // speak() settles and call mode cannot leak a forever-pending task.
@@ -85,6 +93,7 @@ export class Speaker {
   private teardownAudio() {
     if (this.audio) {
       this.audio.pause();
+      this.audio.ontimeupdate = null;
       this.audio.src = "";
       this.audio = null;
     }
@@ -106,6 +115,32 @@ export class Speaker {
     this.request = controller;
     const live = () => this.token === mine && !controller.signal.aborted;
 
+    const isPersonal =
+      typeof opts.voiceId === "string" &&
+      (opts.voiceId.startsWith("personal:") || opts.voiceId.startsWith("apple-personal:"));
+
+    if (isPersonal) {
+      this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId, caption: text, voiceText: text, wordIndex: 0 });
+      if (typeof window !== "undefined" && window.ogb?.personalVoice?.speak) {
+        try {
+          this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: text, voiceText: text, wordIndex: 0 });
+          await window.ogb.personalVoice.speak(text, opts.voiceId);
+          if (live()) this.set(IDLE);
+        } catch (error) {
+          if (live()) this.set({ ...IDLE, error: error instanceof Error ? error.message : String(error) });
+        } finally {
+          if (this.request === controller) this.request = null;
+        }
+        return;
+      }
+      this.set({
+        ...IDLE,
+        error: "Apple Personal Voice speaks on authorized Apple devices (macOS / iOS).",
+      });
+      if (this.request === controller) this.request = null;
+      return;
+    }
+
     if (opts.messageId && opts.botId) {
       this.set({ status: "preparing", botId: opts.botId, messageId: opts.messageId });
       try {
@@ -116,12 +151,26 @@ export class Speaker {
         const endpoint = `/api/threads/${encodeURIComponent(threadId)}/messages/${encodeURIComponent(opts.messageId)}/audio`;
         const response = await fetch(endpoint, { method: "POST", signal: controller.signal });
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `Voice service returned ${response.status}`);
-        const { audio } = await response.json() as { audio: Array<{ path: string; mime: string }> };
+        const parsed = TtsAudioBodySchema.safeParse(await response.json());
+        if (!parsed.success) throw new Error("Voice service returned an invalid response.");
+        const { audio, voiceText, utterances, onDevice } = parsed.data;
+        if (onDevice || (!audio?.length && voiceText)) {
+          if (typeof window !== "undefined" && window.ogb?.personalVoice?.speak) {
+            const speechText = voiceText ?? text;
+            this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: speechText, voiceText: speechText, wordIndex: 0 });
+            await window.ogb.personalVoice.speak(speechText, opts.voiceId);
+            if (live()) this.set(IDLE);
+          } else {
+            throw new Error("Apple Personal Voice speaks on authorized Apple devices (macOS / iOS).");
+          }
+          return;
+        }
         for (let i = 0; i < audio.length && live(); i++) {
           const clip = await fetch(`${endpoint}/${i}`, { signal: controller.signal });
           if (!clip.ok) throw new Error(`Voice clip could not be loaded (${clip.status}).`);
-          this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId });
-          if (!(await this.play(await clip.blob(), live))) throw new Error("The voice clip could not be played.");
+          const caption = utterances?.[i] ?? voiceText;
+          this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption, voiceText, wordIndex: 0 });
+          if (!(await this.play(await clip.blob(), live, caption))) throw new Error("The voice clip could not be played.");
         }
         if (live()) this.set(IDLE);
       } catch (error) {
@@ -173,8 +222,8 @@ export class Speaker {
         return;
       }
       if (!live()) return;
-      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i] });
-      const finished = await this.play(rendered.blob, live);
+      this.set({ status: "speaking", botId: opts.botId, messageId: opts.messageId, caption: utterances[i], wordIndex: 0 });
+      const finished = await this.play(rendered.blob, live, utterances[i]);
       if (!finished || !live()) {
         if (live()) this.set({ ...IDLE, error: "The generated voice clip couldn't be played." });
         if (this.request === controller) this.request = null;
@@ -215,7 +264,7 @@ export class Speaker {
   }
 
   /** Resolves true when the clip finished, false when it was interrupted. */
-  private play(blob: Blob, live: () => boolean): Promise<boolean> {
+  private play(blob: Blob, live: () => boolean, caption?: string): Promise<boolean> {
     return new Promise((resolve) => {
       if (!live()) return resolve(false);
       this.teardownAudio();
@@ -224,11 +273,14 @@ export class Speaker {
       this.audio = audio;
       this.objectUrl = url;
       let settled = false;
+      const words = caption?.trim().split(/\s+/).filter(Boolean) ?? [];
+
       const done = (ok: boolean) => {
         if (settled) return;
         settled = true;
         audio.onended = null;
         audio.onerror = null;
+        audio.ontimeupdate = null;
         if (this.settlePlayback === done) this.settlePlayback = null;
         if (this.audio === audio) this.teardownAudio();
         resolve(ok);
@@ -237,6 +289,21 @@ export class Speaker {
       audio.onended = () => done(true);
       // a clip that cannot decode should not strand the whole message
       audio.onerror = () => done(false);
+
+      if (words.length > 0) {
+        audio.ontimeupdate = () => {
+          if (!live() || settled) return;
+          const duration = audio.duration;
+          if (duration && Number.isFinite(duration) && duration > 0) {
+            const progress = Math.min(1, Math.max(0, audio.currentTime / duration));
+            const idx = Math.min(words.length - 1, Math.floor(progress * words.length));
+            if (idx !== this.snapshot.wordIndex) {
+              this.set({ ...this.snapshot, wordIndex: idx });
+            }
+          }
+        };
+      }
+
       audio.play().catch(() => done(false));
     });
   }

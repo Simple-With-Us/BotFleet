@@ -13,12 +13,12 @@ interface ToolLabels {
 }
 
 const ROUTINE_SETTLED_LABEL = {
-  create: "Routine scheduled",
-  update: "Routine updated",
-  pause: "Routine paused",
-  resume: "Routine resumed",
-  run_now: "Routine run queued",
-  delete: "Routine deleted",
+  create: "Routine Scheduled",
+  update: "Routine Updated",
+  pause: "Routine Paused",
+  resume: "Routine Resumed",
+  run_now: "Routine Run Queued",
+  delete: "Routine Deleted",
 } as const;
 
 /** The tool's own name is noise to a human: mcp__botfleet__computer_batch is
@@ -35,6 +35,7 @@ function toolLabel(tool?: string): string {
     WebSearch: "search the web",
     schedule_routine: "schedule a routine",
     manage_routine: "change a routine",
+    job_start: "start a background job",
   };
   return nice[tool] ?? bare;
 }
@@ -81,6 +82,12 @@ export function ApprovalCard({
         {card.subtitle}
       </pre>
 
+      {displayTool === "job_start" && (
+        <p className="mt-2 text-[12.5px] text-ink-secondary">
+          {"It keeps running in the background after you allow it.\u00a0 You can stop it from Background Jobs in the chat header."}
+        </p>
+      )}
+
       {card.held && (
         <div className="mt-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[12.5px] text-warning">
           {card.held}
@@ -93,7 +100,7 @@ export function ApprovalCard({
         {settled === "allow" ? (
           <>
             <Check size={14} className="text-success" />
-            {routineSettledLabel ?? (isRoutineRequest ? "Routine confirmed" : "Allowed")}
+            {routineSettledLabel ?? (isRoutineRequest ? "Routine Confirmed" : "Allowed")}
           </>
         ) : settled ? (
           <>
@@ -102,7 +109,7 @@ export function ApprovalCard({
         ) : (
           <>
             <ShieldCheck size={14} className="text-accent" />
-            {isRoutineRequest ? "Waiting for your confirmation below" : "Waiting for your answer below"}
+            {isRoutineRequest ? "Waiting for Your Confirmation Below" : "Waiting for Your Answer Below"}
           </>
         )}
       </div>

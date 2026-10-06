@@ -3,7 +3,7 @@
 // Unlike everything else in this package, the source here is not the
 // paired Mac — it is a small public manifest the fleet publishes at
 // `ai-fleet-coordinator/site/ios-versions.json` (served from
-// https://jaywedgeworth22.github.io/ai-fleet-coordinator/ios-versions.json),
+// https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json),
 // listing the latest TestFlight build per app by bundle id.  A phone checks it
 // whether or not it is paired with anything, so it cannot live behind
 // `CompanionClient`, which requires a `Connection`.  It gets the same
@@ -58,7 +58,7 @@ public struct AppBuildInfo: Equatable, Sendable {
 /// public file — so the only thing worth injecting for a test is the
 /// session, exactly like `CompanionClient` does for the harness.
 public struct VersionManifestFetcher: Sendable {
-    public static let manifestURL = URL(string: "https://jaywedgeworth22.github.io/ai-fleet-coordinator/ios-versions.json")!
+    public static let manifestURL = URL(string: "https://simple-with-us.github.io/AI-Fleet-Coordinator/ios-versions.json")!
 
     private let session: URLSession
 
@@ -84,7 +84,7 @@ public struct VersionManifestFetcher: Sendable {
 /// build actually running.
 public enum TestFlightUpdateCheck {
     /// Matches `PRODUCT_BUNDLE_IDENTIFIER` in `ios/project.yml`.
-    public static let bundleId = "app.botfleet.ios"
+    public static let bundleId = "app.botfleet"
 
     /// Whether `candidate` is a newer build than `running`.
     ///
