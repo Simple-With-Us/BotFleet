@@ -154,7 +154,17 @@ function pathExists(homeDir: string, rel: string): boolean {
 }
 
 export function sanitizeDockerConfigForLinux(raw: string): string {
-  const parsed: DockerConfig = DockerConfigSchema.parse(JSON.parse(raw));
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    throw new Error("invalid-docker-config");
+  }
+  const schemaResult = DockerConfigSchema.safeParse(decoded);
+  if (!schemaResult.success) {
+    throw new Error("invalid-docker-config");
+  }
+  const parsed: DockerConfig = schemaResult.data;
   delete parsed.credsStore;
   const helpers = parsed.credHelpers;
   if (helpers) {
@@ -298,7 +308,10 @@ function stageTransformedFile(
       const body = sanitizeDockerConfigForLinux(readFileSync(source, "utf8"));
       writeFileSync(target, body, { mode: 0o600 });
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof Error && error.message === "invalid-docker-config") {
+        return false;
+      }
       return false;
     }
   }
@@ -339,6 +352,11 @@ export function planCredentialSync(options: CredentialSyncOptions = {}): Credent
           if (stageTransformedFile(homeDir, rel, spec.transform, stagingDir)) {
             stagedRelPaths.add(rel);
             toolPaths.push(rel);
+          } else if (pathExists(homeDir, rel)) {
+            const alreadySkipped = skippedTools.some((entry) => entry.name === tool.name);
+            if (!alreadySkipped) {
+              skippedTools.push({ name: tool.name, reason: "Invalid Docker config.json on host" });
+            }
           }
           continue;
         }
@@ -378,9 +396,7 @@ export function resolveCredentialMountSource(
   const rel = candidate.relPath.join("/");
   if (candidate.transform === "docker-linux-config") {
     const staged = join(stagingRoot, rel);
-    if (!materialize) {
-      return existsSync(staged) ? staged : null;
-    }
+    mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
     if (stageTransformedFile(homeDir, rel, candidate.transform, stagingRoot)) return staged;
     return null;
   }
@@ -420,7 +436,11 @@ export function hostCliCredentialMounts(
   if (platform === "win32") return [];
   const materialize = options.materializeCredentials !== false;
   const stagingRoot = credentialMountStagingRoot(home);
-  if (materialize) {
+  const previewDockerStaging = !materialize
+    && cliCredentialCandidates().some(
+      (entry) => entry.transform === "docker-linux-config" && pathExists(home, entry.relPath.join("/")),
+    );
+  if (materialize || previewDockerStaging) {
     mkdirSync(stagingRoot, { recursive: true, mode: 0o700 });
   }
   const mounts: string[] = [];

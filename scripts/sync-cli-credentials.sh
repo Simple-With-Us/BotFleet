@@ -149,6 +149,14 @@ console.log(JSON.stringify({ root, rels }));
 NODE
 )" || { echo "Error: manifest-driven credential discovery failed." >&2; exit 1; }
 TAR_ROOT="$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])')"
+
+cleanup_staging() {
+  if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ] && [ -d "$TAR_ROOT" ]; then
+    rm -rf "$TAR_ROOT"
+  fi
+}
+trap cleanup_staging EXIT INT TERM
+
 while IFS= read -r rel; do
   [ -n "$rel" ] && FOUND+=("$rel")
 done <<< "$(printf '%s' "$CREDENTIAL_PLAN" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["rels"]))')"
@@ -277,10 +285,6 @@ if [ "$TARGET" = "local" ] || [ "$TARGET" = "all" ]; then
   if sync_to_container "local" "$LOCAL_CONTAINER"; then
     SYNCED_TARGETS+=("local:$LOCAL_CONTAINER")
   fi
-fi
-
-if [ -n "$TAR_ROOT" ] && [ "$TAR_ROOT" != "$SRC_HOME" ]; then
-  rm -rf "$TAR_ROOT"
 fi
 
 if [ "$JSON_OUTPUT" -eq 1 ]; then

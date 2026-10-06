@@ -47,6 +47,20 @@ describe("vm CLI credential sync", () => {
     expect(allowed.has("/home/cua/.sentryclirc")).toBe(true);
   });
 
+  it("records invalid docker config as a skipped tool during sync planning", () => {
+    const home = mkdtempSync(join(tmpdir(), "bf-cred-docker-plan-"));
+    mkdirSync(join(home, ".docker"), { recursive: true });
+    writeFileSync(join(home, ".docker", "config.json"), "[]");
+    const stagingDir = mkdtempSync(join(tmpdir(), "bf-cred-stage-plan-"));
+    try {
+      const plan = planCredentialSync({ homeDir: home, stagingDir });
+      expect(plan.skippedTools.some((entry) => entry.name === "docker")).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  });
+
   it("skips malformed docker config instead of aborting credential mounts", () => {
     const home = mkdtempSync(join(tmpdir(), "bf-cred-docker-"));
     mkdirSync(join(home, ".docker"), { recursive: true });
