@@ -32,8 +32,8 @@ The Mac wrapper remains a fallback when the hosted job cannot run.  It prefers `
 - Copy the localized text from `en-US/`.
 - Use `privacy-answers.md` and verify it still matches the binary.
 - Use `review-notes.md`, adding a real review contact in App Store Connect.
-- Support URL: `https://github.com/jaywedgeworth22/BotFleet/issues`
-- Privacy policy URL: `https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/ios-privacy.md`
+- Support URL: `https://github.com/Simple-With-Us/BotFleet/issues`
+- Privacy policy URL: `https://github.com/Simple-With-Us/BotFleet/blob/main/docs/ios-privacy.md`
 - Choose manual release for 1.0; enable a phased release after the first production build is stable.
 
 The unsigned simulator CI proves compilation, not distribution signing.  Hosted TestFlight ships run from `.github/workflows/ios-ship.yml` on `macos-latest` when `ios/**` (or the ship scripts) land on `main`.  Signing uses the existing repository Actions secrets.  Hosted ships use the fleet script default interval (no extra flags).

@@ -26,7 +26,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const DEFAULT_REPOSITORY = "jaywedgeworth22/BotFleet";
+const DEFAULT_REPOSITORY = "Simple-With-Us/BotFleet";
 const WORKFLOW_FILE = "mac-commit-build.yml";
 
 // The repository is public, so the Actions API can be read unauthenticated.

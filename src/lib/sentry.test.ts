@@ -356,7 +356,7 @@ describe("renderer diagnostics refresh", () => {
     const hugeMessageWithEmoji = "Error: 🔥 something crashed 🚨 " + "x".repeat(10000) + " 💥";
     const url = buildFallbackIssueUrl("Error in Bot", hugeMessageWithEmoji, 2000);
     expect(url.length).toBeLessThanOrEqual(2000);
-    expect(url).toContain("https://github.com/jaywedgeworth22/BotFleet/issues/new?title=");
+    expect(url).toContain("https://github.com/Simple-With-Us/BotFleet/issues/new?title=");
     expect(url).toContain("Error%20in%20Bot");
     // Verify decodeURIComponent does not throw (meaning surrogate pairs were not split)
     expect(() => decodeURIComponent(url)).not.toThrow();

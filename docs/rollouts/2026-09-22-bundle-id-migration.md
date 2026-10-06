@@ -3,7 +3,7 @@
 
 ## 2026-10-01 — iOS Ship IDs Stay On `app.botfleet` Until ASC App ID Exists
 
-Schedule run [36839653889](https://github.com/jaywedgeworth22/BotFleet/actions/runs/36839653889) failed the asc-seq gate (`rc=2`) because `scripts/ios-fleet/apps.json` briefly pointed at `app.botfleet.ios`, which has **no** App Store Connect app record.  Live ASC iOS app remains `app.botfleet` / appleId `6806379515`.
+Schedule run [36839653889](https://github.com/Simple-With-Us/BotFleet/actions/runs/36839653889) failed the asc-seq gate (`rc=2`) because `scripts/ios-fleet/apps.json` briefly pointed at `app.botfleet.ios`, which has **no** App Store Connect app record.  Live ASC iOS app remains `app.botfleet` / appleId `6806379515`.
 
 Until the owner registers `app.botfleet.ios` (and widgets) in App Store Connect, hosted ios-ship keeps `bundleId: app.botfleet` in `scripts/ios-fleet/apps.json`, matches `ios/project.yml` / `TestFlightUpdateCheck.swift`, and uses appleId `6806379515` so `latest-build-seq` and `ensure-tf-ready` can verify against the live app.  `asc-api.mjs` exact-matches `filter[bundleId]` results and can fall back to `appleId` when provided.
 
@@ -49,7 +49,7 @@ The same LaunchAgent rename is replicated outside the repo so the live harness m
 - `~/Library/LaunchAgents/com.jay.botfleet-server.plist` — `Label` → `app.botfleet.server`.  File name will move to `~/Library/LaunchAgents/app.botfleet.server.plist` on the owner's reload.
 - `/Users/jay/apps/botfleet-server-start.sh` — `PREFIX` and `~/Library/Logs/botfleet/server.log` references updated to the new label.
 - `/Users/jay/apps/botfleet-imessage-relay.py` — searched for any reference to the LaunchAgent label or bundle ID; none were found (it talks to `http://127.0.0.1:8799`, not to launchd), so the file is untouched.
-- `/Users/jay/apps/botfleet-server` (worktree) — left untouched.  It is a worktree of `jaywedgeworth22/BotFleet`; once the PR merges to `main` and the detached harness re-fetches, the source tree there will carry the new strings.
+- `/Users/jay/apps/botfleet-server` (worktree) — left untouched.  It is a worktree of the canonical BotFleet source (private operations record); once the PR merges to `main` and the detached harness re-fetches, the source tree there will carry the new strings.
 
 ## Owner Action Items
 

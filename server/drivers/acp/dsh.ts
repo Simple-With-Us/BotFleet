@@ -2,7 +2,7 @@
  * DSH ACP driver — BotFleet runtime composed with the Clutch engine shape.
  *
  * Engine catalog, version gate, error classifier, and model-id round-trip
- * live in `jaywedgeworth22/Clutch` (`clutch/dsh/acp`).  This file keeps
+ * live in `Simple-With-Us/Clutch` (`clutch/dsh/acp`).  This file keeps
  * `wrapSpawn` and `createAcpDriver` here because they need BotFleet's ACP
  * core and the Node stdio bridge.  Edit engine shape in Clutch, not here.
  */

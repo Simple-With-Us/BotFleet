@@ -668,14 +668,14 @@ export function VoiceSettings({
             </p>
           </div>
           <a
-            href="https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
+            href="https://github.com/Simple-With-Us/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
             target="_blank"
             rel="noopener noreferrer"
             onClick={(e) => {
               if (window.ogb?.openExternal) {
                 e.preventDefault();
                 void window.ogb.openExternal(
-                  "https://github.com/jaywedgeworth22/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
+                  "https://github.com/Simple-With-Us/BotFleet/blob/main/docs/tts-post-processing-benchmark.md"
                 );
               }
             }}

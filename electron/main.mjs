@@ -2236,7 +2236,7 @@ function setupApplicationMenu() {
       submenu: [
         {
           label: "BotFleet Documentation",
-          click: () => shell.openExternal("https://github.com/jaywedgeworth22/BotFleet"),
+          click: () => shell.openExternal("https://github.com/Simple-With-Us/BotFleet"),
         },
         {
           label: "Open Logs & Data Folder",
