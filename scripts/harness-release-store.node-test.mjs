@@ -13,6 +13,7 @@ import {
   isHeld,
   isReleaseDirectory,
   listReleases,
+  listReleasesDeps,
   promoteStaging,
   pruneReleases,
   releasePath,
@@ -365,15 +366,40 @@ test("listReleases skips a release that vanishes before stat", async (t) => {
     await stage(env, commit, commit);
     await promoteStaging({ commit, env });
   }
-  await chmodWritableTree(releasePath(A, env));
-  const listing = listReleases(env);
-  await new Promise((resolve) => setImmediate(resolve));
-  await forceRemove(releasePath(A, env));
-  const listed = await listing;
+  const pathA = releasePath(A, env);
+  const realStat = listReleasesDeps.statForListReleases;
+  t.mock.method(listReleasesDeps, "statForListReleases", async (path) => {
+    if (path === pathA) {
+      const error = new Error(`ENOENT: no such file or directory, stat '${path}'`);
+      error.code = "ENOENT";
+      throw error;
+    }
+    return realStat(path);
+  });
+  const listed = await listReleases(env);
   assert.ok(listed.includes(B), "listing must complete and still see surviving releases");
-  if (!listed.includes(A)) {
-    assert.deepEqual(listed, [B], "when the race wins, the vanished release is skipped instead of rejecting the listing");
-  }
+  assert.deepEqual(listed, [B], "a release that vanished before stat is skipped instead of rejecting the listing");
+});
+
+test("listReleases surfaces stat failures other than a vanished release", async (t) => {
+  const { env } = await store(t);
+  await stage(env, A, A);
+  await promoteStaging({ commit: A, env });
+  const pathA = releasePath(A, env);
+  const realStat = listReleasesDeps.statForListReleases;
+  t.mock.method(listReleasesDeps, "statForListReleases", async (path) => {
+    if (path === pathA) {
+      const error = new Error(`EACCES: permission denied, stat '${path}'`);
+      error.code = "EACCES";
+      throw error;
+    }
+    return realStat(path);
+  });
+  await assert.rejects(
+    () => listReleases(env),
+    (error) => error.code === "EACCES",
+    "tree permission errors must not drop a release from retention ordering",
+  );
 });
 
 test("pruning leaves a young release alone", async (t) => {

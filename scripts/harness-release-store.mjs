@@ -555,6 +555,12 @@ export async function swapCurrent({ commit, env = process.env, renameImpl = rena
  * manifest cannot be read falls back to its mtime, and then to the name, so an
  * unreadable release sorts predictably instead of vanishing from the list.
  */
+export const listReleasesDeps = {
+  statForListReleases(path) {
+    return stat(path);
+  },
+};
+
 export async function listReleases(env = process.env) {
   let entries;
   try {
@@ -568,8 +574,16 @@ export async function listReleases(env = process.env) {
     const path = join(releasesRoot(env), entry.name);
     const manifest = validateReleaseManifest(await readReleaseManifest(path));
     if (manifest && manifest.commit !== entry.name) continue;
-    const statResult = await stat(path).catch(() => null);
-    if (!statResult) continue;
+    let statResult;
+    try {
+      statResult = await listReleasesDeps.statForListReleases(path);
+    } catch (error) {
+      // Only a release that is genuinely gone may vanish from the listing; any
+      // other failure still has to be ordered (and therefore reported as a
+      // prune candidate) rather than silently dropped.
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+      continue;
+    }
     const parsed = manifest ? Date.parse(manifest.promotedAt) : Number.NaN;
     const promotedAt = Number.isFinite(parsed) ? parsed : statResult.mtimeMs;
     releases.push({ commit: entry.name, promotedAt, mtimeMs: statResult.mtimeMs });
